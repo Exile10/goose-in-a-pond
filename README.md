@@ -31,9 +31,5 @@ and licensed under the Apache License, Version 2.0 and CC BY 4.0..
 If you modify the project, clearly state the changes as shown below and retain all original license and copyright notices.
 
 ```
-Modified by [Your Name/Organization] on [DD-MM-YYYY].
-Changes:
-- Brief description of what was changed
-- Another short bullet if needed
-```
+
 
