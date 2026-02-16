@@ -30,6 +30,5 @@ and licensed under the Apache License, Version 2.0 and CC BY 4.0..
 ### Contributing
 If you modify the project, clearly state the changes as shown below and retain all original license and copyright notices.
 
-```
 
 
