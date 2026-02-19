@@ -78,7 +78,7 @@ We welcome open-source developers, AI engineers, embedded systems developers, mo
 
 Fork the repo, open issues, and submit pull requests.
 
-Check out the [contributing guidelines](./contributing.md). 
+Check out the [contributing guidelines](https://github.com/jarida-io/goose-in-a-pond?tab=contributing-ov-file). 
 
 ---
 
