@@ -32,41 +32,39 @@ You can contribute to Jarida in the following ways:
 
 ## Getting Started (Code Contributions)
 
-1. Fork the repository
-2. Clone your fork locally:
-
+1. **Fork the repository** and clone it locally.
+2. **Setup your environment**:
+   - Ensure the latest stable **Rust** is installed.
+   - Initialize the `goose` submodule:
+     ```bash
+     git submodule update --init --recursive
+     ```
+3. **Build the Workspace**:
    ```bash
-   git clone https://github.com/jarida-io/goose-in-a-pond.git
+   cargo build --workspace
    ```
-3. Create a new branch:
-
+4. **Create a new branch**:
    ```bash
    git checkout -b feature/short-description
    ```
-4. Make your changes
-5. Commit with a clear message:
-
+5. **Make your changes** following the **Hexagonal Architecture** pattern.
+6. **Verify your work**:
    ```bash
-   git commit -m "Add: clear description of change"
+   cargo test --workspace
    ```
-6. Push your branch:
-
-   ```bash
-   git push origin feature/short-description
-   ```
-7. Open a Pull Request
+7. **Commit & Push**.
 
 ---
 
-## Contribution Guidelines
+## Technical Contribution Guidelines
 
-To keep the project healthy and maintainable:
+To keep the project healthy and maintainable, we follow the **Ports & Adapters (Hexagonal)** pattern:
 
-* Keep pull requests **focused and reasonably sized**
-* Follow existing **code style and project structure**
-* Write **clear, readable, and well-documented code**
-* Add or update tests where applicable
-* Update documentation if your change affects usage
+- **Logic First**: Implement business logic in `crates/pond-core` using **TDD (Test-Driven Development)**.
+- **Port-Based**: Define traits in the Core and implement them in `crates/pond-infra` or `crates/pond-adapters-goose`.
+- **Pure Core**: Keep the `pond-core` crate free of database or network dependencies.
+- **Clean Code**: Follow the styles defined in the [Clean Code & Dependencies Guide](./docs/developer/clean_code_and_dependencies.md).
+- **Format & Lint**: Run `cargo fmt` and `cargo clippy` before submitting.
 
 ---
 

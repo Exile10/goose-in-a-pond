@@ -32,6 +32,20 @@ The system is designed to run on edge AI hardware and operate fully offline whil
 
 ---
 
+## 📚 Development & Documentation
+
+### Core Concepts
+- **[Architecture Overview](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/overview.md)**: Deep dive into the Hexagonal (Ports & Adapters) design.
+- **[Component Breakdown](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/components.md)**: Detailed purpose of each crate in `crates/`.
+- **[Data Flow & Lifecycle](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/data_flow.md)**: How requests travel through the system.
+
+### Guides
+- **[Developer Tutorial: Clean Code & Dependencies](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/developer/clean_code_and_dependencies.md)**: How to add libraries and maintain modularity.
+- **[TDD Guide](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/testing/tdd_guide.md)**: Writing unit and integration tests in the Pond.
+- **[Contributing Guide](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/CONTRIBUTING.md)**: Workflow for contributing to the project.
+
+---
+
 ##  Key Features
 
 - **Offline Voice Assistant** (wake word + local speech processing)
