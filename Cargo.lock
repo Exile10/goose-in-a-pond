@@ -4155,6 +4155,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "hstr"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6589,12 +6600,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-gotg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hostname",
+ "pond-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "pond-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
+ "hostname",
+ "pond-core",
+ "pond-infra",
  "serde",
  "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
 ]
 
 [[package]]
@@ -6618,8 +6652,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6630,7 +6666,9 @@ dependencies = [
  "pond-core",
  "serde",
  "sqlx",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6639,15 +6677,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
- "goose",
- "pond-adapters-goose",
+ "clap",
+ "dirs 5.0.1",
+ "hostname",
  "pond-api",
  "pond-core",
- "serde",
+ "pond-infra",
  "tokio",
- "tower-http",
  "tracing",
  "tracing-subscriber",
+ "webbrowser",
 ]
 
 [[package]]

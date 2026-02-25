@@ -1,8 +1,8 @@
-use clap::{Parser, Subcommand};
 use anyhow::Result;
-use std::fs;
+use clap::{Parser, Subcommand};
 use heck::{ToPascalCase, ToSnakeCase};
 use indoc::indoc;
+use std::fs;
 
 #[derive(Parser)]
 #[command(name = "pond-builder")]
@@ -52,8 +52,15 @@ async fn main() -> Result<()> {
             println!("Building {} port: {}...", port_type, name);
             generate_port(&name, &port_type)?;
         }
-        Commands::MakeAdapter { name, r#for, target_crate } => {
-            println!("Building adapter {} for port {} in {}...", name, r#for, target_crate);
+        Commands::MakeAdapter {
+            name,
+            r#for,
+            target_crate,
+        } => {
+            println!(
+                "Building adapter {} for port {} in {}...",
+                name, r#for, target_crate
+            );
             generate_adapter(&name, &r#for, &target_crate)?;
         }
         Commands::MakeService { name } => {
@@ -70,9 +77,9 @@ fn generate_port(name: &str, port_type: &str) -> Result<()> {
     let file_name = name.to_snake_case();
     let port_dir = "crates/pond-core/src/ports";
     fs::create_dir_all(port_dir)?;
-    
+
     let port_path = format!("{}/{}.rs", port_dir, file_name);
-    
+
     let content = format!(
         indoc! {r#"
             use anyhow::Result;
@@ -98,11 +105,14 @@ fn generate_port(name: &str, port_type: &str) -> Result<()> {
 
     fs::write(&port_path, content)?;
     println!("SUCCESS: Created port at {}", port_path);
-    
+
     // Suggest registration info
     println!("\nNext steps:");
-    println!("1. Add `pub mod {};` to crates/pond-core/src/ports/mod.rs", file_name);
-    
+    println!(
+        "1. Add `pub mod {};` to crates/pond-core/src/ports/mod.rs",
+        file_name
+    );
+
     Ok(())
 }
 
@@ -145,7 +155,7 @@ fn generate_adapter(name: &str, r#for: &str, target_crate: &str) -> Result<()> {
 
     fs::write(&adapter_path, content)?;
     println!("SUCCESS: Created adapter at {}", adapter_path);
-    
+
     Ok(())
 }
 
@@ -154,7 +164,7 @@ fn generate_service(name: &str) -> Result<()> {
     let file_name = name.to_snake_case();
     let service_dir = "crates/pond-core/src/services";
     fs::create_dir_all(service_dir)?;
-    
+
     let service_path = format!("{}/{}.rs", service_dir, file_name);
 
     let content = format!(
@@ -184,6 +194,6 @@ fn generate_service(name: &str) -> Result<()> {
 
     fs::write(&service_path, content)?;
     println!("SUCCESS: Created service at {}", service_path);
-    
+
     Ok(())
 }

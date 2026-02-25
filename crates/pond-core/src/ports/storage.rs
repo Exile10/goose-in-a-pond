@@ -7,7 +7,7 @@ pub enum StorageError {
 }
 
 /// Driven Port: Storage
-/// 
+///
 /// This trait defines the interface for Storage.
 pub trait Storage: Send + Sync {
     // Define your methods here
