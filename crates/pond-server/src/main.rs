@@ -1,43 +1,186 @@
-use pond_adapters_goose::GooseAdapter;
-use pond_core::services::chat::ChatService;
+//! Goose In A Pond — Server Entry Point
+//!
+//! Usage:
+//!   pond-server serve [--port PORT] [--open]
+//!   pond-server chat  [--provider mock|ollama]
+//!   pond-server status
+//!
+//! # TODO — Setup Script
+//! - [ ] Create a setup script (`scripts/setup.sh`) that:
+//!   1. Detects whether the device is dedicated (sole GIAP) or shared
+//!   2. If dedicated: configures `http://pond.local/{route}` (port 80)
+//!   3. If shared:    configures `http://pond.<HOSTNAME>.local:<PORT>/{route}`
+//!   4. Preferred port order: 80 → 8080 → 4000 → 5000
+//!   5. Sets up mDNS/Avahi for `.local` hostname resolution
+//!   6. Creates systemd service for auto-start on boot
+//!   7. Initializes databases at a configurable data directory
+//!   8. Prompts for initial onboarding if not yet done
+//!
+//! # TODO — CLI commands
+//! - [ ] `serve`  — Start HTTP server + REST API + web dashboard
+//! - [ ] `chat`   — Interactive CLI chat (Wait→Listen→Think→Speak loop)
+//! - [ ] `status` — Show system info (hostname, port, DB status, onboarding state)
+//! - [ ] `onboard` — Start onboarding wizard in terminal
+//! - [ ] `debug`  — Show debug info, tail logs
+//! - [ ] Open browser automatically if host has a display (headful mode)
+
 use anyhow::Result;
+use clap::{Parser, Subcommand};
+use pond_api::AppState;
+use pond_core::services::chat::ChatService;
+use pond_core::services::mock_agent::MockAgent;
+use pond_infra::db::Database;
 use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "pond")]
+#[command(about = "🦆 Goose In A Pond — Local AI Home Assistant")]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the HTTP server (REST API + web dashboard)
+    Serve {
+        /// Port to listen on (default: 4000)
+        #[arg(short, long, default_value = "4000")]
+        port: u16,
+
+        /// Open the dashboard in the browser
+        #[arg(long)]
+        open: bool,
+
+        /// Enable debug logging
+        #[arg(long)]
+        debug: bool,
+    },
+
+    /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
+    Chat {
+        /// LLM provider: mock or ollama
+        #[arg(short = 'P', long, default_value = "mock")]
+        provider: String,
+    },
+
+    /// Show system status
+    Status,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
 
-    // 1. Setup Infrastructure / Adapters
-    // For now, we'll try to use the environment to configure an OpenAI provider if available,
-    // otherwise we might need a fallback. To keep it simple for the example, we'll assume
-    // some provider is available or we'd use a mock.
-    
-    // Hardcoded for demonstration: Try to create a provider.
-    // In a real app, this would come from config.
-    let provider = match std::env::var("OPENAI_API_KEY") {
-        Ok(_) => Arc::new(goose::providers::openai::OpenAiProvider::default()),
-        Err(_) => {
-            println!("OPENAI_API_KEY not found. Running with a Mock Provider for demonstration.");
-            // We'd use a MockProvider here.
-            // For now, let's just use the OpenAI one and expect it might fail if key is missing during actual use.
-            Arc::new(goose::providers::openai::OpenAiProvider::default())
+    match cli.command {
+        Some(Commands::Serve { port, open, debug }) => {
+            init_tracing(debug);
+            run_server(port, open).await
         }
+        Some(Commands::Chat { provider }) => {
+            init_tracing(false);
+            run_chat(&provider).await
+        }
+        Some(Commands::Status) => {
+            run_status().await
+        }
+        None => {
+            // Default: run interactive chat (backward compat)
+            init_tracing(false);
+            run_chat("mock").await
+        }
+    }
+}
+
+fn init_tracing(debug: bool) {
+    let level = if debug { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| level.into()),
+        )
+        .init();
+}
+
+async fn run_server(port: u16, open: bool) -> Result<()> {
+    println!("  ╔═══════════════════════════════════════╗");
+    println!("  ║   🦆  Goose In A Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
+    println!("  ╚═══════════════════════════════════════╝");
+
+    // Initialize databases
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+
+    // Build app state
+    let state = Arc::new(AppState {
+        db: Arc::new(db),
+    });
+
+    // Build router
+    let app = pond_api::build_router(state);
+
+    // Resolve hostname
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let display_url = if port == 80 {
+        format!("http://pond.{}.local", hostname)
+    } else {
+        format!("http://pond.{}.local:{}", hostname, port)
     };
 
-    let agent_adapter = Arc::new(GooseAdapter::new(provider).await?);
+    println!("  🌐 Listening on {}", bind_addr);
+    println!("  📡 Dashboard: {}", display_url);
+    println!("  📡 API:       {}/api/v1/health", display_url);
+    println!();
 
-    // 2. Setup Domain Services
-    let chat_service = ChatService::new(agent_adapter);
+    if open {
+        let url = format!("http://localhost:{}", port);
+        if webbrowser::open(&url).is_err() {
+            tracing::warn!("Could not open browser (headless mode?)");
+        }
+    }
 
-    // 3. Setup Application layer / API (e.g. Axum routes)
-    // This part will be expanded as we add the API layer.
-    
-    println!("Pond Server initialized.");
-    println!("Chat Service is ready to orchestrate AI interactions.");
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    axum::serve(listener, app).await?;
 
-    // Example call (interactive would be better, but this is a composition root demo)
-    // let response = chat_service.chat("Hello Pond!".to_string(), "session-123".to_string()).await?;
-    // println!("Agent response: {}", response);
+    Ok(())
+}
+
+async fn run_chat(provider: &str) -> Result<()> {
+    println!("  ╔═══════════════════════════════════════╗");
+    println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
+    println!("  ║   Wait → Listen → Think → Speak      ║");
+    println!("  ╚═══════════════════════════════════════╝");
+    println!("  Provider: {}", provider);
+
+    // TODO: match on provider to select MockAgent, OllamaProvider, etc.
+    let agent = Arc::new(MockAgent::new());
+    let chat_service = ChatService::new(agent, "default-session".to_string());
+    chat_service.run_loop().await?;
+
+    Ok(())
+}
+
+async fn run_status() -> Result<()> {
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    println!("  🦆 Goose In A Pond — Status");
+    println!("  ─────────────────────────────");
+    println!("  Version:   {}", env!("CARGO_PKG_VERSION"));
+    println!("  Hostname:  {}", hostname);
+    println!("  Platform:  {} / {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    // TODO: Check DB status, onboarding state, running services
+    println!("  Database:  TODO — check connection");
+    println!("  Onboarded: TODO — check onboarding state");
 
     Ok(())
 }
