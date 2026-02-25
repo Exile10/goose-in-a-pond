@@ -8,9 +8,12 @@ license.workspace = true
 [dependencies]
 pond-core = { workspace = true }
 pond-api = { workspace = true }
+pond-adapters-goose = { workspace = true }
+goose = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
