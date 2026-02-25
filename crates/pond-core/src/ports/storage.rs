@@ -1,4 +1,3 @@
-use anyhow::Result;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

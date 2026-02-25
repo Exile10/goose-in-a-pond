@@ -6580,7 +6580,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "goose",
+ "pond-core",
+ "rmcp 0.16.0",
+ "serde",
  "tokio",
 ]
 
@@ -6635,12 +6639,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
+ "goose",
+ "pond-adapters-goose",
  "pond-api",
  "pond-core",
  "serde",
  "tokio",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

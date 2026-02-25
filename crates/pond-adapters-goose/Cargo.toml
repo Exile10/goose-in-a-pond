@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+pond-core = { workspace = true }
 goose = { workspace = true }
+rmcp = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
