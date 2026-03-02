@@ -1,6 +1,8 @@
 use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 
+/// Enum steps in the onboarding flow
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnboardingStep {
     VerifyDevice,
@@ -21,6 +23,7 @@ impl OnboardingStep {
         }
     }
 
+    /// Check if onboarding is complete
     pub fn is_complete(&self) -> bool {
         matches!(self, Self::Completed)
     }
@@ -53,6 +56,7 @@ mod tests {
 
     #[test]
     fn test_step_progression_order() {
+        // Verify each step advances correctly
         assert_eq!(
             OnboardingStep::VerifyDevice.next(),
             OnboardingStep::CreateProfile
