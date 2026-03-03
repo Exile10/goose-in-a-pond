@@ -73,6 +73,12 @@ impl Database {
     async fn init_system_tables(pool: &Pool<Sqlite>) -> Result<()> {
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS onboarding_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                current_step TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS _schema_version (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))

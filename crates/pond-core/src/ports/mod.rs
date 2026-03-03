@@ -4,3 +4,4 @@ pub mod handshake;
 pub mod notification;
 pub mod provider;
 pub mod storage;
+pub mod onboarding;

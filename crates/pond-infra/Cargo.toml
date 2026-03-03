@@ -12,6 +12,7 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+async-trait = "0.1.89"
 
 [dev-dependencies]
 tempfile = { workspace = true }
