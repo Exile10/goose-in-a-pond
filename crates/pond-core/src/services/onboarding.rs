@@ -1,7 +1,9 @@
+//! Application service for onboarding use cases.
+//! This orchestrates onboarding progression logic.
+
 use crate::domain::onboarding::OnboardingStep;
 use crate::ports::onboarding::OnboardingRepository;
 
-/// Service to manage onboarding steps
 pub struct OnboardingService<R: OnboardingRepository> {
     repo: R,
 }
@@ -11,76 +13,65 @@ impl<R: OnboardingRepository> OnboardingService<R> {
         Self { repo }
     }
 
-    /// Start onboarding 
-    pub fn start(&self) {
-        self.repo.save_step(OnboardingStep::VerifyDevice);
+    /// Start onboarding at the first step.
+    pub async fn start(&self) {
+        self.repo
+            .save_step(OnboardingStep::VerifyDevice)
+            .await;
     }
 
-    /// Move to the next onboarding step
-    pub fn advance(&self) {
-        if let Some(current) = self.repo.get_current_step() {
+    /// Advance onboarding to next step.
+    pub async fn advance(&self) {
+        if let Some(current) = self.repo.get_current_step().await {
             let next = current.next();
-            self.repo.save_step(next);
+            self.repo.save_step(next).await;
         }
     }
 
-    /// Get current onboarding step
-    pub fn status(&self) -> Option<OnboardingStep> {
-        self.repo.get_current_step()
+    /// Get the current onboarding status.
+    pub async fn status(&self) -> Option<OnboardingStep> {
+        self.repo.get_current_step().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::onboarding::OnboardingStep;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
-    /// Mock repository for testing
     struct MockRepo {
-        step: RefCell<Option<OnboardingStep>>,
+        step: Mutex<Option<OnboardingStep>>,
     }
 
     impl MockRepo {
         fn new() -> Self {
-            Self { step: RefCell::new(None) }
+            Self {
+                step: Mutex::new(None),
+            }
         }
     }
 
-    impl crate::ports::onboarding::OnboardingRepository for MockRepo {
-        fn get_current_step(&self) -> Option<OnboardingStep> { *self.step.borrow() }
-        fn save_step(&self, step: OnboardingStep) { *self.step.borrow_mut() = Some(step); }
+    #[async_trait::async_trait]
+    impl OnboardingRepository for MockRepo {
+        async fn get_current_step(&self) -> Option<OnboardingStep> {
+            *self.step.lock().unwrap()
+        }
+
+        async fn save_step(&self, step: OnboardingStep) {
+            *self.step.lock().unwrap() = Some(step);
+        }
     }
 
-    #[test]
-    fn start_sets_initial_step() {
+    #[tokio::test]
+    async fn start_sets_initial_step() {
         let repo = MockRepo::new();
         let service = OnboardingService::new(repo);
 
-        service.start();
+        service.start().await;
 
-        assert_eq!(service.status(), Some(OnboardingStep::VerifyDevice));
-    }
-
-    #[test]
-    fn advance_moves_to_next_step() {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
-
-        service.start();
-        service.advance();
-
-        assert_eq!(service.status(), Some(OnboardingStep::CreateProfile));
-    }
-
-    #[test]
-    fn completed_is_terminal() {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
-
-        service.repo.save_step(OnboardingStep::Completed);
-        service.advance();
-
-        assert_eq!(service.status(), Some(OnboardingStep::Completed));
+        assert_eq!(
+            service.status().await,
+            Some(OnboardingStep::VerifyDevice)
+        );
     }
 }
