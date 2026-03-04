@@ -6663,6 +6663,7 @@ name = "pond-infra"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "pond-core",
  "serde",
  "sqlx",
@@ -6683,6 +6684,7 @@ dependencies = [
  "pond-api",
  "pond-core",
  "pond-infra",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
