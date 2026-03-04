@@ -9,5 +9,5 @@ pub trait OnboardingRepository: Send + Sync {
     async fn get_current_step(&self) -> Option<OnboardingStep>;
 
     /// Persist the current onboarding step.
-    async fn save_step(&self, step: OnboardingStep);
+    async fn save_step(&self, step: OnboardingStep) -> anyhow::Result<()>;
 }
