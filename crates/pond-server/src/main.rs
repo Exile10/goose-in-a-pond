@@ -24,7 +24,6 @@
 //! - [ ] `debug`  — Show debug info, tail logs
 //! - [ ] Open browser automatically if host has a display (headful mode)
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pond_api::AppState;
 use pond_core::services::chat::ChatService;
@@ -230,7 +229,7 @@ pub async fn run_onboard() -> Result<()> {
     let repo = SqlxOnboardingRepository::new(db.system.clone());
     let service = OnboardingService::new(repo);
 
-    // persist user_data once UserProfile domain + port exist
+    // TODO: persist user_data once UserProfile domain + port exist
     let mut user_data: HashMap<String, String> = HashMap::new();
 
     loop {
