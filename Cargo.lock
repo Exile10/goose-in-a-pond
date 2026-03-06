@@ -6684,7 +6684,6 @@ dependencies = [
  "pond-api",
  "pond-core",
  "pond-infra",
- "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
