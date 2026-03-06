@@ -30,8 +30,8 @@ impl<R: OnboardingRepository> OnboardingService<R> {
     }
 
     /// Get the current onboarding status.
-    pub async fn status(&self) -> Result<Option<OnboardingStep>> {
-        Ok(self.repo.get_current_step().await)
+    pub async fn status(&self) -> Option<OnboardingStep> {
+        self.repo.get_current_step().await
     }
 }
 
@@ -75,7 +75,7 @@ mod tests {
         let service = OnboardingService::new(repo);
 
         service.start().await?;
-        assert_eq!(service.status().await?, Some(OnboardingStep::VerifyDevice));
+        assert_eq!(service.status().await, Some(OnboardingStep::VerifyDevice));
         Ok(())
     }
 
@@ -86,7 +86,7 @@ mod tests {
 
         service.start().await?;
         service.advance().await?;
-        assert_eq!(service.status().await?, Some(OnboardingStep::CreateProfile));
+        assert_eq!(service.status().await, Some(OnboardingStep::CreateProfile));
         Ok(())
     }
 
@@ -101,7 +101,7 @@ mod tests {
         service.advance().await?;
         service.advance().await?;
 
-        assert_eq!(service.status().await?, Some(OnboardingStep::Completed));
+        assert_eq!(service.status().await, Some(OnboardingStep::Completed));
         Ok(())
     }
 
@@ -111,7 +111,7 @@ mod tests {
         let service = OnboardingService::new(repo);
 
         service.advance().await?;
-        assert_eq!(service.status().await?, None);
+        assert_eq!(service.status().await, None);
         Ok(())
     }
 }

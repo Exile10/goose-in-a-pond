@@ -31,6 +31,12 @@ use pond_core::services::chat::ChatService;
 use pond_core::services::mock_agent::MockAgent;
 use pond_infra::db::Database;
 use std::sync::Arc;
+use pond_core::services::onboarding::OnboardingService;
+use pond_core::domain::onboarding::OnboardingStep;
+use pond_infra::onboarding::SqlxOnboardingRepository;
+use std::io::{self, Write};
+use std::collections::HashMap;
+use std::net::UdpSocket;
 
 #[derive(Parser)]
 #[command(name = "pond")]
@@ -68,7 +74,7 @@ enum Commands {
     /// Show system status
     Status,
 
-    /// Run interactive onboarding wizard
+    /// Run onboarding
     Onboard,
 }
 
@@ -88,12 +94,7 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             run_status().await
         }
-        Some(Commands::Onboard) => {
-            if let Err(err) = run_onboard().await {
-                eprintln!("Error: {:?}", err);
-            }
-            Ok(())
-        }
+        Some(Commands::Onboard) => run_onboard().await,
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
@@ -194,37 +195,30 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
-use pond_core::services::onboarding::OnboardingService;
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_infra::onboarding::SqlxOnboardingRepository;
-use std::io::{self, Write};
-use std::collections::HashMap;
-use std::net::UdpSocket;
-
-fn get_local_ip() -> Option<String> {
+pub (crate) fn get_local_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
+    socket.connect("192.168.1.1:80").ok()?;
     let local_addr = socket.local_addr().ok()?;
     Some(local_addr.ip().to_string())
 }
 
-fn prompt_nonempty(prompt: &str) -> String {
+pub (crate) fn prompt_nonempty(prompt: &str) -> Result<String> {
     loop {
         print!("{}", prompt);
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        io::stdin().read_line(&mut input)?;
 
         let trimmed = input.trim();
+
         if !trimmed.is_empty() {
-            return trimmed.to_string();
-        } else {
-            println!("Input cannot be empty. Try again.");
+            return Ok(trimmed.to_string());
         }
+
+        println!("Input cannot be empty. Try again.");
     }
 }
-
 pub async fn run_onboard() -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
@@ -233,16 +227,14 @@ pub async fn run_onboard() -> Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
-    // Clear onboarding_state for testing
-    sqlx::query("DELETE FROM onboarding_state").execute(&db.system).await?;
-
     let repo = SqlxOnboardingRepository::new(db.system.clone());
     let service = OnboardingService::new(repo);
 
+    // persist user_data once UserProfile domain + port exist
     let mut user_data: HashMap<String, String> = HashMap::new();
 
     loop {
-        let current_step = service.status().await?;
+        let current_step = service.status().await;
 
         match current_step {
             None => {
@@ -267,7 +259,7 @@ pub async fn run_onboard() -> Result<()> {
             Some(OnboardingStep::CreateProfile) => {
                 println!("Step: Create Profile");
 
-                let username = prompt_nonempty("Enter your username: ");
+                let username = prompt_nonempty("Enter your username: ")?;
                 user_data.insert("username".to_string(), username);
 
                 service.advance().await?;
@@ -290,7 +282,7 @@ pub async fn run_onboard() -> Result<()> {
                 }
 
                 let selected = loop {
-                    let choice = prompt_nonempty("Enter the number of your choice: ");
+                    let choice = prompt_nonempty("Enter the number of your choice: ")?;
                     if let Ok(index) = choice.parse::<usize>() {
                         if index >= 1 && index <= personalities.len() {
                             break personalities[index - 1].to_string();
