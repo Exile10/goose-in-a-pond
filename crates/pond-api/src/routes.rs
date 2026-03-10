@@ -11,32 +11,43 @@ use axum::{
     response::Json,
     routing::{get, post},
     Router,
+    middleware,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::middleware ::onboarding_guard::require_onboarding_complete;
+
 
 // ───────────────────────── REST API Routes ─────────────────────────
+// ───────────────────────── REST API Routes ─────────────────────────
 
-pub fn api_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        // Health
+/// Builds the full REST API router with onboarding-aware middleware
+pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    // ───────────── Public routes (accessible before onboarding) ─────────────
+    let public_routes = Router::new()
         .route("/health", get(health))
-        // Onboarding
         .route("/handshake", post(handshake))
         .route("/onboard", post(start_onboarding))
         .route("/onboard/status", get(onboarding_status))
-        // Chat
-        .route("/chat", post(chat))
-        // System
-        .route("/system/info", get(system_info))
-        // Devices
-        .route("/devices", get(list_devices).post(register_device))
-        // Settings
-        .route("/settings", get(get_settings).put(update_settings))
-}
+        .route("/system/info", get(system_info));
 
+    // ───────────── Protected routes (require onboarding) ─────────────
+    let protected_routes = Router::new()
+        .route("/chat", post(chat))
+        .route("/devices", get(list_devices).post(register_device))
+        .route("/settings", get(get_settings).put(update_settings))
+        .layer(
+            // Apply middleware to ensure onboarding is complete
+            middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
+        );
+
+    // Merge public and protected routes, attach shared state
+    public_routes
+        .merge(protected_routes)
+        .with_state(state)
+}
 // ───────────────────────── Web Dashboard Routes ─────────────────────
 
 pub fn web_routes() -> Router<Arc<AppState>> {

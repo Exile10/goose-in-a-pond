@@ -6620,15 +6620,16 @@ name = "pond-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.8",
  "hostname",
  "pond-core",
  "pond-infra",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
- "tower-http",
- "tracing",
+ "tower",
 ]
 
 [[package]]

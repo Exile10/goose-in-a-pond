@@ -35,15 +35,18 @@
 //! - [ ] Serve the web dashboard at `/{route_name}`
 
 pub mod routes;
+pub mod middleware;
 
 use axum::Router;
 use pond_infra::db::Database;
 use std::sync::Arc;
+use pond_core::ports::onboarding::OnboardingRepository;
 
 /// Shared application state available to all route handlers.
 pub struct AppState {
     pub db: Arc<Database>,
     // TODO: Add LlmProvider, ChatService, etc.
+    pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
 }
 
 /// Build the full API router.
@@ -52,7 +55,7 @@ pub struct AppState {
 /// REST API:      `/api/v1/{route_name}`
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .nest("/api/v1", routes::api_routes())
-        .nest("/", routes::web_routes())
+        .nest("/api/v1", routes::api_routes(state.clone()))
+        .merge(routes::web_routes())
         .with_state(state)
 }
