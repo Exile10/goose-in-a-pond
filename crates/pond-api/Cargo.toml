@@ -14,5 +14,6 @@ hostname = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tower-http = { workspace = true }
-tracing = { workspace = true }
+tempfile = {workspace = true}
+async-trait = {workspace = true}
+tower = "0.5.3"

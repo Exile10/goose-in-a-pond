@@ -114,4 +114,29 @@ mod tests {
         assert_eq!(service.status().await, None);
         Ok(())
     }
+    #[tokio::test]
+    async fn status_is_not_complete_mid_flow() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+
+        service.start().await?;
+
+        // Guard does: matches!(status, Some(Completed)) — this should be false
+        assert_ne!(service.status().await, Some(OnboardingStep::Completed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_is_complete_after_all_steps() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+
+        service.start().await?;
+        service.advance().await?;
+        service.advance().await?;
+        service.advance().await?;
+        service.advance().await?;
+
+        // This is the exact check the middleware performs
+        assert_eq!(service.status().await, Some(OnboardingStep::Completed));
+        Ok(())
+    }
 }

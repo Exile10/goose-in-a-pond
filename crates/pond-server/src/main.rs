@@ -24,6 +24,7 @@
 //! - [ ] `debug`  — Show debug info, tail logs
 //! - [ ] Open browser automatically if host has a display (headful mode)
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pond_api::AppState;
 use pond_core::services::chat::ChatService;
@@ -124,8 +125,10 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
     let db = Database::init(&data_dir).await?;
 
     // Build app state
+    let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
     let state = Arc::new(AppState {
         db: Arc::new(db),
+        onboarding_repo,
     });
 
     // Build router
@@ -194,14 +197,14 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
-pub (crate) fn get_local_ip() -> Option<String> {
+fn get_local_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.168.1.1:80").ok()?;
     let local_addr = socket.local_addr().ok()?;
     Some(local_addr.ip().to_string())
 }
 
-pub (crate) fn prompt_nonempty(prompt: &str) -> Result<String> {
+fn prompt_nonempty(prompt: &str) -> Result<String> {
     loop {
         print!("{}", prompt);
         io::stdout().flush()?;
@@ -228,7 +231,6 @@ pub async fn run_onboard() -> Result<()> {
     let db = Database::init(&data_dir).await?;
     let repo = SqlxOnboardingRepository::new(db.system.clone());
     let service = OnboardingService::new(repo);
-
     // TODO: persist user_data once UserProfile domain + port exist
     let mut user_data: HashMap<String, String> = HashMap::new();
 
