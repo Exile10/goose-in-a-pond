@@ -6651,11 +6651,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6663,6 +6665,8 @@ name = "pond-infra"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "hostname",
  "pond-core",
  "serde",
  "sqlx",
