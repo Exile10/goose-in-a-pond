@@ -21,6 +21,7 @@
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-cli/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-server/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-test/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-gotg/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
