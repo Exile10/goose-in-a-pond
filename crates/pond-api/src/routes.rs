@@ -1,10 +1,9 @@
-//! Route definitions for GIAP REST API and web dashboard.
+//! Route definitions for GIAP REST API.
 //!
 //! # TODO
 //! - [ ] Implement each handler with real logic
 //! - [ ] Add authentication/handshake middleware
 //! - [ ] Add request/response types in pond-core domain
-//! - [ ] Serve static web dashboard files
 
 use axum::{
     extract::State,
@@ -35,15 +34,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/devices", get(list_devices).post(register_device))
         // Settings
         .route("/settings", get(get_settings).put(update_settings))
-}
-
-// ───────────────────────── Web Dashboard Routes ─────────────────────
-
-pub fn web_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/", get(dashboard_index))
-        // TODO: Serve static files for the web dashboard
-        // .nest_service("/assets", ServeDir::new("static"))
 }
 
 // ───────────────────────── Handlers ─────────────────────────────────
@@ -129,17 +119,3 @@ async fn update_settings(State(_state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "status": "todo" }))
 }
 
-async fn dashboard_index() -> axum::response::Html<&'static str> {
-    // TODO: Replace with a real web dashboard (SPA or server-rendered)
-    axum::response::Html(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Goose In A Pond</title></head>
-<body>
-  <h1>🦆 Goose In A Pond</h1>
-  <p>Dashboard coming soon.</p>
-  <p><a href="/api/v1/health">API Health Check</a></p>
-</body>
-</html>"#,
-    )
-}

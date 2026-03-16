@@ -38,7 +38,9 @@ pub mod routes;
 
 use axum::Router;
 use pond_infra::db::Database;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tower_http::services::{ServeDir, ServeFile};
 
 /// Shared application state available to all route handlers.
 pub struct AppState {
@@ -48,11 +50,15 @@ pub struct AppState {
 
 /// Build the full API router.
 ///
-/// Web dashboard: `/{route_name}`
 /// REST API:      `/api/v1/{route_name}`
-pub fn build_router(state: Arc<AppState>) -> Router {
+/// Web dashboard: everything else → served from `static_dir`
+///                Unknown paths fall back to `index.html` for SPA routing.
+pub fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
+    let spa = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(static_dir.join("index.html")));
+
     Router::new()
         .nest("/api/v1", routes::api_routes())
-        .nest("/", routes::web_routes())
         .with_state(state)
+        .fallback_service(spa)
 }
