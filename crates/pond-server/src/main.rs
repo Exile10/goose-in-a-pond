@@ -49,6 +49,10 @@ enum Commands {
         #[arg(short, long, default_value = "4000")]
         port: u16,
 
+        /// Path to the built web dashboard (default: web/dist)
+        #[arg(long, default_value = "web/dist")]
+        static_dir: std::path::PathBuf,
+
         /// Open the dashboard in the browser
         #[arg(long)]
         open: bool,
@@ -74,9 +78,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Serve { port, open, debug }) => {
+        Some(Commands::Serve { port, static_dir, open, debug }) => {
             init_tracing(debug);
-            run_server(port, open).await
+            run_server(port, static_dir, open).await
         }
         Some(Commands::Chat { provider }) => {
             init_tracing(false);
@@ -103,7 +107,7 @@ fn init_tracing(debug: bool) {
         .init();
 }
 
-async fn run_server(port: u16, open: bool) -> Result<()> {
+async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -114,13 +118,22 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
 
+    // Warn if the static dir doesn't exist yet (run `npm run build` in web/)
+    if !static_dir.exists() {
+        tracing::warn!(
+            "Static dir {:?} not found — web dashboard will not be served. \
+             Run `cd web && npm run build` to build it.",
+            static_dir
+        );
+    }
+
     // Build app state
     let state = Arc::new(AppState {
         db: Arc::new(db),
     });
 
     // Build router
-    let app = pond_api::build_router(state);
+    let app = pond_api::build_router(state, static_dir);
 
     // Resolve hostname
     let hostname = hostname::get()
