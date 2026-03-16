@@ -1,43 +1,40 @@
 //! Route definitions for GIAP REST API and web dashboard.
 //!
-//! # Authentication
-//! Protected routes require a bearer token. Call POST /api/v1/handshake first to get a token.
-//!
 //! # TODO
 //! - [ ] Implement each handler with real logic
+//! - [ ] Add authentication/handshake middleware
 //! - [ ] Add request/response types in pond-core domain
 //! - [ ] Serve static web dashboard files
 
 use axum::{
-    extract::{rejection::JsonRejection, State},
-    http::HeaderMap,
+    extract::State,
     response::Json,
     routing::{get, post},
     Router,
 };
-use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use serde_json::{json, Value};
 use std::sync::Arc;
-
-use crate::{middleware, AppState};
+use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::services::onboarding::OnboardingService;
+use crate::AppState;
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
 pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Health (public)
+        // Health
         .route("/health", get(health))
-        // Onboarding (public)
-        .route("/handshake", post(handshake_handler))
+        // Onboarding
+        .route("/handshake", post(handshake))
         .route("/onboard", post(start_onboarding))
         .route("/onboard/status", get(onboarding_status))
-        // Chat (protected)
+        // Chat
         .route("/chat", post(chat))
-        // System (protected)
+        // System
         .route("/system/info", get(system_info))
-        // Devices (protected)
+        // Devices
         .route("/devices", get(list_devices).post(register_device))
-        // Settings (protected)
+        // Settings
         .route("/settings", get(get_settings).put(update_settings))
 }
 
@@ -50,196 +47,110 @@ pub fn web_routes() -> Router<Arc<AppState>> {
         // .nest_service("/assets", ServeDir::new("static"))
 }
 
-// ───────────────────────── Helper Functions ─────────────────────────
-
-/// Validate a token and return 401 if invalid
-async fn validate_token(
-    headers: &HeaderMap,
-    state: &Arc<AppState>,
-) -> Result<String, (axum::http::StatusCode, Json<Value>)> {
-    let token = middleware::extract_bearer_token(headers).map_err(|e| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": format!("{:?}", e),
-                "status": 401
-            })),
-        )
-    })?;
-
-    let is_valid = state
-        .handshake
-        .validate_token(&token)
-        .await
-        .map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Token validation failed: {}", e),
-                    "status": 500
-                })),
-            )
-        })?;
-
-    if !is_valid {
-        return Err((
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "Invalid or expired token",
-                "status": 401
-            })),
-        ));
-    }
-
-    Ok(token)
-}
-
 // ───────────────────────── Handlers ─────────────────────────────────
 
-/// Health check endpoint (public)
 async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// TODO: Implement GIAP ↔ GOTG handshake protocol
+/// The handshake should:
+/// 1. Verify the GOTG client identity
+/// 2. Exchange a session token
+/// 3. Return connection details (hostname, port, capabilities)
+async fn handshake() -> Json<Value> {
+    // TODO: Implement handshake logic
     Json(json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
+        "status": "todo",
+        "message": "Handshake not yet implemented. See TODO in routes.rs"
     }))
 }
 
-/// Handshake endpoint to get authentication token (public)
-async fn handshake_handler(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<HandshakeRequest>, JsonRejection>,
-) -> Result<Json<HandshakeResponse>, (axum::http::StatusCode, Json<Value>)> {
-    let Json(request) = body.map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
+async fn start_onboarding(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    match service.status().await {
+        Some(OnboardingStep::Completed) => Json(json!({
+            "status": "already_complete",
+            "message": "Onboarding has already been completed"
+        })),
+        Some(step) => Json(json!({
+            "status": "in_progress",
+            "message": "Onboarding already started",
+            "current_step": step.to_string()
+        })),
+        None => {
+            service.start().await;
             Json(json!({
-                "error": format!("Invalid request: {}", e),
-                "status": 400
-            })),
-        )
-    })?;
-
-    let response = state
-        .handshake
-        .handshake(request)
-        .await
-        .map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Handshake failed: {}", e),
-                    "status": 500
-                })),
-            )
-        })?;
-
-    Ok(Json(response))
+                "status": "started",
+                "current_step": OnboardingStep::VerifyDevice.to_string()
+            }))
+        }
+    }
 }
 
-/// Start onboarding flow (public)
-async fn start_onboarding() -> Json<Value> {
-    // TODO: Implement onboarding flow
+async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    let total_steps = 4;
+    let (current_step, steps_completed, onboarded) = match service.status().await {
+        None                                      => ("not_started".to_string(),                         0, false),
+        Some(OnboardingStep::VerifyDevice)        => (OnboardingStep::VerifyDevice.to_string(),        1, false),
+        Some(OnboardingStep::CreateProfile)       => (OnboardingStep::CreateProfile.to_string(),       2, false),
+        Some(OnboardingStep::ConfigurePersonality)=> (OnboardingStep::ConfigurePersonality.to_string(),3, false),
+        Some(OnboardingStep::ConnectDevices)      => (OnboardingStep::ConnectDevices.to_string(),      4, false),
+        Some(OnboardingStep::Completed)           => ("Completed".to_string(),                         4, true),
+    };
+
     Json(json!({
-        "status": "todo",
-        "message": "Onboarding not yet implemented"
+        "onboarded": onboarded,
+        "current_step": current_step,
+        "steps_completed": steps_completed,
+        "total_steps": total_steps
     }))
 }
 
-/// Get onboarding status (public)
-async fn onboarding_status() -> Json<Value> {
-    // TODO: Return onboarding progress
+/// TODO: Wire to ChatService + LlmProvider
+async fn chat() -> Json<Value> {
     Json(json!({
-        "status": "todo",
-        "onboarded": false,
-        "steps_completed": 0,
-        "total_steps": 4
-    }))
-}
-
-/// Send a message to the chat (protected)
-async fn chat(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
-    // TODO: Wire to ChatService + LlmProvider
-    Ok(Json(json!({
         "status": "todo",
         "message": "Chat endpoint not yet wired to ChatService"
-    })))
+    }))
 }
 
-/// Get system information (protected)
-async fn system_info(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
+async fn system_info() -> Json<Value> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    Ok(Json(json!({
+    Json(json!({
         "hostname": hostname,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
-    })))
+    }))
 }
 
-/// List registered devices (protected)
-async fn list_devices(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
+async fn list_devices(State(_state): State<Arc<AppState>>) -> Json<Value> {
     // TODO: Query system DB for registered devices
-    Ok(Json(json!({ "devices": [] })))
+    Json(json!({ "devices": [] }))
 }
 
-/// Register a new device (protected)
-async fn register_device(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
+async fn register_device(State(_state): State<Arc<AppState>>) -> Json<Value> {
     // TODO: Insert device into system DB
-    Ok(Json(json!({ "status": "todo" })))
+    Json(json!({ "status": "todo" }))
 }
 
-/// Get current settings (protected)
-async fn get_settings(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
+async fn get_settings(State(_state): State<Arc<AppState>>) -> Json<Value> {
     // TODO: Query system DB for settings
-    Ok(Json(json!({ "settings": {} })))
+    Json(json!({ "settings": {} }))
 }
 
-/// Update settings (protected)
-async fn update_settings(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    // Validate token
-    let _token = validate_token(&headers, &state).await?;
-
+async fn update_settings(State(_state): State<Arc<AppState>>) -> Json<Value> {
     // TODO: Update settings in system DB
-    Ok(Json(json!({ "status": "todo" })))
+    Json(json!({ "status": "todo" }))
 }
 
-/// Web dashboard index
 async fn dashboard_index() -> axum::response::Html<&'static str> {
     // TODO: Replace with a real web dashboard (SPA or server-rendered)
     axum::response::Html(
