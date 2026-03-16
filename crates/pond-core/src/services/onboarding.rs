@@ -69,9 +69,52 @@ mod tests {
 
         service.start().await;
 
-        assert_eq!(
-            service.status().await,
-            Some(OnboardingStep::VerifyDevice)
-        );
+        assert_eq!(service.status().await, Some(OnboardingStep::VerifyDevice));
+    }
+
+    #[tokio::test]
+    async fn status_is_none_before_start() {
+        let service = OnboardingService::new(MockRepo::new());
+        assert_eq!(service.status().await, None);
+    }
+
+    #[tokio::test]
+    async fn advance_does_nothing_before_start() {
+        let service = OnboardingService::new(MockRepo::new());
+        service.advance().await;
+        assert_eq!(service.status().await, None);
+    }
+
+    #[tokio::test]
+    async fn advance_moves_to_next_step() {
+        let service = OnboardingService::new(MockRepo::new());
+        service.start().await;
+        service.advance().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::CreateProfile));
+    }
+
+    #[tokio::test]
+    async fn advance_through_all_steps() {
+        let service = OnboardingService::new(MockRepo::new());
+        service.start().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::VerifyDevice));
+        service.advance().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::CreateProfile));
+        service.advance().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::ConfigurePersonality));
+        service.advance().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::ConnectDevices));
+        service.advance().await;
+        assert_eq!(service.status().await, Some(OnboardingStep::Completed));
+    }
+
+    #[tokio::test]
+    async fn advance_stays_at_completed() {
+        let service = OnboardingService::new(MockRepo::new());
+        service.start().await;
+        for _ in 0..10 {
+            service.advance().await;
+        }
+        assert_eq!(service.status().await, Some(OnboardingStep::Completed));
     }
 }

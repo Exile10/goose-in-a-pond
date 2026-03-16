@@ -41,6 +41,7 @@ pub mod routes;
 
 use axum::{middleware::Next, Router};
 use pond_core::ports::handshake::Handshake;
+use pond_core::ports::onboarding::OnboardingRepository;
 use pond_infra::db::Database;
 use std::sync::Arc;
 
@@ -48,6 +49,7 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Arc<Database>,
     pub handshake: Arc<dyn Handshake>,
+    pub onboarding_repo: Arc<dyn OnboardingRepository>,
     // TODO: Add LlmProvider, ChatService, etc.
 }
 
