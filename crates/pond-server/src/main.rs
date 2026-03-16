@@ -29,7 +29,10 @@ use clap::{Parser, Subcommand};
 use pond_api::AppState;
 use pond_core::services::chat::ChatService;
 use pond_core::services::mock_agent::MockAgent;
+use pond_core::ports::session_storage::SessionStorage;
+use pond_core::services::mock_session::InMemorySessionStorage;
 use pond_infra::db::Database;
+use pond_infra::mock_handshake::MockHandshake;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -117,6 +120,7 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
     // Build app state
     let state = Arc::new(AppState {
         db: Arc::new(db),
+        handshake: Arc::new(MockHandshake::new()),
     });
 
     // Build router
@@ -161,7 +165,9 @@ async fn run_chat(provider: &str) -> Result<()> {
 
     // TODO: match on provider to select MockAgent, OllamaProvider, etc.
     let agent = Arc::new(MockAgent::new());
-    let chat_service = ChatService::new(agent, "default-session".to_string());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    storage.create_session("default-session".to_string()).await?;
+    let chat_service = ChatService::new(agent, "default-session".to_string(), storage);
     chat_service.run_loop().await?;
 
     Ok(())
