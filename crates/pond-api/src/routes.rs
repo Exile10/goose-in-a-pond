@@ -113,7 +113,6 @@ async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-
 /// TODO: Wire to ChatService + LlmProvider
 async fn chat() -> Json<Value> {
     Json(json!({
