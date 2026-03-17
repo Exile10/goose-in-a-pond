@@ -233,6 +233,45 @@ fn prompt_nonempty(prompt: &str) -> String {
     }
 }
 
+async fn run_main_menu() -> Result<()> {
+    loop {
+        println!("\n🦆 Goose In A Pond — Main Menu");
+        println!("─────────────────────────────");
+        println!("  1) Chat        — Interactive AI chat");
+        println!("  2) Serve       — Start the HTTP server + API");
+        println!("  3) Status      — Show system info");
+        println!("  4) Exit");
+        println!();
+
+        let choice = prompt_nonempty("Choose an option: ");
+
+        match choice.trim() {
+            "1" => {
+                run_chat("mock").await?;
+            }
+            "2" => {
+                println!("Enter port (default 4000): ");
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let port: u16 = input.trim().parse().unwrap_or(4000);
+                run_server(port, false).await?;
+            }
+            "3" => {
+                run_status().await?;
+            }
+            "4" => {
+                println!("Goodbye!");
+                break;
+            }
+            _ => {
+                println!("Invalid option. Try again.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_onboard(reset: bool) -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
@@ -304,13 +343,13 @@ async fn run_onboard(reset: bool) -> Result<()> {
             Some(OnboardingStep::Completed) => {
                 if user_data.is_empty() {
                     println!("You are already onboarded!");
-                    println!("Run with --reset to start over.");
                 } else {
                     println!("\nOnboarding complete! Here's your info:\n");
                     for (key, value) in &user_data {
                         println!("  {}: {}", key, value);
                     }
                 }
+                run_main_menu().await?;
                 break;
             }
         }
