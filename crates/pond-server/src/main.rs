@@ -71,6 +71,13 @@ enum Commands {
 
     /// Show system status
     Status,
+
+    /// Run interactive onboarding wizard
+    Onboard {
+        /// Reset and restart onboarding from scratch
+        #[arg(long)]
+        reset: bool,
+    },
 }
 
 #[tokio::main]
@@ -88,6 +95,12 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Status) => {
             run_status().await
+        }
+        Some(Commands::Onboard { reset }) => {
+            if let Err(err) = run_onboard(reset).await {
+                eprintln!("Error: {:?}", err);
+            }
+            Ok(())
         }
         None => {
             // Default: run interactive chat (backward compat)
@@ -190,6 +203,118 @@ async fn run_status() -> Result<()> {
     // TODO: Check DB status, onboarding state, running services
     println!("  Database:  TODO — check connection");
     println!("  Onboarded: TODO — check onboarding state");
+
+    Ok(())
+}
+
+use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::services::onboarding::OnboardingService;
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::net::UdpSocket;
+
+fn get_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn prompt_nonempty(prompt: &str) -> String {
+    loop {
+        print!("{}", prompt);
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let trimmed = input.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+        println!("Input cannot be empty. Try again.");
+    }
+}
+
+async fn run_onboard(reset: bool) -> Result<()> {
+    println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+
+    if reset {
+        sqlx::query("DELETE FROM onboarding_state").execute(&db.system).await?;
+        println!("Onboarding reset. Starting from scratch...\n");
+    }
+
+    let repo = SqlxOnboardingRepository::new(db.system.clone());
+    let service = OnboardingService::new(repo);
+
+    let mut user_data: HashMap<String, String> = HashMap::new();
+
+    loop {
+        match service.status().await {
+            None => {
+                println!("Starting onboarding from scratch...");
+                service.start().await;
+            }
+
+            Some(OnboardingStep::VerifyDevice) => {
+                println!("\nStep 1/4: Verify Device");
+                let ip = get_local_ip().unwrap_or_else(|| "unknown".to_string());
+                println!("Detected device IP: {}", ip);
+                user_data.insert("device_ip".to_string(), ip);
+                service.advance().await;
+            }
+
+            Some(OnboardingStep::CreateProfile) => {
+                println!("\nStep 2/4: Create Profile");
+                let username = prompt_nonempty("Enter your username: ");
+                user_data.insert("username".to_string(), username);
+                service.advance().await;
+            }
+
+            Some(OnboardingStep::ConfigurePersonality) => {
+                println!("\nStep 3/4: Configure Personality");
+                let personalities = ["Friendly", "Professional", "Casual", "Funny", "Stoic"];
+                for (i, p) in personalities.iter().enumerate() {
+                    println!("  {}) {}", i + 1, p);
+                }
+                let selected = loop {
+                    let choice = prompt_nonempty("Enter the number of your choice: ");
+                    if let Ok(i) = choice.parse::<usize>() {
+                        if i >= 1 && i <= personalities.len() {
+                            break personalities[i - 1].to_string();
+                        }
+                    }
+                    println!("Invalid choice. Try again.");
+                };
+                println!("You selected: {}", selected);
+                user_data.insert("personality".to_string(), selected);
+                service.advance().await;
+            }
+
+            Some(OnboardingStep::ConnectDevices) => {
+                println!("\nStep 4/4: Connect Devices");
+                println!("Device connection feature will be added soon.");
+                println!("Press ENTER to skip...");
+                let _ = io::stdin().read_line(&mut String::new())?;
+                service.advance().await;
+            }
+
+            Some(OnboardingStep::Completed) => {
+                if user_data.is_empty() {
+                    println!("You are already onboarded!");
+                    println!("Run with --reset to start over.");
+                } else {
+                    println!("\nOnboarding complete! Here's your info:\n");
+                    for (key, value) in &user_data {
+                        println!("  {}: {}", key, value);
+                    }
+                }
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
