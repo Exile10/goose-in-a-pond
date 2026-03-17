@@ -377,7 +377,6 @@ async fn run_main_menu() -> Result<()> {
 
     Ok(())
 }
-
 async fn run_onboard(reset: bool) -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
@@ -449,6 +448,7 @@ async fn run_onboard(reset: bool) -> Result<()> {
             Some(OnboardingStep::Completed) => {
                 if user_data.is_empty() {
                     println!("You are already onboarded!");
+                    println!("Run with --reset to start over.");
                 } else {
                     println!("\nOnboarding complete! Here's your info:\n");
                     for (key, value) in &user_data {
