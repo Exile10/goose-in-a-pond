@@ -66,7 +66,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .nest("/api/v1", routes::api_routes())
-        .nest("/", routes::web_routes())
+        .merge(routes::web_routes())
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();

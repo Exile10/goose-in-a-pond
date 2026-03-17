@@ -17,4 +17,5 @@ hostname = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+sqlx = { workspace = true }
 webbrowser = { workspace = true }
