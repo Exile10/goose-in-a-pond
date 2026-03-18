@@ -50,6 +50,8 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub handshake: Arc<dyn Handshake>,
     pub onboarding_repo: Arc<dyn OnboardingRepository>,
+    /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
+    pub whisper_url: String,
     // TODO: Add LlmProvider, ChatService, etc.
 }
 
