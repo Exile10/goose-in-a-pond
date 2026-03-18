@@ -27,7 +27,7 @@
 //!
 //! # Authentication
 //! Protected routes require a bearer token in the Authorization header:
-//! ```
+//! ```text
 //! Authorization: Bearer <token>
 //! ```
 //!
