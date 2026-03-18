@@ -21,7 +21,6 @@ use crate::middleware ::onboarding_guard::require_onboarding_complete;
 
 
 // ───────────────────────── REST API Routes ─────────────────────────
-// ───────────────────────── REST API Routes ─────────────────────────
 
 /// Builds the full REST API router with onboarding-aware middleware
 pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
