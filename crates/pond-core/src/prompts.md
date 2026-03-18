@@ -1,9 +1,9 @@
 # Goose in a Pond Default System Prompt Template
 
- Usage: Load this at startup. Replace all {{PLACEHOLDERS}} from the settings DB before passing to LlmProvider::complete(system_prompt, ...).<br><br>
- Overridable fields are marked [SETTINGS OVERRIDE] - these map directly to a row in the `pond_settings` table (key shown in brackets). <br><br>
- The full intended flow is: app starts → load template → read settings DB → substitute placeholders → assembled string is ready → every LLM call, passes that string as the system_prompt argument.<br><br>
- If you pass a raw template with unfilled {{PLACEHOLDERS}} to Goose, the model will generate an error message asking for missing values.
+Usage: Load this at startup. Replace all {{PLACEHOLDERS}} from the settings DB before passing to LlmProvider::complete(system_prompt, ...).<br><br>
+Overridable fields are marked [SETTINGS OVERRIDE] - these map directly to a row in the `pond_settings` table (key shown in brackets). <br><br>
+The full intended flow is: app starts → load template → read settings DB → substitute placeholders → assembled string is ready → every LLM call, passes that string as the system_prompt argument.<br><br>
+If you pass a raw template with unfilled {{PLACEHOLDERS}} to Goose, the model will generate an error message asking for missing values.
 
 ---
 ## Personality Paragraph
@@ -30,19 +30,19 @@ Floors: {{FLOOR_LAYOUT}}                   # [SETTINGS OVERRIDE: home.floors] <b
 Devices:
 {{DEVICE_LIST}}                            # [SETTINGS OVERRIDE: home.devices]
 ### Format per device (one per line):
- room | device_name | type | controllable: true/false
+room | device_name | type | controllable: true/false
 #### Example:
-  Living room | Hue ceiling light | light | true <br>
-  Front door  | August lock       | lock  | true <br>
-  Kitchen     | Bosch oven        | appliance | false <br>
+Living room | Hue ceiling light | light | true <br>
+Front door  | August lock       | lock  | true <br>
+Kitchen     | Bosch oven        | appliance | false <br>
 
 ### User preferences:
 {{USER_PREFERENCES}}                       # [SETTINGS OVERRIDE: user.preferences]
 #### Format (one per line):
-  units: metric | imperial <br>
-  time_format: 24h | 12h <br>
-  language: en | fr | ... <br>
-  reply_length: short | normal | verbose <br>
+units: metric | imperial <br>
+time_format: 24h | 12h <br>
+language: en | fr | ... <br>
+reply_length: short | normal | verbose <br>
 
 ---
 
@@ -64,9 +64,9 @@ Devices:
 ### Persona override (user-configurable)
 
 {{PERSONA_OVERRIDE}}                       # [SETTINGS OVERRIDE: persona.custom]<br>
- Leave blank to use the default persona above.<br>
- If populated, this block replaces the personality paragraph only, the behaviour rules and home context always remain active.
+Leave blank to use the default persona above.<br>
+If populated, this block replaces the personality paragraph only, the behaviour rules and home context always remain active.
 #### Example values:
-   "Be more concise, one sentence max unless I ask for more." <br>
-   "Respond in English at all times." <br>
-   "Use a more friendly and warm tone." <br>
+"Be more concise, one sentence max unless I ask for more." <br>
+"Respond in English at all times." <br>
+"Use a more friendly and warm tone." <br>
