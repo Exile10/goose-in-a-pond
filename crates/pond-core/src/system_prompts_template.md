@@ -56,20 +56,20 @@ Devices:
 {{OFFICE_DEVICE_LIST}}                     # [SETTINGS OVERRIDE: office.devices]
 
 ### Format per device (one per line):
- room | device_name | type | controllable: true/false
+room | device_name | type | controllable: true/false
 #### Example:
-  Living room | Hue ceiling light | light | true <br>
-  Front door  | August lock       | lock  | true <br>
-  Kitchen     | Bosch oven        | appliance | false <br>
+Living room | Hue ceiling light | light | true <br>
+Front door  | August lock       | lock  | true <br>
+Kitchen     | Bosch oven        | appliance | false <br>
 
 ### User preferences:
 {{USER_PREFERENCES}}                       # [SETTINGS OVERRIDE: user.preferences]
 
 #### Format (one per line):
-  units: metric | imperial <br>
-  time_format: 24h | 12h <br>
-  language: en | fr | ... <br>
-  reply_length: short | normal | verbose <br>
+units: metric | imperial <br>
+time_format: 24h | 12h <br>
+language: en | fr | ... <br>
+reply_length: short | normal | verbose <br>
 
 ---
 
