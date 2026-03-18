@@ -6,6 +6,14 @@ interface Props {
   token: string
 }
 
+type Theme = 'system' | 'light' | 'dark'
+
+const THEMES: { value: Theme; label: string; description: string }[] = [
+  { value: 'system', label: 'System',  description: 'Follows your OS or browser dark/light preference.' },
+  { value: 'light',  label: 'Light',   description: 'Always use the light theme.' },
+  { value: 'dark',   label: 'Dark',    description: 'Always use the dark theme.' },
+]
+
 const PERSONALITIES = [
   { value: 'helpful',   label: 'Helpful',    description: 'Clear, thorough, and focused on getting things done.' },
   { value: 'concise',   label: 'Concise',    description: 'Short answers, no fluff — just the essentials.' },
@@ -28,6 +36,7 @@ function load<T>(key: string, fallback: T): T {
 }
 
 export default function Settings({ token }: Props) {
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('pond_theme') as Theme) ?? 'system')
   const [displayName, setDisplayName]     = useState(() => localStorage.getItem('pond_display_name') ?? '')
   const [personality, setPersonality]     = useState(() => load('pond_personality', 'helpful'))
   const [assistantStyle, setAssistantStyle] = useState(() => load('pond_assistant_style', 'proactive'))
@@ -68,6 +77,16 @@ export default function Settings({ token }: Props) {
     }
   }
 
+  function handleThemeChange(value: Theme) {
+    setTheme(value)
+    localStorage.setItem('pond_theme', value)
+    if (value === 'system') {
+      delete document.documentElement.dataset.theme
+    } else {
+      document.documentElement.dataset.theme = value
+    }
+  }
+
   function handleClearActivity() {
     clearActivity()
     setCleared(true)
@@ -83,6 +102,8 @@ export default function Settings({ token }: Props) {
     localStorage.removeItem('pond_personality')
     localStorage.removeItem('pond_assistant_style')
     localStorage.removeItem('pond_system_prompt')
+    localStorage.removeItem('pond_theme')
+    delete document.documentElement.dataset.theme
     window.location.reload()
   }
 
@@ -94,6 +115,33 @@ export default function Settings({ token }: Props) {
       </div>
 
       <form onSubmit={handleSave} className="db-page-content">
+
+        {/* ── Appearance ── */}
+        <div className="db-card">
+          <div className="db-card-header">
+            <h3>Appearance</h3>
+          </div>
+          <div className="db-settings-radio-group">
+            {THEMES.map(opt => (
+              <label
+                key={opt.value}
+                className={`db-settings-radio-card ${theme === opt.value ? 'selected' : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="theme"
+                  value={opt.value}
+                  checked={theme === opt.value}
+                  onChange={() => handleThemeChange(opt.value)}
+                />
+                <div>
+                  <strong>{opt.label}</strong>
+                  <span>{opt.description}</span>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
 
         {/* ── Profile ── */}
         <div className="db-card">

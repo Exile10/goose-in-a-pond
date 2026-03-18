@@ -69,6 +69,16 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
 
 function App() {
     const [page, setPage] = useState<Page>("chat");
+
+    // Apply saved theme preference on mount
+    useEffect(() => {
+        const saved = localStorage.getItem("pond_theme") ?? "system";
+        if (saved === "system") {
+            delete document.documentElement.dataset.theme;
+        } else {
+            document.documentElement.dataset.theme = saved;
+        }
+    }, []);
     const [token, setToken] = useState<string>(
         () => localStorage.getItem("pond_session_token") ?? ""
     );
