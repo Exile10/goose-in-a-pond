@@ -1,17 +1,11 @@
 //! Database initialization for Goose In A Pond
 //!
 //! GIAP uses two SQLite databases:
-//! 1. **System DB** (`pond_system.db`) — Core application data (users,
-//!    devices, sessions, onboarding state, settings)
-//! 2. **Log DB** (`pond_logs.db`) — Logging, telemetry, audit trail
+//! - `pond_system.db` — Sessions, devices, onboarding, settings
+//! - `pond_logs.db`   — Event log, telemetry, system info
 //!
-//! # TODO
-//! - [ ] Define the system DB schema (user will provide)
-//! - [ ] Define the log DB schema (events, metrics, audit)
-//! - [ ] Add migration support (sqlx::migrate!)
-//! - [ ] Add connection pooling configuration
-//! - [ ] Add backup/restore utilities
-//! - [ ] Add database health check endpoint
+//! Migrations live in `migrations/system/` and `migrations/logs/` and are
+//! applied automatically on startup via `sqlx::migrate!()`.
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -19,36 +13,22 @@ use sqlx::{Pool, Sqlite};
 use std::path::Path;
 use std::str::FromStr;
 
-/// Holds connection pools for both GIAP databases.
 pub struct Database {
-    /// Core application data — users, devices, sessions, settings
     pub system: Pool<Sqlite>,
-    /// Logging, telemetry, and audit trail
-    pub logs: Pool<Sqlite>,
+    pub logs:   Pool<Sqlite>,
 }
 
 impl Database {
-    /// Initialize both databases at the given directory.
-    ///
-    /// Creates the files if they don't exist and runs migrations.
     pub async fn init(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
 
-        let system_path = data_dir.join("pond_system.db");
-        let logs_path = data_dir.join("pond_logs.db");
+        let system = Self::connect(&data_dir.join("pond_system.db")).await?;
+        let logs   = Self::connect(&data_dir.join("pond_logs.db")).await?;
 
-        let system = Self::connect(&system_path).await?;
-        let logs = Self::connect(&logs_path).await?;
+        sqlx::migrate!("migrations/system").run(&system).await?;
+        sqlx::migrate!("migrations/logs").run(&logs).await?;
 
-        // Run initial table creation
-        Self::init_system_tables(&system).await?;
-        Self::init_log_tables(&logs).await?;
-
-        tracing::info!(
-            "Databases initialized at {}",
-            data_dir.display()
-        );
-
+        tracing::info!("Databases ready at {}", data_dir.display());
         Ok(Self { system, logs })
     }
 
@@ -58,105 +38,51 @@ impl Database {
         )?
         .create_if_missing(true);
 
-        let pool = SqlitePoolOptions::new()
+        Ok(SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts)
-            .await?;
-
-        Ok(pool)
-    }
-
-    /// System DB schema initialization.
-    ///
-    /// TODO: Replace with user-provided schema.
-    /// TODO: Move to sqlx migrations once schema is finalized.
-    async fn init_system_tables(pool: &Pool<Sqlite>) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS onboarding_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                current_step TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS _schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            -- TODO: User will provide the full system schema.
-            -- Placeholder tables below:
-
-            CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                hostname TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Log DB schema initialization.
-    async fn init_log_tables(pool: &Pool<Sqlite>) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS event_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-                level TEXT NOT NULL DEFAULT 'INFO',
-                source TEXT NOT NULL,
-                message TEXT NOT NULL,
-                metadata TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS system_info (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-                key TEXT NOT NULL,
-                value TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
+            .await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[tokio::test]
-    async fn database_initializes() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn database_initializes_all_tables() {
+        let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
 
-        // Verify system db has tables
-        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM sqlite_master WHERE type='table'")
-            .fetch_one(&db.system)
-            .await
-            .unwrap();
-        assert!(row.0 >= 2, "Expected at least 2 tables in system db");
+        let system_tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .fetch_all(&db.system)
+        .await
+        .unwrap();
+        let sys: Vec<&str> = system_tables.iter().map(|r| r.0.as_str()).collect();
+        assert!(sys.contains(&"sessions"),         "sessions missing");
+        assert!(sys.contains(&"session_messages"), "session_messages missing");
+        assert!(sys.contains(&"onboarding_state"), "onboarding_state missing");
+        assert!(sys.contains(&"devices"),          "devices missing");
+        assert!(sys.contains(&"settings"),         "settings missing");
 
-        // Verify logs db has tables
-        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM sqlite_master WHERE type='table'")
-            .fetch_one(&db.logs)
-            .await
-            .unwrap();
-        assert!(row.0 >= 2, "Expected at least 2 tables in logs db");
+        let log_tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .fetch_all(&db.logs)
+        .await
+        .unwrap();
+        let logs: Vec<&str> = log_tables.iter().map(|r| r.0.as_str()).collect();
+        assert!(logs.contains(&"event_log"),   "event_log missing");
+        assert!(logs.contains(&"system_info"), "system_info missing");
+    }
+
+    #[tokio::test]
+    async fn migrations_are_idempotent() {
+        let tmp = tempdir().unwrap();
+        Database::init(tmp.path()).await.unwrap();
+        Database::init(tmp.path()).await.unwrap(); // second run must not fail
     }
 }
