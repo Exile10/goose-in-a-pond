@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_api::{AppState, build_router};
+use pond_infra::mock_handshake::MockHandshake;
 
 // ─────────────────────────────────────────────────────────────────
 // Minimal mock
@@ -45,6 +46,8 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(MockRepo::new(step)) as Arc<dyn OnboardingRepository + Send + Sync>,
+        handshake: Arc::new(MockHandshake::new()),
+        whisper_url: "http://127.0.0.1:9000".to_string(),
     });
     (build_router(state), tmp)
 }
