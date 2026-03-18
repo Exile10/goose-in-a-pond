@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 pond-core = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -9,7 +9,10 @@ license.workspace = true
 pond-core = { workspace = true }
 pond-api = { workspace = true }
 pond-infra = { workspace = true }
+pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
+pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
 anyhow = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 axum = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
