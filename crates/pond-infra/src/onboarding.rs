@@ -1,9 +1,10 @@
 //! SQLx implementation of the OnboardingRepository port.
-//! connects Core logic to SQLite persistence.
+//! Connects Core logic to SQLite persistence.
 
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::onboarding::OnboardingRepository;
 use sqlx::{Pool, Sqlite};
+use std::str::FromStr;
 
 pub struct SqlxOnboardingRepository {
     pool: Pool<Sqlite>,
@@ -24,19 +25,12 @@ impl OnboardingRepository for SqlxOnboardingRepository {
             .fetch_optional(&self.pool)
             .await
             .ok()??;
-
-        match row.0.as_str() {
-            "VerifyDevice" => Some(OnboardingStep::VerifyDevice),
-            "CreateProfile" => Some(OnboardingStep::CreateProfile),
-            "ConfigurePersonality" => Some(OnboardingStep::ConfigurePersonality),
-            "ConnectDevices" => Some(OnboardingStep::ConnectDevices),
-            "Completed" => Some(OnboardingStep::Completed),
-            _ => None,
-        }
+        
+        OnboardingStep::from_str(row.0.as_str()).ok()
     }
 
-    async fn save_step(&self, step: OnboardingStep) {
-        let step_str = format!("{:?}", step);
+    async fn save_step(&self, step: OnboardingStep) -> anyhow::Result<()> {
+        let step_str = step.to_string();
 
         sqlx::query(
             r#"
@@ -50,8 +44,9 @@ impl OnboardingRepository for SqlxOnboardingRepository {
         )
             .bind(step_str)
             .execute(&self.pool)
-            .await
-            .unwrap();
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -67,8 +62,10 @@ mod tests {
         let db = Database::init(tmp.path()).await.unwrap();
 
         let repo = SqlxOnboardingRepository::new(db.system.clone());
-
-        repo.save_step(OnboardingStep::VerifyDevice).await;
+        
+        repo.save_step(OnboardingStep::VerifyDevice)
+            .await
+            .unwrap();
 
         let step = repo.get_current_step().await;
 

@@ -32,7 +32,7 @@ impl Database {
         Ok(Self { system, logs })
     }
 
-    async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
+    pub async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
         let opts = SqliteConnectOptions::from_str(
             &format!("sqlite:{}?mode=rwc", path.display()),
         )?
