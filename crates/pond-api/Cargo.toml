@@ -9,7 +9,8 @@ license.workspace = true
 pond-core = { workspace = true }
 pond-infra = { workspace = true }
 anyhow = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+reqwest = { workspace = true, features = ["json", "multipart"] }
 hostname = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

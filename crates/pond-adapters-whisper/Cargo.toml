@@ -1,17 +1,20 @@
 [package]
-name = "pond-core"
+name = "pond-adapters-whisper"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
+pond-core = { workspace = true }
 anyhow = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
+cpal = "0.15"
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
