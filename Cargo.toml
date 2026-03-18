@@ -6,6 +6,8 @@ members = [
     "crates/pond-infra",
     "crates/pond-server",
     "crates/pond-adapters-goose",
+    "crates/pond-adapters-llamafile",
+    "crates/pond-adapters-whisper",
     "crates/pond-adapters-gotg",
     "crates/pond-builder",
 ]
@@ -78,7 +80,7 @@ opentelemetry-appender-tracing = "0.31"
 opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.32"
 hostname = "0.4"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono"] }
 
 # Internal workspace crates
 pond-core = { path = "crates/pond-core" }

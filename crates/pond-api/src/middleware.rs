@@ -141,7 +141,7 @@ fn is_public_route(path: &str) -> bool {
 
     matches!(
         path,
-        "/health" | "/handshake" | "/onboard" | "/onboard/status"
+        "/" | "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
     )
 }
 
@@ -224,6 +224,7 @@ mod tests {
         assert!(is_public_route("/api/v1/handshake"));
         assert!(is_public_route("/api/v1/onboard"));
         assert!(is_public_route("/api/v1/onboard/status"));
+        assert!(is_public_route("/api/v1/transcribe"));
         assert!(!is_public_route("/api/v1/chat"));
         assert!(!is_public_route("/api/v1/devices"));
         assert!(!is_public_route("/api/v1/settings"));
