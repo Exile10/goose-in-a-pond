@@ -37,6 +37,11 @@ impl OnboardingRepository for MockRepo {
         *self.step.lock().unwrap() = Some(step);
         Ok(())
     }
+
+    async fn reset(&self) -> anyhow::Result<()> {
+        *self.step.lock().unwrap() = None;
+        Ok(())
+    }
 }
 
 async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile::TempDir) {

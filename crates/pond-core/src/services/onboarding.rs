@@ -33,6 +33,11 @@ impl<R: OnboardingRepository> OnboardingService<R> {
     pub async fn status(&self) -> Option<OnboardingStep> {
         self.repo.get_current_step().await
     }
+
+    /// Reset onboarding state to allow starting from scratch.
+    pub async fn reset(&self) -> Result<()> {
+        self.repo.reset().await
+    }
 }
 
 #[cfg(test)]
@@ -57,33 +62,40 @@ mod tests {
     #[async_trait::async_trait]
     impl OnboardingRepository for MockRepo {
         async fn get_current_step(&self) -> Option<OnboardingStep> {
-            // Lock mutex and convert poison error
             self.step.lock().ok().map(|guard| *guard).flatten()
         }
 
         async fn save_step(&self, step: OnboardingStep) -> Result<()> {
-            // Return mutex poison errors as Result
             let mut guard = self.step.lock().map_err(mutex_error)?;
             *guard = Some(step);
+            Ok(())
+        }
+
+        async fn reset(&self) -> Result<()> {
+            let mut guard = self.step.lock().map_err(mutex_error)?;
+            *guard = None;
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn start_sets_initial_step() -> Result<()> {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
-
+        let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
         assert_eq!(service.status().await, Some(OnboardingStep::VerifyDevice));
         Ok(())
     }
 
     #[tokio::test]
-    async fn advance_progresses_step() -> Result<()> {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
+    async fn status_is_none_before_start() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        assert_eq!(service.status().await, None);
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn advance_progresses_step() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
         service.advance().await?;
         assert_eq!(service.status().await, Some(OnboardingStep::CreateProfile));
@@ -92,35 +104,39 @@ mod tests {
 
     #[tokio::test]
     async fn advance_through_all_steps_reaches_completed() -> Result<()> {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
-
+        let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
         service.advance().await?;
         service.advance().await?;
         service.advance().await?;
         service.advance().await?;
+        assert_eq!(service.status().await, Some(OnboardingStep::Completed));
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn advance_stays_at_completed() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        service.start().await?;
+        for _ in 0..10 {
+            service.advance().await?;
+        }
         assert_eq!(service.status().await, Some(OnboardingStep::Completed));
         Ok(())
     }
 
     #[tokio::test]
     async fn advance_before_start_is_noop() -> Result<()> {
-        let repo = MockRepo::new();
-        let service = OnboardingService::new(repo);
-
+        let service = OnboardingService::new(MockRepo::new());
         service.advance().await?;
         assert_eq!(service.status().await, None);
         Ok(())
     }
+
     #[tokio::test]
     async fn status_is_not_complete_mid_flow() -> Result<()> {
         let service = OnboardingService::new(MockRepo::new());
-
         service.start().await?;
-
-        // Guard does: matches!(status, Some(Completed)) — this should be false
         assert_ne!(service.status().await, Some(OnboardingStep::Completed));
         Ok(())
     }
@@ -128,15 +144,22 @@ mod tests {
     #[tokio::test]
     async fn status_is_complete_after_all_steps() -> Result<()> {
         let service = OnboardingService::new(MockRepo::new());
-
         service.start().await?;
         service.advance().await?;
         service.advance().await?;
         service.advance().await?;
         service.advance().await?;
-
-        // This is the exact check the middleware performs
         assert_eq!(service.status().await, Some(OnboardingStep::Completed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_clears_state() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        service.start().await?;
+        service.advance().await?;
+        service.reset().await?;
+        assert_eq!(service.status().await, None);
         Ok(())
     }
 }
