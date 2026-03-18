@@ -8,13 +8,13 @@ license.workspace = true
 [dependencies]
 pond-core = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 hostname = { workspace = true }
 tracing = { workspace = true }
-async-trait = "0.1.89"
 
 [dev-dependencies]
 tempfile = { workspace = true }
