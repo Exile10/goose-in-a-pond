@@ -33,6 +33,12 @@ use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use std::sync::Arc;
+use pond_core::services::onboarding::OnboardingService;
+use pond_core::domain::onboarding::OnboardingStep;
+use pond_infra::onboarding::SqlxOnboardingRepository;
+use std::io::{self, Write};
+use std::collections::HashMap;
+use std::net::UdpSocket;
 
 #[derive(Parser)]
 #[command(name = "pond")]
@@ -84,6 +90,9 @@ enum Commands {
 
     /// Show system status
     Status,
+
+    /// Run onboarding
+    Onboard,
 }
 
 #[tokio::main]
@@ -105,6 +114,7 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             run_status().await
         }
+        Some(Commands::Onboard) => run_onboard().await,
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
@@ -184,8 +194,10 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
     let db = Database::init(&data_dir).await?;
 
     // Build app state
+    let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
     let state = Arc::new(AppState {
         db: Arc::new(db),
+        onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
     });
@@ -292,6 +304,130 @@ async fn run_status() -> Result<()> {
     // TODO: Check DB status, onboarding state, running services
     println!("  Database:  TODO — check connection");
     println!("  Onboarded: TODO — check onboarding state");
+
+    Ok(())
+}
+
+fn get_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.168.1.1:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
+}
+
+fn prompt_nonempty(prompt: &str) -> Result<String> {
+
+    loop {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        let trimmed = input.trim();
+
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        println!("Input cannot be empty. Try again.");
+    }
+}
+async fn run_onboard() -> Result<()> {
+    println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
+
+    // Initialize database
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = SqlxOnboardingRepository::new(db.system.clone());
+    let service = OnboardingService::new(repo);
+    // TODO: persist user_data once UserProfile domain + port exist
+    let mut user_data: HashMap<String, String> = HashMap::new();
+
+    loop {
+        let current_step = service.status().await;
+
+        match current_step {
+            None => {
+                println!("Starting onboarding from scratch...");
+                service.start().await?;
+            }
+
+            Some(OnboardingStep::VerifyDevice) => {
+                println!("Step: Verify Device");
+
+                if let Some(ip) = get_local_ip() {
+                    println!("Detected device IP: {}", ip);
+                    user_data.insert("device_ip".to_string(), ip);
+                } else {
+                    println!("Could not detect IP, using default 'unknown'.");
+                    user_data.insert("device_ip".to_string(), "unknown".to_string());
+                }
+
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::CreateProfile) => {
+                println!("Step: Create Profile");
+
+                let username = prompt_nonempty("Enter your username: ")?;
+                user_data.insert("username".to_string(), username);
+
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::ConfigurePersonality) => {
+                println!("Step: Configure Personality");
+
+                let personalities = vec![
+                    "Friendly",
+                    "Professional",
+                    "Casual",
+                    "Funny",
+                    "Stoic",
+                ];
+
+                println!("Choose a personality for your assistant:");
+                for (i, p) in personalities.iter().enumerate() {
+                    println!("  {}) {}", i + 1, p);
+                }
+
+                let selected = loop {
+                    let choice = prompt_nonempty("Enter the number of your choice: ")?;
+                    if let Ok(index) = choice.parse::<usize>() {
+                        if index >= 1 && index <= personalities.len() {
+                            break personalities[index - 1].to_string();
+                        }
+                    }
+                    println!("Invalid choice. Try again.");
+                };
+
+                println!("You selected: {}", selected);
+                user_data.insert("personality".to_string(), selected);
+
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::ConnectDevices) => {
+                println!("Step: Connect Devices");
+                println!("Press ENTER when all devices are connected...");
+                let _ = io::stdin().read_line(&mut String::new())?;
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Completed) => {
+                println!("\n Onboarding complete! Here’s your info:\n");
+
+                for (key, value) in &user_data {
+                    println!("  {}: {}", key, value);
+                }
+
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

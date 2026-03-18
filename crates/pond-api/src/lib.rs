@@ -41,6 +41,7 @@ pub mod routes;
 
 use axum::{middleware::Next, Router};
 use pond_core::ports::handshake::Handshake;
+use pond_core::ports::onboarding::OnboardingRepository;
 use pond_infra::db::Database;
 use std::sync::Arc;
 
@@ -50,7 +51,7 @@ pub struct AppState {
     pub handshake: Arc<dyn Handshake>,
     /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
     pub whisper_url: String,
-    // TODO: Add LlmProvider, ChatService, etc.
+    pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
 }
 
 /// Build the full API router.
@@ -65,15 +66,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     ));
 
     Router::new()
-        .nest("/api/v1", routes::api_routes())
+        .nest("/api/v1", routes::api_routes(state.clone()))
         .merge(routes::web_routes())
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();
             rate_limit_with_limiter(req, next, limiter)
         }))
-        // Apply authentication to protected routes
-        .layer(axum::middleware::from_fn(middleware::auth_middleware))
         .with_state(state)
 }
 
