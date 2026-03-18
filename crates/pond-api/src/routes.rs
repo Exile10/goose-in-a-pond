@@ -13,8 +13,17 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tower_http::services::ServeDir;
 
 use crate::AppState;
+
+// ───────────────────────── Web Dashboard Routes ─────────────────────────
+
+/// Serves the built Vite assets from the given directory.
+/// In development, use `npm run dev` instead (Vite dev server on port 5173).
+pub fn web_routes(static_dir: std::path::PathBuf) -> tower_http::services::ServeDir {
+    ServeDir::new(static_dir)
+}
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
