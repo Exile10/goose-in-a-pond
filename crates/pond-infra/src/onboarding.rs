@@ -48,6 +48,13 @@ impl OnboardingRepository for SqlxOnboardingRepository {
 
         Ok(())
     }
+
+    async fn reset(&self) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM onboarding_state WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

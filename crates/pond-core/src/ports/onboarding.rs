@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub trait OnboardingRepository: Send + Sync {
     async fn get_current_step(&self) -> Option<OnboardingStep>;
     async fn save_step(&self, step: OnboardingStep) -> anyhow::Result<()>;
+    /// Reset onboarding state to allow starting from scratch.
+    async fn reset(&self) -> anyhow::Result<()>;
 }
 
 // Allows Arc<dyn OnboardingRepository> to be used wherever R: OnboardingRepository is required
@@ -19,5 +21,9 @@ impl OnboardingRepository for Arc<dyn OnboardingRepository + Send + Sync> {
 
     async fn save_step(&self, step: OnboardingStep) -> anyhow::Result<()> {
         self.as_ref().save_step(step).await
+    }
+
+    async fn reset(&self) -> anyhow::Result<()> {
+        self.as_ref().reset().await
     }
 }

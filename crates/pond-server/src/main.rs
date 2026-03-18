@@ -91,8 +91,12 @@ enum Commands {
     /// Show system status
     Status,
 
-    /// Run onboarding
-    Onboard,
+    /// Run interactive onboarding wizard
+    Onboard {
+        /// Reset and restart onboarding from scratch
+        #[arg(long)]
+        reset: bool,
+    },
 }
 
 #[tokio::main]
@@ -114,7 +118,12 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             run_status().await
         }
-        Some(Commands::Onboard) => run_onboard().await,
+        Some(Commands::Onboard { reset }) => {
+            if let Err(err) = run_onboard(reset).await {
+                eprintln!("Error: {:?}", err);
+            }
+            Ok(())
+        }
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
@@ -333,16 +342,60 @@ fn prompt_nonempty(prompt: &str) -> Result<String> {
         println!("Input cannot be empty. Try again.");
     }
 }
-async fn run_onboard() -> Result<()> {
+async fn run_main_menu() -> Result<()> {
+    loop {
+        println!("\n🦆 Goose In A Pond — Main Menu");
+        println!("─────────────────────────────");
+        println!("  1) Chat        — Interactive AI chat");
+        println!("  2) Serve       — Start the HTTP server + API");
+        println!("  3) Status      — Show system info");
+        println!("  4) Exit");
+        println!();
+
+        let choice = prompt_nonempty("Choose an option: ")?;
+
+        match choice.trim() {
+            "1" => {
+                run_chat("mock", "stdin", None).await?;
+            }
+            "2" => {
+                println!("Enter port (default 4000): ");
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let port: u16 = input.trim().parse().unwrap_or(4000);
+                run_server(port, false).await?;
+            }
+            "3" => {
+                run_status().await?;
+            }
+            "4" => {
+                println!("Goodbye!");
+                break;
+            }
+            _ => {
+                println!("Invalid option. Try again.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_onboard(reset: bool) -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
-    // Initialize database
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
     let repo = SqlxOnboardingRepository::new(db.system.clone());
     let service = OnboardingService::new(repo);
+
+    if reset {
+        service.reset().await?;
+        println!("Onboarding reset. Starting from scratch...\n");
+    }
+
     // TODO: persist user_data once UserProfile domain + port exist
     let mut user_data: HashMap<String, String> = HashMap::new();
 
@@ -418,12 +471,15 @@ async fn run_onboard() -> Result<()> {
             }
 
             Some(OnboardingStep::Completed) => {
-                println!("\n Onboarding complete! Here’s your info:\n");
-
-                for (key, value) in &user_data {
-                    println!("  {}: {}", key, value);
+                if user_data.is_empty() {
+                    println!("You are already onboarded!");
+                } else {
+                    println!("\n Onboarding complete! Here’s your info:\n");
+                    for (key, value) in &user_data {
+                        println!("  {}: {}", key, value);
+                    }
                 }
-
+                run_main_menu().await?;
                 break;
             }
         }
