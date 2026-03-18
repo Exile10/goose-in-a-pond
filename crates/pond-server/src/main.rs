@@ -205,6 +205,7 @@ fn get_local_ip() -> Option<String> {
 }
 
 fn prompt_nonempty(prompt: &str) -> Result<String> {
+
     loop {
         print!("{}", prompt);
         io::stdout().flush()?;
@@ -221,7 +222,7 @@ fn prompt_nonempty(prompt: &str) -> Result<String> {
         println!("Input cannot be empty. Try again.");
     }
 }
-pub async fn run_onboard() -> Result<()> {
+async fn run_onboard() -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
     // Initialize database

@@ -38,16 +38,15 @@ impl OnboardingRepository for MockRepo {
     }
 }
 
-async fn app_with_step(step: Option<OnboardingStep>) -> axum::Router {
+async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
-    std::mem::forget(tmp);
 
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(MockRepo::new(step)) as Arc<dyn OnboardingRepository + Send + Sync>,
     });
-    build_router(state)
+    (build_router(state), tmp)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -56,7 +55,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> axum::Router {
 
 #[tokio::test]
 async fn health_is_accessible_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
         .await
@@ -66,7 +65,7 @@ async fn health_is_accessible_before_onboarding() {
 
 #[tokio::test]
 async fn onboard_status_is_accessible_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/onboard/status").body(Body::empty()).unwrap())
         .await
@@ -76,7 +75,7 @@ async fn onboard_status_is_accessible_before_onboarding() {
 
 #[tokio::test]
 async fn system_info_is_accessible_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/system/info").body(Body::empty()).unwrap())
         .await
@@ -90,7 +89,7 @@ async fn system_info_is_accessible_before_onboarding() {
 
 #[tokio::test]
 async fn chat_is_blocked_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().method("POST").uri("/api/v1/chat").body(Body::empty()).unwrap())
         .await
@@ -100,7 +99,7 @@ async fn chat_is_blocked_before_onboarding() {
 
 #[tokio::test]
 async fn devices_is_blocked_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/devices").body(Body::empty()).unwrap())
         .await
@@ -110,7 +109,7 @@ async fn devices_is_blocked_before_onboarding() {
 
 #[tokio::test]
 async fn settings_is_blocked_before_onboarding() {
-    let app = app_with_step(None).await;
+    let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/settings").body(Body::empty()).unwrap())
         .await
@@ -124,7 +123,7 @@ async fn settings_is_blocked_before_onboarding() {
 
 #[tokio::test]
 async fn chat_is_accessible_after_onboarding() {
-    let app = app_with_step(Some(OnboardingStep::Completed)).await;
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
         .oneshot(Request::builder().method("POST").uri("/api/v1/chat").body(Body::empty()).unwrap())
         .await
@@ -134,7 +133,7 @@ async fn chat_is_accessible_after_onboarding() {
 
 #[tokio::test]
 async fn devices_is_accessible_after_onboarding() {
-    let app = app_with_step(Some(OnboardingStep::Completed)).await;
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/devices").body(Body::empty()).unwrap())
         .await
@@ -144,7 +143,7 @@ async fn devices_is_accessible_after_onboarding() {
 
 #[tokio::test]
 async fn settings_is_accessible_after_onboarding() {
-    let app = app_with_step(Some(OnboardingStep::Completed)).await;
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
         .oneshot(Request::builder().uri("/api/v1/settings").body(Body::empty()).unwrap())
         .await
