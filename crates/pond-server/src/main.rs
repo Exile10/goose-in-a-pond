@@ -353,7 +353,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock").await?;
+                run_chat("mock", "", None).await?;
             }
             "2" => {
                 println!("Enter port (default 4000): ");
