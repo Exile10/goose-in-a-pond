@@ -144,7 +144,7 @@ fn init_tracing(debug: bool) {
 
 async fn run_setup(model: &str) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
-    println!("  ║   🦆  Goose In A Pond — Setup        ║");
+    println!("  ║   🦆  Goose In A Pond — Setup         ║");
     println!("  ╚═══════════════════════════════════════╝");
 
     let data_dir = dirs::data_dir()
@@ -193,7 +193,7 @@ async fn run_setup(model: &str) -> Result<()> {
 
 async fn run_server(port: u16, open: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
-    println!("  ║   🦆  Goose In A Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
+    println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
 
     // Initialize databases
