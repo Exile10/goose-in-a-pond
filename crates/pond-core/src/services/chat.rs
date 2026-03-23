@@ -2,10 +2,8 @@ use crate::domain::agent::{AgentRequest, WorkflowEvent, WorkflowState};
 use crate::domain::message::ChatMessage;
 use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
-use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
 use crate::ports::voice_input::VoiceInput;
-use crate::prompts::SYSTEM_PROMPT;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
 use std::io::{self, Write};
@@ -17,15 +15,10 @@ use uuid::Uuid;
 /// Orchestrates the Wait → Listen → Thinking → Speak workflow loop.
 /// Also persists messages to session storage for conversation history.
 ///
-/// When an `LlmProvider` is wired in via `with_provider()`, the Thinking
-/// step calls `provider.complete()` with the full conversation history.
-/// Otherwise it falls back to the `Agent`.
-///
 /// Input is abstracted via the `VoiceInput` port.  The default is
 /// `StdinInput` (reads from stdin).  Override with `with_voice_input()`.
 pub struct ChatService {
     agent: Arc<dyn Agent>,
-    provider: Option<Arc<dyn LlmProvider>>,
     voice_input: Arc<dyn VoiceInput>,
     session_id: String,
     session_storage: Arc<dyn SessionStorage>,
@@ -39,18 +32,10 @@ impl ChatService {
     ) -> Self {
         Self {
             agent,
-            provider: None,
             voice_input: Arc::new(StdinInput::new()),
             session_id,
             session_storage,
         }
-    }
-
-    /// Attach a real LLM provider. When set, `chat_once` calls the provider
-    /// with the full conversation history instead of the echo agent.
-    pub fn with_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
-        self.provider = Some(provider);
-        self
     }
 
     /// Override the input source.  Defaults to `StdinInput`.
@@ -72,23 +57,11 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        let response_text = if let Some(provider) = &self.provider {
-            // Load full conversation history for context-aware completions
-            let stored = self
-                .session_storage
-                .get_messages(&self.session_id)
-                .await?;
-            let messages: Vec<ChatMessage> =
-                stored.into_iter().map(|sm| sm.message).collect();
-            let response = provider.complete(SYSTEM_PROMPT, messages).await?;
-            response.content
-        } else {
-            let request = AgentRequest {
-                message,
-                session_id: self.session_id.clone(),
-            };
-            self.agent.chat(request).await?.text
+        let request = AgentRequest {
+            message,
+            session_id: self.session_id.clone(),
         };
+        let response_text = self.agent.chat(request).await?.text;
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(response_text.clone());
@@ -184,7 +157,6 @@ impl ChatService {
 mod tests {
     use super::*;
     use crate::services::mock_agent::MockAgent;
-    use crate::services::mock_provider::MockProvider;
     use crate::services::mock_session::InMemorySessionStorage;
 
     #[tokio::test]
@@ -197,21 +169,6 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
-    }
-
-    #[tokio::test]
-    async fn chat_with_provider_calls_provider() {
-        let agent = Arc::new(MockAgent::new());
-        let provider = Arc::new(MockProvider::new());
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let session_id = "test-session".to_string();
-        storage.create_session(session_id.clone()).await.unwrap();
-
-        let service = ChatService::new(agent, session_id.clone(), storage.clone())
-            .with_provider(provider);
-        let result = service.chat_once("Hello!".to_string()).await.unwrap();
-        // MockProvider echoes the last user message
-        assert!(result.contains("Hello!"), "expected provider response, got: {}", result);
     }
 
     #[tokio::test]
