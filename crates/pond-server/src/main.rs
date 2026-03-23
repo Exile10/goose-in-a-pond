@@ -3,7 +3,7 @@
 //! Usage:
 //!   pond-server setup [--model tiny|base|small]
 //!   pond-server serve [--port PORT] [--open]
-//!   pond-server chat  [--provider mock|llamafile] [--input stdin|whisper] [--whisper-url URL]
+//!   pond-server chat  [--input stdin|whisper] [--whisper-url URL]
 //!   pond-server status
 //!
 //! # TODO — Setup Script
@@ -21,7 +21,6 @@ mod model_download;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_whisper::WhisperInput;
 use pond_api::AppState;
 use pond_core::ports::session_storage::SessionStorage;
@@ -70,10 +69,6 @@ enum Commands {
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
     Chat {
-        /// LLM provider: mock or llamafile
-        #[arg(short = 'P', long, default_value = "mock")]
-        provider: String,
-
         /// Input source: stdin (text) or whisper (microphone → ASR)
         #[arg(short = 'I', long, default_value = "stdin")]
         input: String,
@@ -107,9 +102,9 @@ async fn main() -> Result<()> {
             init_tracing(debug);
             run_server(port, open).await
         }
-        Some(Commands::Chat { provider, input, whisper_url }) => {
+        Some(Commands::Chat { input, whisper_url }) => {
             init_tracing(false);
-            run_chat(&provider, &input, whisper_url.as_deref()).await
+            run_chat(&input, whisper_url.as_deref()).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -123,7 +118,7 @@ async fn main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
-            run_chat("mock", "stdin", None).await
+            run_chat("stdin", None).await
         }
     }
 }
@@ -240,12 +235,11 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_chat(provider: &str, input: &str, whisper_url: Option<&str>) -> Result<()> {
+async fn run_chat(input: &str, whisper_url: Option<&str>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
     println!("  ╚═══════════════════════════════════════╝");
-    println!("  Provider: {}", provider);
 
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -259,22 +253,6 @@ async fn run_chat(provider: &str, input: &str, whisper_url: Option<&str>) -> Res
     let _ = storage.create_session(session_id.clone()).await;
 
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage);
-
-    // ── Wire LLM provider ──
-    match provider {
-        "llamafile" => {
-            println!(
-                "  Model:    {} (llamafile @ {})",
-                pond_adapters_llamafile::DEFAULT_MODEL,
-                pond_adapters_llamafile::DEFAULT_HOST
-            );
-            let llm = Arc::new(LlamafileProvider::new(None));
-            chat_service = chat_service.with_provider(llm);
-        }
-        _ => {
-            println!("  Model:    mock (echo)");
-        }
-    }
 
     // ── Wire voice input ──
     let voice: Arc<dyn VoiceInput> = match input {
@@ -353,7 +331,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", "", None).await?;
+                run_chat("", None).await?;
             }
             "2" => {
                 println!("Enter port (default 4000): ");
