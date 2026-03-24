@@ -6830,12 +6830,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "goose",
  "pond-core",
  "rmcp 0.16.0",
  "serde",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6898,6 +6900,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

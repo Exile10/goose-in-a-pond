@@ -1,5 +1,6 @@
 pub mod goose_agent;
 pub mod provider_adapter;
+pub mod session_adapter;
 pub mod logging {
     //! Logging utilities for Goose-based adapters.
     //!
@@ -14,3 +15,4 @@ pub mod logging {
 
 pub use goose_agent::GooseAdapter;
 pub use provider_adapter::GooseProviderAdapter;
+pub use session_adapter::GooseSessionAdapter;

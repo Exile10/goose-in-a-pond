@@ -1,23 +1,33 @@
+use chrono::{DateTime, Utc};
+use goose::conversation::message::Message as GooseMessage;
+use goose::session::{Session as GooseSession, SessionManager, SessionType};
+use pond_core::domain::message::{ChatMessage, Role};
 use pond_core::domain::session::{Session, SessionMessage};
 use pond_core::ports::session_storage::{SessionStorage, SessionStorageError};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use rmcp::model::Role as GooseRole;
+use std::path::PathBuf;
+use uuid::Uuid;
 
 /// Adapter: GooseSessionAdapter
 ///
-/// Wraps Goose's SessionManager to implement the SessionStorage port.
-/// Provides session and message persistence integrated with Goose's session system.
+/// Thin bridge that delegates to Goose's real SessionManager.
+/// Maps between Pond's simple domain types and Goose's richer types.
 pub struct GooseSessionAdapter {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
-    messages: Arc<RwLock<HashMap<String, Vec<SessionMessage>>>>,
+    manager: SessionManager,
 }
 
 impl GooseSessionAdapter {
+    /// Create an adapter using Goose's global singleton SessionManager.
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            messages: Arc::new(RwLock::new(HashMap::new())),
+            manager: SessionManager::instance(),
+        }
+    }
+
+    /// Create an adapter with a custom data directory.
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            manager: SessionManager::new(data_dir),
         }
     }
 }
@@ -28,28 +38,84 @@ impl Default for GooseSessionAdapter {
     }
 }
 
+// ── Type mapping helpers ────────────────────────────────────────────────────
+
+fn goose_session_to_pond(gs: &GooseSession) -> Session {
+    Session {
+        id: gs.id.clone(),
+        title: Some(gs.name.clone()),
+        created_at: gs.created_at,
+        updated_at: gs.updated_at,
+    }
+}
+
+fn pond_role_to_goose_message(role: &Role, content: &str) -> GooseMessage {
+    match role {
+        Role::User | Role::System => GooseMessage::user().with_text(content),
+        Role::Assistant => GooseMessage::assistant().with_text(content),
+    }
+}
+
+fn goose_message_to_pond(
+    msg: &GooseMessage,
+    session_id: &str,
+) -> SessionMessage {
+    let role = match msg.role {
+        GooseRole::User => Role::User,
+        GooseRole::Assistant => Role::Assistant,
+    };
+    let content = msg.as_concat_text();
+    let created_at: DateTime<Utc> =
+        DateTime::from_timestamp(msg.created, 0).unwrap_or_else(Utc::now);
+
+    SessionMessage {
+        id: msg
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        session_id: session_id.to_string(),
+        message: ChatMessage { role, content },
+        created_at,
+    }
+}
+
+fn to_storage_err(e: anyhow::Error) -> SessionStorageError {
+    let msg = e.to_string();
+    if msg.contains("not found") || msg.contains("No session") {
+        SessionStorageError::SessionNotFound(msg)
+    } else {
+        SessionStorageError::StorageError(msg)
+    }
+}
+
+// ── SessionStorage implementation ───────────────────────────────────────────
+
 #[async_trait::async_trait]
 impl SessionStorage for GooseSessionAdapter {
-    async fn create_session(&self, session_id: String) -> Result<Session, SessionStorageError> {
-        let session = Session::new(session_id.clone());
-        self.sessions
-            .write()
+    async fn create_session(
+        &self,
+        session_id: String,
+    ) -> Result<Session, SessionStorageError> {
+        let working_dir =
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let gs = self
+            .manager
+            .create_session(working_dir, session_id, SessionType::User)
             .await
-            .insert(session_id.clone(), session.clone());
-        self.messages
-            .write()
-            .await
-            .insert(session_id, Vec::new());
-        Ok(session)
+            .map_err(to_storage_err)?;
+        Ok(goose_session_to_pond(&gs))
     }
 
-    async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
-        self.sessions
-            .read()
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Session, SessionStorageError> {
+        let gs = self
+            .manager
+            .get_session(session_id, false)
             .await
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))
+            .map_err(to_storage_err)?;
+        Ok(goose_session_to_pond(&gs))
     }
 
     async fn add_message(
@@ -57,83 +123,117 @@ impl SessionStorage for GooseSessionAdapter {
         session_id: String,
         message: SessionMessage,
     ) -> Result<SessionMessage, SessionStorageError> {
-        // Ensure session exists
-        self.get_session(&session_id).await?;
-
-        // Add message to the session
-        let mut messages = self.messages.write().await;
-        if let Some(msgs) = messages.get_mut(&session_id) {
-            msgs.push(message.clone());
-        } else {
-            messages.insert(session_id, vec![message.clone()]);
-        }
-
+        let goose_msg =
+            pond_role_to_goose_message(&message.message.role, &message.message.content);
+        self.manager
+            .add_message(&session_id, &goose_msg)
+            .await
+            .map_err(to_storage_err)?;
         Ok(message)
     }
 
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError> {
-        // Ensure session exists
-        self._get_session(session_id).await?;
-
-        Ok(self
-            .messages
-            .read()
+    async fn get_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        let gs = self
+            .manager
+            .get_session(session_id, true)
             .await
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default())
+            .map_err(to_storage_err)?;
+
+        let messages = gs
+            .conversation
+            .as_ref()
+            .map(|conv| {
+                conv.messages()
+                    .iter()
+                    .map(|m| goose_message_to_pond(m, session_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(messages)
     }
 
-    async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
-        self.sessions.write().await.remove(session_id);
-        self.messages.write().await.remove(session_id);
+    async fn delete_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.manager
+            .delete_session(session_id)
+            .await
+            .map_err(to_storage_err)?;
         Ok(())
     }
-}
 
-impl GooseSessionAdapter {
-    /// Internal helper method to check session existence
-    async fn _get_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
-        self.sessions
-            .read()
+    async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
+        let goose_sessions = self
+            .manager
+            .list_sessions()
             .await
-            .contains_key(session_id)
-            .then_some(())
-            .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))
+            .map_err(to_storage_err)?;
+        Ok(goose_sessions.iter().map(goose_session_to_pond).collect())
+    }
+
+    async fn get_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        // Goose has no native pagination — fetch all and slice in memory.
+        // Acceptable for thin bridge; can be optimized later if needed.
+        let all = self.get_messages(session_id).await?;
+        let paginated = all.into_iter().skip(offset).take(limit).collect();
+        Ok(paginated)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::domain::message::ChatMessage;
 
-    #[tokio::test]
-    async fn test_create_session() {
-        let adapter = GooseSessionAdapter::new();
-        let session = adapter.create_session("session-1".to_string()).await.unwrap();
-        assert_eq!(session.id, "session-1");
+    #[test]
+    fn goose_session_maps_to_pond() {
+        let gs = GooseSession {
+            id: "test-123".to_string(),
+            working_dir: PathBuf::from("."),
+            name: "My Chat".to_string(),
+            user_set_name: false,
+            session_type: SessionType::User,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            extension_data: Default::default(),
+            total_tokens: None,
+            input_tokens: None,
+            output_tokens: None,
+            accumulated_total_tokens: None,
+            accumulated_input_tokens: None,
+            accumulated_output_tokens: None,
+            schedule_id: None,
+            recipe: None,
+            user_recipe_values: None,
+            conversation: None,
+            message_count: 0,
+            provider_name: None,
+            model_config: None,
+        };
+
+        let pond = goose_session_to_pond(&gs);
+        assert_eq!(pond.id, "test-123");
+        assert_eq!(pond.title, Some("My Chat".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_add_and_retrieve_messages() {
-        let adapter = GooseSessionAdapter::new();
-        adapter.create_session("session-1".to_string()).await.unwrap();
+    #[test]
+    fn pond_message_maps_to_goose_and_back() {
+        let goose_msg = pond_role_to_goose_message(&Role::User, "Hello");
+        assert_eq!(goose_msg.as_concat_text(), "Hello");
+        assert_eq!(goose_msg.role, GooseRole::User);
 
-        let message = ChatMessage::user("Hello from Goose");
-        let session_message = SessionMessage::new(
-            "msg-1".to_string(),
-            "session-1".to_string(),
-            message,
-        );
-
-        adapter
-            .add_message("session-1".to_string(), session_message)
-            .await
-            .unwrap();
-
-        let messages = adapter.get_messages("session-1").await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message.content, "Hello from Goose");
+        let pond_msg = goose_message_to_pond(&goose_msg, "sess-1");
+        assert_eq!(pond_msg.message.content, "Hello");
+        assert_eq!(pond_msg.message.role, Role::User);
+        assert_eq!(pond_msg.session_id, "sess-1");
     }
 }

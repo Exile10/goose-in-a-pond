@@ -13,10 +13,14 @@ use axum::{
     Router,
 };
 use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::domain::session::SessionMessage;
+use pond_core::domain::message::ChatMessage;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::services::onboarding::OnboardingService;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::middleware::onboarding_guard::require_onboarding_complete;
@@ -38,6 +42,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
         .route("/chat", post(chat))
+        .route("/sessions", get(list_sessions))
         .route("/devices", get(list_devices).post(register_device))
         .route("/settings", get(get_settings).put(update_settings))
         .layer(
@@ -155,12 +160,113 @@ async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// TODO: Wire to ChatService + LlmProvider
-async fn chat() -> Json<Value> {
-    Json(json!({
-        "status": "todo",
-        "message": "Chat endpoint not yet wired to ChatService"
-    }))
+#[derive(Deserialize)]
+struct ChatRequest {
+    session_id: Option<String>,
+    message: String,
+}
+
+/// Send a message and get a response.
+///
+/// Creates a new session if `session_id` is not provided.
+/// Persists both user and assistant messages to session storage.
+async fn chat(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let storage = &state.session_storage;
+
+    // Ensure session exists
+    if storage.get_session(&session_id).await.is_err() {
+        storage
+            .create_session(session_id.clone())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Failed to create session: {}", e)})),
+                )
+            })?;
+    }
+
+    // Persist user message
+    let user_msg = SessionMessage::new(
+        Uuid::new_v4().to_string(),
+        session_id.clone(),
+        ChatMessage::user(&req.message),
+    );
+    storage
+        .add_message(session_id.clone(), user_msg)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to persist message: {}", e)})),
+            )
+        })?;
+
+    // TODO: Wire to a real LlmProvider for AI-generated responses.
+    // For now, echo back to confirm the endpoint works end-to-end.
+    let response_text = format!("Received: {}", req.message);
+
+    // Persist assistant response
+    let assistant_msg = SessionMessage::new(
+        Uuid::new_v4().to_string(),
+        session_id.clone(),
+        ChatMessage::assistant(&response_text),
+    );
+    storage
+        .add_message(session_id.clone(), assistant_msg)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to persist response: {}", e)})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "response": response_text,
+    })))
+}
+
+/// List all sessions, ordered by most recently updated first.
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sessions = state
+        .session_storage
+        .list_sessions()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to list sessions: {}", e)})),
+            )
+        })?;
+
+    let session_list: Vec<Value> = sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.title,
+                "created_at": s.created_at.to_rfc3339(),
+                "updated_at": s.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "sessions": session_list })))
 }
 
 async fn system_info() -> Json<Value> {
