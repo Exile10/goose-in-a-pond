@@ -73,7 +73,9 @@ impl ChatService {
             .await?;
 
         let response_text = if let Some(provider) = &self.provider {
-            // Load full conversation history for context-aware completions
+            // Load conversation history for context-aware completions.
+            // NOTE: For long conversations, consider using get_messages_paginated()
+            // with a token-budget strategy to limit context size.
             let stored = self
                 .session_storage
                 .get_messages(&self.session_id)
