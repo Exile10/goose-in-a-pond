@@ -6,10 +6,10 @@
 //! - [ ] Serve static web dashboard files
 
 use axum::{
-    extract::{rejection::JsonRejection, Multipart, State},
+    extract::{rejection::JsonRejection, Multipart, Path, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use pond_core::domain::onboarding::OnboardingStep;
@@ -43,6 +43,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
         .route("/chat", post(chat))
         .route("/sessions", get(list_sessions))
+        .route("/sessions/{session_id}", patch(rename_session))
         .route("/devices", get(list_devices).post(register_device))
         .route("/settings", get(get_settings).put(update_settings))
         .layer(
@@ -267,6 +268,47 @@ async fn list_sessions(
         .collect();
 
     Ok(Json(json!({ "sessions": session_list })))
+}
+
+#[derive(Deserialize)]
+struct RenameSessionRequest {
+    title: String,
+}
+
+/// Rename a session (set or update its title).
+///
+/// PATCH /api/v1/sessions/:session_id
+/// Body: { "title": "New Title" }
+async fn rename_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    body: Result<Json<RenameSessionRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    state
+        .session_storage
+        .update_title(&session_id, req.title.clone())
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                pond_core::ports::session_storage::SessionStorageError::SessionNotFound(_) => {
+                    StatusCode::NOT_FOUND
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "title": req.title,
+    })))
 }
 
 async fn system_info() -> Json<Value> {

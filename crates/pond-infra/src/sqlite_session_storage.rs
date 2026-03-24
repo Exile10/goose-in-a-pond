@@ -167,6 +167,25 @@ impl SessionStorage for SqliteSessionStorage {
         rows.into_iter().map(SessionMessage::try_from).collect()
     }
 
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        sqlx::query(
+            "UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
         // ON DELETE CASCADE handles session_messages automatically
         sqlx::query("DELETE FROM sessions WHERE id = ?")
@@ -331,6 +350,23 @@ mod tests {
         let s = make_storage().await;
         let session = s.create_session("sess-1".to_string()).await.unwrap();
         assert_eq!(session.title, None);
+    }
+
+    #[tokio::test]
+    async fn update_title_sets_and_persists() {
+        let s = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+
+        s.update_title("sess-1", "Weather Chat".to_string()).await.unwrap();
+        let session = s.get_session("sess-1").await.unwrap();
+        assert_eq!(session.title, Some("Weather Chat".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_title_on_missing_session_errors() {
+        let s = make_storage().await;
+        let result = s.update_title("missing", "Nope".to_string()).await;
+        assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
     }
 
     #[tokio::test]
