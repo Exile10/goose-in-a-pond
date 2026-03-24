@@ -84,6 +84,20 @@ impl SessionStorage for InMemorySessionStorage {
             .unwrap_or_default())
     }
 
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))?;
+        session.title = Some(title);
+        session.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
         self.sessions.write().await.remove(session_id);
         self.messages.write().await.remove(session_id);
@@ -258,6 +272,25 @@ mod tests {
         // Offset past end
         let empty = storage.get_messages_paginated(&session_id, 3, 100).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_title() {
+        let storage = InMemorySessionStorage::new();
+        storage.create_session("session-1".to_string()).await.unwrap();
+
+        // Title starts as None
+        let session = storage.get_session("session-1").await.unwrap();
+        assert_eq!(session.title, None);
+
+        // Update title
+        storage.update_title("session-1", "My Chat".to_string()).await.unwrap();
+        let session = storage.get_session("session-1").await.unwrap();
+        assert_eq!(session.title, Some("My Chat".to_string()));
+
+        // Update title on nonexistent session fails
+        let result = storage.update_title("nonexistent", "Nope".to_string()).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

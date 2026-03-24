@@ -156,6 +156,20 @@ impl SessionStorage for GooseSessionAdapter {
         Ok(messages)
     }
 
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError> {
+        self.manager
+            .update(session_id)
+            .user_provided_name(&title)
+            .apply()
+            .await
+            .map_err(to_storage_err)?;
+        Ok(())
+    }
+
     async fn delete_session(
         &self,
         session_id: &str,
