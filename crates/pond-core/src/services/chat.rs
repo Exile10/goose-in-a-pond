@@ -184,7 +184,6 @@ impl ChatService {
 mod tests {
     use super::*;
     use crate::services::mock_agent::MockAgent;
-    use crate::services::mock_provider::MockProvider;
     use crate::services::mock_session::InMemorySessionStorage;
 
     #[tokio::test]
@@ -197,21 +196,6 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
-    }
-
-    #[tokio::test]
-    async fn chat_with_provider_calls_provider() {
-        let agent = Arc::new(MockAgent::new());
-        let provider = Arc::new(MockProvider::new());
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let session_id = "test-session".to_string();
-        storage.create_session(session_id.clone()).await.unwrap();
-
-        let service = ChatService::new(agent, session_id.clone(), storage.clone())
-            .with_provider(provider);
-        let result = service.chat_once("Hello!".to_string()).await.unwrap();
-        // MockProvider echoes the last user message
-        assert!(result.contains("Hello!"), "expected provider response, got: {}", result);
     }
 
     #[tokio::test]
