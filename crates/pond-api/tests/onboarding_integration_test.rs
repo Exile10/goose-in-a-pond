@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_api::{AppState, build_router};
+use reqwest::Client as ReqwestClient;
 use pond_infra::mock_handshake::MockHandshake;
 
 // ─────────────────────────────────────────────────────────────────
@@ -48,13 +49,17 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
 
+    let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
+        Arc::new(pond_infra::sqlite_session_storage::SqliteSessionStorage::new(db.system.clone()));
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(MockRepo::new(step)) as Arc<dyn OnboardingRepository + Send + Sync>,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
+        session_storage,
+        http_client: ReqwestClient::new(),
     });
-    (build_router(state), tmp)
+    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
 
 // ─────────────────────────────────────────────────────────────────
