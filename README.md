@@ -40,11 +40,90 @@ We use a **Hexagonal (Ports & Adapters)** architecture to keep our core logic ("
    ```bash
    git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
    ```
-2. **Setup Environment**:
+
+2. **Build** (fast — skips Goose compilation):
    ```bash
-   cargo build --workspace
+   cargo build -p pond-core -p pond-infra -p pond-api -p pond-server
    ```
-3. **Run the Server**:
+
+3. **First-time setup** — initializes the database and downloads the Whisper ASR model (~141 MB):
    ```bash
-   cargo run -p pond-server
+   cargo run -p pond-server -- setup
+   # Optional: choose model size
+   cargo run -p pond-server -- setup --model tiny    # ~39 MB
+   cargo run -p pond-server -- setup --model small   # ~244 MB
    ```
+
+4. **Run** the HTTP server (dashboard + REST API):
+   ```bash
+   cargo run -p pond-server -- serve [--port 4000] [--open]
+   ```
+
+5. **Chat** — interactive voice/text loop:
+   ```bash
+   # Text mode (default)
+   cargo run -p pond-server -- chat
+
+   # With a local LLM (llamafile must be running on port 8080)
+   cargo run -p pond-server -- chat --provider llamafile
+
+   # Microphone mode (whisper.cpp server must be running on port 9000)
+   cargo run -p pond-server -- chat --input whisper
+   cargo run -p pond-server -- chat --input whisper --provider llamafile
+   ```
+
+---
+
+## 🎤 Voice Input (Whisper ASR)
+
+Goose in a Pond uses [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for speech-to-text.
+
+1. **Download a model** (done automatically by `pond-server setup`).
+
+2. **Build and run the whisper.cpp server**:
+
+   **Linux / macOS**
+   ```bash
+   git clone https://github.com/ggerganov/whisper.cpp
+   cd whisper.cpp && make server
+   ./server -m /path/to/ggml-base.en.bin --port 9000
+   ```
+
+   **Windows** — build with CMake (requires Visual Studio or MinGW) or use [WSL](https://learn.microsoft.com/en-us/windows/wsl/):
+   ```powershell
+   git clone https://github.com/ggerganov/whisper.cpp
+   cd whisper.cpp
+   cmake -B build
+   cmake --build build --config Release --target server
+   .\build\bin\Release\server.exe -m C:\path\to\ggml-base.en.bin --port 9000
+   ```
+
+   > The model path for `pond-server setup` defaults to:
+   > - **Linux/macOS**: `~/.local/share/goose-in-a-pond/models/ggml-base.en.bin`
+   > - **Windows**: `%APPDATA%\goose-in-a-pond\models\ggml-base.en.bin`
+
+3. **Start the assistant in voice mode**:
+   ```bash
+   cargo run -p pond-server -- chat --input whisper
+   ```
+
+The adapter posts audio to `POST /inference` (whisper.cpp's native HTTP API) — no native C++ bindings, no long compile times.
+
+---
+
+## 🧪 Testing
+
+```bash
+# All tests
+cargo test
+
+# Single crate (fast iteration)
+cargo test -p pond-core
+cargo test -p pond-adapters-whisper
+
+# Run the live whisper integration test (requires whisper.cpp server on port 9000)
+cargo test -p pond-adapters-whisper -- --ignored live_transcription_of_jfk_wav
+```
+
+Test fixtures live in `tests/blobs/` — `jfk.wav` is the canonical whisper.cpp sample (JFK's 1961 inaugural address, public domain, 16-bit mono 16 kHz).
+

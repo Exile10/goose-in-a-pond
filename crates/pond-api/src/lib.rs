@@ -27,7 +27,7 @@
 //!
 //! # Authentication
 //! Protected routes require a bearer token in the Authorization header:
-//! ```
+//! ```text
 //! Authorization: Bearer <token>
 //! ```
 //!
@@ -41,6 +41,8 @@ pub mod routes;
 
 use axum::{middleware::Next, Router};
 use pond_core::ports::handshake::Handshake;
+use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use std::sync::Arc;
 
@@ -48,14 +50,20 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Arc<Database>,
     pub handshake: Arc<dyn Handshake>,
-    // TODO: Add LlmProvider, ChatService, etc.
+    pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
+    /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
+    pub whisper_url: String,
+    /// Session storage for conversation persistence.
+    pub session_storage: Arc<dyn SessionStorage>,
+    /// Shared HTTP client — reuse across requests to get connection pooling.
+    pub http_client: reqwest::Client,
 }
 
 /// Build the full API router.
 ///
 /// Web dashboard: `/{route_name}`
 /// REST API:      `/api/v1/{route_name}`
-pub fn build_router(state: Arc<AppState>) -> Router {
+pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
     // Create rate limiter: 100 requests per 60 seconds per client
     let rate_limiter = Arc::new(middleware::RateLimiter::new(
         100,
@@ -63,15 +71,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     ));
 
     Router::new()
-        .nest("/api/v1", routes::api_routes())
-        .nest("/", routes::web_routes())
+        .nest("/api/v1", routes::api_routes(state.clone()))
+        .fallback_service(routes::web_routes(static_dir))
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();
             rate_limit_with_limiter(req, next, limiter)
         }))
-        // Apply authentication to protected routes
-        .layer(axum::middleware::from_fn(middleware::auth_middleware))
         .with_state(state)
 }
 
