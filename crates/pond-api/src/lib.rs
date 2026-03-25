@@ -55,13 +55,15 @@ pub struct AppState {
     pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
     /// Session storage for conversation persistence.
     pub session_storage: Arc<dyn SessionStorage>,
+    /// Shared HTTP client — reuse across requests to get connection pooling.
+    pub http_client: reqwest::Client,
 }
 
 /// Build the full API router.
 ///
 /// Web dashboard: `/{route_name}`
 /// REST API:      `/api/v1/{route_name}`
-pub fn build_router(state: Arc<AppState>) -> Router {
+pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
     // Create rate limiter: 100 requests per 60 seconds per client
     let rate_limiter = Arc::new(middleware::RateLimiter::new(
         100,
@@ -70,7 +72,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .nest("/api/v1", routes::api_routes(state.clone()))
-        .merge(routes::web_routes())
+        .fallback_service(routes::web_routes(static_dir))
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();

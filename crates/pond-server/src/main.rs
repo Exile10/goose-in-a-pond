@@ -64,6 +64,10 @@ enum Commands {
         #[arg(short, long, default_value = "4000")]
         port: u16,
 
+        /// Directory of built web assets (default: web/dist)
+        #[arg(long, default_value = "web/dist")]
+        static_dir: std::path::PathBuf,
+
         /// Open the dashboard in the browser
         #[arg(long)]
         open: bool,
@@ -107,9 +111,9 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { port, open, debug }) => {
+        Some(Commands::Serve { port, static_dir, open, debug }) => {
             init_tracing(debug);
-            run_server(port, open).await
+            run_server(port, static_dir, open).await
         }
         Some(Commands::Chat { provider, input, whisper_url }) => {
             init_tracing(false);
@@ -191,7 +195,7 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(port: u16, open: bool) -> Result<()> {
+async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -212,10 +216,17 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
+        http_client: reqwest::Client::new(),
     });
 
     // Build router
-    let app = pond_api::build_router(state);
+    if !static_dir.exists() {
+        tracing::warn!(
+            "Static dir '{}' not found — web dashboard will not be served. Run `npm run build` in web/",
+            static_dir.display()
+        );
+    }
+    let app = pond_api::build_router(state, static_dir);
 
     // Resolve hostname
     let hostname = hostname::get()
@@ -374,7 +385,7 @@ async fn run_main_menu() -> Result<()> {
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
                 let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, false).await?;
+                run_server(port, std::path::PathBuf::from("web/dist"), false).await?;
             }
             "3" => {
                 run_status().await?;
