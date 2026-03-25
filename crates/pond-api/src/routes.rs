@@ -202,6 +202,11 @@ async fn dashboard_index() -> axum::response::Html<&'static str> {
 }
 
 /// Proxy multipart audio to the whisper.cpp server and return the transcript.
+///
+/// This route is intentionally public (no auth required). It is a local
+/// development / testing tool and is only expected to be reachable from
+/// localhost. Do not expose the GIAP server to the internet without adding
+/// authentication to this endpoint.
 async fn transcribe(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -258,8 +263,8 @@ async fn transcribe(
         .part("file", part)
         .text("response_format", "json");
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .post(&whisper_url)
         .multipart(form)
         .send()

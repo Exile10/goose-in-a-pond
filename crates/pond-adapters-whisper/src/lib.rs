@@ -3,8 +3,8 @@
 //! Implements the `VoiceInput` port by:
 //!   1. Recording audio from the default microphone via `cpal`
 //!   2. Encoding the captured PCM as a WAV file in memory
-//!   3. POSTing the WAV to a local [whisper.cpp server] which speaks the
-//!      OpenAI Whisper API (`POST /v1/audio/transcriptions`)
+//!   3. POSTing the WAV to a local [whisper.cpp server] at `POST /inference`
+//!      (the whisper.cpp server API — not the OpenAI `/v1/audio/transcriptions` path)
 //!   4. Returning the transcribed text
 //!
 //! This keeps the same "local HTTP server" pattern as `pond-adapters-llamafile`
@@ -167,6 +167,26 @@ fn record_mono_f32(duration_secs: u32) -> Result<(Vec<f32>, u32)> {
                             let sum: f32 = frame
                                 .iter()
                                 .map(|&s| s as f32 / i16::MAX as f32)
+                                .sum();
+                            sum / channels as f32
+                        })
+                        .collect();
+                    samples_writer.lock().unwrap().extend_from_slice(&mono);
+                },
+                |e| eprintln!("  ⚠ Audio stream error: {}", e),
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let mono: Vec<f32> = data
+                        .chunks(channels)
+                        .map(|frame| {
+                            let sum: f32 = frame
+                                .iter()
+                                .map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0)
                                 .sum();
                             sum / channels as f32
                         })

@@ -52,6 +52,8 @@ pub struct AppState {
     pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
     /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
     pub whisper_url: String,
+    /// Shared HTTP client — reuse across requests to get connection pooling.
+    pub http_client: reqwest::Client,
     // TODO: Add LlmProvider, ChatService, etc.
 }
 
