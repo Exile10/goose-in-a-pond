@@ -214,11 +214,14 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
+    let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
+        Arc::new(SqliteSessionStorage::new(db.system.clone()));
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
+        session_storage,
         http_client: reqwest::Client::new(),
     });
 
@@ -279,8 +282,16 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
     let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
-    // Ignore duplicate-key error: session already exists from a prior run
-    let _ = storage.create_session(session_id.clone()).await;
+    // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
+    if let Err(e) = storage.create_session(session_id.clone()).await {
+        match e {
+            pond_core::ports::session_storage::SessionStorageError::StorageError(_) => {
+                // Likely a duplicate key — session already exists, which is fine
+                tracing::debug!("Session already exists, reusing: {}", session_id);
+            }
+            other => return Err(other.into()),
+        }
+    }
 
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage);
 

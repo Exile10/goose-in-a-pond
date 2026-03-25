@@ -4340,6 +4340,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6830,12 +6836,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "goose",
  "pond-core",
  "rmcp 0.16.0",
  "serde",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6865,6 +6873,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pond-adapters-ollama"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pond-core",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -6898,6 +6920,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "tower-http",
+ "uuid",
 ]
 
 [[package]]
@@ -6938,11 +6962,14 @@ dependencies = [
  "chrono",
  "hostname",
  "pond-core",
+ "reqwest 0.13.2",
  "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -6955,6 +6982,7 @@ dependencies = [
  "dirs 5.0.1",
  "hostname",
  "pond-adapters-llamafile",
+ "pond-adapters-ollama",
  "pond-adapters-whisper",
  "pond-api",
  "pond-core",
@@ -10216,13 +10244,19 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
+ "http-range-header",
+ "httpdate",
  "iri-string",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
  "tokio",
  "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

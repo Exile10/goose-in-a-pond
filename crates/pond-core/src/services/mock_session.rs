@@ -84,10 +84,45 @@ impl SessionStorage for InMemorySessionStorage {
             .unwrap_or_default())
     }
 
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))?;
+        session.title = Some(title);
+        session.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
         self.sessions.write().await.remove(session_id);
         self.messages.write().await.remove(session_id);
         Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
+        let sessions = self.sessions.read().await;
+        let mut result: Vec<Session> = sessions.values().cloned().collect();
+        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(result)
+    }
+
+    async fn get_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        self._get_session(session_id).await?;
+
+        let messages = self.messages.read().await;
+        let msgs = messages.get(session_id).cloned().unwrap_or_default();
+        let paginated = msgs.into_iter().skip(offset).take(limit).collect();
+        Ok(paginated)
     }
 }
 
@@ -192,6 +227,70 @@ mod tests {
 
         let get_result = storage.get_session("session-1").await;
         assert!(get_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions() {
+        let storage = InMemorySessionStorage::new();
+        storage.create_session("session-1".to_string()).await.unwrap();
+        storage.create_session("session-2".to_string()).await.unwrap();
+
+        let sessions = storage.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_paginated() {
+        let storage = InMemorySessionStorage::new();
+        let session_id = "session-1".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        for i in 0..10 {
+            let msg = ChatMessage::user(format!("Message {}", i));
+            let session_msg = SessionMessage::new(
+                format!("msg-{}", i),
+                session_id.clone(),
+                msg,
+            );
+            storage
+                .add_message(session_id.clone(), session_msg)
+                .await
+                .unwrap();
+        }
+
+        // Get first 3 messages
+        let page1 = storage.get_messages_paginated(&session_id, 3, 0).await.unwrap();
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page1[0].message.content, "Message 0");
+        assert_eq!(page1[2].message.content, "Message 2");
+
+        // Get next 3 messages
+        let page2 = storage.get_messages_paginated(&session_id, 3, 3).await.unwrap();
+        assert_eq!(page2.len(), 3);
+        assert_eq!(page2[0].message.content, "Message 3");
+
+        // Offset past end
+        let empty = storage.get_messages_paginated(&session_id, 3, 100).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_title() {
+        let storage = InMemorySessionStorage::new();
+        storage.create_session("session-1".to_string()).await.unwrap();
+
+        // Title starts as None
+        let session = storage.get_session("session-1").await.unwrap();
+        assert_eq!(session.title, None);
+
+        // Update title
+        storage.update_title("session-1", "My Chat".to_string()).await.unwrap();
+        let session = storage.get_session("session-1").await.unwrap();
+        assert_eq!(session.title, Some("My Chat".to_string()));
+
+        // Update title on nonexistent session fails
+        let result = storage.update_title("nonexistent", "Nope".to_string()).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

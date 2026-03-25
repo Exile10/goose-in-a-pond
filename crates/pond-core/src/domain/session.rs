@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A single message within a session, including metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMessage {
     pub id: String,
     pub session_id: String,
@@ -23,9 +23,10 @@ impl SessionMessage {
 }
 
 /// Represents a conversation session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -35,6 +36,7 @@ impl Session {
         let now = Utc::now();
         Self {
             id,
+            title: None,
             created_at: now,
             updated_at: now,
         }

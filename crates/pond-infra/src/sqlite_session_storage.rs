@@ -14,6 +14,7 @@ use sqlx::{Pool, Sqlite};
 #[derive(sqlx::FromRow)]
 struct SessionRow {
     id:         String,
+    title:      Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -60,6 +61,7 @@ impl TryFrom<SessionRow> for Session {
     fn try_from(r: SessionRow) -> Result<Self, Self::Error> {
         Ok(Session {
             id:         r.id,
+            title:      r.title,
             created_at: parse_dt(&r.created_at),
             updated_at: parse_dt(&r.updated_at),
         })
@@ -94,8 +96,8 @@ impl SqliteSessionStorage {
 impl SessionStorage for SqliteSessionStorage {
     async fn create_session(&self, session_id: String) -> Result<Session, SessionStorageError> {
         sqlx::query(
-            "INSERT INTO sessions (id, created_at, updated_at) \
-             VALUES (?, datetime('now'), datetime('now'))",
+            "INSERT INTO sessions (id, title, created_at, updated_at) \
+             VALUES (?, NULL, datetime('now'), datetime('now'))",
         )
         .bind(&session_id)
         .execute(&self.pool)
@@ -107,7 +109,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -165,6 +167,25 @@ impl SessionStorage for SqliteSessionStorage {
         rows.into_iter().map(SessionMessage::try_from).collect()
     }
 
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        sqlx::query(
+            "UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
         // ON DELETE CASCADE handles session_messages automatically
         sqlx::query("DELETE FROM sessions WHERE id = ?")
@@ -173,6 +194,42 @@ impl SessionStorage for SqliteSessionStorage {
             .await
             .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            "SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        rows.into_iter().map(Session::try_from).collect()
+    }
+
+    async fn get_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, role, content, created_at \
+             FROM session_messages \
+             WHERE session_id = ? \
+             ORDER BY created_at ASC, rowid ASC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(session_id)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        rows.into_iter().map(SessionMessage::try_from).collect()
     }
 }
 
@@ -244,6 +301,71 @@ mod tests {
         let s = make_storage().await;
         let msg = SessionMessage::new("m1".to_string(), "no-session".to_string(), ChatMessage::user("Hi"));
         let result = s.add_message("no-session".to_string(), msg).await;
+        assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_all_ordered() {
+        let s = make_storage().await;
+        s.create_session("sess-a".to_string()).await.unwrap();
+        s.create_session("sess-b".to_string()).await.unwrap();
+        // Add a message to sess-a to update its updated_at
+        s.add_message(
+            "sess-a".to_string(),
+            SessionMessage::new("m1".to_string(), "sess-a".to_string(), ChatMessage::user("Hi")),
+        ).await.unwrap();
+
+        let sessions = s.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        // sess-a was updated more recently, so it should be first
+        assert_eq!(sessions[0].id, "sess-a");
+        assert_eq!(sessions[1].id, "sess-b");
+    }
+
+    #[tokio::test]
+    async fn get_messages_paginated_works() {
+        let s = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for i in 0..10 {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(format!("m{}", i), "sess-1".to_string(), ChatMessage::user(format!("Msg {}", i))),
+            ).await.unwrap();
+        }
+
+        let page = s.get_messages_paginated("sess-1", 3, 0).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].message.content, "Msg 0");
+
+        let page2 = s.get_messages_paginated("sess-1", 3, 7).await.unwrap();
+        assert_eq!(page2.len(), 3);
+        assert_eq!(page2[0].message.content, "Msg 7");
+
+        let past_end = s.get_messages_paginated("sess-1", 5, 100).await.unwrap();
+        assert!(past_end.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_title_defaults_to_none() {
+        let s = make_storage().await;
+        let session = s.create_session("sess-1".to_string()).await.unwrap();
+        assert_eq!(session.title, None);
+    }
+
+    #[tokio::test]
+    async fn update_title_sets_and_persists() {
+        let s = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+
+        s.update_title("sess-1", "Weather Chat".to_string()).await.unwrap();
+        let session = s.get_session("sess-1").await.unwrap();
+        assert_eq!(session.title, Some("Weather Chat".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_title_on_missing_session_errors() {
+        let s = make_storage().await;
+        let result = s.update_title("missing", "Nope".to_string()).await;
         assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
     }
 
