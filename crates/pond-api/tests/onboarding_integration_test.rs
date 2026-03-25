@@ -56,7 +56,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         whisper_url: "http://127.0.0.1:9000".to_string(),
         http_client: ReqwestClient::new(),
     });
-    (build_router(state), tmp)
+    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
 
 // ─────────────────────────────────────────────────────────────────
