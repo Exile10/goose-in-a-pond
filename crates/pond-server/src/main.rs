@@ -210,6 +210,7 @@ async fn run_server(port: u16, open: bool) -> Result<()> {
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
+        http_client: reqwest::Client::new(),
     });
 
     // Build router
