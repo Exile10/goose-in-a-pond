@@ -108,7 +108,7 @@ fn is_public_route(path: &str) -> bool {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     matches!(
         path,
-        "/" | "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
+        "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
     )
 }
 

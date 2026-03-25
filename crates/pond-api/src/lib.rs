@@ -42,6 +42,7 @@ pub mod routes;
 use axum::{middleware::Next, Router};
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use std::sync::Arc;
 
@@ -49,9 +50,13 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Arc<Database>,
     pub handshake: Arc<dyn Handshake>,
+    pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
     /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
     pub whisper_url: String,
-    pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
+    /// Session storage for conversation persistence.
+    pub session_storage: Arc<dyn SessionStorage>,
+    /// Shared HTTP client — reuse across requests to get connection pooling.
+    pub http_client: reqwest::Client,
 }
 
 /// Build the full API router.

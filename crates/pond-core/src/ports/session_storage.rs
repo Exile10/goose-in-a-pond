@@ -38,6 +38,26 @@ pub trait SessionStorage: Send + Sync {
     /// Get all messages for a session.
     async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError>;
 
+    /// Update the title of a session.
+    async fn update_title(
+        &self,
+        session_id: &str,
+        title: String,
+    ) -> Result<(), SessionStorageError>;
+
     /// Delete a session and all its messages.
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError>;
+
+    /// List all sessions, ordered by most recently updated first.
+    async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError>;
+
+    /// Get messages for a session with pagination.
+    ///
+    /// Returns up to `limit` messages starting from `offset`, ordered chronologically.
+    async fn get_messages_paginated(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError>;
 }
