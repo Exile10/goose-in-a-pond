@@ -100,10 +100,15 @@ impl RateLimiter {
 
 /// Routes that don't require authentication
 fn is_public_route(path: &str) -> bool {
+    // Non-API paths are static web assets — always public
+    if !path.starts_with("/api/") {
+        return true;
+    }
+
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     matches!(
         path,
-        "/" | "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
+        "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
     )
 }
 
@@ -172,6 +177,10 @@ mod tests {
         assert!(!is_public_route("/api/v1/chat"));
         assert!(!is_public_route("/api/v1/devices"));
         assert!(!is_public_route("/api/v1/settings"));
+        // Web dashboard static assets are always public
+        assert!(is_public_route("/"));
+        assert!(is_public_route("/index.html"));
+        assert!(is_public_route("/assets/main.js"));
     }
 
     #[test]
