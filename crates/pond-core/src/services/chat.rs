@@ -300,9 +300,46 @@ impl ChatService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::message::Role;
     use crate::services::mock_agent::MockAgent;
     use crate::services::mock_provider::MockProvider;
     use crate::services::mock_session::InMemorySessionStorage;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    // ── Inline test doubles ───────────────────────────────────────────────────
+
+    /// Appends every (system_prompt, messages) call to its vecs.
+    /// Use this to assert on any call, not just the last one.
+    struct CapturingProvider {
+        all_system_prompts: Arc<Mutex<Vec<String>>>,
+        all_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            messages: Vec<ChatMessage>,
+        ) -> anyhow::Result<ChatMessage> {
+            self.all_system_prompts.lock().unwrap().push(system_prompt.to_string());
+            self.all_messages.lock().unwrap().push(messages);
+            Ok(ChatMessage::assistant("captured response"))
+        }
+        fn model_name(&self) -> String { "capturing".to_string() }
+    }
+
+    /// Always returns an error from `complete()`.
+    struct AlwaysErrorProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysErrorProvider {
+        async fn complete(&self, _: &str, _: Vec<ChatMessage>) -> anyhow::Result<ChatMessage> {
+            Err(anyhow::anyhow!("provider always errors"))
+        }
+        fn model_name(&self) -> String { "always-error".to_string() }
+    }
 
     #[tokio::test]
     async fn chat_once_returns_echo() {
@@ -433,5 +470,86 @@ mod tests {
 
         let _service = ChatService::new(agent, session_id, storage)
             .with_voice_output(Arc::new(PrintOutput));
+    }
+
+    // ── Pipeline integration tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn custom_system_prompt_forwarded_to_provider() {
+        let all_prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            all_system_prompts: all_prompts.clone(),
+            all_messages: Arc::new(Mutex::new(Vec::new())),
+        };
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "prompt-test".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id, storage)
+            .with_provider(Arc::new(provider))
+            .with_system_prompt("custom system prompt".to_string());
+
+        service.chat_once("hello".to_string()).await.unwrap();
+
+        // The first completion call must use the custom prompt
+        // (the provider may also be called a second time for title generation
+        // with TITLE_GENERATION_PROMPT — we only care about the response call).
+        let prompts = all_prompts.lock().unwrap();
+        assert!(
+            prompts.iter().any(|p| p == "custom system prompt"),
+            "expected 'custom system prompt' in one of {:?}",
+            prompts
+        );
+    }
+
+    #[tokio::test]
+    async fn history_included_in_second_call() {
+        let all_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            all_system_prompts: Arc::new(Mutex::new(Vec::new())),
+            all_messages: all_messages.clone(),
+        };
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "history-test".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id, storage)
+            .with_provider(Arc::new(provider));
+
+        service.chat_once("first message".to_string()).await.unwrap();
+        service.chat_once("second message".to_string()).await.unwrap();
+
+        // Find the completion call whose messages include "second message" —
+        // that is the second-turn response call (not the title call).
+        let calls = all_messages.lock().unwrap();
+        let second_turn_call = calls.iter().find(|msgs| {
+            msgs.iter().any(|m| m.content == "second message")
+        });
+        let msgs = second_turn_call
+            .expect("should find call containing 'second message'");
+
+        // History must include the first exchange before the second message.
+        assert!(
+            msgs.iter().any(|m| m.content == "first message"),
+            "second turn must include first message in history; got: {:?}",
+            msgs.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_error_propagates_from_chat_once() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "error-test".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id, storage)
+            .with_provider(Arc::new(AlwaysErrorProvider));
+
+        let result = service.chat_once("hello".to_string()).await;
+        assert!(result.is_err(), "expected Err from always-error provider");
+        assert!(result.unwrap_err().to_string().contains("always errors"));
     }
 }

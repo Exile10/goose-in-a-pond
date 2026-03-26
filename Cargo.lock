@@ -6968,6 +6968,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -7021,6 +7022,7 @@ dependencies = [
  "axum 0.8.8",
  "chrono",
  "hostname",
+ "pond-adapters-llamafile",
  "pond-core",
  "pond-infra",
  "reqwest 0.13.2",
@@ -7031,6 +7033,7 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -7101,10 +7104,12 @@ dependencies = [
  "pond-infra",
  "reqwest 0.13.2",
  "tar",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "webbrowser",
+ "wiremock",
  "zip 2.4.2",
 ]
 

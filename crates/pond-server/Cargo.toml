@@ -26,3 +26,8 @@ webbrowser = { workspace = true }
 zip = { workspace = true }
 flate2 = "1"
 tar = "0.4"
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
