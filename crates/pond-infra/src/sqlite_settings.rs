@@ -1,0 +1,126 @@
+//! SQLite-backed implementation of `SettingsRepository`.
+//!
+//! Uses the existing `settings(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)` table
+//! in `pond_system.db`. Each Setting field maps to one row; missing keys fall back to
+//! `Settings::default()`.
+//!
+//! IMPORTANT: `update()` issues one `INSERT OR REPLACE` per field — never batched into
+//! a single query (sqlx only executes the first statement when multiple are batched).
+
+use anyhow::Result;
+use async_trait::async_trait;
+use pond_core::domain::settings::Settings;
+use pond_core::ports::settings::SettingsRepository;
+use sqlx::{Pool, Sqlite};
+
+pub struct SqliteSettingsRepository {
+    pool: Pool<Sqlite>,
+}
+
+impl SqliteSettingsRepository {
+    pub fn new(pool: Pool<Sqlite>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl SettingsRepository for SqliteSettingsRepository {
+    async fn get(&self) -> Result<Settings> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM settings")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut s = Settings::default();
+        for (key, value) in rows {
+            apply_key(&mut s, &key, &value);
+        }
+        Ok(s)
+    }
+
+    async fn update(&self, settings: &Settings) -> Result<()> {
+        macro_rules! upsert {
+            ($key:expr, $val:expr) => {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO settings (key, value, updated_at) \
+                     VALUES (?, ?, datetime('now'))",
+                )
+                .bind($key)
+                .bind($val)
+                .execute(&self.pool)
+                .await?;
+            };
+        }
+
+        upsert!("assistant_name",                  &settings.assistant_name);
+        upsert!("assistant_personality",           &settings.assistant_personality);
+        upsert!("user_name",                       &settings.user_name);
+        upsert!("timezone",                        &settings.timezone);
+        upsert!("llm_max_tokens",                  settings.llm_max_tokens.to_string());
+        upsert!("llm_temperature",                 settings.llm_temperature.to_string());
+        upsert!("llm_provider",                    &settings.llm_provider);
+        upsert!("voice_wake_word",                 &settings.voice_wake_word);
+        upsert!("voice_tts_voice",                 &settings.voice_tts_voice);
+        upsert!("voice_recording_duration_secs",   settings.voice_recording_duration_secs.to_string());
+        upsert!("voice_whisper_url",               &settings.voice_whisper_url);
+        upsert!("retention_event_log_days",        settings.retention_event_log_days.to_string());
+        upsert!("retention_sensor_days",           settings.retention_sensor_days.to_string());
+        upsert!("retention_session_messages_keep", settings.retention_session_messages_keep.to_string());
+
+        Ok(())
+    }
+
+    async fn get_key(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    async fn set_key(&self, key: &str, value: String) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) \
+             VALUES (?, ?, datetime('now'))",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Apply a single key-value pair from the DB onto a `Settings` struct.
+fn apply_key(s: &mut Settings, key: &str, value: &str) {
+    match key {
+        "assistant_name"                  => s.assistant_name = value.to_string(),
+        "assistant_personality"           => s.assistant_personality = value.to_string(),
+        "user_name"                       => s.user_name = value.to_string(),
+        "timezone"                        => s.timezone = value.to_string(),
+        "llm_max_tokens"                  => {
+            if let Ok(v) = value.parse() { s.llm_max_tokens = v; }
+        }
+        "llm_temperature"                 => {
+            if let Ok(v) = value.parse() { s.llm_temperature = v; }
+        }
+        "llm_provider"                    => s.llm_provider = value.to_string(),
+        "voice_wake_word"                 => s.voice_wake_word = value.to_string(),
+        "voice_tts_voice"                 => s.voice_tts_voice = value.to_string(),
+        "voice_recording_duration_secs"   => {
+            if let Ok(v) = value.parse() { s.voice_recording_duration_secs = v; }
+        }
+        "voice_whisper_url"               => s.voice_whisper_url = value.to_string(),
+        "retention_event_log_days"        => {
+            if let Ok(v) = value.parse() { s.retention_event_log_days = v; }
+        }
+        "retention_sensor_days"           => {
+            if let Ok(v) = value.parse() { s.retention_sensor_days = v; }
+        }
+        "retention_session_messages_keep" => {
+            if let Ok(v) = value.parse() { s.retention_session_messages_keep = v; }
+        }
+        _ => {} // unknown key — ignore
+    }
+}
