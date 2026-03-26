@@ -24,3 +24,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+pond-adapters-llamafile = { workspace = true }
+pond-core = { workspace = true }

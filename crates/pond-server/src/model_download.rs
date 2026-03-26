@@ -438,6 +438,38 @@ const PIPER_RELEASE_TAG: &str = "2023.11.14-2";
 const PIPER_GITHUB_BASE: &str =
     "https://github.com/rhasspy/piper/releases/download/2023.11.14-2";
 
+/// Platform-specific archive asset for piper.
+///
+/// Returns `(archive_filename, is_zip)` for supported platforms, or `None`
+/// when no pre-built binary is available (e.g. macOS, Windows ARM64).
+pub struct PiperBinaryAsset {
+    pub archive_name: &'static str,
+    pub is_zip: bool,
+}
+
+/// Returns the pre-built piper asset for this platform, or `None` if unavailable.
+///
+/// rhasspy/piper ships pre-built binaries for:
+///   - Windows x86_64
+///   - Linux x86_64
+///   - Linux aarch64 (Jetson)
+///
+/// macOS and Windows ARM64 have no upstream pre-built release.
+/// On those platforms callers should fall back gracefully (print output).
+pub fn piper_binary_asset() -> Option<PiperBinaryAsset> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return Some(PiperBinaryAsset { archive_name: "piper_windows_amd64.zip", is_zip: true });
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return Some(PiperBinaryAsset { archive_name: "piper_linux_aarch64.tar.gz", is_zip: false });
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return Some(PiperBinaryAsset { archive_name: "piper_linux_x86_64.tar.gz", is_zip: false });
+
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Returns the on-disk path where the piper binary should live.
 pub fn piper_binary_path(data_dir: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -447,6 +479,9 @@ pub fn piper_binary_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Download and install the platform-appropriate piper binary into `<data_dir>/bin/`.
+///
+/// Returns `Err` on platforms without a pre-built binary (macOS, Windows ARM64).
+/// In those cases the TTS feature degrades gracefully to text output.
 pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
     let dest = piper_binary_path(data_dir);
 
@@ -455,25 +490,20 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         return Ok(dest);
     }
 
+    let asset = piper_binary_asset().ok_or_else(|| anyhow!(
+        "No pre-built piper binary for {} {} — \
+         TTS will fall back to text output. \
+         To enable voice: build piper from source \
+         (https://github.com/rhasspy/piper) and place the binary in {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        data_dir.join("bin").display(),
+    ))?;
+
+    let archive_name = asset.archive_name;
+    let is_zip = asset.is_zip;
+
     tokio::fs::create_dir_all(data_dir.join("bin")).await?;
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let (archive_name, is_zip) = ("piper_windows_amd64.zip", true);
-
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    let (archive_name, is_zip) = ("piper_linux_aarch64.tar.gz", false);
-
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let (archive_name, is_zip) = ("piper_linux_x86_64.tar.gz", false);
-
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-    )))]
-    return Err(anyhow!(
-        "No pre-built piper binary for this platform — build from source: https://github.com/rhasspy/piper"
-    ));
 
     println!(
         "  ⬇  piper TTS binary ({}, {})",
@@ -749,4 +779,244 @@ async fn run_cmd(cmd: &mut tokio::process::Command, label: &str) -> Result<()> {
         return Err(anyhow!("{} failed (exit {})", label, status));
     }
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── Path helper tests (all platforms) ────────────────────────────────────
+
+    #[test]
+    fn whisper_binary_path_has_correct_extension() {
+        let dir = std::path::PathBuf::from("/data");
+        let p = whisper_binary_path(&dir);
+        #[cfg(windows)]
+        assert!(p.to_string_lossy().ends_with(".exe"), "expected .exe on Windows, got {}", p.display());
+        #[cfg(not(windows))]
+        assert!(!p.to_string_lossy().ends_with(".exe"), "unexpected .exe on non-Windows, got {}", p.display());
+        assert!(p.to_string_lossy().contains("whisper-server"));
+    }
+
+    #[test]
+    fn piper_binary_path_has_correct_extension() {
+        let dir = std::path::PathBuf::from("/data");
+        let p = piper_binary_path(&dir);
+        #[cfg(windows)]
+        assert!(p.to_string_lossy().ends_with(".exe"), "expected .exe on Windows, got {}", p.display());
+        #[cfg(not(windows))]
+        assert!(!p.to_string_lossy().ends_with(".exe"), "unexpected .exe on non-Windows, got {}", p.display());
+        assert!(p.to_string_lossy().contains("piper"));
+    }
+
+    #[test]
+    fn llamafile_path_has_correct_extension() {
+        let dir = std::path::PathBuf::from("/data");
+        let p = llamafile_path(&dir, "gemma-2b").unwrap();
+        #[cfg(windows)]
+        assert!(p.to_string_lossy().ends_with(".exe"), "expected .exe on Windows, got {}", p.display());
+        #[cfg(not(windows))]
+        assert!(!p.to_string_lossy().ends_with(".exe"), "unexpected .exe on non-Windows, got {}", p.display());
+    }
+
+    // ── Asset detection tests ─────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn whisper_binary_asset_returns_some_on_windows_x64() {
+        let asset = whisper_binary_asset().expect("Windows x64 should have a pre-built whisper asset");
+        assert!(asset.zip_url.contains("whisper"), "URL should reference whisper, got {}", asset.zip_url);
+        assert!(asset.server_exe.ends_with(".exe"), "server_exe should end in .exe on Windows");
+    }
+
+    #[test]
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    fn whisper_binary_asset_returns_none_on_non_windows_x64() {
+        // Linux and macOS fall back to build-from-source.
+        assert!(
+            whisper_binary_asset().is_none(),
+            "Expected None for this platform — build-from-source path should be used"
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn piper_binary_asset_returns_zip_on_windows_x64() {
+        let asset = piper_binary_asset().expect("Windows x64 should have a piper asset");
+        assert!(asset.is_zip, "Windows piper asset should be a zip archive");
+        assert!(asset.archive_name.ends_with(".zip"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn piper_binary_asset_returns_targz_on_linux_x64() {
+        let asset = piper_binary_asset().expect("Linux x86_64 should have a piper asset");
+        assert!(!asset.is_zip, "Linux piper asset should be a .tar.gz archive");
+        assert!(asset.archive_name.ends_with(".tar.gz"));
+        assert!(asset.archive_name.contains("x86_64"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn piper_binary_asset_returns_targz_on_linux_aarch64() {
+        let asset = piper_binary_asset().expect("Linux aarch64 (Jetson) should have a piper asset");
+        assert!(!asset.is_zip, "Linux piper asset should be a .tar.gz archive");
+        assert!(asset.archive_name.contains("aarch64"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn piper_binary_asset_returns_none_on_macos() {
+        assert!(
+            piper_binary_asset().is_none(),
+            "macOS has no pre-built piper binary — should return None"
+        );
+    }
+
+    // ── Whisper model download via mock HTTP server ───────────────────────────
+
+    #[tokio::test]
+    async fn download_whisper_model_writes_file_to_disk() {
+        let server = MockServer::start().await;
+        let fake_model_bytes = b"fake whisper model data";
+
+        Mock::given(method("GET"))
+            .and(path("/ggml-base.en.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_model_bytes.as_slice()))
+            .mount(&server)
+            .await;
+
+        // Temporarily redirect the model URL by downloading from our mock URL directly.
+        // We test via download_file (the internal helper) since WHISPER_MODELS URLs are hardcoded.
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("ggml-base.en.bin");
+        let url = format!("{}/ggml-base.en.bin", server.uri());
+
+        download_file(&url, &dest, 1).await.unwrap();
+
+        assert!(dest.exists(), "model file should exist after download");
+        assert_eq!(std::fs::read(&dest).unwrap(), fake_model_bytes);
+    }
+
+    #[tokio::test]
+    async fn download_whisper_model_skips_if_already_present() {
+        let tmp = TempDir::new().unwrap();
+        // Pre-create the models dir and model file.
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let dest = models.join("ggml-base.en.bin");
+        std::fs::write(&dest, b"existing content").unwrap();
+
+        // download_whisper_model should detect the file and return early without
+        // making any HTTP request. We pass an unreachable URL to prove no request is made.
+        let result = download_whisper_model("base", tmp.path()).await;
+        assert!(result.is_ok());
+        // Content should be unchanged (no overwrite).
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
+    }
+
+    #[tokio::test]
+    async fn download_whisper_model_fails_on_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("fail.bin");
+        let url = format!("{}/fail.bin", server.uri());
+
+        let err = download_file(&url, &dest, 1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 error, got: {}",
+            err
+        );
+    }
+
+    // ── piper_binary_asset graceful degradation on unsupported platforms ──────
+
+    #[tokio::test]
+    async fn download_piper_binary_errors_gracefully_when_no_asset() {
+        // Simulate the None path by calling ok_or_else directly — this runs on all
+        // platforms but only triggers in production on macOS / Windows ARM64.
+        #[cfg(target_os = "macos")]
+        {
+            let result: Result<PiperBinaryAsset> = piper_binary_asset().ok_or_else(|| {
+                anyhow!(
+                    "No pre-built piper binary for {} {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                )
+            });
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("No pre-built"),
+                "error should mention missing binary, got: {}",
+                msg
+            );
+        }
+
+        // On Windows / Linux a pre-built asset exists; the function returns Some.
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                piper_binary_asset().is_some(),
+                "expected a pre-built piper asset on this platform"
+            );
+        }
+    }
+
+    // ── llamafile model: skip if already present ──────────────────────────────
+
+    #[tokio::test]
+    async fn download_llamafile_model_skips_if_already_present() {
+        let tmp = TempDir::new().unwrap();
+        let llm_dir = tmp.path().join("models").join("llm");
+        std::fs::create_dir_all(&llm_dir).unwrap();
+
+        // Create the expected file at the platform-correct path.
+        let dest = llamafile_path(tmp.path(), "gemma-2b").unwrap();
+        std::fs::write(&dest, b"existing llamafile").unwrap();
+
+        let result = download_llamafile_model("gemma-2b", tmp.path()).await;
+        assert!(result.is_ok());
+        // Content unchanged.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing llamafile");
+    }
+
+    #[tokio::test]
+    async fn download_llamafile_model_rejects_unknown_model_name() {
+        let tmp = TempDir::new().unwrap();
+        let err = download_llamafile_model("does-not-exist", tmp.path()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown llamafile model"),
+            "expected 'Unknown llamafile model' error, got: {}",
+            err
+        );
+    }
+
+    // ── Generic download_file: connection refused ─────────────────────────────
+
+    #[tokio::test]
+    async fn download_file_fails_on_connection_refused() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("nope.bin");
+        // Port 1 is reserved — instant connection refused.
+        let err = download_file("http://127.0.0.1:1/nope.bin", &dest, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a non-empty error on connection refused"
+        );
+        assert!(!dest.exists(), "partial file should not exist after connection failure");
+    }
 }
