@@ -1,4 +1,5 @@
 import SystemStatus from '../components/SystemStatus'
+import WakeWordTest from '../components/WakeWordTest'
 
 interface Props {
   token: string
@@ -13,6 +14,7 @@ export default function Status({ token }: Props) {
       </div>
       <div className="db-page-content">
         <SystemStatus token={token} />
+        <WakeWordTest />
       </div>
     </div>
   )
