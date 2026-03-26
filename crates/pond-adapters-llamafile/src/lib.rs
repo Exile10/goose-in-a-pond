@@ -57,6 +57,8 @@ pub struct LlamafileProvider {
     client: Client,
     endpoint: String,
     model: String,
+    max_tokens: u32,
+    temperature: f32,
 }
 
 impl LlamafileProvider {
@@ -68,7 +70,21 @@ impl LlamafileProvider {
             client: Client::new(),
             endpoint: format!("{}/v1/chat/completions", base),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: 1024,
+            temperature: 0.7,
         }
+    }
+
+    /// Override the maximum number of tokens to generate (default: 1024).
+    pub fn with_max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = n;
+        self
+    }
+
+    /// Override the sampling temperature (default: 0.7).
+    pub fn with_temperature(mut self, t: f32) -> Self {
+        self.temperature = t;
+        self
     }
 }
 
@@ -98,8 +114,8 @@ impl LlmProvider for LlamafileProvider {
         let body = CompletionRequest {
             model: &self.model,
             messages: oai,
-            temperature: 0.7,
-            max_tokens: 512,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
         };
 
         let resp = self

@@ -18,16 +18,22 @@
 //!   8. Prompts for initial onboarding if not yet done
 
 mod model_download;
+mod whisper_process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
-use pond_adapters_whisper::WhisperInput;
+use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
+use pond_core::ports::wake_word::WakeWordDetector;
+use pond_core::services::instant_activation::InstantActivation;
 use pond_api::AppState;
+use pond_core::ports::agent::Agent;
+use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::voice_input::VoiceInput;
 use pond_core::services::chat::ChatService;
+use pond_core::services::fallback_provider::FallbackProvider;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
@@ -95,6 +101,15 @@ enum Commands {
         /// URL of the running whisper.cpp server (only used when --input whisper)
         #[arg(long)]
         whisper_url: Option<String>,
+
+        /// Enable voice-based wake word detection (requires --input whisper).
+        /// Say the trigger phrase to activate the assistant before each turn.
+        #[arg(long, default_value = "goose")]
+        wake_word: Option<String>,
+
+        /// Disable wake word detection (jump straight to listen on each turn).
+        #[arg(long)]
+        no_wake_word: bool,
     },
 
     /// Show system status
@@ -121,9 +136,9 @@ async fn main() -> Result<()> {
             init_tracing(debug);
             run_server(port, static_dir, open).await
         }
-        Some(Commands::Chat { provider, model, input, whisper_url }) => {
+        Some(Commands::Chat { provider, model, input, whisper_url, wake_word, no_wake_word }) => {
             init_tracing(false);
-            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref()).await
+            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref(), wake_word.as_deref(), no_wake_word).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -137,7 +152,7 @@ async fn main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
-            run_chat("mock", None, "stdin", None).await
+            run_chat("mock", None, "stdin", None, None, true).await
         }
     }
 }
@@ -175,26 +190,28 @@ async fn run_setup(model: &str) -> Result<()> {
         model
     };
     let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [2/2] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [2/3] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
     let model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
 
+    // Step 3: Download whisper-server binary
+    println!("\n  [3/3] Downloading whisper-server binary...");
+    let _ = model_download::download_whisper_binary(&data_dir).await;
+
     // Print next steps
-    let model_str = model_path.display();
+    let _ = model_path; // suppress unused warning
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
     println!();
-    println!("  1. Download & build whisper.cpp:");
-    println!("       https://github.com/ggerganov/whisper.cpp");
-    println!();
-    println!("  2. Start the Whisper server:");
-    println!("       ./server -m \"{}\" --port 9000", model_str);
-    println!();
-    println!("  3. Start llamafile (local LLM):");
+    println!("  1. (Optional) Start llamafile for a local LLM:");
     println!("       ./your-model.llamafile");
     println!();
-    println!("  4. Run the assistant:");
+    println!("  2. Run the server (whisper.cpp starts automatically):");
+    println!("       pond-server serve");
+    println!();
+    println!("  3. Or run interactive CLI chat with voice:");
     println!("       pond-server chat --provider llamafile --input whisper");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -212,17 +229,44 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
 
+    // Auto-start whisper.cpp if not already running
+    let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
+        .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+    let _whisper_guard = whisper_process::try_start(&data_dir, &whisper_model, 9000).await;
+
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
     let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
         Arc::new(SqliteSessionStorage::new(db.system.clone()));
+
+    let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+    // Fallback chain: llamafile → ollama → (if both down, ChatService falls back to agent echo)
+    let llamafile = Arc::new(LlamafileProvider::new(None).with_max_tokens(1024));
+    let ollama = Arc::new(OllamaProvider::new(None, None).with_max_tokens(1024));
+    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(
+        Arc::new(FallbackProvider::new(llamafile, ollama))
+    );
+
+    let db = Arc::new(db);
+
+    // Spawn background TTL pruning task (runs every 6 hours)
+    {
+        let logs = db.logs.clone();
+        let system = db.system.clone();
+        tokio::spawn(async move {
+            pond_infra::pruning::run_pruning(logs, system, Default::default()).await;
+        });
+    }
+
     let state = Arc::new(AppState {
-        db: Arc::new(db),
+        db,
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: reqwest::Client::new(),
+        agent,
+        llm_provider,
     });
 
     // Warn if static assets haven't been built yet
@@ -267,7 +311,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
     Ok(())
 }
 
-async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>) -> Result<()> {
+async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>, wake_word: Option<&str>, no_wake_word: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
@@ -278,6 +322,15 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
+
+    // Auto-start whisper.cpp when voice input is requested.
+    let _whisper_guard = if input == "whisper" {
+        let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
+            .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+        whisper_process::try_start(&data_dir, &whisper_model, 9000).await
+    } else {
+        None
+    };
 
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
@@ -334,6 +387,17 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         }
     };
     chat_service = chat_service.with_voice_input(voice);
+
+    // ── Wire wake word detector ──
+    let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
+        Arc::new(InstantActivation)
+    } else {
+        let trigger = wake_word.unwrap_or("goose");
+        let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
+        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, url);
+        Arc::new(WhisperKeywordDetector::new(Some(url), trigger))
+    };
+    chat_service = chat_service.with_wake_word_detector(detector);
 
     chat_service.run_loop().await?;
 
@@ -397,7 +461,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", None, "stdin", None).await?;
+                run_chat("mock", None, "stdin", None, None, true).await?;
             }
             "2" => {
                 println!("Enter port (default 4000): ");

@@ -1,5 +1,9 @@
 //! Whisper ASR adapter for Goose In A Pond.
 //!
+//! Exports:
+//! - `WhisperInput`           — `VoiceInput` port: record mic → whisper → text
+//! - `WhisperKeywordDetector` — `WakeWordDetector` port: poll mic until trigger phrase heard
+//!
 //! Implements the `VoiceInput` port by:
 //!   1. Recording audio from the default microphone via `cpal`
 //!   2. Encoding the captured PCM as a WAV file in memory
@@ -23,6 +27,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pond_core::ports::voice_input::VoiceInput;
+use pond_core::ports::wake_word::WakeWordDetector;
 use std::sync::{Arc, Mutex};
 
 /// Default whisper.cpp server URL.
@@ -274,6 +279,64 @@ fn encode_wav_mono_16k(samples: &[f32]) -> Vec<u8> {
     }
 
     buf
+}
+
+// ── WhisperKeywordDetector ────────────────────────────────────────────────────
+
+/// WakeWordDetector that polls the microphone until the trigger phrase is heard.
+///
+/// Records short clips (default 2 s), transcribes each via whisper.cpp, and
+/// returns `Ok(())` as soon as the transcript contains the trigger word/phrase
+/// (case-insensitive).
+///
+/// This is a polyfill for real-time KWS.  It has ~2 s latency per poll cycle
+/// and requires the whisper server to be running.  On Jetson with the `tiny`
+/// model, one cycle takes roughly 2 s record + 0.5 s inference = 2.5 s.
+///
+/// A dedicated native KWS library (Porcupine, Vosk KWS) will replace this
+/// when always-on wake-word detection is required.
+pub struct WhisperKeywordDetector {
+    whisper: WhisperInput,
+    /// The trigger phrase to listen for (case-insensitive substring match).
+    trigger: String,
+}
+
+impl WhisperKeywordDetector {
+    /// Create a detector listening for `trigger` (e.g. `"goose"`).
+    /// Uses `server_url` for whisper (defaults to `DEFAULT_HOST`).
+    /// Records 2-second clips by default.
+    pub fn new(server_url: Option<&str>, trigger: impl Into<String>) -> Self {
+        Self {
+            whisper: WhisperInput::new(server_url).with_duration(2),
+            trigger: trigger.into().to_lowercase(),
+        }
+    }
+}
+
+#[async_trait]
+impl WakeWordDetector for WhisperKeywordDetector {
+    async fn wait_for_activation(&self) -> Result<()> {
+        loop {
+            match self.whisper.listen().await {
+                Ok(Some(text)) if text.to_lowercase().contains(&self.trigger) => {
+                    tracing::info!("Wake word detected: \"{}\"", text.trim());
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Nothing heard or trigger not in transcript — keep polling
+                    tracing::debug!("No wake word, polling again...");
+                }
+                Err(e) => {
+                    // Log but keep polling — a single failed clip is not fatal
+                    tracing::warn!("Wake word poll error (retrying): {}", e);
+                }
+            }
+        }
+    }
+
+    fn activation_prompt(&self) -> &str {
+        "Say \"Goose\" to activate..."
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
