@@ -87,6 +87,10 @@ pub struct AppState {
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).
     pub camera_storage: Arc<dyn CameraStorage + Send + Sync>,
+    /// Directory to look for user-supplied prompt overrides (e.g. `system.md`).
+    /// Mirrors Goose's `~/.config/goose/prompts/` pattern.
+    /// `None` in tests; `Some($DATA_DIR/prompts)` in production.
+    pub prompt_template_dir: Option<std::path::PathBuf>,
 }
 
 /// Build the full API router.
