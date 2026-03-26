@@ -1,11 +1,12 @@
-//! Whisper GGML model downloader.
+//! Model downloader — Whisper ASR, Piper TTS, and llamafile LLM.
 //!
-//! Downloads quantized Whisper model files from the ggerganov/whisper.cpp
-//! HuggingFace repository into GIAP's data directory.
+//! All models are downloaded into subdirectories of GIAP's data directory:
+//! - `models/ggml-*.bin`        — Whisper GGML models
+//! - `models/tts/`              — Piper voice models
+//! - `models/llm/`              — llamafile LLM models
 //!
-//! These files are loaded by the **whisper.cpp server binary** (a separate
-//! process that `WhisperInput` speaks to over HTTP).  This crate only
-//! handles the one-time download; it does not run inference itself.
+//! llamafile bundles model weights + llama.cpp server into a single executable.
+//! Running it with `--server --port 8080` starts an OpenAI-compatible HTTP server.
 
 use anyhow::{anyhow, Context, Result};
 use std::io::Write as _;
@@ -583,6 +584,106 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
     }
 
     println!("  ✅ piper installed: {}", dest.display());
+    Ok(dest)
+}
+
+// ── llamafile LLM model registry ──────────────────────────────────────────────
+
+/// Metadata for a llamafile model.
+///
+/// llamafile bundles weights + llama.cpp into a single executable.
+/// On Windows the file must have a `.exe` extension to be runnable.
+pub struct LlamafileModelInfo {
+    /// Short name used in CLI args (e.g. `"gemma-2b"`).
+    pub name:        &'static str,
+    /// Base filename without `.exe` (the extension is added on Windows automatically).
+    pub filename:    &'static str,
+    /// HuggingFace direct-download URL.
+    pub url:         &'static str,
+    /// Approximate compressed download size in MB.
+    pub size_mb:     u64,
+    /// Human-readable description shown during download.
+    pub description: &'static str,
+}
+
+/// Available llamafile LLM models, lightest first.
+pub const LLAMAFILE_MODELS: &[LlamafileModelInfo] = &[
+    LlamafileModelInfo {
+        name:        "llama-1b",
+        filename:    "Llama-3.2-1B-Instruct-Q4_K_M.llamafile",
+        url:         "https://huggingface.co/Mozilla/Llama-3.2-1B-Instruct-llamafile/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.llamafile",
+        size_mb:     1_120,
+        description: "Llama 3.2 1B Instruct Q4_K_M (Meta/Mozilla, ~1.1 GB)",
+    },
+    LlamafileModelInfo {
+        name:        "gemma-2b",
+        filename:    "gemma-2-2b-it.Q4_K_M.llamafile",
+        url:         "https://huggingface.co/Mozilla/gemma-2-2b-it-llamafile/resolve/main/gemma-2-2b-it.Q4_K_M.llamafile",
+        size_mb:     1_950,
+        description: "Gemma 2 2B IT Q4_K_M (Google/Mozilla, ~2.0 GB)",
+    },
+];
+
+/// Default LLM model downloaded during `setup` and used during `serve`.
+pub const DEFAULT_LLAMAFILE_MODEL: &str = "gemma-2b";
+
+/// Directory for LLM models: `<data_dir>/models/llm/`.
+pub fn llm_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join("llm")
+}
+
+/// On-disk path for a llamafile model.
+///
+/// On Windows the `.exe` suffix is appended so the file is directly runnable.
+pub fn llamafile_path(data_dir: &Path, model_name: &str) -> Result<PathBuf> {
+    let info = find_llamafile(model_name)?;
+    let base = llm_models_dir(data_dir).join(info.filename);
+    #[cfg(windows)]
+    return Ok(PathBuf::from(format!("{}.exe", base.display())));
+    #[cfg(not(windows))]
+    Ok(base)
+}
+
+fn find_llamafile(name: &str) -> Result<&'static LlamafileModelInfo> {
+    LLAMAFILE_MODELS
+        .iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| anyhow!("Unknown llamafile model '{}'. Available: {}",
+            name,
+            LLAMAFILE_MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")))
+}
+
+/// Download `model_name` into `<data_dir>/models/llm/` with live progress.
+///
+/// On Unix, `chmod +x` is applied so the file can be executed directly.
+/// On Windows, the file is saved with a `.exe` extension.
+///
+/// Returns the path to the downloaded executable.
+/// If the file already exists it is returned immediately (no re-download).
+pub async fn download_llamafile_model(model_name: &str, data_dir: &Path) -> Result<PathBuf> {
+    let info = find_llamafile(model_name)?;
+    let dir  = llm_models_dir(data_dir);
+    tokio::fs::create_dir_all(&dir).await?;
+
+    let dest = llamafile_path(data_dir, model_name)?;
+
+    if dest.exists() {
+        println!("  ✅ Already downloaded: {}", dest.display());
+        return Ok(dest);
+    }
+
+    println!("  ⬇  {} (~{} MB)", info.description, info.size_mb);
+    println!("     This is a one-time download — it may take several minutes.");
+    download_file(info.url, &dest, info.size_mb).await?;
+
+    // Make executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to chmod +x {}", dest.display()))?;
+    }
+
     Ok(dest)
 }
 

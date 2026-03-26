@@ -20,6 +20,7 @@ use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::prompts::{build_system_prompt, render_template, sanitize_field, SYSTEM_PROMPT};
 use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
 use serde::Deserialize;
@@ -213,12 +214,48 @@ async fn chat(
             })?;
     }
 
+    // Build the system prompt: user-supplied template file takes priority over
+    // the settings-based builder.  Mirrors Goose's `prompts/system.md` override.
+    let system_prompt = {
+        let settings = state.settings_repo.get().await.ok();
+
+        // Try to load $DATA_DIR/prompts/system.md override
+        let file_template = state
+            .prompt_template_dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
+
+        match (file_template, settings) {
+            (Some(tmpl), Some(s)) => {
+                // Pre-compute sanitized strings so temporaries outlive the borrow
+                let name     = sanitize_field(&s.assistant_name, 50);
+                let user     = sanitize_field(&s.user_name, 50);
+                let persona  = sanitize_field(&s.assistant_personality, 200);
+                let tz       = sanitize_field(&s.timezone, 50);
+                render_template(&tmpl, &[
+                    ("assistant_name", name.as_str()),
+                    ("user_name",      user.as_str()),
+                    ("personality",    persona.as_str()),
+                    ("timezone",       tz.as_str()),
+                ])
+            }
+            (None, Some(s)) => build_system_prompt(
+                &s.assistant_name,
+                &s.user_name,
+                &s.assistant_personality,
+                &s.timezone,
+            ),
+            _ => SYSTEM_PROMPT.to_string(),
+        }
+    };
+
     // Build ChatService — wires LLM provider when available, falls back to agent
     let mut service = ChatService::new(
         state.agent.clone(),
         session_id.clone(),
         storage.clone(),
-    );
+    )
+    .with_system_prompt(system_prompt);
     if let Some(provider) = &state.llm_provider {
         service = service.with_provider(provider.clone());
     }
