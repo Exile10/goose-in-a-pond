@@ -36,6 +36,9 @@ pub struct ChatService {
     wake_word_detector: Arc<dyn WakeWordDetector>,
     session_id: String,
     session_storage: Arc<dyn SessionStorage>,
+    /// System prompt sent to the LLM on every completion call.
+    /// Defaults to `SYSTEM_PROMPT`; override with `with_system_prompt()`.
+    system_prompt: String,
 }
 
 impl ChatService {
@@ -52,6 +55,7 @@ impl ChatService {
             wake_word_detector: Arc::new(InstantActivation),
             session_id,
             session_storage,
+            system_prompt: SYSTEM_PROMPT.to_string(),
         }
     }
 
@@ -80,6 +84,15 @@ impl ChatService {
         self
     }
 
+    /// Override the system prompt sent to the LLM.
+    ///
+    /// Use `pond_core::prompts::build_system_prompt()` to build a personalised
+    /// prompt from `Settings`.  The default is the static `SYSTEM_PROMPT` constant.
+    pub fn with_system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt = prompt;
+        self
+    }
+
     /// Single-shot chat (useful for tests and non-interactive callers).
     pub async fn chat_once(&self, message: String) -> Result<String> {
         // Persist the user message first
@@ -104,7 +117,7 @@ impl ChatService {
             let messages: Vec<ChatMessage> =
                 stored.into_iter().map(|sm| sm.message).collect();
             let messages = context_budget::trim_to_budget(messages);
-            let response = provider.complete(SYSTEM_PROMPT, messages).await?;
+            let response = provider.complete(&self.system_prompt, messages).await?;
             response.content
         } else {
             let request = AgentRequest {
