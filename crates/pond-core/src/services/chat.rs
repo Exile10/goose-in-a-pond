@@ -5,8 +5,10 @@ use crate::ports::agent::Agent;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
 use crate::ports::voice_input::VoiceInput;
+use crate::ports::voice_output::VoiceOutput;
 use crate::ports::wake_word::WakeWordDetector;
 use crate::services::instant_activation::InstantActivation;
+use crate::services::print_output::PrintOutput;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::services::context_budget;
 use crate::services::stdin_input::StdinInput;
@@ -30,6 +32,7 @@ pub struct ChatService {
     agent: Arc<dyn Agent>,
     provider: Option<Arc<dyn LlmProvider>>,
     voice_input: Arc<dyn VoiceInput>,
+    voice_output: Arc<dyn VoiceOutput>,
     wake_word_detector: Arc<dyn WakeWordDetector>,
     session_id: String,
     session_storage: Arc<dyn SessionStorage>,
@@ -45,6 +48,7 @@ impl ChatService {
             agent,
             provider: None,
             voice_input: Arc::new(StdinInput::new()),
+            voice_output: Arc::new(PrintOutput),
             wake_word_detector: Arc::new(InstantActivation),
             session_id,
             session_storage,
@@ -61,6 +65,12 @@ impl ChatService {
     /// Override the input source.  Defaults to `StdinInput`.
     pub fn with_voice_input(mut self, input: Arc<dyn VoiceInput>) -> Self {
         self.voice_input = input;
+        self
+    }
+
+    /// Override the voice output.  Defaults to `PrintOutput` (stdout).
+    pub fn with_voice_output(mut self, output: Arc<dyn VoiceOutput>) -> Self {
+        self.voice_output = output;
         self
     }
 
@@ -241,7 +251,10 @@ impl ChatService {
                     // ── Speak ──
                     self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
                     self.emit_event(WorkflowEvent::AgentOutput(response_text.clone()));
-                    println!("  🗣 {}", response_text);
+                    if let Err(e) = self.voice_output.speak(&response_text).await {
+                        tracing::warn!("TTS failed (non-fatal): {}", e);
+                        println!("  🗣  {}", response_text);
+                    }
                 }
                 Err(e) => {
                     eprintln!("  ❌ Error: {}", e);
@@ -387,7 +400,6 @@ mod tests {
 
     #[tokio::test]
     async fn with_voice_input_builder_compiles() {
-        // Verify the builder pattern compiles and VoiceInput is correctly wired.
         use crate::services::stdin_input::StdinInput;
         let agent = Arc::new(MockAgent::new());
         let storage = Arc::new(InMemorySessionStorage::new());
@@ -396,6 +408,17 @@ mod tests {
 
         let _service = ChatService::new(agent, session_id, storage)
             .with_voice_input(Arc::new(StdinInput::new()));
-        // Just verify this compiles — run_loop() is not called in tests
+    }
+
+    #[tokio::test]
+    async fn with_voice_output_builder_compiles() {
+        use crate::services::print_output::PrintOutput;
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let _service = ChatService::new(agent, session_id, storage)
+            .with_voice_output(Arc::new(PrintOutput));
     }
 }

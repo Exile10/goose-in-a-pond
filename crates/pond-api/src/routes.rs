@@ -13,6 +13,10 @@ use axum::{
     Router,
 };
 use pond_core::domain::message::ChatMessage;
+use pond_core::domain::profile::CreateProfileRequest;
+use pond_core::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::domain::settings::Settings;
+use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
@@ -40,7 +44,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/transcribe", post(transcribe))
         .route("/system/info", get(system_info))
         // Service connectivity test (public — diagnostic tool)
-        .route("/test", get(test_services));
+        .route("/test", get(test_services))
+        .route("/test/speak", post(test_speak));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
@@ -48,7 +53,15 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", patch(rename_session))
         .route("/devices", get(list_devices).post(register_device))
+        .route("/devices/{id}", axum::routing::delete(unregister_device))
+        .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/profiles", get(list_profiles).post(create_profile))
+        .route("/profiles/{id}", get(get_profile).patch(update_profile_prefs).delete(delete_profile))
+        .route("/sensors", post(record_sensor))
+        .route("/sensors/{device_id}", get(get_recent_sensors))
+        .route("/camera/events", get(list_camera_events).post(record_camera_event))
+        .route("/camera/events/{id}/acknowledge", patch(acknowledge_camera_event))
         .layer(
             axum::middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
         );
@@ -310,24 +323,348 @@ async fn system_info() -> Json<Value> {
     }))
 }
 
-async fn list_devices(State(_state): State<Arc<AppState>>) -> Json<Value> {
-    // TODO: Query system DB for registered devices
-    Json(json!({ "devices": [] }))
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let devices = state.device_registry.list_devices().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    let list: Vec<Value> = devices
+        .iter()
+        .map(|d| json!({
+            "id":            d.id,
+            "name":          d.name,
+            "device_type":   d.device_type,
+            "hostname":      d.hostname,
+            "ip_address":    d.ip_address,
+            "capabilities":  d.capabilities,
+            "registered_at": d.registered_at,
+            "last_seen":     d.last_seen,
+            "is_online":     d.is_online,
+        }))
+        .collect();
+    Ok(Json(json!({ "devices": list })))
 }
 
-async fn register_device(State(_state): State<Arc<AppState>>) -> Json<Value> {
-    // TODO: Insert device into system DB
-    Json(json!({ "status": "todo" }))
+async fn register_device(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RegisterDeviceRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+    })?;
+    let device = state.device_registry.register(req).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok((StatusCode::CREATED, Json(json!({
+        "id":            device.id,
+        "name":          device.name,
+        "device_type":   device.device_type,
+        "capabilities":  device.capabilities,
+        "registered_at": device.registered_at,
+        "is_online":     device.is_online,
+    }))))
 }
 
-async fn get_settings(State(_state): State<Arc<AppState>>) -> Json<Value> {
-    // TODO: Query system DB for settings
-    Json(json!({ "settings": {} }))
+async fn unregister_device(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state.device_registry.unregister(&id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn update_settings(State(_state): State<Arc<AppState>>) -> Json<Value> {
-    // TODO: Update settings in system DB
-    Json(json!({ "status": "todo" }))
+async fn device_heartbeat(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state.device_registry.heartbeat(&id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn get_settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let settings = state
+        .settings_repo
+        .get()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to load settings: {}", e)})),
+            )
+        })?;
+    Ok(Json(serde_json::to_value(settings).unwrap_or(json!({}))))
+}
+
+async fn update_settings(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Settings>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(new_settings) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid settings body: {}", e)})),
+        )
+    })?;
+
+    state
+        .settings_repo
+        .update(&new_settings)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to save settings: {}", e)})),
+            )
+        })?;
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+// ── Profile handlers ──────────────────────────────────────────────────────────
+
+async fn list_profiles(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let profiles = state.profile_repo.list().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    let list: Vec<Value> = profiles
+        .iter()
+        .map(|p| json!({
+            "id":           p.id,
+            "display_name": p.display_name,
+            "avatar_emoji": p.avatar_emoji,
+            "preferences":  p.preferences,
+            "created_at":   p.created_at.to_rfc3339(),
+            "updated_at":   p.updated_at.to_rfc3339(),
+        }))
+        .collect();
+    Ok(Json(json!({ "profiles": list })))
+}
+
+async fn create_profile(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CreateProfileRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+    })?;
+    let profile = state.profile_repo.create(req).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok((StatusCode::CREATED, Json(json!({
+        "id":           profile.id,
+        "display_name": profile.display_name,
+        "avatar_emoji": profile.avatar_emoji,
+        "preferences":  profile.preferences,
+        "created_at":   profile.created_at.to_rfc3339(),
+        "updated_at":   profile.updated_at.to_rfc3339(),
+    }))))
+}
+
+async fn get_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let profile = state.profile_repo.get(&id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    match profile {
+        Some(p) => Ok(Json(json!({
+            "id":           p.id,
+            "display_name": p.display_name,
+            "avatar_emoji": p.avatar_emoji,
+            "preferences":  p.preferences,
+            "created_at":   p.created_at.to_rfc3339(),
+            "updated_at":   p.updated_at.to_rfc3339(),
+        }))),
+        None => Err((StatusCode::NOT_FOUND, Json(json!({"error": "profile not found"})))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UpdatePrefsRequest {
+    preferences: std::collections::HashMap<String, String>,
+}
+
+async fn update_profile_prefs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdatePrefsRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+    })?;
+    let profile = state
+        .profile_repo
+        .update_preferences(&id, req.preferences)
+        .await
+        .map_err(|e| {
+            let status = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({"error": e.to_string()})))
+        })?;
+    Ok(Json(json!({
+        "id":           profile.id,
+        "display_name": profile.display_name,
+        "preferences":  profile.preferences,
+        "updated_at":   profile.updated_at.to_rfc3339(),
+    })))
+}
+
+async fn delete_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state.profile_repo.delete(&id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Sensor handlers ───────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SensorReadingRequest {
+    device_id:   String,
+    sensor_type: String,
+    value:       f64,
+    unit:        String,
+}
+
+async fn record_sensor(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SensorReadingRequest>, JsonRejection>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+    })?;
+    let reading = SensorReading {
+        device_id:   req.device_id,
+        sensor_type: req.sensor_type,
+        value:       req.value,
+        unit:        req.unit,
+        recorded_at: chrono::Utc::now(),
+    };
+    state.sensor_storage.record(reading).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(StatusCode::CREATED)
+}
+
+#[derive(serde::Deserialize)]
+struct SensorQueryParams {
+    limit: Option<usize>,
+}
+
+async fn get_recent_sensors(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SensorQueryParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let limit = params.limit.unwrap_or(20).min(100);
+    let readings = state
+        .sensor_storage
+        .get_recent(&device_id, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    let list: Vec<Value> = readings
+        .iter()
+        .map(|r| json!({
+            "device_id":   r.device_id,
+            "sensor_type": r.sensor_type,
+            "value":       r.value,
+            "unit":        r.unit,
+            "recorded_at": r.recorded_at.to_rfc3339(),
+        }))
+        .collect();
+    Ok(Json(json!({ "readings": list })))
+}
+
+// ── Camera handlers ───────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CameraEventRequest {
+    camera_id:     String,
+    event_type:    String,
+    confidence:    Option<f64>,
+    snapshot_path: Option<String>,
+    metadata:      Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CameraQueryParams {
+    camera_id: Option<String>,
+    limit:     Option<usize>,
+}
+
+async fn record_camera_event(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CameraEventRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+    })?;
+    let event = CameraEvent {
+        id:            None,
+        camera_id:     req.camera_id,
+        event_type:    req.event_type,
+        confidence:    req.confidence,
+        snapshot_path: req.snapshot_path,
+        metadata:      req.metadata,
+        acknowledged:  false,
+        created_at:    chrono::Utc::now(),
+    };
+    let id = state.camera_storage.record_event(event).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
+}
+
+async fn list_camera_events(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<CameraQueryParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let camera_id = params.camera_id.as_deref().unwrap_or("default");
+    let limit = params.limit.unwrap_or(20).min(100);
+    let events = state
+        .camera_storage
+        .list_events(camera_id, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    let list: Vec<Value> = events
+        .iter()
+        .map(|e| json!({
+            "id":             e.id,
+            "camera_id":      e.camera_id,
+            "event_type":     e.event_type,
+            "confidence":     e.confidence,
+            "snapshot_path":  e.snapshot_path,
+            "acknowledged":   e.acknowledged,
+            "created_at":     e.created_at.to_rfc3339(),
+        }))
+        .collect();
+    Ok(Json(json!({ "events": list })))
+}
+
+async fn acknowledge_camera_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state.camera_storage.acknowledge(id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 /// Proxy multipart audio to the whisper.cpp server and return the transcript.
@@ -596,6 +933,19 @@ code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
     </div>
     <pre id="fallback-out">—</pre>
   </div>
+
+  <!-- TTS / Piper -->
+  <div class="card">
+    <h2>TTS (Piper)</h2>
+    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Requires server started with <code>--tts piper</code>.</p>
+    <div style="margin-bottom:0.5rem">
+      <textarea id="tts-text">Hello! I am Goose, your local AI assistant.</textarea>
+    </div>
+    <div class="flex">
+      <button onclick="testTts()">▶ Speak on device</button>
+    </div>
+    <pre id="tts-out">—</pre>
+  </div>
 </div>
 
 <script>
@@ -798,6 +1148,24 @@ async function testFallback(){
   }catch(e){out.textContent='Error: '+e.message;}
 }
 
+// ── TTS ───────────────────────────────────────────────────────────────────────
+async function testTts(){
+  const text=document.getElementById('tts-text').value.trim()||'Hello from Goose!';
+  const out=document.getElementById('tts-out');
+  out.textContent='Speaking…';
+  try{
+    const t0=Date.now();
+    const r=await fetch(`${API}/test/speak`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text})
+    });
+    const d=await r.json();
+    d._client_latency_ms=Date.now()-t0;
+    out.textContent=JSON.stringify(d,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 checkServices();
 </script>
@@ -810,6 +1178,48 @@ checkServices();
 /// **Never expose this to the internet.**
 pub async fn dev_test_page() -> Html<&'static str> {
     Html(DEV_TEST_HTML)
+}
+
+/// `POST /api/v1/test/speak`
+///
+/// Synthesise speech on the server device via the configured TTS engine.
+/// Body: `{ "text": "hello world" }`
+/// Response: `{ "status": "ok"|"unavailable", "engine": "piper"|"print"|"none", "text": "..." }`
+async fn test_speak(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Json<Value> {
+    let text = match body {
+        Ok(Json(v)) => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Hello from Goose In A Pond!")
+            .to_string(),
+        Err(_) => "Hello from Goose In A Pond!".to_string(),
+    };
+
+    match &state.tts {
+        Some(tts) => {
+            let t0 = std::time::Instant::now();
+            match tts.speak(&text).await {
+                Ok(()) => Json(json!({
+                    "status": "ok",
+                    "text": text,
+                    "latency_ms": t0.elapsed().as_millis() as u64,
+                })),
+                Err(e) => Json(json!({
+                    "status": "error",
+                    "text": text,
+                    "error": e.to_string(),
+                })),
+            }
+        }
+        None => Json(json!({
+            "status": "unavailable",
+            "text": text,
+            "message": "No TTS engine configured. Start server with --tts piper after running setup.",
+        })),
+    }
 }
 
 /// Hit `url` with a GET, return a status/latency object.
