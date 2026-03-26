@@ -8,15 +8,15 @@
 use axum::{
     extract::{rejection::JsonRejection, Multipart, Path, State},
     http::StatusCode,
-    response::Json,
+    response::{Html, Json},
     routing::{get, patch, post},
     Router,
 };
+use pond_core::domain::message::ChatMessage;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::domain::session::SessionMessage;
-use pond_core::domain::message::ChatMessage;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,7 +38,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/status", get(onboarding_status))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
-        .route("/system/info", get(system_info));
+        .route("/system/info", get(system_info))
+        // Service connectivity test (public — diagnostic tool)
+        .route("/test", get(test_services));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
@@ -198,39 +200,23 @@ async fn chat(
             })?;
     }
 
-    // Persist user message
-    let user_msg = SessionMessage::new(
-        Uuid::new_v4().to_string(),
+    // Build ChatService — wires LLM provider when available, falls back to agent
+    let mut service = ChatService::new(
+        state.agent.clone(),
         session_id.clone(),
-        ChatMessage::user(&req.message),
+        storage.clone(),
     );
-    storage
-        .add_message(session_id.clone(), user_msg)
+    if let Some(provider) = &state.llm_provider {
+        service = service.with_provider(provider.clone());
+    }
+
+    let response_text = service
+        .chat_once(req.message)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to persist message: {}", e)})),
-            )
-        })?;
-
-    // TODO: Wire to a real LlmProvider for AI-generated responses.
-    // For now, echo back to confirm the endpoint works end-to-end.
-    let response_text = format!("Received: {}", req.message);
-
-    // Persist assistant response
-    let assistant_msg = SessionMessage::new(
-        Uuid::new_v4().to_string(),
-        session_id.clone(),
-        ChatMessage::assistant(&response_text),
-    );
-    storage
-        .add_message(session_id.clone(), assistant_msg)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to persist response: {}", e)})),
+                Json(json!({"error": e.to_string()})),
             )
         })?;
 
@@ -436,4 +422,414 @@ async fn transcribe(
 
     let text = json["text"].as_str().unwrap_or("").trim().to_string();
     Ok(Json(json!({"text": text})))
+}
+
+// ── Service connectivity test ─────────────────────────────────────────────────
+
+/// `GET /api/v1/test`
+///
+/// Probes all external services in parallel and returns their status.
+/// Use this to confirm whisper, llamafile, and ollama are reachable before
+/// starting a voice session.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "whisper":   { "status": "ok",          "url": "...", "latency_ms": 12 },
+///   "llamafile": { "status": "unavailable",  "url": "...", "error": "connection refused" },
+///   "ollama":    { "status": "unavailable",  "url": "...", "error": "..." },
+///   "llm":       { "status": "ok",           "provider": "llamafile → ollama", "response": "pong", "latency_ms": 220 }
+/// }
+/// ```
+async fn test_services(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let client = &state.http_client;
+
+    // Run all connectivity checks concurrently.
+    let (whisper_result, llamafile_result, ollama_result) = tokio::join!(
+        probe(client, &state.whisper_url, 3),
+        probe(client, "http://127.0.0.1:8080", 3),
+        probe(client, "http://127.0.0.1:11434", 3),
+    );
+
+    // Optionally probe the wired LLM provider with a real completion.
+    let llm_result = if let Some(provider) = &state.llm_provider {
+        let model_name = provider.model_name();
+        let t0 = std::time::Instant::now();
+        let res = provider
+            .complete(
+                "You are a test service. Reply with exactly one word.",
+                vec![ChatMessage::user("pong")],
+            )
+            .await;
+        let ms = t0.elapsed().as_millis() as u64;
+        match res {
+            Ok(msg) => json!({
+                "status": "ok",
+                "provider": model_name,
+                "response": msg.content.trim(),
+                "latency_ms": ms,
+            }),
+            Err(e) => json!({
+                "status": "error",
+                "provider": model_name,
+                "error": e.to_string(),
+            }),
+        }
+    } else {
+        json!({ "status": "not_configured" })
+    };
+
+    Json(json!({
+        "whisper":   whisper_result,
+        "llamafile": llamafile_result,
+        "ollama":    ollama_result,
+        "llm":       llm_result,
+    }))
+}
+
+// ── Dev test HTML page ────────────────────────────────────────────────────────
+
+const DEV_TEST_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GIAP Dev Test</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:2rem}
+h1{color:#58a6ff;margin-bottom:0.5rem}
+.subtitle{color:#8b949e;font-size:0.8rem;margin-bottom:1.5rem}
+h2{color:#79c0ff;font-size:0.95rem;margin-bottom:0.75rem}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:1.25rem;margin-bottom:1.25rem}
+.row{display:flex;gap:0.75rem;align-items:center;margin-bottom:0.5rem}
+label{color:#8b949e;font-size:0.82rem;min-width:110px}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:0.78rem;font-weight:bold}
+.ok{background:#1a4731;color:#56d364}
+.unavailable{background:#3d1a1a;color:#f85149}
+.pending{background:#2d2a1e;color:#d29922}
+.unknown{background:#21262d;color:#8b949e}
+button{background:#238636;color:#fff;border:none;border-radius:4px;padding:5px 14px;cursor:pointer;font-family:monospace;font-size:0.85rem}
+button:hover{background:#2ea043}
+button:disabled{background:#333;color:#555;cursor:not-allowed}
+button.danger{background:#b91c1c}
+button.danger:hover{background:#dc2626}
+button.danger.pulse{animation:pulse 1s infinite}
+button.secondary{background:#21262d;border:1px solid #30363d}
+button.secondary:hover{background:#30363d}
+textarea,input[type=text]{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:7px;font-family:monospace;font-size:0.85rem}
+textarea{height:70px;resize:vertical}
+pre{background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:10px;font-size:0.78rem;overflow:auto;white-space:pre-wrap;word-break:break-all;max-height:180px;margin-top:0.5rem}
+.ms{color:#8b949e;font-size:0.78rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+.note{color:#8b949e;font-size:0.78rem;margin-bottom:0.75rem}
+@media(max-width:750px){.grid{grid-template-columns:1fr}}
+@keyframes pulse{0%,100%{background:#b91c1c}50%{background:#ef4444}}
+.flex{display:flex;gap:0.5rem;align-items:center;margin-bottom:0.75rem}
+.detected{color:#56d364;font-weight:bold}
+.not-detected{color:#f85149;font-weight:bold}
+code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
+</style>
+</head>
+<body>
+<h1>🦆 GIAP Dev Test Panel</h1>
+<p class="subtitle">⚠ Testing only — never expose this page to the internet.</p>
+
+<!-- Services status -->
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+    <h2>Services</h2>
+    <button onclick="checkServices()">Refresh</button>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.25rem 1rem">
+    <div class="row"><label>Whisper</label><span id="svc-whisper" class="badge unknown">—</span><span id="svc-whisper-ms" class="ms"></span></div>
+    <div class="row"><label>Llamafile</label><span id="svc-llamafile" class="badge unknown">—</span><span id="svc-llamafile-ms" class="ms"></span></div>
+    <div class="row"><label>Ollama</label><span id="svc-ollama" class="badge unknown">—</span><span id="svc-ollama-ms" class="ms"></span></div>
+    <div class="row"><label>LLM Provider</label><span id="svc-llm" class="badge unknown">—</span><span id="svc-llm-ms" class="ms"></span></div>
+  </div>
+  <pre id="svc-detail" style="margin-top:0.5rem;display:none"></pre>
+</div>
+
+<div class="grid">
+  <!-- Chat test -->
+  <div class="card">
+    <h2>Chat</h2>
+    <p class="note">Requires onboarding completed. <button class="secondary" style="padding:2px 8px;font-size:0.75rem" onclick="doOnboard()">Auto-onboard</button></p>
+    <div style="margin-bottom:0.5rem">
+      <input type="text" id="chat-session" placeholder="session_id (blank = new)" style="margin-bottom:6px">
+      <textarea id="chat-msg">What is 2+2?</textarea>
+    </div>
+    <div class="flex">
+      <button onclick="sendChat()">Send</button>
+      <button class="secondary" onclick="clearChat()">Clear</button>
+    </div>
+    <pre id="chat-out">—</pre>
+  </div>
+
+  <!-- Whisper transcription -->
+  <div class="card">
+    <h2>Whisper Transcription</h2>
+    <p class="note">Records mic audio → <code>/api/v1/transcribe</code> → whisper.cpp</p>
+    <div class="flex">
+      <button id="rec-btn" onclick="toggleRecording()">● Record</button>
+      <span id="rec-status" style="font-size:0.8rem;color:#8b949e"></span>
+    </div>
+    <pre id="transcribe-out">—</pre>
+  </div>
+
+  <!-- Wake word test -->
+  <div class="card">
+    <h2>Wake Word Test</h2>
+    <p class="note">Records 3 s → transcribes → looks for <code>"goose"</code> in transcript</p>
+    <div class="flex">
+      <button id="wake-btn" onclick="testWakeWord()">▶ Test (3 s)</button>
+      <span id="wake-status" style="font-size:0.8rem;color:#8b949e"></span>
+    </div>
+    <pre id="wake-out">Say "Goose" during the recording window.</pre>
+  </div>
+
+  <!-- Fallback provider -->
+  <div class="card">
+    <h2>Fallback Provider</h2>
+    <p class="note">Sends a simple prompt through the wired LLM provider (includes fallback chain if configured).</p>
+    <div class="flex">
+      <button onclick="testFallback()">Test</button>
+    </div>
+    <pre id="fallback-out">—</pre>
+  </div>
+</div>
+
+<script>
+const API='/api/v1';
+
+// ── Onboarding ────────────────────────────────────────────────────────────────
+async function doOnboard(){
+  try{
+    const r=await fetch(`${API}/onboard`,{method:'POST'});
+    alert(await r.text());
+  }catch(e){alert('Onboard error: '+e.message);}
+}
+
+// ── Services ──────────────────────────────────────────────────────────────────
+async function checkServices(){
+  ['whisper','llamafile','ollama','llm'].forEach(k=>setBadge(k,'pending','…'));
+  try{
+    const r=await fetch(`${API}/test`);
+    const d=await r.json();
+    renderSvc('whisper',d.whisper);
+    renderSvc('llamafile',d.llamafile);
+    renderSvc('ollama',d.ollama);
+    renderLlm(d.llm);
+    const det=document.getElementById('svc-detail');
+    det.style.display='block';
+    det.textContent=JSON.stringify(d,null,2);
+  }catch(e){
+    ['whisper','llamafile','ollama','llm'].forEach(k=>setBadge(k,'unavailable','error'));
+  }
+}
+function renderSvc(k,s){
+  if(!s)return setBadge(k,'unknown','?');
+  setBadge(k,s.status==='ok'?'ok':'unavailable',s.status==='ok'?'ok':'unavailable');
+  document.getElementById('svc-'+k+'-ms').textContent=s.latency_ms!=null?s.latency_ms+'ms':'';
+}
+function renderLlm(l){
+  if(!l)return setBadge('llm','unknown','?');
+  if(l.status==='not_configured')return setBadge('llm','unknown','not configured');
+  setBadge('llm',l.status==='ok'?'ok':'unavailable',l.provider||l.status);
+  document.getElementById('svc-llm-ms').textContent=l.latency_ms!=null?l.latency_ms+'ms':'';
+}
+function setBadge(k,cls,txt){
+  const el=document.getElementById('svc-'+k);
+  el.className='badge '+cls;el.textContent=txt;
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+async function sendChat(){
+  const msg=document.getElementById('chat-msg').value.trim();
+  if(!msg)return;
+  const si=document.getElementById('chat-session');
+  const out=document.getElementById('chat-out');
+  out.textContent='…';
+  const body={message:msg};
+  if(si.value.trim())body.session_id=si.value.trim();
+  try{
+    const r=await fetch(`${API}/chat`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer dev'},
+      body:JSON.stringify(body)
+    });
+    const d=await r.json();
+    if(d.session_id)si.value=d.session_id;
+    out.textContent=JSON.stringify(d,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+function clearChat(){
+  document.getElementById('chat-session').value='';
+  document.getElementById('chat-out').textContent='—';
+}
+
+// ── WAV encoder (browser → whisper.cpp requires 16-bit PCM WAV, 16 kHz mono) ──
+// Browser MediaRecorder produces WebM/Opus which whisper.cpp cannot decode.
+// We decode via AudioContext, resample to 16 kHz mono, then write a WAV header.
+async function blobToWav(blob){
+  const ab=await blob.arrayBuffer();
+  const ctx=new AudioContext();
+  let decoded;
+  try{decoded=await ctx.decodeAudioData(ab);}
+  finally{ctx.close();}
+  const SR=16000;
+  const len=Math.ceil(decoded.duration*SR);
+  const off=new OfflineAudioContext(1,len,SR);
+  const src=off.createBufferSource();
+  src.buffer=decoded;
+  src.connect(off.destination);
+  src.start(0);
+  const rendered=await off.startRendering();
+  const pcmF32=rendered.getChannelData(0);
+  const pcm16=new Int16Array(pcmF32.length);
+  for(let i=0;i<pcmF32.length;i++){
+    const s=Math.max(-1,Math.min(1,pcmF32[i]));
+    pcm16[i]=s<0?s*0x8000:s*0x7fff;
+  }
+  // Build WAV container
+  const buf=new ArrayBuffer(44+pcm16.byteLength);
+  const v=new DataView(buf);
+  const str=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  str(0,'RIFF');v.setUint32(4,36+pcm16.byteLength,true);str(8,'WAVE');
+  str(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,SR,true);v.setUint32(28,SR*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+  str(36,'data');v.setUint32(40,pcm16.byteLength,true);
+  new Int16Array(buf,44).set(pcm16);
+  return new Blob([buf],{type:'audio/wav'});
+}
+
+// ── Recording helpers ─────────────────────────────────────────────────────────
+let mr=null,chunks=[];
+async function toggleRecording(){
+  if(mr&&mr.state==='recording'){mr.stop();return;}
+  chunks=[];
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    mr=new MediaRecorder(stream);
+    mr.ondataavailable=e=>chunks.push(e.data);
+    mr.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const raw=new Blob(chunks,{type:mr.mimeType});
+      transcribeBlob(raw,'transcribe-out');
+      setRecBtn(false);
+    };
+    mr.start();setRecBtn(true);
+  }catch(e){document.getElementById('transcribe-out').textContent='Mic error: '+e.message;}
+}
+function setRecBtn(on){
+  const b=document.getElementById('rec-btn');
+  const s=document.getElementById('rec-status');
+  if(on){b.textContent='■ Stop';b.classList.add('danger','pulse');s.textContent='Recording…';}
+  else{b.textContent='● Record';b.className='';s.textContent='';}
+}
+async function transcribeBlob(raw,outId){
+  const out=document.getElementById(outId);
+  out.textContent='Converting to WAV…';
+  let wav;
+  try{wav=await blobToWav(raw);}
+  catch(e){out.textContent='WAV encode error: '+e.message;return '';}
+  out.textContent='Transcribing…';
+  const form=new FormData();
+  form.append('audio',wav,'audio.wav');
+  try{
+    const r=await fetch(`${API}/transcribe`,{method:'POST',body:form});
+    const d=await r.json();
+    out.textContent=JSON.stringify(d,null,2);
+    return d.text||'';
+  }catch(e){out.textContent='Error: '+e.message;return '';}
+}
+
+// ── Wake word ─────────────────────────────────────────────────────────────────
+async function testWakeWord(){
+  const btn=document.getElementById('wake-btn');
+  const st=document.getElementById('wake-status');
+  const out=document.getElementById('wake-out');
+  btn.disabled=true;out.textContent='…';
+  let secs=3;
+  st.textContent=`Recording ${secs}s… say "Goose"`;
+  const tick=setInterval(()=>{secs--;if(secs>0)st.textContent=`Recording ${secs}s… say "Goose"`;},1000);
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const wrec=new MediaRecorder(stream);
+    const wchunks=[];
+    wrec.ondataavailable=e=>wchunks.push(e.data);
+    wrec.onstop=async()=>{
+      clearInterval(tick);st.textContent='Converting…';
+      stream.getTracks().forEach(t=>t.stop());
+      const raw=new Blob(wchunks,{type:wrec.mimeType});
+      let wav;
+      try{wav=await blobToWav(raw);}
+      catch(e){out.textContent='WAV encode error: '+e.message;st.textContent='';btn.disabled=false;return;}
+      st.textContent='Transcribing…';
+      const form=new FormData();form.append('audio',wav,'audio.wav');
+      try{
+        const r=await fetch(`${API}/transcribe`,{method:'POST',body:form});
+        const d=await r.json();
+        const text=(d.text||'').toLowerCase();
+        const hit=text.includes('goose');
+        out.textContent=`Transcript: "${d.text||'(empty)'}"\n\nWake word "goose": ${hit?'✅ DETECTED':'❌ not found'}`;
+        st.innerHTML=hit?'<span class="detected">✅ Detected</span>':'<span class="not-detected">❌ Not detected</span>';
+      }catch(e){out.textContent='Error: '+e.message;st.textContent='';}
+      btn.disabled=false;
+    };
+    wrec.start();
+    setTimeout(()=>wrec.stop(),3000);
+  }catch(e){clearInterval(tick);out.textContent='Mic error: '+e.message;st.textContent='';btn.disabled=false;}
+}
+
+// ── Fallback provider ─────────────────────────────────────────────────────────
+async function testFallback(){
+  const out=document.getElementById('fallback-out');
+  out.textContent='Testing…';
+  const t0=Date.now();
+  try{
+    const r=await fetch(`${API}/chat`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer dev'},
+      body:JSON.stringify({message:'Reply with exactly one word: pong'})
+    });
+    const d=await r.json();
+    d._latency_ms=Date.now()-t0;
+    out.textContent=JSON.stringify(d,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+checkServices();
+</script>
+</body>
+</html>"#;
+
+/// `GET /dev/test` — self-contained HTML dev test panel.
+///
+/// Tests whisper, llamafile, ollama, fallback provider, wake word, and chat.
+/// **Never expose this to the internet.**
+pub async fn dev_test_page() -> Html<&'static str> {
+    Html(DEV_TEST_HTML)
+}
+
+/// Hit `url` with a GET, return a status/latency object.
+async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value {
+    let t0 = std::time::Instant::now();
+    match client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await
+    {
+        Ok(_) => json!({
+            "status": "ok",
+            "url": url,
+            "latency_ms": t0.elapsed().as_millis() as u64,
+        }),
+        Err(e) => json!({
+            "status": "unavailable",
+            "url": url,
+            "error": e.to_string(),
+        }),
+    }
 }

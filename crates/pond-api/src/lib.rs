@@ -40,8 +40,10 @@ pub mod middleware;
 pub mod routes;
 
 use axum::{middleware::Next, Router};
+use pond_core::ports::agent::Agent;
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use std::sync::Arc;
@@ -57,6 +59,10 @@ pub struct AppState {
     pub session_storage: Arc<dyn SessionStorage>,
     /// Shared HTTP client — reuse across requests to get connection pooling.
     pub http_client: reqwest::Client,
+    /// Agent used as fallback when no LLM provider is configured.
+    pub agent: Arc<dyn Agent>,
+    /// LLM provider for AI-generated responses. `None` → echo via agent.
+    pub llm_provider: Option<Arc<dyn LlmProvider>>,
 }
 
 /// Build the full API router.
@@ -71,6 +77,8 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
     ));
 
     Router::new()
+        // Dev test page — no auth required, returns HTML
+        .route("/dev/test", axum::routing::get(routes::dev_test_page))
         .nest("/api/v1", routes::api_routes(state.clone()))
         .fallback_service(routes::web_routes(static_dir))
         // Apply rate limiting to all routes

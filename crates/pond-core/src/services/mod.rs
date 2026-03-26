@@ -1,6 +1,9 @@
 pub mod chat;
+pub mod context_budget;
+pub mod fallback_provider;
 pub mod mock_agent;
 pub mod mock_provider;
 pub mod mock_session;
 pub mod onboarding;
+pub mod instant_activation;
 pub mod stdin_input;
