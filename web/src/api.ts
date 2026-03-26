@@ -115,6 +115,6 @@ export const api = {
     get<{ status: string; version: string }>('/health', ''),
 
   /** Send a chat message */
-  chat: (message: string, token: string) =>
-    post<{ status: string; message?: string }>('/chat', { message }, token),
+  chat: (message: string, token: string, sessionId?: string) =>
+    post<{ session_id: string; response: string }>('/chat', { message, session_id: sessionId }, token),
 }
