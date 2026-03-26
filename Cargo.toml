@@ -93,3 +93,4 @@ pond-core = { path = "crates/pond-core" }
 pond-api = { path = "crates/pond-api" }
 pond-infra = { path = "crates/pond-infra" }
 pond-adapters-goose = { path = "crates/pond-adapters-goose" }
+pond-adapters-llamafile = { path = "crates/pond-adapters-llamafile" }
