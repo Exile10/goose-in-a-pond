@@ -97,6 +97,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
+        prompt_template_dir: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
