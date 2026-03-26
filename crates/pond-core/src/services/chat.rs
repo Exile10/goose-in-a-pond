@@ -5,7 +5,10 @@ use crate::ports::agent::Agent;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
 use crate::ports::voice_input::VoiceInput;
+use crate::ports::wake_word::WakeWordDetector;
+use crate::services::instant_activation::InstantActivation;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
+use crate::services::context_budget;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
 use std::io::{self, Write};
@@ -27,6 +30,7 @@ pub struct ChatService {
     agent: Arc<dyn Agent>,
     provider: Option<Arc<dyn LlmProvider>>,
     voice_input: Arc<dyn VoiceInput>,
+    wake_word_detector: Arc<dyn WakeWordDetector>,
     session_id: String,
     session_storage: Arc<dyn SessionStorage>,
 }
@@ -41,6 +45,7 @@ impl ChatService {
             agent,
             provider: None,
             voice_input: Arc::new(StdinInput::new()),
+            wake_word_detector: Arc::new(InstantActivation),
             session_id,
             session_storage,
         }
@@ -59,6 +64,12 @@ impl ChatService {
         self
     }
 
+    /// Override the wake-word detector.  Defaults to `InstantActivation` (no wait).
+    pub fn with_wake_word_detector(mut self, detector: Arc<dyn WakeWordDetector>) -> Self {
+        self.wake_word_detector = detector;
+        self
+    }
+
     /// Single-shot chat (useful for tests and non-interactive callers).
     pub async fn chat_once(&self, message: String) -> Result<String> {
         // Persist the user message first
@@ -73,15 +84,16 @@ impl ChatService {
             .await?;
 
         let response_text = if let Some(provider) = &self.provider {
-            // Load conversation history for context-aware completions.
-            // NOTE: For long conversations, consider using get_messages_paginated()
-            // with a token-budget strategy to limit context size.
+            // Load the most recent 100 messages, then trim to the character
+            // budget before sending to the LLM. This prevents context overflow
+            // on devices with small context windows (e.g. Jetson Orin Nano 7B Q4).
             let stored = self
                 .session_storage
-                .get_messages(&self.session_id)
+                .get_recent_messages(&self.session_id, 100)
                 .await?;
             let messages: Vec<ChatMessage> =
                 stored.into_iter().map(|sm| sm.message).collect();
+            let messages = context_budget::trim_to_budget(messages);
             let response = provider.complete(SYSTEM_PROMPT, messages).await?;
             response.content
         } else {
@@ -190,14 +202,17 @@ impl ChatService {
         loop {
             // ── Wait ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
-            print!(
-                "\n  🟢 Waiting for input (type \"exit\" to quit)\n  {}",
-                self.voice_input.prompt()
+            println!(
+                "\n  🟢 {} (type \"exit\" to quit)",
+                self.wake_word_detector.activation_prompt()
             );
             io::stdout().flush()?;
+            self.wake_word_detector.wait_for_activation().await?;
 
             // ── Listen ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+            print!("  {}", self.voice_input.prompt());
+            io::stdout().flush()?;
 
             let input = match self.voice_input.listen().await? {
                 None => {

@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_api::{AppState, build_router};
+use pond_core::services::mock_agent::MockAgent;
 use reqwest::Client as ReqwestClient;
 use pond_infra::mock_handshake::MockHandshake;
 
@@ -58,6 +59,8 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: ReqwestClient::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
