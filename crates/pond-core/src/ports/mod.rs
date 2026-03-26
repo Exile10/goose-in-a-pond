@@ -1,10 +1,17 @@
 pub mod agent;
+pub mod camera_storage;
 pub mod device_registry;
+pub mod embedding;
 pub mod handshake;
+pub mod memory_repository;
 pub mod notification;
 pub mod provider;
+pub mod profile;
+pub mod sensor_storage;
 pub mod session_storage;
+pub mod settings;
 pub mod storage;
 pub mod onboarding;
 pub mod voice_input;
+pub mod voice_output;
 pub mod wake_word;

@@ -9,6 +9,7 @@ members = [
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",
+    "crates/pond-adapters-piper",
     "crates/pond-adapters-gotg",
     "crates/pond-builder",
 ]

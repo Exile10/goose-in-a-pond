@@ -385,6 +385,259 @@ async fn build_whisper_from_source(data_dir: &Path, dest: &Path) -> Result<PathB
     Ok(dest.to_path_buf())
 }
 
+// ── Piper TTS model download ───────────────────────────────────────────────────
+
+/// HuggingFace base URL for rhasspy/piper-voices.
+const PIPER_VOICES_BASE: &str =
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium";
+
+pub const PIPER_MODEL_FILENAME: &str = "en_US-lessac-medium.onnx";
+const PIPER_MODEL_JSON_FILENAME: &str = "en_US-lessac-medium.onnx.json";
+const PIPER_MODEL_SIZE_MB: u64 = 65;
+
+/// Directory for TTS voice models: `<data_dir>/models/tts/`.
+pub fn tts_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join("tts")
+}
+
+/// Download `en_US-lessac-medium.onnx` + `.onnx.json` into `<data_dir>/models/tts/`.
+///
+/// Both files are required — piper reads the JSON config alongside the ONNX weights.
+/// Returns the path to the `.onnx` file.
+pub async fn download_piper_model(data_dir: &Path) -> Result<PathBuf> {
+    let dir = tts_models_dir(data_dir);
+    tokio::fs::create_dir_all(&dir).await?;
+
+    let onnx_path = dir.join(PIPER_MODEL_FILENAME);
+    let json_path = dir.join(PIPER_MODEL_JSON_FILENAME);
+
+    // Download .onnx weights
+    if onnx_path.exists() {
+        println!("  ✅ Already downloaded: {}", onnx_path.display());
+    } else {
+        let url = format!("{}/{}", PIPER_VOICES_BASE, PIPER_MODEL_FILENAME);
+        download_file(&url, &onnx_path, PIPER_MODEL_SIZE_MB).await?;
+    }
+
+    // Download .onnx.json config (tiny, but required)
+    if json_path.exists() {
+        println!("  ✅ Already downloaded: {}", json_path.display());
+    } else {
+        let url = format!("{}/{}", PIPER_VOICES_BASE, PIPER_MODEL_JSON_FILENAME);
+        download_file(&url, &json_path, 1).await?;
+    }
+
+    Ok(onnx_path)
+}
+
+// ── Piper binary download ──────────────────────────────────────────────────────
+
+/// Pinned Piper release.
+const PIPER_RELEASE_TAG: &str = "2023.11.14-2";
+const PIPER_GITHUB_BASE: &str =
+    "https://github.com/rhasspy/piper/releases/download/2023.11.14-2";
+
+/// Returns the on-disk path where the piper binary should live.
+pub fn piper_binary_path(data_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    return data_dir.join("bin").join("piper.exe");
+    #[cfg(not(windows))]
+    return data_dir.join("bin").join("piper");
+}
+
+/// Download and install the platform-appropriate piper binary into `<data_dir>/bin/`.
+pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
+    let dest = piper_binary_path(data_dir);
+
+    if dest.exists() {
+        println!("  ✅ piper already present: {}", dest.display());
+        return Ok(dest);
+    }
+
+    tokio::fs::create_dir_all(data_dir.join("bin")).await?;
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let (archive_name, is_zip) = ("piper_windows_amd64.zip", true);
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let (archive_name, is_zip) = ("piper_linux_aarch64.tar.gz", false);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let (archive_name, is_zip) = ("piper_linux_x86_64.tar.gz", false);
+
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+    )))]
+    return Err(anyhow!(
+        "No pre-built piper binary for this platform — build from source: https://github.com/rhasspy/piper"
+    ));
+
+    println!(
+        "  ⬇  piper TTS binary ({}, {})",
+        PIPER_RELEASE_TAG, archive_name
+    );
+
+    let url = format!("{}/{}", PIPER_GITHUB_BASE, archive_name);
+    let client = reqwest::Client::builder().build()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to fetch piper binary archive")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("Download returned {}", resp.status()));
+    }
+
+    let total = resp.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut buf: Vec<u8> = if total > 0 {
+        Vec::with_capacity(total as usize)
+    } else {
+        Vec::new()
+    };
+
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.context("Download interrupted")? {
+        buf.extend_from_slice(&chunk);
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let pct = (downloaded * 100) / total;
+            print!(
+                "\r  ⬇  {} / {} MB  ({}%)",
+                downloaded / 1_048_576,
+                total / 1_048_576,
+                pct
+            );
+            std::io::stdout().flush().ok();
+        }
+    }
+    println!();
+
+    let bin_dir = data_dir.join("bin");
+
+    if is_zip {
+        // Windows: extract piper.exe from zip
+        let dest_clone = dest.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let cursor = std::io::Cursor::new(buf);
+            let mut archive = zip::ZipArchive::new(cursor)
+                .context("Failed to open piper zip archive")?;
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i)?;
+                let name = entry.name().to_string();
+                let file_name = std::path::Path::new(&name)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if file_name.is_empty() {
+                    continue;
+                }
+                let out_path = bin_dir.join(&file_name);
+                let mut out_file = std::fs::File::create(&out_path)
+                    .with_context(|| format!("Cannot write {}", out_path.display()))?;
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+                out_file.write_all(&content)?;
+            }
+            let _ = &dest_clone; // suppress unused warning
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Zip extraction task panicked")??;
+    } else {
+        // Linux: extract piper binary from .tar.gz
+        let dest_clone = dest.clone();
+        tokio::task::spawn_blocking(move || {
+            use flate2::read::GzDecoder;
+            use tar::Archive;
+            let gz = GzDecoder::new(std::io::Cursor::new(buf));
+            let mut tar = Archive::new(gz);
+            for entry in tar.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?;
+                let file_name = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if file_name.is_empty() {
+                    continue;
+                }
+                let out_path = bin_dir.join(&file_name);
+                entry.unpack(&out_path)?;
+
+                #[cfg(unix)]
+                if file_name == "piper" {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+            let _ = &dest_clone;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Tar extraction task panicked")??;
+    }
+
+    println!("  ✅ piper installed: {}", dest.display());
+    Ok(dest)
+}
+
+// ── Generic file download helper ──────────────────────────────────────────────
+
+/// Download `url` to `dest`, showing a live progress line.  Skips if `dest` exists.
+async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
+    println!("  ⬇  {} (~{} MB)", dest.file_name().unwrap_or_default().to_string_lossy(), approx_size_mb);
+
+    let client = reqwest::Client::builder().build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch {url}"))?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("Server returned {} for {url}", resp.status()));
+    }
+
+    let total = resp
+        .content_length()
+        .unwrap_or(approx_size_mb * 1_048_576);
+
+    let tmp = dest.with_extension("part");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut downloaded: u64 = 0;
+    let mut resp = resp;
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow!("Download interrupted: {}", e))?
+    {
+        use tokio::io::AsyncWriteExt as _;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| anyhow!("Write error: {}", e))?;
+        downloaded += chunk.len() as u64;
+        let pct = (downloaded * 100) / total.max(1);
+        print!(
+            "\r  ⬇  {} / {} MB  ({}%)",
+            downloaded / 1_048_576,
+            total / 1_048_576,
+            pct
+        );
+        std::io::stdout().flush().ok();
+    }
+
+    println!();
+    tokio::fs::rename(&tmp, dest).await?;
+    println!("  ✅ Saved: {}", dest.display());
+    Ok(())
+}
+
 /// Run a `tokio::process::Command`, streaming its output, and return an error on non-zero exit.
 async fn run_cmd(cmd: &mut tokio::process::Command, label: &str) -> Result<()> {
     let status = cmd
