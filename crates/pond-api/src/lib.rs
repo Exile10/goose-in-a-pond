@@ -42,6 +42,7 @@ pub mod routes;
 use axum::{middleware::Next, Router};
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub struct AppState {
     pub session_storage: Arc<dyn SessionStorage>,
     /// Shared HTTP client — reuse across requests to get connection pooling.
     pub http_client: reqwest::Client,
+    /// LLM provider for the /chat endpoint. Defaults to mock (echo).
+    pub llm_provider: Arc<dyn LlmProvider>,
 }
 
 /// Build the full API router.
