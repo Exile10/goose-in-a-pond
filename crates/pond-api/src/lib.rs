@@ -40,10 +40,19 @@ pub mod middleware;
 pub mod routes;
 
 use axum::{middleware::Next, Router};
+use pond_core::ports::agent::Agent;
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
+use pond_core::ports::camera_storage::CameraStorage;
+use pond_core::ports::device_registry::DeviceRegistry;
+use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::ports::memory_repository::MemoryRepository;
+use pond_core::ports::profile::ProfileRepository;
+use pond_core::ports::sensor_storage::SensorStorage;
+use pond_core::ports::settings::SettingsRepository;
+use pond_core::ports::voice_output::VoiceOutput;
 use pond_infra::db::Database;
 use std::sync::Arc;
 
@@ -58,8 +67,26 @@ pub struct AppState {
     pub session_storage: Arc<dyn SessionStorage>,
     /// Shared HTTP client — reuse across requests to get connection pooling.
     pub http_client: reqwest::Client,
-    /// LLM provider for the /chat endpoint. Defaults to mock (echo).
-    pub llm_provider: Arc<dyn LlmProvider>,
+    /// Agent used as fallback when no LLM provider is configured.
+    pub agent: Arc<dyn Agent>,
+    /// LLM provider for AI-generated responses. `None` → echo via agent.
+    pub llm_provider: Option<Arc<dyn LlmProvider>>,
+    /// TTS engine for the `/api/v1/test/speak` dev endpoint. `None` → print only.
+    pub tts: Option<Arc<dyn VoiceOutput>>,
+    /// Persistent settings repository (assistant identity, LLM, voice, retention).
+    pub settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
+    /// Profile repository for household members.
+    pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
+    /// Device registry for GOTG devices and other connected hardware.
+    pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    /// Memory fragment repository for semantic/recency-based retrieval.
+    pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
+    /// Embedding provider — `None` until a real embedding model is configured.
+    pub embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    /// IoT sensor reading storage (uses logs DB).
+    pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+    /// Camera event storage (uses logs DB).
+    pub camera_storage: Arc<dyn CameraStorage + Send + Sync>,
 }
 
 /// Build the full API router.
@@ -74,6 +101,8 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
     ));
 
     Router::new()
+        // Dev test page — no auth required, returns HTML
+        .route("/dev/test", axum::routing::get(routes::dev_test_page))
         .nest("/api/v1", routes::api_routes(state.clone()))
         .fallback_service(routes::web_routes(static_dir))
         // Apply rate limiting to all routes

@@ -11,6 +11,12 @@ use tower::ServiceExt;
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_api::{AppState, build_router};
+use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::services::mock_agent::MockAgent;
+use pond_core::services::mock_memory::MockMemoryRepository;
+use pond_core::services::mock_profile::MockProfileRepository;
+use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
+use pond_core::services::mock_settings::MockSettingsRepository;
 use reqwest::Client as ReqwestClient;
 use pond_infra::mock_handshake::MockHandshake;
 
@@ -45,6 +51,29 @@ impl OnboardingRepository for MockRepo {
     }
 }
 
+struct MockDeviceRegistry;
+
+#[async_trait::async_trait]
+impl DeviceRegistry for MockDeviceRegistry {
+    async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
+        Ok(Device {
+            id: "mock-id".to_string(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01 00:00:00".to_string(),
+            last_seen: None,
+            is_online: false,
+        })
+    }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
+    async fn get_device(&self, _id: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
+    async fn unregister(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn heartbeat(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+}
+
 async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
@@ -58,6 +87,16 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: ReqwestClient::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: None,
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(MockDeviceRegistry),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

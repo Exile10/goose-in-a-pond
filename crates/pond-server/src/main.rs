@@ -18,21 +18,36 @@
 //!   8. Prompts for initial onboarding if not yet done
 
 mod model_download;
+mod piper_process;
+mod whisper_process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
-use pond_adapters_whisper::WhisperInput;
-use pond_api::AppState;
-use pond_core::ports::session_storage::SessionStorage;
+use pond_adapters_piper::PiperOutput;
+use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
+use pond_core::ports::wake_word::WakeWordDetector;
 use pond_core::ports::voice_input::VoiceInput;
+use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::services::instant_activation::InstantActivation;
+use pond_core::services::print_output::PrintOutput;
+use pond_api::AppState;
+use pond_core::ports::agent::Agent;
+use pond_core::ports::provider::LlmProvider;
+use pond_core::ports::session_storage::SessionStorage;
 use pond_core::services::chat::ChatService;
+use pond_core::services::fallback_provider::FallbackProvider;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
+use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
+use pond_infra::sqlite_memory::SqliteMemoryRepository;
+use pond_infra::sqlite_profile::SqliteProfileRepository;
+use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use std::sync::Arc;
 use pond_core::services::onboarding::OnboardingService;
 use pond_core::domain::onboarding::OnboardingStep;
@@ -76,14 +91,6 @@ enum Commands {
         /// Enable debug logging
         #[arg(long)]
         debug: bool,
-
-        /// LLM provider for the /chat endpoint: mock, llamafile, or ollama
-        #[arg(short = 'P', long, default_value = "mock")]
-        provider: String,
-
-        /// Model name (only used when --provider ollama)
-        #[arg(short = 'M', long)]
-        model: Option<String>,
     },
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
@@ -103,6 +110,23 @@ enum Commands {
         /// URL of the running whisper.cpp server (only used when --input whisper)
         #[arg(long)]
         whisper_url: Option<String>,
+
+        /// Enable voice-based wake word detection (requires --input whisper).
+        /// Say the trigger phrase to activate the assistant before each turn.
+        #[arg(long, default_value = "goose")]
+        wake_word: Option<String>,
+
+        /// Disable wake word detection (jump straight to listen on each turn).
+        #[arg(long)]
+        no_wake_word: bool,
+
+        /// Text-to-speech engine: none (print only) or piper
+        #[arg(long, default_value = "none")]
+        tts: String,
+
+        /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
+        #[arg(long)]
+        tts_model: Option<std::path::PathBuf>,
     },
 
     /// Show system status
@@ -125,13 +149,13 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { port, static_dir, open, debug, provider, model }) => {
+        Some(Commands::Serve { port, static_dir, open, debug }) => {
             init_tracing(debug);
-            run_server(port, static_dir, open, &provider, model.as_deref()).await
+            run_server(port, static_dir, open).await
         }
-        Some(Commands::Chat { provider, model, input, whisper_url }) => {
+        Some(Commands::Chat { provider, model, input, whisper_url, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
-            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref()).await
+            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref(), wake_word.as_deref(), no_wake_word, &tts, tts_model).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -145,7 +169,7 @@ async fn main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
-            run_chat("mock", None, "stdin", None).await
+            run_chat("mock", None, "stdin", None, None, true, "none", None).await
         }
     }
 }
@@ -172,7 +196,7 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  📂 Data directory: {}", data_dir.display());
 
     // Step 1: Initialize databases
-    println!("\n  [1/2] Initializing databases...");
+    println!("\n  [1/4] Initializing databases...");
     Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
@@ -183,33 +207,43 @@ async fn run_setup(model: &str) -> Result<()> {
         model
     };
     let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [2/2] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [2/4] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
-    let model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
+    let _model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
 
-    // Print next steps
-    let model_str = model_path.display();
+    // Step 3: Download whisper-server binary
+    println!("\n  [3/4] Downloading whisper-server binary...");
+    let _ = model_download::download_whisper_binary(&data_dir).await;
+
+    // Step 4: Download Piper TTS binary + voice model
+    println!("\n  [4/4] Downloading Piper TTS binary and voice model...");
+    match model_download::download_piper_binary(&data_dir).await {
+        Ok(_) => {}
+        Err(e) => println!("  ⚠  Could not download piper binary: {}", e),
+    }
+    match model_download::download_piper_model(&data_dir).await {
+        Ok(_) => {}
+        Err(e) => println!("  ⚠  Could not download piper voice model: {}", e),
+    }
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
     println!();
-    println!("  1. Download & build whisper.cpp:");
-    println!("       https://github.com/ggerganov/whisper.cpp");
-    println!();
-    println!("  2. Start the Whisper server:");
-    println!("       ./server -m \"{}\" --port 9000", model_str);
-    println!();
-    println!("  3. Start llamafile (local LLM):");
+    println!("  1. (Optional) Start llamafile for a local LLM:");
     println!("       ./your-model.llamafile");
     println!();
-    println!("  4. Run the assistant:");
-    println!("       pond-server chat --provider llamafile --input whisper");
+    println!("  2. Run the server (whisper.cpp starts automatically):");
+    println!("       pond-server serve");
+    println!();
+    println!("  3. Or run interactive CLI chat with voice + TTS:");
+    println!("       pond-server chat --provider llamafile --input whisper --tts piper");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
 }
 
-async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, provider: &str, model: Option<&str>) -> Result<()> {
+async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -220,35 +254,113 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, provi
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
 
-    // Wire LLM provider for the /chat endpoint
-    let llm_provider: Arc<dyn pond_core::ports::provider::LlmProvider> = match provider {
-        "ollama" => {
-            let ollama_model = model.unwrap_or(pond_adapters_ollama::DEFAULT_MODEL);
-            println!("  Provider: ollama ({})", ollama_model);
-            Arc::new(OllamaProvider::new(None, Some(ollama_model)))
+    // ── Component startup: auto-download + wire critical services ────────────
+    println!("\n  ── Components ──────────────────────────────────────");
+
+    // STT — whisper.cpp binary + model
+    let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
+        .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+    if !whisper_model.exists() {
+        println!("  📥 STT model not found — downloading ({})...", model_download::DEFAULT_WHISPER_MODEL);
+        match model_download::download_whisper_model(model_download::DEFAULT_WHISPER_MODEL, &data_dir).await {
+            Ok(_) => {}
+            Err(e) => println!("  ⚠  STT model download failed: {}", e),
         }
-        "llamafile" => {
-            println!("  Provider: llamafile");
-            Arc::new(LlamafileProvider::new(None))
+    }
+    if !model_download::whisper_binary_path(&data_dir).exists() {
+        println!("  📥 STT binary not found — downloading...");
+        match model_download::download_whisper_binary(&data_dir).await {
+            Ok(_) => {}
+            Err(e) => println!("  ⚠  STT binary download failed: {}", e),
         }
-        _ => {
-            println!("  Provider: mock (echo)");
-            Arc::new(pond_core::services::mock_provider::MockProvider::new())
+    }
+    let _whisper_guard = whisper_process::try_start(&data_dir, &whisper_model, 9000).await;
+
+    // TTS — piper binary + voice model
+    let piper_model = model_download::tts_models_dir(&data_dir)
+        .join(model_download::PIPER_MODEL_FILENAME);
+    if !model_download::piper_binary_path(&data_dir).exists() {
+        println!("  📥 TTS binary not found — downloading...");
+        match model_download::download_piper_binary(&data_dir).await {
+            Ok(_) => {}
+            Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
         }
-    };
+    }
+    if !piper_model.exists() {
+        println!("  📥 TTS model not found — downloading...");
+        match model_download::download_piper_model(&data_dir).await {
+            Ok(_) => {}
+            Err(e) => println!("  ⚠  TTS model download failed: {}", e),
+        }
+    }
+    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
+        match piper_process::find_binary(&data_dir) {
+            Some(bin) if piper_model.exists() => {
+                println!("  ✅ TTS: piper ready");
+                Some(Arc::new(PiperOutput::new(bin, piper_model.clone()))
+                    as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
+            }
+            _ => {
+                println!("  ⚠  TTS: piper unavailable (binary or model missing)");
+                None
+            }
+        };
+
+    println!("  ────────────────────────────────────────────────────\n");
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
     let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
         Arc::new(SqliteSessionStorage::new(db.system.clone()));
+    let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let profile_repo: Arc<dyn pond_core::ports::profile::ProfileRepository + Send + Sync> =
+        Arc::new(SqliteProfileRepository::new(db.system.clone()));
+    let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
+        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
+        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let sensor_storage: Arc<dyn pond_core::ports::sensor_storage::SensorStorage + Send + Sync> =
+        Arc::new(SqliteSensorStorage::new(db.logs.clone()));
+    let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
+        Arc::new(SqliteCameraStorage::new(db.logs.clone()));
+
+    let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+    // Fallback chain: llamafile → ollama → (if both down, ChatService falls back to agent echo)
+    let llamafile = Arc::new(LlamafileProvider::new(None).with_max_tokens(1024));
+    let ollama = Arc::new(OllamaProvider::new(None, None).with_max_tokens(1024));
+    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(
+        Arc::new(FallbackProvider::new(llamafile, ollama))
+    );
+
+    let db = Arc::new(db);
+
+    // Spawn background TTL pruning task (runs every 6 hours)
+    {
+        let logs = db.logs.clone();
+        let system = db.system.clone();
+        tokio::spawn(async move {
+            pond_infra::pruning::run_pruning(logs, system, Default::default()).await;
+        });
+    }
+
     let state = Arc::new(AppState {
-        db: Arc::new(db),
+        db,
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: reqwest::Client::new(),
+        agent,
         llm_provider,
+        tts,
+        settings_repo,
+        profile_repo,
+        device_registry,
+        memory_repo,
+        embedding_provider: None,
+        sensor_storage,
+        camera_storage,
     });
 
     // Warn if static assets haven't been built yet
@@ -293,7 +405,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, provi
     Ok(())
 }
 
-async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>) -> Result<()> {
+async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
@@ -304,6 +416,15 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
+
+    // Auto-start whisper.cpp when voice input is requested.
+    let _whisper_guard = if input == "whisper" {
+        let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
+            .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+        whisper_process::try_start(&data_dir, &whisper_model, 9000).await
+    } else {
+        None
+    };
 
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
@@ -360,6 +481,42 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         }
     };
     chat_service = chat_service.with_voice_input(voice);
+
+    // ── Wire wake word detector ──
+    let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
+        Arc::new(InstantActivation)
+    } else {
+        let trigger = wake_word.unwrap_or("goose");
+        let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
+        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, url);
+        Arc::new(WhisperKeywordDetector::new(Some(url), trigger))
+    };
+    chat_service = chat_service.with_wake_word_detector(detector);
+
+    // ── Wire TTS output ──
+    let voice_out: Arc<dyn VoiceOutput> = match tts {
+        "piper" => {
+            let model_path = tts_model.unwrap_or_else(|| {
+                data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME)
+            });
+            match piper_process::find_binary(&data_dir) {
+                Some(bin) => {
+                    println!("  TTS:      piper ({:?})", model_path.file_name().unwrap_or_default());
+                    Arc::new(PiperOutput::new(bin, model_path))
+                }
+                None => {
+                    println!("  TTS:      piper requested but binary not found — falling back to print");
+                    println!("            Run `pond-server setup` to download piper.");
+                    Arc::new(PrintOutput)
+                }
+            }
+        }
+        _ => {
+            println!("  TTS:      print");
+            Arc::new(PrintOutput)
+        }
+    };
+    chat_service = chat_service.with_voice_output(voice_out);
 
     chat_service.run_loop().await?;
 
@@ -423,14 +580,14 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", None, "stdin", None).await?;
+                run_chat("mock", None, "stdin", None, None, true, "none", None).await?;
             }
             "2" => {
                 println!("Enter port (default 4000): ");
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
                 let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, std::path::PathBuf::from("web/dist"), false, "mock", None).await?;
+                run_server(port, std::path::PathBuf::from("web/dist"), false).await?;
             }
             "3" => {
                 run_status().await?;

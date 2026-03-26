@@ -12,6 +12,7 @@ pond-infra = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
+pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 axum = { workspace = true }
@@ -22,3 +23,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 webbrowser = { workspace = true }
+zip = { workspace = true }
+flate2 = "1"
+tar = "0.4"

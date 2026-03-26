@@ -13,6 +13,7 @@ reqwest = { workspace = true, features = ["json", "multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 cpal = "0.15"
 
 [dev-dependencies]
