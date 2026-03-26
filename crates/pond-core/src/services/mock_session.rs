@@ -124,6 +124,20 @@ impl SessionStorage for InMemorySessionStorage {
         let paginated = msgs.into_iter().skip(offset).take(limit).collect();
         Ok(paginated)
     }
+
+    async fn get_recent_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        self._get_session(session_id).await?;
+
+        let messages = self.messages.read().await;
+        let msgs = messages.get(session_id).cloned().unwrap_or_default();
+        // Take the last `limit` messages — they are already in chronological order.
+        let start = msgs.len().saturating_sub(limit);
+        Ok(msgs[start..].to_vec())
+    }
 }
 
 impl InMemorySessionStorage {
