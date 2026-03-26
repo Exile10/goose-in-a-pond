@@ -76,6 +76,14 @@ enum Commands {
         /// Enable debug logging
         #[arg(long)]
         debug: bool,
+
+        /// LLM provider for the /chat endpoint: mock, llamafile, or ollama
+        #[arg(short = 'P', long, default_value = "mock")]
+        provider: String,
+
+        /// Model name (only used when --provider ollama)
+        #[arg(short = 'M', long)]
+        model: Option<String>,
     },
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
@@ -117,9 +125,9 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { port, static_dir, open, debug }) => {
+        Some(Commands::Serve { port, static_dir, open, debug, provider, model }) => {
             init_tracing(debug);
-            run_server(port, static_dir, open).await
+            run_server(port, static_dir, open, &provider, model.as_deref()).await
         }
         Some(Commands::Chat { provider, model, input, whisper_url }) => {
             init_tracing(false);
@@ -201,7 +209,7 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Result<()> {
+async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, provider: &str, model: Option<&str>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -211,6 +219,23 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
+
+    // Wire LLM provider for the /chat endpoint
+    let llm_provider: Arc<dyn pond_core::ports::provider::LlmProvider> = match provider {
+        "ollama" => {
+            let ollama_model = model.unwrap_or(pond_adapters_ollama::DEFAULT_MODEL);
+            println!("  Provider: ollama ({})", ollama_model);
+            Arc::new(OllamaProvider::new(None, Some(ollama_model)))
+        }
+        "llamafile" => {
+            println!("  Provider: llamafile");
+            Arc::new(LlamafileProvider::new(None))
+        }
+        _ => {
+            println!("  Provider: mock (echo)");
+            Arc::new(pond_core::services::mock_provider::MockProvider::new())
+        }
+    };
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
@@ -223,6 +248,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: reqwest::Client::new(),
+        llm_provider,
     });
 
     // Warn if static assets haven't been built yet
@@ -404,7 +430,7 @@ async fn run_main_menu() -> Result<()> {
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
                 let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, std::path::PathBuf::from("web/dist"), false).await?;
+                run_server(port, std::path::PathBuf::from("web/dist"), false, "mock", None).await?;
             }
             "3" => {
                 run_status().await?;

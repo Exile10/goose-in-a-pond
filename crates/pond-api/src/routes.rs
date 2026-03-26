@@ -14,9 +14,9 @@ use axum::{
 };
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::domain::session::SessionMessage;
-use pond_core::domain::message::ChatMessage;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::services::chat::ChatService;
+use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -185,7 +185,7 @@ async fn chat(
     let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let storage = &state.session_storage;
 
-    // Ensure session exists
+    // Ensure session exists — ChatService expects it to already exist.
     if storage.get_session(&session_id).await.is_err() {
         storage
             .create_session(session_id.clone())
@@ -198,39 +198,21 @@ async fn chat(
             })?;
     }
 
-    // Persist user message
-    let user_msg = SessionMessage::new(
-        Uuid::new_v4().to_string(),
+    // Delegate to ChatService — handles message persistence, history, and LLM call.
+    let chat_service = ChatService::new(
+        Arc::new(MockAgent::new()),
         session_id.clone(),
-        ChatMessage::user(&req.message),
-    );
-    storage
-        .add_message(session_id.clone(), user_msg)
+        storage.clone(),
+    )
+    .with_provider(state.llm_provider.clone());
+
+    let response_text = chat_service
+        .chat_once(req.message)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to persist message: {}", e)})),
-            )
-        })?;
-
-    // TODO: Wire to a real LlmProvider for AI-generated responses.
-    // For now, echo back to confirm the endpoint works end-to-end.
-    let response_text = format!("Received: {}", req.message);
-
-    // Persist assistant response
-    let assistant_msg = SessionMessage::new(
-        Uuid::new_v4().to_string(),
-        session_id.clone(),
-        ChatMessage::assistant(&response_text),
-    );
-    storage
-        .add_message(session_id.clone(), assistant_msg)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to persist response: {}", e)})),
+                Json(json!({"error": format!("Chat failed: {}", e)})),
             )
         })?;
 
