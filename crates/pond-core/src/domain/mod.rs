@@ -1,4 +1,8 @@
 pub mod agent;
+pub mod memory;
 pub mod message;
 pub mod onboarding;
+pub mod profile;
+pub mod sensor;
 pub mod session;
+pub mod settings;

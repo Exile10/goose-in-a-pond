@@ -1,0 +1,16 @@
+[package]
+name = "pond-adapters-piper"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core   = { workspace = true }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+# rodio is isolated here — not added to workspace deps to avoid pulling
+# audio playback into every crate.
+rodio = "0.19"

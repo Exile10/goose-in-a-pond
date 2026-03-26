@@ -35,6 +35,16 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<OllamaMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Serialize)]
+struct OllamaOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +64,8 @@ pub struct OllamaProvider {
     client: Client,
     endpoint: String,
     model: String,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
 }
 
 impl OllamaProvider {
@@ -66,7 +78,23 @@ impl OllamaProvider {
             client: Client::new(),
             endpoint: format!("{}/api/chat", base),
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
+            max_tokens: None,
+            temperature: None,
         }
+    }
+
+    /// Override the maximum number of tokens to generate.
+    /// When not set, Ollama uses its own default.
+    pub fn with_max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = Some(n);
+        self
+    }
+
+    /// Override the sampling temperature.
+    /// When not set, Ollama uses its own default.
+    pub fn with_temperature(mut self, t: f32) -> Self {
+        self.temperature = Some(t);
+        self
     }
 }
 
@@ -95,10 +123,20 @@ impl LlmProvider for OllamaProvider {
             });
         }
 
+        let options = if self.max_tokens.is_some() || self.temperature.is_some() {
+            Some(OllamaOptions {
+                num_predict: self.max_tokens,
+                temperature: self.temperature,
+            })
+        } else {
+            None
+        };
+
         let body = ChatRequest {
             model: &self.model,
             messages: ollama_messages,
             stream: false,
+            options,
         };
 
         let resp = self

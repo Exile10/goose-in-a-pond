@@ -231,6 +231,33 @@ impl SessionStorage for SqliteSessionStorage {
 
         rows.into_iter().map(SessionMessage::try_from).collect()
     }
+
+    async fn get_recent_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        // Fetch newest-first, then reverse to return chronological order.
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, role, content, created_at \
+             FROM session_messages \
+             WHERE session_id = ? \
+             ORDER BY created_at DESC, rowid DESC \
+             LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let mut messages: Vec<SessionMessage> =
+            rows.into_iter().map(SessionMessage::try_from).collect::<Result<_, _>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -367,6 +394,53 @@ mod tests {
         let s = make_storage().await;
         let result = s.update_title("missing", "Nope".to_string()).await;
         assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn get_recent_messages_returns_newest_in_order() {
+        let s = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for i in 0..10 {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    format!("m{}", i),
+                    "sess-1".to_string(),
+                    ChatMessage::user(format!("Msg {}", i)),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Ask for 3 most recent → should get Msg 7, 8, 9 in chronological order
+        let recent = s.get_recent_messages("sess-1", 3).await.unwrap();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].message.content, "Msg 7");
+        assert_eq!(recent[1].message.content, "Msg 8");
+        assert_eq!(recent[2].message.content, "Msg 9");
+    }
+
+    #[tokio::test]
+    async fn get_recent_messages_limit_exceeds_count_returns_all() {
+        let s = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for i in 0..3 {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    format!("m{}", i),
+                    "sess-1".to_string(),
+                    ChatMessage::user(format!("Msg {}", i)),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let recent = s.get_recent_messages("sess-1", 100).await.unwrap();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].message.content, "Msg 0");
     }
 
     #[tokio::test]

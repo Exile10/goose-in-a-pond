@@ -102,6 +102,7 @@ export default function ChatWidget({ token }: Props) {
   const [listening, setListening] = useState(false)
   const [showSuggestions, setShowSuggestions] = useState(true)
   const [agentRunning, setAgentRunning] = useState(true)
+  const [sessionId, setSessionId] = useState<string | undefined>(undefined)
   const suggestions = getSuggestions()
   const bottomRef = useRef<HTMLDivElement>(null)
   const recognitionRef = useRef<ISpeechRecognition | null>(null)
@@ -154,11 +155,12 @@ export default function ChatWidget({ token }: Props) {
           text: '(Preview mode — connect to a live server to get real responses.)',
         }])
       } else {
-        const res = await api.chat(text, token)
+        const res = await api.chat(text, token, sessionId)
+        setSessionId(res.session_id)
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
           role: 'assistant',
-          text: res.message ?? res.status,
+          text: res.response,
         }])
       }
     } catch (err) {
@@ -191,6 +193,7 @@ export default function ChatWidget({ token }: Props) {
     setMessages([{ id: crypto.randomUUID(), role: 'assistant', text: greeting() }])
     setShowSuggestions(true)
     setInput('')
+    setSessionId(undefined)
   }
 
   function toggleAgent() {

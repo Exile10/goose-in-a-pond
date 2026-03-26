@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { api, isPreviewMode } from '../api'
 import VerifyDevice from '../steps/VerifyDevice'
 import CreateProfile from '../steps/CreateProfile'
 import ConfigurePersonality from '../steps/ConfigurePersonality'
@@ -52,9 +53,21 @@ export default function Onboarding({ onComplete }: Props) {
           <p>
             <strong>{ctx.displayName ?? ctx.profileName}</strong>, your pond is ready.
           </p>
-          <button className="ob-btn ob-btn-primary" onClick={() => {
+          <button className="ob-btn ob-btn-primary" onClick={async () => {
             if (ctx.devices && ctx.devices.length > 0) {
               localStorage.setItem('pond_devices', JSON.stringify(ctx.devices))
+            }
+            // Sync personality settings to backend now that onboarding is complete
+            // and the protected /settings route is accessible.
+            if (ctx.sessionToken && !isPreviewMode(ctx.sessionToken) && ctx.personality) {
+              try {
+                await api.saveSettings(
+                  { personality: ctx.personality, assistant_style: ctx.assistantStyle ?? 'proactive' },
+                  ctx.sessionToken,
+                )
+              } catch {
+                // Non-fatal: settings are already in localStorage
+              }
             }
             onComplete(ctx.sessionToken ?? '', ctx.displayName ?? ctx.profileName ?? '')
           }}>

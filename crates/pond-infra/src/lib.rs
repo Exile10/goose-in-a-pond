@@ -1,5 +1,11 @@
 pub mod db;
 pub mod mock_handshake;
 pub mod onboarding;
+pub mod pruning;
+pub mod sqlite_device_registry;
+pub mod sqlite_memory;
+pub mod sqlite_profile;
+pub mod sqlite_sensor;
 pub mod sqlite_session_storage;
+pub mod sqlite_settings;
 pub mod sqlite_storage;

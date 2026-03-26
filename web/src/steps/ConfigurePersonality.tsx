@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { api, isPreviewMode } from '../api'
 import type { OnboardingContext } from '../pages/Onboarding'
 
 interface Props {
@@ -23,7 +22,6 @@ const STYLES = [
 export default function ConfigurePersonality({ ctx, onNext, onBack }: Props) {
   const [personality, setPersonality] = useState(ctx.personality ?? 'helpful')
   const [assistantStyle, setAssistantStyle] = useState(ctx.assistantStyle ?? 'proactive')
-  const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   async function handleSubmit(e: React.FormEvent) {
@@ -34,20 +32,9 @@ export default function ConfigurePersonality({ ctx, onNext, onBack }: Props) {
     localStorage.setItem('pond_personality', JSON.stringify(personality))
     localStorage.setItem('pond_assistant_style', JSON.stringify(assistantStyle))
 
-    if (isPreviewMode(ctx.sessionToken!)) {
-      onNext({ personality, assistantStyle })
-      return
-    }
-
-    setLoading(true)
-    try {
-      await api.saveSettings({ personality, assistant_style: assistantStyle }, ctx.sessionToken!)
-      onNext({ personality, assistantStyle })
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save settings.')
-    } finally {
-      setLoading(false)
-    }
+    // Settings are persisted to localStorage above and synced to the backend
+    // after onboarding completes, when the protected /settings route is accessible.
+    onNext({ personality, assistantStyle })
   }
 
   return (
@@ -109,8 +96,8 @@ export default function ConfigurePersonality({ ctx, onNext, onBack }: Props) {
         <button type="button" className="ob-btn ob-btn-ghost" onClick={onBack}>
           Back
         </button>
-        <button type="submit" className="ob-btn ob-btn-primary" disabled={loading}>
-          {loading ? 'Saving...' : 'Next'}
+        <button type="submit" className="ob-btn ob-btn-primary">
+          Next
         </button>
       </div>
     </form>

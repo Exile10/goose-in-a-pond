@@ -9,6 +9,7 @@ members = [
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",
+    "crates/pond-adapters-piper",
     "crates/pond-adapters-gotg",
     "crates/pond-builder",
 ]
@@ -16,7 +17,9 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-authors = ["Jerry Anyumba <jerryanyumba@gmail.com>"]
+authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
+    "Purity Wanjiru <wanjiru@jarida.io>","Emmanuel Oyugi <oyugi@jarida.io>",
+    "Africia Kerubo <africia@jarida.io>"]
 license = "Apache-2.0"
 repository = "https://github.com/jarida-io/goose-in-a-pond"
 description = "Goose in a Pond - A modular AI assistant"
@@ -82,6 +85,7 @@ opentelemetry-appender-tracing = "0.31"
 opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.32"
 hostname = "0.4"
+zip = "2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono"] }
 
 # Internal workspace crates

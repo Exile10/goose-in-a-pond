@@ -60,4 +60,12 @@ pub trait SessionStorage: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SessionMessage>, SessionStorageError>;
+
+    /// Fetch the most recent `limit` messages, returned in chronological order
+    /// (oldest-first). Use this instead of `get_messages()` to cap context load.
+    async fn get_recent_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError>;
 }
