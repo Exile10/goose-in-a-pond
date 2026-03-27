@@ -57,6 +57,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/models", get(list_models))
+        .route("/models/registry/refresh", post(refresh_model_registry))
+        .route("/models/{category}/{name}/download", post(download_model))
         .route("/profiles", get(list_profiles).post(create_profile))
         .route("/profiles/{id}", get(get_profile).patch(update_profile_prefs).delete(delete_profile))
         .route("/sensors", post(record_sensor))
@@ -463,6 +466,166 @@ async fn update_settings(
 
     Ok(Json(json!({ "status": "ok" })))
 }
+
+// ── Model registry handlers ───────────────────────────────────────────────────
+
+/// GET /api/v1/models — returns the model status snapshot with downloaded/active flags.
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(model_status) = &state.model_status else {
+        return Ok(Json(json!({"whisper": [], "llamafile": [], "tts": []})));
+    };
+    let entries = model_status.read().await.clone();
+
+    // Group by category for a tidy response shape.
+    let mut whisper   = vec![];
+    let mut llamafile = vec![];
+    let mut tts       = vec![];
+
+    for e in entries {
+        let v = serde_json::to_value(&e).unwrap_or_default();
+        match e.category.as_str() {
+            "whisper"   => whisper.push(v),
+            "llamafile" => llamafile.push(v),
+            "tts"       => tts.push(v),
+            _           => {}
+        }
+    }
+
+    Ok(Json(json!({"whisper": whisper, "llamafile": llamafile, "tts": tts})))
+}
+
+/// POST /api/v1/models/registry/refresh — fetch the latest registry from the online URL.
+async fn refresh_model_registry(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(model_status) = &state.model_status else {
+        return Ok(Json(json!({"status": "no_registry"})));
+    };
+
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+
+    let data_dir = state.data_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let url = settings.model_registry_url.clone();
+
+    // Fetch in the background so we don't block on slow network.
+    let status_lock = Arc::clone(model_status);
+    let active_w = settings.active_whisper_model.clone();
+    let active_l = settings.active_llm_model.clone();
+    let active_t = settings.active_tts_model.clone();
+
+    tokio::spawn(async move {
+        match reqwest::get(&url).await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    if let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        // Save cache
+                        let _ = std::fs::write(data_dir.join("registry.json"), &bytes);
+                        tracing::info!("Model registry refreshed from {}", url);
+
+                        // Rebuild status snapshot from fresh registry
+                        if let Ok(typed) = serde_json::from_value::<ModelRegistrySnapshot>(registry) {
+                            let new_status = typed.build_status(&active_w, &active_l, &active_t, &data_dir);
+                            *status_lock.write().await = new_status;
+                        }
+                    }
+                }
+            }
+            Ok(resp) => tracing::warn!("Registry refresh returned {}", resp.status()),
+            Err(e)   => tracing::warn!("Registry refresh failed: {}", e),
+        }
+    });
+
+    Ok(Json(json!({"status": "refresh_started"})))
+}
+
+/// POST /api/v1/models/{category}/{name}/download — download a specific model.
+async fn download_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(model_status) = &state.model_status else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+    };
+
+    // Check if already downloaded.
+    {
+        let entries = model_status.read().await;
+        if let Some(e) = entries.iter().find(|e| e.category == category && e.name == name) {
+            if e.downloaded {
+                return Ok(Json(json!({"status": "already_downloaded", "name": name})));
+            }
+        } else {
+            return Err((StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in category '{}'", name, category)}))));
+        }
+    }
+
+    // TODO: wire download_model_entry() once model_download is accessible from pond-api.
+    // For now return accepted — the download should be triggered from the server side.
+    Ok(Json(json!({
+        "status": "download_not_supported_via_api",
+        "hint": "Run `pond-server setup` to download models, or use the settings to change active models"
+    })))
+}
+
+/// Minimal registry shape needed to rebuild status inside routes.
+/// This avoids pulling pond-server internals into pond-api.
+#[derive(serde::Deserialize)]
+pub struct ModelRegistrySnapshot {
+    pub whisper:   Vec<RegistryWhisperEntry>,
+    pub llamafile: Vec<RegistryLlamafileEntry>,
+    pub tts:       Vec<serde_json::Value>,
+}
+
+impl ModelRegistrySnapshot {
+    fn build_status(&self, active_w: &str, active_l: &str, active_t: &str, data_dir: &std::path::Path) -> Vec<crate::ModelStatusEntry> {
+        let mut out = Vec::new();
+        for m in &self.whisper {
+            out.push(crate::ModelStatusEntry {
+                category: "whisper".into(), name: m.name.clone(),
+                description: m.description.clone(), size_mb: m.size_mb,
+                downloaded: data_dir.join("models").join(&m.filename).exists(),
+                active: m.name == active_w,
+            });
+        }
+        for m in &self.llamafile {
+            #[cfg(windows)]
+            let path = std::path::PathBuf::from(format!("{}.exe", data_dir.join("models").join("llm").join(&m.filename).display()));
+            #[cfg(not(windows))]
+            let path = data_dir.join("models").join("llm").join(&m.filename);
+            out.push(crate::ModelStatusEntry {
+                category: "llamafile".into(), name: m.name.clone(),
+                description: m.description.clone(), size_mb: m.size_mb,
+                downloaded: path.exists(), active: m.name == active_l,
+            });
+        }
+        for entry in &self.tts {
+            let name = entry["name"].as_str().unwrap_or("").to_string();
+            let engine = entry["engine"].as_str().unwrap_or("");
+            let downloaded = if engine == "http" {
+                true
+            } else {
+                let fname = entry["model_filename"].as_str().unwrap_or("");
+                data_dir.join("models").join("tts").join(fname).exists()
+            };
+            out.push(crate::ModelStatusEntry {
+                category: "tts".into(), name: name.clone(),
+                description: entry["description"].as_str().unwrap_or("").to_string(),
+                size_mb: entry["size_mb"].as_u64().unwrap_or(0),
+                downloaded, active: name == active_t,
+            });
+        }
+        out
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RegistryWhisperEntry   { pub name: String, pub filename: String, pub description: String, pub size_mb: u64 }
+#[derive(serde::Deserialize)]
+pub struct RegistryLlamafileEntry { pub name: String, pub filename: String, pub description: String, pub size_mb: u64 }
 
 // ── Profile handlers ──────────────────────────────────────────────────────────
 
