@@ -59,6 +59,31 @@ pub struct Settings {
     #[serde(default = "Settings::default_whisper_url")]
     pub voice_whisper_url: String,
 
+    // ── Active model selection ──────────────────────────────────────────────
+    /// Active LLM model name from the registry (e.g. "gemma-2b", "llama-1b")
+    #[serde(default = "Settings::default_active_llm_model")]
+    pub active_llm_model: String,
+
+    /// Active Whisper model name from the registry (e.g. "base", "tiny", "small")
+    #[serde(default = "Settings::default_active_whisper_model")]
+    pub active_whisper_model: String,
+
+    /// Active TTS model name from the registry (e.g. "qwen-tts", "piper-lessac")
+    #[serde(default = "Settings::default_active_tts_model")]
+    pub active_tts_model: String,
+
+    /// Base URL of the Qwen TTS HTTP server (OpenAI-compatible /v1/audio/speech)
+    #[serde(default = "Settings::default_tts_http_url")]
+    pub voice_tts_http_url: String,
+
+    /// Voice name sent to the Qwen TTS server (e.g. "Chelsie")
+    #[serde(default = "Settings::default_tts_http_voice")]
+    pub voice_tts_http_voice: String,
+
+    /// URL to fetch the latest model registry JSON
+    #[serde(default = "Settings::default_model_registry_url")]
+    pub model_registry_url: String,
+
     // ── Data retention ─────────────────────────────────────────────────────
     /// Days to keep rows in event_log (0 = keep forever)
     #[serde(default = "Settings::default_event_log_days")]
@@ -87,6 +112,12 @@ impl Default for Settings {
             voice_tts_voice:                 Self::default_tts_voice(),
             voice_recording_duration_secs:   Self::default_recording_duration(),
             voice_whisper_url:               Self::default_whisper_url(),
+            active_llm_model:                Self::default_active_llm_model(),
+            active_whisper_model:            Self::default_active_whisper_model(),
+            active_tts_model:                Self::default_active_tts_model(),
+            voice_tts_http_url:              Self::default_tts_http_url(),
+            voice_tts_http_voice:            Self::default_tts_http_voice(),
+            model_registry_url:              Self::default_model_registry_url(),
             retention_event_log_days:        Self::default_event_log_days(),
             retention_sensor_days:           Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
@@ -106,6 +137,14 @@ impl Settings {
     fn default_tts_voice()                  -> String { "en_US-lessac-medium.onnx".to_string() }
     fn default_recording_duration()         -> u32    { 5 }
     fn default_whisper_url()                -> String { "http://127.0.0.1:9000".to_string() }
+    fn default_active_llm_model()           -> String { "gemma-2b".to_string() }
+    fn default_active_whisper_model()       -> String { "base".to_string() }
+    fn default_active_tts_model()           -> String { "qwen-tts".to_string() }
+    fn default_tts_http_url()               -> String { "http://127.0.0.1:8181".to_string() }
+    fn default_tts_http_voice()             -> String { "Chelsie".to_string() }
+    fn default_model_registry_url()         -> String {
+        "https://raw.githubusercontent.com/jarida-io/goose-in-a-pond/main/crates/pond-server/registry.json".to_string()
+    }
     fn default_event_log_days()             -> u32    { 30 }
     fn default_sensor_days()                -> u32    { 7 }
     fn default_session_messages_keep()      -> u32    { 500 }

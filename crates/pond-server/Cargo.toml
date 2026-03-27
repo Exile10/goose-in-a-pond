@@ -10,11 +10,14 @@ pond-core = { workspace = true }
 pond-api = { workspace = true }
 pond-infra = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
+pond-adapters-qwen-tts  = { workspace = true }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
 pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
