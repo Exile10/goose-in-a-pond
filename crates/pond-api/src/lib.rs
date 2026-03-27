@@ -54,6 +54,7 @@ use pond_core::ports::sensor_storage::SensorStorage;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_infra::db::Database;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Shared application state available to all route handlers.
@@ -91,6 +92,25 @@ pub struct AppState {
     /// Mirrors Goose's `~/.config/goose/prompts/` pattern.
     /// `None` in tests; `Some($DATA_DIR/prompts)` in production.
     pub prompt_template_dir: Option<std::path::PathBuf>,
+    /// Live model status snapshot — updated by the registry refresh endpoint.
+    /// `None` in tests that don't exercise model endpoints.
+    pub model_status: Option<Arc<tokio::sync::RwLock<Vec<ModelStatusEntry>>>>,
+    /// GIAP data directory — used by model endpoints to check file presence on disk.
+    /// `None` in tests.
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+/// Snapshot of one model's availability, sent over the REST API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStatusEntry {
+    pub category:    String,
+    pub name:        String,
+    pub description: String,
+    pub size_mb:     u64,
+    /// True if the model file exists on disk (or for HTTP TTS, always true).
+    pub downloaded:  bool,
+    /// True if this is the currently active model for its category.
+    pub active:      bool,
 }
 
 /// Build the full API router.
