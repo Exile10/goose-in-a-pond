@@ -22,6 +22,7 @@ mod model_download;
 mod model_registry;
 mod piper_process;
 mod qwen_tts_process;
+mod system_deps;
 mod whisper_process;
 
 use anyhow::Result;
@@ -202,32 +203,41 @@ async fn run_setup(model: &str) -> Result<()> {
 
     println!("\n  📂 Data directory: {}", data_dir.display());
 
-    // Step 1: Initialize databases
-    println!("\n  [1/5] Initializing databases...");
+    // Step 1: Check + auto-install system dependencies (Linux/macOS only)
+    println!("\n  [1/7] Checking system dependencies...");
+    if system_deps::ensure_system_deps().await {
+        println!("  ✅ System dependencies OK");
+    } else {
+        println!("  ⚠  Some system deps could not be installed — see docs/developer/linux-setup.md");
+        println!("     Continuing setup; some features may not work until deps are installed.");
+    }
+
+    // Step 2: Initialize databases
+    println!("\n  [2/7] Initializing databases...");
     Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
-    // Step 2: Download Whisper ASR model
+    // Step 3: Download Whisper ASR model
     let effective_model = if model.is_empty() {
         model_download::DEFAULT_WHISPER_MODEL
     } else {
         model
     };
     let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [2/6] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [3/7] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
     let _model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
 
-    // Step 3: Download whisper-server binary
-    println!("\n  [3/6] Downloading whisper-server binary...");
+    // Step 4: Download whisper-server binary
+    println!("\n  [4/7] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
-    // Step 4: Qwen TTS (primary TTS engine — auto-installed into managed venv)
-    println!("\n  [4/6] Installing Qwen TTS (primary TTS engine)...");
+    // Step 5: Qwen TTS (primary TTS engine — auto-installed into managed venv)
+    println!("\n  [5/7] Installing Qwen TTS (primary TTS engine)...");
     qwen_tts_process::setup_install(&data_dir).await;
 
-    // Step 5: Download Piper TTS binary + voice model (fallback TTS)
-    println!("\n  [5/6] Downloading Piper TTS binary and voice model (fallback TTS)...");
+    // Step 6: Download Piper TTS binary + voice model (fallback TTS)
+    println!("\n  [6/7] Downloading Piper TTS binary and voice model (fallback TTS)...");
     match model_download::download_piper_binary(&data_dir).await {
         Ok(_) => {}
         Err(e) => println!("  ⚠  Could not download piper binary: {}", e),
@@ -237,9 +247,9 @@ async fn run_setup(model: &str) -> Result<()> {
         Err(e) => println!("  ⚠  Could not download piper voice model: {}", e),
     }
 
-    // Step 6: Download default LLM (Gemma 2 2B via llamafile)
+    // Step 7: Download default LLM (Gemma 2 2B via llamafile)
     println!(
-        "\n  [6/6] Downloading LLM model ({})...",
+        "\n  [7/7] Downloading LLM model ({})...",
         model_download::DEFAULT_LLAMAFILE_MODEL
     );
     match model_download::download_llamafile_model(
@@ -276,6 +286,9 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
+
+    // Soft system-dep check (non-fatal — just warn if something looks wrong)
+    system_deps::warn_if_missing();
 
     // ── Load registry + settings early (drives model selection) ─────────────
     let registry = model_registry::ModelRegistry::load_cached(&data_dir);
