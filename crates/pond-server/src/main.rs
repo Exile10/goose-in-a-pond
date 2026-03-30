@@ -183,11 +183,22 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    let level = if debug { "debug" } else { "info" };
+    // In debug mode, our own crates run at DEBUG while noisy third-party crates
+    // (sqlx, hyper, tower, reqwest) are capped at WARN so their internal query
+    // and connection tracing does not drown out the useful output.
+    //
+    // RUST_LOG always takes priority, so a developer can still override any
+    // target at runtime:
+    //   RUST_LOG=sqlx=debug cargo run -p pond-server -- serve --debug
+    let filter = if debug {
+        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+                .unwrap_or_else(|_| filter.into()),
         )
         .init();
 }
