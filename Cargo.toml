@@ -5,14 +5,21 @@ members = [
     "crates/pond-api",
     "crates/pond-infra",
     "crates/pond-server",
-    "crates/pond-adapters-goose",
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",
     "crates/pond-adapters-piper",
+    "crates/pond-adapters-qwen-tts",
     "crates/pond-adapters-gotg",
     "crates/pond-builder",
 ]
+# pond-adapters-goose is intentionally excluded from the default workspace build.
+# It pulls in the goose/ submodule which has a diamond rmcp version conflict
+# (pctx_code_execution_runtime 0.1.3 uses rmcp ^0.14 while pctx_config uses rmcp 1.2).
+# This crate is also explicitly never linked into pond-server on Windows due to a
+# fatal linker conflict. Build it in isolation when needed:
+#   cargo build -p pond-adapters-goose
+exclude = ["crates/pond-adapters-goose"]
 
 [workspace.package]
 edition = "2021"
@@ -93,3 +100,5 @@ pond-core = { path = "crates/pond-core" }
 pond-api = { path = "crates/pond-api" }
 pond-infra = { path = "crates/pond-infra" }
 pond-adapters-goose = { path = "crates/pond-adapters-goose" }
+pond-adapters-llamafile = { path = "crates/pond-adapters-llamafile" }
+pond-adapters-qwen-tts  = { path = "crates/pond-adapters-qwen-tts" }

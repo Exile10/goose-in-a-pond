@@ -17,8 +17,12 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
+mod llamafile_process;
 mod model_download;
+mod model_registry;
 mod piper_process;
+mod qwen_tts_process;
+mod system_deps;
 mod whisper_process;
 
 use anyhow::Result;
@@ -26,6 +30,7 @@ use clap::{Parser, Subcommand};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
+use pond_adapters_qwen_tts::QwenTtsOutput;
 use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
 use pond_core::ports::wake_word::WakeWordDetector;
 use pond_core::ports::voice_input::VoiceInput;
@@ -36,8 +41,11 @@ use pond_api::AppState;
 use pond_core::ports::agent::Agent;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
+use pond_core::ports::settings::SettingsRepository as _;
+use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
 use pond_core::services::fallback_provider::FallbackProvider;
+use pond_core::services::fallback_voice_output::FallbackVoiceOutput;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
@@ -120,8 +128,8 @@ enum Commands {
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: none (print only) or piper
-        #[arg(long, default_value = "none")]
+        /// Text-to-speech engine: qwen (default), piper, or none (print only)
+        #[arg(long, default_value = "qwen")]
         tts: String,
 
         /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
@@ -195,28 +203,41 @@ async fn run_setup(model: &str) -> Result<()> {
 
     println!("\n  📂 Data directory: {}", data_dir.display());
 
-    // Step 1: Initialize databases
-    println!("\n  [1/4] Initializing databases...");
+    // Step 1: Check + auto-install system dependencies (Linux/macOS only)
+    println!("\n  [1/7] Checking system dependencies...");
+    if system_deps::ensure_system_deps().await {
+        println!("  ✅ System dependencies OK");
+    } else {
+        println!("  ⚠  Some system deps could not be installed — see docs/developer/linux-setup.md");
+        println!("     Continuing setup; some features may not work until deps are installed.");
+    }
+
+    // Step 2: Initialize databases
+    println!("\n  [2/7] Initializing databases...");
     Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
-    // Step 2: Download Whisper model
+    // Step 3: Download Whisper ASR model
     let effective_model = if model.is_empty() {
         model_download::DEFAULT_WHISPER_MODEL
     } else {
         model
     };
     let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [2/4] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [3/7] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
     let _model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
 
-    // Step 3: Download whisper-server binary
-    println!("\n  [3/4] Downloading whisper-server binary...");
+    // Step 4: Download whisper-server binary
+    println!("\n  [4/7] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
-    // Step 4: Download Piper TTS binary + voice model
-    println!("\n  [4/4] Downloading Piper TTS binary and voice model...");
+    // Step 5: Qwen TTS (primary TTS engine — auto-installed into managed venv)
+    println!("\n  [5/7] Installing Qwen TTS (primary TTS engine)...");
+    qwen_tts_process::setup_install(&data_dir).await;
+
+    // Step 6: Download Piper TTS binary + voice model (fallback TTS)
+    println!("\n  [6/7] Downloading Piper TTS binary and voice model (fallback TTS)...");
     match model_download::download_piper_binary(&data_dir).await {
         Ok(_) => {}
         Err(e) => println!("  ⚠  Could not download piper binary: {}", e),
@@ -226,17 +247,29 @@ async fn run_setup(model: &str) -> Result<()> {
         Err(e) => println!("  ⚠  Could not download piper voice model: {}", e),
     }
 
+    // Step 7: Download default LLM (Gemma 2 2B via llamafile)
+    println!(
+        "\n  [7/7] Downloading LLM model ({})...",
+        model_download::DEFAULT_LLAMAFILE_MODEL
+    );
+    match model_download::download_llamafile_model(
+        model_download::DEFAULT_LLAMAFILE_MODEL,
+        &data_dir,
+    )
+    .await
+    {
+        Ok(p) => println!("  ✅ LLM model ready: {}", p.display()),
+        Err(e) => println!("  ⚠  Could not download LLM model: {}", e),
+    }
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
     println!();
-    println!("  1. (Optional) Start llamafile for a local LLM:");
-    println!("       ./your-model.llamafile");
-    println!();
-    println!("  2. Run the server (whisper.cpp starts automatically):");
+    println!("  Run the server (all AI components start automatically):");
     println!("       pond-server serve");
     println!();
-    println!("  3. Or run interactive CLI chat with voice + TTS:");
+    println!("  Or run interactive CLI chat with voice + TTS:");
     println!("       pond-server chat --provider llamafile --input whisper --tts piper");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -254,15 +287,25 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
 
+    // Soft system-dep check (non-fatal — just warn if something looks wrong)
+    system_deps::warn_if_missing();
+
+    // ── Load registry + settings early (drives model selection) ─────────────
+    let registry = model_registry::ModelRegistry::load_cached(&data_dir);
+    let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
+    let settings = settings_repo_early.get().await.unwrap_or_default();
+
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
-    // STT — whisper.cpp binary + model
-    let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
-        .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+    // STT — whisper.cpp binary + model (use active_whisper_model from settings)
+    let active_whisper = registry
+        .find_whisper(&settings.active_whisper_model)
+        .unwrap_or_else(|| registry.whisper.first().expect("registry has no whisper models"));
+    let whisper_model = data_dir.join("models").join(&active_whisper.filename);
     if !whisper_model.exists() {
-        println!("  📥 STT model not found — downloading ({})...", model_download::DEFAULT_WHISPER_MODEL);
-        match model_download::download_whisper_model(model_download::DEFAULT_WHISPER_MODEL, &data_dir).await {
+        println!("  📥 STT model not found — downloading ({})...", active_whisper.name);
+        match model_download::download_whisper_model(&active_whisper.name, &data_dir).await {
             Ok(_) => {}
             Err(e) => println!("  ⚠  STT model download failed: {}", e),
         }
@@ -276,37 +319,79 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
     }
     let _whisper_guard = whisper_process::try_start(&data_dir, &whisper_model, 9000).await;
 
-    // TTS — piper binary + voice model
+    // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
+    let _qwen_tts_guard = qwen_tts_process::try_start(&settings.voice_tts_http_url, &data_dir).await;
+
     let piper_model = model_download::tts_models_dir(&data_dir)
         .join(model_download::PIPER_MODEL_FILENAME);
     if !model_download::piper_binary_path(&data_dir).exists() {
-        println!("  📥 TTS binary not found — downloading...");
+        println!("  📥 TTS fallback binary not found — downloading piper...");
         match model_download::download_piper_binary(&data_dir).await {
             Ok(_) => {}
-            Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+            Err(e) => println!("  ⚠  Piper binary download failed: {}", e),
         }
     }
     if !piper_model.exists() {
-        println!("  📥 TTS model not found — downloading...");
+        println!("  📥 TTS fallback model not found — downloading piper voice...");
         match model_download::download_piper_model(&data_dir).await {
             Ok(_) => {}
-            Err(e) => println!("  ⚠  TTS model download failed: {}", e),
+            Err(e) => println!("  ⚠  Piper model download failed: {}", e),
         }
     }
-    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
+    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
         match piper_process::find_binary(&data_dir) {
             Some(bin) if piper_model.exists() => {
-                println!("  ✅ TTS: piper ready");
-                Some(Arc::new(PiperOutput::new(bin, piper_model.clone()))
-                    as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
+                println!("  ✅ TTS fallback: piper ready");
+                Some(Arc::new(PiperOutput::new(bin, piper_model.clone())))
             }
             _ => {
-                println!("  ⚠  TTS: piper unavailable (binary or model missing)");
+                println!("  ⚠  TTS fallback: piper unavailable (binary or model missing)");
                 None
             }
         };
+    let qwen_tts = Arc::new(
+        QwenTtsOutput::new(Some(&settings.voice_tts_http_url))
+            .with_voice(&settings.voice_tts_http_voice),
+    );
+    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = Some(
+        match piper_tts {
+            Some(piper) => {
+                println!("  ✅ TTS: qwen-tts (primary) → piper (fallback)");
+                Arc::new(FallbackVoiceOutput::new(qwen_tts, piper))
+                    as Arc<dyn pond_core::ports::voice_output::VoiceOutput>
+            }
+            None => {
+                println!("  ✅ TTS: qwen-tts (primary, no fallback available)");
+                qwen_tts as Arc<dyn pond_core::ports::voice_output::VoiceOutput>
+            }
+        }
+    );
+
+    // LLM — llamafile auto-download + auto-start (use active_llm_model from settings)
+    let active_llm = registry
+        .find_llamafile(&settings.active_llm_model)
+        .unwrap_or_else(|| registry.llamafile.first().expect("registry has no llamafile models"));
+    let llm_model_path = llamafile_process::find_model(&data_dir);
+    if llm_model_path.is_none() {
+        println!("  📥 LLM model not found — downloading {}...", active_llm.name);
+        match model_download::download_llamafile_model(&active_llm.name, &data_dir).await {
+            Ok(_)  => {}
+            Err(e) => println!("  ⚠  LLM download failed: {}", e),
+        }
+    }
+    let _llamafile_guard = llamafile_process::try_start(&data_dir, 8080).await;
 
     println!("  ────────────────────────────────────────────────────\n");
+
+    // Build model status snapshot for API
+    let model_status_entries = model_registry::build_model_status(
+        &registry,
+        &settings.active_whisper_model,
+        &settings.active_llm_model,
+        &settings.active_tts_model,
+        &data_dir,
+    );
+    let model_status = Arc::new(tokio::sync::RwLock::new(model_status_entries));
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
@@ -361,6 +446,9 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         embedding_provider: None,
         sensor_storage,
         camera_storage,
+        prompt_template_dir: Some(data_dir.join("prompts")),
+        model_status: Some(model_status),
+        data_dir: Some(data_dir.clone()),
     });
 
     // Warn if static assets haven't been built yet
@@ -421,13 +509,73 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     let _whisper_guard = if input == "whisper" {
         let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
             .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+        if !whisper_model.exists() {
+            println!("  📥 STT model not found — downloading ({})...", model_download::DEFAULT_WHISPER_MODEL);
+            match model_download::download_whisper_model(model_download::DEFAULT_WHISPER_MODEL, &data_dir).await {
+                Ok(_)  => {}
+                Err(e) => println!("  ⚠  STT model download failed: {}", e),
+            }
+        }
         whisper_process::try_start(&data_dir, &whisper_model, 9000).await
+    } else {
+        None
+    };
+
+    // Auto-start llamafile when --provider llamafile is requested.
+    let _llamafile_guard = if provider == "llamafile" {
+        if llamafile_process::find_model(&data_dir).is_none() {
+            println!("  📥 LLM model not found — downloading {}...",
+                model_download::DEFAULT_LLAMAFILE_MODEL);
+            match model_download::download_llamafile_model(
+                model_download::DEFAULT_LLAMAFILE_MODEL, &data_dir,
+            ).await {
+                Ok(_)  => {}
+                Err(e) => println!("  ⚠  LLM download failed: {}", e),
+            }
+        }
+        llamafile_process::try_start(&data_dir, 8080).await
     } else {
         None
     };
 
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
+
+    // Resolve the system prompt:
+    // 1. If $DATA_DIR/prompts/system.md exists, load and render it with settings vars.
+    // 2. Otherwise, build from settings values.
+    // 3. Fall back to the static SYSTEM_PROMPT constant if settings are unavailable.
+    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+    let system_prompt = {
+        let settings = settings_repo.get().await.ok();
+        let prompt_dir = data_dir.join("prompts");
+        let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
+
+        match (file_template, settings) {
+            (Some(tmpl), Some(s)) => {
+                println!("  Prompt:   custom ({})", prompt_dir.join("system.md").display());
+                let name    = pond_core::prompts::sanitize_field(&s.assistant_name, 50);
+                let user    = pond_core::prompts::sanitize_field(&s.user_name, 50);
+                let persona = pond_core::prompts::sanitize_field(&s.assistant_personality, 200);
+                let tz      = pond_core::prompts::sanitize_field(&s.timezone, 50);
+                pond_core::prompts::render_template(&tmpl, &[
+                    ("assistant_name", name.as_str()),
+                    ("user_name",      user.as_str()),
+                    ("personality",    persona.as_str()),
+                    ("timezone",       tz.as_str()),
+                ])
+            }
+            (None, Some(s)) => {
+                println!(
+                    "  Assistant: {} / greeting: {}",
+                    s.assistant_name, s.user_name
+                );
+                build_system_prompt(&s.assistant_name, &s.user_name, &s.assistant_personality, &s.timezone)
+            }
+            _ => pond_core::prompts::SYSTEM_PROMPT.to_string(),
+        }
+    };
+
     let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
@@ -440,7 +588,8 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         }
     }
 
-    let mut chat_service = ChatService::new(agent, session_id.clone(), storage);
+    let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
+        .with_system_prompt(system_prompt);
 
     // ── Wire LLM provider ──
     match provider {
@@ -493,20 +642,65 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     };
     chat_service = chat_service.with_wake_word_detector(detector);
 
+    // Auto-start Qwen TTS server before the match (guard must outlive voice_out).
+    let _qwen_tts_chat_guard = if tts == "qwen" || tts == "qwen-tts" {
+        qwen_tts_process::try_start(pond_adapters_qwen_tts::DEFAULT_HOST, &data_dir).await
+    } else {
+        None
+    };
+
     // ── Wire TTS output ──
     let voice_out: Arc<dyn VoiceOutput> = match tts {
+        "qwen" | "qwen-tts" => {
+            let qwen = Arc::new(QwenTtsOutput::new(None));
+
+            // Build piper if available (auto-download if needed).
+            let piper_model = data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME);
+            if piper_process::find_binary(&data_dir).is_none() {
+                let _ = model_download::download_piper_binary(&data_dir).await;
+            }
+            if !piper_model.exists() {
+                let _ = model_download::download_piper_model(&data_dir).await;
+            }
+            match piper_process::find_binary(&data_dir) {
+                Some(bin) if piper_model.exists() => {
+                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
+                    Arc::new(FallbackVoiceOutput::new(
+                        qwen as Arc<dyn VoiceOutput>,
+                        Arc::new(PiperOutput::new(bin, piper_model)),
+                    ))
+                }
+                _ => {
+                    println!("  TTS:      qwen-tts");
+                    qwen as Arc<dyn VoiceOutput>
+                }
+            }
+        }
         "piper" => {
             let model_path = tts_model.unwrap_or_else(|| {
                 data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME)
             });
+            if piper_process::find_binary(&data_dir).is_none() {
+                println!("  📥 TTS binary not found — downloading...");
+                match model_download::download_piper_binary(&data_dir).await {
+                    Ok(_)  => {}
+                    Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                }
+            }
+            if !model_path.exists() {
+                println!("  📥 TTS model not found — downloading...");
+                match model_download::download_piper_model(&data_dir).await {
+                    Ok(_)  => {}
+                    Err(e) => println!("  ⚠  TTS model download failed: {}", e),
+                }
+            }
             match piper_process::find_binary(&data_dir) {
                 Some(bin) => {
-                    println!("  TTS:      piper ({:?})", model_path.file_name().unwrap_or_default());
+                    println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
                     Arc::new(PiperOutput::new(bin, model_path))
                 }
                 None => {
-                    println!("  TTS:      piper requested but binary not found — falling back to print");
-                    println!("            Run `pond-server setup` to download piper.");
+                    println!("  TTS:      piper unavailable (binary not found) — falling back to print");
                     Arc::new(PrintOutput)
                 }
             }
