@@ -40,6 +40,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
         .route("/onboard", post(start_onboarding))
+        .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
@@ -156,6 +157,29 @@ async fn start_onboarding(
             })))
         }
     }
+}
+
+/// Mark onboarding as complete (public).
+///
+/// Called by the web UI on the final onboarding step. Saving
+/// `OnboardingStep::Completed` lifts the onboarding guard middleware so that
+/// protected routes become accessible. This must be called and must succeed
+/// before the client attempts any authenticated request; if it fails the UI
+/// shows an error and does not navigate to the dashboard.
+async fn complete_onboarding(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .onboarding_repo
+        .save_step(OnboardingStep::Completed)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to complete onboarding: {}", e)})),
+            )
+        })?;
+    Ok(Json(json!({"status": "completed"})))
 }
 
 /// Return current onboarding progress (public)
