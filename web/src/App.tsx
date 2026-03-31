@@ -137,7 +137,7 @@ function App() {
                             onClick={() => setPage(item.page)}
                         >
                             <span className="db-sidebar-link-icon">{item.icon}</span>
-                            {item.label}
+                            <span className="db-sidebar-link-label">{item.label}</span>
                         </button>
                     ))}
                 </nav>

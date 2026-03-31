@@ -1,4 +1,4 @@
-//! Authentication, rate limiting, and onboarding middleware.
+//! Authentication, rate limiting, onboarding, and debug-logging middleware.
 
 pub mod onboarding_guard;
 
@@ -108,8 +108,44 @@ fn is_public_route(path: &str) -> bool {
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     matches!(
         path,
-        "/health" | "/handshake" | "/onboard" | "/onboard/status" | "/transcribe"
+        "/health" | "/handshake" | "/onboard" | "/onboard/complete" | "/onboard/status" | "/transcribe"
     )
+}
+
+/// Debug request/response logging middleware.
+///
+/// Emits one `DEBUG` span for each incoming request and one for the outgoing
+/// response. Because both use [`tracing::debug!`], they are only visible when
+/// the active log filter includes the `debug` level — i.e. when the server is
+/// started with `pond-server serve --debug`. At the default `info` level this
+/// middleware is a zero-cost pass-through; no branching or allocation occurs.
+///
+/// Logged fields:
+/// - `-->` line: HTTP method, path, and query string (empty string when absent)
+/// - `<--` line: HTTP method, path, response status code, elapsed time in ms
+pub async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri    = req.uri().clone();
+    let start  = std::time::Instant::now();
+
+    tracing::debug!(
+        method = %method,
+        path   = %uri.path(),
+        query  = %uri.query().unwrap_or(""),
+        "--> incoming request"
+    );
+
+    let response = next.run(req).await;
+
+    tracing::debug!(
+        method     = %method,
+        path       = %uri.path(),
+        status     = response.status().as_u16(),
+        latency_ms = start.elapsed().as_millis(),
+        "<-- outgoing response"
+    );
+
+    response
 }
 
 /// Global token-based authentication middleware

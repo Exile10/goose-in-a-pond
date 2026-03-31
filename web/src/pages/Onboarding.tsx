@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { api, isPreviewMode } from '../api'
 import VerifyDevice from '../steps/VerifyDevice'
 import CreateProfile from '../steps/CreateProfile'
 import ConfigurePersonality from '../steps/ConfigurePersonality'
@@ -33,6 +34,8 @@ interface Props {
 export default function Onboarding({ onComplete }: Props) {
   const [step, setStep] = useState<Step>(0)
   const [ctx, setCtx] = useState<Partial<OnboardingContext>>({})
+  const [completing, setCompleting] = useState(false)
+  const [completeError, setCompleteError] = useState<string | null>(null)
 
   function next(data: Partial<OnboardingContext>) {
     setCtx(prev => ({ ...prev, ...data }))
@@ -52,13 +55,50 @@ export default function Onboarding({ onComplete }: Props) {
           <p>
             <strong>{ctx.displayName ?? ctx.profileName}</strong>, your pond is ready.
           </p>
-          <button className="ob-btn ob-btn-primary" onClick={() => {
+          {completeError && (
+            <p className="ob-error">
+              Could not save onboarding state: {completeError}. Please try again.
+            </p>
+          )}
+          <button className="ob-btn ob-btn-primary" disabled={completing} onClick={async () => {
             if (ctx.devices && ctx.devices.length > 0) {
               localStorage.setItem('pond_devices', JSON.stringify(ctx.devices))
             }
+
+            // Tell the backend onboarding is complete. This lifts the onboarding
+            // guard middleware so protected routes become accessible. The call
+            // must succeed before we navigate — if it fails we show the error
+            // and stay on this screen rather than letting the user reach the
+            // dashboard in a broken state where every API call would be rejected.
+            if (!isPreviewMode(ctx.sessionToken ?? '')) {
+              setCompleting(true)
+              setCompleteError(null)
+              try {
+                await api.completeOnboarding()
+              } catch (err) {
+                setCompleting(false)
+                setCompleteError(err instanceof Error ? err.message : 'Could not reach the server')
+                return
+              }
+              setCompleting(false)
+            }
+
+            // Sync personality settings now that protected routes are accessible.
+            // Non-fatal: settings are in localStorage and will be re-synced when
+            // the user visits Settings on the dashboard.
+            if (ctx.sessionToken && !isPreviewMode(ctx.sessionToken) && ctx.personality) {
+              try {
+                await api.saveSettings(
+                  { personality: ctx.personality, assistant_style: ctx.assistantStyle ?? 'proactive' },
+                  ctx.sessionToken,
+                )
+              } catch {
+                // intentionally ignored — see comment above
+              }
+            }
             onComplete(ctx.sessionToken ?? '', ctx.displayName ?? ctx.profileName ?? '')
           }}>
-            Go to dashboard
+            {completing ? 'Saving…' : 'Go to dashboard'}
           </button>
         </div>
       </div>
