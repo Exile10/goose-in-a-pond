@@ -11,8 +11,7 @@
 //!   5. Spawn `<venv>/python -m qwen_tts serve --port <port>`.
 //!   6. Return a guard that kills the process on drop.
 //!
-//! If Python is not installed at all, instructions are printed and the server
-//! falls back to Piper TTS.
+//! If Python is unavailable or install fails, falls back to Piper TTS.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -175,10 +174,17 @@ fn find_in_path(name: &str) -> Option<String> {
 }
 
 fn find_python() -> Option<String> {
+    // Prefer newer Python — qwen-tts deps (accelerate 1.x) require Python 3.10+.
     #[cfg(windows)]
-    let candidates = &["python.exe", "python3.exe", "py.exe"][..];
+    let candidates = &[
+        "python3.13.exe", "python3.12.exe", "python3.11.exe", "python3.10.exe",
+        "python3.exe", "python.exe", "py.exe",
+    ][..];
     #[cfg(not(windows))]
-    let candidates = &["python3", "python"][..];
+    let candidates = &[
+        "python3.13", "python3.12", "python3.11", "python3.10",
+        "python3", "python",
+    ][..];
 
     for name in candidates {
         if find_in_path(name).is_some() {
@@ -202,21 +208,19 @@ pub async fn is_running(base_url: &str) -> bool {
 
 // ── Venv creation + pip install ───────────────────────────────────────────────
 
-/// Create managed venv (if absent) and `pip install qwen-tts` inside it.
+/// Create managed venv (if absent) and install qwen-tts with all prerequisites.
 /// Returns the `Invoker` to use for spawning.
 async fn ensure_installed(data_dir: &Path) -> Result<Invoker> {
     let venv = venv_dir(data_dir);
 
-    let python = find_python().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Python not found — install Python 3.9+ then re-run setup.\n\
-             Download: https://www.python.org/downloads/"
-        )
-    })?;
+    let python = find_python().ok_or_else(|| anyhow::anyhow!("Python 3.10+ not found"))?;
 
-    // Create venv if absent.
+    // Install system sox binary — required by the sox Python package's setup.py.
+    install_system_sox().await;
+
+    // Create venv if absent (or if broken from a previous failed attempt).
     if !venv.exists() {
-        println!("  🐍 Creating Python venv at {} ...", venv.display());
+        println!("  🐍 Creating Python venv...");
         let status = tokio::process::Command::new(&python)
             .args(["-m", "venv", &venv.to_string_lossy()])
             .status()
@@ -225,14 +229,29 @@ async fn ensure_installed(data_dir: &Path) -> Result<Invoker> {
         if !status.success() {
             anyhow::bail!("venv creation failed (exit {})", status);
         }
-        println!("  ✅ venv created");
     }
 
-    // pip install qwen-tts (idempotent — pip skips if already satisfied)
     let pip = venv_pip(data_dir);
-    println!("  📦 Installing qwen-tts into venv...");
+
+    // Upgrade pip — old pip (e.g. 21.x bundled with Xcode CLT Python) has
+    // poor dependency resolver behaviour that causes false conflicts.
+    let _ = tokio::process::Command::new(&pip)
+        .args(["install", "--upgrade", "pip"])
+        .status()
+        .await;
+
+    // numpy must be installed before sox (the Python package) because sox's
+    // setup.py imports numpy during metadata collection.
+    let _ = tokio::process::Command::new(&pip)
+        .args(["install", "numpy"])
+        .status()
+        .await;
+
+    // Install qwen-tts. Do not pass --upgrade to avoid pulling in conflicting
+    // transitive upgrades on top of an existing environment.
+    println!("  📦 Installing qwen-tts...");
     let status = tokio::process::Command::new(&pip)
-        .args(["install", "--upgrade", "qwen-tts"])
+        .args(["install", "qwen-tts"])
         .status()
         .await
         .context("Failed to run pip install")?;
@@ -242,6 +261,46 @@ async fn ensure_installed(data_dir: &Path) -> Result<Invoker> {
 
     find_invoker(data_dir)
         .ok_or_else(|| anyhow::anyhow!("qwen_tts module not found in venv after install"))
+}
+
+/// Install the system `sox` audio tool if it is not already present.
+/// Required by the `sox` Python package which qwen-tts depends on.
+async fn install_system_sox() {
+    // Check if already installed.
+    let already = tokio::process::Command::new("sox")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if already { return; }
+
+    println!("  📥 Installing system sox...");
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tokio::process::Command::new("brew")
+            .args(["install", "sox"])
+            .status().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for args in &[
+            &["apt-get", "install", "-y", "sox"][..],
+            &["apt",     "install", "-y", "sox"],
+            &["dnf",     "install", "-y", "sox"],
+            &["yum",     "install", "-y", "sox"],
+            &["pacman",  "--noconfirm", "-S", "sox"],
+        ] {
+            if tokio::process::Command::new("sudo")
+                .args(*args)
+                .status().await.map(|s| s.success()).unwrap_or(false)
+            { break; }
+        }
+    }
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -299,7 +358,6 @@ pub async fn try_start(base_url: &str, data_dir: &Path) -> Option<QwenTtsProcess
                 Ok(i) => i,
                 Err(e) => {
                     println!("  ⚠  Could not install qwen-tts: {}", e);
-                    println!("     Piper will be used as TTS fallback.");
                     return None;
                 }
             }
@@ -314,7 +372,6 @@ pub async fn try_start(base_url: &str, data_dir: &Path) -> Option<QwenTtsProcess
         }
         Err(e) => {
             println!("  ⚠  Failed to start Qwen TTS: {}", e);
-            println!("     Piper will be used as TTS fallback.");
             None
         }
     }

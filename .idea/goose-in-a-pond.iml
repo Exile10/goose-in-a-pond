@@ -25,6 +25,11 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-llamafile/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-whisper/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-whisper/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-llamafile/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-ollama/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-piper/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-qwen-tts/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-api/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
