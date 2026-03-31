@@ -20,6 +20,7 @@
 mod llamafile_process;
 mod model_download;
 mod model_registry;
+mod piper_http;
 mod piper_process;
 mod qwen_tts_process;
 mod system_deps;
@@ -335,18 +336,39 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     let piper_model = model_download::tts_models_dir(&data_dir)
         .join(model_download::PIPER_MODEL_FILENAME);
 
-    // If qwen is not available, piper is the primary TTS — ensure it is fully set up.
+    // Ensure piper binary + model + espeak-ng-data are present.
     if !model_download::piper_binary_path(&data_dir).exists() {
         let _ = model_download::download_piper_binary(&data_dir).await;
     }
     if !piper_model.exists() {
         let _ = model_download::download_piper_model(&data_dir).await;
     }
+    // Always ensure espeak-ng-data is present (may be missing after source build).
+    model_download::ensure_espeak_ng_data(&data_dir).await;
 
+    // Start piper as a persistent HTTP server so it shows up in the service list.
+    let espeak_data = {
+        let p = model_download::piper_espeak_data_path(&data_dir);
+        if p.exists() { Some(p) } else { None }
+    };
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
         match piper_process::find_binary(&data_dir) {
             Some(bin) if piper_model.exists() => {
-                Some(Arc::new(PiperOutput::new(bin, piper_model.clone())))
+                let ed = espeak_data.clone();
+                match piper_http::start(bin.clone(), piper_model.clone(), ed, piper_http::DEFAULT_PORT).await {
+                    Ok(port) => {
+                        println!("  ✅ Piper TTS running on port {}", port);
+                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        Some(Arc::new(out))
+                    }
+                    Err(e) => {
+                        tracing::warn!("piper-http failed to start: {e}");
+                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        Some(Arc::new(out))
+                    }
+                }
             }
             _ => None,
         };

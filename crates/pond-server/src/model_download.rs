@@ -816,7 +816,9 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         .await
         .context("Zip extraction task panicked")??;
     } else {
-        // Linux: extract piper binary from .tar.gz
+        // Linux: extract piper from .tar.gz, preserving subdirectory structure
+        // so that espeak-ng-data/ ends up at bin/espeak-ng-data/.
+        // The archive root is a single directory (e.g. "piper/"); strip it.
         let dest_clone = dest.clone();
         tokio::task::spawn_blocking(move || {
             use flate2::read::GzDecoder;
@@ -825,19 +827,27 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
             let mut tar = Archive::new(gz);
             for entry in tar.entries()? {
                 let mut entry = entry?;
-                let path = entry.path()?;
-                let file_name = path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if file_name.is_empty() {
+                let path = entry.path()?.into_owned();
+
+                // Skip the top-level directory entry itself.
+                let mut components = path.components();
+                components.next(); // strip leading "piper/" component
+                let relative: std::path::PathBuf = components.collect();
+                if relative.as_os_str().is_empty() {
                     continue;
                 }
-                let out_path = bin_dir.join(&file_name);
+
+                let out_path = bin_dir.join(&relative);
+
+                // Ensure parent directories exist (needed for espeak-ng-data/*)
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
                 entry.unpack(&out_path)?;
 
                 #[cfg(unix)]
-                if file_name == "piper" {
+                if relative.to_string_lossy() == "piper" {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755))?;
                 }
@@ -849,8 +859,128 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         .context("Tar extraction task panicked")??;
     }
 
+    // Ensure espeak-ng-data is present alongside the binary.
+    ensure_espeak_ng_data(data_dir).await;
+
     println!("  ✅ piper installed: {}", dest.display());
     Ok(dest)
+}
+
+/// Returns the path where espeak-ng-data should live: `<data_dir>/bin/espeak-ng-data/`.
+pub fn piper_espeak_data_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin").join("espeak-ng-data")
+}
+
+/// Ensure espeak-ng-data is installed at `<data_dir>/bin/espeak-ng-data/`.
+///
+/// On first run (or after a source-only build that didn't copy the data):
+///   1. macOS: try `brew install espeak-ng` and copy from Homebrew prefix.
+///   2. All platforms fallback: download the Linux x86_64 piper tarball and
+///      extract only the `espeak-ng-data/` subtree.  The phoneme data files
+///      are platform-agnostic (text/binary tables, not native code).
+pub async fn ensure_espeak_ng_data(data_dir: &Path) {
+    let dest = piper_espeak_data_path(data_dir);
+    if dest.exists() {
+        return;
+    }
+
+    println!("  📥 espeak-ng-data missing — installing...");
+
+    // ── Option 1: brew prefix on macOS ──────────────────────────────────────
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = tokio::process::Command::new("brew")
+            .args(["install", "espeak-ng"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                // Find data dir in Homebrew prefix.
+                for candidate in &[
+                    "/opt/homebrew/lib/espeak-ng-data",
+                    "/usr/local/lib/espeak-ng-data",
+                    "/opt/homebrew/Cellar",
+                ] {
+                    let p = std::path::Path::new(candidate);
+                    if p.is_dir() && p.file_name().map_or(false, |n| n == "espeak-ng-data") {
+                        if copy_dir_all(p, &dest).is_ok() {
+                            println!("  ✅ espeak-ng-data from Homebrew: {}", dest.display());
+                            return;
+                        }
+                    }
+                }
+                // Homebrew installed but path detection failed — do broader search.
+                if let Ok(out) = tokio::process::Command::new("brew")
+                    .args(["--prefix", "espeak-ng"])
+                    .output()
+                    .await
+                {
+                    let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let data_p = std::path::Path::new(&prefix).join("lib").join("espeak-ng-data");
+                    if data_p.is_dir() {
+                        if copy_dir_all(&data_p, &dest).is_ok() {
+                            println!("  ✅ espeak-ng-data from Homebrew: {}", dest.display());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Option 2: download from piper Linux x86_64 tarball ──────────────────
+    // The phoneme data files are platform-independent; we borrow them from the
+    // Linux release and they work on macOS/Windows just as well.
+    let url = format!(
+        "{}/piper_linux_x86_64.tar.gz",
+        PIPER_GITHUB_BASE
+    );
+    println!("  ⬇  espeak-ng-data (via piper Linux tarball)...");
+
+    let bytes = match reqwest::get(&url).await.and_then(|r| Ok(r)) {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => { tracing::warn!("espeak-ng-data download failed: {e}"); return; }
+            }
+        }
+        Ok(resp) => { tracing::warn!("espeak-ng-data download: HTTP {}", resp.status()); return; }
+        Err(e) => { tracing::warn!("espeak-ng-data download failed: {e}"); return; }
+    };
+
+    let dest_clone = dest.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use flate2::read::GzDecoder;
+        use tar::Archive;
+        let gz = GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut tar = Archive::new(gz);
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            // Only extract entries under espeak-ng-data/
+            let mut comps = path.components();
+            comps.next(); // strip top-level "piper/"
+            let relative: std::path::PathBuf = comps.collect();
+            let rel_str = relative.to_string_lossy();
+            if !rel_str.starts_with("espeak-ng-data") {
+                continue;
+            }
+            let out_path = dest_clone.parent().unwrap_or(&dest_clone).join(&relative);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&out_path)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) if dest.exists() => println!("  ✅ espeak-ng-data installed: {}", dest.display()),
+        Ok(Ok(())) => tracing::warn!("espeak-ng-data not found in tarball"),
+        Ok(Err(e)) => tracing::warn!("espeak-ng-data extraction failed: {e}"),
+        Err(e) => tracing::warn!("espeak-ng-data task panicked: {e}"),
+    }
 }
 
 /// Build piper from source for platforms without a pre-built binary (macOS, Windows ARM64).
@@ -920,8 +1050,64 @@ async fn build_piper_from_source(data_dir: &Path, dest: &Path) -> Result<PathBuf
         std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
+    // Copy espeak-ng-data next to the binary so piper can find it at runtime.
+    // cmake's FetchContent/ExternalProject places it somewhere under build_dir.
+    let espeak_dest = data_dir.join("bin").join("espeak-ng-data");
+    if !espeak_dest.exists() {
+        if let Some(espeak_src) = find_espeak_ng_data(&build_dir) {
+            println!("  📋 Copying espeak-ng-data from {}...", espeak_src.display());
+            copy_dir_all(&espeak_src, &espeak_dest)?;
+            println!("  ✅ espeak-ng-data installed: {}", espeak_dest.display());
+        } else {
+            // Not found in build tree — fall through to ensure_espeak_ng_data() below.
+            tracing::warn!("espeak-ng-data not found in cmake build tree — will download separately");
+        }
+    }
+
+    // Final safety net: download if still missing.
+    ensure_espeak_ng_data(data_dir).await;
+
     println!("  ✅ piper built and installed: {}", dest.display());
     Ok(dest.to_path_buf())
+}
+
+/// Recursively search `root` for a directory named `espeak-ng-data`.
+fn find_espeak_ng_data(root: &Path) -> Option<PathBuf> {
+    // BFS through the directory tree (depth-limited to avoid infinite loops).
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0u32));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > 10 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name() == "espeak-ng-data" {
+                    return Some(path);
+                }
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    None
+}
+
+/// Recursively copy a directory tree from `src` to `dst`.
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 // ── llamafile LLM model registry ──────────────────────────────────────────────
