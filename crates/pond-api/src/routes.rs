@@ -1178,8 +1178,10 @@ const API='/api/v1';
 // ── Onboarding ────────────────────────────────────────────────────────────────
 async function doOnboard(){
   try{
-    const r=await fetch(`${API}/onboard`,{method:'POST'});
-    alert(await r.text());
+    const r=await fetch(`${API}/onboard/complete`,{method:'POST'});
+    const d=await r.json();
+    if(d.status==='completed') location.reload();
+    else alert(JSON.stringify(d));
   }catch(e){alert('Onboard error: '+e.message);}
 }
 
