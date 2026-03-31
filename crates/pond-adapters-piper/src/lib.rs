@@ -37,6 +37,9 @@ pub struct PiperOutput {
     /// Sample rate of the model's raw PCM output.
     /// `en_US-lessac-medium` = 22 050 Hz.  Override with `with_sample_rate()`.
     sample_rate: u32,
+    /// Optional path to the espeak-ng-data directory.
+    /// When set, `--espeak_data <path>` is passed to piper.
+    espeak_data: Option<PathBuf>,
 }
 
 impl PiperOutput {
@@ -49,7 +52,15 @@ impl PiperOutput {
             piper_bin,
             model,
             sample_rate: 22_050,
+            espeak_data: None,
         }
+    }
+
+    /// Set the espeak-ng-data directory (passed as `--espeak_data` to piper).
+    /// Required when piper was compiled against a different system path.
+    pub fn with_espeak_data(mut self, path: PathBuf) -> Self {
+        self.espeak_data = Some(path);
+        self
     }
 
     /// Override the expected sample rate (default: 22 050 for lessac-medium).
@@ -60,12 +71,17 @@ impl PiperOutput {
 
     /// Assemble the piper command arguments (useful for tests without a real binary).
     pub fn build_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "--model".to_string(),
             self.model.to_string_lossy().to_string(),
             "--output-raw".to_string(),
             "--quiet".to_string(),
-        ]
+        ];
+        if let Some(ref d) = self.espeak_data {
+            args.push("--espeak_data".to_string());
+            args.push(d.to_string_lossy().to_string());
+        }
+        args
     }
 }
 
@@ -77,9 +93,11 @@ impl VoiceOutput for PiperOutput {
         let sample_rate = self.sample_rate;
         let text = text.to_string();
 
+        let espeak_data = self.espeak_data.clone();
+
         // Piper is a blocking subprocess — run it off the async executor.
         tokio::task::spawn_blocking(move || {
-            speak_blocking(&bin, &model, sample_rate, &text)
+            speak_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)
         })
         .await
         .context("piper speak task panicked")??;
@@ -93,18 +111,24 @@ impl VoiceOutput for PiperOutput {
 fn speak_blocking(
     piper_bin: &std::path::Path,
     model: &std::path::Path,
+    espeak_data: Option<&std::path::Path>,
     sample_rate: u32,
     text: &str,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
-    // Spawn piper, pipe stdin + stdout.
-    let mut child = Command::new(piper_bin)
-        .args(["--model", &model.to_string_lossy()])
-        .args(["--output-raw", "--quiet"])
+    // Spawn piper, pipe stdin + stdout.  Capture stderr so we can include it
+    // in the error message if piper exits non-zero.
+    let mut cmd = Command::new(piper_bin);
+    cmd.args(["--model", &model.to_string_lossy()])
+       .args(["--output-raw", "--quiet"]);
+    if let Some(d) = espeak_data {
+        cmd.args(["--espeak_data", &d.to_string_lossy()]);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("Failed to spawn piper at {}", piper_bin.display()))?;
 
@@ -121,10 +145,12 @@ fn speak_blocking(
     let output = child.wait_with_output().context("Failed to wait for piper")?;
 
     if !output.status.success() {
-        return Err(anyhow!(
-            "piper exited with status {}",
-            output.status
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            return Err(anyhow!("piper exited with status {}", output.status));
+        }
+        return Err(anyhow!("piper exited with status {}: {}", output.status, stderr));
     }
 
     let pcm = output.stdout;

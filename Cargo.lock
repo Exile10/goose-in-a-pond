@@ -2155,8 +2155,10 @@ dependencies = [
  "pond-core",
  "reqwest",
  "rodio",
+ "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 

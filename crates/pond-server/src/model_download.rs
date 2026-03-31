@@ -23,7 +23,7 @@ pub struct WhisperModelInfo {
     pub size_mb: u64,
 }
 
-/// English-only GGML models ordered by size (smallest → largest).
+/// GGML models ordered by size (smallest → largest).
 pub const WHISPER_MODELS: &[WhisperModelInfo] = &[
     WhisperModelInfo {
         name: "tiny",
@@ -42,6 +42,24 @@ pub const WHISPER_MODELS: &[WhisperModelInfo] = &[
         filename: "ggml-small.en.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
         size_mb: 244,
+    },
+    WhisperModelInfo {
+        name: "medium",
+        filename: "ggml-medium.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
+        size_mb: 769,
+    },
+    WhisperModelInfo {
+        name: "large-v3-turbo",
+        filename: "ggml-large-v3-turbo.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        size_mb: 809,
+    },
+    WhisperModelInfo {
+        name: "large-v3",
+        filename: "ggml-large-v3.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+        size_mb: 1550,
     },
 ];
 
@@ -283,6 +301,241 @@ async fn fetch_whisper_zip(
     Ok(dest.to_path_buf())
 }
 
+// ── Build-tool helpers: cmake + git auto-download ─────────────────────────────
+
+/// Pinned cmake release downloaded when the system has none.
+const CMAKE_VERSION: &str = "3.31.6";
+const CMAKE_GITHUB_BASE: &str = "https://github.com/Kitware/CMake/releases/download";
+
+struct CmakePlatform {
+    archive_name: &'static str,
+    /// Relative path inside the extracted archive to the cmake binary.
+    bin_rel:      &'static str,
+    is_zip:       bool,
+}
+
+fn cmake_platform_info() -> Option<CmakePlatform> {
+    // macOS universal binary (runs on both Apple Silicon and Intel)
+    #[cfg(target_os = "macos")]
+    return Some(CmakePlatform {
+        archive_name: "cmake-3.31.6-macos-universal.tar.gz",
+        bin_rel:      "cmake-3.31.6-macos-universal/CMake.app/Contents/bin/cmake",
+        is_zip:       false,
+    });
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return Some(CmakePlatform {
+        archive_name: "cmake-3.31.6-linux-x86_64.tar.gz",
+        bin_rel:      "cmake-3.31.6-linux-x86_64/bin/cmake",
+        is_zip:       false,
+    });
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return Some(CmakePlatform {
+        archive_name: "cmake-3.31.6-linux-aarch64.tar.gz",
+        bin_rel:      "cmake-3.31.6-linux-aarch64/bin/cmake",
+        is_zip:       false,
+    });
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return Some(CmakePlatform {
+        archive_name: "cmake-3.31.6-windows-x86_64.zip",
+        bin_rel:      "cmake-3.31.6-windows-x86_64/bin/cmake.exe",
+        is_zip:       true,
+    });
+
+    #[allow(unreachable_code)]
+    None
+}
+
+fn managed_cmake_path(data_dir: &Path) -> Option<PathBuf> {
+    Some(data_dir.join("build-tools").join(cmake_platform_info()?.bin_rel))
+}
+
+async fn tool_in_path(name: &str) -> bool {
+    tokio::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ensure cmake is available, downloading a portable binary if not in PATH.
+/// Returns the command/path to invoke cmake.
+pub async fn ensure_cmake(data_dir: &Path) -> Result<String> {
+    // 1. Already downloaded by GIAP
+    if let Some(p) = managed_cmake_path(data_dir) {
+        if p.exists() {
+            return Ok(p.to_string_lossy().into_owned());
+        }
+    }
+
+    // 2. Available in system PATH
+    if tool_in_path("cmake").await {
+        return Ok("cmake".to_string());
+    }
+
+    // 3. Download portable cmake binary from cmake.org
+    match cmake_platform_info() {
+        Some(info) => {
+            println!("  📥 cmake not found — downloading cmake {} for {} {}...",
+                CMAKE_VERSION, std::env::consts::OS, std::env::consts::ARCH);
+            download_cmake_binary(data_dir, &info).await?;
+            let path = managed_cmake_path(data_dir)
+                .expect("cmake_platform_info is Some");
+            Ok(path.to_string_lossy().into_owned())
+        }
+        None => Err(anyhow!("cmake unavailable for {} {}", std::env::consts::OS, std::env::consts::ARCH)),
+    }
+}
+
+async fn download_cmake_binary(data_dir: &Path, info: &CmakePlatform) -> Result<()> {
+    let tools_dir = data_dir.join("build-tools");
+    tokio::fs::create_dir_all(&tools_dir).await?;
+
+    let url = format!("{}/v{}/{}", CMAKE_GITHUB_BASE, CMAKE_VERSION, info.archive_name);
+    println!("  ⬇  cmake {} ({})", CMAKE_VERSION, info.archive_name);
+
+    let client = reqwest::Client::builder().build()?;
+    let resp = client.get(&url).send().await.context("Failed to fetch cmake archive")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("cmake download returned {}", resp.status()));
+    }
+
+    let total = resp.content_length().unwrap_or(60 * 1_048_576);
+    let mut downloaded: u64 = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.context("cmake download interrupted")? {
+        buf.extend_from_slice(&chunk);
+        downloaded += chunk.len() as u64;
+        let pct = (downloaded * 100) / total.max(1);
+        print!("\r  ⬇  {} / {} MB  ({}%)",
+            downloaded / 1_048_576, total / 1_048_576, pct);
+        std::io::stdout().flush().ok();
+    }
+    println!();
+
+    let tools_dir_clone = tools_dir.clone();
+    let bin_rel = info.bin_rel.to_string();
+
+    if info.is_zip {
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let cursor = std::io::Cursor::new(buf);
+            let mut archive = zip::ZipArchive::new(cursor).context("Invalid cmake zip")?;
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i)?;
+                if entry.is_dir() { continue; }
+                let entry_path = entry.name().replace('\\', "/");
+                let out_path = tools_dir_clone.join(&entry_path);
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut out = std::fs::File::create(&out_path)?;
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+                out.write_all(&content)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("cmake zip extraction panicked")??;
+    } else {
+        tokio::task::spawn_blocking(move || {
+            use flate2::read::GzDecoder;
+            use tar::Archive;
+            let gz = GzDecoder::new(std::io::Cursor::new(buf));
+            let mut tar = Archive::new(gz);
+            tar.set_preserve_permissions(true);
+            for entry in tar.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.to_path_buf();
+                let out_path = tools_dir_clone.join(&path);
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if entry.header().entry_type().is_dir() {
+                    std::fs::create_dir_all(&out_path)?;
+                } else {
+                    entry.unpack(&out_path)?;
+                }
+            }
+            // Ensure the cmake binary is executable on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let cmake_bin = tools_dir_clone.join(&bin_rel);
+                if cmake_bin.exists() {
+                    std::fs::set_permissions(&cmake_bin, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+            let _ = bin_rel;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("cmake tar extraction panicked")??;
+    }
+
+    println!("  ✅ cmake {} installed to build-tools/", CMAKE_VERSION);
+    Ok(())
+}
+
+/// Ensure git is available, installing automatically if possible.
+pub async fn ensure_git() -> Result<()> {
+    if tool_in_path("git").await {
+        return Ok(());
+    }
+
+    println!("  📥 git not found — installing...");
+
+    #[cfg(target_os = "linux")]
+    {
+        for args in &[
+            &["apt-get", "install", "-y", "git", "build-essential"][..],
+            &["apt",     "install", "-y", "git", "build-essential"],
+            &["dnf",     "install", "-y", "git", "gcc-c++", "make"],
+            &["yum",     "install", "-y", "git", "gcc-c++", "make"],
+            &["pacman",  "--noconfirm", "-S", "git", "base-devel"],
+            &["zypper",  "install", "-y", "git", "gcc-c++", "make"],
+        ] {
+            if tokio::process::Command::new("sudo")
+                .args(*args)
+                .status().await.map(|s| s.success()).unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Try Homebrew
+        if tokio::process::Command::new("brew")
+            .args(["install", "git"])
+            .status().await.map(|s| s.success()).unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Try winget (Windows 10 1809+)
+        if tokio::process::Command::new("winget")
+            .args(["install", "--id", "Git.Git", "-e", "--source", "winget", "--silent"])
+            .status().await.map(|s| s.success()).unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+
+    Err(anyhow!("git unavailable"))
+}
+
 /// Build whisper-server from source using cmake.
 ///
 /// Enables platform-appropriate optimizations:
@@ -292,23 +545,8 @@ async fn fetch_whisper_zip(
 ///
 /// Clones into `<data_dir>/whisper-src/`, builds in `<data_dir>/whisper-src/build/`.
 async fn build_whisper_from_source(data_dir: &Path, dest: &Path) -> Result<PathBuf> {
-    // Check that git and cmake are available.
-    for tool in &["git", "cmake"] {
-        let ok = tokio::process::Command::new(tool)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            return Err(anyhow!(
-                "`{}` not found — install it and re-run `pond-server setup`",
-                tool
-            ));
-        }
-    }
+    ensure_git().await?;
+    let cmake_cmd = ensure_cmake(data_dir).await?;
 
     let src_dir = data_dir.join("whisper-src");
     let build_dir = src_dir.join("build");
@@ -338,7 +576,7 @@ async fn build_whisper_from_source(data_dir: &Path, dest: &Path) -> Result<PathB
 
     println!("  🔨 Configuring cmake (CUDA: {})...", if has_cuda { "enabled" } else { "disabled" });
 
-    let mut cmake_cfg = tokio::process::Command::new("cmake");
+    let mut cmake_cfg = tokio::process::Command::new(&cmake_cmd);
     cmake_cfg
         .arg("-B").arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
@@ -357,7 +595,7 @@ async fn build_whisper_from_source(data_dir: &Path, dest: &Path) -> Result<PathB
 
     println!("  🔨 Building whisper-server ({} jobs)...", jobs);
     run_cmd(
-        tokio::process::Command::new("cmake")
+        tokio::process::Command::new(&cmake_cmd)
             .args(["--build"])
             .arg(&build_dir)
             .args(["-j", &jobs, "--config", "Release", "--target", "whisper-server"])
@@ -442,6 +680,7 @@ const PIPER_GITHUB_BASE: &str =
 ///
 /// Returns `(archive_filename, is_zip)` for supported platforms, or `None`
 /// when no pre-built binary is available (e.g. macOS, Windows ARM64).
+#[derive(Debug)]
 pub struct PiperBinaryAsset {
     pub archive_name: &'static str,
     pub is_zip: bool,
@@ -478,10 +717,10 @@ pub fn piper_binary_path(data_dir: &Path) -> PathBuf {
     return data_dir.join("bin").join("piper");
 }
 
-/// Download and install the platform-appropriate piper binary into `<data_dir>/bin/`.
+/// Download (or build) the piper binary into `<data_dir>/bin/`.
 ///
-/// Returns `Err` on platforms without a pre-built binary (macOS, Windows ARM64).
-/// In those cases the TTS feature degrades gracefully to text output.
+/// Prefers a pre-built release archive; falls back to building from source
+/// on platforms without one (macOS, Windows ARM64).
 pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
     let dest = piper_binary_path(data_dir);
 
@@ -490,15 +729,12 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         return Ok(dest);
     }
 
-    let asset = piper_binary_asset().ok_or_else(|| anyhow!(
-        "No pre-built piper binary for {} {} — \
-         TTS will fall back to text output. \
-         To enable voice: build piper from source \
-         (https://github.com/rhasspy/piper) and place the binary in {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        data_dir.join("bin").display(),
-    ))?;
+    let Some(asset) = piper_binary_asset() else {
+        // No pre-built binary for this platform — build from source instead.
+        println!("  📦 No pre-built piper for {} {} — building from source...",
+            std::env::consts::OS, std::env::consts::ARCH);
+        return build_piper_from_source(data_dir, &dest).await;
+    };
 
     let archive_name = asset.archive_name;
     let is_zip = asset.is_zip;
@@ -580,7 +816,9 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         .await
         .context("Zip extraction task panicked")??;
     } else {
-        // Linux: extract piper binary from .tar.gz
+        // Linux: extract piper from .tar.gz, preserving subdirectory structure
+        // so that espeak-ng-data/ ends up at bin/espeak-ng-data/.
+        // The archive root is a single directory (e.g. "piper/"); strip it.
         let dest_clone = dest.clone();
         tokio::task::spawn_blocking(move || {
             use flate2::read::GzDecoder;
@@ -589,19 +827,27 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
             let mut tar = Archive::new(gz);
             for entry in tar.entries()? {
                 let mut entry = entry?;
-                let path = entry.path()?;
-                let file_name = path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if file_name.is_empty() {
+                let path = entry.path()?.into_owned();
+
+                // Skip the top-level directory entry itself.
+                let mut components = path.components();
+                components.next(); // strip leading "piper/" component
+                let relative: std::path::PathBuf = components.collect();
+                if relative.as_os_str().is_empty() {
                     continue;
                 }
-                let out_path = bin_dir.join(&file_name);
+
+                let out_path = bin_dir.join(&relative);
+
+                // Ensure parent directories exist (needed for espeak-ng-data/*)
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
                 entry.unpack(&out_path)?;
 
                 #[cfg(unix)]
-                if file_name == "piper" {
+                if relative.to_string_lossy() == "piper" {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755))?;
                 }
@@ -613,8 +859,255 @@ pub async fn download_piper_binary(data_dir: &Path) -> Result<PathBuf> {
         .context("Tar extraction task panicked")??;
     }
 
+    // Ensure espeak-ng-data is present alongside the binary.
+    ensure_espeak_ng_data(data_dir).await;
+
     println!("  ✅ piper installed: {}", dest.display());
     Ok(dest)
+}
+
+/// Returns the path where espeak-ng-data should live: `<data_dir>/bin/espeak-ng-data/`.
+pub fn piper_espeak_data_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin").join("espeak-ng-data")
+}
+
+/// Ensure espeak-ng-data is installed at `<data_dir>/bin/espeak-ng-data/`.
+///
+/// On first run (or after a source-only build that didn't copy the data):
+///   1. macOS: try `brew install espeak-ng` and copy from Homebrew prefix.
+///   2. All platforms fallback: download the Linux x86_64 piper tarball and
+///      extract only the `espeak-ng-data/` subtree.  The phoneme data files
+///      are platform-agnostic (text/binary tables, not native code).
+pub async fn ensure_espeak_ng_data(data_dir: &Path) {
+    let dest = piper_espeak_data_path(data_dir);
+    if dest.exists() {
+        return;
+    }
+
+    println!("  📥 espeak-ng-data missing — installing...");
+
+    // ── Option 1: brew prefix on macOS ──────────────────────────────────────
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = tokio::process::Command::new("brew")
+            .args(["install", "espeak-ng"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                // Find data dir in Homebrew prefix.
+                for candidate in &[
+                    "/opt/homebrew/lib/espeak-ng-data",
+                    "/usr/local/lib/espeak-ng-data",
+                    "/opt/homebrew/Cellar",
+                ] {
+                    let p = std::path::Path::new(candidate);
+                    if p.is_dir() && p.file_name().map_or(false, |n| n == "espeak-ng-data") {
+                        if copy_dir_all(p, &dest).is_ok() {
+                            println!("  ✅ espeak-ng-data from Homebrew: {}", dest.display());
+                            return;
+                        }
+                    }
+                }
+                // Homebrew installed but path detection failed — do broader search.
+                if let Ok(out) = tokio::process::Command::new("brew")
+                    .args(["--prefix", "espeak-ng"])
+                    .output()
+                    .await
+                {
+                    let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let data_p = std::path::Path::new(&prefix).join("lib").join("espeak-ng-data");
+                    if data_p.is_dir() {
+                        if copy_dir_all(&data_p, &dest).is_ok() {
+                            println!("  ✅ espeak-ng-data from Homebrew: {}", dest.display());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Option 2: download from piper Linux x86_64 tarball ──────────────────
+    // The phoneme data files are platform-independent; we borrow them from the
+    // Linux release and they work on macOS/Windows just as well.
+    let url = format!(
+        "{}/piper_linux_x86_64.tar.gz",
+        PIPER_GITHUB_BASE
+    );
+    println!("  ⬇  espeak-ng-data (via piper Linux tarball)...");
+
+    let bytes = match reqwest::get(&url).await.and_then(|r| Ok(r)) {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => { tracing::warn!("espeak-ng-data download failed: {e}"); return; }
+            }
+        }
+        Ok(resp) => { tracing::warn!("espeak-ng-data download: HTTP {}", resp.status()); return; }
+        Err(e) => { tracing::warn!("espeak-ng-data download failed: {e}"); return; }
+    };
+
+    let dest_clone = dest.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use flate2::read::GzDecoder;
+        use tar::Archive;
+        let gz = GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut tar = Archive::new(gz);
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            // Only extract entries under espeak-ng-data/
+            let mut comps = path.components();
+            comps.next(); // strip top-level "piper/"
+            let relative: std::path::PathBuf = comps.collect();
+            let rel_str = relative.to_string_lossy();
+            if !rel_str.starts_with("espeak-ng-data") {
+                continue;
+            }
+            let out_path = dest_clone.parent().unwrap_or(&dest_clone).join(&relative);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&out_path)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) if dest.exists() => println!("  ✅ espeak-ng-data installed: {}", dest.display()),
+        Ok(Ok(())) => tracing::warn!("espeak-ng-data not found in tarball"),
+        Ok(Err(e)) => tracing::warn!("espeak-ng-data extraction failed: {e}"),
+        Err(e) => tracing::warn!("espeak-ng-data task panicked: {e}"),
+    }
+}
+
+/// Build piper from source for platforms without a pre-built binary (macOS, Windows ARM64).
+///
+/// Clones `https://github.com/rhasspy/piper` at `PIPER_RELEASE_TAG` into
+/// `<data_dir>/piper-src/` and builds with cmake.  Piper's CMakeLists.txt
+/// fetches its own dependencies (onnxruntime, espeak-ng-data) automatically.
+async fn build_piper_from_source(data_dir: &Path, dest: &Path) -> Result<PathBuf> {
+    ensure_git().await?;
+    let cmake_cmd = ensure_cmake(data_dir).await?;
+
+    let src_dir   = data_dir.join("piper-src");
+    let build_dir = src_dir.join("build");
+
+    if !src_dir.join(".git").exists() {
+        println!("  📦 Cloning piper source ({})...", PIPER_RELEASE_TAG);
+        run_cmd(
+            tokio::process::Command::new("git")
+                .args(["clone", "--depth", "1", "--branch", PIPER_RELEASE_TAG,
+                       "https://github.com/rhasspy/piper"])
+                .arg(&src_dir),
+            "git clone piper",
+        ).await?;
+    }
+
+    println!("  🔨 Configuring piper cmake...");
+    run_cmd(
+        tokio::process::Command::new(&cmake_cmd)
+            .arg("-B").arg(&build_dir)
+            .arg("-DCMAKE_BUILD_TYPE=Release")
+            .current_dir(&src_dir),
+        "cmake configure piper",
+    ).await?;
+
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "4".to_string());
+
+    println!("  🔨 Building piper ({} jobs)...", jobs);
+    run_cmd(
+        tokio::process::Command::new(&cmake_cmd)
+            .args(["--build"])
+            .arg(&build_dir)
+            .args(["-j", &jobs, "--config", "Release"])
+            .current_dir(&src_dir),
+        "cmake build piper",
+    ).await?;
+
+    // Search common output locations across cmake generators/platforms.
+    let candidates = [
+        build_dir.join("piper"),
+        build_dir.join("src").join("piper"),
+        build_dir.join("Release").join("piper.exe"),
+        build_dir.join("src").join("Release").join("piper.exe"),
+    ];
+    let built = candidates.iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow!("piper build completed but binary not found in expected locations"))?;
+
+    tokio::fs::create_dir_all(data_dir.join("bin")).await?;
+    tokio::fs::copy(built, dest).await
+        .with_context(|| format!("Failed to copy piper to {}", dest.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Copy espeak-ng-data next to the binary so piper can find it at runtime.
+    // cmake's FetchContent/ExternalProject places it somewhere under build_dir.
+    let espeak_dest = data_dir.join("bin").join("espeak-ng-data");
+    if !espeak_dest.exists() {
+        if let Some(espeak_src) = find_espeak_ng_data(&build_dir) {
+            println!("  📋 Copying espeak-ng-data from {}...", espeak_src.display());
+            copy_dir_all(&espeak_src, &espeak_dest)?;
+            println!("  ✅ espeak-ng-data installed: {}", espeak_dest.display());
+        } else {
+            // Not found in build tree — fall through to ensure_espeak_ng_data() below.
+            tracing::warn!("espeak-ng-data not found in cmake build tree — will download separately");
+        }
+    }
+
+    // Final safety net: download if still missing.
+    ensure_espeak_ng_data(data_dir).await;
+
+    println!("  ✅ piper built and installed: {}", dest.display());
+    Ok(dest.to_path_buf())
+}
+
+/// Recursively search `root` for a directory named `espeak-ng-data`.
+fn find_espeak_ng_data(root: &Path) -> Option<PathBuf> {
+    // BFS through the directory tree (depth-limited to avoid infinite loops).
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0u32));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > 10 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name() == "espeak-ng-data" {
+                    return Some(path);
+                }
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    None
+}
+
+/// Recursively copy a directory tree from `src` to `dst`.
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 // ── llamafile LLM model registry ──────────────────────────────────────────────
@@ -651,6 +1144,27 @@ pub const LLAMAFILE_MODELS: &[LlamafileModelInfo] = &[
         url:         "https://huggingface.co/Mozilla/gemma-2-2b-it-llamafile/resolve/main/gemma-2-2b-it.Q4_K_M.llamafile",
         size_mb:     1_950,
         description: "Gemma 2 2B IT Q4_K_M (Google/Mozilla, ~2.0 GB)",
+    },
+    LlamafileModelInfo {
+        name:        "llama-3b",
+        filename:    "Llama-3.2-3B-Instruct-Q4_K_M.llamafile",
+        url:         "https://huggingface.co/Mozilla/Llama-3.2-3B-Instruct-llamafile/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.llamafile",
+        size_mb:     2_020,
+        description: "Llama 3.2 3B Instruct Q4_K_M (Meta/Mozilla, ~2.0 GB)",
+    },
+    LlamafileModelInfo {
+        name:        "phi-3.5-mini",
+        filename:    "Phi-3.5-mini-instruct.Q4_K_M.llamafile",
+        url:         "https://huggingface.co/Mozilla/Phi-3.5-mini-instruct-llamafile/resolve/main/Phi-3.5-mini-instruct.Q4_K_M.llamafile",
+        size_mb:     2_390,
+        description: "Phi-3.5 Mini Instruct Q4_K_M (Microsoft/Mozilla, ~2.4 GB)",
+    },
+    LlamafileModelInfo {
+        name:        "mistral-7b",
+        filename:    "Mistral-7B-Instruct-v0.2.Q4_K_M.llamafile",
+        url:         "https://huggingface.co/Mozilla/Mistral-7B-Instruct-v0.2-llamafile/resolve/main/Mistral-7B-Instruct-v0.2.Q4_K_M.llamafile",
+        size_mb:     4_370,
+        description: "Mistral 7B Instruct v0.2 Q4_K_M (Mistral/Mozilla, ~4.4 GB)",
     },
 ];
 
