@@ -20,6 +20,7 @@
 mod llamafile_process;
 mod model_download;
 mod model_registry;
+mod piper_http;
 mod piper_process;
 mod qwen_tts_process;
 mod system_deps;
@@ -243,19 +244,17 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  [4/7] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
-    // Step 5: Qwen TTS (primary TTS engine — auto-installed into managed venv)
-    println!("\n  [5/7] Installing Qwen TTS (primary TTS engine)...");
-    qwen_tts_process::setup_install(&data_dir).await;
+    // Step 5: TTS — try Qwen first; if it fails, ensure Piper is fully set up.
+    println!("\n  [5/7] Setting up TTS...");
+    let qwen_ok = qwen_tts_process::setup_install(&data_dir).await;
 
-    // Step 6: Download Piper TTS binary + voice model (fallback TTS)
-    println!("\n  [6/7] Downloading Piper TTS binary and voice model (fallback TTS)...");
-    match model_download::download_piper_binary(&data_dir).await {
-        Ok(_) => {}
-        Err(e) => println!("  ⚠  Could not download piper binary: {}", e),
-    }
-    match model_download::download_piper_model(&data_dir).await {
-        Ok(_) => {}
-        Err(e) => println!("  ⚠  Could not download piper voice model: {}", e),
+    // Step 6: Piper TTS — always set up (primary when Qwen unavailable, fallback otherwise)
+    println!("\n  [6/7] Setting up Piper TTS{}...",
+        if qwen_ok { " (fallback)" } else { " (primary — Qwen unavailable)" });
+    let piper_bin_ok = model_download::download_piper_binary(&data_dir).await.is_ok();
+    let piper_model_ok = model_download::download_piper_model(&data_dir).await.is_ok();
+    if !qwen_ok && (!piper_bin_ok || !piper_model_ok) {
+        println!("  ⚠  Both Qwen TTS and Piper failed — voice output will be text-only.");
     }
 
     // Step 7: Download default LLM (Gemma 2 2B via llamafile)
@@ -332,40 +331,53 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
 
     // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
     let _qwen_tts_guard = qwen_tts_process::try_start(&settings.voice_tts_http_url, &data_dir).await;
+    let qwen_tts_available = qwen_tts_process::is_running(&settings.voice_tts_http_url).await;
 
     let piper_model = model_download::tts_models_dir(&data_dir)
         .join(model_download::PIPER_MODEL_FILENAME);
+
+    // Ensure piper binary + model + espeak-ng-data are present.
     if !model_download::piper_binary_path(&data_dir).exists() {
-        println!("  📥 TTS fallback binary not found — downloading piper...");
-        match model_download::download_piper_binary(&data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  Piper binary download failed: {}", e),
-        }
+        let _ = model_download::download_piper_binary(&data_dir).await;
     }
     if !piper_model.exists() {
-        println!("  📥 TTS fallback model not found — downloading piper voice...");
-        match model_download::download_piper_model(&data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  Piper model download failed: {}", e),
-        }
+        let _ = model_download::download_piper_model(&data_dir).await;
     }
+    // Always ensure espeak-ng-data is present (may be missing after source build).
+    model_download::ensure_espeak_ng_data(&data_dir).await;
+
+    // Start piper as a persistent HTTP server so it shows up in the service list.
+    let espeak_data = {
+        let p = model_download::piper_espeak_data_path(&data_dir);
+        if p.exists() { Some(p) } else { None }
+    };
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
         match piper_process::find_binary(&data_dir) {
             Some(bin) if piper_model.exists() => {
-                println!("  ✅ TTS fallback: piper ready");
-                Some(Arc::new(PiperOutput::new(bin, piper_model.clone())))
+                let ed = espeak_data.clone();
+                match piper_http::start(bin.clone(), piper_model.clone(), ed, piper_http::DEFAULT_PORT).await {
+                    Ok(port) => {
+                        println!("  ✅ Piper TTS running on port {}", port);
+                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        Some(Arc::new(out))
+                    }
+                    Err(e) => {
+                        tracing::warn!("piper-http failed to start: {e}");
+                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        Some(Arc::new(out))
+                    }
+                }
             }
-            _ => {
-                println!("  ⚠  TTS fallback: piper unavailable (binary or model missing)");
-                None
-            }
+            _ => None,
         };
-    let qwen_tts = Arc::new(
-        QwenTtsOutput::new(Some(&settings.voice_tts_http_url))
-            .with_voice(&settings.voice_tts_http_voice),
-    );
-    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = Some(
-        match piper_tts {
+    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = if qwen_tts_available {
+        let qwen_tts = Arc::new(
+            QwenTtsOutput::new(Some(&settings.voice_tts_http_url))
+                .with_voice(&settings.voice_tts_http_voice),
+        );
+        Some(match piper_tts {
             Some(piper) => {
                 println!("  ✅ TTS: qwen-tts (primary) → piper (fallback)");
                 Arc::new(FallbackVoiceOutput::new(qwen_tts, piper))
@@ -375,8 +387,19 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
                 println!("  ✅ TTS: qwen-tts (primary, no fallback available)");
                 qwen_tts as Arc<dyn pond_core::ports::voice_output::VoiceOutput>
             }
+        })
+    } else {
+        match piper_tts {
+            Some(piper) => {
+                println!("  ✅ TTS: piper (qwen-tts unavailable)");
+                Some(piper)
+            }
+            None => {
+                println!("  ⚠  TTS: no engine available — responses will be text-only");
+                None
+            }
         }
-    );
+    };
 
     // LLM — llamafile auto-download + auto-start (use active_llm_model from settings)
     let active_llm = registry
@@ -484,10 +507,11 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     // Build router
     let app = pond_api::build_router(state, static_dir);
 
-    // Resolve hostname
+    // Resolve hostname — strip trailing ".local" if the OS already appended it
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "localhost".to_string());
+    let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
 
     let bind_addr = format!("0.0.0.0:{}", port);
     let display_url = if port == 80 {
@@ -814,6 +838,7 @@ async fn run_status() -> Result<()> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
 
     println!("  🦆 Goose In A Pond — Status");
     println!("  ─────────────────────────────");
