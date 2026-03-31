@@ -9,12 +9,14 @@ license.workspace = true
 pond-core   = { workspace = true }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
-reqwest     = { workspace = true, features = ["json"] }
+reqwest     = { workspace = true, features = ["json", "rustls"] }
+# rodio is isolated here — not added to workspace deps to avoid pulling audio
+# deps into every crate that doesn't need them.
+rodio       = "0.19"
+serde       = { workspace = true }
 serde_json  = { workspace = true }
 tokio       = { workspace = true }
-# rodio is isolated here — not added to workspace deps to avoid pulling
-# audio playback into every crate.
-rodio = "0.19"
+tracing     = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
