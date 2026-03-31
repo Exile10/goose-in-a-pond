@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Serve { port, static_dir, open, debug }) => {
             init_tracing(debug);
-            run_server(port, static_dir, open).await
+            run_server(port, static_dir, open, debug).await
         }
         Some(Commands::Chat { provider, model, input, whisper_url, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
@@ -183,11 +183,22 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    let level = if debug { "debug" } else { "info" };
+    // In debug mode, our own crates run at DEBUG while noisy third-party crates
+    // (sqlx, hyper, tower, reqwest) are capped at WARN so their internal query
+    // and connection tracing does not drown out the useful output.
+    //
+    // RUST_LOG always takes priority, so a developer can still override any
+    // target at runtime:
+    //   RUST_LOG=sqlx=debug cargo run -p pond-server -- serve --debug
+    let filter = if debug {
+        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+                .unwrap_or_else(|_| filter.into()),
         )
         .init();
 }
@@ -274,7 +285,7 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Result<()> {
+async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -430,6 +441,16 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
         });
     }
 
+    // Debug mode: tail pond_logs.db so new event_log rows are printed to the
+    // terminal in real time. Polls every second and only surfaces rows added
+    // after startup, so existing history is not replayed.
+    if debug {
+        let logs_pool = db.logs.clone();
+        tokio::spawn(async move {
+            tail_event_log(logs_pool).await;
+        });
+    }
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -482,10 +503,15 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool) -> Re
     println!("  📡 API:       {}/api/v1/health", display_url);
     println!();
 
-    if open {
+    // Open the browser when:
+    //   - `--open` is explicitly passed, OR
+    //   - `--debug` is passed and the host has a graphical display.
+    // On Linux a display requires DISPLAY (X11) or WAYLAND_DISPLAY to be set.
+    // On macOS and Windows a display is always assumed to be present.
+    if open || (debug && has_display()) {
         let url = format!("http://localhost:{}", port);
         if webbrowser::open(&url).is_err() {
-            tracing::warn!("Could not open browser (headless mode?)");
+            tracing::warn!("Could not open browser — no display available or xdg-open missing");
         }
     }
 
@@ -719,6 +745,73 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     Ok(())
 }
 
+/// Returns `true` when the process has access to a graphical display.
+///
+/// On Linux, a display is present when `DISPLAY` (X11) or `WAYLAND_DISPLAY`
+/// is set in the environment. On all other platforms (macOS, Windows) a
+/// display is unconditionally assumed.
+fn has_display() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Background task that tails the `event_log` table in `pond_logs.db`.
+///
+/// On startup it records the current maximum row ID so that pre-existing log
+/// history is not replayed. It then polls every second and prints any new rows
+/// to stdout. This is intentionally a plain `println!` rather than a tracing
+/// event so the output is always visible alongside the tracing output, making
+/// it easy to correlate API activity with DB-level events in a single terminal.
+///
+/// Output format:
+/// ```text
+///   [db] 2024-01-15 12:34:56  INFO [pond-api] request handled
+///   [db] 2024-01-15 12:34:57 ERROR [pond-core] something failed — {"key":"val"}
+/// ```
+async fn tail_event_log(pool: sqlx::Pool<sqlx::Sqlite>) {
+    // Anchor to the highest existing ID so we only surface new events.
+    let mut cursor: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM event_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+    println!("  [debug] tailing pond_logs.db event_log (cursor = {})...", cursor);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let rows: Vec<(i64, String, String, String, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, timestamp, level, source, message, metadata \
+                 FROM event_log WHERE id > ? ORDER BY id ASC",
+            )
+            .bind(cursor)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+
+        for (id, timestamp, level, source, message, metadata) in rows {
+            match metadata.as_deref().filter(|m| !m.is_empty()) {
+                Some(meta) => println!(
+                    "  [db] {} {:>5} [{}] {} — {}",
+                    timestamp, level, source, message, meta
+                ),
+                None => println!(
+                    "  [db] {} {:>5} [{}] {}",
+                    timestamp, level, source, message
+                ),
+            }
+            cursor = id;
+        }
+    }
+}
+
 async fn run_status() -> Result<()> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -784,7 +877,7 @@ async fn run_main_menu() -> Result<()> {
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
                 let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, std::path::PathBuf::from("web/dist"), false).await?;
+                run_server(port, std::path::PathBuf::from("web/dist"), false, false).await?;
             }
             "3" => {
                 run_status().await?;

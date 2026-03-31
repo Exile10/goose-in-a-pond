@@ -106,6 +106,10 @@ export const api = {
   onboardingStatus: () =>
     get<OnboardingStatus>('/onboard/status', ''),
 
+  /** Mark onboarding as complete on the backend, unlocking protected routes */
+  completeOnboarding: () =>
+    post<{ status: string }>('/onboard/complete', {}),
+
   /** System info — hostname, version, platform */
   systemInfo: (token: string) =>
     get<{ hostname: string; version: string; platform: string; arch: string }>('/system/info', token),
