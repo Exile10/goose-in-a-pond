@@ -2256,6 +2256,7 @@ name = "pond-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "dirs",
@@ -2278,6 +2279,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "webbrowser",
  "wiremock",
  "zip",
