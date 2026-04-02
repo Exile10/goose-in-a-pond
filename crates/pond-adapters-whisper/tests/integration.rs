@@ -151,3 +151,44 @@ async fn live_transcription_of_jfk_wav() {
         text
     );
 }
+
+// ── WhisperKeywordDetector ────────────────────────────────────────────────────
+
+use pond_adapters_whisper::WhisperKeywordDetector;
+use pond_core::ports::wake_word::WakeWordDetector;
+
+/// The activation prompt must mention the trigger word so the user knows
+/// what to say.
+#[test]
+fn wake_word_detector_prompt_mentions_goose() {
+    let detector = WhisperKeywordDetector::new(None, "goose");
+    assert!(
+        detector.activation_prompt().to_lowercase().contains("goose"),
+        "expected 'goose' in prompt: {}",
+        detector.activation_prompt()
+    );
+}
+
+/// Verify the type satisfies the `WakeWordDetector` port so it can be
+/// wired into `ChatService`.
+#[test]
+fn wake_word_detector_is_wake_word_detector_trait_object() {
+    use std::sync::Arc;
+    let _: Arc<dyn WakeWordDetector> =
+        Arc::new(WhisperKeywordDetector::new(None, "goose"));
+}
+
+/// Run with: `cargo test -p pond-adapters-whisper -- --ignored live_wake_word`
+///
+/// Requires a running whisper.cpp server on port 9000 and a connected
+/// microphone.  Say "goose" (or the configured trigger word) to pass.
+#[tokio::test]
+#[ignore = "requires local whisper.cpp server on port 9000 and a microphone"]
+async fn live_wake_word_detection() {
+    // default server: http://127.0.0.1:9000, trigger: "goose"
+    let detector = WhisperKeywordDetector::new(None, "goose");
+    detector
+        .wait_for_activation()
+        .await
+        .expect("wake word detection failed");
+}
