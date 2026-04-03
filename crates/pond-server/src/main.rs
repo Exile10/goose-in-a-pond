@@ -22,6 +22,7 @@ mod model_download;
 mod model_registry;
 mod piper_http;
 mod piper_process;
+mod ports;
 mod qwen_tts_process;
 mod system_deps;
 mod whisper_process;
@@ -42,6 +43,7 @@ use pond_api::AppState;
 use pond_core::ports::agent::Agent;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
+use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
@@ -51,11 +53,14 @@ use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
+use pond_infra_scheduler::{CronSchedulerAdapter, WebhookTaskExecutor};
+use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use std::sync::Arc;
 use pond_core::services::onboarding::OnboardingService;
@@ -85,10 +90,6 @@ enum Commands {
 
     /// Start the HTTP server (REST API + web dashboard)
     Serve {
-        /// Port to listen on (default: 4000)
-        #[arg(short, long, default_value = "4000")]
-        port: u16,
-
         /// Path to the built web dashboard assets (run `cd web && npm run build` first)
         #[arg(long, default_value = "web/dist")]
         static_dir: std::path::PathBuf,
@@ -100,11 +101,17 @@ enum Commands {
         /// Enable debug logging
         #[arg(long)]
         debug: bool,
+
+        /// Agent backend: mock (fast, no LLM) or goose (Block's Goose with MCP tool calls).
+        /// Requires the `goose-agent` feature:
+        ///   cargo run -p pond-server --features goose-agent -- serve --agent goose
+        #[arg(long, default_value = "mock")]
+        agent: String,
     },
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
     Chat {
-        /// LLM provider: mock, llamafile, or ollama
+        /// LLM provider: mock, llamafile, ollama, or local (GGUF in-process, requires --features local-inference)
         #[arg(short = 'P', long, default_value = "mock")]
         provider: String,
 
@@ -115,10 +122,6 @@ enum Commands {
         /// Input source: stdin (text) or whisper (microphone → ASR)
         #[arg(short = 'I', long, default_value = "stdin")]
         input: String,
-
-        /// URL of the running whisper.cpp server (only used when --input whisper)
-        #[arg(long)]
-        whisper_url: Option<String>,
 
         /// Enable voice-based wake word detection (requires --input whisper).
         /// Say the trigger phrase to activate the assistant before each turn.
@@ -158,13 +161,13 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { port, static_dir, open, debug }) => {
+        Some(Commands::Serve { static_dir, open, debug, agent }) => {
             init_tracing(debug);
-            run_server(port, static_dir, open, debug).await
+            run_server(static_dir, open, debug, &agent).await
         }
-        Some(Commands::Chat { provider, model, input, whisper_url, wake_word, no_wake_word, tts, tts_model }) => {
+        Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
-            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref(), wake_word.as_deref(), no_wake_word, &tts, tts_model).await
+            run_chat(&provider, model.as_deref(), &input, wake_word.as_deref(), no_wake_word, &tts, tts_model).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -178,7 +181,7 @@ async fn main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat)
             init_tracing(false);
-            run_chat("mock", None, "stdin", None, None, true, "none", None).await
+            run_chat("mock", None, "stdin", None, true, "none", None).await
         }
     }
 }
@@ -286,7 +289,7 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug: bool) -> Result<()> {
+async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -327,11 +330,23 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
             Err(e) => println!("  ⚠  STT binary download failed: {}", e),
         }
     }
-    let _whisper_guard = whisper_process::try_start(&data_dir, &whisper_model, 9000).await;
+    let (_whisper_guard, whisper_port) = whisper_process::try_start(&data_dir, &whisper_model).await;
+    let whisper_url = whisper_process::url_for(whisper_port);
 
     // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
-    let _qwen_tts_guard = qwen_tts_process::try_start(&settings.voice_tts_http_url, &data_dir).await;
-    let qwen_tts_available = qwen_tts_process::is_running(&settings.voice_tts_http_url).await;
+    // try_start returns (process, confirmed_running). If it was already running before
+    // we called try_start (returns None), fall back to a live is_running check.
+    let (_qwen_tts_guard, qwen_tts_url, qwen_tts_available) =
+        match qwen_tts_process::try_start(&data_dir).await {
+            Some((proc, port, confirmed)) => {
+                (Some(proc), qwen_tts_process::url_for(port), confirmed)
+            }
+            None => {
+                let url = qwen_tts_process::url_for(ports::QWEN_TTS);
+                let running = qwen_tts_process::is_running(&url).await;
+                (None, url, running)
+            }
+        };
 
     let piper_model = model_download::tts_models_dir(&data_dir)
         .join(model_download::PIPER_MODEL_FILENAME);
@@ -343,7 +358,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     if !piper_model.exists() {
         let _ = model_download::download_piper_model(&data_dir).await;
     }
-    // Always ensure espeak-ng-data is present (may be missing after source build).
+    // Always ensure espeak-ng-data is present (maybe missing after source build).
     model_download::ensure_espeak_ng_data(&data_dir).await;
 
     // Start piper as a persistent HTTP server so it shows up in the service list.
@@ -355,7 +370,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         match piper_process::find_binary(&data_dir) {
             Some(bin) if piper_model.exists() => {
                 let ed = espeak_data.clone();
-                match piper_http::start(bin.clone(), piper_model.clone(), ed, piper_http::DEFAULT_PORT).await {
+                match piper_http::start(bin.clone(), piper_model.clone(), ed).await {
                     Ok(port) => {
                         println!("  ✅ Piper TTS running on port {}", port);
                         let mut out = PiperOutput::new(bin, piper_model.clone());
@@ -374,7 +389,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         };
     let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = if qwen_tts_available {
         let qwen_tts = Arc::new(
-            QwenTtsOutput::new(Some(&settings.voice_tts_http_url))
+            QwenTtsOutput::new(Some(&qwen_tts_url))
                 .with_voice(&settings.voice_tts_http_voice),
         );
         Some(match piper_tts {
@@ -413,7 +428,12 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
             Err(e) => println!("  ⚠  LLM download failed: {}", e),
         }
     }
-    let _llamafile_guard = llamafile_process::try_start(&data_dir, 8080).await;
+    let (_llamafile_guard, llamafile_port) =
+        match llamafile_process::try_start(&data_dir).await {
+            Some((proc, port)) => (Some(proc), port),
+            None => (None, ports::LLAMAFILE),
+        };
+    let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     println!("  ────────────────────────────────────────────────────\n");
 
@@ -444,9 +464,9 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
-    let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
-    // Fallback chain: llamafile → ollama → (if both down, ChatService falls back to agent echo)
-    let llamafile = Arc::new(LlamafileProvider::new(None).with_max_tokens(1024));
+    // ── LLM provider (fallback chain: llamafile → ollama) ───────────────────────
+    // Use the actual port llamafile was started on (may differ from base if port was busy).
+    let llamafile = Arc::new(LlamafileProvider::new(Some(&llamafile_url)).with_max_tokens(1024));
     let ollama = Arc::new(OllamaProvider::new(None, None).with_max_tokens(1024));
     let llm_provider: Option<Arc<dyn LlmProvider>> = Some(
         Arc::new(FallbackProvider::new(llamafile, ollama))
@@ -473,11 +493,115 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         });
     }
 
+    // Weather — fed into GiapServiceHandles (MCP tool), not AppState.
+    // The LLM calls giap__get_current_weather when it needs weather data.
+    let weather: Option<Arc<dyn WeatherProvider>> = {
+        if settings.weather_enabled
+            && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+        {
+            let loc = if settings.weather_location_name.is_empty() {
+                format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+            } else {
+                settings.weather_location_name.clone()
+            };
+            tracing::info!(
+                "weather enabled: {} ({}, {})",
+                loc, settings.weather_latitude, settings.weather_longitude
+            );
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(
+                settings.weather_latitude,
+                settings.weather_longitude,
+                loc,
+            )))
+        } else {
+            tracing::info!("weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)");
+            None
+        }
+    };
+
+    // Scheduler — persist task list next to the databases
+    let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
+        let exec = Arc::new(WebhookTaskExecutor::new());
+        match CronSchedulerAdapter::new(data_dir.join("schedules.json"), exec).await {
+            Ok(s) => {
+                tracing::info!("scheduler ready ({})", data_dir.join("schedules.json").display());
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!("scheduler init failed: {e} — schedule endpoints will return 503");
+                None
+            }
+        }
+    };
+
+    // MCP Memory — enabled when --features mcp-memory is passed at build time.
+    #[cfg(feature = "mcp-memory")]
+    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = {
+        use pond_adapters_mcp_memory::GooseMcpMemoryAdapter;
+        let adapter = GooseMcpMemoryAdapter::new(data_dir.join("memory"));
+        tracing::info!("MCP memory enabled ({})", data_dir.join("memory").display());
+        Some(Arc::new(adapter))
+    };
+    #[cfg(not(feature = "mcp-memory"))]
+    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = None;
+
+    // ── Agent backend ────────────────────────────────────────────────────────────
+    #[cfg(feature = "goose-agent")]
+    let (agent, extension_manager) = build_goose_backend(
+        agent_backend,
+        &llamafile_url,
+        weather.clone(),
+        device_registry.clone(),
+        scheduler.clone(),
+    ).await;
+
+    #[cfg(not(feature = "goose-agent"))]
+    let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
+        if agent_backend == "goose" {
+            tracing::warn!(
+                "--agent goose requested but this binary was compiled without the `goose-agent` feature. \
+                 Rebuild with: cargo run -p pond-server --features goose-agent -- serve --agent goose \
+                 Falling back to mock agent."
+            );
+        }
+        (Arc::new(MockAgent::new()), None)
+    };
+
+    // MCP client — load persisted server configs and auto-connect enabled ones.
+    let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
+        let repo = Arc::new(SqliteMcpServerRepository::new(db.system.clone()));
+        // Auto-connect saved external MCP servers if the extension manager is available.
+        if let Some(mgr) = &extension_manager {
+            match repo.list().await {
+                Ok(servers) => {
+                    for srv in servers.into_iter().filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled) {
+                        use pond_core::ports::extension_manager::AddExtensionRequest;
+                        let req = AddExtensionRequest {
+                            name:        srv.name.clone(),
+                            kind:        srv.kind.clone(),
+                            description: srv.description.clone(),
+                            command:     srv.command.clone(),
+                            args:        srv.args.clone(),
+                            env:         srv.env.clone(),
+                            uri:         srv.uri.clone(),
+                        };
+                        match mgr.add_extension(req).await {
+                            Ok(_) => tracing::info!("auto-connected MCP server '{}'", srv.name),
+                            Err(e) => tracing::warn!("failed to auto-connect MCP server '{}': {e}", srv.name),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("failed to load saved MCP servers: {e}"),
+            }
+        }
+        Some(repo)
+    };
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
-        whisper_url: "http://127.0.0.1:9000".to_string(),
+        whisper_url: whisper_url.clone(),
         session_storage,
         http_client: reqwest::Client::new(),
         agent,
@@ -493,6 +617,11 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         prompt_template_dir: Some(data_dir.join("prompts")),
         model_status: Some(model_status),
         data_dir: Some(data_dir.clone()),
+        skip_onboarding: false,
+        scheduler,
+        mcp_memory,
+        extension_manager,
+        mcp_server_repo,
     });
 
     // Warn if static assets haven't been built yet
@@ -513,14 +642,14 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         .unwrap_or_else(|_| "localhost".to_string());
     let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
 
-    let bind_addr = format!("0.0.0.0:{}", port);
-    let display_url = if port == 80 {
+    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
+    let display_url = if api_port == 80 {
         format!("http://pond.{}.local", hostname)
     } else {
-        format!("http://pond.{}.local:{}", hostname, port)
+        format!("http://pond.{}.local:{}", hostname, api_port)
     };
 
-    println!("  🌐 Listening on {}", bind_addr);
+    println!("  🌐 Listening on 0.0.0.0:{}", api_port);
     println!("  📡 Dashboard: {}", display_url);
     println!("  📡 API:       {}/api/v1/health", display_url);
     println!();
@@ -531,19 +660,18 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     // On Linux a display requires DISPLAY (X11) or WAYLAND_DISPLAY to be set.
     // On macOS and Windows a display is always assumed to be present.
     if open || (debug && has_display()) {
-        let url = format!("http://localhost:{}", port);
+        let url = format!("http://localhost:{}", api_port);
         if webbrowser::open(&url).is_err() {
             tracing::warn!("Could not open browser — no display available or xdg-open missing");
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
+async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
@@ -556,6 +684,7 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     let db = Database::init(&data_dir).await?;
 
     // Auto-start whisper.cpp when voice input is requested.
+    let mut whisper_port = ports::WHISPER;
     let _whisper_guard = if input == "whisper" {
         let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
             .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
@@ -566,12 +695,16 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
                 Err(e) => println!("  ⚠  STT model download failed: {}", e),
             }
         }
-        whisper_process::try_start(&data_dir, &whisper_model, 9000).await
+        let (guard, port) = whisper_process::try_start(&data_dir, &whisper_model).await;
+        whisper_port = port;
+        guard
     } else {
         None
     };
+    let whisper_url = whisper_process::url_for(whisper_port);
 
     // Auto-start llamafile when --provider llamafile is requested.
+    let mut llamafile_port = ports::LLAMAFILE;
     let _llamafile_guard = if provider == "llamafile" {
         if llamafile_process::find_model(&data_dir).is_none() {
             println!("  📥 LLM model not found — downloading {}...",
@@ -583,10 +716,14 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
                 Err(e) => println!("  ⚠  LLM download failed: {}", e),
             }
         }
-        llamafile_process::try_start(&data_dir, 8080).await
+        match llamafile_process::try_start(&data_dir).await {
+            Some((proc, port)) => { llamafile_port = port; Some(proc) }
+            None => None,
+        }
     } else {
         None
     };
+    let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
@@ -647,9 +784,9 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
             println!(
                 "  Model:    {} (llamafile @ {})",
                 pond_adapters_llamafile::DEFAULT_MODEL,
-                pond_adapters_llamafile::DEFAULT_HOST
+                llamafile_url
             );
-            let llm = Arc::new(LlamafileProvider::new(None));
+            let llm = Arc::new(LlamafileProvider::new(Some(&llamafile_url)));
             chat_service = chat_service.with_provider(llm);
         }
         "ollama" => {
@@ -662,6 +799,25 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
             let llm = Arc::new(OllamaProvider::new(None, Some(ollama_model)));
             chat_service = chat_service.with_provider(llm);
         }
+        "local" => {
+            #[cfg(feature = "local-inference")]
+            {
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                let model_id = model.unwrap_or(LocalInferenceLlmAdapter::DEFAULT_MODEL);
+                println!("  Model:    {} (local GGUF in-process)", model_id);
+                let llm = Arc::new(LocalInferenceLlmAdapter::new(model_id).await?);
+                chat_service = chat_service.with_provider(llm);
+            }
+            #[cfg(not(feature = "local-inference"))]
+            {
+                eprintln!(
+                    "  ERROR: --provider local requires the `local-inference` feature.\n\
+                     Rebuild with:\n  \
+                     cargo run -p pond-server --features local-inference -- chat --provider local"
+                );
+                std::process::exit(1);
+            }
+        }
         _ => {
             println!("  Model:    mock (echo)");
         }
@@ -670,9 +826,8 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     // ── Wire voice input ──
     let voice: Arc<dyn VoiceInput> = match input {
         "whisper" => {
-            let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
-            println!("  Input:    whisper (@ {})", url);
-            Arc::new(WhisperInput::new(Some(url)))
+            println!("  Input:    whisper (@ {})", whisper_url);
+            Arc::new(WhisperInput::new(Some(&whisper_url)))
         }
         _ => {
             println!("  Input:    stdin");
@@ -686,23 +841,27 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
         Arc::new(InstantActivation)
     } else {
         let trigger = wake_word.unwrap_or("goose");
-        let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
-        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, url);
-        Arc::new(WhisperKeywordDetector::new(Some(url), trigger))
+        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, whisper_url);
+        Arc::new(WhisperKeywordDetector::new(Some(&whisper_url), trigger))
     };
     chat_service = chat_service.with_wake_word_detector(detector);
 
     // Auto-start Qwen TTS server before the match (guard must outlive voice_out).
+    let mut qwen_chat_port = ports::QWEN_TTS;
     let _qwen_tts_chat_guard = if tts == "qwen" || tts == "qwen-tts" {
-        qwen_tts_process::try_start(pond_adapters_qwen_tts::DEFAULT_HOST, &data_dir).await
+        match qwen_tts_process::try_start(&data_dir).await {
+            Some((proc, port, _confirmed)) => { qwen_chat_port = port; Some(proc) }
+            None => None,
+        }
     } else {
         None
     };
+    let qwen_chat_url = qwen_tts_process::url_for(qwen_chat_port);
 
     // ── Wire TTS output ──
     let voice_out: Arc<dyn VoiceOutput> = match tts {
         "qwen" | "qwen-tts" => {
-            let qwen = Arc::new(QwenTtsOutput::new(None));
+            let qwen = Arc::new(QwenTtsOutput::new(Some(&qwen_chat_url)));
 
             // Build piper if available (auto-download if needed).
             let piper_model = data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME);
@@ -785,7 +944,7 @@ fn has_display() -> bool {
 
 /// Background task that tails the `event_log` table in `pond_logs.db`.
 ///
-/// On startup it records the current maximum row ID so that pre-existing log
+/// On startup, it records the current maximum row ID so that pre-existing log
 /// history is not replayed. It then polls every second and prints any new rows
 /// to stdout. This is intentionally a plain `println!` rather than a tracing
 /// event so the output is always visible alongside the tracing output, making
@@ -892,14 +1051,10 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", None, "stdin", None, None, true, "none", None).await?;
+                run_chat("mock", None, "stdin", None, true, "none", None).await?;
             }
             "2" => {
-                println!("Enter port (default 4000): ");
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, std::path::PathBuf::from("web/dist"), false, false).await?;
+                run_server(std::path::PathBuf::from("web/dist"), false, false, "mock").await?;
             }
             "3" => {
                 run_status().await?;
@@ -1022,4 +1177,51 @@ async fn run_onboard(reset: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Goose agent backend ───────────────────────────────────────────────────────
+
+/// Build a Goose-backed agent + extension manager.
+///
+/// Only compiled when `--features goose-agent` is enabled.
+/// Falls back to MockAgent gracefully when `agent_backend != "goose"`.
+#[cfg(feature = "goose-agent")]
+async fn build_goose_backend(
+    agent_backend: &str,
+    llamafile_url: &str,
+    weather: Option<Arc<dyn WeatherProvider>>,
+    device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
+    scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
+) -> (
+    Arc<dyn Agent>,
+    Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+) {
+    use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
+    use pond_core::ports::extension_manager::ExtensionManagerPort;
+
+    if agent_backend != "goose" {
+        return (Arc::new(MockAgent::new()), None);
+    }
+
+    // Register the GIAP MCP server into Goose's builtin extension registry.
+    let handles = Arc::new(GiapServiceHandles { weather, device_registry, scheduler });
+    if let Err(e) = register_giap_extension(handles) {
+        tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
+        return (Arc::new(MockAgent::new()), None);
+    }
+
+    // Build the adapter (OllamaProvider → llamafile on actual port).
+    match GooseAdapter::with_llamafile(Some(llamafile_url)).await {
+        Ok(adapter) => {
+            let ext_mgr: Arc<dyn ExtensionManagerPort> =
+                Arc::new(adapter.extension_manager("server".to_string()));
+            tracing::info!("Goose agent active — GIAP MCP extension registered");
+            let agent: Arc<dyn Agent> = Arc::new(adapter);
+            (agent, Some(ext_mgr))
+        }
+        Err(e) => {
+            tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
+            (Arc::new(MockAgent::new()), None)
+        }
+    }
 }

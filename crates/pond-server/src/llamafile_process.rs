@@ -99,15 +99,36 @@ async fn spawn(binary: &Path, port: u16) -> Result<LlamafileProcess> {
 
 // ── High-level entry point ────────────────────────────────────────────────────
 
+/// Base URL for llamafile given a port.
+pub fn url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{}", port)
+}
+
 /// Check → find → spawn.  Never returns an error — failures are printed as warnings.
 ///
-/// Returns `Some(guard)` if we started the process, `None` if it was already
-/// running or no model was found.
-pub async fn try_start(data_dir: &Path, port: u16) -> Option<LlamafileProcess> {
-    if is_running(port).await {
-        println!("  🧠 LLM already running at http://127.0.0.1:{}", port);
+/// The base port is [`crate::ports::LLAMAFILE`].  If busy, the next port in
+/// arithmetic sequence is tried automatically.
+///
+/// Returns `Some((guard, port))` with the actual port the process was started
+/// on, or `None` if already running (port = base) or no model was found.
+pub async fn try_start(data_dir: &Path) -> Option<(LlamafileProcess, u16)> {
+    let base_port = crate::ports::LLAMAFILE;
+
+    if is_running(base_port).await {
+        println!("  🧠 LLM already running at {}", url_for(base_port));
         return None;
     }
+
+    let port = match crate::ports::find_free_port(base_port).await {
+        Some(p) => p,
+        None => {
+            println!(
+                "  ⚠  No free port found near {} for llamafile",
+                base_port
+            );
+            return None;
+        }
+    };
 
     let model = match find_model(data_dir) {
         Some(p) => p,
@@ -126,7 +147,7 @@ pub async fn try_start(data_dir: &Path, port: u16) -> Option<LlamafileProcess> {
     match spawn(&model, port).await {
         Ok(proc) => {
             println!("  ✅ LLM ready on port {}", port);
-            Some(proc)
+            Some((proc, port))
         }
         Err(e) => {
             println!("  ⚠  Failed to start llamafile: {}", e);

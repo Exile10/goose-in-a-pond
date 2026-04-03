@@ -9,12 +9,13 @@ use axum::{
     extract::{rejection::JsonRejection, Multipart, Path, State},
     http::StatusCode,
     response::{Html, Json},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use pond_core::domain::message::ChatMessage;
 use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::ports::scheduler::CreateTaskRequest;
 use pond_core::domain::settings::Settings;
 use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
@@ -47,7 +48,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/system/info", get(system_info))
         // Service connectivity test (public — diagnostic tool)
         .route("/test", get(test_services))
-        .route("/test/speak", post(test_speak));
+        .route("/test/speak", post(test_speak))
+        // Goose agent status (public — dev diagnostic)
+        .route("/dev/goose", get(goose_status));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
@@ -67,6 +70,15 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sensors/{device_id}", get(get_recent_sensors))
         .route("/camera/events", get(list_camera_events).post(record_camera_event))
         .route("/camera/events/{id}/acknowledge", patch(acknowledge_camera_event))
+        // ── Scheduler ──────────────────────────────────────────────────────────
+        .route("/schedules", get(list_schedules).post(create_schedule))
+        .route("/schedules/{id}", delete(delete_schedule))
+        .route("/schedules/{id}/pause", post(pause_schedule))
+        .route("/schedules/{id}/resume", post(resume_schedule))
+        .route("/schedules/{id}/run-now", post(run_schedule_now))
+        // ── Extensions (MCP/Goose extension manager) ───────────────────────────
+        .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
+        .route("/extensions/{name}", delete(remove_extension_handler))
         .layer(
             axum::middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
         );
@@ -274,6 +286,19 @@ async fn chat(
             ),
             _ => SYSTEM_PROMPT.to_string(),
         }
+    };
+
+    // Append MCP memory context to the system prompt when available.
+    let system_prompt = match &state.mcp_memory {
+        Some(m) => {
+            let mem = m.instructions();
+            if mem.is_empty() {
+                system_prompt
+            } else {
+                format!("{}\n\n---\n{}", system_prompt, mem)
+            }
+        }
+        None => system_prompt,
     };
 
     // Build ChatService — wires LLM provider when available, falls back to agent
@@ -1170,6 +1195,136 @@ code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
     </div>
     <pre id="tts-out">—</pre>
   </div>
+
+  <!-- Weather -->
+  <div class="card" style="grid-column:1/-1">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+      <h2>Weather</h2>
+      <div style="display:flex;gap:0.5rem;align-items:center">
+        <span id="wx-cfg-badge" class="badge unknown">—</span>
+        <button class="secondary" onclick="fetchWeather()">↺ Fetch</button>
+        <button class="secondary" onclick="geolocate()">📍 My location</button>
+      </div>
+    </div>
+    <p class="note">
+      Weather is injected into every LLM system prompt when enabled.
+      Enable via <code>PUT /api/v1/settings</code> with <code>weather_enabled:true</code>, <code>weather_latitude</code>, <code>weather_longitude</code>, <code>weather_location_name</code>.
+    </p>
+    <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:0.5rem;margin-bottom:0.75rem">
+      <div><label style="display:block;margin-bottom:2px;font-size:0.8rem">Latitude</label><input type="text" id="wx-lat" placeholder="-1.286"></div>
+      <div><label style="display:block;margin-bottom:2px;font-size:0.8rem">Longitude</label><input type="text" id="wx-lon" placeholder="36.817"></div>
+      <div><label style="display:block;margin-bottom:2px;font-size:0.8rem">Location name</label><input type="text" id="wx-loc" placeholder="Nairobi, KE"></div>
+    </div>
+    <div class="flex" style="margin-bottom:0.75rem">
+      <button onclick="testWeatherDirect()">▶ Test (direct API call)</button>
+      <button class="secondary" onclick="saveWeatherSettings()">💾 Save &amp; enable</button>
+      <button class="secondary" onclick="disableWeather()">✕ Disable</button>
+    </div>
+    <div id="wx-display" style="display:none">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0.5rem;margin-bottom:0.75rem">
+        <div style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:0.6rem;text-align:center">
+          <div style="font-size:1.6rem;font-weight:bold;color:#79c0ff" id="wx-temp">—</div>
+          <div style="font-size:0.7rem;color:#8b949e">Temperature</div>
+        </div>
+        <div style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:0.6rem;text-align:center">
+          <div style="font-size:1.6rem;font-weight:bold;color:#79c0ff" id="wx-feels">—</div>
+          <div style="font-size:0.7rem;color:#8b949e">Feels like</div>
+        </div>
+        <div style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:0.6rem;text-align:center">
+          <div style="font-size:1.6rem;font-weight:bold;color:#79c0ff" id="wx-hum">—</div>
+          <div style="font-size:0.7rem;color:#8b949e">Humidity</div>
+        </div>
+        <div style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:0.6rem;text-align:center">
+          <div style="font-size:1.6rem;font-weight:bold;color:#79c0ff" id="wx-wind">—</div>
+          <div style="font-size:0.7rem;color:#8b949e">Wind</div>
+        </div>
+        <div style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:0.6rem;text-align:center">
+          <div style="font-size:1.6rem;font-weight:bold;color:#79c0ff" id="wx-precip">—</div>
+          <div style="font-size:0.7rem;color:#8b949e">Precipitation</div>
+        </div>
+      </div>
+      <div id="wx-desc" style="color:#56d364;font-size:0.9rem;margin-bottom:0.5rem"></div>
+      <details>
+        <summary style="cursor:pointer;color:#8b949e;font-size:0.78rem">LLM context block (what the assistant sees)</summary>
+        <pre id="wx-context-block" style="margin-top:0.4rem"></pre>
+      </details>
+    </div>
+    <pre id="wx-out" style="display:none"></pre>
+  </div>
+
+  <!-- Scheduler -->
+  <div class="card" style="grid-column:1/-1">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+      <h2>Scheduler</h2>
+      <button class="secondary" onclick="listSchedules()">↺ Refresh</button>
+    </div>
+    <p class="note">Cron uses 6-field format: <code>sec min hour dom month dow</code> — e.g. <code>0 0 8 * * *</code> = 08:00 daily.</p>
+
+    <!-- Create form -->
+    <details style="margin-bottom:0.75rem">
+      <summary style="cursor:pointer;color:#79c0ff;font-size:0.85rem;margin-bottom:0.5rem">+ Create task</summary>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-top:0.5rem">
+        <div><label style="display:block;margin-bottom:2px">ID</label><input type="text" id="sched-id" placeholder="morning-summary"></div>
+        <div><label style="display:block;margin-bottom:2px">Label</label><input type="text" id="sched-label" placeholder="Morning summary"></div>
+        <div><label style="display:block;margin-bottom:2px">Cron (6-field)</label><input type="text" id="sched-cron" placeholder="0 0 8 * * *"></div>
+        <div><label style="display:block;margin-bottom:2px">Webhook URL (optional)</label><input type="text" id="sched-webhook" placeholder="http://localhost:9999/hook"></div>
+      </div>
+      <div style="margin-top:0.5rem">
+        <button onclick="createSchedule()">Create</button>
+      </div>
+    </details>
+
+    <!-- Task list -->
+    <div id="sched-list"><p style="color:#8b949e;font-size:0.82rem">Click Refresh to load tasks.</p></div>
+    <pre id="sched-out" style="display:none;margin-top:0.5rem">—</pre>
+  </div>
+
+  <!-- Goose MCP Extensions -->
+  <div class="card" style="grid-column:1/-1">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+      <h2>Goose MCP Extensions</h2>
+      <div style="display:flex;gap:0.5rem;align-items:center">
+        <span id="goose-badge" class="badge unknown">—</span>
+        <button class="secondary" onclick="loadGooseStatus()">↺ Refresh</button>
+      </div>
+    </div>
+    <p class="note">Enable with: <code>cargo run -p pond-server --features goose-agent -- serve --agent goose</code>.
+    Extensions require onboarding. <button class="secondary" style="padding:2px 8px;font-size:0.75rem" onclick="doOnboard()">Auto-onboard</button></p>
+
+    <!-- Extension list -->
+    <div id="goose-ext-list" style="margin-bottom:0.75rem"><p style="color:#8b949e;font-size:0.82rem">Click Refresh to load extensions.</p></div>
+
+    <!-- Add extension -->
+    <details style="margin-bottom:0.75rem">
+      <summary style="cursor:pointer;color:#79c0ff;font-size:0.85rem;margin-bottom:0.5rem">+ Add extension</summary>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-top:0.5rem">
+        <div><label style="display:block;margin-bottom:2px">Kind</label>
+          <select id="ext-kind" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:7px;font-family:monospace;font-size:0.85rem" onchange="onExtKindChange()">
+            <option value="builtin">builtin</option>
+            <option value="stdio">stdio</option>
+            <option value="streamable_http">streamable_http</option>
+          </select>
+        </div>
+        <div><label style="display:block;margin-bottom:2px">Name</label><input type="text" id="ext-name" placeholder="giap"></div>
+        <div id="ext-cmd-row"><label style="display:block;margin-bottom:2px">Command (stdio only)</label><input type="text" id="ext-cmd" placeholder="/usr/bin/my-mcp-server"></div>
+        <div id="ext-uri-row" style="display:none"><label style="display:block;margin-bottom:2px">URI (http only)</label><input type="text" id="ext-uri" placeholder="http://localhost:8080/mcp"></div>
+        <div style="grid-column:1/-1"><label style="display:block;margin-bottom:2px">Description</label><input type="text" id="ext-desc" placeholder="optional description"></div>
+      </div>
+      <div style="margin-top:0.5rem"><button onclick="addExtension()">Add</button></div>
+    </details>
+
+    <!-- Goose chat (uses existing /api/v1/chat, active only when --agent goose) -->
+    <details>
+      <summary style="cursor:pointer;color:#79c0ff;font-size:0.85rem;margin-bottom:0.5rem">▶ Test Goose chat</summary>
+      <p class="note" style="margin-top:0.5rem">Sends through the wired agent. When <code>--agent goose</code> is active the Goose engine handles the message and can call MCP tools.</p>
+      <input type="text" id="goose-session" placeholder="session_id (blank = new)" style="margin-bottom:6px">
+      <textarea id="goose-msg" style="margin-bottom:6px">List my registered devices using the GIAP MCP tools.</textarea>
+      <div class="flex"><button onclick="sendGooseChat()">Send</button></div>
+      <pre id="goose-chat-out">—</pre>
+    </details>
+
+    <pre id="goose-out" style="display:none;margin-top:0.5rem">—</pre>
+  </div>
 </div>
 
 <script>
@@ -1392,8 +1547,297 @@ async function testTts(){
   }catch(e){out.textContent='Error: '+e.message;}
 }
 
+// ── Weather ───────────────────────────────────────────────────────────────────
+async function fetchWeather(){
+  const badge=document.getElementById('wx-cfg-badge');
+  const out=document.getElementById('wx-out');
+  badge.className='badge pending';badge.textContent='…';
+  out.style.display='none';
+  try{
+    const r=await fetch(`${API}/weather`);
+    if(r.status===503){
+      badge.className='badge unavailable';badge.textContent='disabled';
+      document.getElementById('wx-display').style.display='none';
+      out.style.display='block';out.textContent='Weather disabled — fill in lat/lon and click "Save & enable".';
+      return;
+    }
+    const d=await r.json();
+    if(d.error){
+      badge.className='badge unavailable';badge.textContent='error';
+      out.style.display='block';out.textContent=d.error;
+      return;
+    }
+    badge.className='badge ok';badge.textContent='ok';
+    renderWeather(d);
+  }catch(e){
+    badge.className='badge unavailable';badge.textContent='error';
+    out.style.display='block';out.textContent='Error: '+e.message;
+  }
+}
+
+async function testWeatherDirect(){
+  const lat=parseFloat(document.getElementById('wx-lat').value);
+  const lon=parseFloat(document.getElementById('wx-lon').value);
+  const loc=document.getElementById('wx-loc').value.trim()||`${lat}, ${lon}`;
+  const out=document.getElementById('wx-out');
+  if(isNaN(lat)||isNaN(lon)){alert('Enter valid lat/lon first.');return;}
+  out.style.display='block';out.textContent='Fetching from open-meteo.com…';
+  document.getElementById('wx-display').style.display='none';
+  try{
+    const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`+
+      `&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,`+
+      `weather_code,wind_speed_10m,wind_direction_10m`+
+      `&temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm`;
+    const r=await fetch(url);
+    const api=await r.json();
+    const c=api.current;
+    const WMO={0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',
+      45:'Fog',48:'Fog',51:'Light drizzle',53:'Moderate drizzle',55:'Dense drizzle',
+      61:'Slight rain',63:'Moderate rain',65:'Heavy rain',
+      71:'Slight snow',73:'Moderate snow',75:'Heavy snow',
+      80:'Slight showers',81:'Moderate showers',82:'Violent showers',
+      95:'Thunderstorm',96:'Thunderstorm with hail',99:'Thunderstorm with hail'};
+    const desc=WMO[c.weather_code]||'Unknown';
+    const data={
+      temperature_c:c.temperature_2m,feels_like_c:c.apparent_temperature,
+      humidity_pct:c.relative_humidity_2m,description:desc,
+      wind_speed_kmh:c.wind_speed_10m,wind_direction_deg:c.wind_direction_10m,
+      precipitation_mm:c.precipitation,location_name:loc,
+      fetched_at:new Date().toISOString()
+    };
+    renderWeather(data);
+    out.textContent=JSON.stringify(api.current,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+function renderWeather(d){
+  document.getElementById('wx-display').style.display='block';
+  document.getElementById('wx-temp').textContent=d.temperature_c.toFixed(1)+'°C';
+  document.getElementById('wx-feels').textContent=d.feels_like_c.toFixed(1)+'°C';
+  document.getElementById('wx-hum').textContent=d.humidity_pct+'%';
+  document.getElementById('wx-wind').textContent=d.wind_speed_kmh.toFixed(0)+' km/h';
+  document.getElementById('wx-precip').textContent=d.precipitation_mm.toFixed(1)+' mm';
+  document.getElementById('wx-desc').textContent=`${d.description} — ${d.location_name}`;
+  const block=`[Current Weather — ${d.location_name}]\n${d.description} | `+
+    `${d.temperature_c.toFixed(1)}°C (feels like ${d.feels_like_c.toFixed(1)}°C) | `+
+    `Humidity: ${d.humidity_pct}% | Wind: ${d.wind_speed_kmh.toFixed(0)} km/h | `+
+    `Precip: ${d.precipitation_mm.toFixed(1)} mm`;
+  document.getElementById('wx-context-block').textContent=block;
+}
+
+function geolocate(){
+  if(!navigator.geolocation){alert('Geolocation not supported.');return;}
+  navigator.geolocation.getCurrentPosition(pos=>{
+    document.getElementById('wx-lat').value=pos.coords.latitude.toFixed(6);
+    document.getElementById('wx-lon').value=pos.coords.longitude.toFixed(6);
+  },err=>alert('Geolocation error: '+err.message));
+}
+
+async function saveWeatherSettings(){
+  const lat=parseFloat(document.getElementById('wx-lat').value);
+  const lon=parseFloat(document.getElementById('wx-lon').value);
+  const loc=document.getElementById('wx-loc').value.trim();
+  if(isNaN(lat)||isNaN(lon)){alert('Enter valid lat/lon first.');return;}
+  const out=document.getElementById('wx-out');
+  out.style.display='block';out.textContent='Saving…';
+  try{
+    const r=await fetch(`${API}/settings`,{
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({weather_enabled:true,weather_latitude:lat,weather_longitude:lon,weather_location_name:loc})
+    });
+    const d=await r.json();
+    if(r.ok){out.textContent='Saved! Fetching weather…';fetchWeather();}
+    else{out.textContent='Error: '+JSON.stringify(d);}
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+async function disableWeather(){
+  const out=document.getElementById('wx-out');
+  out.style.display='block';out.textContent='Disabling…';
+  try{
+    const r=await fetch(`${API}/settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather_enabled:false})});
+    const d=await r.json();
+    if(r.ok){out.textContent='Weather disabled.';fetchWeather();}
+    else{out.textContent='Error: '+JSON.stringify(d);}
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+// ── Scheduler ─────────────────────────────────────────────────────────────────
+async function listSchedules(){
+  const out=document.getElementById('sched-out');
+  const list=document.getElementById('sched-list');
+  try{
+    const r=await fetch(`${API}/schedules`);
+    if(r.status===503){
+      list.innerHTML='<p style="color:#f85149;font-size:0.82rem">Scheduler not configured (503).</p>';
+      return;
+    }
+    const tasks=await r.json();
+    if(!Array.isArray(tasks)||tasks.length===0){
+      list.innerHTML='<p style="color:#8b949e;font-size:0.82rem">No scheduled tasks.</p>';
+      return;
+    }
+    list.innerHTML=tasks.map(t=>`
+      <div style="border:1px solid #30363d;border-radius:4px;padding:0.6rem 0.75rem;margin-bottom:0.5rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap">
+        <div style="flex:1;min-width:160px">
+          <span style="font-weight:bold;font-size:0.88rem">${esc(t.id)}</span>
+          <span style="color:#8b949e;font-size:0.78rem;margin-left:6px">${esc(t.label)}</span><br>
+          <code style="font-size:0.75rem">${esc(t.cron)}</code>
+          ${t.paused?'<span class="badge pending" style="margin-left:6px">paused</span>':''}
+          ${t.currently_running?'<span class="badge ok" style="margin-left:6px">running</span>':''}
+        </div>
+        <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+          <button class="secondary" style="padding:3px 8px;font-size:0.75rem" onclick="schedRunNow('${esc(t.id)}')">▶ Run now</button>
+          ${t.paused
+            ?`<button class="secondary" style="padding:3px 8px;font-size:0.75rem" onclick="schedResume('${esc(t.id)}')">Resume</button>`
+            :`<button class="secondary" style="padding:3px 8px;font-size:0.75rem" onclick="schedPause('${esc(t.id)}')">Pause</button>`}
+          <button class="danger" style="padding:3px 8px;font-size:0.75rem" onclick="schedDelete('${esc(t.id)}')">Delete</button>
+        </div>
+      </div>`).join('');
+    out.style.display='none';
+  }catch(e){
+    list.innerHTML='';
+    out.style.display='block';
+    out.textContent='Error: '+e.message;
+  }
+}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+async function schedAction(method,path,body){
+  const out=document.getElementById('sched-out');
+  out.style.display='block';
+  out.textContent='…';
+  try{
+    const opts={method,headers:{'Content-Type':'application/json'}};
+    if(body)opts.body=JSON.stringify(body);
+    const r=await fetch(`${API}${path}`,opts);
+    const d=await r.json();
+    out.textContent=JSON.stringify(d,null,2);
+    listSchedules();
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+async function createSchedule(){
+  const id=document.getElementById('sched-id').value.trim();
+  const label=document.getElementById('sched-label').value.trim()||id;
+  const cron=document.getElementById('sched-cron').value.trim();
+  const webhook=document.getElementById('sched-webhook').value.trim();
+  if(!id||!cron){alert('ID and Cron are required.');return;}
+  const payload=webhook?{webhook_url:webhook}:{};
+  await schedAction('POST','/schedules',{id,label,cron,payload});
+}
+async function schedRunNow(id){await schedAction('POST',`/schedules/${id}/run-now`);}
+async function schedPause(id){await schedAction('POST',`/schedules/${id}/pause`);}
+async function schedResume(id){await schedAction('POST',`/schedules/${id}/resume`);}
+async function schedDelete(id){
+  if(!confirm(`Delete task "${id}"?`))return;
+  await schedAction('DELETE',`/schedules/${id}`);
+}
+
+// ── Goose MCP Extensions ──────────────────────────────────────────────────────
+async function loadGooseStatus(){
+  const badge=document.getElementById('goose-badge');
+  const list=document.getElementById('goose-ext-list');
+  const out=document.getElementById('goose-out');
+  badge.textContent='…';badge.className='badge pending';
+  try{
+    const r=await fetch(`${API}/dev/goose`);
+    const d=await r.json();
+    if(d.goose_active){
+      badge.textContent='active';badge.className='badge ok';
+      if(d.extensions&&d.extensions.length>0){
+        list.innerHTML=d.extensions.map(e=>`
+          <div style="border:1px solid #30363d;border-radius:4px;padding:0.5rem 0.75rem;margin-bottom:0.4rem;display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <span style="font-weight:bold;font-size:0.88rem">${esc(e.name)}</span>
+              <span class="badge unknown" style="margin-left:6px;font-size:0.72rem">${esc(e.kind)}</span>
+              ${e.tools&&e.tools.length?'<br><span style="color:#8b949e;font-size:0.75rem">tools: '+e.tools.map(t=>esc(t)).join(', ')+'</span>':''}
+            </div>
+            <button class="danger" style="padding:3px 8px;font-size:0.75rem" onclick="removeExtension('${esc(e.name)}')">Remove</button>
+          </div>`).join('');
+      } else {
+        list.innerHTML='<p style="color:#8b949e;font-size:0.82rem">No extensions loaded. Add the "giap" builtin to enable GIAP tools.</p>';
+      }
+      out.style.display='none';
+    } else {
+      badge.textContent='inactive';badge.className='badge unavailable';
+      list.innerHTML=`<p style="color:#f85149;font-size:0.82rem">${esc(d.message||'Goose agent not active.')}</p>`;
+      out.style.display='none';
+    }
+  }catch(e){badge.textContent='error';badge.className='badge unavailable';out.style.display='block';out.textContent='Error: '+e.message;}
+}
+
+function onExtKindChange(){
+  const kind=document.getElementById('ext-kind').value;
+  document.getElementById('ext-cmd-row').style.display=kind==='stdio'?'':'none';
+  document.getElementById('ext-uri-row').style.display=kind==='streamable_http'?'':'none';
+}
+
+async function addExtension(){
+  const out=document.getElementById('goose-out');
+  const kind=document.getElementById('ext-kind').value;
+  const name=document.getElementById('ext-name').value.trim();
+  const desc=document.getElementById('ext-desc').value.trim();
+  const cmd=document.getElementById('ext-cmd').value.trim();
+  const uri=document.getElementById('ext-uri').value.trim();
+  if(!name){alert('Name is required.');return;}
+  const body={kind,name,description:desc,args:[],env:{}};
+  if(kind==='stdio'){if(!cmd){alert('Command is required for stdio.');return;}body.command=cmd;}
+  if(kind==='streamable_http'){if(!uri){alert('URI is required for http.');return;}body.uri=uri;}
+  out.style.display='block';out.textContent='Adding…';
+  try{
+    const r=await fetch(`${API}/extensions`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer dev'},
+      body:JSON.stringify(body)
+    });
+    const d=await r.json();
+    out.textContent=JSON.stringify(d,null,2);
+    loadGooseStatus();
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+async function removeExtension(name){
+  if(!confirm(`Remove extension "${name}"?`))return;
+  const out=document.getElementById('goose-out');
+  out.style.display='block';out.textContent='Removing…';
+  try{
+    const r=await fetch(`${API}/extensions/${encodeURIComponent(name)}`,{
+      method:'DELETE',
+      headers:{'Authorization':'Bearer dev'}
+    });
+    out.textContent=r.ok?'Removed.':JSON.stringify(await r.json(),null,2);
+    loadGooseStatus();
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
+async function sendGooseChat(){
+  const si=document.getElementById('goose-session');
+  const msg=document.getElementById('goose-msg').value.trim();
+  const out=document.getElementById('goose-chat-out');
+  if(!msg)return;
+  out.textContent='Thinking…';
+  const body={message:msg};
+  if(si.value.trim())body.session_id=si.value.trim();
+  try{
+    const r=await fetch(`${API}/chat`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer dev'},
+      body:JSON.stringify(body)
+    });
+    const d=await r.json();
+    if(d.session_id)si.value=d.session_id;
+    out.textContent=JSON.stringify(d,null,2);
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 checkServices();
+fetchWeather();
+listSchedules();
+loadGooseStatus();
 </script>
 </body>
 </html>"#;
@@ -1404,6 +1848,34 @@ checkServices();
 /// **Never expose this to the internet.**
 pub async fn dev_test_page() -> Html<&'static str> {
     Html(DEV_TEST_HTML)
+}
+
+/// `GET /api/v1/dev/goose` — Goose agent status (public, dev only).
+///
+/// Returns whether the Goose agent is active and the extension manager is wired.
+/// When active, also returns the current tool list.
+async fn goose_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    match &state.extension_manager {
+        None => Json(json!({
+            "goose_active": false,
+            "message": "Goose agent not active. Restart with: cargo run -p pond-server --features goose-agent -- serve --agent goose"
+        })),
+        Some(mgr) => {
+            let tools = mgr.list_tools().await.unwrap_or_default();
+            let extensions = mgr.list_extensions().await.unwrap_or_default();
+            Json(json!({
+                "goose_active": true,
+                "extension_count": extensions.len(),
+                "extensions": extensions.iter().map(|e| json!({
+                    "name": e.name,
+                    "kind": e.kind,
+                    "tools": e.tools,
+                })).collect::<Vec<_>>(),
+                "tool_count": tools.len(),
+                "tools": tools,
+            }))
+        }
+    }
 }
 
 /// `POST /api/v1/test/speak`
@@ -1467,5 +1939,213 @@ async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value 
             "url": url,
             "error": e.to_string(),
         }),
+    }
+}
+
+// ───────────────────────── Scheduler Handlers ───────────────────────
+
+/// `GET /api/v1/schedules` — list all scheduled tasks.
+async fn list_schedules(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    match scheduler.list_tasks().await {
+        Ok(tasks) => (StatusCode::OK, Json(json!(tasks))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// `POST /api/v1/schedules` — create a new scheduled task.
+async fn create_schedule(
+    State(state): State<Arc<AppState>>,
+    result: Result<Json<CreateTaskRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    let Json(req) = match result {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+    };
+    match scheduler.create_task(req).await {
+        Ok(task) => (StatusCode::CREATED, Json(json!(task))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// `DELETE /api/v1/schedules/:id` — remove a scheduled task.
+async fn delete_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    match scheduler.delete_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"deleted": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/schedules/:id/pause` — pause a scheduled task.
+async fn pause_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    match scheduler.pause_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"paused": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/schedules/:id/resume` — resume a paused task.
+async fn resume_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    match scheduler.resume_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"resumed": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/schedules/:id/run-now` — fire a task immediately.
+async fn run_schedule_now(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    match scheduler.run_now(&id).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"fired": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+// ── Extension management handlers ─────────────────────────────────────────────
+
+/// `GET /api/v1/extensions` — list all active Goose/MCP extensions.
+async fn list_extensions_handler(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(manager) = &state.extension_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Extension manager not available"})),
+        )
+            .into_response();
+    };
+    match manager.list_extensions().await {
+        Ok(exts) => Json(json!({"extensions": exts})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/extensions` — register a new MCP extension and persist it.
+async fn add_extension_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<pond_core::ports::extension_manager::AddExtensionRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(manager) = &state.extension_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Extension manager not available"})),
+        )
+            .into_response();
+    };
+    match manager.add_extension(req.clone()).await {
+        Ok(info) => {
+            // Persist so the server reconnects on restart.
+            if let Some(repo) = &state.mcp_server_repo {
+                let cfg = pond_core::ports::mcp_server::McpServerConfig {
+                    id:          uuid::Uuid::new_v4().to_string(),
+                    name:        req.name.clone(),
+                    kind:        req.kind.clone(),
+                    description: req.description.clone(),
+                    command:     req.command.clone(),
+                    args:        req.args.clone(),
+                    env:         req.env.clone(),
+                    uri:         req.uri.clone(),
+                    enabled:     true,
+                    created_at:  chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = repo.save(&cfg).await {
+                    tracing::warn!("Failed to persist MCP server '{}': {e}", req.name);
+                }
+            }
+            (StatusCode::CREATED, Json(info)).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/extensions/:name` — remove a registered extension and its persisted config.
+async fn remove_extension_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(manager) = &state.extension_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Extension manager not available"})),
+        )
+            .into_response();
+    };
+    match manager.remove_extension(&name).await {
+        Ok(()) => {
+            if let Some(repo) = &state.mcp_server_repo {
+                if let Err(e) = repo.delete(&name).await {
+                    tracing::warn!("Failed to remove persisted MCP server '{name}': {e}");
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }

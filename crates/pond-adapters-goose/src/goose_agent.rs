@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use goose::agents::{Agent as GooseAgent, AgentConfig, GoosePlatform};
+use goose::agents::{Agent as GooseAgent, AgentConfig, ExtensionConfig, GoosePlatform};
 use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
 use pond_core::ports::agent::{Agent as AgentPort, AgentRequest, AgentResponse};
 use std::sync::Arc;
+
+use crate::extension_manager::GiapGooseExtensionManager;
 
 /// Adapter: GooseAdapter
 ///
@@ -46,6 +48,7 @@ impl GooseAdapter {
                 std::env::current_dir()?,
                 "init".to_string(),
                 goose::session::session_manager::SessionType::User,
+                goose::config::GooseMode::default(),
             )
             .await?;
         adapter
@@ -54,6 +57,41 @@ impl GooseAdapter {
             .await?;
 
         Ok(adapter)
+    }
+
+    /// Build a GooseAdapter backed by an OllamaProvider pointing at llamafile on port 8080.
+    ///
+    /// This is the default factory used by `pond-server --features goose-agent`.
+    /// llamafile speaks the same `POST /v1/chat/completions` format as Ollama.
+    pub async fn with_llamafile(host: Option<&str>) -> Result<Self> {
+        let host = host.unwrap_or("http://127.0.0.1:8080");
+        // OllamaProvider reads OLLAMA_HOST from env.
+        std::env::set_var("OLLAMA_HOST", host);
+        let model_cfg = goose::model::ModelConfig::new_or_fail("llamafile");
+        let provider = goose::providers::ollama::OllamaProvider::from_env(model_cfg).await
+            .map_err(|e| anyhow!("OllamaProvider init failed: {e}"))?;
+        Self::new(Arc::new(provider)).await
+    }
+
+    /// Returns an `GiapGooseExtensionManager` that can add/remove/list Goose extensions.
+    pub fn extension_manager(&self, session_id: String) -> GiapGooseExtensionManager {
+        GiapGooseExtensionManager::new(self.agent.clone(), session_id)
+    }
+
+    /// Convenience: add the named builtin extension to the given session.
+    pub async fn add_builtin_extension(&self, name: &str, session_id: &str) -> Result<()> {
+        let config = ExtensionConfig::Builtin {
+            name: name.to_string(),
+            description: String::new(),
+            display_name: None,
+            timeout: None,
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+        self.agent
+            .add_extension(config, session_id)
+            .await
+            .map_err(|e| anyhow!("Failed to add builtin extension '{}': {}", name, e))
     }
 }
 

@@ -84,6 +84,23 @@ pub struct Settings {
     #[serde(default = "Settings::default_model_registry_url")]
     pub model_registry_url: String,
 
+    // ── Weather ────────────────────────────────────────────────────────────
+    /// Whether to fetch live weather and inject it into the LLM system prompt.
+    #[serde(default = "Settings::default_weather_enabled")]
+    pub weather_enabled: bool,
+
+    /// Latitude for the weather location (decimal degrees, e.g. -1.286 for Nairobi).
+    #[serde(default = "Settings::default_weather_latitude")]
+    pub weather_latitude: f64,
+
+    /// Longitude for the weather location (decimal degrees, e.g. 36.817 for Nairobi).
+    #[serde(default = "Settings::default_weather_longitude")]
+    pub weather_longitude: f64,
+
+    /// Human-readable location name shown in context and API responses.
+    #[serde(default = "Settings::default_weather_location_name")]
+    pub weather_location_name: String,
+
     // ── Data retention ─────────────────────────────────────────────────────
     /// Days to keep rows in event_log (0 = keep forever)
     #[serde(default = "Settings::default_event_log_days")]
@@ -118,6 +135,10 @@ impl Default for Settings {
             voice_tts_http_url:              Self::default_tts_http_url(),
             voice_tts_http_voice:            Self::default_tts_http_voice(),
             model_registry_url:              Self::default_model_registry_url(),
+            weather_enabled:                 Self::default_weather_enabled(),
+            weather_latitude:                Self::default_weather_latitude(),
+            weather_longitude:               Self::default_weather_longitude(),
+            weather_location_name:           Self::default_weather_location_name(),
             retention_event_log_days:        Self::default_event_log_days(),
             retention_sensor_days:           Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
@@ -145,7 +166,11 @@ impl Settings {
     fn default_model_registry_url()         -> String {
         "https://raw.githubusercontent.com/jarida-io/goose-in-a-pond/main/crates/pond-server/registry.json".to_string()
     }
-    fn default_event_log_days()             -> u32    { 30 }
+    fn default_weather_enabled()             -> bool   { false }
+    fn default_weather_latitude()            -> f64    { 0.0 }
+    fn default_weather_longitude()           -> f64    { 0.0 }
+    fn default_weather_location_name()       -> String { "".to_string() }
+    fn default_event_log_days()              -> u32    { 30 }
     fn default_sensor_days()                -> u32    { 7 }
     fn default_session_messages_keep()      -> u32    { 500 }
 }

@@ -7,5 +7,6 @@ pub mod sqlite_memory;
 pub mod sqlite_profile;
 pub mod sqlite_sensor;
 pub mod sqlite_session_storage;
+pub mod sqlite_mcp_servers;
 pub mod sqlite_settings;
 pub mod sqlite_storage;

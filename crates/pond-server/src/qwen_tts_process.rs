@@ -406,7 +406,10 @@ async fn install_system_sox() {
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
-async fn spawn(invoker: Invoker, port: u16) -> Result<QwenTtsProcess> {
+/// Spawns the Qwen TTS process and waits up to 60 s for it to respond.
+/// Returns `(process, confirmed)` where `confirmed` is `true` only when
+/// the server actually responded within the timeout window.
+async fn spawn(invoker: Invoker, port: u16) -> Result<(QwenTtsProcess, bool)> {
     let desc = invoker.description();
     let mut cmd = invoker.into_command(port);
     let child = cmd
@@ -421,35 +424,51 @@ async fn spawn(invoker: Invoker, port: u16) -> Result<QwenTtsProcess> {
     for attempt in 1..=60 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if is_running(&url).await {
-            return Ok(proc);
+            return Ok((proc, true));
         }
         if attempt == 10 {
             println!("  ⏳ Still waiting for Qwen TTS to load the model (first run can take ~30 s)...");
         }
     }
 
-    println!("  ⚠  Qwen TTS did not respond within 60 s — it may still be loading.");
-    Ok(proc)
+    println!("  ⚠  Qwen TTS did not respond within 60 s — it may still be loading in the background.");
+    Ok((proc, false))
 }
 
 // ── High-level entry points ───────────────────────────────────────────────────
 
-fn extract_port(url: &str) -> u16 {
-    url.rsplit(':')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8181)
+/// Base URL for Qwen TTS given a port.
+pub fn url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{}", port)
 }
 
 /// Ensure Qwen TTS is installed, then start it if not already running.
-/// Never returns `Err` — all failures are printed as warnings.
-pub async fn try_start(base_url: &str, data_dir: &Path) -> Option<QwenTtsProcess> {
-    if is_running(base_url).await {
+///
+/// The base port is [`crate::ports::QWEN_TTS`].  If busy, the next free port
+/// in arithmetic sequence is used automatically.
+///
+/// Returns `Some((process, actual_port, confirmed))` where `confirmed` is
+/// `true` when the server responded within the startup window.  Returns `None`
+/// when already running (caller should re-check [`is_running`]) or on failure.
+pub async fn try_start(data_dir: &Path) -> Option<(QwenTtsProcess, u16, bool)> {
+    let base_port = crate::ports::QWEN_TTS;
+    let base_url = url_for(base_port);
+
+    if is_running(&base_url).await {
         println!("  🔊 Qwen TTS already running at {}", base_url);
         return None;
     }
 
-    let port = extract_port(base_url);
+    let port = match crate::ports::find_free_port(base_port).await {
+        Some(p) => p,
+        None => {
+            println!(
+                "  ⚠  No free port found near {} for Qwen TTS",
+                base_port
+            );
+            return None;
+        }
+    };
 
     let invoker = match find_invoker(data_dir) {
         Some(i) => i,
@@ -467,9 +486,13 @@ pub async fn try_start(base_url: &str, data_dir: &Path) -> Option<QwenTtsProcess
 
     println!("  🔊 Starting Qwen TTS ({})...", invoker.description());
     match spawn(invoker, port).await {
-        Ok(proc) => {
+        Ok((proc, true)) => {
             println!("  ✅ Qwen TTS ready on port {}", port);
-            Some(proc)
+            Some((proc, port, true))
+        }
+        Ok((proc, false)) => {
+            // Timed out but process is still alive — keep guard so it stays running.
+            Some((proc, port, false))
         }
         Err(e) => {
             println!("  ⚠  Failed to start Qwen TTS: {}", e);

@@ -96,19 +96,41 @@ async fn spawn(binary: &Path, model: &Path, port: u16) -> Result<WhisperProcess>
     Ok(proc)
 }
 
+/// Base URL for whisper given a port.
+pub fn url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{}", port)
+}
+
 // ── High-level entry point ────────────────────────────────────────────────────
 
 /// Check → find/download → spawn.
 ///
-/// Returns `Some(guard)` if we started the process, `None` if it was already
-/// running.  Errors are printed as warnings; this function never returns `Err`.
-pub async fn try_start(data_dir: &Path, model_path: &Path, port: u16) -> Option<WhisperProcess> {
-    let base_url = format!("http://127.0.0.1:{}", port);
+/// The base port is [`crate::ports::WHISPER`].  If that port is busy,
+/// the next port in arithmetic sequence is tried automatically.
+///
+/// Returns `(Some(guard), port)` if we started the process, or
+/// `(None, port)` if it was already running on the base port.
+/// Errors are printed as warnings; the returned port is always valid.
+pub async fn try_start(data_dir: &Path, model_path: &Path) -> (Option<WhisperProcess>, u16) {
+    let base_port = crate::ports::WHISPER;
+    let base_url = url_for(base_port);
 
     if is_running(&base_url).await {
         println!("  🎙  whisper.cpp already running at {}", base_url);
-        return None;
+        return (None, base_port);
     }
+
+    // Find the port we will actually spawn on.
+    let port = match crate::ports::find_free_port(base_port).await {
+        Some(p) => p,
+        None => {
+            println!(
+                "  ⚠  No free port found near {} for whisper.cpp",
+                base_port
+            );
+            return (None, base_port);
+        }
+    };
 
     // Find or download the binary.
     let binary = match find_binary(data_dir) {
@@ -118,9 +140,8 @@ pub async fn try_start(data_dir: &Path, model_path: &Path, port: u16) -> Option<
             match model_download::download_whisper_binary(data_dir).await {
                 Ok(p) => p,
                 Err(e) => {
-                    // Non-fatal: server still starts, voice features just won't work.
                     println!("  ⚠  Could not obtain whisper-server: {}", e);
-                    return None;
+                    return (None, base_port);
                 }
             }
         }
@@ -129,7 +150,7 @@ pub async fn try_start(data_dir: &Path, model_path: &Path, port: u16) -> Option<
     if !model_path.exists() {
         println!("  ⚠  Whisper model not found at {}", model_path.display());
         println!("     Run `pond-server setup` to download it.");
-        return None;
+        return (None, base_port);
     }
 
     println!("  🎙  Starting whisper.cpp  ({})", binary.display());
@@ -137,11 +158,11 @@ pub async fn try_start(data_dir: &Path, model_path: &Path, port: u16) -> Option<
     match spawn(&binary, model_path, port).await {
         Ok(proc) => {
             println!("  ✅ whisper.cpp ready on port {}", port);
-            Some(proc)
+            (Some(proc), port)
         }
         Err(e) => {
             println!("  ⚠  Failed to start whisper.cpp: {}", e);
-            None
+            (None, base_port)
         }
     }
 }

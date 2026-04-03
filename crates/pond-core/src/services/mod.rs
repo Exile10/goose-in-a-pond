@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod context_budget;
+pub mod context_compactor;
 pub mod fallback_provider;
 pub mod fallback_voice_output;
 pub mod mock_agent;

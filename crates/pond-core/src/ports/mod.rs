@@ -1,12 +1,16 @@
 pub mod agent;
 pub mod camera_storage;
 pub mod device_registry;
+pub mod extension_manager;
 pub mod embedding;
 pub mod handshake;
+pub mod mcp_memory;
+pub mod mcp_server;
 pub mod memory_repository;
 pub mod notification;
 pub mod provider;
 pub mod profile;
+pub mod scheduler;
 pub mod sensor_storage;
 pub mod session_storage;
 pub mod settings;
