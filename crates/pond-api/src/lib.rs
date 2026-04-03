@@ -48,8 +48,12 @@ use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::camera_storage::CameraStorage;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::ports::mcp_memory::McpMemoryPort;
 use pond_core::ports::memory_repository::MemoryRepository;
+use pond_core::ports::extension_manager::ExtensionManagerPort;
+use pond_core::ports::mcp_server::McpServerRepository;
 use pond_core::ports::profile::ProfileRepository;
+use pond_core::ports::scheduler::SchedulerPort;
 use pond_core::ports::sensor_storage::SensorStorage;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::voice_output::VoiceOutput;
@@ -98,6 +102,18 @@ pub struct AppState {
     /// GIAP data directory — used by model endpoints to check file presence on disk.
     /// `None` in tests.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Skip onboarding check in middleware. Set to `true` in tests.
+    pub skip_onboarding: bool,
+    /// Cron-based task scheduler. `None` until `pond-infra-scheduler` is wired in.
+    pub scheduler: Option<Arc<dyn SchedulerPort>>,
+    /// MCP-style persistent memory. `None` until `pond-adapters-mcp-memory` is wired in.
+    pub mcp_memory: Option<Arc<dyn McpMemoryPort + Send + Sync>>,
+    /// MCP extension manager — manages Goose extensions for tool calling.
+    /// `None` until a Goose agent with extension support is wired in.
+    pub extension_manager: Option<Arc<dyn ExtensionManagerPort>>,
+    /// Persistent storage for configured external MCP server connections.
+    /// Loaded at startup to auto-connect saved servers.
+    pub mcp_server_repo: Option<Arc<dyn McpServerRepository>>,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.

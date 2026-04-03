@@ -29,7 +29,10 @@ pub async fn require_onboarding_complete(
     next: Next,
 ) -> Result<Response, Response> {
 
-    // Create service
+    if state.skip_onboarding {
+        return Ok(next.run(req).await);
+    }
+
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
     // Get onboarding status

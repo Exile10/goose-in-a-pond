@@ -98,6 +98,11 @@ async fn make_app(
         prompt_template_dir: None,
         model_status: None,
         data_dir: None,
+        skip_onboarding: true,
+        scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

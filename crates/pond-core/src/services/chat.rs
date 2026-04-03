@@ -11,6 +11,7 @@ use crate::services::instant_activation::InstantActivation;
 use crate::services::print_output::PrintOutput;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::services::context_budget;
+use crate::services::context_compactor::ContextCompactor;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
 use std::io::{self, Write};
@@ -39,6 +40,9 @@ pub struct ChatService {
     /// System prompt sent to the LLM on every completion call.
     /// Defaults to `SYSTEM_PROMPT`; override with `with_system_prompt()`.
     system_prompt: String,
+    /// Optional LLM-based context compactor.  When set, triggers at 80% of
+    /// the context budget instead of falling straight to trim_to_budget.
+    compactor: Option<ContextCompactor>,
 }
 
 impl ChatService {
@@ -56,6 +60,7 @@ impl ChatService {
             session_id,
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
+            compactor: None,
         }
     }
 
@@ -93,6 +98,16 @@ impl ChatService {
         self
     }
 
+    /// Enable LLM-based context compaction.
+    ///
+    /// When set, `chat_once` will summarise the oldest 75% of history whenever
+    /// the conversation exceeds 80% of the context limit, instead of simply
+    /// dropping old messages via `trim_to_budget`.
+    pub fn with_context_compactor(mut self, compactor: ContextCompactor) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
     /// Single-shot chat (useful for tests and non-interactive callers).
     pub async fn chat_once(&self, message: String) -> Result<String> {
         // Persist the user message first
@@ -116,7 +131,17 @@ impl ChatService {
                 .await?;
             let messages: Vec<ChatMessage> =
                 stored.into_iter().map(|sm| sm.message).collect();
-            let messages = context_budget::trim_to_budget(messages);
+            // Apply LLM-based compaction if configured and threshold exceeded,
+            // otherwise fall back to simple character-budget trimming.
+            let messages = if let Some(compactor) = &self.compactor {
+                if compactor.needs_compaction(&messages) {
+                    compactor.compact(provider.as_ref(), messages).await
+                } else {
+                    context_budget::trim_to_budget(messages)
+                }
+            } else {
+                context_budget::trim_to_budget(messages)
+            };
             let response = provider.complete(&self.system_prompt, messages).await?;
             response.content
         } else {

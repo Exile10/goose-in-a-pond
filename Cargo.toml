@@ -4,6 +4,7 @@ members = [
     "crates/pond-core",
     "crates/pond-api",
     "crates/pond-infra",
+    "crates/pond-infra-scheduler",
     "crates/pond-server",
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
@@ -11,15 +12,15 @@ members = [
     "crates/pond-adapters-piper",
     "crates/pond-adapters-qwen-tts",
     "crates/pond-adapters-gotg",
+    "crates/pond-adapters-weather",
+    "crates/pond-adapters-mcp-memory",
     "crates/pond-builder",
+    # Goose-dependent crates — use goose with default-features=false to avoid
+    # the rmcp version conflict (code-mode feature is not enabled).
+    "crates/pond-adapters-goose",
+    "crates/pond-adapters-local-inference",
+    "crates/pond-mcp-server",
 ]
-# pond-adapters-goose is intentionally excluded from the default workspace build.
-# It pulls in the goose/ submodule which has a diamond rmcp version conflict
-# (pctx_code_execution_runtime 0.1.3 uses rmcp ^0.14 while pctx_config uses rmcp 1.2).
-# This crate is also explicitly never linked into pond-server on Windows due to a
-# fatal linker conflict. Build it in isolation when needed:
-#   cargo build -p pond-adapters-goose
-exclude = ["crates/pond-adapters-goose"]
 
 [workspace.package]
 edition = "2021"
@@ -36,8 +37,38 @@ uninlined_format_args = "allow"
 string_slice = "warn"
 
 [workspace.dependencies]
-goose = { path = "goose/crates/goose" }
-rmcp = { version = "0.16", features = ["schemars", "auth"] }
+# rmcp 1.2.0 — required by goose sub-crates when cargo resolves their
+# `workspace = true` deps against the outer (GIAP) workspace for path-dep builds.
+# No GIAP workspace member uses rmcp directly.
+rmcp = { version = "=1.2.0", features = ["schemars", "auth", "server", "client",
+    "transport-io", "macros", "transport-child-process",
+    "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+# ── Goose sub-workspace deps ──────────────────────────────────────────────────
+# Cargo resolves goose crates' `workspace = true` dependency entries against the
+# outermost workspace (GIAP) when those crates are reached via path deps.
+# These entries mirror goose/Cargo.toml [workspace.dependencies] for the deps
+# that are NOT already declared above in GIAP's own dep list.
+agent-client-protocol-schema = { version = "0.11", features = ["unstable"] }
+sacp             = "11.0.0"
+arboard          = "3"
+sha2             = "0.10"
+strum            = { version = "0.27", features = ["derive"] }
+shell-words      = "1.1"
+rayon            = "1.10"
+tracing-futures  = { version = "0.2", features = ["futures-03"] }
+tree-sitter            = "0.26"
+tree-sitter-go         = "0.25"
+tree-sitter-java       = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-kotlin-ng  = "1.1"
+tree-sitter-python     = "0.25"
+tree-sitter-ruby       = "0.23"
+tree-sitter-rust       = "0.24"
+tree-sitter-swift      = "0.7"
+tree-sitter-typescript = "0.23"
+winapi = { version = "0.3", features = ["wincred"] }
+# zip v8 for goose; pond-server pins zip = "2" directly in its own Cargo.toml
+zip = { version = "^8.0", default-features = false, features = ["deflate"] }
 anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -82,23 +113,36 @@ uuid = { version = "1.11", features = ["v4"] }
 webbrowser = "1.0"
 which = "8.0.0"
 wiremock = "0.6"
+tokio-cron-scheduler = "0.14"
 serial_test = "3.2.0"
 test-case = "3.3.1"
 url = "2.5.8"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["metrics"] }
 opentelemetry-otlp = "0.31"
-opentelemetry-appender-tracing = "0.31"
+opentelemetry-appender-tracing = { version = "0.31", features = ["experimental_span_attributes"] }
 opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.32"
 hostname = "0.4"
-zip = "2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono"] }
 
 # Internal workspace crates
-pond-core = { path = "crates/pond-core" }
-pond-api = { path = "crates/pond-api" }
-pond-infra = { path = "crates/pond-infra" }
-pond-adapters-goose = { path = "crates/pond-adapters-goose" }
+pond-core              = { path = "crates/pond-core" }
+pond-api               = { path = "crates/pond-api" }
+pond-infra             = { path = "crates/pond-infra" }
+pond-infra-scheduler   = { path = "crates/pond-infra-scheduler" }
 pond-adapters-llamafile = { path = "crates/pond-adapters-llamafile" }
 pond-adapters-qwen-tts  = { path = "crates/pond-adapters-qwen-tts" }
+pond-adapters-weather          = { path = "crates/pond-adapters-weather" }
+pond-adapters-mcp-memory       = { path = "crates/pond-adapters-mcp-memory" }
+pond-adapters-local-inference  = { path = "crates/pond-adapters-local-inference" }
+
+# ── Patches required by goose sub-crates ─────────────────────────────────────
+[patch.crates-io]
+sacp       = { git = "https://github.com/agentclientprotocol/symposium-acp", rev = "14086c9" }
+sacp-derive = { git = "https://github.com/agentclientprotocol/symposium-acp", rev = "14086c9" }
+opentelemetry              = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+opentelemetry_sdk          = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+opentelemetry-appender-tracing = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+opentelemetry-otlp         = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+opentelemetry-stdout       = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }

@@ -1,18 +1,25 @@
 [package]
 name = "pond-adapters-goose"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
+    "Purity Wanjiru <wanjiru@jarida.io>","Emmanuel Oyugi <oyugi@jarida.io>",
+    "Africia Kerubo <africia@jarida.io>"]
+license = "Apache-2.0"
+
+# This crate is intentionally excluded from the GIAP workspace — it depends on
+# the goose submodule with all features, which pulls in rmcp version conflicts.
+# Build in isolation: cargo build --manifest-path crates/pond-adapters-goose/Cargo.toml
 
 [dependencies]
-pond-core = { workspace = true }
-goose = { workspace = true }
-rmcp = { workspace = true }
-anyhow = { workspace = true }
-tokio = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
-serde = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
+pond-core        = { path = "../pond-core" }
+pond-mcp-server  = { path = "../pond-mcp-server" }
+goose            = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls"] }
+rmcp             = { workspace = true }
+anyhow = "1.0"
+tokio = { version = "1.49", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.11", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
