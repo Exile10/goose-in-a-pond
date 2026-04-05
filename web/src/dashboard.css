@@ -1320,3 +1320,307 @@
   font-style: italic;
   margin: 0.5rem 0;
 }
+
+/* ── Voice Orb ─────────────────────────────────────────────────────────────── */
+
+.voice-orb-container {
+  position: fixed;
+  bottom: 1.75rem;
+  right: 1.75rem;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  pointer-events: none;
+}
+
+.voice-orb-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  pointer-events: all;
+}
+
+.voice-orb-label {
+  font-size: 0.65rem;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* The main orb button */
+.voice-orb-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  position: relative;
+  outline: none;
+}
+
+.voice-orb-btn:focus-visible {
+  outline: 2px solid #a78bfa;
+  outline-offset: 3px;
+}
+
+/* Wait: gentle pulse */
+.voice-orb-wait {
+  background: linear-gradient(135deg, #7c3aed, #a855f7);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(124, 58, 237, 0.45);
+  animation: orb-pulse 2.8s ease-in-out infinite;
+}
+
+@keyframes orb-pulse {
+  0%, 100% { box-shadow: 0 4px 20px rgba(124, 58, 237, 0.45); transform: scale(1); }
+  50%       { box-shadow: 0 4px 32px rgba(168, 85, 247, 0.65); transform: scale(1.04); }
+}
+
+/* Listen: recording — red ring */
+.voice-orb-listen {
+  background: #dc2626;
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(220, 38, 38, 0.5);
+  animation: orb-record 1.2s ease-in-out infinite;
+}
+
+@keyframes orb-record {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.5); }
+  50%       { box-shadow: 0 0 0 10px rgba(220, 38, 38, 0); }
+}
+
+/* Think: spinner */
+.voice-orb-think {
+  background: linear-gradient(135deg, #0369a1, #0ea5e9);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(14, 165, 233, 0.4);
+}
+
+.voice-orb-spinner-icon {
+  animation: orb-spin 0.8s linear infinite;
+}
+
+@keyframes orb-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Speak: green wave */
+.voice-orb-speak {
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(16, 185, 129, 0.45);
+}
+
+.voice-orb-wave {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.voice-orb-wave span {
+  display: block;
+  width: 3px;
+  border-radius: 2px;
+  background: #fff;
+  animation: orb-wave 1s ease-in-out infinite;
+}
+
+.voice-orb-wave span:nth-child(1) { height: 8px;  animation-delay: 0s; }
+.voice-orb-wave span:nth-child(2) { height: 14px; animation-delay: 0.1s; }
+.voice-orb-wave span:nth-child(3) { height: 20px; animation-delay: 0.2s; }
+.voice-orb-wave span:nth-child(4) { height: 14px; animation-delay: 0.3s; }
+.voice-orb-wave span:nth-child(5) { height: 8px;  animation-delay: 0.4s; }
+
+@keyframes orb-wave {
+  0%, 100% { transform: scaleY(0.5); opacity: 0.7; }
+  50%       { transform: scaleY(1);   opacity: 1; }
+}
+
+/* Mute toggle */
+.voice-orb-mute-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: blur(8px);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.voice-orb-mute-btn:hover { background: var(--surface-muted); color: var(--text-secondary); }
+.voice-orb-mute-btn.muted { color: #dc2626; }
+
+/* Transcript / response overlay */
+.voice-orb-overlay {
+  position: fixed;
+  bottom: 7.5rem;
+  right: 1.75rem;
+  width: 280px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border-card);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  box-shadow: 0 8px 32px rgba(109, 40, 217, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  pointer-events: all;
+  z-index: 201;
+}
+
+.voice-orb-overlay-close {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.6rem;
+  background: none;
+  border: none;
+  font-size: 0.75rem;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.voice-orb-overlay-close:hover { color: var(--text-secondary); }
+
+.voice-orb-overlay-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.voice-orb-overlay-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.voice-orb-overlay-text {
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  line-height: 1.45;
+}
+
+/* Error toast */
+.voice-orb-error {
+  position: fixed;
+  bottom: 7.5rem;
+  right: 1.75rem;
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  color: var(--error-text);
+  font-size: 0.78rem;
+  border-radius: 8px;
+  padding: 0.5rem 0.85rem;
+  pointer-events: all;
+  cursor: pointer;
+  z-index: 201;
+  max-width: 220px;
+}
+
+/* ── Schedules page ─────────────────────────────────────────────────────────── */
+
+.db-schedules-empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  font-style: italic;
+}
+
+.db-table-wrapper {
+  overflow-x: auto;
+}
+
+.db-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.83rem;
+}
+
+.db-table th {
+  text-align: left;
+  padding: 0.55rem 0.75rem;
+  color: var(--text-faint);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.db-table td {
+  padding: 0.65rem 0.75rem;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--glass-border);
+  vertical-align: middle;
+}
+
+.db-table tr:last-child td { border-bottom: none; }
+
+.db-table-actions {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.db-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: 99px;
+}
+
+.db-badge-active  { background: #d1fae5; color: #065f46; }
+.db-badge-paused  { background: #fef3c7; color: #92400e; }
+.db-badge-running { background: #dbeafe; color: #1e40af; }
+
+.db-cron-input {
+  font-family: monospace;
+  font-size: 0.83rem;
+  background: var(--surface-muted);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  padding: 0.4rem 0.6rem;
+  width: 100%;
+}
+
+.db-cron-input::placeholder { color: var(--text-faint); }
+
+/* Sensor readings inside device cards */
+.db-sensor-list {
+  margin-top: 0.65rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.db-sensor-chip {
+  font-size: 0.75rem;
+  background: var(--surface-muted);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  padding: 0.25rem 0.55rem;
+  color: var(--text-secondary);
+}
+
+.db-sensor-chip strong { color: var(--text-primary); margin-right: 0.2rem; }

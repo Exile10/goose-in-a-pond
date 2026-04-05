@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { api, isPreviewMode } from '../api'
+import { useState, useEffect, useCallback } from 'react'
+import { api, isPreviewMode, type SensorReading } from '../api'
 import DeviceIcon from './DeviceIcon'
 import { logActivity } from '../activityLog'
 
@@ -44,6 +44,13 @@ function saveDevices(devices: Device[]) {
   ))
 }
 
+function timeAgoShort(iso: string): string {
+  const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (diff < 60) return `${diff}s ago`
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  return `${Math.floor(diff / 3600)}h ago`
+}
+
 export default function DeviceList({ token }: Props) {
   const [devices, setDevices] = useState<Device[]>(() => loadStoredDevices())
   const [error, setError] = useState<string | null>(null)
@@ -52,6 +59,8 @@ export default function DeviceList({ token }: Props) {
   const [adding, setAdding] = useState(false)
   const [addError, setAddError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [sensors, setSensors] = useState<Record<string, SensorReading[]>>({})
 
   useEffect(() => {
     if (isPreviewMode(token)) return
@@ -63,6 +72,25 @@ export default function DeviceList({ token }: Props) {
       })
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load devices.'))
   }, [token])
+
+  // Load sensors for the expanded device, poll every 30s
+  const loadSensors = useCallback((deviceId: string) => {
+    if (isPreviewMode(token)) return
+    api.getSensors(deviceId, token, 5)
+      .then(res => setSensors(prev => ({ ...prev, [deviceId]: res.readings })))
+      .catch(() => { /* sensor data optional */ })
+  }, [token])
+
+  useEffect(() => {
+    if (!expandedId) return
+    loadSensors(expandedId)
+    const id = setInterval(() => loadSensors(expandedId), 30_000)
+    return () => clearInterval(id)
+  }, [expandedId, loadSensors])
+
+  function toggleExpand(id: string) {
+    setExpandedId(prev => prev === id ? null : id)
+  }
 
   function toggleDevice(id: string) {
     setDevices(prev => prev.map(d => {
@@ -79,6 +107,7 @@ export default function DeviceList({ token }: Props) {
     const updated = devices.filter(d => d.id !== id)
     setDevices(updated)
     saveDevices(updated)
+    if (expandedId === id) setExpandedId(null)
   }
 
   async function handleAdd(e: React.FormEvent) {
@@ -150,13 +179,21 @@ export default function DeviceList({ token }: Props) {
         <div className="db-device-grid">
           {devices.map(device => {
             const t = theme(device.type)
+            const isExpanded = expandedId === device.id
+            const deviceSensors = sensors[device.id] ?? []
+
             return (
               <div
                 key={device.id}
                 className={`db-device-card ${device.active ? 'active' : 'inactive'}`}
               >
-                {/* Icon */}
-                <div className="db-device-card-icon" style={{ background: t.bg, color: t.color }}>
+                {/* Icon — click to expand sensor panel */}
+                <div
+                  className="db-device-card-icon"
+                  style={{ background: t.bg, color: t.color, cursor: 'pointer' }}
+                  onClick={() => toggleExpand(device.id)}
+                  title="View sensor readings"
+                >
                   <DeviceIcon type={device.type} size={32} />
                 </div>
 
@@ -193,6 +230,25 @@ export default function DeviceList({ token }: Props) {
                     ✕
                   </button>
                 </div>
+
+                {/* Sensor readings panel */}
+                {isExpanded && (
+                  <div className="db-sensor-list">
+                    {deviceSensors.length === 0 ? (
+                      <span className="db-sensor-chip" style={{ fontStyle: 'italic' }}>No sensor readings</span>
+                    ) : (
+                      deviceSensors.map((r, i) => (
+                        <span key={i} className="db-sensor-chip">
+                          <strong>{r.sensor_type}</strong>
+                          {r.value} {r.unit}
+                          <span style={{ color: 'var(--text-faint)', marginLeft: '0.25rem' }}>
+                            {timeAgoShort(r.recorded_at)}
+                          </span>
+                        </span>
+                      ))
+                    )}
+                  </div>
+                )}
               </div>
             )
           })}

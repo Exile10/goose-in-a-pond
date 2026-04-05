@@ -141,15 +141,15 @@ mod tests {
     use crate::db::Database;
     use tempfile::tempdir;
 
-    async fn make_repo() -> SqliteProfileRepository {
+    async fn make_repo() -> (SqliteProfileRepository, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        SqliteProfileRepository::new(db.system)
+        (SqliteProfileRepository::new(db.system), tmp)
     }
 
     #[tokio::test]
     async fn create_and_get() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         let profile = repo
             .create(CreateProfileRequest {
                 display_name: "Jerry".to_string(),
@@ -166,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_all() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         repo.create(CreateProfileRequest { display_name: "A".to_string(), avatar_emoji: "A".to_string() }).await.unwrap();
         repo.create(CreateProfileRequest { display_name: "B".to_string(), avatar_emoji: "B".to_string() }).await.unwrap();
         assert_eq!(repo.list().await.unwrap().len(), 2);
@@ -174,7 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_preferences_persists() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         let profile = repo
             .create(CreateProfileRequest { display_name: "Jerry".to_string(), avatar_emoji: "X".to_string() })
             .await
@@ -187,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_profile() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         let profile = repo
             .create(CreateProfileRequest { display_name: "Temp".to_string(), avatar_emoji: "T".to_string() })
             .await

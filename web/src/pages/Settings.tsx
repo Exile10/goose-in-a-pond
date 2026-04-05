@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { api, isPreviewMode } from '../api'
 import { clearActivity, logActivity } from '../activityLog'
 
@@ -41,6 +41,23 @@ export default function Settings({ token }: Props) {
   const [personality, setPersonality]     = useState(() => load('pond_personality', 'helpful'))
   const [assistantStyle, setAssistantStyle] = useState(() => load('pond_assistant_style', 'proactive'))
   const [systemPrompt, setSystemPrompt]   = useState(() => localStorage.getItem('pond_system_prompt') ?? '')
+
+  // Hydrate from backend on mount
+  useEffect(() => {
+    if (isPreviewMode(token)) return
+    api.getSettings(token)
+      .then(s => {
+        if (s.user_name) {
+          setDisplayName(s.user_name)
+          localStorage.setItem('pond_display_name', s.user_name)
+        }
+        if (s.assistant_personality) {
+          setPersonality(s.assistant_personality)
+          localStorage.setItem('pond_personality', JSON.stringify(s.assistant_personality))
+        }
+      })
+      .catch(() => { /* fall back to localStorage */ })
+  }, [token])
 
   const [saving, setSaving]   = useState(false)
   const [saved, setSaved]     = useState(false)

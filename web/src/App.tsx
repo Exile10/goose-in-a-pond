@@ -4,11 +4,13 @@ import Devices from "./pages/Devices";
 import Status from "./pages/Status";
 import Settings from "./pages/Settings";
 import Activity from "./pages/Activity";
+import Schedules from "./pages/Schedules";
 import Onboarding from "./pages/Onboarding";
+import VoiceOrb from "./components/VoiceOrb";
 import logo from "./assets/logo.png";
 import "./dashboard.css";
 
-type Page = "chat" | "devices" | "activity" | "status" | "settings";
+type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules";
 
 function getInitials(name: string): string {
     return name.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'
@@ -32,6 +34,18 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
                 <rect x="2" y="3" width="20" height="14" rx="2" />
                 <line x1="8" y1="21" x2="16" y2="21" />
                 <line x1="12" y1="17" x2="12" y2="21" />
+            </svg>
+        ),
+    },
+    {
+        page: "schedules",
+        label: "Schedules",
+        icon: (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                <line x1="16" y1="2" x2="16" y2="6" />
+                <line x1="8" y1="2" x2="8" y2="6" />
+                <line x1="3" y1="10" x2="21" y2="10" />
             </svg>
         ),
     },
@@ -163,12 +177,16 @@ function App() {
             </aside>
 
             <main className="db-main">
-                {page === "chat"     && <Dashboard token={token} />}
-                {page === "devices"  && <Devices token={token} />}
-                {page === "activity" && <Activity />}
-                {page === "status"   && <Status token={token} />}
-                {page === "settings" && <Settings token={token} />}
+                {page === "chat"      && <Dashboard token={token} />}
+                {page === "devices"   && <Devices token={token} />}
+                {page === "schedules" && <Schedules token={token} />}
+                {page === "activity"  && <Activity token={token} />}
+                {page === "status"    && <Status token={token} />}
+                {page === "settings"  && <Settings token={token} />}
             </main>
+
+            {/* Voice orb — always accessible regardless of page */}
+            <VoiceOrb token={token} />
         </div>
     );
 }

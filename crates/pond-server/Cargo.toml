@@ -6,8 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+default = ["goose-agent"]
 # Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
-# cargo run -p pond-server --features goose-agent -- serve --agent goose
+# Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
 goose-agent = ["dep:pond-adapters-goose"]
 # Enable flat-file MCP memory (memories injected into system prompt every chat turn).
 # cargo run -p pond-server --features mcp-memory -- serve

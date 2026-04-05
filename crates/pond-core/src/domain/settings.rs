@@ -29,6 +29,22 @@ pub struct Settings {
     #[serde(default = "Settings::default_timezone")]
     pub timezone: String,
 
+    /// Prompt style — selects the built-in system prompt template.
+    /// Accepted values: "balanced" (default) | "concise" | "technical" | "warm"
+    #[serde(default = "Settings::default_prompt_style")]
+    pub prompt_style: String,
+
+    /// Advanced: fully replace the system prompt. Supports {{assistant_name}},
+    /// {{user_name}}, {{personality}}, {{timezone}}, {{location}},
+    /// {{prompt_addendum}} placeholders. When Some, overrides prompt_style.
+    #[serde(default)]
+    pub custom_system_prompt: Option<String>,
+
+    /// Extra instructions appended to the generated system prompt (max 500 chars).
+    /// Example: "Always respond in French." or "Mention upcoming schedules proactively."
+    #[serde(default = "Settings::default_prompt_addendum")]
+    pub prompt_addendum: String,
+
     // ── LLM behaviour ──────────────────────────────────────────────────────
     /// Maximum tokens the LLM may generate per response
     #[serde(default = "Settings::default_max_tokens")]
@@ -76,7 +92,7 @@ pub struct Settings {
     #[serde(default = "Settings::default_tts_http_url")]
     pub voice_tts_http_url: String,
 
-    /// Voice name sent to the Qwen TTS server (e.g. "Chelsie")
+    /// Voice name sent to the Qwen TTS server (e.g. "Vivian", "Chelsie")
     #[serde(default = "Settings::default_tts_http_voice")]
     pub voice_tts_http_voice: String,
 
@@ -122,6 +138,9 @@ impl Default for Settings {
             assistant_personality:           Self::default_assistant_personality(),
             user_name:                       Self::default_user_name(),
             timezone:                        Self::default_timezone(),
+            prompt_style:                    Self::default_prompt_style(),
+            custom_system_prompt:            None,
+            prompt_addendum:                 Self::default_prompt_addendum(),
             llm_max_tokens:                  Self::default_max_tokens(),
             llm_temperature:                 Self::default_temperature(),
             llm_provider:                    Self::default_llm_provider(),
@@ -147,6 +166,8 @@ impl Default for Settings {
 }
 
 impl Settings {
+    fn default_prompt_style()                -> String { "balanced".to_string() }
+    fn default_prompt_addendum()             -> String { "".to_string() }
     fn default_assistant_name()             -> String { "Goose".to_string() }
     fn default_assistant_personality()      -> String { "friendly and concise".to_string() }
     fn default_user_name()                  -> String { "Friend".to_string() }
@@ -162,7 +183,7 @@ impl Settings {
     fn default_active_whisper_model()       -> String { "base".to_string() }
     fn default_active_tts_model()           -> String { "qwen-tts".to_string() }
     fn default_tts_http_url()               -> String { "http://127.0.0.1:8181".to_string() }
-    fn default_tts_http_voice()             -> String { "Chelsie".to_string() }
+    fn default_tts_http_voice()             -> String { "Vivian".to_string() }
     fn default_model_registry_url()         -> String {
         "https://raw.githubusercontent.com/jarida-io/goose-in-a-pond/main/crates/pond-server/registry.json".to_string()
     }
@@ -200,6 +221,33 @@ mod tests {
         assert_eq!(s2.llm_max_tokens, 2048);
         // Unchanged fields keep defaults
         assert_eq!(s2.llm_temperature, 0.7);
+    }
+
+    #[test]
+    fn default_prompt_style_is_balanced() {
+        let s = Settings::default();
+        assert_eq!(s.prompt_style, "balanced");
+        assert!(s.custom_system_prompt.is_none());
+        assert_eq!(s.prompt_addendum, "");
+    }
+
+    #[test]
+    fn partial_json_with_prompt_fields() {
+        let json = r#"{"prompt_style":"concise","prompt_addendum":"Be brief."}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.prompt_style, "concise");
+        assert_eq!(s.prompt_addendum, "Be brief.");
+        assert!(s.custom_system_prompt.is_none());
+    }
+
+    #[test]
+    fn custom_system_prompt_roundtrips() {
+        let json = r#"{"custom_system_prompt":"You are {{assistant_name}}."}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.custom_system_prompt, Some("You are {{assistant_name}}.".to_string()));
+        let json2 = serde_json::to_string(&s).unwrap();
+        let s2: Settings = serde_json::from_str(&json2).unwrap();
+        assert_eq!(s2.custom_system_prompt, s.custom_system_prompt);
     }
 
     #[test]
