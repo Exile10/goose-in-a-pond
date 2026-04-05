@@ -102,10 +102,9 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
-        /// Agent backend: mock (fast, no LLM) or goose (Block's Goose with MCP tool calls).
-        /// Requires the `goose-agent` feature:
-        ///   cargo run -p pond-server --features goose-agent -- serve --agent goose
-        #[arg(long, default_value = "mock")]
+        /// Agent backend: goose (default, Block's Goose with MCP tool calls) or mock (fast, no LLM).
+        /// Override: cargo run -p pond-server -- serve --agent mock
+        #[arg(long, default_value = "goose")]
         agent: String,
     },
 
@@ -559,8 +558,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
         if agent_backend == "goose" {
             tracing::warn!(
-                "--agent goose requested but this binary was compiled without the `goose-agent` feature. \
-                 Rebuild with: cargo run -p pond-server --features goose-agent -- serve --agent goose \
+                "Goose agent backend requested but this binary was compiled without the `goose-agent` feature. \
+                 Rebuild with: cargo run -p pond-server -- serve  (goose-agent is a default feature). \
                  Falling back to mock agent."
             );
         }
@@ -622,6 +621,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         mcp_memory,
         extension_manager,
         mcp_server_repo,
+        qwen_tts_url: if qwen_tts_available { Some(qwen_tts_url.clone()) } else { None },
     });
 
     // Warn if static assets haven't been built yet
@@ -741,23 +741,31 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
         match (file_template, settings) {
             (Some(tmpl), Some(s)) => {
                 println!("  Prompt:   custom ({})", prompt_dir.join("system.md").display());
-                let name    = pond_core::prompts::sanitize_field(&s.assistant_name, 50);
-                let user    = pond_core::prompts::sanitize_field(&s.user_name, 50);
-                let persona = pond_core::prompts::sanitize_field(&s.assistant_personality, 200);
-                let tz      = pond_core::prompts::sanitize_field(&s.timezone, 50);
+                let name     = pond_core::prompts::sanitize_field(&s.assistant_name, 50);
+                let user     = pond_core::prompts::sanitize_field(&s.user_name, 50);
+                let persona  = pond_core::prompts::sanitize_field(&s.assistant_personality, 200);
+                let tz       = pond_core::prompts::sanitize_field(&s.timezone, 50);
+                let location = if s.weather_location_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nLocation: {}.", pond_core::prompts::sanitize_field(&s.weather_location_name, 100))
+                };
+                let addendum = pond_core::prompts::sanitize_field(&s.prompt_addendum, 500);
                 pond_core::prompts::render_template(&tmpl, &[
-                    ("assistant_name", name.as_str()),
-                    ("user_name",      user.as_str()),
-                    ("personality",    persona.as_str()),
-                    ("timezone",       tz.as_str()),
+                    ("assistant_name",  name.as_str()),
+                    ("user_name",       user.as_str()),
+                    ("personality",     persona.as_str()),
+                    ("timezone",        tz.as_str()),
+                    ("location",        location.as_str()),
+                    ("prompt_addendum", addendum.as_str()),
                 ])
             }
             (None, Some(s)) => {
                 println!(
-                    "  Assistant: {} / greeting: {}",
-                    s.assistant_name, s.user_name
+                    "  Assistant: {} / style: {} / greeting: {}",
+                    s.assistant_name, s.prompt_style, s.user_name
                 );
-                build_system_prompt(&s.assistant_name, &s.user_name, &s.assistant_personality, &s.timezone)
+                build_system_prompt(&s)
             }
             _ => pond_core::prompts::SYSTEM_PROMPT.to_string(),
         }
@@ -1183,8 +1191,8 @@ async fn run_onboard(reset: bool) -> Result<()> {
 
 /// Build a Goose-backed agent + extension manager.
 ///
-/// Only compiled when `--features goose-agent` is enabled.
-/// Falls back to MockAgent gracefully when `agent_backend != "goose"`.
+/// Only compiled when the `goose-agent` feature is enabled (default).
+/// Falls back to MockAgent when `--agent mock` is explicitly passed.
 #[cfg(feature = "goose-agent")]
 async fn build_goose_backend(
     agent_backend: &str,

@@ -103,6 +103,7 @@ async fn make_app(
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        qwen_tts_url: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

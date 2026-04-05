@@ -33,7 +33,7 @@ impl VoiceOutput for FallbackVoiceOutput {
         match self.primary.speak(text).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                tracing::warn!("Primary TTS failed ({}), trying fallback...", e);
+                tracing::info!("Primary TTS unavailable ({}), using fallback.", e);
                 self.fallback.speak(text).await
             }
         }

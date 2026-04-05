@@ -39,10 +39,11 @@ pub async fn require_onboarding_complete(
     let step: Option<OnboardingStep> = service.status().await;
 
     match step {
-        // No record yet (onboarding flow not implemented) or explicitly completed → allow
-        None | Some(OnboardingStep::Completed) => Ok(next.run(req).await),
+        // Explicitly completed → allow
+        Some(OnboardingStep::Completed) => Ok(next.run(req).await),
 
-        Some(_) => Err((
+        // None (not started) or any in-progress step → block
+        None | Some(_) => Err((
             StatusCode::FORBIDDEN,
             Json(json!({
                 "error": "onboarding_required",

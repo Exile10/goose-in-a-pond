@@ -102,10 +102,39 @@ export default function ChatWidget({ token }: Props) {
   const [listening, setListening] = useState(false)
   const [showSuggestions, setShowSuggestions] = useState(true)
   const [agentRunning, setAgentRunning] = useState(true)
-  const [sessionId, setSessionId] = useState<string | undefined>(undefined)
+  const [sessionId, setSessionId] = useState<string | undefined>(() =>
+    localStorage.getItem('pond_chat_session_id') ?? undefined
+  )
+  const [muted, setMuted] = useState(() => localStorage.getItem('pond_tts_muted') === 'true')
+  const [historyLoaded, setHistoryLoaded] = useState(false)
   const suggestions = getSuggestions()
   const bottomRef = useRef<HTMLDivElement>(null)
   const recognitionRef = useRef<ISpeechRecognition | null>(null)
+
+  // Load chat history from backend on mount
+  useEffect(() => {
+    const storedSessionId = localStorage.getItem('pond_chat_session_id')
+    if (!storedSessionId || isPreviewMode(token)) {
+      setHistoryLoaded(true)
+      return
+    }
+    api.getSessionMessages(storedSessionId, token)
+      .then(res => {
+        if (res.messages.length > 0) {
+          const loaded: Message[] = res.messages
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .map(m => ({
+              id: m.id,
+              role: m.role as 'user' | 'assistant',
+              text: m.content,
+            }))
+          setMessages(loaded)
+          setShowSuggestions(false)
+        }
+      })
+      .catch(() => { /* no history, keep greeting */ })
+      .finally(() => setHistoryLoaded(true))
+  }, [token])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -114,6 +143,32 @@ export default function ChatWidget({ token }: Props) {
   useEffect(() => {
     return () => { recognitionRef.current?.abort() }
   }, [])
+
+  // Sync muted state with localStorage (VoiceOrb may change it)
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key === 'pond_tts_muted') {
+        setMuted(e.newValue === 'true')
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
+  function speak(text: string) {
+    if (muted || !window.speechSynthesis) return
+    window.speechSynthesis.cancel()
+    const utter = new SpeechSynthesisUtterance(text)
+    utter.lang = 'en-US'
+    window.speechSynthesis.speak(utter)
+  }
+
+  function toggleMute() {
+    const next = !muted
+    setMuted(next)
+    localStorage.setItem('pond_tts_muted', String(next))
+    if (next) window.speechSynthesis?.cancel()
+  }
 
   function toggleListening() {
     if (listening) {
@@ -149,19 +204,17 @@ export default function ChatWidget({ token }: Props) {
     try {
       if (isPreviewMode(token)) {
         await new Promise(r => setTimeout(r, 600))
-        setMessages(prev => [...prev, {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          text: '(Preview mode — connect to a live server to get real responses.)',
-        }])
+        const reply = '(Preview mode — connect to a live server to get real responses.)'
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: reply }])
+        speak(reply)
       } else {
         const res = await api.chat(text, token, sessionId)
-        setSessionId(res.session_id)
-        setMessages(prev => [...prev, {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          text: res.response,
-        }])
+        const newSessionId = res.session_id
+        setSessionId(newSessionId)
+        localStorage.setItem('pond_chat_session_id', newSessionId)
+        const reply = res.response
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: reply }])
+        speak(reply)
       }
     } catch (err) {
       setMessages(prev => [...prev, {
@@ -190,10 +243,12 @@ export default function ChatWidget({ token }: Props) {
   }
 
   function clearChat() {
+    window.speechSynthesis?.cancel()
     setMessages([{ id: crypto.randomUUID(), role: 'assistant', text: greeting() }])
     setShowSuggestions(true)
     setInput('')
     setSessionId(undefined)
+    localStorage.removeItem('pond_chat_session_id')
   }
 
   function toggleAgent() {
@@ -209,6 +264,10 @@ export default function ChatWidget({ token }: Props) {
     setShowSuggestions(false)
   }
 
+  if (!historyLoaded) {
+    return <div className="db-loading">Loading conversation…</div>
+  }
+
   return (
     <div className="db-chat">
 
@@ -219,6 +278,30 @@ export default function ChatWidget({ token }: Props) {
           {agentRunning ? 'Agent Online' : 'Agent Offline'}
         </span>
         <div className="db-chat-control-btns">
+          {/* Mute/unmute TTS */}
+          <button
+            className="db-chat-control-btn"
+            onClick={toggleMute}
+            title={muted ? 'Unmute voice' : 'Mute voice'}
+          >
+            {muted ? (
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="1" y1="1" x2="23" y2="23" />
+                <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
+                <line x1="12" y1="19" x2="12" y2="22" />
+              </svg>
+            ) : (
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="22" />
+                <line x1="8" y1="22" x2="16" y2="22" />
+              </svg>
+            )}
+            {muted ? 'Unmute' : 'Mute'}
+          </button>
+
           <button
             className={`db-chat-control-btn ${agentRunning ? 'stop' : 'start'}`}
             onClick={toggleAgent}

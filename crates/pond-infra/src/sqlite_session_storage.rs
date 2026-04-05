@@ -269,15 +269,15 @@ mod tests {
     use pond_core::domain::message::ChatMessage;
     use tempfile::tempdir;
 
-    async fn make_storage() -> SqliteSessionStorage {
+    async fn make_storage() -> (SqliteSessionStorage, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        SqliteSessionStorage::new(db.system)
+        (SqliteSessionStorage::new(db.system), tmp)
     }
 
     #[tokio::test]
     async fn create_and_get_session() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         let session = s.create_session("sess-1".to_string()).await.unwrap();
         assert_eq!(session.id, "sess-1");
         let fetched = s.get_session("sess-1").await.unwrap();
@@ -286,14 +286,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_nonexistent_session_returns_error() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         let result = s.get_session("missing").await;
         assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
     }
 
     #[tokio::test]
     async fn add_and_retrieve_messages() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         let msg = SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("Hello"));
         s.add_message("sess-1".to_string(), msg).await.unwrap();
@@ -305,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn messages_preserve_insertion_order() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         s.add_message("sess-1".to_string(), SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("First"))).await.unwrap();
         s.add_message("sess-1".to_string(), SessionMessage::new("m2".to_string(), "sess-1".to_string(), ChatMessage::assistant("Second"))).await.unwrap();
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_session_cascades_to_messages() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         s.add_message("sess-1".to_string(), SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("Hi"))).await.unwrap();
         s.delete_session("sess-1").await.unwrap();
@@ -325,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_to_missing_session_errors() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         let msg = SessionMessage::new("m1".to_string(), "no-session".to_string(), ChatMessage::user("Hi"));
         let result = s.add_message("no-session".to_string(), msg).await;
         assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
@@ -333,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_sessions_returns_all_ordered() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-a".to_string()).await.unwrap();
         s.create_session("sess-b".to_string()).await.unwrap();
         // Add a message to sess-a to update its updated_at
@@ -351,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_messages_paginated_works() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         for i in 0..10 {
             s.add_message(
@@ -374,14 +374,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_title_defaults_to_none() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         let session = s.create_session("sess-1".to_string()).await.unwrap();
         assert_eq!(session.title, None);
     }
 
     #[tokio::test]
     async fn update_title_sets_and_persists() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
 
         s.update_title("sess-1", "Weather Chat".to_string()).await.unwrap();
@@ -391,14 +391,14 @@ mod tests {
 
     #[tokio::test]
     async fn update_title_on_missing_session_errors() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         let result = s.update_title("missing", "Nope".to_string()).await;
         assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
     }
 
     #[tokio::test]
     async fn get_recent_messages_returns_newest_in_order() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         for i in 0..10 {
             s.add_message(
@@ -423,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_recent_messages_limit_exceeds_count_returns_all() {
-        let s = make_storage().await;
+        let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         for i in 0..3 {
             s.add_message(

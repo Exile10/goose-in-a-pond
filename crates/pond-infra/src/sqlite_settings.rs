@@ -72,6 +72,9 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("retention_event_log_days",        settings.retention_event_log_days.to_string());
         upsert!("retention_sensor_days",           settings.retention_sensor_days.to_string());
         upsert!("retention_session_messages_keep", settings.retention_session_messages_keep.to_string());
+        upsert!("prompt_style",         &settings.prompt_style);
+        upsert!("custom_system_prompt", settings.custom_system_prompt.as_deref().unwrap_or(""));
+        upsert!("prompt_addendum",      &settings.prompt_addendum);
 
         Ok(())
     }
@@ -133,6 +136,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "retention_session_messages_keep" => {
             if let Ok(v) = value.parse() { s.retention_session_messages_keep = v; }
         }
+        "prompt_style"         => s.prompt_style = value.to_string(),
+        "custom_system_prompt" => {
+            s.custom_system_prompt = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "prompt_addendum"      => s.prompt_addendum = value.to_string(),
         _ => {} // unknown key — ignore
     }
 }

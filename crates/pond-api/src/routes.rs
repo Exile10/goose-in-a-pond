@@ -50,13 +50,16 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))
         // Goose agent status (public — dev diagnostic)
-        .route("/dev/goose", get(goose_status));
+        .route("/dev/goose", get(goose_status))
+        // Qwen TTS status (public — dev diagnostic)
+        .route("/dev/qwen-status", get(qwen_tts_status));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
         .route("/chat", post(chat))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", patch(rename_session))
+        .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
@@ -266,24 +269,27 @@ async fn chat(
 
         match (file_template, settings) {
             (Some(tmpl), Some(s)) => {
-                // Pre-compute sanitized strings so temporaries outlive the borrow
+                // File-override path: render the custom file template with all settings vars.
                 let name     = sanitize_field(&s.assistant_name, 50);
                 let user     = sanitize_field(&s.user_name, 50);
                 let persona  = sanitize_field(&s.assistant_personality, 200);
                 let tz       = sanitize_field(&s.timezone, 50);
+                let location = if s.weather_location_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nLocation: {}.", sanitize_field(&s.weather_location_name, 100))
+                };
+                let addendum = sanitize_field(&s.prompt_addendum, 500);
                 render_template(&tmpl, &[
-                    ("assistant_name", name.as_str()),
-                    ("user_name",      user.as_str()),
-                    ("personality",    persona.as_str()),
-                    ("timezone",       tz.as_str()),
+                    ("assistant_name",  name.as_str()),
+                    ("user_name",       user.as_str()),
+                    ("personality",     persona.as_str()),
+                    ("timezone",        tz.as_str()),
+                    ("location",        location.as_str()),
+                    ("prompt_addendum", addendum.as_str()),
                 ])
             }
-            (None, Some(s)) => build_system_prompt(
-                &s.assistant_name,
-                &s.user_name,
-                &s.assistant_personality,
-                &s.timezone,
-            ),
+            (None, Some(s)) => build_system_prompt(&s),
             _ => SYSTEM_PROMPT.to_string(),
         }
     };
@@ -397,6 +403,49 @@ async fn rename_session(
         "session_id": session_id,
         "title": req.title,
     })))
+}
+
+/// Get all messages for a session.
+///
+/// GET /api/v1/sessions/:session_id/messages
+async fn get_session_messages(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::domain::message::Role;
+    use pond_core::ports::session_storage::SessionStorageError;
+
+    let messages = state
+        .session_storage
+        .get_messages(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+
+    let list: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            let role = match m.message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+            };
+            json!({
+                "id": m.id,
+                "session_id": m.session_id,
+                "role": role,
+                "content": m.message.content,
+                "created_at": m.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "messages": list })))
 }
 
 async fn system_info() -> Json<Value> {
@@ -1183,10 +1232,32 @@ code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
     <pre id="fallback-out">—</pre>
   </div>
 
-  <!-- TTS / Piper -->
+  <!-- TTS -->
   <div class="card">
-    <h2>TTS (Piper)</h2>
-    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Requires server started with <code>--tts piper</code>.</p>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
+      <h2>TTS</h2>
+      <button class="secondary" onclick="checkQwenStatus()" style="font-size:0.75rem">↺ Refresh</button>
+    </div>
+    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Qwen TTS is primary; Piper is the fallback.</p>
+
+    <!-- Qwen TTS status row -->
+    <table style="width:100%;border-collapse:collapse;margin-bottom:0.75rem;font-size:0.82rem">
+      <tbody>
+        <tr>
+          <td style="padding:4px 8px 4px 0;color:var(--muted);white-space:nowrap">Qwen server</td>
+          <td><span id="qwen-server-badge" class="badge unknown">—</span></td>
+          <td style="padding:4px 0 4px 12px;color:var(--muted);white-space:nowrap">Model</td>
+          <td><span id="qwen-model-badge" class="badge unknown">—</span></td>
+          <td style="padding:4px 0 4px 12px" id="qwen-url-cell"></td>
+        </tr>
+        <tr>
+          <td colspan="5" style="padding:2px 0">
+            <span id="qwen-message" style="color:var(--muted);font-size:0.78rem"></span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
     <div style="margin-bottom:0.5rem">
       <textarea id="tts-text">Hello! I am Goose, your local AI assistant.</textarea>
     </div>
@@ -1530,6 +1601,43 @@ async function testFallback(){
 }
 
 // ── TTS ───────────────────────────────────────────────────────────────────────
+async function checkQwenStatus(){
+  const serverBadge = document.getElementById('qwen-server-badge');
+  const modelBadge  = document.getElementById('qwen-model-badge');
+  const msgEl       = document.getElementById('qwen-message');
+  const urlCell     = document.getElementById('qwen-url-cell');
+  serverBadge.className='badge pending'; serverBadge.textContent='…';
+  modelBadge.className='badge pending';  modelBadge.textContent='…';
+  try{
+    const r = await fetch(`${API}/dev/qwen-status`);
+    const d = await r.json();
+    // Server badge
+    if(!d.configured){
+      serverBadge.className='badge error'; serverBadge.textContent='not configured';
+      modelBadge.className='badge unknown'; modelBadge.textContent='—';
+    } else if(d.server==='up'){
+      serverBadge.className='badge ok'; serverBadge.textContent='up';
+      // Model badge
+      if(d.model==='ready'){
+        modelBadge.className='badge ok'; modelBadge.textContent='ready ✓';
+      } else if(d.model==='loading'){
+        modelBadge.className='badge pending'; modelBadge.textContent='loading…';
+      } else {
+        modelBadge.className='badge error'; modelBadge.textContent='error';
+      }
+    } else {
+      serverBadge.className='badge error'; serverBadge.textContent='down';
+      modelBadge.className='badge unknown'; modelBadge.textContent='—';
+    }
+    msgEl.textContent = d.message||'';
+    urlCell.textContent = d.url||'';
+  }catch(e){
+    serverBadge.className='badge error'; serverBadge.textContent='error';
+    modelBadge.className='badge unknown'; modelBadge.textContent='—';
+    msgEl.textContent = e.message;
+  }
+}
+
 async function testTts(){
   const text=document.getElementById('tts-text').value.trim()||'Hello from Goose!';
   const out=document.getElementById('tts-out');
@@ -1544,6 +1652,8 @@ async function testTts(){
     const d=await r.json();
     d._client_latency_ms=Date.now()-t0;
     out.textContent=JSON.stringify(d,null,2);
+    // Refresh Qwen status after a speak attempt (shows if model became ready)
+    checkQwenStatus();
   }catch(e){out.textContent='Error: '+e.message;}
 }
 
@@ -1838,6 +1948,9 @@ checkServices();
 fetchWeather();
 listSchedules();
 loadGooseStatus();
+checkQwenStatus();
+// Re-poll Qwen status every 15 s while the page is open (model loading can take minutes)
+setInterval(checkQwenStatus, 15000);
 </script>
 </body>
 </html>"#;
@@ -1917,6 +2030,71 @@ async fn test_speak(
             "text": text,
             "message": "No TTS engine configured. Start server with --tts piper after running setup.",
         })),
+    }
+}
+
+/// `GET /api/v1/dev/qwen-status`
+///
+/// Probe the Qwen TTS server and return its current state:
+/// ```json
+/// { "configured": bool, "url": "...", "server": "up"|"down",
+///   "model": "ready"|"loading"|"error", "message": "..." }
+/// ```
+async fn qwen_tts_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let Some(ref url) = state.qwen_tts_url else {
+        return Json(json!({
+            "configured": false,
+            "server": "down",
+            "model": "none",
+            "message": "Qwen TTS not configured (no URL in AppState). \
+                        Start server with default TTS settings to enable it."
+        }));
+    };
+
+    let client = &state.http_client;
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+
+    match resp {
+        Err(e) => Json(json!({
+            "configured": true,
+            "url": url,
+            "server": "down",
+            "model": "none",
+            "message": format!("Server not reachable: {}", e),
+        })),
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            if status == 200 {
+                Json(json!({
+                    "configured": true,
+                    "url": url,
+                    "server": "up",
+                    "model": "ready",
+                    "message": "Model loaded and ready.",
+                }))
+            } else if status == 503 {
+                Json(json!({
+                    "configured": true,
+                    "url": url,
+                    "server": "up",
+                    "model": "loading",
+                    "message": body,
+                }))
+            } else {
+                Json(json!({
+                    "configured": true,
+                    "url": url,
+                    "server": "up",
+                    "model": "error",
+                    "message": format!("Unexpected status {}: {}", status, body),
+                }))
+            }
+        }
     }
 }
 

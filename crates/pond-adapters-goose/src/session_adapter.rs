@@ -243,6 +243,7 @@ mod tests {
             message_count: 0,
             provider_name: None,
             model_config: None,
+            goose_mode: GooseMode::default(),
         };
 
         let pond = goose_session_to_pond(&gs);

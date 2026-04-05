@@ -114,6 +114,9 @@ pub struct AppState {
     /// Persistent storage for configured external MCP server connections.
     /// Loaded at startup to auto-connect saved servers.
     pub mcp_server_repo: Option<Arc<dyn McpServerRepository>>,
+    /// Base URL of the Qwen TTS server (e.g. "http://127.0.0.1:8181").
+    /// `None` when Qwen TTS is not configured.
+    pub qwen_tts_url: Option<String>,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.

@@ -156,10 +156,10 @@ mod tests {
     use crate::db::Database;
     use tempfile::tempdir;
 
-    async fn make_registry() -> SqliteDeviceRegistry {
+    async fn make_registry() -> (SqliteDeviceRegistry, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        SqliteDeviceRegistry::new(db.system)
+        (SqliteDeviceRegistry::new(db.system), tmp)
     }
 
     fn req(name: &str) -> RegisterDeviceRequest {
@@ -173,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_list() {
-        let reg = make_registry().await;
+        let (reg, _tmp) = make_registry().await;
         let dev = reg.register(req("My Phone")).await.unwrap();
         assert_eq!(dev.name, "My Phone");
         assert!(dev.is_online); // just registered
@@ -185,14 +185,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_device_returns_none_for_unknown() {
-        let reg = make_registry().await;
+        let (reg, _tmp) = make_registry().await;
         let result = reg.get_device("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn unregister_removes_device() {
-        let reg = make_registry().await;
+        let (reg, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.unregister(&dev.id).await.unwrap();
         assert!(reg.get_device(&dev.id).await.unwrap().is_none());
@@ -200,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_updates_last_seen() {
-        let reg = make_registry().await;
+        let (reg, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.heartbeat(&dev.id).await.unwrap();
         let updated = reg.get_device(&dev.id).await.unwrap().unwrap();
