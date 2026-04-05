@@ -133,6 +133,12 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         // Output is only visible when `--debug` is passed (sets the tracing
         // filter to `debug`); at the default `info` level this is a no-op.
         .layer(axum::middleware::from_fn(middleware::log_requests))
+        // Authenticate protected API routes via Bearer token.
+        // Public routes (health, handshake, onboard, etc.) bypass this check.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ))
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();
