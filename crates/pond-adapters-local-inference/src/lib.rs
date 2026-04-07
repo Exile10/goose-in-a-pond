@@ -1,4 +1,4 @@
-//! In-process GGUF inference adapter.
+//! In-process GGUF inference adapter and memory-aware model scheduler.
 //!
 //! Wraps Goose's [`LocalInferenceProvider`] so GIAP can load model weights
 //! directly into the process — no llamafile/Ollama subprocess required.
@@ -26,6 +26,9 @@
 //! # Ok(())
 //! # }
 //! ```
+
+pub mod scheduler;
+pub use scheduler::{NoopScheduler, ResourceAwareModelScheduler, LLM_BUDGET_MB, JETSON_TOTAL_RAM_MB};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -85,6 +88,64 @@ impl LocalInferenceLlmAdapter {
         Ok(Self {
             inner: GooseProviderAdapter::new(Arc::new(provider) as Arc<dyn GooseProvider>, session_id),
         })
+    }
+
+    /// Build the adapter, registering the model path in GIAP's data directory.
+    ///
+    /// Unlike `new()`, this method registers the model's `local_path` in Goose's
+    /// global model registry so that `LocalInferenceProvider` can find the GGUF
+    /// file at `$data_dir/models/gguf/{filename}` instead of Goose's default
+    /// `~/.local/share/goose/models/` location.
+    pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
+        use goose::providers::local_inference::local_model_registry::{
+            get_registry, LocalModelEntry, ModelSettings, model_id_from_repo,
+        };
+
+        // Parse "repo_id:quantization" — e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
+        let (repo_id, quantization) = model_id
+            .rsplit_once(':')
+            .unwrap_or((model_id, "Q4_K_M"));
+
+        let id = model_id_from_repo(repo_id, quantization);
+
+        // Derive filename: strip "-GGUF" suffix from the repo name, append "-{quant}.gguf"
+        let model_name = repo_id.split('/').last().unwrap_or(repo_id);
+        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename   = format!("{}-{}.gguf", base_name, quantization);
+
+        let gguf_dir   = data_dir.join("models").join("gguf");
+        let local_path = gguf_dir.join(&filename);
+        let source_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            repo_id, filename
+        );
+
+        // Register / update local_path in Goose's global registry.
+        // The lock is dropped before calling Self::new() to avoid deadlock.
+        {
+            match get_registry().lock() {
+                Ok(mut registry) => {
+                    if !registry.has_model(&id) {
+                        let entry = LocalModelEntry {
+                            id:           id.clone(),
+                            repo_id:      repo_id.to_string(),
+                            filename:     filename.clone(),
+                            quantization: quantization.to_string(),
+                            local_path,
+                            source_url,
+                            settings:     ModelSettings::default(),
+                            size_bytes:   0,
+                        };
+                        if let Err(e) = registry.add_model(entry) {
+                            tracing::warn!("Could not register GGUF model '{}': {}", id, e);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("GGUF registry lock poisoned: {}", e),
+            }
+        }
+
+        Self::new(model_id).await
     }
 
     /// Patch the Goose model registry with Jetson Orin Nano–optimised settings.

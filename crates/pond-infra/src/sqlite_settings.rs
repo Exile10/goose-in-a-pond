@@ -52,6 +52,13 @@ impl SettingsRepository for SqliteSettingsRepository {
             };
         }
 
+        upsert!("primary_profile_id", settings.primary_profile_id.as_deref().unwrap_or(""));
+        upsert!("chat_provider",      &settings.chat_provider);
+        upsert!("chat_model",         &settings.chat_model);
+        upsert!("think_provider",     settings.think_provider.as_deref().unwrap_or(""));
+        upsert!("think_model",        settings.think_model.as_deref().unwrap_or(""));
+        upsert!("task_provider",      settings.task_provider.as_deref().unwrap_or(""));
+        upsert!("task_model",         settings.task_model.as_deref().unwrap_or(""));
         upsert!("assistant_name",                  &settings.assistant_name);
         upsert!("assistant_personality",           &settings.assistant_personality);
         upsert!("user_name",                       &settings.user_name);
@@ -104,6 +111,23 @@ impl SettingsRepository for SqliteSettingsRepository {
 /// Apply a single key-value pair from the DB onto a `Settings` struct.
 fn apply_key(s: &mut Settings, key: &str, value: &str) {
     match key {
+        "primary_profile_id" => {
+            s.primary_profile_id = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "chat_provider"  => s.chat_provider = value.to_string(),
+        "chat_model"     => s.chat_model = value.to_string(),
+        "think_provider" => {
+            s.think_provider = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "think_model" => {
+            s.think_model = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "task_provider" => {
+            s.task_provider = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "task_model" => {
+            s.task_model = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
         "assistant_name"                  => s.assistant_name = value.to_string(),
         "assistant_personality"           => s.assistant_personality = value.to_string(),
         "user_name"                       => s.user_name = value.to_string(),

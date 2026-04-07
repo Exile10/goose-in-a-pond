@@ -70,12 +70,12 @@ mod tests {
 
         let repo = SqlxOnboardingRepository::new(db.system.clone());
         
-        repo.save_step(OnboardingStep::VerifyDevice)
+        repo.save_step(OnboardingStep::Basics)
             .await
             .unwrap();
 
         let step = repo.get_current_step().await;
 
-        assert_eq!(step, Some(OnboardingStep::VerifyDevice));
+        assert_eq!(step, Some(OnboardingStep::Basics));
     }
 }

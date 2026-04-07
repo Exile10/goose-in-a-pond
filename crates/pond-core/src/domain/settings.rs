@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     // ── Assistant identity ──────────────────────────────────────────────────
+    /// UUID of the primary household profile created during onboarding.
+    #[serde(default)]
+    pub primary_profile_id: Option<String>,
+
     /// Display name the assistant uses (default: "Goose")
     #[serde(default = "Settings::default_assistant_name")]
     pub assistant_name: String,
@@ -44,6 +48,31 @@ pub struct Settings {
     /// Example: "Always respond in French." or "Mention upcoming schedules proactively."
     #[serde(default = "Settings::default_prompt_addendum")]
     pub prompt_addendum: String,
+
+    // ── Model roles ────────────────────────────────────────────────────────
+    /// Provider for the Chat role (fast, conversational). Default = llm_provider.
+    #[serde(default = "Settings::default_llm_provider")]
+    pub chat_provider: String,
+
+    /// Model name for the Chat role. Default = active_llm_model.
+    #[serde(default = "Settings::default_active_llm_model")]
+    pub chat_model: String,
+
+    /// Provider for the Think role (deep reasoning). None = same as chat_provider.
+    #[serde(default)]
+    pub think_provider: Option<String>,
+
+    /// Model name for the Think role. None = same as chat_model.
+    #[serde(default)]
+    pub think_model: Option<String>,
+
+    /// Provider for the Task role (agentic tool-use). None = same as chat_provider.
+    #[serde(default)]
+    pub task_provider: Option<String>,
+
+    /// Model name for the Task role. None = same as chat_model.
+    #[serde(default)]
+    pub task_model: Option<String>,
 
     // ── LLM behaviour ──────────────────────────────────────────────────────
     /// Maximum tokens the LLM may generate per response
@@ -134,6 +163,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            primary_profile_id:              None,
             assistant_name:                  Self::default_assistant_name(),
             assistant_personality:           Self::default_assistant_personality(),
             user_name:                       Self::default_user_name(),
@@ -141,6 +171,12 @@ impl Default for Settings {
             prompt_style:                    Self::default_prompt_style(),
             custom_system_prompt:            None,
             prompt_addendum:                 Self::default_prompt_addendum(),
+            chat_provider:                   Self::default_llm_provider(),
+            chat_model:                      Self::default_active_llm_model(),
+            think_provider:                  None,
+            think_model:                     None,
+            task_provider:                   None,
+            task_model:                      None,
             llm_max_tokens:                  Self::default_max_tokens(),
             llm_temperature:                 Self::default_temperature(),
             llm_provider:                    Self::default_llm_provider(),

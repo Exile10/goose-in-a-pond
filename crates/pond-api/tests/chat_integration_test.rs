@@ -100,6 +100,7 @@ async fn make_app(
         data_dir: None,
         skip_onboarding: true,
         scheduler: None,
+        model_scheduler: None,
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
