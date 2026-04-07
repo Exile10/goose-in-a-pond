@@ -9,7 +9,7 @@ use axum::{
     extract::{rejection::JsonRejection, Multipart, Path, State},
     http::StatusCode,
     response::{Html, Json},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use pond_core::domain::message::ChatMessage;
@@ -21,7 +21,7 @@ use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
-use pond_core::prompts::{build_system_prompt, render_template, sanitize_field, SYSTEM_PROMPT};
+use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext, SYSTEM_PROMPT};
 use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
 use serde::Deserialize;
@@ -43,6 +43,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
+        // Settings write is public so onboarding steps can save before completion
+        .route("/settings", put(update_settings))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
         .route("/system/info", get(system_info))
@@ -52,7 +54,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Goose agent status (public — dev diagnostic)
         .route("/dev/goose", get(goose_status))
         // Qwen TTS status (public — dev diagnostic)
-        .route("/dev/qwen-status", get(qwen_tts_status));
+        .route("/dev/qwen-status", get(qwen_tts_status))
+        // Profile create/patch are public so onboarding steps can write before completion
+        .route("/profiles", post(create_profile))
+        .route("/profiles/{id}", patch(update_profile_prefs));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
@@ -63,12 +68,14 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
-        .route("/settings", get(get_settings).put(update_settings))
+        .route("/settings", get(get_settings))
         .route("/models", get(list_models))
+        .route("/models/memory-status", get(get_memory_status))
         .route("/models/registry/refresh", post(refresh_model_registry))
+        .route("/models/ollama", get(list_ollama_models))
         .route("/models/{category}/{name}/download", post(download_model))
-        .route("/profiles", get(list_profiles).post(create_profile))
-        .route("/profiles/{id}", get(get_profile).patch(update_profile_prefs).delete(delete_profile))
+        .route("/profiles", get(list_profiles))
+        .route("/profiles/{id}", get(get_profile).delete(delete_profile))
         .route("/sensors", post(record_sensor))
         .route("/sensors/{device_id}", get(get_recent_sensors))
         .route("/camera/events", get(list_camera_events).post(record_camera_event))
@@ -168,7 +175,7 @@ async fn start_onboarding(
             })?;
             Ok(Json(json!({
                 "status": "started",
-                "current_step": OnboardingStep::VerifyDevice.to_string()
+                "current_step": OnboardingStep::Welcome.to_string()
             })))
         }
     }
@@ -201,14 +208,19 @@ async fn complete_onboarding(
 async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
-    let total_steps = 4;
+    let total_steps = 8;
     let (current_step, steps_completed, onboarded) = match service.status().await {
-        None                                       => ("not_started".to_string(),                         0, false),
-        Some(OnboardingStep::VerifyDevice)         => (OnboardingStep::VerifyDevice.to_string(),         1, false),
-        Some(OnboardingStep::CreateProfile)        => (OnboardingStep::CreateProfile.to_string(),        2, false),
-        Some(OnboardingStep::ConfigurePersonality) => (OnboardingStep::ConfigurePersonality.to_string(), 3, false),
-        Some(OnboardingStep::ConnectDevices)       => (OnboardingStep::ConnectDevices.to_string(),       3, false),
-        Some(OnboardingStep::Completed)            => ("Completed".to_string(),                          4, true),
+        None                                   => ("not_started".to_string(),                    0, false),
+        Some(OnboardingStep::Welcome)           => (OnboardingStep::Welcome.to_string(),          1, false),
+        Some(OnboardingStep::Basics)            => (OnboardingStep::Basics.to_string(),           2, false),
+        Some(OnboardingStep::Location)          => (OnboardingStep::Location.to_string(),         3, false),
+        Some(OnboardingStep::Accessibility)     => (OnboardingStep::Accessibility.to_string(),    4, false),
+        Some(OnboardingStep::Personality)       => (OnboardingStep::Personality.to_string(),      5, false),
+        Some(OnboardingStep::GooseIdentity)     => (OnboardingStep::GooseIdentity.to_string(),    6, false),
+        Some(OnboardingStep::WakeWord)          => (OnboardingStep::WakeWord.to_string(),         7, false),
+        Some(OnboardingStep::Model)             => (OnboardingStep::Model.to_string(),            8, false),
+        Some(OnboardingStep::Extensions)        => (OnboardingStep::Extensions.to_string(),       8, false),
+        Some(OnboardingStep::Completed)         => ("Completed".to_string(),                      8, true),
     };
 
     Json(json!({
@@ -261,6 +273,27 @@ async fn chat(
     let system_prompt = {
         let settings = state.settings_repo.get().await.ok();
 
+        // Load primary profile preferences for context injection.
+        let profile_ctx: Option<ProfileContext> = if let Some(ref s) = settings {
+            if let Some(ref pid) = s.primary_profile_id {
+                state.profile_repo.get(pid).await.ok().flatten().map(|p| {
+                    let prefs = &p.preferences;
+                    ProfileContext {
+                        preferred_name: prefs.get("preferred_name").cloned(),
+                        birthday: prefs.get("birthday").cloned(),
+                        language: prefs.get("language").cloned(),
+                        atypical_speech: prefs.get("accessibility_atypical_speech")
+                            .map(|v| v == "true")
+                            .unwrap_or(false),
+                    }
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Try to load $DATA_DIR/prompts/system.md override
         let file_template = state
             .prompt_template_dir
@@ -289,7 +322,7 @@ async fn chat(
                     ("prompt_addendum", addendum.as_str()),
                 ])
             }
-            (None, Some(s)) => build_system_prompt(&s),
+            (None, Some(s)) => build_system_prompt_with_profile(&s, profile_ctx.as_ref()),
             _ => SYSTEM_PROMPT.to_string(),
         }
     };
@@ -542,18 +575,39 @@ async fn get_settings(
 
 async fn update_settings(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<Settings>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(new_settings) = body.map_err(|e| {
+    let Json(patch) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Invalid settings body: {}", e)})),
         )
     })?;
 
+    // Load current settings so we only overwrite the fields the caller provided.
+    let current = state
+        .settings_repo
+        .get()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to load current settings: {}", e)})),
+            )
+        })?;
+
+    // Merge: serialise current → Value, apply patch fields, deserialise back.
+    let mut base = serde_json::to_value(&current).unwrap_or(serde_json::Value::Object(Default::default()));
+    if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    let merged: Settings = serde_json::from_value(base).unwrap_or(current);
+
     state
         .settings_repo
-        .update(&new_settings)
+        .update(&merged)
         .await
         .map_err(|e| {
             (
@@ -567,12 +621,29 @@ async fn update_settings(
 
 // ── Model registry handlers ───────────────────────────────────────────────────
 
+/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
+async fn get_memory_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let status = state
+        .model_scheduler
+        .as_ref()
+        .map(|s| s.memory_status())
+        .unwrap_or_default();
+
+    Json(json!({
+        "total_mb":             status.total_mb,
+        "available_for_llm_mb": status.available_for_llm_mb,
+        "loaded_model":         status.loaded_model,
+    }))
+}
+
 /// GET /api/v1/models — returns the model status snapshot with downloaded/active flags.
 async fn list_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_status) = &state.model_status else {
-        return Ok(Json(json!({"whisper": [], "llamafile": [], "tts": []})));
+        return Ok(Json(json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []})));
     };
     let entries = model_status.read().await.clone();
 
@@ -580,6 +651,7 @@ async fn list_models(
     let mut whisper   = vec![];
     let mut llamafile = vec![];
     let mut tts       = vec![];
+    let mut gguf      = vec![];
 
     for e in entries {
         let v = serde_json::to_value(&e).unwrap_or_default();
@@ -587,11 +659,12 @@ async fn list_models(
             "whisper"   => whisper.push(v),
             "llamafile" => llamafile.push(v),
             "tts"       => tts.push(v),
+            "gguf"      => gguf.push(v),
             _           => {}
         }
     }
 
-    Ok(Json(json!({"whisper": whisper, "llamafile": llamafile, "tts": tts})))
+    Ok(Json(json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf})))
 }
 
 /// POST /api/v1/models/registry/refresh — fetch the latest registry from the online URL.
@@ -640,7 +713,7 @@ async fn refresh_model_registry(
     Ok(Json(json!({"status": "refresh_started"})))
 }
 
-/// POST /api/v1/models/{category}/{name}/download — download a specific model.
+/// POST /api/v1/models/{category}/{name}/download — trigger async model download.
 async fn download_model(
     State(state): State<Arc<AppState>>,
     Path((category, name)): Path<(String, String)>,
@@ -648,25 +721,92 @@ async fn download_model(
     let Some(model_status) = &state.model_status else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
     };
+    let Some(data_dir) = &state.data_dir else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "data_dir not configured"}))));
+    };
 
-    // Check if already downloaded.
-    {
+    // Find the entry
+    let (url, filename, dl_category) = {
         let entries = model_status.read().await;
-        if let Some(e) = entries.iter().find(|e| e.category == category && e.name == name) {
-            if e.downloaded {
-                return Ok(Json(json!({"status": "already_downloaded", "name": name})));
-            }
-        } else {
-            return Err((StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in category '{}'", name, category)}))));
+        let Some(e) = entries.iter().find(|e| e.category == category && e.name == name) else {
+            return Err((StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))));
+        };
+        if e.downloaded {
+            return Ok(Json(json!({"status": "already_downloaded", "name": name})));
         }
-    }
+        let Some(url) = e.url.clone() else {
+            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "model has no download URL"}))));
+        };
+        let Some(filename) = e.filename.clone() else {
+            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "model has no filename"}))));
+        };
+        (url, filename, category.clone())
+    };
 
-    // TODO: wire download_model_entry() once model_download is accessible from pond-api.
-    // For now return accepted — the download should be triggered from the server side.
-    Ok(Json(json!({
-        "status": "download_not_supported_via_api",
-        "hint": "Run `pond-server setup` to download models, or use the settings to change active models"
-    })))
+    // Determine destination path based on category
+    let dest = match dl_category.as_str() {
+        "whisper"   => data_dir.join("models").join(&filename),
+        "llamafile" => data_dir.join("models").join("llm").join(&filename),
+        "gguf"      => data_dir.join("models").join("gguf").join(&filename),
+        "tts"       => data_dir.join("models").join("tts").join(&filename),
+        _           => data_dir.join("models").join(&filename),
+    };
+
+    // Spawn background download
+    let status_lock = Arc::clone(model_status);
+    let model_name  = name.clone();
+    let model_cat   = dl_category.clone();
+
+    tokio::spawn(async move {
+        if let Some(parent) = dest.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(7200))
+            .build()
+            .unwrap_or_default();
+        tracing::info!("Downloading {} ({}) from {}", model_name, model_cat, url);
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        if let Err(e) = tokio::fs::write(&dest, &bytes).await {
+                            tracing::error!("Failed to save model {}: {}", model_name, e);
+                        } else {
+                            tracing::info!("Model {} downloaded to {:?}", model_name, dest);
+                            // Mark as downloaded in the live status snapshot
+                            let mut entries = status_lock.write().await;
+                            if let Some(e) = entries.iter_mut().find(|e| e.category == model_cat && e.name == model_name) {
+                                e.downloaded = true;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("Failed to read model response {}: {}", model_name, e),
+                }
+            }
+            Ok(resp) => tracing::error!("Download {} failed: HTTP {}", model_name, resp.status()),
+            Err(e)   => tracing::error!("Download {} error: {}", model_name, e),
+        }
+    });
+
+    Ok(Json(json!({"status": "download_started", "name": name, "category": category})))
+}
+
+/// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
+/// Returns `{"models": [...]}` or `{"models": [], "error": "..."}` if Ollama is unreachable.
+async fn list_ollama_models() -> Json<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    match client.get("http://localhost:11434/api/tags").send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: Value = resp.json().await.unwrap_or(json!({"models": []}));
+            Json(body)
+        }
+        Ok(resp) => Json(json!({"models": [], "error": format!("Ollama returned {}", resp.status())})),
+        Err(_)   => Json(json!({"models": [], "error": "Ollama not running or not installed"})),
+    }
 }
 
 /// Minimal registry shape needed to rebuild status inside routes.
@@ -676,6 +816,7 @@ pub struct ModelRegistrySnapshot {
     pub whisper:   Vec<RegistryWhisperEntry>,
     pub llamafile: Vec<RegistryLlamafileEntry>,
     pub tts:       Vec<serde_json::Value>,
+    pub gguf:      Vec<serde_json::Value>,
 }
 
 impl ModelRegistrySnapshot {
@@ -683,10 +824,17 @@ impl ModelRegistrySnapshot {
         let mut out = Vec::new();
         for m in &self.whisper {
             out.push(crate::ModelStatusEntry {
-                category: "whisper".into(), name: m.name.clone(),
-                description: m.description.clone(), size_mb: m.size_mb,
-                downloaded: data_dir.join("models").join(&m.filename).exists(),
-                active: m.name == active_w,
+                category:    "whisper".into(),
+                name:        m.name.clone(),
+                description: m.description.clone(),
+                size_mb:     m.size_mb,
+                downloaded:  data_dir.join("models").join(&m.filename).exists(),
+                active:      m.name == active_w,
+                url:         Some(m.url.clone()),
+                hf_id:       None,
+                filename:    Some(m.filename.clone()),
+                ram_estimate_mb:  None,
+                recommended_role: None,
             });
         }
         for m in &self.llamafile {
@@ -695,9 +843,17 @@ impl ModelRegistrySnapshot {
             #[cfg(not(windows))]
             let path = data_dir.join("models").join("llm").join(&m.filename);
             out.push(crate::ModelStatusEntry {
-                category: "llamafile".into(), name: m.name.clone(),
-                description: m.description.clone(), size_mb: m.size_mb,
-                downloaded: path.exists(), active: m.name == active_l,
+                category:    "llamafile".into(),
+                name:        m.name.clone(),
+                description: m.description.clone(),
+                size_mb:     m.size_mb,
+                downloaded:  path.exists(),
+                active:      m.name == active_l,
+                url:         Some(m.url.clone()),
+                hf_id:       None,
+                filename:    Some(m.filename.clone()),
+                ram_estimate_mb:  m.ram_estimate_mb,
+                recommended_role: m.recommended_role.clone(),
             });
         }
         for entry in &self.tts {
@@ -710,10 +866,38 @@ impl ModelRegistrySnapshot {
                 data_dir.join("models").join("tts").join(fname).exists()
             };
             out.push(crate::ModelStatusEntry {
-                category: "tts".into(), name: name.clone(),
+                category:    "tts".into(),
+                name:        name.clone(),
                 description: entry["description"].as_str().unwrap_or("").to_string(),
-                size_mb: entry["size_mb"].as_u64().unwrap_or(0),
-                downloaded, active: name == active_t,
+                size_mb:     entry["size_mb"].as_u64().unwrap_or(0),
+                downloaded,
+                active:      name == active_t,
+                url:         None,
+                hf_id:       None,
+                filename:    None,
+                ram_estimate_mb:  None,
+                recommended_role: None,
+            });
+        }
+        let active_gguf = active_l; // active_l carries settings.active_llm_model
+        for entry in &self.gguf {
+            let name     = entry["name"].as_str().unwrap_or("").to_string();
+            let id       = entry["id"].as_str().unwrap_or("").to_string();
+            let filename = entry["filename"].as_str().unwrap_or("").to_string();
+            let url      = entry["url"].as_str().map(|s| s.to_string());
+            let path     = data_dir.join("models").join("gguf").join(&filename);
+            out.push(crate::ModelStatusEntry {
+                category:    "gguf".into(),
+                name:        name.clone(),
+                description: entry["description"].as_str().unwrap_or("").to_string(),
+                size_mb:     entry["size_mb"].as_u64().unwrap_or(0),
+                downloaded:  path.exists(),
+                active:      name == active_gguf || id == active_gguf,
+                url,
+                hf_id:       Some(id),
+                filename:    Some(filename),
+                ram_estimate_mb:  entry["ram_estimate_mb"].as_u64(),
+                recommended_role: entry["recommended_role"].as_str().map(|s| s.to_string()),
             });
         }
         out
@@ -721,9 +905,19 @@ impl ModelRegistrySnapshot {
 }
 
 #[derive(serde::Deserialize)]
-pub struct RegistryWhisperEntry   { pub name: String, pub filename: String, pub description: String, pub size_mb: u64 }
+pub struct RegistryWhisperEntry   { pub name: String, pub filename: String, pub url: String, pub description: String, pub size_mb: u64 }
 #[derive(serde::Deserialize)]
-pub struct RegistryLlamafileEntry { pub name: String, pub filename: String, pub description: String, pub size_mb: u64 }
+pub struct RegistryLlamafileEntry {
+    pub name: String,
+    pub filename: String,
+    pub url: String,
+    pub description: String,
+    pub size_mb: u64,
+    #[serde(default)]
+    pub ram_estimate_mb: Option<u64>,
+    #[serde(default)]
+    pub recommended_role: Option<String>,
+}
 
 // ── Profile handlers ──────────────────────────────────────────────────────────
 

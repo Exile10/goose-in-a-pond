@@ -5,12 +5,13 @@ import Status from "./pages/Status";
 import Settings from "./pages/Settings";
 import Activity from "./pages/Activity";
 import Schedules from "./pages/Schedules";
+import Models from "./pages/Models";
 import Onboarding from "./pages/Onboarding";
 import VoiceOrb from "./components/VoiceOrb";
 import logo from "./assets/logo.png";
 import "./dashboard.css";
 
-type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules";
+type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models";
 
 function getInitials(name: string): string {
     return name.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'
@@ -66,6 +67,15 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
                 <circle cx="12" cy="12" r="10" />
                 <line x1="12" y1="8" x2="12" y2="12" />
                 <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+        ),
+    },
+    {
+        page: "models",
+        label: "Models",
+        icon: (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
             </svg>
         ),
     },
@@ -182,6 +192,7 @@ function App() {
                 {page === "schedules" && <Schedules token={token} />}
                 {page === "activity"  && <Activity token={token} />}
                 {page === "status"    && <Status token={token} />}
+                {page === "models"    && <Models token={token} />}
                 {page === "settings"  && <Settings token={token} />}
             </main>
 

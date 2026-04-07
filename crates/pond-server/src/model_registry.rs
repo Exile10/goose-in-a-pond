@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use pond_api::ModelStatusEntry;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Compile-time fallback — always available offline.
 const BUNDLED_REGISTRY: &str = include_str!("../registry.json");
@@ -26,6 +26,7 @@ pub struct ModelRegistry {
     pub whisper: Vec<WhisperModelEntry>,
     pub llamafile: Vec<LlamafileModelEntry>,
     pub tts: Vec<TtsModelEntry>,
+    pub gguf: Vec<GgufModelEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +45,30 @@ pub struct LlamafileModelEntry {
     pub url: String,
     pub size_mb: u64,
     pub description: String,
+    /// Approximate RAM footprint at runtime in MB (distinct from disk size_mb).
+    #[serde(default)]
+    pub ram_estimate_mb: Option<u64>,
+    /// Suggested role: "chat" | "think" | "task". None = general purpose.
+    #[serde(default)]
+    pub recommended_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufModelEntry {
+    /// Goose HF spec: "author/repo:quantization"
+    pub id: String,
+    /// Friendly name used in Settings.active_llm_model when provider = "local"
+    pub name: String,
+    pub filename: String,
+    pub url: String,
+    pub size_mb: u64,
+    pub description: String,
+    /// Approximate RAM footprint at runtime in MB.
+    #[serde(default)]
+    pub ram_estimate_mb: Option<u64>,
+    /// Suggested role: "chat" | "think" | "task". None = general purpose.
+    #[serde(default)]
+    pub recommended_role: Option<String>,
 }
 
 /// A TTS model entry — either an HTTP server or a local Piper subprocess.
@@ -146,6 +171,7 @@ impl ModelRegistry {
     pub fn find_tts(&self, name: &str) -> Option<&TtsModelEntry> {
         self.tts.iter().find(|m| m.name() == name)
     }
+
 }
 
 /// Build a status snapshot by checking which model files are present on disk.
@@ -161,12 +187,17 @@ pub fn build_model_status(
     for m in &registry.whisper {
         let path = data_dir.join("models").join(&m.filename);
         out.push(ModelStatusEntry {
-            category: "whisper".into(),
-            name: m.name.clone(),
-            description: m.description.clone(),
-            size_mb: m.size_mb,
-            downloaded: path.exists(),
-            active: m.name == active_whisper,
+            category:         "whisper".into(),
+            name:             m.name.clone(),
+            description:      m.description.clone(),
+            size_mb:          m.size_mb,
+            downloaded:       path.exists(),
+            active:           m.name == active_whisper,
+            url:              Some(m.url.clone()),
+            hf_id:            None,
+            filename:         Some(m.filename.clone()),
+            ram_estimate_mb:  None,
+            recommended_role: None,
         });
     }
 
@@ -178,12 +209,17 @@ pub fn build_model_status(
         #[cfg(not(windows))]
         let path = base;
         out.push(ModelStatusEntry {
-            category: "llamafile".into(),
-            name: m.name.clone(),
-            description: m.description.clone(),
-            size_mb: m.size_mb,
-            downloaded: path.exists(),
-            active: m.name == active_llamafile,
+            category:         "llamafile".into(),
+            name:             m.name.clone(),
+            description:      m.description.clone(),
+            size_mb:          m.size_mb,
+            downloaded:       path.exists(),
+            active:           m.name == active_llamafile,
+            url:              Some(m.url.clone()),
+            hf_id:            None,
+            filename:         Some(m.filename.clone()),
+            ram_estimate_mb:  m.ram_estimate_mb,
+            recommended_role: m.recommended_role.clone(),
         });
     }
 
@@ -195,12 +231,35 @@ pub fn build_model_status(
             }
         };
         out.push(ModelStatusEntry {
-            category: "tts".into(),
-            name: m.name().to_string(),
-            description: m.description().to_string(),
-            size_mb: m.size_mb(),
+            category:         "tts".into(),
+            name:             m.name().to_string(),
+            description:      m.description().to_string(),
+            size_mb:          m.size_mb(),
             downloaded,
-            active: m.name() == active_tts,
+            active:           m.name() == active_tts,
+            url:              None,
+            hf_id:            None,
+            filename:         None,
+            ram_estimate_mb:  None,
+            recommended_role: None,
+        });
+    }
+
+    let active_gguf = active_llamafile; // reuse the active_llamafile param — caller passes settings.active_llm_model
+    for m in &registry.gguf {
+        let path = data_dir.join("models").join("gguf").join(&m.filename);
+        out.push(ModelStatusEntry {
+            category:         "gguf".into(),
+            name:             m.name.clone(),
+            description:      m.description.clone(),
+            size_mb:          m.size_mb,
+            downloaded:       path.exists(),
+            active:           m.name == active_gguf || m.id == active_gguf,
+            url:              Some(m.url.clone()),
+            hf_id:            Some(m.id.clone()),
+            filename:         Some(m.filename.clone()),
+            ram_estimate_mb:  m.ram_estimate_mb,
+            recommended_role: m.recommended_role.clone(),
         });
     }
 
@@ -219,6 +278,7 @@ mod tests {
         assert!(!r.whisper.is_empty(), "whisper list must not be empty");
         assert!(!r.llamafile.is_empty(), "llamafile list must not be empty");
         assert!(!r.tts.is_empty(), "tts list must not be empty");
+        assert!(!r.gguf.is_empty(), "gguf list must not be empty");
     }
 
     #[test]
