@@ -47,7 +47,7 @@ use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
-use pond_core::services::fallback_provider::FallbackProvider;
+use pond_core::services::model_router::ModelRouter;
 use pond_core::services::fallback_voice_output::FallbackVoiceOutput;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
@@ -110,9 +110,10 @@ enum Commands {
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
     Chat {
-        /// LLM provider: mock, llamafile, ollama, or local (GGUF in-process, requires --features local-inference)
-        #[arg(short = 'P', long, default_value = "mock")]
-        provider: String,
+        /// LLM provider: mock, llamafile, ollama, or local (GGUF in-process, requires --features local-inference).
+        /// Defaults to the value stored in Settings (llm_provider field).
+        #[arg(short = 'P', long)]
+        provider: Option<String>,
 
         /// Model name (only used when --provider ollama, e.g. "llama3.2", "gemma2")
         #[arg(short = 'M', long)]
@@ -166,7 +167,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
-            run_chat(&provider, model.as_deref(), &input, wake_word.as_deref(), no_wake_word, &tts, tts_model).await
+            run_chat(provider.as_deref(), model.as_deref(), &input, wake_word.as_deref(), no_wake_word, &tts, tts_model).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -178,9 +179,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         None => {
-            // Default: run interactive chat (backward compat)
+            // Default: run interactive chat (backward compat) — provider comes from Settings
             init_tracing(false);
-            run_chat("mock", None, "stdin", None, true, "none", None).await
+            run_chat(None, None, "stdin", None, true, "none", None).await
         }
     }
 }
@@ -463,13 +464,60 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
-    // ── LLM provider (fallback chain: llamafile → ollama) ───────────────────────
-    // Use the actual port llamafile was started on (may differ from base if port was busy).
-    let llamafile = Arc::new(LlamafileProvider::new(Some(&llamafile_url)).with_max_tokens(1024));
-    let ollama = Arc::new(OllamaProvider::new(None, None).with_max_tokens(1024));
-    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(
-        Arc::new(FallbackProvider::new(llamafile, ollama))
-    );
+    // ── One-time migration: bootstrap role fields from legacy single-model settings ──
+    // If chat_model is empty (new fields not yet persisted), copy active_llm_model
+    // and llm_provider so existing installs don't need to visit Settings.
+    let (effective_chat_provider, effective_chat_model) =
+        if settings.chat_model.is_empty() {
+            let _ = settings_repo.set_key("chat_provider", settings.llm_provider.clone()).await;
+            let _ = settings_repo.set_key("chat_model",    settings.active_llm_model.clone()).await;
+            (settings.llm_provider.clone(), settings.active_llm_model.clone())
+        } else {
+            (settings.chat_provider.clone(), settings.chat_model.clone())
+        };
+
+    // ── Build per-role LLM providers ────────────────────────────────────────
+    // Each role (Chat / Think / Task) may use a different provider + model.
+    // Token budget and temperature are baked in at startup.
+    //
+    // Helper: build one Arc<dyn LlmProvider> for a given (provider, model) pair.
+    let build_provider = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+        match provider {
+            "ollama" => Arc::new(
+                OllamaProvider::new(None, Some(model))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+            _ => Arc::new(
+                // Default: llamafile (covers "llamafile" and unknown values)
+                LlamafileProvider::new(Some(&llamafile_url))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+        }
+    };
+
+    let chat_provider_arc = build_provider(&effective_chat_provider, &effective_chat_model);
+
+    // Think role: reuse chat Arc if not separately configured.
+    let think_provider_arc: Arc<dyn LlmProvider> =
+        if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
+            build_provider(tp, tm)
+        } else {
+            chat_provider_arc.clone()
+        };
+
+    // Task role: reuse chat Arc if not separately configured.
+    let task_provider_arc: Arc<dyn LlmProvider> =
+        if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
+            build_provider(tp, tm)
+        } else {
+            chat_provider_arc.clone()
+        };
+
+    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(Arc::new(
+        ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc)
+    ));
 
     let db = Arc::new(db);
 
@@ -618,6 +666,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         data_dir: Some(data_dir.clone()),
         skip_onboarding: false,
         scheduler,
+        model_scheduler: None, // populated when local-inference feature is active
         mcp_memory,
         extension_manager,
         mcp_server_repo,
@@ -671,17 +720,26 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     Ok(())
 }
 
-async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
+async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
     println!("  ╚═══════════════════════════════════════╝");
-    println!("  Provider: {}", provider);
 
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
+
+    // Load settings early — drives provider, model, token budget, temperature, and wake word.
+    // Falls back to Settings::default() when the DB has no rows yet (first run).
+    let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
+    let settings = settings_repo_chat.get().await.unwrap_or_default();
+
+    // CLI args override settings; settings override built-in defaults.
+    let effective_provider = provider.unwrap_or(settings.llm_provider.as_str());
+    let effective_model    = model.unwrap_or(settings.active_llm_model.as_str());
+    println!("  Provider: {} (model: {})", effective_provider, effective_model);
 
     // Auto-start whisper.cpp when voice input is requested.
     let mut whisper_port = ports::WHISPER;
@@ -703,9 +761,10 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
     };
     let whisper_url = whisper_process::url_for(whisper_port);
 
-    // Auto-start llamafile when --provider llamafile is requested.
+    // Auto-start llamafile for all providers except ollama and local (which manage their own process).
+    // llamafile is the default and fallback — always start it unless a remote/in-process provider is used.
     let mut llamafile_port = ports::LLAMAFILE;
-    let _llamafile_guard = if provider == "llamafile" {
+    let _llamafile_guard = if effective_provider != "ollama" && effective_provider != "local" {
         if llamafile_process::find_model(&data_dir).is_none() {
             println!("  📥 LLM model not found — downloading {}...",
                 model_download::DEFAULT_LLAMAFILE_MODEL);
@@ -728,29 +787,25 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
     let session_id = "default-session".to_string();
     let agent = Arc::new(MockAgent::new());
 
-    // Resolve the system prompt:
-    // 1. If $DATA_DIR/prompts/system.md exists, load and render it with settings vars.
-    // 2. Otherwise, build from settings values.
-    // 3. Fall back to the static SYSTEM_PROMPT constant if settings are unavailable.
-    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+    // Resolve the system prompt using the already-loaded settings:
+    // 1. File at $DATA_DIR/prompts/system.md (deployment override, rendered with all vars)
+    // 2. build_system_prompt(&settings) — honours custom_system_prompt + prompt_style + addendum
     let system_prompt = {
-        let settings = settings_repo.get().await.ok();
-        let prompt_dir = data_dir.join("prompts");
+        let prompt_dir    = data_dir.join("prompts");
         let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
-
-        match (file_template, settings) {
-            (Some(tmpl), Some(s)) => {
+        match file_template {
+            Some(tmpl) => {
                 println!("  Prompt:   custom ({})", prompt_dir.join("system.md").display());
-                let name     = pond_core::prompts::sanitize_field(&s.assistant_name, 50);
-                let user     = pond_core::prompts::sanitize_field(&s.user_name, 50);
-                let persona  = pond_core::prompts::sanitize_field(&s.assistant_personality, 200);
-                let tz       = pond_core::prompts::sanitize_field(&s.timezone, 50);
-                let location = if s.weather_location_name.is_empty() {
+                let name     = pond_core::prompts::sanitize_field(&settings.assistant_name, 50);
+                let user     = pond_core::prompts::sanitize_field(&settings.user_name, 50);
+                let persona  = pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
+                let tz       = pond_core::prompts::sanitize_field(&settings.timezone, 50);
+                let location = if settings.weather_location_name.is_empty() {
                     String::new()
                 } else {
-                    format!("\nLocation: {}.", pond_core::prompts::sanitize_field(&s.weather_location_name, 100))
+                    format!("\nLocation: {}.", pond_core::prompts::sanitize_field(&settings.weather_location_name, 100))
                 };
-                let addendum = pond_core::prompts::sanitize_field(&s.prompt_addendum, 500);
+                let addendum = pond_core::prompts::sanitize_field(&settings.prompt_addendum, 500);
                 pond_core::prompts::render_template(&tmpl, &[
                     ("assistant_name",  name.as_str()),
                     ("user_name",       user.as_str()),
@@ -760,14 +815,13 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
                     ("prompt_addendum", addendum.as_str()),
                 ])
             }
-            (None, Some(s)) => {
+            None => {
                 println!(
-                    "  Assistant: {} / style: {} / greeting: {}",
-                    s.assistant_name, s.prompt_style, s.user_name
+                    "  Assistant: {} / style: {} / user: {}",
+                    settings.assistant_name, settings.prompt_style, settings.user_name
                 );
-                build_system_prompt(&s)
+                build_system_prompt(&settings)
             }
-            _ => pond_core::prompts::SYSTEM_PROMPT.to_string(),
         }
     };
 
@@ -786,32 +840,30 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
         .with_system_prompt(system_prompt);
 
-    // ── Wire LLM provider ──
-    match provider {
-        "llamafile" => {
-            println!(
-                "  Model:    {} (llamafile @ {})",
-                pond_adapters_llamafile::DEFAULT_MODEL,
-                llamafile_url
-            );
-            let llm = Arc::new(LlamafileProvider::new(Some(&llamafile_url)));
-            chat_service = chat_service.with_provider(llm);
-        }
+    // ── Wire LLM provider (settings drive token budget + temperature) ──
+    // Default / fallback is always llamafile — it is auto-started above for any provider
+    // that is not "ollama" or "local".
+    match effective_provider {
         "ollama" => {
-            let ollama_model = model.unwrap_or(pond_adapters_ollama::DEFAULT_MODEL);
             println!(
-                "  Model:    {} (ollama @ {})",
-                ollama_model,
-                pond_adapters_ollama::DEFAULT_HOST
+                "  Model:    {} (ollama @ {}, max_tokens={}, temp={})",
+                effective_model,
+                pond_adapters_ollama::DEFAULT_HOST,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
             );
-            let llm = Arc::new(OllamaProvider::new(None, Some(ollama_model)));
+            let llm = Arc::new(
+                OllamaProvider::new(None, Some(effective_model))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            );
             chat_service = chat_service.with_provider(llm);
         }
         "local" => {
             #[cfg(feature = "local-inference")]
             {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-                let model_id = model.unwrap_or(LocalInferenceLlmAdapter::DEFAULT_MODEL);
+                let model_id = effective_model;
                 println!("  Model:    {} (local GGUF in-process)", model_id);
                 let llm = Arc::new(LocalInferenceLlmAdapter::new(model_id).await?);
                 chat_service = chat_service.with_provider(llm);
@@ -827,7 +879,20 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
             }
         }
         _ => {
-            println!("  Model:    mock (echo)");
+            // "llamafile" and any unrecognised value — use the llamafile process started above.
+            println!(
+                "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
+                pond_adapters_llamafile::DEFAULT_MODEL,
+                llamafile_url,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
+            );
+            let llm = Arc::new(
+                LlamafileProvider::new(Some(&llamafile_url))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            );
+            chat_service = chat_service.with_provider(llm);
         }
     }
 
@@ -848,7 +913,7 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, wake_word: O
     let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
         Arc::new(InstantActivation)
     } else {
-        let trigger = wake_word.unwrap_or("goose");
+        let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
         println!("  Wake word: \"{}\" (via whisper @ {})", trigger, whisper_url);
         Arc::new(WhisperKeywordDetector::new(Some(&whisper_url), trigger))
     };
@@ -1059,10 +1124,10 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", None, "stdin", None, true, "none", None).await?;
+                run_chat(None, None, "stdin", None, true, "none", None).await?;
             }
             "2" => {
-                run_server(std::path::PathBuf::from("web/dist"), false, false, "mock").await?;
+                run_server(std::path::PathBuf::from("web/dist"), false, false, "goose").await?;
             }
             "3" => {
                 run_status().await?;
@@ -1106,8 +1171,8 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 service.start().await?;
             }
 
-            Some(OnboardingStep::VerifyDevice) => {
-                println!("Step: Verify Device");
+            Some(OnboardingStep::Welcome) => {
+                println!("Step: Welcome");
 
                 if let Some(ip) = get_local_ip() {
                     println!("Detected device IP: {}", ip);
@@ -1120,51 +1185,103 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::CreateProfile) => {
-                println!("Step: Create Profile");
+            Some(OnboardingStep::Basics) => {
+                println!("Step: Basics");
 
-                let username = prompt_nonempty("Enter your username: ")?;
-                user_data.insert("username".to_string(), username);
+                let username = prompt_nonempty("Enter your name: ")?;
+                user_data.insert("user_name".to_string(), username);
 
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::ConfigurePersonality) => {
-                println!("Step: Configure Personality");
+            Some(OnboardingStep::Location) => {
+                println!("Step: Language & Location");
+                println!("(Press Enter to skip any field — configure later in Settings)");
 
-                let personalities = vec![
-                    "Friendly",
-                    "Professional",
-                    "Casual",
-                    "Funny",
-                    "Stoic",
-                ];
+                print!("Timezone (e.g. Africa/Nairobi): ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut timezone = String::new();
+                let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut timezone);
+                if !timezone.trim().is_empty() {
+                    user_data.insert("timezone".to_string(), timezone.trim().to_string());
+                }
 
-                println!("Choose a personality for your assistant:");
-                for (i, p) in personalities.iter().enumerate() {
-                    println!("  {}) {}", i + 1, p);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Accessibility) => {
+                println!("Step: Accessibility");
+                println!("(All accessibility options can be configured in Settings later)");
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Personality) => {
+                println!("Step: Personality");
+
+                let styles = vec!["balanced", "concise", "technical", "warm"];
+                println!("Choose a conversation style:");
+                for (i, s) in styles.iter().enumerate() {
+                    println!("  {}) {}", i + 1, s);
                 }
 
                 let selected = loop {
                     let choice = prompt_nonempty("Enter the number of your choice: ")?;
                     if let Ok(index) = choice.parse::<usize>() {
-                        if index >= 1 && index <= personalities.len() {
-                            break personalities[index - 1].to_string();
+                        if index >= 1 && index <= styles.len() {
+                            break styles[index - 1].to_string();
                         }
                     }
                     println!("Invalid choice. Try again.");
                 };
 
                 println!("You selected: {}", selected);
-                user_data.insert("personality".to_string(), selected);
+                user_data.insert("prompt_style".to_string(), selected);
 
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::ConnectDevices) => {
-                println!("Step: Connect Devices");
-                println!("Press ENTER when all devices are connected...");
-                let _ = io::stdin().read_line(&mut String::new())?;
+            Some(OnboardingStep::GooseIdentity) => {
+                println!("Step: Goose's Identity");
+
+                print!("Assistant name (default: Goose): ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut name = String::new();
+                let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut name);
+                let name = if name.trim().is_empty() { "Goose".to_string() } else { name.trim().to_string() };
+                user_data.insert("assistant_name".to_string(), name);
+
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::WakeWord) => {
+                println!("Step: Wake Word");
+                println!("Presets: 1) goose  2) hey goose  3) ok computer  4) custom");
+
+                let wake_word = loop {
+                    let choice = prompt_nonempty("Enter number or type a custom phrase: ")?;
+                    break match choice.trim() {
+                        "1" => "goose".to_string(),
+                        "2" => "hey goose".to_string(),
+                        "3" => "ok computer".to_string(),
+                        "4" => prompt_nonempty("Enter your custom wake phrase: ")?,
+                        other => other.to_string(),
+                    };
+                };
+
+                user_data.insert("voice_wake_word".to_string(), wake_word);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Model) => {
+                println!("Step: AI Model");
+                let model = prompt_nonempty("Enter the model name (e.g. gemma-2b): ")?;
+                user_data.insert("active_llm_model".to_string(), model);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Extensions) => {
+                println!("Step: Extensions");
+                println!("(Extensions can be enabled from Settings later)");
                 service.advance().await?;
             }
 

@@ -78,7 +78,42 @@ export interface CameraEvent {
   created_at: string
 }
 
+export interface ModelStatusEntry {
+  category:         string
+  name:             string
+  description:      string
+  size_mb:          number
+  downloaded:       boolean
+  active:           boolean
+  url:              string | null
+  hf_id:            string | null
+  filename:         string | null
+  ram_estimate_mb:  number | null
+  recommended_role: string | null
+}
+
+export interface MemoryStatus {
+  total_mb:             number
+  available_for_llm_mb: number
+  loaded_model:         string | null
+}
+
+export interface ModelsResponse {
+  whisper:   ModelStatusEntry[]
+  llamafile: ModelStatusEntry[]
+  tts:       ModelStatusEntry[]
+  gguf:      ModelStatusEntry[]
+}
+
+export interface OllamaModel {
+  name:        string
+  model:       string
+  size:        number
+  modified_at: string
+}
+
 export interface Settings {
+  primary_profile_id: string | null
   assistant_name: string
   assistant_personality: string
   user_name: string
@@ -103,6 +138,16 @@ export interface Settings {
   retention_event_log_days: number
   retention_sensor_days: number
   retention_session_messages_keep: number
+  prompt_style: string
+  custom_system_prompt: string | null
+  prompt_addendum: string
+  // Model role assignments
+  chat_provider:  string
+  chat_model:     string
+  think_provider: string | null
+  think_model:    string | null
+  task_provider:  string | null
+  task_model:     string | null
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -179,9 +224,9 @@ export const api = {
   handshake: (req: HandshakeRequest) =>
     postReq<HandshakeResponse>('/handshake', req),
 
-  /** Step 2: submit profile info */
-  createProfile: (profile: { name: string; display_name: string }, token: string) =>
-    postReq<{ status: string }>('/onboard', profile, token),
+  /** Step 2: start onboarding tracking on the backend */
+  startOnboarding: () =>
+    postReq<{ status: string }>('/onboard', {}),
 
   /** Check whether this device has completed onboarding */
   onboardingStatus: () =>
@@ -233,6 +278,23 @@ export const api = {
       body: JSON.stringify({ title }),
     }).then(r => r.json()),
 
+  // ── Profiles ─────────────────────────────────────────────────────────────
+
+  /** Create a new household profile (public — callable during onboarding) */
+  createProfile: (req: { display_name: string; avatar_emoji: string }, token: string) =>
+    postReq<{ id: string; display_name: string; avatar_emoji: string; preferences: Record<string, string> }>('/profiles', req, token),
+
+  /** Update a profile's preferences (public — callable during onboarding) */
+  updateProfilePreferences: (id: string, preferences: Record<string, string>, token: string) =>
+    fetch(`${BASE}/profiles/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ preferences }),
+    }).then(async r => {
+      if (!r.ok) { const t = await r.text(); throw new Error(t || `HTTP ${r.status}`) }
+      return r.json()
+    }),
+
   // ── Devices ──────────────────────────────────────────────────────────────
 
   /** List already-registered devices */
@@ -280,4 +342,26 @@ export const api = {
   /** Trigger a task to run immediately */
   runScheduleNow: (id: string, token: string) =>
     postReq<{ status: string }>(`/schedules/${id}/run-now`, {}, token),
+
+  // ── Models ───────────────────────────────────────────────────────────────
+
+  /** List all models with download/active status */
+  listModels: (token: string) =>
+    getReq<ModelsResponse>('/models', token),
+
+  /** Trigger an async download for a model */
+  downloadModel: (category: string, name: string, token: string) =>
+    postReq<{ status: string; name: string; category: string }>(`/models/${category}/${name}/download`, {}, token),
+
+  /** Refresh the model registry from the online URL */
+  refreshModelRegistry: (token: string) =>
+    postReq<{ status: string }>('/models/registry/refresh', {}, token),
+
+  /** List models available in a running Ollama instance */
+  listOllamaModels: (token: string) =>
+    getReq<{ models: OllamaModel[]; error?: string }>('/models/ollama', token),
+
+  /** Get current RAM usage and loaded model info */
+  getMemoryStatus: (token: string) =>
+    getReq<MemoryStatus>('/models/memory-status', token),
 }

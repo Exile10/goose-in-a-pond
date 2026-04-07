@@ -1,4 +1,6 @@
 pub mod chat;
+pub mod model_router;
+pub mod request_classifier;
 pub mod context_budget;
 pub mod context_compactor;
 pub mod fallback_provider;

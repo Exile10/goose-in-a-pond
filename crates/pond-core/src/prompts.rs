@@ -11,6 +11,22 @@
 
 use crate::domain::settings::Settings;
 
+// ── Profile context ───────────────────────────────────────────────────────────
+
+/// Relevant per-user profile preferences to inject into the system prompt.
+/// Extracted from `Profile.preferences` by the API layer.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileContext {
+    /// What the user wants to be called (e.g. "Jerry", "Captain").
+    pub preferred_name: Option<String>,
+    /// User's birthday in ISO format (YYYY-MM-DD), for greetings.
+    pub birthday: Option<String>,
+    /// BCP-47 language code, e.g. "en", "fr", "sw". When set, Goose responds in that language.
+    pub language: Option<String>,
+    /// If true, Goose phrasing should be patient and forgiving of non-standard speech.
+    pub atypical_speech: bool,
+}
+
 // ── Static fallback ───────────────────────────────────────────────────────────
 
 /// Static fallback — used in tests and when Settings are unavailable.
@@ -139,21 +155,24 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
 
 // ── Dynamic prompt builder ────────────────────────────────────────────────────
 
-/// Build a personalised system prompt from `Settings`.
+/// Build a personalised system prompt from `Settings` and an optional `ProfileContext`.
 ///
 /// Priority:
 /// 1. `settings.custom_system_prompt` (Some) → render with all vars
 /// 2. Built-in template selected by `settings.prompt_style`
-/// Then: append `settings.prompt_addendum` if non-empty.
+/// Then: append profile context lines, then `settings.prompt_addendum`.
 ///
 /// All user-supplied strings are sanitized before substitution.
 pub fn build_system_prompt(settings: &Settings) -> String {
+    build_system_prompt_with_profile(settings, None)
+}
+
+/// Full version — also injects per-user `ProfileContext` into the prompt.
+pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&ProfileContext>) -> String {
     let name    = sanitize_field(&settings.assistant_name, 50);
     let user    = sanitize_field(&settings.user_name, 50);
     let persona = sanitize_field(&settings.assistant_personality, 200);
     let tz      = sanitize_field(&settings.timezone, 50);
-    // location: either "\nLocation: <name>." or "" so the placeholder
-    // either attaches cleanly on its own line or disappears entirely.
     let location = if settings.weather_location_name.is_empty() {
         String::new()
     } else {
@@ -175,17 +194,71 @@ pub fn build_system_prompt(settings: &Settings) -> String {
             "concise"   => PROMPT_CONCISE,
             "technical" => PROMPT_TECHNICAL,
             "warm"      => PROMPT_WARM,
-            _           => PROMPT_BALANCED, // "balanced" and any unknown value
+            _           => PROMPT_BALANCED,
         };
         render_template(tmpl, vars)
     };
 
-    let addendum = sanitize_field(&settings.prompt_addendum, 500);
-    if addendum.is_empty() {
-        base
-    } else {
-        format!("{}\n\n{}", base, addendum)
+    // ── Profile context lines ─────────────────────────────────────────────────
+    let mut profile_lines: Vec<String> = Vec::new();
+
+    if let Some(ctx) = profile {
+        // Preferred name — overrides generic user_name address if set
+        if let Some(ref pname) = ctx.preferred_name {
+            let pname = sanitize_field(pname, 50);
+            if !pname.is_empty() && pname != user {
+                profile_lines.push(format!("The user prefers to be called {}.", pname));
+            }
+        }
+
+        // Language — instruct Goose to respond in the user's language
+        if let Some(ref lang) = ctx.language {
+            let lang = sanitize_field(lang, 20);
+            if !lang.is_empty() && lang != "en" {
+                let lang_label = match lang.as_str() {
+                    "fr"    => "French",
+                    "es"    => "Spanish",
+                    "de"    => "German",
+                    "sw"    => "Swahili",
+                    "ar"    => "Arabic",
+                    "pt"    => "Portuguese",
+                    "zh"    => "Chinese",
+                    "ja"    => "Japanese",
+                    "ko"    => "Korean",
+                    other   => other,
+                };
+                profile_lines.push(format!("Always respond in {}.", lang_label));
+            }
+        }
+
+        // Birthday — enable date-aware greetings
+        if let Some(ref bday) = ctx.birthday {
+            let bday = sanitize_field(bday, 20);
+            if !bday.is_empty() {
+                profile_lines.push(format!("The user's birthday is {}.", bday));
+            }
+        }
+
+        // Atypical speech — soften LLM interpretation of fragmented input
+        if ctx.atypical_speech {
+            profile_lines.push(
+                "The user may have atypical speech — be patient, never correct speech patterns, \
+                 and interpret incomplete sentences charitably.".to_string()
+            );
+        }
     }
+
+    let addendum = sanitize_field(&settings.prompt_addendum, 500);
+
+    // Assemble: base + profile lines + addendum
+    let mut parts = vec![base];
+    if !profile_lines.is_empty() {
+        parts.push(profile_lines.join(" "));
+    }
+    if !addendum.is_empty() {
+        parts.push(addendum);
+    }
+    parts.join("\n\n")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
