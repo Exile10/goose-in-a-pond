@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { api, isPreviewMode, DEV_MOCK_TOKEN } from '../api'
 import logo from '../assets/logo.png'
 import '../onboarding.css'
@@ -67,11 +67,11 @@ const DEFAULT_DRAFT: Draft = {
   promptStyle:      'balanced',
   personality:      'friendly and helpful',
   assistantName:    'Goose',
-  ttsVoice:         'en_US-lessac-medium.onnx',
+  ttsVoice:         '',
   wakeWord:         'goose',
   wakeWordCustom:   '',
-  llmProvider:      'llamafile',
-  llmModel:         'gemma-2b',
+  llmProvider:      '',
+  llmModel:         '',
   enableMcpMemory:  false,
 }
 
@@ -530,12 +530,7 @@ function StepPersonality({ draft, onChange, onNext, onBack, loading, error }: {
 
 // ── Step 5 — Goose's Identity ─────────────────────────────────────────────────
 
-const TTS_VOICES = [
-  { value: 'en_US-lessac-medium.onnx', label: 'Lessac',   desc: 'Natural American English. Recommended.' },
-  { value: 'en_GB-alba-medium.onnx',   label: 'Alba',     desc: 'Scottish English accent.' },
-  { value: 'de_DE-thorsten-medium.onnx', label: 'Thorsten', desc: 'German language voice.' },
-  { value: 'custom',                   label: 'Custom',   desc: 'Enter a ONNX model name in Settings.' },
-]
+interface TtsVoiceOption { value: string; label: string; desc: string }
 
 function StepGooseIdentity({ draft, onChange, onNext, onBack, loading, error }: {
   draft: Draft
@@ -545,6 +540,30 @@ function StepGooseIdentity({ draft, onChange, onNext, onBack, loading, error }: 
   loading: boolean
   error: string | null
 }) {
+  const [ttsVoices, setTtsVoices] = useState<TtsVoiceOption[]>([])
+
+  useEffect(() => {
+    api.listModels(draft.token)
+      .then(resp => {
+        const voices: TtsVoiceOption[] = resp.tts
+          .filter(m => m.filename && m.filename.endsWith('.onnx'))
+          .map(m => ({
+            value: m.filename!,
+            label: m.name,
+            desc:  m.description || m.filename!,
+          }))
+        setTtsVoices([
+          ...voices,
+          { value: 'custom', label: 'Custom', desc: 'Enter an ONNX model filename in Settings.' },
+        ])
+      })
+      .catch(() => {
+        setTtsVoices([
+          { value: 'custom', label: 'Custom', desc: 'Enter an ONNX model filename in Settings.' },
+        ])
+      })
+  }, [draft.token])
+
   return (
     <div className="ob-body ob-form">
       <h2>Goose's identity</h2>
@@ -565,26 +584,30 @@ function StepGooseIdentity({ draft, onChange, onNext, onBack, loading, error }: 
 
       <fieldset className="ob-fieldset">
         <legend>Voice</legend>
-        <div className="ob-radio-group">
-          {TTS_VOICES.map(v => (
-            <label
-              key={v.value}
-              className={`ob-radio-card ${draft.ttsVoice === v.value ? 'selected' : ''}`}
-            >
-              <input
-                type="radio"
-                name="ttsVoice"
-                value={v.value}
-                checked={draft.ttsVoice === v.value}
-                onChange={() => onChange({ ttsVoice: v.value })}
-              />
-              <div>
-                <strong>{v.label}</strong>
-                <span>{v.desc}</span>
-              </div>
-            </label>
-          ))}
-        </div>
+        {ttsVoices.length === 0 ? (
+          <p className="ob-hint">Loading available voices…</p>
+        ) : (
+          <div className="ob-radio-group">
+            {ttsVoices.map(v => (
+              <label
+                key={v.value}
+                className={`ob-radio-card ${draft.ttsVoice === v.value ? 'selected' : ''}`}
+              >
+                <input
+                  type="radio"
+                  name="ttsVoice"
+                  value={v.value}
+                  checked={draft.ttsVoice === v.value}
+                  onChange={() => onChange({ ttsVoice: v.value })}
+                />
+                <div>
+                  <strong>{v.label}</strong>
+                  <span>{v.desc}</span>
+                </div>
+              </label>
+            ))}
+          </div>
+        )}
       </fieldset>
 
       {error && <p className="ob-error">{error}</p>}
@@ -872,7 +895,9 @@ export default function Onboarding({ onComplete }: Props) {
     await wrap(async () => {
       let clientId = localStorage.getItem('pond_client_id') ?? ''
       if (!clientId) {
-        clientId = crypto.randomUUID()
+        clientId = typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
         localStorage.setItem('pond_client_id', clientId)
       }
 

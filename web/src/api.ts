@@ -112,6 +112,36 @@ export interface OllamaModel {
   modified_at: string
 }
 
+export interface HuggingFaceModel {
+  id:        string
+  downloads: number
+  likes:     number
+  tags:      string[]
+  url:       string
+}
+
+export interface HuggingFaceFile {
+  filename: string
+  size_mb:  number | null
+  url:      string
+}
+
+export interface DownloadEntry {
+  filename:          string
+  category:          string
+  downloaded_bytes:  number
+  total_bytes:       number | null
+  status:            'downloading' | 'done' | 'error'
+}
+
+export interface LlamafileAsset {
+  name:        string
+  version:     string
+  size_mb:     number
+  url:         string
+  release_url: string
+}
+
 export interface Settings {
   primary_profile_id: string | null
   assistant_name: string
@@ -260,7 +290,7 @@ export const api = {
 
   /** Send a chat message */
   chat: (message: string, token: string, sessionId?: string) =>
-    postReq<{ session_id: string; response: string }>('/chat', { message, session_id: sessionId }, token),
+    postReq<{ session_id: string; response: string; model_role?: string }>('/chat', { message, session_id: sessionId }, token),
 
   /** List all sessions */
   listSessions: (token: string) =>
@@ -357,11 +387,181 @@ export const api = {
   refreshModelRegistry: (token: string) =>
     postReq<{ status: string }>('/models/registry/refresh', {}, token),
 
+  /** Scan model directories for files not yet in the registry */
+  scanModels: (token: string) =>
+    postReq<{ found: number; entries: ModelStatusEntry[] }>('/models/scan', {}, token),
+
+  /** Get the currently wired provider+model for each role */
+  getActiveRoles: (token: string) =>
+    getReq<{
+      chat:  { provider: string; model: string }
+      think: { provider: string | null; model: string | null }
+      task:  { provider: string | null; model: string | null }
+      asr:   { model_id: string | null }
+      tts:   { model_id: string | null }
+      router_name: string
+    }>('/models/active-roles', token),
+
   /** List models available in a running Ollama instance */
   listOllamaModels: (token: string) =>
     getReq<{ models: OllamaModel[]; error?: string }>('/models/ollama', token),
 
+  /** Pull an Ollama model by name (non-blocking on the server) */
+  pullOllamaModel: (model: string, token: string) =>
+    postReq<{ status: string; model: string }>('/models/ollama/pull', { model }, token),
+
+  /** Search HuggingFace for GGUF models */
+  searchGgufModels: (q: string, token: string) =>
+    getReq<{ models: HuggingFaceModel[]; error?: string }>(`/models/search/gguf?q=${encodeURIComponent(q)}`, token),
+
+  /** List .gguf files inside a specific HuggingFace repo */
+  listHfModelFiles: (repo: string, token: string) =>
+    getReq<{ files: HuggingFaceFile[]; error?: string }>(`/models/search/gguf/files?repo=${encodeURIComponent(repo)}`, token),
+
+  /** Download a model file by URL into the server's models folder */
+  downloadModelFromUrl: (url: string, category: string, filename: string, token: string) =>
+    postReq<{ status: string; filename: string; category: string }>('/models/download/url', { url, category, filename }, token),
+
+  /** Get progress for all active/recent downloads */
+  getDownloadProgress: (token: string) =>
+    getReq<{ downloads: DownloadEntry[] }>('/models/download/progress', token),
+
+  /** List llamafile releases from GitHub */
+  searchLlamafileModels: (q: string, token: string) =>
+    getReq<{ models: LlamafileAsset[]; error?: string }>(`/models/search/llamafile?q=${encodeURIComponent(q)}`, token),
+
   /** Get current RAM usage and loaded model info */
   getMemoryStatus: (token: string) =>
     getReq<MemoryStatus>('/models/memory-status', token),
+
+  /** Delete a model file from disk (catalog record kept). Returns 204 No Content. */
+  deleteModel: async (category: string, name: string, token: string): Promise<void> => {
+    const res = await fetch(`${BASE}/models/${category}/${name}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}` },
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+  },
+
+  /** Assign a model to a role, rebuilding the ModelRouter live. */
+  activateModel: (category: string, name: string, role: string, token: string) =>
+    postReq<{ role: string; model_id: string }>(`/models/${category}/${name}/activate`, { role }, token),
+
+  // ── Streaming chat ────────────────────────────────────────────────────────
+
+  /**
+   * Stream chat tokens via Server-Sent Events.
+   *
+   * Calls `onToken` for each incremental token, `onDone` when complete,
+   * and `onError` on failure. Uses `fetch` + `ReadableStream` because SSE
+   * requires a POST body which `EventSource` does not support.
+   */
+  chatStream: async (
+    message: string,
+    token: string,
+    sessionId: string | undefined,
+    onToken: (token: string) => void,
+    onDone: (sessionId: string, modelRole?: string) => void,
+    onError: (err: string) => void,
+  ): Promise<void> => {
+    let res: Response
+    try {
+      res = await fetch(`${BASE}/chat/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message, session_id: sessionId }),
+      })
+    } catch (e) {
+      onError(String(e))
+      return
+    }
+
+    if (!res.ok) {
+      onError(`HTTP ${res.status}`)
+      return
+    }
+
+    const reader = res.body?.getReader()
+    if (!reader) { onError('No response body'); return }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        // Process all complete SSE lines in the buffer
+        let newlinePos: number
+        while ((newlinePos = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlinePos).trimEnd()
+          buffer = buffer.slice(newlinePos + 1)
+
+          if (!line.startsWith('data: ')) continue
+          const raw = line.slice('data: '.length).trim()
+          if (!raw) continue
+
+          try {
+            const payload = JSON.parse(raw) as {
+              token?: string
+              done?: boolean
+              session_id?: string
+              model_role?: string
+              error?: string
+            }
+            if (payload.error) {
+              onError(payload.error)
+              return
+            }
+            if (payload.done) {
+              onDone(payload.session_id ?? '', payload.model_role)
+              return
+            }
+            if (payload.token) {
+              onToken(payload.token)
+            }
+          } catch {
+            // Ignore malformed SSE lines
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  },
+
+  // ── Server-side TTS ───────────────────────────────────────────────────────
+
+  /**
+   * Synthesise speech server-side and return a blob URL for playback.
+   *
+   * The server routes to Piper HTTP or Qwen TTS based on its configuration.
+   * Returns `null` if no TTS backend is running (caller should skip audio).
+   * Caller is responsible for calling `URL.revokeObjectURL()` after playback.
+   */
+  speak: async (text: string, token: string): Promise<string | null> => {
+    try {
+      const res = await fetch(`${BASE}/tts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ text }),
+      })
+      if (!res.ok) return null
+      const blob = await res.blob()
+      return URL.createObjectURL(blob)
+    } catch {
+      return null
+    }
+  },
 }

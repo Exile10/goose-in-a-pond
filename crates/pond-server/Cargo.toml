@@ -42,6 +42,7 @@ pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
 #   cargo build -p pond-adapters-goose
 # See crates/pond-mcp-server/ and docs/developer/goose_integrations.md
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

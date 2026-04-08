@@ -1,4 +1,8 @@
 pub mod agent;
+pub mod model_catalog_provider;
+pub mod model_downloader;
+pub mod model_repository;
+pub mod model_storage;
 pub mod camera_storage;
 pub mod device_registry;
 pub mod extension_manager;

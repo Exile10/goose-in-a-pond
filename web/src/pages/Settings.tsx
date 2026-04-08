@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api, isPreviewMode } from '../api'
+import { useSettings } from '../context/SettingsContext'
 import { clearActivity, logActivity } from '../activityLog'
 
 interface Props {
@@ -37,6 +38,8 @@ function load<T>(key: string, fallback: T): T {
 }
 
 export default function Settings({ token }: Props) {
+  const { settings: ctxSettings, refetch } = useSettings()
+
   // ── Appearance ──
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('pond_theme') as Theme) ?? 'system')
 
@@ -52,12 +55,12 @@ export default function Settings({ token }: Props) {
   const [showAdvanced, setShowAdvanced]     = useState(false)
 
   // ── LLM pipeline ──
-  const [llmProvider, setLlmProvider]   = useState(() => localStorage.getItem('pond_llm_provider') ?? 'llamafile')
-  const [llmModel, setLlmModel]         = useState(() => localStorage.getItem('pond_llm_model') ?? 'gemma-2b')
+  const [llmProvider, setLlmProvider]   = useState(() => localStorage.getItem('pond_llm_provider') ?? '')
+  const [llmModel, setLlmModel]         = useState(() => localStorage.getItem('pond_llm_model') ?? '')
   const [llmMaxTokens, setLlmMaxTokens] = useState(() => load('pond_llm_max_tokens', 1024))
   const [llmTemp, setLlmTemp]           = useState(() => load('pond_llm_temperature', 0.7))
   // Model role assignments
-  const [chatProvider,  setChatProvider]  = useState(() => localStorage.getItem('pond_chat_provider') ?? 'llamafile')
+  const [chatProvider,  setChatProvider]  = useState(() => localStorage.getItem('pond_chat_provider') ?? '')
   const [chatModel,     setChatModel]     = useState(() => localStorage.getItem('pond_chat_model') ?? '')
   const [thinkProvider, setThinkProvider] = useState(() => localStorage.getItem('pond_think_provider') ?? '')
   const [thinkModel,    setThinkModel]    = useState(() => localStorage.getItem('pond_think_model') ?? '')
@@ -67,9 +70,14 @@ export default function Settings({ token }: Props) {
   const [taskSameAsChat,  setTaskSameAsChat]  = useState(() => !localStorage.getItem('pond_task_model'))
 
   // ── Voice ──
-  const [wakeWord, setWakeWord]         = useState(() => localStorage.getItem('pond_wake_word') ?? 'goose')
-  const [whisperModel, setWhisperModel] = useState(() => localStorage.getItem('pond_whisper_model') ?? 'base')
-  const [ttsModel, setTtsModel]         = useState(() => localStorage.getItem('pond_tts_model') ?? 'qwen-tts')
+  const [wakeWord, setWakeWord]               = useState(() => localStorage.getItem('pond_wake_word') ?? '')
+  const [whisperModel, setWhisperModel]       = useState(() => localStorage.getItem('pond_whisper_model') ?? '')
+  const [whisperUrl, setWhisperUrl]           = useState(() => localStorage.getItem('pond_whisper_url') ?? '')
+  const [recordingDuration, setRecordingDuration] = useState(() => load('pond_recording_duration', 5))
+  const [ttsModel, setTtsModel]               = useState(() => localStorage.getItem('pond_tts_model') ?? '')
+  const [ttsVoice, setTtsVoice]               = useState(() => localStorage.getItem('pond_tts_voice') ?? '')
+  const [ttsHttpUrl, setTtsHttpUrl]           = useState(() => localStorage.getItem('pond_tts_http_url') ?? '')
+  const [ttsHttpVoice, setTtsHttpVoice]       = useState(() => localStorage.getItem('pond_tts_http_voice') ?? '')
 
   // ── UI state ──
   const [saving, setSaving]   = useState(false)
@@ -77,40 +85,39 @@ export default function Settings({ token }: Props) {
   const [error, setError]     = useState<string | null>(null)
   const [cleared, setCleared] = useState(false)
 
-  // ── Hydrate from backend ──
+  // ── Hydrate from API context (runs every time settings are fetched from server) ──
   useEffect(() => {
-    if (isPreviewMode(token)) return
-    api.getSettings(token)
-      .then(s => {
-        if (s.user_name)             { setDisplayName(s.user_name);               localStorage.setItem('pond_display_name', s.user_name) }
-        if (s.assistant_name)        { setAssistantName(s.assistant_name);         localStorage.setItem('pond_assistant_name', s.assistant_name) }
-        if (s.assistant_personality) { setPersonality(s.assistant_personality);    localStorage.setItem('pond_personality', s.assistant_personality) }
-        if (s.prompt_style)          { setPromptStyle(s.prompt_style);             localStorage.setItem('pond_prompt_style', JSON.stringify(s.prompt_style)) }
-        if (s.prompt_addendum !== undefined) { setPromptAddendum(s.prompt_addendum); localStorage.setItem('pond_prompt_addendum', s.prompt_addendum) }
-        if (s.custom_system_prompt !== undefined) {
-          const val = s.custom_system_prompt ?? ''
-          setCustomPrompt(val)
-          localStorage.setItem('pond_custom_prompt', val)
-        }
-        // LLM pipeline
-        if (s.llm_provider)      { setLlmProvider(s.llm_provider);               localStorage.setItem('pond_llm_provider', s.llm_provider) }
-        if (s.active_llm_model)  { setLlmModel(s.active_llm_model);              localStorage.setItem('pond_llm_model', s.active_llm_model) }
-        if (s.llm_max_tokens)    { setLlmMaxTokens(s.llm_max_tokens);            localStorage.setItem('pond_llm_max_tokens', JSON.stringify(s.llm_max_tokens)) }
-        if (s.llm_temperature !== undefined) { setLlmTemp(s.llm_temperature);    localStorage.setItem('pond_llm_temperature', JSON.stringify(s.llm_temperature)) }
-        // Model role assignments
-        if (s.chat_provider)  { setChatProvider(s.chat_provider);   localStorage.setItem('pond_chat_provider',  s.chat_provider) }
-        if (s.chat_model)     { setChatModel(s.chat_model);         localStorage.setItem('pond_chat_model',     s.chat_model) }
-        if (s.think_provider) { setThinkProvider(s.think_provider); localStorage.setItem('pond_think_provider', s.think_provider); setThinkSameAsChat(false) }
-        if (s.think_model)    { setThinkModel(s.think_model);       localStorage.setItem('pond_think_model',    s.think_model);    setThinkSameAsChat(false) }
-        if (s.task_provider)  { setTaskProvider(s.task_provider);   localStorage.setItem('pond_task_provider',  s.task_provider);  setTaskSameAsChat(false) }
-        if (s.task_model)     { setTaskModel(s.task_model);         localStorage.setItem('pond_task_model',     s.task_model);     setTaskSameAsChat(false) }
-        // Voice
-        if (s.voice_wake_word)       { setWakeWord(s.voice_wake_word);           localStorage.setItem('pond_wake_word', s.voice_wake_word) }
-        if (s.active_whisper_model)  { setWhisperModel(s.active_whisper_model);  localStorage.setItem('pond_whisper_model', s.active_whisper_model) }
-        if (s.active_tts_model)      { setTtsModel(s.active_tts_model);          localStorage.setItem('pond_tts_model', s.active_tts_model) }
-      })
-      .catch(() => { /* fall back to localStorage */ })
-  }, [token])
+    const s = ctxSettings
+    if (!s || isPreviewMode(token)) return
+
+    if (s.user_name)             setDisplayName(s.user_name)
+    if (s.assistant_name)        setAssistantName(s.assistant_name)
+    if (s.assistant_personality) setPersonality(s.assistant_personality)
+    if (s.prompt_style)          setPromptStyle(s.prompt_style)
+    if (s.prompt_addendum !== undefined) setPromptAddendum(s.prompt_addendum)
+    if (s.custom_system_prompt !== undefined) setCustomPrompt(s.custom_system_prompt ?? '')
+    // LLM pipeline
+    if (s.llm_provider)               setLlmProvider(s.llm_provider)
+    if (s.active_llm_model)           setLlmModel(s.active_llm_model)
+    if (s.llm_max_tokens)             setLlmMaxTokens(s.llm_max_tokens)
+    if (s.llm_temperature !== undefined) setLlmTemp(s.llm_temperature)
+    // Model role assignments
+    if (s.chat_provider)  setChatProvider(s.chat_provider)
+    if (s.chat_model)     setChatModel(s.chat_model)
+    if (s.think_provider) { setThinkProvider(s.think_provider); setThinkSameAsChat(false) }
+    if (s.think_model)    { setThinkModel(s.think_model);       setThinkSameAsChat(false) }
+    if (s.task_provider)  { setTaskProvider(s.task_provider);   setTaskSameAsChat(false) }
+    if (s.task_model)     { setTaskModel(s.task_model);         setTaskSameAsChat(false) }
+    // Voice
+    if (s.voice_wake_word)               setWakeWord(s.voice_wake_word)
+    if (s.active_whisper_model)          setWhisperModel(s.active_whisper_model)
+    if (s.voice_whisper_url)             setWhisperUrl(s.voice_whisper_url)
+    if (s.voice_recording_duration_secs) setRecordingDuration(s.voice_recording_duration_secs)
+    if (s.active_tts_model)              setTtsModel(s.active_tts_model)
+    if (s.voice_tts_voice)               setTtsVoice(s.voice_tts_voice)
+    if (s.voice_tts_http_url)            setTtsHttpUrl(s.voice_tts_http_url)
+    if (s.voice_tts_http_voice)          setTtsHttpVoice(s.voice_tts_http_voice)
+  }, [ctxSettings, token])
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
@@ -119,37 +126,9 @@ export default function Settings({ token }: Props) {
     setSaving(true)
 
     try {
-      // Persist to localStorage
-      localStorage.setItem('pond_display_name',    displayName.trim())
-      localStorage.setItem('pond_assistant_name',  assistantName.trim())
-      localStorage.setItem('pond_personality',     personality.trim())
-      localStorage.setItem('pond_prompt_style',    JSON.stringify(promptStyle))
-      localStorage.setItem('pond_prompt_addendum', promptAddendum.trim())
-      localStorage.setItem('pond_custom_prompt',   customPrompt.trim())
-      localStorage.setItem('pond_llm_provider',    llmProvider)
-      localStorage.setItem('pond_llm_model',       llmModel.trim())
-      localStorage.setItem('pond_llm_max_tokens',  JSON.stringify(llmMaxTokens))
-      localStorage.setItem('pond_llm_temperature', JSON.stringify(llmTemp))
-      localStorage.setItem('pond_wake_word',       wakeWord.trim())
-      localStorage.setItem('pond_whisper_model',   whisperModel.trim())
-      localStorage.setItem('pond_tts_model',       ttsModel.trim())
-      localStorage.setItem('pond_chat_provider',   chatProvider.trim())
-      localStorage.setItem('pond_chat_model',      chatModel.trim())
-      if (!thinkSameAsChat) {
-        localStorage.setItem('pond_think_provider', thinkProvider.trim())
-        localStorage.setItem('pond_think_model',    thinkModel.trim())
-      } else {
-        localStorage.removeItem('pond_think_provider')
-        localStorage.removeItem('pond_think_model')
-      }
-      if (!taskSameAsChat) {
-        localStorage.setItem('pond_task_provider',  taskProvider.trim())
-        localStorage.setItem('pond_task_model',     taskModel.trim())
-      } else {
-        localStorage.removeItem('pond_task_provider')
-        localStorage.removeItem('pond_task_model')
-      }
-
+      // Settings are persisted exclusively via the API; localStorage is no longer
+      // written for settings fields (it caused stale-cache divergence from the DB).
+      // The API response is refetched after save, which re-hydrates all form fields.
       if (!isPreviewMode(token)) {
         await api.saveSettings(
           {
@@ -163,9 +142,14 @@ export default function Settings({ token }: Props) {
             active_llm_model:      llmModel.trim(),
             llm_max_tokens:        llmMaxTokens,
             llm_temperature:       llmTemp,
-            voice_wake_word:       wakeWord.trim(),
-            active_whisper_model:  whisperModel.trim(),
-            active_tts_model:      ttsModel.trim(),
+            voice_wake_word:              wakeWord.trim(),
+            active_whisper_model:         whisperModel.trim(),
+            voice_whisper_url:            whisperUrl.trim(),
+            voice_recording_duration_secs: recordingDuration,
+            active_tts_model:             ttsModel.trim(),
+            voice_tts_voice:              ttsVoice.trim(),
+            voice_tts_http_url:           ttsHttpUrl.trim(),
+            voice_tts_http_voice:         ttsHttpVoice.trim(),
             chat_provider:         chatProvider.trim(),
             chat_model:            chatModel.trim(),
             think_provider:        thinkSameAsChat ? null : thinkProvider.trim() || null,
@@ -177,6 +161,7 @@ export default function Settings({ token }: Props) {
         )
       }
 
+      await refetch()
       logActivity('chat', 'Settings updated')
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
@@ -221,7 +206,12 @@ export default function Settings({ token }: Props) {
     localStorage.removeItem('pond_llm_temperature')
     localStorage.removeItem('pond_wake_word')
     localStorage.removeItem('pond_whisper_model')
+    localStorage.removeItem('pond_whisper_url')
+    localStorage.removeItem('pond_recording_duration')
     localStorage.removeItem('pond_tts_model')
+    localStorage.removeItem('pond_tts_voice')
+    localStorage.removeItem('pond_tts_http_url')
+    localStorage.removeItem('pond_tts_http_voice')
     delete document.documentElement.dataset.theme
     window.location.reload()
   }
@@ -376,21 +366,94 @@ export default function Settings({ token }: Props) {
 
         {/* ── Voice ── */}
         <div className="db-card">
-          <div className="db-card-header"><h3>Voice</h3></div>
+          <div className="db-card-header"><h3>Speech Recognition (STT)</h3></div>
+          <p className="db-settings-hint">
+            GIAP uses a local <strong>whisper.cpp</strong> server for transcription. Set the model and server URL below.
+            Use the <strong>Models</strong> page to download Whisper models.
+          </p>
           <div className="db-settings-field">
             <label className="db-settings-label" htmlFor="wakeWord">Wake word</label>
-            <p className="db-settings-hint">Spoken phrase that activates the assistant. Default: goose</p>
+            <p className="db-settings-hint">Spoken phrase that activates the assistant (case-insensitive).</p>
             <input id="wakeWord" className="db-settings-input" type="text" value={wakeWord} onChange={e => setWakeWord(e.target.value)} placeholder="goose" maxLength={50} />
           </div>
           <div className="db-settings-field">
-            <label className="db-settings-label" htmlFor="whisperModel">Whisper ASR model</label>
-            <p className="db-settings-hint">Speech recognition model name, e.g. base or small.</p>
+            <label className="db-settings-label" htmlFor="whisperModel">Whisper model</label>
+            <p className="db-settings-hint">
+              Model used for transcription: <code>tiny</code>, <code>base</code>, <code>small</code>, <code>medium</code>, <code>large</code>.
+              Larger = more accurate but slower. <code>base</code> works well for most home use.
+            </p>
             <input id="whisperModel" className="db-settings-input" type="text" value={whisperModel} onChange={e => setWhisperModel(e.target.value)} placeholder="base" maxLength={50} />
           </div>
           <div className="db-settings-field">
-            <label className="db-settings-label" htmlFor="ttsModel">TTS model</label>
-            <p className="db-settings-hint">Text-to-speech model name, e.g. qwen-tts or piper-lessac.</p>
+            <label className="db-settings-label" htmlFor="whisperUrl">Whisper server URL</label>
+            <p className="db-settings-hint">
+              URL of the whisper.cpp HTTP server. Leave as default if GIAP manages the process.
+              Set a custom URL to use an external or remote whisper server.
+            </p>
+            <input id="whisperUrl" className="db-settings-input" type="url" value={whisperUrl} onChange={e => setWhisperUrl(e.target.value)} placeholder="http://127.0.0.1:9000" maxLength={200} />
+          </div>
+          <div className="db-settings-field">
+            <label className="db-settings-label" htmlFor="recordingDuration">
+              Recording duration <span style={{ opacity: 0.55, fontWeight: 400 }}>({recordingDuration}s)</span>
+            </label>
+            <p className="db-settings-hint">Seconds of audio captured per voice input. 3–8s is typical for sentences.</p>
+            <input id="recordingDuration" className="db-settings-input" type="range" min={2} max={15} step={1} value={recordingDuration} onChange={e => setRecordingDuration(Number(e.target.value))} style={{ padding: '0.25rem 0', cursor: 'pointer' }} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', opacity: 0.45, marginTop: '0.15rem' }}>
+              <span>2s</span><span>15s</span>
+            </div>
+          </div>
+        </div>
+
+        {/* ── TTS ── */}
+        <div className="db-card">
+          <div className="db-card-header"><h3>Text-to-Speech (TTS)</h3></div>
+          <p className="db-settings-hint">
+            GIAP supports two TTS engines: <strong>Qwen TTS</strong> (HTTP server, natural voices) and
+            <strong> Piper</strong> (local subprocess, fast and offline). Configure whichever you use.
+          </p>
+
+          {/* Active TTS model */}
+          <div className="db-settings-field">
+            <label className="db-settings-label" htmlFor="ttsModel">Active TTS model</label>
+            <p className="db-settings-hint">
+              Name from the registry: <code>qwen-tts</code> uses the HTTP server below.
+              <code> piper-lessac</code> (or any <code>piper-*</code>) uses the Piper engine.
+              Use the <strong>Models</strong> page to see all TTS options.
+            </p>
             <input id="ttsModel" className="db-settings-input" type="text" value={ttsModel} onChange={e => setTtsModel(e.target.value)} placeholder="qwen-tts" maxLength={50} />
+          </div>
+
+          {/* Qwen TTS config */}
+          <div style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem', marginTop: '0.25rem' }}>
+            <p className="db-settings-label" style={{ marginBottom: '0.25rem' }}>Qwen TTS (HTTP server)</p>
+            <div className="db-settings-field" style={{ marginTop: '0.5rem' }}>
+              <label className="db-settings-label" htmlFor="ttsHttpUrl">Server URL</label>
+              <p className="db-settings-hint">Base URL of the Qwen TTS server (OpenAI-compatible <code>/v1/audio/speech</code>).</p>
+              <input id="ttsHttpUrl" className="db-settings-input" type="url" value={ttsHttpUrl} onChange={e => setTtsHttpUrl(e.target.value)} placeholder="http://127.0.0.1:8181" maxLength={200} />
+            </div>
+            <div className="db-settings-field">
+              <label className="db-settings-label" htmlFor="ttsHttpVoice">Voice name</label>
+              <p className="db-settings-hint">
+                Voice sent to the server. Qwen2.5-TTS supports: <code>Vivian</code>, <code>Chelsie</code>, <code>Ethan</code>, <code>Dylan</code>.
+              </p>
+              <input id="ttsHttpVoice" className="db-settings-input" type="text" value={ttsHttpVoice} onChange={e => setTtsHttpVoice(e.target.value)} placeholder="Vivian" maxLength={50} />
+            </div>
+          </div>
+
+          {/* Piper config */}
+          <div style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem' }}>
+            <p className="db-settings-label" style={{ marginBottom: '0.25rem' }}>Piper (local subprocess)</p>
+            <div className="db-settings-field" style={{ marginTop: '0.5rem' }}>
+              <label className="db-settings-label" htmlFor="ttsVoice">Voice model filename</label>
+              <p className="db-settings-hint">
+                ONNX file in <code>$DATA_DIR/models/tts/</code>, e.g. <code>en_US-lessac-medium.onnx</code>.
+                Browse{' '}
+                <a href="https://rhasspy.github.io/piper-samples/" target="_blank" rel="noopener noreferrer" style={{ color: '#a96ff5' }}>Piper voice samples ↗</a>
+                {' '}and{' '}
+                <a href="https://huggingface.co/rhasspy/piper-voices/tree/main" target="_blank" rel="noopener noreferrer" style={{ color: '#a96ff5' }}>download voices from HuggingFace ↗</a>.
+              </p>
+              <input id="ttsVoice" className="db-settings-input" type="text" value={ttsVoice} onChange={e => setTtsVoice(e.target.value)} placeholder="en_US-lessac-medium.onnx" maxLength={200} />
+            </div>
           </div>
         </div>
 

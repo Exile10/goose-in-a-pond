@@ -9,13 +9,35 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::ports::provider::{LlmProvider, TokenStream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 /// Default llamafile server URL.
 pub const DEFAULT_HOST: &str = "http://127.0.0.1:8080";
+
+/// Stop tokens that some models (e.g. Gemma) append to their output.
+/// Strip these before returning to callers so they never appear in responses.
+const STOP_TOKENS: &[&str] = &["<end_of_turn>", "<|eot_id|>", "<|im_end|>"];
+
+fn strip_stop_tokens(mut s: String) -> String {
+    loop {
+        let trimmed = s.trim_end();
+        let mut changed = false;
+        for tok in STOP_TOKENS {
+            if let Some(without) = trimmed.strip_suffix(tok) {
+                s = without.trim_end().to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return s.trim_end().to_string();
+        }
+    }
+}
 
 /// Model name that llamafile reports in its responses.
 pub const DEFAULT_MODEL: &str = "LLaMA_CPP";
@@ -86,6 +108,22 @@ impl LlamafileProvider {
         self.temperature = t;
         self
     }
+
+    /// Build the OpenAI-format messages array from a system prompt + history.
+    fn build_oai_messages(system_prompt: &str, messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+        let mut oai = vec![serde_json::json!({ "role": "system", "content": system_prompt })];
+        for m in messages {
+            oai.push(serde_json::json!({
+                "role": match m.role {
+                    Role::User      => "user",
+                    Role::Assistant => "assistant",
+                    Role::System    => "system",
+                },
+                "content": m.content,
+            }));
+        }
+        oai
+    }
 }
 
 #[async_trait]
@@ -141,7 +179,7 @@ impl LlmProvider for LlamafileProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| strip_stop_tokens(c.message.content))
             .ok_or_else(|| anyhow!("llamafile returned no choices"))?;
 
         Ok(ChatMessage::assistant(content))
@@ -149,5 +187,78 @@ impl LlmProvider for LlamafileProvider {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Override with native OpenAI streaming (`stream: true`).
+    ///
+    /// Sends `"stream": true` in the request body and parses `data: {...}` SSE lines
+    /// from the response, yielding each token as it arrives.
+    fn stream_complete<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        messages: Vec<ChatMessage>,
+    ) -> TokenStream<'a> {
+        // Clone everything needed into owned values so the stream is self-contained.
+        let client   = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let model    = self.model.clone();
+        let temperature = self.temperature;
+        let max_tokens  = self.max_tokens;
+        let oai_messages = Self::build_oai_messages(system_prompt, &messages);
+
+        Box::pin(async_stream::stream! {
+            let body = serde_json::json!({
+                "model":       model,
+                "messages":    oai_messages,
+                "temperature": temperature,
+                "max_tokens":  max_tokens,
+                "stream":      true,
+            });
+
+            let resp = match client.post(&endpoint).json(&body).send().await {
+                Ok(r)  => r,
+                Err(e) => { yield Err(anyhow!("llamafile stream request failed: {}", e)); return; }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                yield Err(anyhow!("llamafile stream error {}: {}", status, text));
+                return;
+            }
+
+            let mut byte_stream = resp.bytes_stream();
+            let mut line_buf = String::new();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c)  => c,
+                    Err(e) => { yield Err(anyhow!("llamafile stream read error: {}", e)); return; }
+                };
+
+                line_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process all complete lines in the buffer.
+                while let Some(pos) = line_buf.find('\n') {
+                    let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                    line_buf = line_buf[pos + 1..].to_string();
+
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            return;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
+                                let token = strip_stop_tokens(token.to_string());
+                                if !token.is_empty() {
+                                    yield Ok(token);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 }

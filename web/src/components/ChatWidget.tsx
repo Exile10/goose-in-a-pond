@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { api, isPreviewMode } from '../api'
+import { useSettings } from '../context/SettingsContext'
 import { logActivity } from '../activityLog'
 
 // Minimal SpeechRecognition types (not in default TS lib)
@@ -38,6 +39,8 @@ interface Message {
   id: string
   role: 'user' | 'assistant'
   text: string
+  modelRole?: string   // 'chat' | 'think' | 'task' — which role handled this response
+  streaming?: boolean  // true while tokens are still arriving
 }
 
 interface Suggestion {
@@ -57,10 +60,9 @@ function getDeviceCount(): { total: number; active: number } {
   }
 }
 
-function greeting(): string {
+function buildGreeting(userName: string): string {
   const hour = new Date().getHours()
-  const name = localStorage.getItem('pond_display_name')?.trim()
-  const salutation = name ? `, ${name}` : ''
+  const salutation = userName.trim() ? `, ${userName.trim()}` : ''
   const { total, active } = getDeviceCount()
   const deviceLine = total > 0
     ? ` ${active} of your ${total} device${total !== 1 ? 's' : ''} ${active === 1 ? 'is' : 'are'} online and ready.`
@@ -94,8 +96,11 @@ function getSuggestions(): Suggestion[] {
 }
 
 export default function ChatWidget({ token }: Props) {
+  const { settings } = useSettings()
+  const userName = settings?.user_name ?? localStorage.getItem('pond_display_name') ?? ''
+
   const [messages, setMessages] = useState<Message[]>([
-    { id: '0', role: 'assistant', text: greeting() },
+    { id: '0', role: 'assistant', text: buildGreeting(localStorage.getItem('pond_display_name') ?? '') },
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -110,6 +115,17 @@ export default function ChatWidget({ token }: Props) {
   const suggestions = getSuggestions()
   const bottomRef = useRef<HTMLDivElement>(null)
   const recognitionRef = useRef<ISpeechRecognition | null>(null)
+
+  // Update greeting when settings load (only if the greeting message is still shown)
+  useEffect(() => {
+    if (!settings) return
+    setMessages(prev => {
+      if (prev.length === 1 && prev[0].id === '0' && prev[0].role === 'assistant') {
+        return [{ ...prev[0], text: buildGreeting(settings.user_name ?? '') }]
+      }
+      return prev
+    })
+  }, [settings?.user_name])
 
   // Load chat history from backend on mount
   useEffect(() => {
@@ -155,19 +171,23 @@ export default function ChatWidget({ token }: Props) {
     return () => window.removeEventListener('storage', onStorage)
   }, [])
 
-  function speak(text: string) {
-    if (muted || !window.speechSynthesis) return
-    window.speechSynthesis.cancel()
-    const utter = new SpeechSynthesisUtterance(text)
-    utter.lang = 'en-US'
-    window.speechSynthesis.speak(utter)
-  }
+  /**
+   * Synthesise speech via the server's TTS backend.
+   * Returns immediately if muted. Falls back silently if server TTS is unavailable.
+   */
+  const speakText = useCallback(async (text: string) => {
+    if (muted) return
+    const blobUrl = await api.speak(text, token)
+    if (!blobUrl) return
+    const audio = new Audio(blobUrl)
+    audio.onended = () => URL.revokeObjectURL(blobUrl)
+    void audio.play()
+  }, [muted, token])
 
   function toggleMute() {
     const next = !muted
     setMuted(next)
     localStorage.setItem('pond_tts_muted', String(next))
-    if (next) window.speechSynthesis?.cancel()
   }
 
   function toggleListening() {
@@ -201,30 +221,73 @@ export default function ChatWidget({ token }: Props) {
     setInput('')
     setLoading(true)
 
-    try {
-      if (isPreviewMode(token)) {
-        await new Promise(r => setTimeout(r, 600))
-        const reply = '(Preview mode — connect to a live server to get real responses.)'
-        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: reply }])
-        speak(reply)
-      } else {
-        const res = await api.chat(text, token, sessionId)
-        const newSessionId = res.session_id
+    if (isPreviewMode(token)) {
+      await new Promise(r => setTimeout(r, 600))
+      const reply = '(Preview mode — connect to a live server to get real responses.)'
+      setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: reply }])
+      setLoading(false)
+      return
+    }
+
+    const assistantMsgId = crypto.randomUUID()
+    let fullText = ''
+    let streamingStarted = false
+
+    await api.chatStream(
+      text,
+      token,
+      sessionId,
+      // onToken — called for each incremental token
+      (tokenText) => {
+        fullText += tokenText
+        if (!streamingStarted) {
+          streamingStarted = true
+          setLoading(false)
+          setMessages(prev => [
+            ...prev,
+            { id: assistantMsgId, role: 'assistant', text: tokenText, streaming: true },
+          ])
+        } else {
+          setMessages(prev => {
+            const idx = prev.findIndex(m => m.id === assistantMsgId)
+            if (idx === -1) return prev
+            const updated = { ...prev[idx], text: prev[idx].text + tokenText }
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)]
+          })
+        }
+      },
+      // onDone — called when the stream completes
+      (newSessionId, modelRole) => {
         setSessionId(newSessionId)
         localStorage.setItem('pond_chat_session_id', newSessionId)
-        const reply = res.response
-        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', text: reply }])
-        speak(reply)
-      }
-    } catch (err) {
-      setMessages(prev => [...prev, {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        text: `Error: ${err instanceof Error ? err.message : 'Failed to send message.'}`,
-      }])
-    } finally {
-      setLoading(false)
-    }
+        setMessages(prev => {
+          const idx = prev.findIndex(m => m.id === assistantMsgId)
+          if (idx === -1) return prev
+          const updated = { ...prev[idx], modelRole, streaming: false }
+          return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)]
+        })
+        setLoading(false)
+        void speakText(fullText)
+      },
+      // onError — called on network or LLM failure
+      (err) => {
+        const errText = `Error: ${err}`
+        if (!streamingStarted) {
+          setMessages(prev => [
+            ...prev,
+            { id: assistantMsgId, role: 'assistant', text: errText },
+          ])
+        } else {
+          setMessages(prev => {
+            const idx = prev.findIndex(m => m.id === assistantMsgId)
+            if (idx === -1) return prev
+            const updated = { ...prev[idx], text: errText, streaming: false }
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)]
+          })
+        }
+        setLoading(false)
+      },
+    )
   }
 
   async function handleSend(e: React.FormEvent) {
@@ -243,8 +306,7 @@ export default function ChatWidget({ token }: Props) {
   }
 
   function clearChat() {
-    window.speechSynthesis?.cancel()
-    setMessages([{ id: crypto.randomUUID(), role: 'assistant', text: greeting() }])
+    setMessages([{ id: crypto.randomUUID(), role: 'assistant', text: buildGreeting(userName) }])
     setShowSuggestions(true)
     setInput('')
     setSessionId(undefined)
@@ -338,7 +400,27 @@ export default function ChatWidget({ token }: Props) {
       <div className="db-chat-messages">
         {messages.map(msg => (
           <div key={msg.id} className={`db-chat-msg db-chat-msg-${msg.role}`}>
-            <span className="db-chat-bubble">{msg.text}</span>
+            {msg.role === 'assistant' && msg.modelRole && msg.modelRole !== 'chat' && (
+              <div style={{ marginBottom: '0.2rem' }}>
+                <span style={{
+                  fontSize: '0.65rem',
+                  fontWeight: 600,
+                  opacity: 0.55,
+                  padding: '0.1rem 0.45rem',
+                  borderRadius: '20px',
+                  border: '1px solid rgba(169,111,245,0.3)',
+                  color: '#a96ff5',
+                  background: 'rgba(169,111,245,0.08)',
+                  letterSpacing: '0.04em',
+                }}>
+                  {msg.modelRole === 'think' ? '🧠 Think' : '⚙️ Task'}
+                </span>
+              </div>
+            )}
+            <span className="db-chat-bubble">
+              {msg.text}
+              {msg.streaming && <span className="db-chat-cursor" />}
+            </span>
           </div>
         ))}
 

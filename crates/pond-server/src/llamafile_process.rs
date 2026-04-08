@@ -14,8 +14,6 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Child;
 
-use crate::model_download;
-
 // ── Guard ─────────────────────────────────────────────────────────────────────
 
 /// Holds the spawned llamafile child process.  Kills it on drop.
@@ -44,13 +42,18 @@ pub async fn is_running(port: u16) -> bool {
 
 /// Find the first downloaded llamafile model in `<data_dir>/models/llm/`.
 ///
-/// Searches in `LLAMAFILE_MODELS` order (lightest first).
+/// Scans the directory for any `.llamafile` (or `.llamafile.exe` on Windows) file.
 pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
-    for info in model_download::LLAMAFILE_MODELS {
-        if let Ok(path) = model_download::llamafile_path(data_dir, info.name) {
-            if path.exists() {
-                return Some(path);
-            }
+    let llm_dir = data_dir.join("models").join("llm");
+    let entries = std::fs::read_dir(&llm_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_llamafile = name.ends_with(".llamafile")
+            || name.ends_with(".llamafile.exe");
+        if is_llamafile {
+            return Some(path);
         }
     }
     None
@@ -109,9 +112,13 @@ pub fn url_for(port: u16) -> String {
 /// The base port is [`crate::ports::LLAMAFILE`].  If busy, the next port in
 /// arithmetic sequence is tried automatically.
 ///
+/// `preferred_model` is the on-disk path for the model configured in Settings.
+/// If it exists it is started directly; otherwise `find_model` is used as a
+/// fallback so a previously-downloaded model is still used rather than nothing.
+///
 /// Returns `Some((guard, port))` with the actual port the process was started
 /// on, or `None` if already running (port = base) or no model was found.
-pub async fn try_start(data_dir: &Path) -> Option<(LlamafileProcess, u16)> {
+pub async fn try_start(data_dir: &Path, preferred_model: Option<&Path>) -> Option<(LlamafileProcess, u16)> {
     let base_port = crate::ports::LLAMAFILE;
 
     if is_running(base_port).await {
@@ -130,7 +137,13 @@ pub async fn try_start(data_dir: &Path) -> Option<(LlamafileProcess, u16)> {
         }
     };
 
-    let model = match find_model(data_dir) {
+    // Prefer the configured model; fall back to any downloaded model.
+    let model = preferred_model
+        .filter(|p| p.exists())
+        .map(|p| p.to_path_buf())
+        .or_else(|| find_model(data_dir));
+
+    let model = match model {
         Some(p) => p,
         None => {
             println!("  ⚠  No LLM model found — run `pond-server setup` to download one.");

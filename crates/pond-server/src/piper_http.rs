@@ -155,6 +155,7 @@ pub async fn start(
 }
 
 /// Returns `true` if a piper-http server is already responding on `port`.
+#[allow(dead_code)]
 pub async fn is_running(port: u16) -> bool {
     reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/tts"))

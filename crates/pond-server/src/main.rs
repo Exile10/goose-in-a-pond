@@ -17,9 +17,11 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
+mod filesystem_model_storage;
+mod http_model_catalog_provider;
+mod http_model_downloader;
 mod llamafile_process;
 mod model_download;
-mod model_registry;
 mod piper_http;
 mod piper_process;
 mod ports;
@@ -61,7 +63,10 @@ use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
+use pond_infra::sqlite_model_repository::SqliteModelRepository;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
+use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+use pond_core::ports::model_repository::ModelRepository;
 use std::sync::Arc;
 use pond_core::services::onboarding::OnboardingService;
 use pond_core::domain::onboarding::OnboardingStep;
@@ -125,16 +130,18 @@ enum Commands {
 
         /// Enable voice-based wake word detection (requires --input whisper).
         /// Say the trigger phrase to activate the assistant before each turn.
-        #[arg(long, default_value = "goose")]
+        /// Defaults to the wake word stored in Settings.
+        #[arg(long)]
         wake_word: Option<String>,
 
         /// Disable wake word detection (jump straight to listen on each turn).
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: qwen (default), piper, or none (print only)
-        #[arg(long, default_value = "qwen")]
-        tts: String,
+        /// Text-to-speech engine: qwen, piper, or none (print only).
+        /// Defaults to the active TTS model stored in Settings.
+        #[arg(long)]
+        tts: Option<String>,
 
         /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
         #[arg(long)]
@@ -149,6 +156,34 @@ enum Commands {
         /// Reset and restart onboarding from scratch
         #[arg(long)]
         reset: bool,
+    },
+
+    /// Browse and manage AI models
+    Models {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// List all models in the catalog (grouped by category)
+    List {
+        /// Filter by category: gguf | llamafile | whisper | tts | ollama
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Download a model to disk
+    Download { category: String, name: String },
+    /// Delete a model file from disk (catalog record kept)
+    Delete { category: String, name: String },
+    /// Assign a model to a role
+    Activate {
+        category: String,
+        name: String,
+        /// Role to assign: chat | think | task | asr | tts
+        #[arg(long)]
+        role: String,
     },
 }
 
@@ -167,7 +202,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
-            run_chat(provider.as_deref(), model.as_deref(), &input, wake_word.as_deref(), no_wake_word, &tts, tts_model).await
+            run_chat(provider.as_deref(), model.as_deref(), &input, wake_word.as_deref(), no_wake_word, tts.as_deref(), tts_model).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -178,10 +213,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Commands::Models { action }) => {
+            run_models(action).await
+        }
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             init_tracing(false);
-            run_chat(None, None, "stdin", None, true, "none", None).await
+            run_chat(None, None, "stdin", None, true, Some("none"), None).await
         }
     }
 }
@@ -219,7 +257,7 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  📂 Data directory: {}", data_dir.display());
 
     // Step 1: Check + auto-install system dependencies (Linux/macOS only)
-    println!("\n  [1/7] Checking system dependencies...");
+    println!("\n  [1/6] Checking system dependencies...");
     if system_deps::ensure_system_deps().await {
         println!("  ✅ System dependencies OK");
     } else {
@@ -227,63 +265,81 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("     Continuing setup; some features may not work until deps are installed.");
     }
 
-    // Step 2: Initialize databases
-    println!("\n  [2/7] Initializing databases...");
-    Database::init(&data_dir).await?;
+    // Step 2: Initialize databases + seed model catalog
+    println!("\n  [2/6] Initializing databases...");
+    let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
-    // Step 3: Download Whisper ASR model
-    let effective_model = if model.is_empty() {
-        model_download::DEFAULT_WHISPER_MODEL
-    } else {
-        model
+    let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
+    let setup_settings = SqliteSettingsRepository::new(db_setup.system.clone())
+        .get().await.unwrap_or_default();
+    println!("  📋 Fetching model catalog from {}...", setup_settings.model_registry_url);
+    seed_model_catalog(&setup_model_repo, &setup_settings.model_registry_url, &data_dir).await;
+
+    // Step 3: Download Whisper ASR model from catalog URL
+    let effective_model = if model.is_empty() { "base" } else { model };
+    let (expected_path, whisper_dl_url, whisper_dl_mb) = {
+        use crate::filesystem_model_storage::FilesystemModelStorage;
+        use pond_core::ports::model_storage::ModelStorage as _;
+        let storage = FilesystemModelStorage::new(&data_dir);
+        let model_id = format!("whisper/{}", effective_model);
+        match setup_model_repo.get_by_id(&model_id).await.ok().flatten() {
+            Some(r) => {
+                let path = storage.path_for(&r)
+                    .unwrap_or_else(|| data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model)));
+                (path, r.url.unwrap_or_default(), r.size_mb)
+            }
+            None => {
+                let path = data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model));
+                (path, String::new(), 0u64)
+            }
+        }
     };
-    let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [3/7] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [3/6] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
-    let _model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
+    if expected_path.exists() {
+        println!("  ✅ Already downloaded: {}", expected_path.display());
+    } else if !whisper_dl_url.is_empty() {
+        if let Some(parent) = expected_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        model_download::download_file(&whisper_dl_url, &expected_path, whisper_dl_mb).await?;
+    } else {
+        println!("  ⚠  Model '{}' not found in catalog — skipping download", effective_model);
+    }
 
     // Step 4: Download whisper-server binary
-    println!("\n  [4/7] Downloading whisper-server binary...");
+    println!("\n  [4/6] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
     // Step 5: TTS — try Qwen first; if it fails, ensure Piper is fully set up.
-    println!("\n  [5/7] Setting up TTS...");
+    println!("\n  [5/6] Setting up TTS...");
     let qwen_ok = qwen_tts_process::setup_install(&data_dir).await;
 
-    // Step 6: Piper TTS — always set up (primary when Qwen unavailable, fallback otherwise)
-    println!("\n  [6/7] Setting up Piper TTS{}...",
+    // Step 6: Piper TTS binary — voice model is selected via the web Settings page
+    println!("\n  [6/6] Setting up Piper TTS binary{}...",
         if qwen_ok { " (fallback)" } else { " (primary — Qwen unavailable)" });
     let piper_bin_ok = model_download::download_piper_binary(&data_dir).await.is_ok();
-    let piper_model_ok = model_download::download_piper_model(&data_dir).await.is_ok();
-    if !qwen_ok && (!piper_bin_ok || !piper_model_ok) {
-        println!("  ⚠  Both Qwen TTS and Piper failed — voice output will be text-only.");
-    }
-
-    // Step 7: Download default LLM (Gemma 2 2B via llamafile)
-    println!(
-        "\n  [7/7] Downloading LLM model ({})...",
-        model_download::DEFAULT_LLAMAFILE_MODEL
-    );
-    match model_download::download_llamafile_model(
-        model_download::DEFAULT_LLAMAFILE_MODEL,
-        &data_dir,
-    )
-    .await
-    {
-        Ok(p) => println!("  ✅ LLM model ready: {}", p.display()),
-        Err(e) => println!("  ⚠  Could not download LLM model: {}", e),
+    if !qwen_ok && !piper_bin_ok {
+        println!("  ⚠  Both Qwen TTS and Piper binary unavailable — voice output will be text-only.");
+        println!("     Install piper manually or retry setup.");
+    } else if piper_bin_ok {
+        println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
     println!();
-    println!("  Run the server (all AI components start automatically):");
+    println!("  1. Run the server:");
     println!("       pond-server serve");
     println!();
-    println!("  Or run interactive CLI chat with voice + TTS:");
-    println!("       pond-server chat --provider llamafile --input whisper --tts piper");
+    println!("  2. Open the web UI and go to Models to download an LLM.");
+    println!("     Then go to Settings to configure voice, TTS voice model,");
+    println!("     and assign model roles (chat / think / task).");
+    println!();
+    println!("  Or run interactive CLI chat (configure voice + TTS via Settings first):");
+    println!("       pond-server chat --input whisper");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
@@ -303,83 +359,157 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Soft system-dep check (non-fatal — just warn if something looks wrong)
     system_deps::warn_if_missing();
 
-    // ── Load registry + settings early (drives model selection) ─────────────
-    let registry = model_registry::ModelRegistry::load_cached(&data_dir);
+    // ── Load settings early (drives model selection) ─────────────────────────
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
 
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
-    // STT — whisper.cpp binary + model (use active_whisper_model from settings)
-    let active_whisper = registry
-        .find_whisper(&settings.active_whisper_model)
-        .unwrap_or_else(|| registry.whisper.first().expect("registry has no whisper models"));
-    let whisper_model = data_dir.join("models").join(&active_whisper.filename);
-    if !whisper_model.exists() {
-        println!("  📥 STT model not found — downloading ({})...", active_whisper.name);
-        match model_download::download_whisper_model(&active_whisper.name, &data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  STT model download failed: {}", e),
+    // STT — whisper.cpp binary + model (only when active_whisper_model is configured)
+    // Guard is held for the server lifetime; port is used to build the URL below.
+    let (_whisper_guard, whisper_port) = if settings.active_whisper_model.is_empty() {
+        println!("  ⏭  STT: whisper skipped (no whisper model configured in Settings)");
+        (None, ports::WHISPER)
+    } else {
+        // Derive filename and download URL from the model catalog DB.
+        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("whisper/{}", settings.active_whisper_model)).await.ok().flatten()
+            .map(|r| (
+                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", &settings.active_whisper_model)),
+                r.url.unwrap_or_default(),
+                r.size_mb,
+            ))
+            .unwrap_or_else(|| (
+                format!("ggml-{}.en.bin", &settings.active_whisper_model),
+                String::new(),
+                0u64,
+            ));
+        let whisper_model = data_dir.join("models").join(&whisper_filename);
+        if !whisper_model.exists() {
+            println!("  📥 STT model not found — downloading ({})...", settings.active_whisper_model);
+            if !whisper_url.is_empty() {
+                if let Some(parent) = whisper_model.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
+                    Ok(_) => {}
+                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                }
+            } else {
+                println!("  ⚠  STT model '{}' not in catalog — cannot download", settings.active_whisper_model);
+            }
         }
-    }
-    if !model_download::whisper_binary_path(&data_dir).exists() {
-        println!("  📥 STT binary not found — downloading...");
-        match model_download::download_whisper_binary(&data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  STT binary download failed: {}", e),
+        if !model_download::whisper_binary_path(&data_dir).exists() {
+            println!("  📥 STT binary not found — downloading...");
+            match model_download::download_whisper_binary(&data_dir).await {
+                Ok(_) => {}
+                Err(e) => println!("  ⚠  STT binary download failed: {}", e),
+            }
         }
-    }
-    let (_whisper_guard, whisper_port) = whisper_process::try_start(&data_dir, &whisper_model).await;
-    let whisper_url = whisper_process::url_for(whisper_port);
+        whisper_process::try_start(&data_dir, &whisper_model).await
+    };
+    // When the user has set a custom whisper URL (not the default 127.0.0.1:9000),
+    // honour it — this lets users point at an external whisper server.
+    // Otherwise use the auto-started local process URL.
+    const DEFAULT_WHISPER_URL: &str = "http://127.0.0.1:9000";
+    let whisper_url = if !settings.voice_whisper_url.is_empty()
+        && settings.voice_whisper_url != DEFAULT_WHISPER_URL
+    {
+        settings.voice_whisper_url.clone()
+    } else {
+        whisper_process::url_for(whisper_port)
+    };
 
     // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
     // try_start returns (process, confirmed_running). If it was already running before
     // we called try_start (returns None), fall back to a live is_running check.
     let (_qwen_tts_guard, qwen_tts_url, qwen_tts_available) =
-        match qwen_tts_process::try_start(&data_dir).await {
+        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
             Some((proc, port, confirmed)) => {
                 (Some(proc), qwen_tts_process::url_for(port), confirmed)
             }
             None => {
-                let url = qwen_tts_process::url_for(ports::QWEN_TTS);
+                // Prefer settings URL if the user configured a custom Qwen TTS server.
+                const DEFAULT_QWEN_URL: &str = "http://127.0.0.1:8181";
+                let url = if !settings.voice_tts_http_url.is_empty()
+                    && settings.voice_tts_http_url != DEFAULT_QWEN_URL
+                {
+                    settings.voice_tts_http_url.clone()
+                } else {
+                    qwen_tts_process::url_for(ports::QWEN_TTS)
+                };
                 let running = qwen_tts_process::is_running(&url).await;
                 (None, url, running)
             }
         };
 
-    let piper_model = model_download::tts_models_dir(&data_dir)
-        .join(model_download::PIPER_MODEL_FILENAME);
+    // Piper voice path — None when no voice is configured (skips all piper startup).
+    // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
+    // do not fall back to a hardcoded default.
+    let piper_model: Option<std::path::PathBuf> = if settings.voice_tts_voice.is_empty() {
+        None
+    } else {
+        Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
+    };
 
-    // Ensure piper binary + model + espeak-ng-data are present.
-    if !model_download::piper_binary_path(&data_dir).exists() {
-        let _ = model_download::download_piper_binary(&data_dir).await;
+    // Only download/install piper components when piper is the configured active TTS
+    // AND a specific voice model has been chosen by the user.
+    let piper_is_primary = settings.active_tts_model.starts_with("piper");
+    if piper_is_primary {
+        if let Some(ref piper_model_path) = piper_model {
+            if !model_download::piper_binary_path(&data_dir).exists() {
+                println!("  📥 Piper binary not found — downloading...");
+                let _ = model_download::download_piper_binary(&data_dir).await;
+            }
+            if !piper_model_path.exists() {
+                // Look up the exact voice in the DB to get the correct download URL.
+                let voice_filename = &settings.voice_tts_voice;
+                let registry_entry = SqliteModelRepository::new(db.system.clone())
+                    .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.filename.as_deref() == Some(voice_filename.as_str()))
+                    .and_then(|m| {
+                        let mf = m.filename?;
+                        let cf = m.config_filename?;
+                        let mu = m.url?;
+                        let cu = m.config_url?;
+                        Some((mf, cf, mu, cu, m.size_mb))
+                    });
+                if let Some((mf, cf, mu, cu, sz)) = registry_entry {
+                    let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                } else {
+                    println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                }
+            }
+            model_download::ensure_espeak_ng_data(&data_dir).await;
+        } else {
+            println!("  ⏭  Piper: active_tts_model=piper but no voice model configured — configure one in Settings");
+        }
     }
-    if !piper_model.exists() {
-        let _ = model_download::download_piper_model(&data_dir).await;
-    }
-    // Always ensure espeak-ng-data is present (maybe missing after source build).
-    model_download::ensure_espeak_ng_data(&data_dir).await;
 
     // Start piper as a persistent HTTP server so it shows up in the service list.
+    // Only starts when both the binary and a configured voice model are present on disk.
     let espeak_data = {
         let p = model_download::piper_espeak_data_path(&data_dir);
         if p.exists() { Some(p) } else { None }
     };
+    let mut piper_http_port: Option<u16> = None;
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
-        match piper_process::find_binary(&data_dir) {
-            Some(bin) if piper_model.exists() => {
+        match (piper_process::find_binary(&data_dir), &piper_model) {
+            (Some(bin), Some(model_path)) if model_path.exists() => {
                 let ed = espeak_data.clone();
-                match piper_http::start(bin.clone(), piper_model.clone(), ed).await {
+                match piper_http::start(bin.clone(), model_path.clone(), ed).await {
                     Ok(port) => {
                         println!("  ✅ Piper TTS running on port {}", port);
-                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        piper_http_port = Some(port);
+                        let mut out = PiperOutput::new(bin, model_path.clone());
                         if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
                         Some(Arc::new(out))
                     }
                     Err(e) => {
                         tracing::warn!("piper-http failed to start: {e}");
-                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        let mut out = PiperOutput::new(bin, model_path.clone());
                         if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
                         Some(Arc::new(out))
                     }
@@ -416,36 +546,53 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         }
     };
 
-    // LLM — llamafile auto-download + auto-start (use active_llm_model from settings)
-    let active_llm = registry
-        .find_llamafile(&settings.active_llm_model)
-        .unwrap_or_else(|| registry.llamafile.first().expect("registry has no llamafile models"));
-    let llm_model_path = llamafile_process::find_model(&data_dir);
-    if llm_model_path.is_none() {
-        println!("  📥 LLM model not found — downloading {}...", active_llm.name);
-        match model_download::download_llamafile_model(&active_llm.name, &data_dir).await {
-            Ok(_)  => {}
-            Err(e) => println!("  ⚠  LLM download failed: {}", e),
+    // LLM — only download + start llamafile when at least one role is configured to use it.
+    let any_role_needs_llamafile = settings.chat_provider == "llamafile"
+        || settings.think_provider.as_deref() == Some("llamafile")
+        || settings.task_provider.as_deref()  == Some("llamafile");
+
+    let active_llm_name: String = settings.chat_model.clone();
+    let (_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
+        // Resolve the on-disk path for the configured model from the catalog DB.
+        use pond_core::ports::model_storage::ModelStorage as _;
+        let fs_storage = crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir);
+        let llm_record = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("llamafile/{}", active_llm_name)).await.ok().flatten();
+        let configured_llm_path = llm_record.as_ref().and_then(|r| fs_storage.path_for(r));
+        if configured_llm_path.as_ref().map_or(true, |p| !p.exists()) {
+            println!("  📥 LLM model not found — downloading {}...", active_llm_name);
+            if let Some(ref record) = llm_record {
+                if let (Some(url), Some(path)) = (record.url.as_deref(), configured_llm_path.as_ref()) {
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    match model_download::download_file(url, path, record.size_mb).await {
+                        Ok(_)  => {}
+                        Err(e) => println!("  ⚠  LLM download failed: {}", e),
+                    }
+                }
+            } else {
+                println!("  ⚠  LLM model '{}' not in catalog — cannot download", active_llm_name);
+            }
         }
-    }
-    let (_llamafile_guard, llamafile_port) =
-        match llamafile_process::try_start(&data_dir).await {
+        match llamafile_process::try_start(&data_dir, configured_llm_path.as_deref()).await {
             Some((proc, port)) => (Some(proc), port),
             None => (None, ports::LLAMAFILE),
-        };
+        }
+    } else {
+        println!("  ⏭  LLM: llamafile skipped (provider = {})", settings.chat_provider);
+        (None, ports::LLAMAFILE)
+    };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     println!("  ────────────────────────────────────────────────────\n");
 
-    // Build model status snapshot for API
-    let model_status_entries = model_registry::build_model_status(
-        &registry,
-        &settings.active_whisper_model,
-        &settings.active_llm_model,
-        &settings.active_tts_model,
-        &data_dir,
+    // ── Persistent model catalog ─────────────────────────────────────────────
+    let model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
+        SqliteModelRepository::new(db.system.clone())
     );
-    let model_status = Arc::new(tokio::sync::RwLock::new(model_status_entries));
+    seed_model_catalog(&*model_repo, &settings.model_registry_url, &data_dir).await;
+    sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
@@ -464,17 +611,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
-    // ── One-time migration: bootstrap role fields from legacy single-model settings ──
-    // If chat_model is empty (new fields not yet persisted), copy active_llm_model
-    // and llm_provider so existing installs don't need to visit Settings.
-    let (effective_chat_provider, effective_chat_model) =
-        if settings.chat_model.is_empty() {
-            let _ = settings_repo.set_key("chat_provider", settings.llm_provider.clone()).await;
-            let _ = settings_repo.set_key("chat_model",    settings.active_llm_model.clone()).await;
-            (settings.llm_provider.clone(), settings.active_llm_model.clone())
-        } else {
-            (settings.chat_provider.clone(), settings.chat_model.clone())
-        };
+    let effective_chat_provider = settings.chat_provider.clone();
+    let effective_chat_model    = settings.chat_model.clone();
 
     // ── Build per-role LLM providers ────────────────────────────────────────
     // Each role (Chat / Think / Task) may use a different provider + model.
@@ -515,9 +653,10 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             chat_provider_arc.clone()
         };
 
-    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(Arc::new(
-        ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc)
-    ));
+    let llm_provider = Arc::new(tokio::sync::RwLock::new(Some(
+        Arc::new(ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc))
+            as Arc<dyn LlmProvider>
+    )));
 
     let db = Arc::new(db);
 
@@ -653,6 +792,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         http_client: reqwest::Client::new(),
         agent,
         llm_provider,
+        llamafile_url: llamafile_url.clone(),
         tts,
         settings_repo,
         profile_repo,
@@ -662,7 +802,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
-        model_status: Some(model_status),
+        model_repo: Some(model_repo),
         data_dir: Some(data_dir.clone()),
         skip_onboarding: false,
         scheduler,
@@ -671,6 +811,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         extension_manager,
         mcp_server_repo,
         qwen_tts_url: if qwen_tts_available { Some(qwen_tts_url.clone()) } else { None },
+        download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port,
+        model_catalog_provider: Some(Arc::new(
+            crate::http_model_catalog_provider::HttpModelCatalogProvider::new()
+        )),
+        model_storage_dir: Some(data_dir.clone()),
     });
 
     // Warn if static assets haven't been built yet
@@ -720,7 +866,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     Ok(())
 }
 
-async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
+async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: Option<&str>, tts_model: Option<std::path::PathBuf>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
@@ -731,26 +877,62 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         .join("goose-in-a-pond");
     let db = Database::init(&data_dir).await?;
 
-    // Load settings early — drives provider, model, token budget, temperature, and wake word.
+    // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_chat.get().await.unwrap_or_default();
 
-    // CLI args override settings; settings override built-in defaults.
-    let effective_provider = provider.unwrap_or(settings.llm_provider.as_str());
-    let effective_model    = model.unwrap_or(settings.active_llm_model.as_str());
+    // CLI args override settings; settings provide the defaults from the chat role.
+    let settings_provider = settings.chat_provider.clone();
+    let effective_provider: &str = provider.unwrap_or(&settings_provider);
+
+    let settings_model = settings.chat_model.clone();
+    let effective_model: &str = model.unwrap_or(&settings_model);
+    // Resolve TTS engine from CLI flag or settings. Normalise piper-* variants to "piper".
+    let effective_tts_owned: String;
+    let effective_tts: &str = match tts {
+        Some(t) => t,
+        None => {
+            effective_tts_owned = if settings.active_tts_model.starts_with("piper") {
+                "piper".to_string()
+            } else {
+                settings.active_tts_model.clone()
+            };
+            &effective_tts_owned
+        }
+    };
     println!("  Provider: {} (model: {})", effective_provider, effective_model);
 
     // Auto-start whisper.cpp when voice input is requested.
     let mut whisper_port = ports::WHISPER;
     let _whisper_guard = if input == "whisper" {
-        let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
-            .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
+        let whisper_model_name = settings.active_whisper_model.as_str();
+        // Look up filename and URL from the catalog DB.
+        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("whisper/{}", whisper_model_name)).await.ok().flatten()
+            .map(|r| (
+                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name)),
+                r.url.unwrap_or_default(),
+                r.size_mb,
+            ))
+            .unwrap_or_else(|| (
+                format!("ggml-{}.en.bin", whisper_model_name),
+                String::new(),
+                0u64,
+            ));
+        let whisper_model = data_dir.join("models").join(&whisper_filename);
         if !whisper_model.exists() {
-            println!("  📥 STT model not found — downloading ({})...", model_download::DEFAULT_WHISPER_MODEL);
-            match model_download::download_whisper_model(model_download::DEFAULT_WHISPER_MODEL, &data_dir).await {
-                Ok(_)  => {}
-                Err(e) => println!("  ⚠  STT model download failed: {}", e),
+            println!("  📥 STT model not found — downloading ({})...", whisper_model_name);
+            if !whisper_url.is_empty() {
+                if let Some(parent) = whisper_model.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
+                    Ok(_)  => {}
+                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                }
+            } else {
+                println!("  ⚠  STT model '{}' not in catalog — cannot download", whisper_model_name);
             }
         }
         let (guard, port) = whisper_process::try_start(&data_dir, &whisper_model).await;
@@ -761,21 +943,36 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     let whisper_url = whisper_process::url_for(whisper_port);
 
-    // Auto-start llamafile for all providers except ollama and local (which manage their own process).
-    // llamafile is the default and fallback — always start it unless a remote/in-process provider is used.
+    // Auto-start llamafile only when the provider is explicitly "llamafile".
+    // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
     let mut llamafile_port = ports::LLAMAFILE;
-    let _llamafile_guard = if effective_provider != "ollama" && effective_provider != "local" {
-        if llamafile_process::find_model(&data_dir).is_none() {
-            println!("  📥 LLM model not found — downloading {}...",
-                model_download::DEFAULT_LLAMAFILE_MODEL);
-            match model_download::download_llamafile_model(
-                model_download::DEFAULT_LLAMAFILE_MODEL, &data_dir,
-            ).await {
-                Ok(_)  => {}
-                Err(e) => println!("  ⚠  LLM download failed: {}", e),
+    let _llamafile_guard = if effective_provider == "llamafile" {
+        // Resolve path from the catalog DB; fall back to treating effective_model as a direct path.
+        use pond_core::ports::model_storage::ModelStorage as _;
+        let fs_storage_chat = crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir);
+        let llm_record_chat = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("llamafile/{}", effective_model)).await.ok().flatten();
+        let configured_llm_path = llm_record_chat.as_ref().and_then(|r| fs_storage_chat.path_for(r));
+        if let Some(ref path) = configured_llm_path {
+            if !path.exists() {
+                println!("  📥 LLM model not found — downloading {}...", effective_model);
+                if let Some(ref record) = llm_record_chat {
+                    if let Some(url) = record.url.as_deref() {
+                        if let Some(parent) = path.parent() {
+                            let _ = tokio::fs::create_dir_all(parent).await;
+                        }
+                        match model_download::download_file(url, path, record.size_mb).await {
+                            Ok(_)  => {}
+                            Err(e) => println!("  ⚠  LLM download failed: {}", e),
+                        }
+                    }
+                }
             }
+        } else {
+            // Model name not in the catalog — treat effective_model as a direct file path.
+            println!("  ℹ  Model '{}' not in catalog — using as direct path", effective_model);
         }
-        match llamafile_process::try_start(&data_dir).await {
+        match llamafile_process::try_start(&data_dir, configured_llm_path.as_deref()).await {
             Some((proc, port)) => { llamafile_port = port; Some(proc) }
             None => None,
         }
@@ -825,6 +1022,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         }
     };
 
+    let db_system = db.system.clone();
     let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
@@ -882,7 +1080,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             // "llamafile" and any unrecognised value — use the llamafile process started above.
             println!(
                 "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
-                pond_adapters_llamafile::DEFAULT_MODEL,
+                effective_model,
                 llamafile_url,
                 settings.llm_max_tokens,
                 settings.llm_temperature,
@@ -921,8 +1119,8 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
 
     // Auto-start Qwen TTS server before the match (guard must outlive voice_out).
     let mut qwen_chat_port = ports::QWEN_TTS;
-    let _qwen_tts_chat_guard = if tts == "qwen" || tts == "qwen-tts" {
-        match qwen_tts_process::try_start(&data_dir).await {
+    let _qwen_tts_chat_guard = if effective_tts == "qwen" || effective_tts == "qwen-tts" {
+        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
             Some((proc, port, _confirmed)) => { qwen_chat_port = port; Some(proc) }
             None => None,
         }
@@ -932,58 +1130,87 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     let qwen_chat_url = qwen_tts_process::url_for(qwen_chat_port);
 
     // ── Wire TTS output ──
-    let voice_out: Arc<dyn VoiceOutput> = match tts {
+    let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "qwen" | "qwen-tts" => {
             let qwen = Arc::new(QwenTtsOutput::new(Some(&qwen_chat_url)));
 
-            // Build piper if available (auto-download if needed).
-            let piper_model = data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME);
-            if piper_process::find_binary(&data_dir).is_none() {
-                let _ = model_download::download_piper_binary(&data_dir).await;
-            }
-            if !piper_model.exists() {
-                let _ = model_download::download_piper_model(&data_dir).await;
-            }
-            match piper_process::find_binary(&data_dir) {
-                Some(bin) if piper_model.exists() => {
-                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
-                    Arc::new(FallbackVoiceOutput::new(
-                        qwen as Arc<dyn VoiceOutput>,
-                        Arc::new(PiperOutput::new(bin, piper_model)),
-                    ))
+            // Offer piper as a silent fallback only when already installed on disk.
+            // Never auto-download piper for this path — user must configure piper explicitly.
+            let piper_opt: Option<Arc<dyn VoiceOutput>> = if !settings.voice_tts_voice.is_empty() {
+                let model_path = model_download::tts_models_dir(&data_dir)
+                    .join(&settings.voice_tts_voice);
+                match piper_process::find_binary(&data_dir) {
+                    Some(bin) if model_path.exists() => {
+                        Some(Arc::new(PiperOutput::new(bin, model_path)))
+                    }
+                    _ => None,
                 }
-                _ => {
+            } else {
+                None
+            };
+            match piper_opt {
+                Some(piper) => {
+                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
+                    Arc::new(FallbackVoiceOutput::new(qwen as Arc<dyn VoiceOutput>, piper))
+                }
+                None => {
                     println!("  TTS:      qwen-tts");
                     qwen as Arc<dyn VoiceOutput>
                 }
             }
         }
         "piper" => {
-            let model_path = tts_model.unwrap_or_else(|| {
-                data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME)
-            });
-            if piper_process::find_binary(&data_dir).is_none() {
-                println!("  📥 TTS binary not found — downloading...");
-                match model_download::download_piper_binary(&data_dir).await {
-                    Ok(_)  => {}
-                    Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
-                }
-            }
-            if !model_path.exists() {
-                println!("  📥 TTS model not found — downloading...");
-                match model_download::download_piper_model(&data_dir).await {
-                    Ok(_)  => {}
-                    Err(e) => println!("  ⚠  TTS model download failed: {}", e),
-                }
-            }
-            match piper_process::find_binary(&data_dir) {
-                Some(bin) => {
-                    println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
-                    Arc::new(PiperOutput::new(bin, model_path))
-                }
-                None => {
-                    println!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                    Arc::new(PrintOutput)
+            // Resolve model path: CLI arg → settings → warn and fall back to text
+            let model_path_opt: Option<std::path::PathBuf> = if let Some(p) = tts_model {
+                Some(p)
+            } else if !settings.voice_tts_voice.is_empty() {
+                Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
+            } else {
+                println!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
+                println!("     Set a piper voice in the web UI, then restart. Using text output.");
+                None
+            };
+            match model_path_opt {
+                None => Arc::new(PrintOutput),
+                Some(model_path) => {
+                    if piper_process::find_binary(&data_dir).is_none() {
+                        println!("  📥 TTS binary not found — downloading...");
+                        match model_download::download_piper_binary(&data_dir).await {
+                            Ok(_)  => {}
+                            Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                        }
+                    }
+                    if !model_path.exists() {
+                        println!("  📥 TTS model not found — downloading configured voice...");
+                        // Look up in DB by filename to get the correct download URL.
+                        let voice_filename = settings.voice_tts_voice.as_str();
+                        let registry_entry = SqliteModelRepository::new(db_system.clone())
+                            .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                            .into_iter()
+                            .find(|m| m.filename.as_deref() == Some(voice_filename))
+                            .and_then(|m| {
+                                let mf = m.filename?;
+                                let cf = m.config_filename?;
+                                let mu = m.url?;
+                                let cu = m.config_url?;
+                                Some((mf, cf, mu, cu, m.size_mb))
+                            });
+                        if let Some((mf, cf, mu, cu, sz)) = registry_entry {
+                            let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                        } else {
+                            println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                        }
+                    }
+                    match piper_process::find_binary(&data_dir) {
+                        Some(bin) => {
+                            println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
+                            Arc::new(PiperOutput::new(bin, model_path))
+                        }
+                        None => {
+                            println!("  TTS:      piper unavailable (binary not found) — falling back to print");
+                            Arc::new(PrintOutput)
+                        }
+                    }
                 }
             }
         }
@@ -1124,7 +1351,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(None, None, "stdin", None, true, "none", None).await?;
+                run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
             }
             "2" => {
                 run_server(std::path::PathBuf::from("web/dist"), false, false, "goose").await?;
@@ -1275,7 +1502,7 @@ async fn run_onboard(reset: bool) -> Result<()> {
             Some(OnboardingStep::Model) => {
                 println!("Step: AI Model");
                 let model = prompt_nonempty("Enter the model name (e.g. gemma-2b): ")?;
-                user_data.insert("active_llm_model".to_string(), model);
+                user_data.insert("chat_model".to_string(), model);
                 service.advance().await?;
             }
 
@@ -1349,4 +1576,241 @@ async fn build_goose_backend(
             (Arc::new(MockAgent::new()), None)
         }
     }
+}
+
+// ── Model catalog helpers ─────────────────────────────────────────────────────
+
+/// Seed the persistent model catalog from the online registry URL.
+///
+/// Fetches the catalog JSON, upserts all returned records (preserving `is_custom`
+/// rows), and sets `downloaded` by checking the filesystem.  A failure to fetch
+/// is non-fatal — the server starts with whatever models are already in the DB.
+async fn seed_model_catalog(
+    repo: &dyn ModelRepository,
+    registry_url: &str,
+    data_dir: &std::path::Path,
+) {
+    use crate::http_model_catalog_provider::HttpModelCatalogProvider;
+    use crate::filesystem_model_storage::FilesystemModelStorage;
+    use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
+    use pond_core::ports::model_storage::ModelStorage;
+
+    let provider = HttpModelCatalogProvider::new();
+    let storage  = FilesystemModelStorage::new(data_dir);
+
+    let (models, _binaries) = match provider.fetch(registry_url).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("Failed to fetch model catalog from {registry_url}: {e}. Starting with existing DB records.");
+            return;
+        }
+    };
+
+    for mut record in models {
+        record.downloaded = storage.is_present(&record);
+        if let Err(e) = repo.upsert(&record).await {
+            tracing::warn!("Failed to seed model '{}': {e}", record.name);
+        }
+    }
+
+    tracing::info!("model catalog seeded from {}", registry_url);
+}
+
+/// Sync role assignments from the join table to the settings KV hot-cache.
+///
+/// The join table is the source of truth.  If a role has no assignment row yet,
+/// the settings KV value is left unchanged (backward-compat with existing installs
+/// that only have the legacy single-model settings fields).
+async fn sync_assignments_to_settings(
+    repo: &dyn ModelRepository,
+    settings_repo: &dyn pond_core::ports::settings::SettingsRepository,
+) {
+    let assignments = match repo.list_assignments().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("sync_assignments_to_settings: failed to read assignments: {e}");
+            return;
+        }
+    };
+
+    for a in &assignments {
+        // model_id format: "{category}/{name}"
+        let model_name = a.model_id.split('/').nth(1).unwrap_or(&a.model_id);
+        let category   = a.model_id.split('/').next().unwrap_or("");
+
+        match a.role.as_str() {
+            "chat" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("chat_provider", provider).await;
+                let _ = settings_repo.set_key("chat_model",    model_name.to_string()).await;
+            }
+            "think" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("think_provider", provider).await;
+                let _ = settings_repo.set_key("think_model",    model_name.to_string()).await;
+            }
+            "task" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("task_provider", provider).await;
+                let _ = settings_repo.set_key("task_model",    model_name.to_string()).await;
+            }
+            "asr" => {
+                let _ = settings_repo.set_key("active_whisper_model", model_name.to_string()).await;
+            }
+            "tts" => {
+                let _ = settings_repo.set_key("active_tts_model", model_name.to_string()).await;
+            }
+            other => {
+                tracing::debug!("sync_assignments_to_settings: unknown role '{other}', skipping");
+            }
+        }
+    }
+
+    if !assignments.is_empty() {
+        tracing::info!("synced {} role assignment(s) to settings KV", assignments.len());
+    }
+}
+
+fn category_to_provider(category: &str) -> String {
+    match category {
+        "ollama"    => "ollama".to_string(),
+        "gguf"      => "local".to_string(),
+        _           => "llamafile".to_string(),
+    }
+}
+
+/// Direct-SQLite model management CLI — no HTTP server started.
+async fn run_models(action: ModelAction) -> Result<()> {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = Arc::new(SqliteModelRepository::new(db.system.clone()));
+
+    match action {
+        ModelAction::List { category } => {
+            let models = if let Some(cat_str) = &category {
+                match ModelCategory::from_str(cat_str) {
+                    Some(cat) => repo.list_by_category(&cat).await?,
+                    None => {
+                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                repo.list_all().await?
+            };
+
+            let assignments = repo.list_assignments().await.unwrap_or_default();
+
+            println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  Role",
+                "Category", "Name", "Size(MB)", "DL?", "RAM(MB)");
+            println!("{}", "─".repeat(78));
+
+            for m in &models {
+                let role = assignments.iter()
+                    .find(|a| a.model_id == m.id)
+                    .map(|a| a.role.as_str())
+                    .unwrap_or("—");
+                let dl  = if m.downloaded { "✓" } else { "✗" };
+                let ram = m.ram_estimate_mb
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  {}",
+                    m.category.as_str(), m.name, m.size_mb, dl, ram, role);
+            }
+        }
+
+        ModelAction::Download { category, name } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            let record = repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            let url = record.url.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no download URL"))?;
+            let filename = record.filename.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no filename"))?;
+
+            let subdir = match cat {
+                ModelCategory::Whisper  => "models",
+                ModelCategory::Llamafile => "models/llm",
+                ModelCategory::Gguf     => "models/gguf",
+                ModelCategory::TtsPiper => "models/tts",
+                _                       => "models",
+            };
+            let dest = data_dir.join(subdir).join(filename);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            println!("Downloading {} → {}", url, dest.display());
+            let response = reqwest::get(url).await?;
+            let bytes = response.bytes().await?;
+            std::fs::write(&dest, &bytes)?;
+            repo.set_downloaded(&id, true).await?;
+            println!("✓ Downloaded {}", filename);
+        }
+
+        ModelAction::Delete { category, name } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            let record = repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            let assignments = repo.list_assignments().await?;
+            if let Some(a) = assignments.iter().find(|a| a.model_id == id) {
+                anyhow::bail!(
+                    "Model is assigned to role '{}'. Deactivate it first.", a.role
+                );
+            }
+
+            if let Some(filename) = &record.filename {
+                let subdir = match cat {
+                    ModelCategory::Whisper   => "models",
+                    ModelCategory::Llamafile => "models/llm",
+                    ModelCategory::Gguf      => "models/gguf",
+                    ModelCategory::TtsPiper  => "models/tts",
+                    _                        => "models",
+                };
+                let path = data_dir.join(subdir).join(filename);
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    println!("✓ Deleted {}", path.display());
+                } else {
+                    println!("File not on disk (already absent): {}", path.display());
+                }
+            }
+            repo.set_downloaded(&id, false).await?;
+        }
+
+        ModelAction::Activate { category, name, role } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            use pond_core::domain::model_record::ModelRoleAssignment;
+            if !ModelRoleAssignment::category_matches_role(&cat, &role) {
+                anyhow::bail!(
+                    "Category '{}' is not compatible with role '{}'. \
+                     (whisper→asr, tts_piper/tts_http→tts, gguf/llamafile/ollama→chat|think|task)",
+                    cat.as_str(), role
+                );
+            }
+
+            let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+            repo.set_assignment(&role, &id).await?;
+            sync_assignments_to_settings(&*repo, &settings_repo).await;
+            println!("✓ {} assigned to role '{}'", id, role);
+        }
+    }
+
+    Ok(())
 }
