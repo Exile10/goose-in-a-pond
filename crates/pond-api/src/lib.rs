@@ -34,7 +34,7 @@
 //! Get a token via POST /api/v1/handshake
 //!
 //! # Rate Limiting
-//! All clients are rate limited to 100 requests per 60 seconds.
+//! All clients are rate limited to 600 requests per 60 seconds (10 req/s burst).
 
 pub mod middleware;
 pub mod routes;
@@ -49,6 +49,8 @@ use pond_core::ports::camera_storage::CameraStorage;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::embedding::EmbeddingProvider;
 use pond_core::ports::mcp_memory::McpMemoryPort;
+use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
+use pond_core::ports::model_repository::ModelRepository;
 use pond_core::ports::model_scheduler::ModelScheduler;
 use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::extension_manager::ExtensionManagerPort;
@@ -75,8 +77,13 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Agent used as fallback when no LLM provider is configured.
     pub agent: Arc<dyn Agent>,
-    /// LLM provider for AI-generated responses. `None` → echo via agent.
-    pub llm_provider: Option<Arc<dyn LlmProvider>>,
+    /// LLM provider for AI-generated responses, wrapped in a RwLock so the
+    /// ModelRouter can be hot-swapped when the user changes role assignments.
+    /// `None` inside the lock → echo via agent.
+    pub llm_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    /// Base URL of the local llamafile server — stored here so the settings
+    /// handler can rebuild the ModelRouter without restarting the server.
+    pub llamafile_url: String,
     /// TTS engine for the `/api/v1/test/speak` dev endpoint. `None` → print only.
     pub tts: Option<Arc<dyn VoiceOutput>>,
     /// Persistent settings repository (assistant identity, LLM, voice, retention).
@@ -97,9 +104,9 @@ pub struct AppState {
     /// Mirrors Goose's `~/.config/goose/prompts/` pattern.
     /// `None` in tests; `Some($DATA_DIR/prompts)` in production.
     pub prompt_template_dir: Option<std::path::PathBuf>,
-    /// Live model status snapshot — updated by the registry refresh endpoint.
+    /// Persistent model catalog — replaces the old in-memory snapshot.
     /// `None` in tests that don't exercise model endpoints.
-    pub model_status: Option<Arc<tokio::sync::RwLock<Vec<ModelStatusEntry>>>>,
+    pub model_repo: Option<Arc<dyn ModelRepository + Send + Sync>>,
     /// GIAP data directory — used by model endpoints to check file presence on disk.
     /// `None` in tests.
     pub data_dir: Option<std::path::PathBuf>,
@@ -120,6 +127,30 @@ pub struct AppState {
     /// Base URL of the Qwen TTS server (e.g. "http://127.0.0.1:8181").
     /// `None` when Qwen TTS is not configured.
     pub qwen_tts_url: Option<String>,
+    /// Tracks in-progress model downloads so the UI can show progress bars.
+    pub download_tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    /// Port the Piper HTTP TTS server is listening on.
+    /// Set at startup by `piper_http::start()`. `None` if Piper is not running.
+    pub piper_http_port: Option<u16>,
+    /// Catalog provider — fetches the online model registry and returns typed records.
+    /// Injected by pond-server so pond-api has no HTTP or parsing logic.
+    /// `None` in tests.
+    pub model_catalog_provider: Option<Arc<dyn ModelCatalogProvider>>,
+    /// Filesystem storage helper — resolves on-disk paths for model records.
+    /// Used by the refresh handler to update `downloaded` flags.
+    /// `None` in tests.
+    pub model_storage_dir: Option<std::path::PathBuf>,
+}
+
+/// State of a single in-progress (or recently completed) model download.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadEntry {
+    pub filename:         String,
+    pub category:         String,
+    pub downloaded_bytes: u64,
+    pub total_bytes:      Option<u64>,
+    /// "downloading" | "done" | "error"
+    pub status:           String,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.
@@ -150,9 +181,11 @@ pub struct ModelStatusEntry {
 /// Web dashboard: `/{route_name}`
 /// REST API:      `/api/v1/{route_name}`
 pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
-    // Create rate limiter: 100 requests per 60 seconds per client
+    // Rate limiter for remote clients (GOTG app, external integrations).
+    // 600 req/60s = 10 req/s burst — generous for API use, still protects against abuse.
+    // Loopback clients (local web dashboard) are exempted entirely in the middleware.
     let rate_limiter = Arc::new(middleware::RateLimiter::new(
-        100,
+        600,
         std::time::Duration::from_secs(60),
     ));
 
@@ -184,6 +217,12 @@ async fn rate_limit_with_limiter(
         .get::<std::net::SocketAddr>()
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+
+    // Loopback clients are the local web dashboard — never rate limit them.
+    // Rate limiting only applies to remote clients (GOTG app, external integrations).
+    if client_ip == "127.0.0.1" || client_ip == "::1" {
+        return Ok(next.run(req).await);
+    }
 
     if !limiter.check_rate_limit(&client_ip).await {
         return Err(middleware::AuthError::RateLimitExceeded);

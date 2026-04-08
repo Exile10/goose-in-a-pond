@@ -5,6 +5,10 @@ It documents *how* to navigate effectively — not what the code does (that's `C
 but how to move through it without wasting context, hitting known traps, or violating
 architectural constraints.
 
+**Core constraint**: Every AI capability must run fully offline on the target hardware.
+Cloud APIs are optional fallbacks, never requirements. Before adding any AI feature, ask:
+*can this run on a Jetson Orin Nano (8 GB) or a Raspberry Pi 5 (8 GB)?*
+
 ---
 
 ## 1. Orient Before Acting
@@ -181,7 +185,102 @@ External MCP servers (those the user adds via REST) are **persisted to SQLite** 
 
 ---
 
-## 13. What GEMINI.md Got Wrong About This Repo
+## 13. Hardware Constraints — Model Selection Rules
+
+GIAP targets two primary edge platforms:
+
+| Platform | RAM | GPU | Realistic model range | ASR | TTS |
+|---|---|---|---|---|---|
+| Jetson Orin Nano 8 GB | 8 GB unified | 1024-core Ampere, 40 TOPS | 1–7B Q4_K_M, 40–70 tok/s | whisper `base.en` | Piper medium |
+| Raspberry Pi 5 8 GB | 8 GB | None | ≤3B Q4, ~10–20 tok/s | whisper `tiny.en` | Piper medium |
+| Raspberry Pi 4 4 GB | 4 GB | None | HTTP provider only | whisper `tiny.en` | Piper small |
+
+**Rules when choosing or adding models:**
+
+1. **Quantize first.** Prefer GGUF Q4_K_M or Q5_K_M — halves RAM vs. full precision with minimal quality loss.
+2. **Stay under 6 GB total model footprint** on Jetson. Reserve ~2 GB for OS, voice pipeline, and inference overhead.
+3. **Embedding models** must be ≤150 MB (e.g. `nomic-embed-text`, `all-MiniLM-L6-v2`).
+4. **ASR**: `tiny.en` (~39 MB) for Pi, `base.en` (~74 MB) for Jetson. Larger models are rarely justified for wake-word + command recognition.
+5. **TTS**: Piper with `en_US-lessac-medium.onnx` (~60 MB) is the baseline. Do not add TTS that requires a running GPU server unless wrapped in `Option<>` in `AppState`.
+6. **Never require a GPU for the core serve path.** GPU acceleration is additive (Jetson CUDA feature flag), not mandatory.
+
+**The three-role LLM pipeline** (`ModelRole` in `pond-core/src/domain/model_role.rs`):
+
+| Role | Purpose | Constrained-device guidance |
+|---|---|---|
+| `Chat` | Fast conversational replies | Jetson: 3–7B Q4. Pi: 1B or HTTP provider |
+| `Think` | Analysis, multi-step reasoning | Jetson only: 7B Q4. Skip on Pi |
+| `Task` | Tool use, scheduling, device control | Jetson: 3–7B with tool support. Pi: delegate to Chat |
+
+`RequestClassifier` routes by keyword (zero overhead). All three roles fall back to `Chat` if not separately configured.
+
+---
+
+## 14. The Five AI Layers
+
+GIAP is structured across five conceptual layers. When adding features, identify which layer owns the work:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  5. UX Layer — Voice pipeline, Web dashboard, GOTG     │
+│               (pond-server, pond-api, web/, GOTG app)  │
+├────────────────────────────────────────────────────────┤
+│  4. Goose Layer — Agents, MCP tools, Memory, Recipes   │
+│               (pond-adapters-goose, pond-mcp-server)   │
+├────────────────────────────────────────────────────────┤
+│  3. Shell Layer — Goose process, bash scripts, cron    │
+│               (pond-infra-scheduler, scripts/)         │
+├────────────────────────────────────────────────────────┤
+│  2. GUI Layer — Web dashboard, emulators (optional)    │
+│               (web/dist, tower-http ServeDir)          │
+├────────────────────────────────────────────────────────┤
+│  1. OS Layer — Linux, drivers, models on disk          │
+│               (Cross.toml, deploy-jetson.sh, setup.sh) │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 15. Planned MCP Ecosystem (Quarterly Roadmap)
+
+These are the MCP servers planned in the project proposal. When implementing, each becomes a new crate under `crates/pond-mcp-*` following the `GiapMcpServer` pattern:
+
+| MCP Server | Quarter | Purpose |
+|---|---|---|
+| `giap` builtin | **Live** | Weather, devices, schedules — already wired |
+| Moonbeam MCP | Q2 | Android UI automation for SDK-less smart devices (Playwright-equivalent for Android) |
+| Vision Event Detection MCP | Q2/Q3 | Local camera feeds — motion, pets, packages; no frames leave device |
+| Offline ASR MCP | Q2 | Standalone voice/NLU server exposing transcription as an MCP tool |
+| Sensor Aggregator MCP | Q2 | Temperature, humidity, motion over local protocols (MQTT, Zigbee, GPIO) |
+| Routine / Scheduler MCP | Q2 | Natural-language routine creation backed by `CronSchedulerAdapter` |
+| Privacy Audit MCP | Q3 | Query activity logs: "what did Goose do this hour?" |
+| Inter-Agent Coordination MCP | Q3 | Multi-agent task delegation and shared context |
+
+**Implementation pattern for a new MCP server:**
+1. Add service handles to `GiapServiceHandles` (`pond-mcp-server/src/registry.rs`)
+2. Implement `#[tool]` methods in a new `*_server.rs` alongside `giap_server.rs`
+3. Register via `register_builtin_extension(name, spawn_fn)` in `main.rs`
+4. Tool names auto-prefix as `<extension_name>__<tool_name>`
+
+---
+
+## 16. Memory and Self-Improvement Architecture
+
+Current memory stack (in order of access speed):
+
+| Layer | Implementation | Scope |
+|---|---|---|
+| In-context window | `trim_to_budget()` → 9,952 char cap | Current session |
+| Context compaction | `ContextCompactor` → LLM summarization at 80% budget | Current session |
+| Session persistence | `SqliteSessionStorage` → `pond_system.db` | Cross-restart |
+| Semantic fragments | `SqliteMemoryRepository` → cosine similarity (stubbed) | Cross-session |
+| MCP flat-file memory | `GooseMcpMemoryAdapter` (`--features mcp-memory`) | Cross-session |
+
+**Q3 roadmap: self-improving prompts.** The `prompt_addendum` field in `Settings` is the hook point — the system will feed session logs through the Memory MCP and allow the LLM to rewrite its own addendum. Do not build prompt rewriting as a core feature; keep it behind the existing Settings API.
+
+---
+
+## 17. What GEMINI.md Got Wrong About This Repo
 
 `GEMINI.md` describes the upstream `goose/` submodule — not GIAP itself. References to `crates/goose-mcp`, `crates/goose-server`, `ui/desktop`, `just generate-openapi`, and `.goosehints` describe the Goose project, not GIAP. Disregard those sections when working in GIAP's own code.
 

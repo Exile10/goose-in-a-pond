@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { api } from "./api";
+import { SettingsProvider } from "./context/SettingsContext";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
 import Status from "./pages/Status";
@@ -109,11 +111,50 @@ function App() {
     const [displayName, setDisplayName] = useState<string>(
         () => localStorage.getItem("pond_display_name") ?? ""
     );
+    // null = still checking, false = show onboarding, true = show dashboard
+    const [onboarded, setOnboarded] = useState<boolean | null>(
+        () => localStorage.getItem("pond_session_token") ? true : null
+    );
     const [menuOpen, setMenuOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
 
-    // Derived: a user is considered onboarded if they have a saved session token
-    const onboarded = token !== "";
+    // On mount (or when no local token), probe the backend.
+    // If the pond is already onboarded, auto-handshake so the user goes
+    // straight to the dashboard regardless of which hostname they use.
+    const autoConnect = useCallback(async () => {
+        try {
+            const status = await api.onboardingStatus();
+            if (!status.onboarded) {
+                setOnboarded(false);
+                return;
+            }
+            // Pond is onboarded — get/create a client ID and handshake
+            let clientId = localStorage.getItem("pond_client_id") ?? "";
+            if (!clientId) {
+                clientId = typeof crypto.randomUUID === "function"
+                    ? crypto.randomUUID()
+                    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+                localStorage.setItem("pond_client_id", clientId);
+            }
+            const res = await api.handshake({ client_id: clientId, client_type: "web", client_version: "1.0.0" });
+            if (res.accepted && res.session_token) {
+                localStorage.setItem("pond_session_token", res.session_token);
+                setToken(res.session_token);
+                setOnboarded(true);
+            } else {
+                setOnboarded(false);
+            }
+        } catch {
+            // Backend unreachable — fall through to onboarding (which will also fail and show an error)
+            setOnboarded(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (onboarded === null) {
+            autoConnect();
+        }
+    }, [onboarded, autoConnect]);
 
     useEffect(() => {
         function handleClickOutside(e: MouseEvent) {
@@ -134,17 +175,28 @@ function App() {
         setMenuOpen(false);
     }
 
+    if (onboarded === null) {
+        // Still checking with the backend — show a minimal splash
+        return (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--bg-base, #0f1117)' }}>
+                <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: '0.9rem' }}>Connecting…</span>
+            </div>
+        );
+    }
+
     if (!onboarded) {
         return (
             <Onboarding onComplete={(t, name) => {
                 setToken(t);
                 setDisplayName(name);
+                setOnboarded(true);
                 setPage("chat");
             }} />
         );
     }
 
     return (
+        <SettingsProvider token={token}>
         <div className="db-shell">
             <aside className="db-sidebar">
                 {/* Logo */}
@@ -199,6 +251,7 @@ function App() {
             {/* Voice orb — always accessible regardless of page */}
             <VoiceOrb token={token} />
         </div>
+        </SettingsProvider>
     );
 }
 

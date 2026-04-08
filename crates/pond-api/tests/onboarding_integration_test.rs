@@ -88,7 +88,8 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         session_storage,
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),
-        llm_provider: None,
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
@@ -98,7 +99,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
-        model_status: None,
+        model_repo: None,
         data_dir: None,
         skip_onboarding: false,
         scheduler: None,
@@ -107,6 +108,10 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         extension_manager: None,
         mcp_server_repo: None,
         qwen_tts_url: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
+        model_catalog_provider: None,
+        model_storage_dir: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

@@ -55,7 +55,7 @@ impl LlmProvider for DynamicProvider {
         messages: Vec<ChatMessage>,
     ) -> Result<ChatMessage> {
         let settings = self.settings_repo.get().await.unwrap_or_default();
-        let provider = self.pick(&settings.llm_provider);
+        let provider = self.pick(&settings.chat_provider);
         provider.complete(system_prompt, messages).await
     }
 

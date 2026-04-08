@@ -6,12 +6,17 @@
 //! - [ ] Serve static web dashboard files
 
 use axum::{
+    body::Body,
     extract::{rejection::JsonRejection, Multipart, Path, State},
-    http::StatusCode,
-    response::{Html, Json},
+    http::{Response, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, Json,
+    },
     routing::{delete, get, patch, post, put},
     Router,
 };
+use futures::StreamExt;
 use pond_core::domain::message::ChatMessage;
 use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
@@ -22,14 +27,20 @@ use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext, SYSTEM_PROMPT};
+use pond_core::ports::provider::LlmProvider;
 use pond_core::services::chat::ChatService;
+use pond_core::services::model_router::ModelRouter;
 use pond_core::services::onboarding::OnboardingService;
+use pond_core::services::request_classifier::classify_request;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::AppState;
+use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+
+use crate::{AppState, DownloadEntry, ModelStatusEntry};
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 
 // ───────────────────────── REST API Routes ─────────────────────────
@@ -62,6 +73,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
         .route("/chat", post(chat))
+        .route("/chat/stream", post(chat_stream))
+        .route("/tts", post(tts_synthesise))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", patch(rename_session))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
@@ -71,9 +84,19 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
         .route("/models/memory-status", get(get_memory_status))
+        .route("/models/active-roles", get(get_active_roles))
         .route("/models/registry/refresh", post(refresh_model_registry))
         .route("/models/ollama", get(list_ollama_models))
+        .route("/models/ollama/pull", post(pull_ollama_model))
+        .route("/models/search/gguf", get(search_gguf_models))
+        .route("/models/search/gguf/files", get(list_hf_model_files))
+        .route("/models/search/llamafile", get(search_llamafile_models))
+        .route("/models/download/url", post(download_model_from_url))
+        .route("/models/download/progress", get(get_download_progress))
+        .route("/models/scan", post(scan_models))
         .route("/models/{category}/{name}/download", post(download_model))
+        .route("/models/{category}/{name}/activate", post(activate_model))
+        .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
         .route("/sensors", post(record_sensor))
@@ -208,7 +231,7 @@ async fn complete_onboarding(
 async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
-    let total_steps = 8;
+    let total_steps = 9;  // Welcome Basics Location Accessibility Personality GooseIdentity WakeWord Model Extensions
     let (current_step, steps_completed, onboarded) = match service.status().await {
         None                                   => ("not_started".to_string(),                    0, false),
         Some(OnboardingStep::Welcome)           => (OnboardingStep::Welcome.to_string(),          1, false),
@@ -340,6 +363,16 @@ async fn chat(
         None => system_prompt,
     };
 
+    // Classify the message to determine which model role will handle it
+    let model_role = {
+        use pond_core::domain::model_role::ModelRole;
+        match classify_request(&req.message) {
+            ModelRole::Think => "think",
+            ModelRole::Task  => "task",
+            ModelRole::Chat  => "chat",
+        }
+    };
+
     // Build ChatService — wires LLM provider when available, falls back to agent
     let mut service = ChatService::new(
         state.agent.clone(),
@@ -347,8 +380,11 @@ async fn chat(
         storage.clone(),
     )
     .with_system_prompt(system_prompt);
-    if let Some(provider) = &state.llm_provider {
-        service = service.with_provider(provider.clone());
+    {
+        let guard = state.llm_provider.read().await;
+        if let Some(provider) = guard.as_ref() {
+            service = service.with_provider(provider.clone());
+        }
     }
 
     let response_text = service
@@ -363,8 +399,266 @@ async fn chat(
 
     Ok(Json(json!({
         "session_id": session_id,
-        "response": response_text,
+        "response":   response_text,
+        "model_role": model_role,
     })))
+}
+
+// ── TTS request ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TtsRequest {
+    text: String,
+}
+
+/// Synthesise speech server-side and return WAV audio bytes.
+///
+/// Priority order:
+/// 1. Piper HTTP server (if running — see `AppState.piper_http_port`)
+/// 2. Qwen TTS HTTP server (if `AppState.qwen_tts_url` is configured)
+/// 3. 503 Service Unavailable — no TTS backend is running
+///
+/// Callers should create an `Audio` object from the returned blob and play it.
+/// This replaces `window.speechSynthesis` on the frontend so that the server's
+/// configured TTS voice is always used.
+async fn tts_synthesise(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<TtsRequest>, JsonRejection>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+    })?;
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "text is required"}))));
+    }
+
+    // Priority 1: Piper HTTP server
+    if let Some(port) = state.piper_http_port {
+        let url = format!("http://127.0.0.1:{}/tts", port);
+        if let Ok(res) = state.http_client.post(&url).body(text.clone()).send().await {
+            if res.status().is_success() {
+                let bytes = res.bytes().await.unwrap_or_default();
+                return Ok(Response::builder()
+                    .header("Content-Type", "audio/wav")
+                    .header("Content-Length", bytes.len())
+                    .body(Body::from(bytes))
+                    .unwrap());
+            }
+        }
+    }
+
+    // Priority 2: Qwen TTS HTTP server
+    if let Some(ref qwen_url) = state.qwen_tts_url {
+        let url = format!("{}/v1/audio/speech", qwen_url);
+        let body_json = json!({ "model": "qwen-tts", "input": text, "voice": "default" });
+        if let Ok(res) = state.http_client.post(&url).json(&body_json).send().await {
+            if res.status().is_success() {
+                let bytes = res.bytes().await.unwrap_or_default();
+                return Ok(Response::builder()
+                    .header("Content-Type", "audio/wav")
+                    .header("Content-Length", bytes.len())
+                    .body(Body::from(bytes))
+                    .unwrap());
+            }
+        }
+    }
+
+    Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "No TTS backend is running"}))))
+}
+
+// ── SSE streaming chat ────────────────────────────────────────────────────────
+
+/// Stream chat tokens via Server-Sent Events.
+///
+/// Each SSE event carries a JSON payload:
+/// - Token event:  `data: {"token": "..."}`
+/// - Done event:   `data: {"done": true, "session_id": "...", "model_role": "..."}`
+/// - Error event:  `data: {"error": "..."}`
+///
+/// The stream persists both the user message and the full assistant response
+/// to session storage before yielding the final done event.
+async fn chat_stream(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+    })?;
+
+    let stream = async_stream::stream! {
+        let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let storage = &state.session_storage;
+
+        // Ensure session exists
+        if storage.get_session(&session_id).await.is_err() {
+            if let Err(e) = storage.create_session(session_id.clone()).await {
+                let data = json!({"error": format!("Failed to create session: {}", e)}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
+        }
+
+        // Build the system prompt (mirrors the logic in chat())
+        let system_prompt = {
+            let settings = state.settings_repo.get().await.ok();
+
+            let profile_ctx: Option<ProfileContext> = if let Some(ref s) = settings {
+                if let Some(ref pid) = s.primary_profile_id {
+                    state.profile_repo.get(pid).await.ok().flatten().map(|p| {
+                        let prefs = &p.preferences;
+                        ProfileContext {
+                            preferred_name: prefs.get("preferred_name").cloned(),
+                            birthday: prefs.get("birthday").cloned(),
+                            language: prefs.get("language").cloned(),
+                            atypical_speech: prefs.get("accessibility_atypical_speech")
+                                .map(|v| v == "true")
+                                .unwrap_or(false),
+                        }
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let file_template = state
+                .prompt_template_dir
+                .as_ref()
+                .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
+
+            match (file_template, settings) {
+                (Some(tmpl), Some(s)) => {
+                    let name     = sanitize_field(&s.assistant_name, 50);
+                    let user     = sanitize_field(&s.user_name, 50);
+                    let persona  = sanitize_field(&s.assistant_personality, 200);
+                    let tz       = sanitize_field(&s.timezone, 50);
+                    let location = if s.weather_location_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nLocation: {}.", sanitize_field(&s.weather_location_name, 100))
+                    };
+                    let addendum = sanitize_field(&s.prompt_addendum, 500);
+                    render_template(&tmpl, &[
+                        ("assistant_name",  name.as_str()),
+                        ("user_name",       user.as_str()),
+                        ("personality",     persona.as_str()),
+                        ("timezone",        tz.as_str()),
+                        ("location",        location.as_str()),
+                        ("prompt_addendum", addendum.as_str()),
+                    ])
+                }
+                (None, Some(s)) => build_system_prompt_with_profile(&s, profile_ctx.as_ref()),
+                _ => SYSTEM_PROMPT.to_string(),
+            }
+        };
+
+        let system_prompt = match &state.mcp_memory {
+            Some(m) => {
+                let mem = m.instructions();
+                if mem.is_empty() { system_prompt } else { format!("{}\n\n---\n{}", system_prompt, mem) }
+            }
+            None => system_prompt,
+        };
+
+        // Classify message for model role
+        let model_role = {
+            use pond_core::domain::model_role::ModelRole;
+            match classify_request(&req.message) {
+                ModelRole::Think => "think",
+                ModelRole::Task  => "task",
+                ModelRole::Chat  => "chat",
+            }
+        };
+
+        // Persist user message
+        {
+            use pond_core::domain::message::ChatMessage;
+            use pond_core::domain::session::SessionMessage;
+            let user_msg = ChatMessage::user(req.message.clone());
+            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), user_msg);
+            if let Err(e) = storage.add_message(session_id.clone(), sm).await {
+                let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
+        }
+
+        // Load conversation history and apply context budget
+        let history = match storage.get_recent_messages(&session_id, 100).await {
+            Ok(msgs) => {
+                use pond_core::services::context_budget;
+                let raw: Vec<ChatMessage> = msgs.into_iter().map(|sm| sm.message).collect();
+                context_budget::trim_to_budget(raw)
+            }
+            Err(e) => {
+                let data = json!({"error": format!("Failed to load history: {}", e)}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
+        };
+
+        // Acquire provider and stream tokens
+        let provider_opt = {
+            let guard = state.llm_provider.read().await;
+            guard.as_ref().cloned()
+        };
+
+        let mut full_text = String::new();
+
+        if let Some(provider) = provider_opt {
+            let mut token_stream = provider.stream_complete(&system_prompt, history);
+            while let Some(result) = token_stream.next().await {
+                match result {
+                    Ok(token) => {
+                        full_text.push_str(&token);
+                        let data = json!({"token": token}).to_string();
+                        yield Ok(Event::default().data(data));
+                    }
+                    Err(e) => {
+                        let data = json!({"error": e.to_string()}).to_string();
+                        yield Ok(Event::default().data(data));
+                        return;
+                    }
+                }
+            }
+        } else {
+            // Fallback: use MockAgent (echo)
+            use pond_core::domain::agent::AgentRequest;
+            let agent_req = AgentRequest {
+                message: req.message.clone(),
+                session_id: session_id.clone(),
+            };
+            match state.agent.chat(agent_req).await {
+                Ok(resp) => {
+                    full_text = resp.text.clone();
+                    let data = json!({"token": resp.text}).to_string();
+                    yield Ok(Event::default().data(data));
+                }
+                Err(e) => {
+                    let data = json!({"error": e.to_string()}).to_string();
+                    yield Ok(Event::default().data(data));
+                    return;
+                }
+            }
+        }
+
+        // Persist full assistant response
+        {
+            use pond_core::domain::message::ChatMessage;
+            use pond_core::domain::session::SessionMessage;
+            let assistant_msg = ChatMessage::assistant(full_text);
+            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
+            let _ = storage.add_message(session_id.clone(), sm).await;
+        }
+
+        // Done event
+        let data = json!({"done": true, "session_id": session_id, "model_role": model_role}).to_string();
+        yield Ok(Event::default().data(data));
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// List all sessions, ordered by most recently updated first.
@@ -616,10 +910,145 @@ async fn update_settings(
             )
         })?;
 
+    // Hot-reload the ModelRouter whenever any provider/model field changes.
+    let provider_keys = ["chat_provider","chat_model","think_provider","think_model",
+                         "task_provider","task_model",
+                         "active_whisper_model","active_tts_model"];
+    if let Some(obj) = patch.as_object() {
+        if obj.keys().any(|k| provider_keys.contains(&k.as_str())) {
+            rebuild_model_router(&state, &merged).await;
+
+            // Sync role fields → model_role_assignments (source of truth).
+            // This ensures CLI `models list` and `/activate` see the same state
+            // as the Settings page write path.
+            if let Some(repo) = &state.model_repo {
+                let role_map: &[(&str, &str, &str)] = &[
+                    ("chat",  &merged.chat_provider,  &merged.chat_model),
+                    ("think", merged.think_provider.as_deref().unwrap_or(""), merged.think_model.as_deref().unwrap_or("")),
+                    ("task",  merged.task_provider.as_deref().unwrap_or(""),  merged.task_model.as_deref().unwrap_or("")),
+                    ("asr",  "", &merged.active_whisper_model),
+                    ("tts",  "", &merged.active_tts_model),
+                ];
+                for (role, provider, model_name) in role_map {
+                    if model_name.is_empty() {
+                        let _ = repo.clear_assignment(role).await;
+                        continue;
+                    }
+                    // Derive category from provider
+                    let category = match *provider {
+                        "local"  => "gguf",
+                        "ollama" => "ollama",
+                        "asr" | "" if *role == "asr" => "whisper",
+                        "tts" | "" if *role == "tts" => "tts_piper",
+                        _ => "llamafile",
+                    };
+                    let model_id = format!("{}/{}", category, model_name);
+                    let _ = repo.set_assignment(role, &model_id).await;
+                }
+            }
+        }
+    }
+
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// Rebuild and hot-swap the ModelRouter using the new settings.
+/// Called whenever the user changes any provider/model assignment.
+async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
+    use pond_adapters_llamafile::LlamafileProvider;
+    use pond_adapters_ollama::OllamaProvider;
+    #[allow(unused_imports)]
+    use pond_core::ports::provider::LlmProvider as _;
+
+    let url = &state.llamafile_url;
+
+    let build = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+        match provider {
+            "ollama" => Arc::new(
+                OllamaProvider::new(None, Some(model))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+            _ => Arc::new(
+                LlamafileProvider::new(Some(url))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+        }
+    };
+
+    let effective_chat_provider = &settings.chat_provider;
+    let effective_chat_model    = &settings.chat_model;
+
+    let chat  = build(effective_chat_provider, effective_chat_model);
+    let think = if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
+        build(tp, tm)
+    } else { chat.clone() };
+    let task  = if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
+        build(tp, tm)
+    } else { chat.clone() };
+
+    let new_router: Arc<dyn LlmProvider> = Arc::new(ModelRouter::new(chat, think, task));
+    *state.llm_provider.write().await = Some(new_router);
+    tracing::info!("ModelRouter hot-reloaded: chat={}/{} think={:?}/{:?} task={:?}/{:?}",
+        effective_chat_provider, effective_chat_model,
+        settings.think_provider, settings.think_model,
+        settings.task_provider, settings.task_model,
+    );
+}
+
 // ── Model registry handlers ───────────────────────────────────────────────────
+
+/// GET /api/v1/models/active-roles — returns the provider+model currently wired for each role.
+///
+/// Reads from `model_role_assignments` (source of truth) with a settings KV fallback.
+async fn get_active_roles(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    // Try to read from the persistent join table first
+    let assignments: std::collections::HashMap<String, String> = state.model_repo
+        .as_ref()
+        .and_then(|r| {
+            // Use try_join in a blocking context — we're inside async so use block_in_place
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(r.list_assignments())
+            })
+            .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.role, a.model_id))
+        .collect();
+
+    // Fall back to settings KV hot-cache
+    let settings = state.settings_repo.get().await.unwrap_or_default();
+    let chat_provider = settings.chat_provider.clone();
+    let chat_model    = settings.chat_model.clone();
+
+    Json(json!({
+        "chat":  {
+            "provider": chat_provider,
+            "model":    chat_model,
+            "model_id": assignments.get("chat"),
+        },
+        "think": {
+            "provider": settings.think_provider,
+            "model":    settings.think_model,
+            "model_id": assignments.get("think"),
+        },
+        "task":  {
+            "provider": settings.task_provider,
+            "model":    settings.task_model,
+            "model_id": assignments.get("task"),
+        },
+        "asr": { "model_id": assignments.get("asr") },
+        "tts": { "model_id": assignments.get("tts") },
+        "router_name": state.llm_provider.read().await
+            .as_ref()
+            .map(|p| p.model_name())
+            .unwrap_or_else(|| "none".to_string()),
+    }))
+}
 
 /// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
 async fn get_memory_status(
@@ -638,79 +1067,208 @@ async fn get_memory_status(
     }))
 }
 
-/// GET /api/v1/models — returns the model status snapshot with downloaded/active flags.
+/// Converts a `ModelRecord` to the API response DTO (`ModelStatusEntry`).
+///
+/// `assignments` is the list of current role assignments; used to determine
+/// the `active` flag (true when any role points to this model).
+fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelStatusEntry {
+    let active = assignments.iter().any(|a| a.model_id == m.id);
+    ModelStatusEntry {
+        category:         m.category.as_str().to_string(),
+        name:             m.name.clone(),
+        description:      m.description.clone(),
+        size_mb:          m.size_mb,
+        downloaded:       m.downloaded,
+        active,
+        url:              m.url.clone(),
+        hf_id:            m.hf_id.clone(),
+        filename:         m.filename.clone(),
+        ram_estimate_mb:  m.ram_estimate_mb,
+        recommended_role: m.recommended_role.clone(),
+    }
+}
+
+/// Scans model directories for files on disk not yet in the catalog,
+/// inserts them as custom entries via the model repository, and returns
+/// the newly discovered records.
+async fn scan_filesystem_extras(
+    data_dir: &std::path::Path,
+    model_repo: &Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+) -> Vec<ModelRecord> {
+    let all = model_repo.list_all().await.unwrap_or_default();
+    let known_filenames: std::collections::HashSet<String> = all.iter()
+        .filter_map(|m| m.filename.clone())
+        .collect();
+
+    let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&'static str]|
+        -> Vec<ModelRecord>
+    {
+        let mut found = vec![];
+        let Ok(rd) = std::fs::read_dir(&dir) else { return found };
+        for entry in rd.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
+            if known_filenames.contains(&fname) { continue; }
+            let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+            let name = fname
+                .trim_end_matches(".gguf")
+                .trim_end_matches(".llamafile")
+                .trim_end_matches(".onnx")
+                .trim_end_matches(".bin")
+                .to_string();
+            found.push(ModelRecord {
+                id:              ModelRecord::id_for(&category, &name),
+                category:        category.clone(),
+                name,
+                filename:        Some(fname),
+                description:     "(detected on disk)".to_string(),
+                size_mb,
+                url:             None,
+                hf_id:           None,
+                ram_estimate_mb: None,
+                recommended_role: None,
+                context_length:  None,
+                quantization:    None,
+                asr_language:    None,
+                asr_size:        None,
+                tts_engine:      None,
+                tts_voice_name:  None,
+                config_filename: None,
+                config_url:      None,
+                tts_url:         None,
+                sample_rate:     None,
+                downloaded:      true,
+                is_custom:       true,
+            });
+        }
+        found
+    };
+
+    let mut extras = vec![];
+    extras.extend(scan_dir(data_dir.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
+    extras.extend(scan_dir(data_dir.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
+    extras.extend(scan_dir(data_dir.join("models"),               ModelCategory::Whisper,   &[".bin"]));
+    extras.extend(scan_dir(data_dir.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+
+    // Persist newly discovered models to the catalog
+    for m in &extras {
+        let _ = model_repo.upsert(m).await;
+    }
+
+    extras
+}
+
+/// GET /api/v1/models — returns all catalog models with downloaded/active flags.
 async fn list_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(model_status) = &state.model_status else {
+    let Some(model_repo) = &state.model_repo else {
         return Ok(Json(json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []})));
     };
-    let entries = model_status.read().await.clone();
 
-    // Group by category for a tidy response shape.
+    // Discover any files on disk not yet in the catalog
+    if let Some(data_dir) = &state.data_dir {
+        let _ = scan_filesystem_extras(data_dir, model_repo).await;
+    }
+
+    let records = model_repo.list_all().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    let assignments = model_repo.list_assignments().await.unwrap_or_default();
+
     let mut whisper   = vec![];
     let mut llamafile = vec![];
     let mut tts       = vec![];
     let mut gguf      = vec![];
 
-    for e in entries {
-        let v = serde_json::to_value(&e).unwrap_or_default();
-        match e.category.as_str() {
-            "whisper"   => whisper.push(v),
-            "llamafile" => llamafile.push(v),
-            "tts"       => tts.push(v),
-            "gguf"      => gguf.push(v),
-            _           => {}
+    for m in &records {
+        let v = serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default();
+        match m.category {
+            ModelCategory::Whisper               => whisper.push(v),
+            ModelCategory::Llamafile             => llamafile.push(v),
+            ModelCategory::TtsPiper
+            | ModelCategory::TtsHttp             => tts.push(v),
+            ModelCategory::Gguf
+            | ModelCategory::Ollama              => gguf.push(v),
         }
     }
 
     Ok(Json(json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf})))
 }
 
+/// POST /api/v1/models/scan — explicit filesystem scan, persists and returns newly discovered entries.
+async fn scan_models(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let (Some(data_dir), Some(model_repo)) = (&state.data_dir, &state.model_repo) else {
+        return Json(json!({"found": 0, "entries": []}));
+    };
+
+    let extras = scan_filesystem_extras(data_dir, model_repo).await;
+    let count  = extras.len();
+    let assignments = model_repo.list_assignments().await.unwrap_or_default();
+    let entries: Vec<Value> = extras.iter()
+        .map(|m| serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default())
+        .collect();
+
+    Json(json!({"found": count, "entries": entries}))
+}
+
 /// POST /api/v1/models/registry/refresh — fetch the latest registry from the online URL.
 async fn refresh_model_registry(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(model_status) = &state.model_status else {
+    let Some(model_repo) = state.model_repo.clone() else {
         return Ok(Json(json!({"status": "no_registry"})));
+    };
+    let Some(catalog_provider) = state.model_catalog_provider.clone() else {
+        return Ok(Json(json!({"status": "no_catalog_provider"})));
     };
 
     let settings = state.settings_repo.get().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
     })?;
 
-    let data_dir = state.data_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
     let url = settings.model_registry_url.clone();
+    let data_dir = state.model_storage_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Fetch in the background so we don't block on slow network.
-    let status_lock = Arc::clone(model_status);
-    let active_w = settings.active_whisper_model.clone();
-    let active_l = settings.active_llm_model.clone();
-    let active_t = settings.active_tts_model.clone();
-
     tokio::spawn(async move {
-        match reqwest::get(&url).await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(bytes) = resp.bytes().await {
-                    if let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        // Save cache
-                        let _ = std::fs::write(data_dir.join("registry.json"), &bytes);
-                        tracing::info!("Model registry refreshed from {}", url);
-
-                        // Rebuild status snapshot from fresh registry
-                        if let Ok(typed) = serde_json::from_value::<ModelRegistrySnapshot>(registry) {
-                            let new_status = typed.build_status(&active_w, &active_l, &active_t, &data_dir);
-                            *status_lock.write().await = new_status;
-                        }
+        use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
+        match catalog_provider.fetch(&url).await {
+            Ok((models, _binaries)) => {
+                let count = models.len();
+                for mut m in models {
+                    // Update downloaded flag from disk.
+                    m.downloaded = m.filename.as_ref()
+                        .map(|f| match m.category {
+                            pond_core::domain::model_record::ModelCategory::Whisper   => data_dir.join("models").join(f).exists(),
+                            pond_core::domain::model_record::ModelCategory::Llamafile => data_dir.join("models").join("llm").join(f).exists(),
+                            pond_core::domain::model_record::ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(f).exists(),
+                            pond_core::domain::model_record::ModelCategory::TtsPiper  => data_dir.join("models").join("tts").join(f).exists(),
+                            _ => false,
+                        })
+                        .unwrap_or(matches!(m.category, pond_core::domain::model_record::ModelCategory::TtsHttp | pond_core::domain::model_record::ModelCategory::Ollama));
+                    if let Err(e) = model_repo.upsert(&m).await {
+                        tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
                     }
                 }
+                tracing::info!("Model registry refreshed: {} records upserted from {}", count, url);
             }
-            Ok(resp) => tracing::warn!("Registry refresh returned {}", resp.status()),
-            Err(e)   => tracing::warn!("Registry refresh failed: {}", e),
+            Err(e) => tracing::warn!("Registry refresh failed from {}: {}", url, e),
         }
     });
 
     Ok(Json(json!({"status": "refresh_started"})))
+}
+
+/// GET /api/v1/models/download/progress — return all active/recent downloads.
+async fn get_download_progress(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let tracker = state.download_tracker.read().await;
+    let entries: Vec<&DownloadEntry> = tracker.values().collect();
+    Json(json!({"downloads": entries}))
 }
 
 /// POST /api/v1/models/{category}/{name}/download — trigger async model download.
@@ -718,78 +1276,184 @@ async fn download_model(
     State(state): State<Arc<AppState>>,
     Path((category, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(model_status) = &state.model_status else {
+    let Some(model_repo) = state.model_repo.clone() else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
     };
-    let Some(data_dir) = &state.data_dir else {
+    let Some(data_dir) = state.data_dir.clone() else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "data_dir not configured"}))));
     };
 
-    // Find the entry
-    let (url, filename, dl_category) = {
-        let entries = model_status.read().await;
-        let Some(e) = entries.iter().find(|e| e.category == category && e.name == name) else {
-            return Err((StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))));
-        };
-        if e.downloaded {
-            return Ok(Json(json!({"status": "already_downloaded", "name": name})));
-        }
-        let Some(url) = e.url.clone() else {
-            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "model has no download URL"}))));
-        };
-        let Some(filename) = e.filename.clone() else {
-            return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "model has no filename"}))));
-        };
-        (url, filename, category.clone())
-    };
+    let cat = ModelCategory::from_str(&category)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+    let model_id = ModelRecord::id_for(&cat, &name);
+
+    let m = model_repo.get_by_id(&model_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+
+    if m.downloaded {
+        return Ok(Json(json!({"status": "already_downloaded", "name": name})));
+    }
+    let url = m.url.clone().ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": "model has no download URL"})))
+    })?;
+    let filename = m.filename.clone().ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": "model has no filename"})))
+    })?;
 
     // Determine destination path based on category
-    let dest = match dl_category.as_str() {
-        "whisper"   => data_dir.join("models").join(&filename),
-        "llamafile" => data_dir.join("models").join("llm").join(&filename),
-        "gguf"      => data_dir.join("models").join("gguf").join(&filename),
-        "tts"       => data_dir.join("models").join("tts").join(&filename),
-        _           => data_dir.join("models").join(&filename),
+    let dest = match cat {
+        ModelCategory::Whisper   => data_dir.join("models").join(&filename),
+        ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
+        ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(&filename),
+        ModelCategory::TtsPiper
+        | ModelCategory::TtsHttp => data_dir.join("models").join("tts").join(&filename),
+        ModelCategory::Ollama    => data_dir.join("models").join(&filename),
     };
 
-    // Spawn background download
-    let status_lock = Arc::clone(model_status);
-    let model_name  = name.clone();
-    let model_cat   = dl_category.clone();
+    let tracker     = Arc::clone(&state.download_tracker);
+    let dl_filename = filename.clone();
+    let dl_category = category.clone();
 
     tokio::spawn(async move {
-        if let Some(parent) = dest.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(7200))
-            .build()
-            .unwrap_or_default();
-        tracing::info!("Downloading {} ({}) from {}", model_name, model_cat, url);
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        if let Err(e) = tokio::fs::write(&dest, &bytes).await {
-                            tracing::error!("Failed to save model {}: {}", model_name, e);
-                        } else {
-                            tracing::info!("Model {} downloaded to {:?}", model_name, dest);
-                            // Mark as downloaded in the live status snapshot
-                            let mut entries = status_lock.write().await;
-                            if let Some(e) = entries.iter_mut().find(|e| e.category == model_cat && e.name == model_name) {
-                                e.downloaded = true;
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("Failed to read model response {}: {}", model_name, e),
-                }
-            }
-            Ok(resp) => tracing::error!("Download {} failed: HTTP {}", model_name, resp.status()),
-            Err(e)   => tracing::error!("Download {} error: {}", model_name, e),
-        }
+        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, async move {
+            let _ = model_repo.set_downloaded(&model_id, true).await;
+        }).await;
     });
 
     Ok(Json(json!({"status": "download_started", "name": name, "category": category})))
+}
+
+/// DELETE /api/v1/models/{category}/{name} — delete the model file from disk.
+///
+/// The catalog record is kept (with `downloaded=false`) so the model can be re-downloaded.
+/// Returns 409 if the model is currently assigned to any active role.
+async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let Some(model_repo) = state.model_repo.clone() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+    };
+
+    let cat = ModelCategory::from_str(&category)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+    let model_id = ModelRecord::id_for(&cat, &name);
+
+    let m = model_repo.get_by_id(&model_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+
+    // Block deletion if model is assigned to any active role
+    let assignments = model_repo.list_assignments().await.unwrap_or_default();
+    if let Some(a) = assignments.iter().find(|a| a.model_id == model_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("Model is assigned to role '{}'. Deactivate it first.", a.role)
+            })),
+        ));
+    }
+
+    // Delete file from disk (ignore not-found)
+    if let (Some(filename), Some(data_dir)) = (&m.filename, &state.data_dir) {
+        let path = match cat {
+            ModelCategory::Whisper   => data_dir.join("models").join(filename),
+            ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
+            ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(filename),
+            ModelCategory::TtsPiper
+            | ModelCategory::TtsHttp => data_dir.join("models").join("tts").join(filename),
+            ModelCategory::Ollama    => data_dir.join("models").join(filename),
+        };
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete file: {e}")})))
+            })?;
+        }
+    }
+
+    model_repo.set_downloaded(&model_id, false).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/models/{category}/{name}/activate — assign model to a role.
+///
+/// Body: `{ "role": "chat" | "think" | "task" | "asr" | "tts" }`
+///
+/// Also syncs to the settings KV hot-cache and rebuilds `ModelRouter` for LLM roles.
+async fn activate_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(model_repo) = state.model_repo.clone() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+    };
+
+    let Json(body) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid JSON: {e}")})))
+    })?;
+    let role = body["role"].as_str().unwrap_or("").to_string();
+    if role.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "role is required"}))));
+    }
+
+    let cat = ModelCategory::from_str(&category)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+
+    // Validate role ↔ category compatibility
+    if !ModelRoleAssignment::category_matches_role(&cat, &role) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "Category '{}' cannot be assigned to role '{}'. \
+                     LLM roles (chat/think/task) require gguf/llamafile/ollama; \
+                     asr requires whisper; tts requires tts_piper/tts_http.",
+                    category, role
+                )
+            })),
+        ));
+    }
+
+    let model_id = ModelRecord::id_for(&cat, &name);
+    model_repo.get_by_id(&model_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+
+    // Persist assignment
+    model_repo.set_assignment(&role, &model_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+    // Sync to settings KV hot-cache
+    let settings_repo = state.settings_repo.clone();
+    match role.as_str() {
+        "chat"  => {
+            let _ = settings_repo.set_key("chat_model",    name.clone()).await;
+            let _ = settings_repo.set_key("chat_provider", category.clone()).await;
+        }
+        "think" => {
+            let _ = settings_repo.set_key("think_model",    name.clone()).await;
+            let _ = settings_repo.set_key("think_provider", category.clone()).await;
+        }
+        "task"  => {
+            let _ = settings_repo.set_key("task_model",    name.clone()).await;
+            let _ = settings_repo.set_key("task_provider", category.clone()).await;
+        }
+        "asr"   => { let _ = settings_repo.set_key("active_whisper_model", name.clone()).await; }
+        "tts"   => { let _ = settings_repo.set_key("active_tts_model",     name.clone()).await; }
+        _       => {}
+    }
+
+    // Hot-rebuild the ModelRouter for LLM roles using the existing helper
+    if matches!(role.as_str(), "chat" | "think" | "task") {
+        let settings = state.settings_repo.get().await.unwrap_or_default();
+        rebuild_model_router(&state, &settings).await;
+    }
+
+    Ok(Json(json!({"role": role, "model_id": model_id})))
 }
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
@@ -809,115 +1473,284 @@ async fn list_ollama_models() -> Json<Value> {
     }
 }
 
-/// Minimal registry shape needed to rebuild status inside routes.
-/// This avoids pulling pond-server internals into pond-api.
-#[derive(serde::Deserialize)]
-pub struct ModelRegistrySnapshot {
-    pub whisper:   Vec<RegistryWhisperEntry>,
-    pub llamafile: Vec<RegistryLlamafileEntry>,
-    pub tts:       Vec<serde_json::Value>,
-    pub gguf:      Vec<serde_json::Value>,
-}
-
-impl ModelRegistrySnapshot {
-    fn build_status(&self, active_w: &str, active_l: &str, active_t: &str, data_dir: &std::path::Path) -> Vec<crate::ModelStatusEntry> {
-        let mut out = Vec::new();
-        for m in &self.whisper {
-            out.push(crate::ModelStatusEntry {
-                category:    "whisper".into(),
-                name:        m.name.clone(),
-                description: m.description.clone(),
-                size_mb:     m.size_mb,
-                downloaded:  data_dir.join("models").join(&m.filename).exists(),
-                active:      m.name == active_w,
-                url:         Some(m.url.clone()),
-                hf_id:       None,
-                filename:    Some(m.filename.clone()),
-                ram_estimate_mb:  None,
-                recommended_role: None,
-            });
-        }
-        for m in &self.llamafile {
-            #[cfg(windows)]
-            let path = std::path::PathBuf::from(format!("{}.exe", data_dir.join("models").join("llm").join(&m.filename).display()));
-            #[cfg(not(windows))]
-            let path = data_dir.join("models").join("llm").join(&m.filename);
-            out.push(crate::ModelStatusEntry {
-                category:    "llamafile".into(),
-                name:        m.name.clone(),
-                description: m.description.clone(),
-                size_mb:     m.size_mb,
-                downloaded:  path.exists(),
-                active:      m.name == active_l,
-                url:         Some(m.url.clone()),
-                hf_id:       None,
-                filename:    Some(m.filename.clone()),
-                ram_estimate_mb:  m.ram_estimate_mb,
-                recommended_role: m.recommended_role.clone(),
-            });
-        }
-        for entry in &self.tts {
-            let name = entry["name"].as_str().unwrap_or("").to_string();
-            let engine = entry["engine"].as_str().unwrap_or("");
-            let downloaded = if engine == "http" {
-                true
-            } else {
-                let fname = entry["model_filename"].as_str().unwrap_or("");
-                data_dir.join("models").join("tts").join(fname).exists()
-            };
-            out.push(crate::ModelStatusEntry {
-                category:    "tts".into(),
-                name:        name.clone(),
-                description: entry["description"].as_str().unwrap_or("").to_string(),
-                size_mb:     entry["size_mb"].as_u64().unwrap_or(0),
-                downloaded,
-                active:      name == active_t,
-                url:         None,
-                hf_id:       None,
-                filename:    None,
-                ram_estimate_mb:  None,
-                recommended_role: None,
-            });
-        }
-        let active_gguf = active_l; // active_l carries settings.active_llm_model
-        for entry in &self.gguf {
-            let name     = entry["name"].as_str().unwrap_or("").to_string();
-            let id       = entry["id"].as_str().unwrap_or("").to_string();
-            let filename = entry["filename"].as_str().unwrap_or("").to_string();
-            let url      = entry["url"].as_str().map(|s| s.to_string());
-            let path     = data_dir.join("models").join("gguf").join(&filename);
-            out.push(crate::ModelStatusEntry {
-                category:    "gguf".into(),
-                name:        name.clone(),
-                description: entry["description"].as_str().unwrap_or("").to_string(),
-                size_mb:     entry["size_mb"].as_u64().unwrap_or(0),
-                downloaded:  path.exists(),
-                active:      name == active_gguf || id == active_gguf,
-                url,
-                hf_id:       Some(id),
-                filename:    Some(filename),
-                ram_estimate_mb:  entry["ram_estimate_mb"].as_u64(),
-                recommended_role: entry["recommended_role"].as_str().map(|s| s.to_string()),
-            });
-        }
-        out
+/// POST /api/v1/models/ollama/pull — trigger `ollama pull <model>` on the server.
+async fn pull_ollama_model(
+    body: Result<Json<Value>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let model = match body {
+        Ok(Json(v)) => v["model"].as_str().unwrap_or("").to_string(),
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "expected {\"model\":\"name\"}"})))
+    };
+    if model.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "model name is required"})));
+    }
+    // Spawn `ollama pull <model>` as a background process (non-blocking).
+    match tokio::process::Command::new("ollama")
+        .args(["pull", &model])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_)  => (StatusCode::ACCEPTED, Json(json!({"status": "pulling", "model": model}))),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("ollama not found: {e}")}))),
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct RegistryWhisperEntry   { pub name: String, pub filename: String, pub url: String, pub description: String, pub size_mb: u64 }
-#[derive(serde::Deserialize)]
-pub struct RegistryLlamafileEntry {
-    pub name: String,
-    pub filename: String,
-    pub url: String,
-    pub description: String,
-    pub size_mb: u64,
-    #[serde(default)]
-    pub ram_estimate_mb: Option<u64>,
-    #[serde(default)]
-    pub recommended_role: Option<String>,
+/// GET /api/v1/models/search/gguf?q=<query> — proxy HuggingFace API for GGUF models.
+async fn search_gguf_models(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let url = format!(
+        "https://huggingface.co/api/models?filter=gguf&search={}&limit=20&sort=downloads&direction=-1",
+        urlencoding::encode(q)
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default();
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let models: Vec<Value> = resp.json().await.unwrap_or_default();
+            // Return a simplified shape: id, downloads, likes, tags
+            let simplified: Vec<Value> = models.into_iter().map(|m| json!({
+                "id":        m["id"],
+                "downloads": m["downloads"],
+                "likes":     m["likes"],
+                "tags":      m["tags"],
+                "url":       format!("https://huggingface.co/{}", m["id"].as_str().unwrap_or("")),
+            })).collect();
+            Json(json!({"models": simplified}))
+        }
+        Ok(resp) => Json(json!({"models": [], "error": format!("HuggingFace returned {}", resp.status())})),
+        Err(e)   => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
+    }
 }
+
+/// GET /api/v1/models/search/llamafile?q=<query> — list llamafile releases from GitHub.
+async fn search_llamafile_models(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let q = params.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
+    let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default();
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let releases: Vec<Value> = resp.json().await.unwrap_or_default();
+            let mut assets: Vec<Value> = Vec::new();
+            for release in &releases {
+                let tag = release["tag_name"].as_str().unwrap_or("");
+                if let Some(arr) = release["assets"].as_array() {
+                    for asset in arr {
+                        let name = asset["name"].as_str().unwrap_or("");
+                        // Only include .llamafile executables, filter by query
+                        if name.ends_with(".llamafile") || name.ends_with(".llamafile.exe") {
+                            if q.is_empty() || name.to_lowercase().contains(&q) {
+                                let size_mb = asset["size"].as_u64().unwrap_or(0) / (1024 * 1024);
+                                assets.push(json!({
+                                    "name":       name,
+                                    "version":    tag,
+                                    "size_mb":    size_mb,
+                                    "url":        asset["browser_download_url"],
+                                    "release_url": release["html_url"],
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            Json(json!({"models": assets}))
+        }
+        Ok(resp) => Json(json!({"models": [], "error": format!("GitHub returned {}", resp.status())})),
+        Err(e)   => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
+    }
+}
+
+/// GET /api/v1/models/search/gguf/files?repo=<owner/name> — list .gguf files inside a HF repo.
+async fn list_hf_model_files(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let repo = match params.get("repo") {
+        Some(r) if !r.is_empty() => r.clone(),
+        _ => return Json(json!({"files": [], "error": "repo param required"})),
+    };
+    // Do NOT percent-encode the repo — HF expects the literal owner/name path segment
+    // (urlencoding::encode would turn '/' into '%2F' which returns 400)
+    let url = format!("https://huggingface.co/api/models/{}", repo);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default();
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let meta: Value = resp.json().await.unwrap_or_default();
+            let files: Vec<Value> = meta["siblings"]
+                .as_array()
+                .map(|siblings| {
+                    siblings.iter()
+                        .filter(|s| {
+                            s["rfilename"].as_str()
+                                .map(|n| n.ends_with(".gguf"))
+                                .unwrap_or(false)
+                        })
+                        .map(|s| {
+                            let filename = s["rfilename"].as_str().unwrap_or("").to_string();
+                            let size_mb  = s["size"].as_u64().map(|b| b / 1_048_576);
+                            json!({
+                                "filename": filename,
+                                "size_mb":  size_mb,
+                                "url": format!("https://huggingface.co/{}/resolve/main/{}", repo, filename),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Json(json!({"files": files}))
+        }
+        Ok(resp) => Json(json!({"files": [], "error": format!("HuggingFace returned {}", resp.status())})),
+        Err(e)   => Json(json!({"files": [], "error": format!("Request failed: {e}")})),
+    }
+}
+
+/// POST /api/v1/models/download/url — download a model file by URL into the right folder.
+/// Body: { "url": "https://...", "category": "gguf"|"llamafile"|"whisper"|"tts", "filename": "model.gguf" }
+async fn download_model_from_url(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid JSON body"}))),
+    };
+    let url      = body["url"].as_str().unwrap_or("").to_string();
+    let category = body["category"].as_str().unwrap_or("gguf").to_string();
+    let filename = body["filename"].as_str().unwrap_or("").to_string();
+
+    if url.is_empty() || filename.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "url and filename are required"})));
+    }
+    if !url.starts_with("https://") {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "only https URLs are accepted"})));
+    }
+
+    let Some(data_dir) = state.data_dir.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "data_dir not configured"})));
+    };
+
+    let dest = match category.as_str() {
+        "whisper"   => data_dir.join("models").join(&filename),
+        "llamafile" => data_dir.join("models").join("llm").join(&filename),
+        "gguf"      => data_dir.join("models").join("gguf").join(&filename),
+        "tts"       => data_dir.join("models").join("tts").join(&filename),
+        _           => data_dir.join("models").join(&filename),
+    };
+
+    let tracker       = Arc::clone(&state.download_tracker);
+    let resp_filename = filename.clone();
+    let resp_category = category.clone();
+
+    tokio::spawn(async move {
+        spawn_tracked_download(url, dest, filename, category, tracker, async {}).await;
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({"status": "downloading", "filename": resp_filename, "category": resp_category})))
+}
+
+/// Shared streaming download with progress tracking.
+/// Streams the URL to `dest`, updating `tracker` as each chunk arrives.
+/// Calls `on_done` (an async closure) when the download completes successfully.
+async fn spawn_tracked_download<F>(
+    url:      String,
+    dest:     std::path::PathBuf,
+    filename: String,
+    category: String,
+    tracker:  Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    on_done:  F,
+) where F: std::future::Future<Output = ()> + Send {
+    use tokio::io::AsyncWriteExt;
+
+    // Register as in-progress
+    {
+        let mut t = tracker.write().await;
+        t.insert(filename.clone(), DownloadEntry {
+            filename:         filename.clone(),
+            category:         category.clone(),
+            downloaded_bytes: 0,
+            total_bytes:      None,
+            status:           "downloading".to_string(),
+        });
+    }
+
+    if let Some(parent) = dest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(7200))
+        .build()
+        .unwrap_or_default();
+
+    tracing::info!("Downloading {} from {}", filename, url);
+
+    let result: Result<(), String> = async {
+        let resp = client.get(&url).send().await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let total = resp.content_length();
+        {
+            let mut t = tracker.write().await;
+            if let Some(e) = t.get_mut(&filename) {
+                e.total_bytes = total;
+            }
+        }
+
+        let mut file = tokio::fs::File::create(&dest).await
+            .map_err(|e| e.to_string())?;
+
+        let mut downloaded: u64 = 0;
+        let mut resp = resp;
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+            downloaded += chunk.len() as u64;
+            let mut t = tracker.write().await;
+            if let Some(e) = t.get_mut(&filename) {
+                e.downloaded_bytes = downloaded;
+            }
+        }
+        file.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }.await;
+
+    match result {
+        Ok(()) => {
+            tracing::info!("Downloaded {} to {:?}", filename, dest);
+            {
+                let mut t = tracker.write().await;
+                if let Some(e) = t.get_mut(&filename) {
+                    e.status = "done".to_string();
+                }
+            }
+            on_done.await;
+        }
+        Err(err) => {
+            tracing::error!("Download {} failed: {}", filename, err);
+            let mut t = tracker.write().await;
+            if let Some(e) = t.get_mut(&filename) {
+                e.status = "error".to_string();
+            }
+        }
+    }
+}
+
 
 // ── Profile handlers ──────────────────────────────────────────────────────────
 
@@ -1281,7 +2114,8 @@ async fn test_services(State(state): State<Arc<AppState>>) -> Json<Value> {
     );
 
     // Optionally probe the wired LLM provider with a real completion.
-    let llm_result = if let Some(provider) = &state.llm_provider {
+    let provider_opt = state.llm_provider.read().await.clone();
+    let llm_result = if let Some(provider) = provider_opt {
         let model_name = provider.model_name();
         let t0 = std::time::Instant::now();
         let res = provider

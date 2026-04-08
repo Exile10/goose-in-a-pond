@@ -210,16 +210,16 @@ impl Settings {
     fn default_timezone()                   -> String { "UTC".to_string() }
     fn default_max_tokens()                 -> u32    { 1024 }
     fn default_temperature()                -> f32    { 0.7 }
-    fn default_llm_provider()               -> String { "llamafile".to_string() }
+    fn default_llm_provider()               -> String { "".to_string() }
     fn default_wake_word()                  -> String { "goose".to_string() }
-    fn default_tts_voice()                  -> String { "en_US-lessac-medium.onnx".to_string() }
+    fn default_tts_voice()                  -> String { "".to_string() }
     fn default_recording_duration()         -> u32    { 5 }
     fn default_whisper_url()                -> String { "http://127.0.0.1:9000".to_string() }
-    fn default_active_llm_model()           -> String { "gemma-2b".to_string() }
-    fn default_active_whisper_model()       -> String { "base".to_string() }
-    fn default_active_tts_model()           -> String { "qwen-tts".to_string() }
+    fn default_active_llm_model()           -> String { "".to_string() }
+    fn default_active_whisper_model()       -> String { "".to_string() }
+    fn default_active_tts_model()           -> String { "".to_string() }
     fn default_tts_http_url()               -> String { "http://127.0.0.1:8181".to_string() }
-    fn default_tts_http_voice()             -> String { "Vivian".to_string() }
+    fn default_tts_http_voice()             -> String { "".to_string() }
     fn default_model_registry_url()         -> String {
         "https://raw.githubusercontent.com/jarida-io/goose-in-a-pond/main/crates/pond-server/registry.json".to_string()
     }

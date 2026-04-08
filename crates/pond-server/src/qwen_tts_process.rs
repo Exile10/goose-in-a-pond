@@ -477,16 +477,21 @@ async fn is_model_ready(base_url: &str) -> bool {
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+/// Default HuggingFace checkpoint used when no specific one is configured.
+pub const DEFAULT_QWEN_CHECKPOINT: &str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+
 /// Spawn the server script and wait for the HTTP server to bind (≤10 s).
 ///
+/// `checkpoint` — HuggingFace repo id or local path for the Qwen TTS model.
 /// `confirmed = true` means the HTTP server is accepting connections.
 /// The model may still be loading in the background — speech requests
 /// return 503 until it's ready, which `FallbackVoiceOutput` handles
 /// transparently by routing to Piper.
-async fn spawn(python: &Path, script: &Path, port: u16) -> Result<(QwenTtsProcess, bool)> {
+async fn spawn(python: &Path, script: &Path, port: u16, checkpoint: &str) -> Result<(QwenTtsProcess, bool)> {
     let child = tokio::process::Command::new(python)
         .arg(script)
         .args(["--port", &port.to_string()])
+        .args(["--checkpoint", checkpoint])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -520,9 +525,21 @@ pub fn url_for(port: u16) -> String {
 }
 
 /// Ensure Qwen TTS is installed, then start it if not already running.
-pub async fn try_start(data_dir: &Path) -> Option<(QwenTtsProcess, u16, bool)> {
+///
+/// `checkpoint` — HuggingFace repo id or local path to use.  Pass
+/// `settings.voice_tts_http_voice` when non-empty, or [`DEFAULT_QWEN_CHECKPOINT`]
+/// as the fallback so the model is always explicit rather than relying on the
+/// Python script's hardcoded argparse default.
+pub async fn try_start(data_dir: &Path, checkpoint: &str) -> Option<(QwenTtsProcess, u16, bool)> {
     let base_port = crate::ports::QWEN_TTS;
     let base_url = url_for(base_port);
+
+    // Use the caller-supplied checkpoint, or the known default if empty.
+    let effective_checkpoint = if checkpoint.is_empty() {
+        DEFAULT_QWEN_CHECKPOINT
+    } else {
+        checkpoint
+    };
 
     if is_running(&base_url).await {
         println!("  🔊 Qwen TTS already running at {}", base_url);
@@ -554,8 +571,8 @@ pub async fn try_start(data_dir: &Path) -> Option<(QwenTtsProcess, u16, bool)> {
     }
 
     let script = server_script_path(data_dir);
-    println!("  🔊 Starting Qwen TTS server...");
-    match spawn(&python, &script, port).await {
+    println!("  🔊 Starting Qwen TTS server (checkpoint: {})...", effective_checkpoint);
+    match spawn(&python, &script, port, effective_checkpoint).await {
         Ok((proc, true)) => {
             println!("  ✅ Qwen TTS ready on port {}", port);
             Some((proc, port, true))

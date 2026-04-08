@@ -1641,12 +1641,32 @@
   padding: 0.85rem 1rem;
   background: var(--surface-muted);
   border: 1px solid var(--glass-border);
+  border-left: 4px solid transparent;
   border-radius: 8px;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, opacity 0.15s, background 0.15s;
+  /* Not-installed: slightly dimmed */
+  opacity: 0.72;
 }
 
+.db-model-card:hover {
+  opacity: 1;
+  border-color: rgba(128,128,128,0.3);
+}
+
+/* Installed: full opacity, green left accent, green-tinted background */
 .db-model-card[data-downloaded='true'] {
-  border-color: rgba(100, 220, 140, 0.25);
+  opacity: 1;
+  border-color: rgba(100, 220, 140, 0.35);
+  border-left-color: rgba(100, 220, 140, 0.8);
+  background: rgba(100, 220, 140, 0.05);
+}
+
+/* Active (currently loaded) model: stronger accent */
+.db-model-card[data-active='true'] {
+  opacity: 1;
+  border-color: rgba(100, 220, 140, 0.55);
+  border-left-color: #4ade80;
+  background: rgba(100, 220, 140, 0.09);
 }
 
 .db-model-card-info { flex: 1; min-width: 0; }
@@ -1659,6 +1679,11 @@
   align-items: center;
   gap: 0.45rem;
   flex-wrap: wrap;
+}
+
+/* Uninstalled model name: a bit more muted */
+.db-model-card:not([data-downloaded='true']) .db-model-card-name {
+  color: var(--text-secondary);
 }
 
 .db-model-card-hf {
@@ -1684,9 +1709,73 @@
 .db-model-card-actions {
   flex-shrink: 0;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.4rem;
   padding-top: 0.1rem;
 }
 
-.db-model-card-installed { font-size: 0.75rem; color: #15803d; }
-.db-model-card-no-dl     { font-size: 0.75rem; color: var(--text-faint); font-style: italic; }
+/* Green pill for installed/active status */
+.db-model-card-installed {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.12);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  border-radius: 20px;
+  padding: 0.15rem 0.55rem;
+}
+
+.db-model-card-installed::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+}
+
+.db-model-card-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #86efac;
+  background: rgba(74, 222, 128, 0.18);
+  border: 1px solid rgba(74, 222, 128, 0.5);
+  border-radius: 20px;
+  padding: 0.15rem 0.55rem;
+}
+
+.db-model-card-active::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.db-model-card-no-dl { font-size: 0.75rem; color: var(--text-faint); font-style: italic; }
+
+/* Section divider between installed and available models */
+.db-model-section-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 0.35rem 0 0.2rem;
+  opacity: 0.65;
+}

@@ -14,7 +14,6 @@ members = [
     "crates/pond-adapters-gotg",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
-    "crates/pond-builder",
     # Goose-dependent crates — use goose with default-features=false to avoid
     # the rmcp version conflict (code-mode feature is not enabled).
     "crates/pond-adapters-goose",

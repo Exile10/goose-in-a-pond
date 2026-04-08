@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { api } from '../api'
+import { useSettings } from '../context/SettingsContext'
 
 type LoopState = 'wait' | 'listen' | 'think' | 'speak'
 
@@ -14,6 +16,8 @@ const STATE_LABEL: Record<LoopState, string> = {
 }
 
 export default function VoiceOrb({ token }: Props) {
+  const { settings } = useSettings()
+  const assistantName = settings?.assistant_name || 'Assistant'
   const [loopState, setLoopState] = useState<LoopState>('wait')
   const [transcript, setTranscript] = useState('')
   const [response, setResponse] = useState('')
@@ -25,6 +29,7 @@ export default function VoiceOrb({ token }: Props) {
   const audioChunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null)
 
   // Cancel everything and return to Wait
   const cancel = useCallback(() => {
@@ -36,7 +41,10 @@ export default function VoiceOrb({ token }: Props) {
       streamRef.current.getTracks().forEach(t => t.stop())
       streamRef.current = null
     }
-    window.speechSynthesis?.cancel()
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause()
+      currentAudioRef.current = null
+    }
     setLoopState('wait')
     setError(null)
   }, [])
@@ -58,7 +66,7 @@ export default function VoiceOrb({ token }: Props) {
     const blob = new Blob(chunks, { type: 'audio/webm' })
 
     try {
-      // Transcribe via whisper proxy
+      // Transcribe via whisper proxy — the server uses its configured whisper URL
       const formData = new FormData()
       formData.append('audio', blob, 'audio.webm')
       const transcribeRes = await fetch('/api/v1/transcribe', {
@@ -76,33 +84,49 @@ export default function VoiceOrb({ token }: Props) {
       setTranscript(text.trim())
       setShowOverlay(true)
 
-      // Chat with the LLM
+      // Stream chat response
       const sessionId = localStorage.getItem('pond_voice_session_id') ?? undefined
-      const chatRes = await fetch('/api/v1/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ message: text.trim(), session_id: sessionId }),
-      })
-      if (!chatRes.ok) throw new Error('Chat request failed')
-      const { session_id, response: reply } = await chatRes.json() as { session_id: string; response: string }
+      let replyText = ''
+      let newSessionId = ''
 
-      if (session_id) localStorage.setItem('pond_voice_session_id', session_id)
-      setResponse(reply)
+      await api.chatStream(
+        text.trim(),
+        token,
+        sessionId,
+        (tokenText) => { replyText += tokenText },
+        (sid) => { newSessionId = sid },
+        (err) => { throw new Error(err) },
+      )
 
-      if (muted) {
+      if (newSessionId) localStorage.setItem('pond_voice_session_id', newSessionId)
+      setResponse(replyText)
+
+      if (muted || !replyText) {
+        setLoopState('wait')
+        return
+      }
+
+      // Speak via server TTS
+      const blobUrl = await api.speak(replyText, token)
+      if (!blobUrl) {
         setLoopState('wait')
         return
       }
 
       setLoopState('speak')
-      const utter = new SpeechSynthesisUtterance(reply)
-      utter.lang = 'en-US'
-      utter.onend = () => setLoopState('wait')
-      utter.onerror = () => setLoopState('wait')
-      window.speechSynthesis.speak(utter)
+      const audio = new Audio(blobUrl)
+      currentAudioRef.current = audio
+      audio.onended = () => {
+        URL.revokeObjectURL(blobUrl)
+        currentAudioRef.current = null
+        setLoopState('wait')
+      }
+      audio.onerror = () => {
+        URL.revokeObjectURL(blobUrl)
+        currentAudioRef.current = null
+        setLoopState('wait')
+      }
+      void audio.play()
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
@@ -128,7 +152,7 @@ export default function VoiceOrb({ token }: Props) {
           streamRef.current.getTracks().forEach(t => t.stop())
           streamRef.current = null
         }
-        handleRecordingStop(audioChunksRef.current)
+        void handleRecordingStop(audioChunksRef.current)
       }
 
       recorder.start()
@@ -156,7 +180,7 @@ export default function VoiceOrb({ token }: Props) {
 
   function handleOrbClick() {
     if (loopState === 'wait') {
-      startListen()
+      void startListen()
     } else if (loopState === 'listen') {
       stopListen()
     } else {
@@ -169,7 +193,10 @@ export default function VoiceOrb({ token }: Props) {
     setMuted(next)
     localStorage.setItem('pond_tts_muted', String(next))
     if (next && loopState === 'speak') {
-      window.speechSynthesis?.cancel()
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause()
+        currentAudioRef.current = null
+      }
       setLoopState('wait')
     }
   }
@@ -194,7 +221,7 @@ export default function VoiceOrb({ token }: Props) {
           )}
           {response && (
             <div className="voice-orb-overlay-row">
-              <span className="voice-orb-overlay-label">Goose</span>
+              <span className="voice-orb-overlay-label">{assistantName}</span>
               <span className="voice-orb-overlay-text">{response}</span>
             </div>
           )}
