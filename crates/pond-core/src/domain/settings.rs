@@ -158,6 +158,23 @@ pub struct Settings {
     /// Maximum session messages to keep per session
     #[serde(default = "Settings::default_session_messages_keep")]
     pub retention_session_messages_keep: u32,
+
+    // ── Agent behaviour ────────────────────────────────────────────────────────
+    /// GooseMode for the agent loop: "auto" | "chat" | "smart"
+    #[serde(default = "Settings::default_agent_goose_mode")]
+    pub agent_goose_mode: String,
+
+    /// Maximum agentic loop turns per request (safety cap)
+    #[serde(default = "Settings::default_agent_max_turns")]
+    pub agent_max_turns: u32,
+
+    /// When true, recent memory fragments are injected into the system prompt each turn
+    #[serde(default = "Settings::default_agent_memory_inject")]
+    pub agent_memory_inject: bool,
+
+    /// How many memory fragments to inject (most recent first)
+    #[serde(default = "Settings::default_agent_memory_limit")]
+    pub agent_memory_limit: u32,
 }
 
 impl Default for Settings {
@@ -197,6 +214,10 @@ impl Default for Settings {
             retention_event_log_days:        Self::default_event_log_days(),
             retention_sensor_days:           Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
+            agent_goose_mode:                Self::default_agent_goose_mode(),
+            agent_max_turns:                 Self::default_agent_max_turns(),
+            agent_memory_inject:             Self::default_agent_memory_inject(),
+            agent_memory_limit:              Self::default_agent_memory_limit(),
         }
     }
 }
@@ -230,6 +251,10 @@ impl Settings {
     fn default_event_log_days()              -> u32    { 30 }
     fn default_sensor_days()                -> u32    { 7 }
     fn default_session_messages_keep()      -> u32    { 500 }
+    fn default_agent_goose_mode()           -> String { "auto".to_string() }
+    fn default_agent_max_turns()            -> u32    { 20 }
+    fn default_agent_memory_inject()        -> bool   { false }
+    fn default_agent_memory_limit()         -> u32    { 5 }
 }
 
 #[cfg(test)]

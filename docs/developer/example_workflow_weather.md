@@ -1,94 +1,150 @@
 # End-to-End Workflow Example: Weather Feature
 
-This guide walks you through implementing a new feature—**Getting the Weather**—using the `pond-builder` and our Hexagonal Architecture.
+This guide walks through implementing a new feature — **Getting the Weather** — using the Hexagonal Architecture. The weather feature is already implemented; this doc explains the pattern so you can follow it for new features.
+
+> **Note:** `pond-builder` (the code-generation CLI) has been removed. Follow these steps manually.
 
 ---
 
-## 🏗️ 1. The Strategy
-We will implement a **Driven Port** (the interface for weather), a **Service** (the logic that uses the weather), and an **Adapter** (the actual API call).
+## The Strategy
+
+We will implement a **Driven Port** (the interface for weather), a **Service** (the logic that uses it), and an **Adapter** (the actual API call). This keeps the `pond-core` brain free of HTTP/API details.
 
 ---
 
-## 🛠️ Step 1: Create the Port
+## Step 1: Create the Port
+
 The Port is the contract. It lives in `pond-core`.
 
-```powershell
-cargo run -p pond-builder -- make:port Weather --type driven
-```
-
-**Result**: Created `crates/pond-core/src/ports/weather.rs`.
-
-**Next**: Add `pub mod weather;` to `crates/pond-core/src/ports/mod.rs`.
-
----
-
-## 🧠 Step 2: Define Domain Models
-Update `crates/pond-core/src/domain/mod.rs` (or create a new domain file) to include weather data:
+**File:** `crates/pond-core/src/ports/weather.rs`
 
 ```rust
-pub struct WeatherReport {
-    pub temperature: f32,
-    pub condition: String,
+use anyhow::Result;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait WeatherProvider: Send + Sync {
+    async fn get_weather(&self, lat: f64, lon: f64) -> Result<WeatherData>;
 }
 ```
 
----
-
-## 🧪 Step 3: Implement Logic (TDD)
-Create the Service that orchestrates the logic.
-
-```powershell
-cargo run -p pond-builder -- make:service weather
-```
-
-**Result**: Created `crates/pond-core/src/services/weather.rs`.
-
-### Write a Unit Test (Mocking)
-In `crates/pond-core/src/services/weather.rs`, write a test that ensures the service correctly processes weather data without calling a real API.
+Register it:
 
 ```rust
+// crates/pond-core/src/ports/mod.rs
+pub mod weather;
+```
+
+---
+
+## Step 2: Define Domain Types
+
+**File:** `crates/pond-core/src/domain/weather.rs` (or within `pond-adapters-weather` if the type is adapter-specific)
+
+```rust
+pub struct WeatherData {
+    pub temperature_c: f32,
+    pub condition: String,
+    pub humidity_pct: u8,
+}
+```
+
+> In the actual implementation, `WeatherData` and `WeatherProvider` live in `crates/pond-adapters-weather/src/` because weather is only ever exposed via MCP tools, not core domain logic. Place types in `pond-core` when multiple adapters or core services consume them.
+
+---
+
+## Step 3: Write a Mock and Tests (TDD first)
+
+**File:** `crates/pond-core/src/services/mock_weather.rs`
+
+```rust
+use async_trait::async_trait;
+use anyhow::Result;
+use crate::ports::weather::{WeatherProvider, WeatherData};
+
+pub struct MockWeather;
+
+#[async_trait]
+impl WeatherProvider for MockWeather {
+    async fn get_weather(&self, _lat: f64, _lon: f64) -> Result<WeatherData> {
+        Ok(WeatherData { temperature_c: 22.0, condition: "Sunny".into(), humidity_pct: 40 })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Mock Weather Port implementation here...
+    #[tokio::test]
+    async fn mock_returns_data() {
+        let w = MockWeather;
+        let data = w.get_weather(0.0, 0.0).await.unwrap();
+        assert_eq!(data.condition, "Sunny");
+    }
 }
 ```
 
----
+Run quickly (no Goose compilation):
 
-## 🔌 Step 4: Implement the Adapter
-Now we implement the "Real World" connection in `pond-infra`.
-
-```powershell
-cargo run -p pond-builder -- make:adapter open_weather --for Weather --target-crate crates/pond-infra
+```bash
+cargo test -p pond-core
 ```
 
-**Result**: Created `crates/pond-infra/src/open_weather_weather.rs`.
-
-**Next**: Implement the `Weather` trait in this file, making the actual HTTP calls using `reqwest`.
-
 ---
 
-## 🔌 Step 5: Wiring in the Server
-Finally, wire the Adapter to the Service in `crates/pond-server/src/main.rs`.
+## Step 4: Implement the Adapter
+
+Create a new adapter crate (or add to an existing one):
+
+**File:** `crates/pond-adapters-weather/src/lib.rs`
 
 ```rust
-// 1. Initialize Adapter
-let weather_adapter = OpenWeatherWeather::new(api_key);
+pub struct OpenMeteoWeatherAdapter {
+    client: reqwest::Client,
+    cache: tokio::sync::Mutex<Option<(Instant, WeatherData)>>,
+    ttl: Duration,
+}
 
-// 2. Inject into Service
-let weather_service = WeatherService::new(Box::new(weather_adapter));
-
-// 3. Add to Application State
-let state = AppState { weather_service };
+#[async_trait]
+impl WeatherProvider for OpenMeteoWeatherAdapter {
+    async fn get_weather(&self, lat: f64, lon: f64) -> Result<WeatherData> {
+        // Check cache, then fetch from Open-Meteo free API
+        let url = format!(
+            "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        );
+        // ... parse response ...
+    }
+}
 ```
+
+Add to `Cargo.toml` workspace members, add `reqwest` as a workspace dep if not already present.
 
 ---
 
-## ✅ Summary
-1. **Port** defines **What** can be done.
-2. **Service** defines **How** the assistant thinks about it.
-3. **Adapter** defines **Where** the data actually comes from.
-4. **Server** wires the **Plugin** to the **Core**.
+## Step 5: Wire into the Server
 
-By following this flow, you can swap out OpenWeather for any other provider without touching a single line of your business logic!
+In `crates/pond-server/src/main.rs`:
+
+```rust
+// 1. Build the adapter (only if weather is enabled in settings)
+let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled {
+    Some(Arc::new(OpenMeteoWeatherAdapter::new(Duration::from_secs(900))))
+} else {
+    None
+};
+
+// 2. Pass to GIAP MCP service handles (exposed to the LLM as a tool)
+init_giap_services(Arc::new(GiapServiceHandles { weather, device_registry, scheduler }));
+```
+
+Weather is **not** in `AppState` — it goes into `GiapServiceHandles` and reaches the LLM via the `giap__get_current_weather` MCP tool.
+
+---
+
+## Summary
+
+1. **Port** defines *what* can be done (`WeatherProvider` trait in `pond-core`).
+2. **Mock** enables fast tests without HTTP (`MockWeather` in `pond-core`).
+3. **Adapter** does the real work (`OpenMeteoWeatherAdapter` in `pond-adapters-weather`).
+4. **Server** wires it all together and passes to MCP or `AppState`.
+
+By following this flow you can swap Open-Meteo for any other provider by implementing `WeatherProvider` — zero changes to `pond-core`.

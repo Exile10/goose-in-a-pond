@@ -6533,7 +6533,9 @@ dependencies = [
  "pond-mcp-server",
  "rmcp",
  "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -6757,14 +6759,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "once_cell",
  "pond-adapters-weather",
  "pond-core",
  "rmcp",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6774,6 +6779,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "clap",
  "dirs",
  "flate2",
@@ -6800,6 +6806,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "webbrowser",
  "wiremock",
  "zip 2.4.2",

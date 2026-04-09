@@ -11,7 +11,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt as _;
 
 // ── whisper-server binary download ────────────────────────────────────────────
 

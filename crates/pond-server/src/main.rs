@@ -19,7 +19,6 @@
 
 mod filesystem_model_storage;
 mod http_model_catalog_provider;
-mod http_model_downloader;
 mod llamafile_process;
 mod model_download;
 mod piper_http;
@@ -64,7 +63,11 @@ use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_model_repository::SqliteModelRepository;
+use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
+use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
+use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
+use pond_infra::sqlite_skill::SqliteSkillRepository;
 use pond_core::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::ports::model_repository::ModelRepository;
 use std::sync::Arc;
@@ -163,6 +166,36 @@ enum Commands {
         #[command(subcommand)]
         action: ModelAction,
     },
+
+    /// One-shot agent chat via the Goose agentic loop (no voice I/O)
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Manage system prompt templates (DB-stored, editable at runtime)
+    Prompts {
+        #[command(subcommand)]
+        action: PromptAction,
+    },
+
+    /// Manage user skills injected into the agent system prompt
+    Skills {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
+    /// Manage agent recipes (Goose YAML automations stored in DB)
+    Recipes {
+        #[command(subcommand)]
+        action: RecipeAction,
+    },
+
+    /// Manage persistent memory fragments
+    Memories {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -187,6 +220,111 @@ enum ModelAction {
     },
 }
 
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Send a message through the Goose agent and print the response
+    Chat {
+        /// The message to send to the agent
+        message: String,
+        /// Session ID for conversation continuity across calls
+        #[arg(long, default_value = "cli-agent")]
+        session: String,
+    },
+    /// List MCP tool extensions currently known to the agent
+    Tools,
+    /// List all system prompt extras from the database
+    Extras,
+}
+
+#[derive(Subcommand)]
+enum PromptAction {
+    /// List all prompt templates (built-in and user-defined)
+    List,
+    /// Show the full content of a named template
+    Show {
+        /// Template name: balanced | concise | technical | warm | <custom>
+        name: String,
+    },
+    /// Re-seed a built-in template to its factory default (overwrites DB record)
+    Reset {
+        /// Built-in template name: balanced | concise | technical | warm
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// List skills (active only by default; use --all for inactive too)
+    List {
+        /// Include inactive skills in the output
+        #[arg(long)]
+        all: bool,
+    },
+    /// Add a new skill (reads content from --content or stdin)
+    Add {
+        /// Unique skill slug (e.g. "morning_brief", "light_control")
+        name: String,
+        /// Markdown instruction content. Omit to read from stdin.
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Toggle a skill's active state by UUID
+    Toggle {
+        /// Skill UUID (from `pond skills list --all`)
+        id: String,
+    },
+    /// Permanently delete a skill by UUID
+    Remove {
+        /// Skill UUID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipeAction {
+    /// List all recipes
+    List,
+    /// Show a recipe's YAML content
+    Show {
+        /// Recipe slug name
+        name: String,
+    },
+    /// Import a recipe from a local YAML file
+    Import {
+        /// Recipe slug (e.g. "morning_brief")
+        name: String,
+        /// Path to the Goose recipe YAML file
+        file: std::path::PathBuf,
+        /// Short one-sentence description
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Delete a recipe by slug name
+    Remove {
+        /// Recipe slug name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// List recent memory fragments (newest last)
+    List {
+        /// Maximum number of fragments to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Save a new memory fragment
+    Add {
+        /// The text content of the memory
+        content: String,
+    },
+    /// Delete a memory fragment by UUID
+    Remove {
+        /// Memory fragment UUID
+        id: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -215,6 +353,22 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Models { action }) => {
             run_models(action).await
+        }
+        Some(Commands::Agent { action }) => {
+            init_tracing(false);
+            run_agent_cmd(action).await
+        }
+        Some(Commands::Prompts { action }) => {
+            run_prompts_cmd(action).await
+        }
+        Some(Commands::Skills { action }) => {
+            run_skills_cmd(action).await
+        }
+        Some(Commands::Recipes { action }) => {
+            run_recipes_cmd(action).await
+        }
+        Some(Commands::Memories { action }) => {
+            run_memories_cmd(action).await
         }
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
@@ -275,6 +429,34 @@ async fn run_setup(model: &str) -> Result<()> {
         .get().await.unwrap_or_default();
     println!("  📋 Fetching model catalog from {}...", setup_settings.model_registry_url);
     seed_model_catalog(&setup_model_repo, &setup_settings.model_registry_url, &data_dir).await;
+
+    // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+
+        let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, complete behaviour rules. Default for most households."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users who want brevity."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = template_repo.insert_if_absent(&t).await {
+                println!("  ⚠  Failed to seed prompt template '{name}': {e}");
+            }
+        }
+        println!("  ✅ Prompt templates seeded");
+    }
 
     // Step 3: Download Whisper ASR model from catalog URL
     let effective_model = if model.is_empty() { "base" } else { model };
@@ -611,6 +793,15 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
+    let prompt_template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let prompt_extra_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+        Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model    = settings.chat_model.clone();
 
@@ -739,6 +930,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         weather.clone(),
         device_registry.clone(),
         scheduler.clone(),
+        settings_repo.clone(),
+        memory_repo.clone(),
+        skill_repo.clone(),
+        recipe_repo.clone(),
+        prompt_template_repo.clone(),
+        prompt_extra_repo.clone(),
     ).await;
 
     #[cfg(not(feature = "goose-agent"))]
@@ -817,6 +1014,10 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             crate::http_model_catalog_provider::HttpModelCatalogProvider::new()
         )),
         model_storage_dir: Some(data_dir.clone()),
+        prompt_template_repo: Some(prompt_template_repo),
+        prompt_extra_repo: Some(prompt_extra_repo),
+        skill_repo: Some(skill_repo.clone()),
+        recipe_repo: Some(recipe_repo.clone()),
     });
 
     // Warn if static assets haven't been built yet
@@ -1544,6 +1745,12 @@ async fn build_goose_backend(
     weather: Option<Arc<dyn WeatherProvider>>,
     device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
     scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
+    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
+    memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync>,
+    recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
+    template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync>,
+    extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
@@ -1556,14 +1763,29 @@ async fn build_goose_backend(
     }
 
     // Register the GIAP MCP server into Goose's builtin extension registry.
-    let handles = Arc::new(GiapServiceHandles { weather, device_registry, scheduler });
+    let handles = Arc::new(GiapServiceHandles {
+        weather,
+        device_registry,
+        scheduler,
+        settings_repo: settings_repo.clone(),
+        memory_repo: memory_repo.clone(),
+        skill_repo: skill_repo.clone(),
+        recipe_repo: recipe_repo.clone(),
+    });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
         return (Arc::new(MockAgent::new()), None);
     }
 
-    // Build the adapter (OllamaProvider → llamafile on actual port).
-    match GooseAdapter::with_llamafile(Some(llamafile_url)).await {
+    // Build the adapter with all repos injected.
+    match GooseAdapter::new(
+        settings_repo,
+        template_repo,
+        extras_repo,
+        skill_repo,
+        memory_repo,
+        llamafile_url.to_string(),
+    ).await {
         Ok(adapter) => {
             let ext_mgr: Arc<dyn ExtensionManagerPort> =
                 Arc::new(adapter.extension_manager("server".to_string()));
@@ -1809,6 +2031,444 @@ async fn run_models(action: ModelAction) -> Result<()> {
             repo.set_assignment(&role, &id).await?;
             sync_assignments_to_settings(&*repo, &settings_repo).await;
             println!("✓ {} assigned to role '{}'", id, role);
+        }
+    }
+
+    Ok(())
+}
+
+// ── Agent CLI ─────────────────────────────────────────────────────────────────
+
+/// One-shot Goose agent chat from the CLI.
+///
+/// Builds the full GooseAdapter + GIAP MCP backend (same as `run_server`),
+/// sends a single message, prints the text response, then exits.
+async fn run_agent_cmd(action: AgentAction) -> Result<()> {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+
+    match action {
+        AgentAction::Chat { message, session } => {
+            use pond_core::domain::agent::AgentRequest;
+
+            let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+                Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+            let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
+                Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+            let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+                Arc::new(SqliteSkillRepository::new(db.system.clone()));
+            let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+                Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+            let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+                Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+            let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+                Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+            let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
+                Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+
+            let settings = settings_repo.get().await.unwrap_or_default();
+            let llamafile_url = format!("http://127.0.0.1:{}", ports::LLAMAFILE);
+
+            println!("Agent: {} | Provider: {} | Model: {}",
+                settings.assistant_name, settings.chat_provider, settings.chat_model);
+            println!("Sending: {message}\n");
+
+            let (agent, _ext_mgr) = build_goose_backend(
+                "goose",
+                &llamafile_url,
+                None,
+                device_registry,
+                None,
+                settings_repo,
+                memory_repo,
+                skill_repo,
+                recipe_repo,
+                template_repo,
+                extras_repo,
+            ).await;
+
+            let request = AgentRequest { message, session_id: session };
+            match agent.chat(request).await {
+                Ok(response) => {
+                    println!("{}", response.text);
+                    if let Some(calls) = response.metadata.get("tool_calls") {
+                        if !calls.is_empty() {
+                            eprintln!("\n[tool calls: {}]", calls);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Agent error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        AgentAction::Tools => {
+            let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+                Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+            let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
+                Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+            let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+                Arc::new(SqliteSkillRepository::new(db.system.clone()));
+            let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+                Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+            let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+                Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+            let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+                Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+            let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
+                Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+            let llamafile_url = format!("http://127.0.0.1:{}", ports::LLAMAFILE);
+
+            let (_agent, ext_mgr) = build_goose_backend(
+                "goose",
+                &llamafile_url,
+                None,
+                device_registry,
+                None,
+                settings_repo,
+                memory_repo,
+                skill_repo,
+                recipe_repo,
+                template_repo,
+                extras_repo,
+            ).await;
+
+            match ext_mgr {
+                None => println!("No extension manager available (agent backend may be 'mock')."),
+                Some(mgr) => {
+                    let extensions = mgr.list_extensions().await.unwrap_or_default();
+                    if extensions.is_empty() {
+                        println!("No extensions loaded yet (start the server to initialise sessions).");
+                    } else {
+                        println!("{:<20} {}", "Extension", "Tools");
+                        println!("{}", "─".repeat(60));
+                        for ext in &extensions {
+                            let tools = ext.tools.join(", ");
+                            println!("{:<20} {}", ext.name, tools);
+                        }
+                    }
+                }
+            }
+        }
+
+        AgentAction::Extras => {
+            use pond_core::ports::prompt_extra::PromptExtraRepository as _;
+
+            let extras_repo = SqlitePromptExtraRepository::new(db.system.clone());
+            let extras = extras_repo.list_all().await?;
+
+            if extras.is_empty() {
+                println!("No prompt extras defined. Add via POST /api/v1/agent/extras");
+                return Ok(());
+            }
+
+            println!("{:<4} {:<20} {:<6} {}", "Ord", "Key", "Active", "Instruction");
+            println!("{}", "─".repeat(72));
+            for e in &extras {
+                let active = if e.active { "✓" } else { "✗" };
+                let preview = if e.instruction.len() > 40 {
+                    format!("{}…", &e.instruction[..39])
+                } else {
+                    e.instruction.clone()
+                };
+                println!("{:<4} {:<20} {:<6} {}", e.sort_order, e.key, active, preview);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Prompts CLI ───────────────────────────────────────────────────────────────
+
+async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
+    use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = SqlitePromptTemplateRepository::new(db.system.clone());
+
+    match action {
+        PromptAction::List => {
+            let templates = repo.list().await?;
+            if templates.is_empty() {
+                println!("No templates found. Run `pond setup` to seed built-ins.");
+                return Ok(());
+            }
+            println!("{:<16} {:<8} {}", "Name", "System", "Description");
+            println!("{}", "─".repeat(60));
+            for t in &templates {
+                let sys = if t.is_system { "✓" } else { "—" };
+                println!("{:<16} {:<8} {}", t.name, sys, t.description);
+            }
+        }
+
+        PromptAction::Show { name } => {
+            match repo.get(&name).await? {
+                None => {
+                    eprintln!("Template '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(t) => {
+                    println!("─── {} ─── (system={})", t.name, t.is_system);
+                    println!("{}", t.content);
+                }
+            }
+        }
+
+        PromptAction::Reset { name } => {
+            use pond_core::domain::prompt_template::PromptTemplate;
+            use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+
+            let (content, description) = match name.as_str() {
+                "balanced"  => (PROMPT_BALANCED, "Warm, practical, complete behaviour rules. Default for most households."),
+                "concise"   => (PROMPT_CONCISE,  "Minimal, action-first. For power users who want brevity."),
+                "technical" => (PROMPT_TECHNICAL,"Verbose, tool-aware, narrates reasoning. For developers."),
+                "warm"      => (PROMPT_WARM,     "Conversational, family-friendly, personality-forward."),
+                other => {
+                    eprintln!("'{other}' is not a built-in template. Only balanced | concise | technical | warm can be reset.");
+                    std::process::exit(1);
+                }
+            };
+            let t = PromptTemplate {
+                name: name.clone(),
+                content: content.to_string(),
+                description: description.to_string(),
+                is_system: true,
+                updated_at: String::new(),
+            };
+            repo.upsert(&t).await?;
+            println!("✓ Template '{name}' reset to factory default.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Skills CLI ────────────────────────────────────────────────────────────────
+
+async fn run_skills_cmd(action: SkillAction) -> Result<()> {
+    use pond_core::ports::skill::UserSkillRepository as _;
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteSkillRepository::new(db.system.clone());
+
+    match action {
+        SkillAction::List { all } => {
+            let skills = if all {
+                repo.list_all().await?
+            } else {
+                repo.list_active().await?
+            };
+            if skills.is_empty() {
+                let hint = if all { "" } else { " (use --all to include inactive)" };
+                println!("No skills found{hint}.");
+                return Ok(());
+            }
+            println!("{:<38} {:<6} {}", "ID", "Active", "Name");
+            println!("{}", "─".repeat(60));
+            for s in &skills {
+                let active = if s.active { "✓" } else { "✗" };
+                println!("{:<38} {:<6} {}", s.id, active, s.name);
+            }
+        }
+
+        SkillAction::Add { name, content } => {
+            use pond_core::domain::skill::UserSkill;
+
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    eprintln!("Reading skill content from stdin (Ctrl-D to finish)...");
+                    let mut buf = String::new();
+                    use std::io::Read as _;
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim().to_string()
+                }
+            };
+            if content.is_empty() {
+                eprintln!("Skill content cannot be empty.");
+                std::process::exit(1);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let skill = UserSkill {
+                id: id.clone(),
+                name: name.clone(),
+                content,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            repo.create(&skill).await?;
+            println!("✓ Skill '{name}' created (id: {id})");
+        }
+
+        SkillAction::Toggle { id } => {
+            use pond_core::ports::skill::UserSkillRepository as _;
+
+            let skill = repo.get(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Skill '{id}' not found"))?;
+            let updated = pond_core::domain::skill::UserSkill {
+                active: !skill.active,
+                ..skill.clone()
+            };
+            repo.update(&updated).await?;
+            let state = if updated.active { "enabled" } else { "disabled" };
+            println!("✓ Skill '{}' {state}", skill.name);
+        }
+
+        SkillAction::Remove { id } => {
+            repo.delete(&id).await?;
+            println!("✓ Skill {id} deleted.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Recipes CLI ───────────────────────────────────────────────────────────────
+
+async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
+    use pond_core::ports::recipe::AgentRecipeRepository as _;
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteRecipeRepository::new(db.system.clone());
+
+    match action {
+        RecipeAction::List => {
+            let recipes = repo.list().await?;
+            if recipes.is_empty() {
+                println!("No recipes found. Import one with `pond recipes import <name> <file.yaml>`");
+                return Ok(());
+            }
+            println!("{:<38} {:<6} {:<20} {}", "ID", "Active", "Name", "Description");
+            println!("{}", "─".repeat(80));
+            for r in &recipes {
+                let active = if r.active { "✓" } else { "✗" };
+                let desc = if r.description.len() > 30 {
+                    format!("{}…", &r.description[..29])
+                } else {
+                    r.description.clone()
+                };
+                println!("{:<38} {:<6} {:<20} {}", r.id, active, r.name, desc);
+            }
+        }
+
+        RecipeAction::Show { name } => {
+            match repo.get_by_name(&name).await? {
+                None => {
+                    eprintln!("Recipe '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(r) => {
+                    println!("─── {} ─── (active={})", r.name, r.active);
+                    if !r.description.is_empty() {
+                        println!("# {}\n", r.description);
+                    }
+                    println!("{}", r.yaml);
+                }
+            }
+        }
+
+        RecipeAction::Import { name, file, description } => {
+            use pond_core::domain::recipe::AgentRecipe;
+
+            let yaml = tokio::fs::read_to_string(&file).await
+                .map_err(|e| anyhow::anyhow!("Cannot read '{}': {e}", file.display()))?;
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let recipe = AgentRecipe {
+                id: id.clone(),
+                name: name.clone(),
+                description,
+                yaml,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            repo.upsert(&recipe).await?;
+            println!("✓ Recipe '{name}' imported (id: {id})");
+        }
+
+        RecipeAction::Remove { name } => {
+            match repo.get_by_name(&name).await? {
+                None => {
+                    eprintln!("Recipe '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(r) => {
+                    repo.delete(&r.id).await?;
+                    println!("✓ Recipe '{name}' deleted.");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Memories CLI ──────────────────────────────────────────────────────────────
+
+async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
+    use pond_core::ports::memory_repository::MemoryRepository as _;
+
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond");
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteMemoryRepository::new(db.system.clone());
+
+    match action {
+        MemoryAction::List { limit } => {
+            let fragments = repo.search_recent(None, limit).await?;
+            if fragments.is_empty() {
+                println!("No memory fragments found.");
+                return Ok(());
+            }
+            println!("{:<38} {:<24} {}", "ID", "Created", "Content");
+            println!("{}", "─".repeat(80));
+            for f in &fragments {
+                let ts = f.created_at.format("%Y-%m-%d %H:%M").to_string();
+                let preview = if f.content.len() > 40 {
+                    format!("{}…", &f.content[..39])
+                } else {
+                    f.content.clone()
+                };
+                println!("{:<38} {:<24} {}", f.id, ts, preview);
+            }
+        }
+
+        MemoryAction::Add { content } => {
+            use pond_core::domain::memory::MemoryFragment;
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let fragment = MemoryFragment {
+                id: id.clone(),
+                profile_id: None,
+                session_id: None,
+                content: content.clone(),
+                embedding: None,
+                source: "cli".to_string(),
+                tags: vec![],
+                created_at: chrono::Utc::now(),
+            };
+            repo.add(fragment).await?;
+            println!("✓ Memory saved (id: {id})");
+        }
+
+        MemoryAction::Remove { id } => {
+            repo.delete(&id).await?;
+            println!("✓ Memory {id} deleted.");
         }
     }
 

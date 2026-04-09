@@ -504,6 +504,100 @@ pub model_scheduler:        Option<Arc<dyn ModelScheduler>>,            // backg
 
 ---
 
+## Settings Reference
+
+All settings live in `crates/pond-core/src/domain/settings.rs` and are persisted as a flat key-value store in `pond_system.db`. Read/write via `GET /api/v1/settings` and `PUT /api/v1/settings` (or `settings_repo.get()` / `settings_repo.set_key()` in Rust).
+
+### Assistant Identity
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `assistant_name` | `String` | `"Goose"` | Name the assistant uses for itself |
+| `assistant_personality` | `String` | `"friendly and concise"` | Personality hint injected into the system prompt |
+| `user_name` | `String` | `"Friend"` | Primary user's name, personalises responses |
+| `timezone` | `String` | `"UTC"` | IANA timezone string, e.g. `"Africa/Nairobi"` |
+| `primary_profile_id` | `Option<String>` | `None` | UUID of the primary profile created during onboarding |
+
+### Prompt System
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `prompt_style` | `String` | `"balanced"` | Built-in template. Values: `balanced` \| `concise` \| `technical` \| `warm` |
+| `custom_system_prompt` | `Option<String>` | `None` | Full prompt override. Supports `{{assistant_name}}`, `{{user_name}}`, `{{personality}}`, `{{timezone}}`, `{{location}}`, `{{prompt_addendum}}` placeholders. Max 4000 chars. |
+| `prompt_addendum` | `String` | `""` | Extra instructions appended after the main prompt. Max 500 chars. |
+
+### Model Roles (LLM routing)
+
+These are the **authoritative** fields read at runtime. Written by `sync_assignments_to_settings()` from the `model_role_assignments` table; also written directly when the web UI saves the Settings page.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `chat_provider` | `String` | `""` | Provider for the Chat role: `"llamafile"` \| `"ollama"` \| `"gguf"` \| `"mock"` |
+| `chat_model` | `String` | `""` | Model name for the Chat role (e.g. `"llama-3b"`) |
+| `think_provider` | `Option<String>` | `None` | Provider for the Think role. `None` = fallback to `chat_provider` |
+| `think_model` | `Option<String>` | `None` | Model for the Think role. `None` = fallback to `chat_model` |
+| `task_provider` | `Option<String>` | `None` | Provider for the Task role. `None` = fallback to `chat_provider` |
+| `task_model` | `Option<String>` | `None` | Model for the Task role. `None` = fallback to `chat_model` |
+
+### LLM Behaviour
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `llm_max_tokens` | `u32` | `1024` | Maximum tokens the LLM may generate per response |
+| `llm_temperature` | `f32` | `0.7` | Sampling temperature (0.0 = deterministic, 1.0 = creative) |
+
+### Voice Pipeline
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `voice_wake_word` | `String` | `"goose"` | Wake word / phrase detected by `WhisperKeywordDetector` (case-insensitive substring) |
+| `voice_recording_duration_secs` | `u32` | `5` | Microphone capture duration per Whisper inference call |
+| `voice_whisper_url` | `String` | `"http://127.0.0.1:9000"` | Custom remote whisper.cpp server URL |
+| `voice_tts_voice` | `String` | `""` | Piper ONNX voice filename (e.g. `"en_US-lessac-medium.onnx"`) |
+| `voice_tts_http_url` | `String` | `"http://127.0.0.1:8181"` | HTTP TTS server base URL (OpenAI-compatible `/v1/audio/speech`) |
+| `voice_tts_http_voice` | `String` | `""` | Voice name sent to HTTP TTS server (e.g. `"Vivian"`, `"Chelsie"`) |
+
+### Active Model Selection (hot-cache)
+
+These are written by `sync_assignments_to_settings()` from `model_role_assignments`. Do not write them directly from application code — use the role assignment system instead.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `active_whisper_model` | `String` | `""` | Model name for the `"asr"` role (e.g. `"base"`, `"small"`) |
+| `active_tts_model` | `String` | `""` | Model name for the `"tts"` role (e.g. `"en-lessac"`, `"qwen-tts"`) |
+
+### Model Catalog
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `model_registry_url` | `String` | GitHub raw URL | URL of the registry JSON fetched by `HttpModelCatalogProvider` |
+
+### Weather
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `weather_enabled` | `bool` | `false` | Whether to make weather available to the LLM via the `giap__get_current_weather` MCP tool |
+| `weather_latitude` | `f64` | `0.0` | Decimal latitude for weather lookups (e.g. `-1.286` for Nairobi) |
+| `weather_longitude` | `f64` | `0.0` | Decimal longitude (e.g. `36.817` for Nairobi) |
+| `weather_location_name` | `String` | `""` | Human-readable location injected into the system prompt |
+
+### Data Retention
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `retention_event_log_days` | `u32` | `30` | Days to keep rows in `event_log` (0 = keep forever) |
+| `retention_sensor_days` | `u32` | `7` | Days to keep rows in `sensor_readings` |
+| `retention_session_messages_keep` | `u32` | `500` | Maximum session messages to keep per session |
+
+### Legacy fields (kept for DB compat, not used for routing)
+
+| Field | Status | Notes |
+|---|---|---|
+| `llm_provider` | Serde-compatible stub | Old single-provider field. DB rows with this key are harmless. Code reads `chat_provider` instead. |
+| `active_llm_model` | Serde-compatible stub | Old model name field. Code reads `chat_model` instead. |
+
+---
+
 ## Verification Checklist
 
 ```bash

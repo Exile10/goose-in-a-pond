@@ -1,18 +1,20 @@
 # Integrating Goose Built-in Capabilities into GIAP
 
+> **Status: Implemented (2026-04-08).** All phases described below are complete. This document is preserved as a design record. For current architecture see `CLAUDE.md` and `docs/developer/model_architecture.md`.
+
 ## Background
 
-The Goose submodule (`goose/crates/goose/`) ships production-quality implementations of several capabilities that GIAP currently handles with external HTTP subprocesses. This document describes the plan to wrap those built-ins as GIAP port adapters.
+The Goose submodule (`goose/crates/goose/`) ships production-quality implementations of several capabilities that GIAP previously handled with external HTTP subprocesses. This document describes the integration that wrapped those built-ins as GIAP port adapters.
 
 ### Why
 
-| Current state | After integration |
+| Before | After (implemented) |
 |---|---|
-| llamafile HTTP server (external process) | `LocalInferenceProvider` — GGUF loaded in-process, no subprocess |
-| whisper.cpp HTTP server (external process) | Candle-based Whisper — in-process STT (future phase) |
-| No persistent cross-session memory | Goose `MemoryServer` (flat-file MCP) injected into system prompt |
-| No scheduler | `tokio-cron-scheduler` adapter — enables time-based automations |
-| `trim_to_budget()` (char-count truncation) | LLM-summarization compaction at 80% context threshold |
+| llamafile HTTP server (external process) | `LocalInferenceProvider` — GGUF loaded in-process, no subprocess (`pond-adapters-local-inference`) |
+| whisper.cpp HTTP server (external process) | whisper.cpp HTTP server still used; in-process Candle Whisper is a future phase |
+| No persistent cross-session memory | Goose `MemoryServer` (flat-file MCP) injected into system prompt (`pond-adapters-mcp-memory`) |
+| No scheduler | `CronSchedulerAdapter` wrapping `tokio-cron-scheduler` (`pond-infra-scheduler`) |
+| `trim_to_budget()` (char-count truncation) | `ContextCompactor` — LLM-summarization at 80% context threshold (`pond-core`) |
 
 This is the right architecture for the Jetson Orin Nano target: fewer external processes, direct hardware acceleration (Metal on macOS, CUDA on Jetson).
 

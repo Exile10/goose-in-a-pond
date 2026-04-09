@@ -82,6 +82,10 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("prompt_style",         &settings.prompt_style);
         upsert!("custom_system_prompt", settings.custom_system_prompt.as_deref().unwrap_or(""));
         upsert!("prompt_addendum",      &settings.prompt_addendum);
+        upsert!("agent_goose_mode",     &settings.agent_goose_mode);
+        upsert!("agent_max_turns",      settings.agent_max_turns.to_string());
+        upsert!("agent_memory_inject",  if settings.agent_memory_inject { "true" } else { "false" });
+        upsert!("agent_memory_limit",   settings.agent_memory_limit.to_string());
 
         Ok(())
     }
@@ -165,6 +169,14 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             s.custom_system_prompt = if value.is_empty() { None } else { Some(value.to_string()) };
         }
         "prompt_addendum"      => s.prompt_addendum = value.to_string(),
+        "agent_goose_mode"     => s.agent_goose_mode = value.to_string(),
+        "agent_max_turns"      => {
+            if let Ok(v) = value.parse() { s.agent_max_turns = v; }
+        }
+        "agent_memory_inject"  => s.agent_memory_inject = value == "true",
+        "agent_memory_limit"   => {
+            if let Ok(v) = value.parse() { s.agent_memory_limit = v; }
+        }
         _ => {} // unknown key — ignore
     }
 }
