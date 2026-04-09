@@ -330,15 +330,63 @@ Verifies:
 
 ---
 
+## Model Management Debugging
+
+### List the catalog
+
+```bash
+cargo run -p pond-server -- models list
+cargo run -p pond-server -- models list --category gguf
+cargo run -p pond-server -- models list --downloaded
+```
+
+### Check role assignments
+
+```bash
+cargo run -p pond-server -- models list-assignments
+```
+
+### Assign a model to a role
+
+```bash
+cargo run -p pond-server -- models assign --role chat --model gguf/llama-3b
+cargo run -p pond-server -- models assign --role asr  --model whisper/base
+cargo run -p pond-server -- models assign --role tts  --model tts_piper/en-lessac
+```
+
+### Re-seed the catalog (if DB is empty or URL changed)
+
+```bash
+# Happens automatically on `pond-server serve`, or force via:
+cargo run -p pond-server -- setup
+```
+
+### Check downloaded flag vs actual files
+
+```bash
+# The 'downloaded' flag is set from disk at startup. If it's wrong, restart the server.
+# Files should be at:
+#   Whisper:   $DATA_DIR/models/ggml-*.bin
+#   Llamafile: $DATA_DIR/models/llm/*.llamafile
+#   GGUF:      $DATA_DIR/models/gguf/*.gguf
+#   TTS:       $DATA_DIR/models/tts/*.onnx
+#   Binaries:  $DATA_DIR/bin/whisper-server, $DATA_DIR/bin/piper
+sqlite3 "$DATA_DIR/pond_system.db" "SELECT id, downloaded FROM models ORDER BY id;"
+```
+
+---
+
 ## Phase Status at a Glance
 
 | Phase | Status | Test command |
 |---|---|---|
 | Foundation + Infrastructure | Done | `cargo test -p pond-core -p pond-infra` |
-| Think (llamafile / ollama) | Done | `cargo run -- chat --provider llamafile` |
+| Think (llamafile / ollama / gguf) | Done | `cargo run -- chat --provider llamafile` |
 | Session persistence | Done | `cargo test -p pond-infra -- sqlite_session` |
 | Listen (Whisper ASR) | Done | `cargo run -- chat --input whisper` |
 | Data pipeline (P1–P4) | Done | `cargo test -p pond-core -- context_budget` |
 | Wait (Wake word) | Done | `cargo run -- chat --input whisper` (says "goose") |
-| Speak (TTS) | Pending | — |
+| Speak (TTS — Piper + Qwen) | Done | `cargo run -- chat --tts piper` |
+| Model catalog + roles (DB-driven) | Done | `cargo test -p pond-api --test model_integration_test` |
+| Goose agent + MCP extensions | Done | `cargo run -- serve` + trigger agent |
 | Deployment (Jetson ARM64) | Pending | — |

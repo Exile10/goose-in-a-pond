@@ -111,11 +111,17 @@ pub mod mock_your_port;
 
 ---
 
-## 4. Create the Goose Adapter
+## 4. Create the Adapter
 
-Create the adapter in `pond-adapters-goose/src/`.
+Adapters live in the crate that matches their dependency:
 
-**File:** `crates/pond-adapters-goose/src/<name>_adapter.rs`
+| Adapter type | Crate |
+|---|---|
+| Wraps Goose built-in types | `pond-adapters-goose/src/` |
+| Pure HTTP (no Goose dep) | `pond-adapters-<name>/src/` or `pond-server/src/` |
+| SQLite persistence | `pond-infra/src/` |
+
+**File:** `crates/pond-adapters-goose/src/<name>_adapter.rs` (example: Goose-backed)
 
 ```rust
 use anyhow::Result;
@@ -124,7 +130,6 @@ use pond_core::domain::your_types::YourDomainType;
 use pond_core::ports::your_port::YourPort;
 use std::sync::Arc;
 
-// Import the Goose type you're wrapping
 use goose::some_module::GooseThing;
 
 pub struct GooseYourPortAdapter {
@@ -132,35 +137,22 @@ pub struct GooseYourPortAdapter {
 }
 
 impl GooseYourPortAdapter {
-    pub fn new(inner: Arc<GooseThing>) -> Self {
-        Self { inner }
-    }
-
-    // Conversion: pond domain → Goose
+    pub fn new(inner: Arc<GooseThing>) -> Self { Self { inner } }
     fn to_goose(input: &YourDomainType) -> GooseInput { /* ... */ }
-
-    // Conversion: Goose → pond domain
     fn from_goose(output: &GooseOutput) -> YourDomainType { /* ... */ }
 }
 
 #[async_trait]
 impl YourPort for GooseYourPortAdapter {
     async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType> {
-        let goose_input = Self::to_goose(&input);
-        let goose_output = self.inner.goose_method(goose_input).await?;
-        Ok(Self::from_goose(&goose_output))
+        let out = self.inner.goose_method(Self::to_goose(&input)).await?;
+        Ok(Self::from_goose(&out))
     }
     fn name(&self) -> String { "goose".to_string() }
 }
 ```
 
-Register:
-
-```rust
-// crates/pond-adapters-goose/src/lib.rs
-pub mod your_port_adapter;
-pub use your_port_adapter::GooseYourPortAdapter;
-```
+> **Workspace exclusion rule:** `pond-adapters-goose` and any crate importing `goose::*` must stay in `workspace.exclude` in the root `Cargo.toml`. See `CLAUDE.md` for details.
 
 ---
 
@@ -206,11 +198,31 @@ cargo run -p pond-server
 
 ## Reference: Existing Ports
 
-| Port | Domain Types | Mock | Goose Adapter |
+| Port | Domain Types | Mock | Adapters |
 |---|---|---|---|
-| `Agent` | `AgentRequest`, `AgentResponse` | `MockAgent` | `GooseAdapter` |
-| `LlmProvider` | `ChatMessage`, `Role` | `MockProvider` | `GooseProviderAdapter` |
-| `Storage` | *(empty)* | — | — |
+| `Agent` | `AgentRequest`, `AgentResponse` | `MockAgent` | `GooseAdapter` (pond-adapters-goose) |
+| `LlmProvider` | `ChatMessage`, `Role` | `MockProvider`, `FallbackProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `LocalInferenceProvider` |
+| `SessionStorage` | `ChatSession`, `ChatMessage` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra), `GooseSessionAdapter` (pond-adapters-goose) |
+| `VoiceInput` | — | `StdinInput` | `WhisperInput` (pond-adapters-whisper) |
+| `VoiceOutput` | — | `PrintOutput` | `PiperOutput` (pond-adapters-piper), `QwenTtsOutput` (pond-adapters-qwen-tts) |
+| `WakeWordDetector` | — | `InstantActivation` | `WhisperKeywordDetector` (pond-adapters-whisper) |
+| `OnboardingRepository` | `OnboardingStep` | *(inline in tests)* | `SqlxOnboardingRepository` (pond-infra) |
+| `DeviceRegistry` | `Device`, `RegisterDeviceRequest` | *(inline in tests)* | `SqliteDeviceRegistry` (pond-infra) |
+| `Handshake` | — | `MockHandshake` | — |
+| `SettingsRepository` | `Settings` | `MockSettingsRepository` | `SqliteSettingsRepository` (pond-infra) |
+| `SchedulerPort` | `ScheduledTask`, `CreateTaskRequest` | — | `CronSchedulerAdapter` (pond-infra-scheduler) |
+| `McpMemoryPort` | — | — | `GooseMcpMemoryAdapter` (pond-adapters-mcp-memory) |
+| `ExtensionManagerPort` | — | — | `GiapGooseExtensionManager` (pond-adapters-goose) |
+| `ModelRepository` | `ModelRecord`, `ModelRoleAssignment` | *(inline in tests)* | `SqliteModelRepository` (pond-infra) |
+| `ModelCatalogProvider` | `ModelRecord`, `BinaryRecord` | — | `HttpModelCatalogProvider` (pond-server) |
+| `ModelDownloader` | — | — | `HttpModelDownloader` (pond-server) |
+| `ModelStorage` | — | — | `FilesystemModelStorage` (pond-server) |
+| `ModelScheduler` | `DownloadStatus` | — | *(not yet implemented)* |
+| `WeatherProvider` | `WeatherData` | — | `OpenMeteoWeatherAdapter` (pond-adapters-weather) |
+| `SensorStorage` | `SensorReading` | `MockSensorStorage` | `SqliteSensorStorage` (pond-infra) |
+| `CameraStorage` | `CameraImage` | `MockCameraStorage` | `SqliteCameraStorage` (pond-infra) |
+| `ProfileRepository` | `Profile` | `MockProfileRepository` | *(SQLite impl in pond-infra)* |
+| `MemoryRepository` | — | `MockMemoryRepository` | *(SQLite impl in pond-infra)* |
 
 ---
 

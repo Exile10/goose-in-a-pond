@@ -1,0 +1,32 @@
+[package]
+name = "pond-mcp-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
+    "Purity Wanjiru <wanjiru@jarida.io>","Emmanuel Oyugi <oyugi@jarida.io>",
+    "Africia Kerubo <africia@jarida.io>"]
+license = "Apache-2.0"
+
+# This crate is workspace-excluded — build with:
+#   cargo check --manifest-path crates/pond-mcp-server/Cargo.toml
+#
+# The registration of spawn_giap_server into goose's builtin registry is done
+# inside pond-adapters-goose, which already carries the full goose dep.
+# pond-mcp-server itself only needs rmcp (MCP protocol types + macros) and
+# pond-core (port trait objects for weather/devices/scheduler).
+
+[dependencies]
+pond-core            = { path = "../pond-core" }
+pond-adapters-weather = { path = "../pond-adapters-weather" }
+# Use rmcp 1.2.0 directly — matches the version used by goose's builtin registry
+rmcp       = { workspace = true }
+anyhow     = "1.0"
+async-trait = "0.1"
+tokio      = { version = "1.49", features = ["full"] }
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing    = "0.1"
+once_cell  = "1.20"
+uuid       = { version = "1.11", features = ["v4"] }
+chrono     = { version = "0.4", features = ["serde"] }
+schemars   = { version = "1", features = ["derive"] }

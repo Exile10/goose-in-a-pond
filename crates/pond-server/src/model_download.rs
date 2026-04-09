@@ -11,153 +11,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt as _;
-
-// ── Model registry ────────────────────────────────────────────────────────────
-
-pub struct WhisperModelInfo {
-    pub name: &'static str,
-    pub filename: &'static str,
-    pub url: &'static str,
-    /// Approximate size shown during download.
-    pub size_mb: u64,
-}
-
-/// GGML models ordered by size (smallest → largest).
-pub const WHISPER_MODELS: &[WhisperModelInfo] = &[
-    WhisperModelInfo {
-        name: "tiny",
-        filename: "ggml-tiny.en.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
-        size_mb: 39,
-    },
-    WhisperModelInfo {
-        name: "base",
-        filename: "ggml-base.en.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-        size_mb: 141,
-    },
-    WhisperModelInfo {
-        name: "small",
-        filename: "ggml-small.en.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
-        size_mb: 244,
-    },
-    WhisperModelInfo {
-        name: "medium",
-        filename: "ggml-medium.en.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
-        size_mb: 769,
-    },
-    WhisperModelInfo {
-        name: "large-v3-turbo",
-        filename: "ggml-large-v3-turbo.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-        size_mb: 809,
-    },
-    WhisperModelInfo {
-        name: "large-v3",
-        filename: "ggml-large-v3.bin",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-        size_mb: 1550,
-    },
-];
-
-/// Default model used when none is specified.
-pub const DEFAULT_WHISPER_MODEL: &str = "base";
-
-// ── Path helpers ──────────────────────────────────────────────────────────────
-
-pub fn models_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("models")
-}
-
-/// Returns the on-disk path for a named model (does not check existence).
-pub fn model_path(data_dir: &Path, model_name: &str) -> Result<PathBuf> {
-    let info = find_model(model_name)?;
-    Ok(models_dir(data_dir).join(info.filename))
-}
-
-fn find_model(name: &str) -> Result<&'static WhisperModelInfo> {
-    WHISPER_MODELS
-        .iter()
-        .find(|m| m.name == name)
-        .ok_or_else(|| anyhow!("Unknown model '{}'. Available: tiny, base, small", name))
-}
-
-// ── Download ──────────────────────────────────────────────────────────────────
-
-/// Download `model_name` into `<data_dir>/models/` with a live progress line.
-///
-/// Returns the path to the downloaded file.
-/// If the file already exists it is returned immediately (no re-download).
-pub async fn download_whisper_model(model_name: &str, data_dir: &Path) -> Result<PathBuf> {
-    let info = find_model(model_name)?;
-
-    let dir = models_dir(data_dir);
-    tokio::fs::create_dir_all(&dir).await?;
-    let out_path = dir.join(info.filename);
-
-    if out_path.exists() {
-        println!("  ✅ Already downloaded: {}", out_path.display());
-        return Ok(out_path);
-    }
-
-    println!("  ⬇  {} (~{} MB)", info.filename, info.size_mb);
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?;
-
-    let resp = client
-        .get(info.url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Download request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(anyhow!("Server returned {}", resp.status()));
-    }
-
-    // Use Content-Length if available, else fall back to known approximate size.
-    let total_bytes = resp
-        .content_length()
-        .unwrap_or(info.size_mb * 1_048_576);
-
-    // Write to a temp file first so we never leave a partial .bin on disk.
-    let tmp_path = out_path.with_extension("bin.part");
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    let mut downloaded: u64 = 0;
-    let mut resp = resp;
-
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| anyhow!("Download interrupted: {}", e))?
-    {
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| anyhow!("Write error: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        let pct = (downloaded * 100) / total_bytes.max(1);
-        print!(
-            "\r  ⬇  {} / {} MB  ({}%)",
-            downloaded / 1_048_576,
-            total_bytes / 1_048_576,
-            pct
-        );
-        std::io::stdout().flush().ok();
-    }
-
-    println!(); // newline after progress line
-
-    // Atomic rename: only visible if fully written
-    tokio::fs::rename(&tmp_path, &out_path).await?;
-    println!("  ✅ Saved: {}", out_path.display());
-
-    Ok(out_path)
-}
 
 // ── whisper-server binary download ────────────────────────────────────────────
 
@@ -626,44 +479,39 @@ async fn build_whisper_from_source(data_dir: &Path, dest: &Path) -> Result<PathB
 
 // ── Piper TTS model download ───────────────────────────────────────────────────
 
-/// HuggingFace base URL for rhasspy/piper-voices.
-const PIPER_VOICES_BASE: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium";
-
-pub const PIPER_MODEL_FILENAME: &str = "en_US-lessac-medium.onnx";
-const PIPER_MODEL_JSON_FILENAME: &str = "en_US-lessac-medium.onnx.json";
-const PIPER_MODEL_SIZE_MB: u64 = 65;
-
 /// Directory for TTS voice models: `<data_dir>/models/tts/`.
 pub fn tts_models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models").join("tts")
 }
 
-/// Download `en_US-lessac-medium.onnx` + `.onnx.json` into `<data_dir>/models/tts/`.
+/// Download a specific piper voice model by its filename and URL into `<data_dir>/models/tts/`.
 ///
-/// Both files are required — piper reads the JSON config alongside the ONNX weights.
+/// Both the `.onnx` weights and the `.onnx.json` config are downloaded.
 /// Returns the path to the `.onnx` file.
-pub async fn download_piper_model(data_dir: &Path) -> Result<PathBuf> {
+pub async fn download_piper_model_entry(
+    data_dir: &Path,
+    model_filename: &str,
+    config_filename: &str,
+    model_url: &str,
+    config_url: &str,
+    size_mb: u64,
+) -> Result<PathBuf> {
     let dir = tts_models_dir(data_dir);
     tokio::fs::create_dir_all(&dir).await?;
 
-    let onnx_path = dir.join(PIPER_MODEL_FILENAME);
-    let json_path = dir.join(PIPER_MODEL_JSON_FILENAME);
+    let onnx_path = dir.join(model_filename);
+    let json_path = dir.join(config_filename);
 
-    // Download .onnx weights
     if onnx_path.exists() {
         println!("  ✅ Already downloaded: {}", onnx_path.display());
     } else {
-        let url = format!("{}/{}", PIPER_VOICES_BASE, PIPER_MODEL_FILENAME);
-        download_file(&url, &onnx_path, PIPER_MODEL_SIZE_MB).await?;
+        download_file(model_url, &onnx_path, size_mb).await?;
     }
 
-    // Download .onnx.json config (tiny, but required)
     if json_path.exists() {
         println!("  ✅ Already downloaded: {}", json_path.display());
     } else {
-        let url = format!("{}/{}", PIPER_VOICES_BASE, PIPER_MODEL_JSON_FILENAME);
-        download_file(&url, &json_path, 1).await?;
+        download_file(config_url, &json_path, 1).await?;
     }
 
     Ok(onnx_path)
@@ -1112,129 +960,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
 // ── llamafile LLM model registry ──────────────────────────────────────────────
 
-/// Metadata for a llamafile model.
-///
-/// llamafile bundles weights + llama.cpp into a single executable.
-/// On Windows the file must have a `.exe` extension to be runnable.
-pub struct LlamafileModelInfo {
-    /// Short name used in CLI args (e.g. `"gemma-2b"`).
-    pub name:        &'static str,
-    /// Base filename without `.exe` (the extension is added on Windows automatically).
-    pub filename:    &'static str,
-    /// HuggingFace direct-download URL.
-    pub url:         &'static str,
-    /// Approximate compressed download size in MB.
-    pub size_mb:     u64,
-    /// Human-readable description shown during download.
-    pub description: &'static str,
-}
-
-/// Available llamafile LLM models, lightest first.
-pub const LLAMAFILE_MODELS: &[LlamafileModelInfo] = &[
-    LlamafileModelInfo {
-        name:        "llama-1b",
-        filename:    "Llama-3.2-1B-Instruct-Q4_K_M.llamafile",
-        url:         "https://huggingface.co/Mozilla/Llama-3.2-1B-Instruct-llamafile/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.llamafile",
-        size_mb:     1_120,
-        description: "Llama 3.2 1B Instruct Q4_K_M (Meta/Mozilla, ~1.1 GB)",
-    },
-    LlamafileModelInfo {
-        name:        "gemma-2b",
-        filename:    "gemma-2-2b-it.Q4_K_M.llamafile",
-        url:         "https://huggingface.co/Mozilla/gemma-2-2b-it-llamafile/resolve/main/gemma-2-2b-it.Q4_K_M.llamafile",
-        size_mb:     1_950,
-        description: "Gemma 2 2B IT Q4_K_M (Google/Mozilla, ~2.0 GB)",
-    },
-    LlamafileModelInfo {
-        name:        "llama-3b",
-        filename:    "Llama-3.2-3B-Instruct-Q4_K_M.llamafile",
-        url:         "https://huggingface.co/Mozilla/Llama-3.2-3B-Instruct-llamafile/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.llamafile",
-        size_mb:     2_020,
-        description: "Llama 3.2 3B Instruct Q4_K_M (Meta/Mozilla, ~2.0 GB)",
-    },
-    LlamafileModelInfo {
-        name:        "phi-3.5-mini",
-        filename:    "Phi-3.5-mini-instruct.Q4_K_M.llamafile",
-        url:         "https://huggingface.co/Mozilla/Phi-3.5-mini-instruct-llamafile/resolve/main/Phi-3.5-mini-instruct.Q4_K_M.llamafile",
-        size_mb:     2_390,
-        description: "Phi-3.5 Mini Instruct Q4_K_M (Microsoft/Mozilla, ~2.4 GB)",
-    },
-    LlamafileModelInfo {
-        name:        "mistral-7b",
-        filename:    "Mistral-7B-Instruct-v0.2.Q4_K_M.llamafile",
-        url:         "https://huggingface.co/Mozilla/Mistral-7B-Instruct-v0.2-llamafile/resolve/main/Mistral-7B-Instruct-v0.2.Q4_K_M.llamafile",
-        size_mb:     4_370,
-        description: "Mistral 7B Instruct v0.2 Q4_K_M (Mistral/Mozilla, ~4.4 GB)",
-    },
-];
-
-/// Default LLM model downloaded during `setup` and used during `serve`.
-pub const DEFAULT_LLAMAFILE_MODEL: &str = "gemma-2b";
-
-/// Directory for LLM models: `<data_dir>/models/llm/`.
-pub fn llm_models_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("models").join("llm")
-}
-
-/// On-disk path for a llamafile model.
-///
-/// On Windows the `.exe` suffix is appended so the file is directly runnable.
-pub fn llamafile_path(data_dir: &Path, model_name: &str) -> Result<PathBuf> {
-    let info = find_llamafile(model_name)?;
-    let base = llm_models_dir(data_dir).join(info.filename);
-    #[cfg(windows)]
-    return Ok(PathBuf::from(format!("{}.exe", base.display())));
-    #[cfg(not(windows))]
-    Ok(base)
-}
-
-fn find_llamafile(name: &str) -> Result<&'static LlamafileModelInfo> {
-    LLAMAFILE_MODELS
-        .iter()
-        .find(|m| m.name == name)
-        .ok_or_else(|| anyhow!("Unknown llamafile model '{}'. Available: {}",
-            name,
-            LLAMAFILE_MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")))
-}
-
-/// Download `model_name` into `<data_dir>/models/llm/` with live progress.
-///
-/// On Unix, `chmod +x` is applied so the file can be executed directly.
-/// On Windows, the file is saved with a `.exe` extension.
-///
-/// Returns the path to the downloaded executable.
-/// If the file already exists it is returned immediately (no re-download).
-pub async fn download_llamafile_model(model_name: &str, data_dir: &Path) -> Result<PathBuf> {
-    let info = find_llamafile(model_name)?;
-    let dir  = llm_models_dir(data_dir);
-    tokio::fs::create_dir_all(&dir).await?;
-
-    let dest = llamafile_path(data_dir, model_name)?;
-
-    if dest.exists() {
-        println!("  ✅ Already downloaded: {}", dest.display());
-        return Ok(dest);
-    }
-
-    println!("  ⬇  {} (~{} MB)", info.description, info.size_mb);
-    println!("     This is a one-time download — it may take several minutes.");
-    download_file(info.url, &dest, info.size_mb).await?;
-
-    // Make executable on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to chmod +x {}", dest.display()))?;
-    }
-
-    Ok(dest)
-}
-
 // ── Generic file download helper ──────────────────────────────────────────────
 
 /// Download `url` to `dest`, showing a live progress line.  Skips if `dest` exists.
-async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
+pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
     println!("  ⬇  {} (~{} MB)", dest.file_name().unwrap_or_default().to_string_lossy(), approx_size_mb);
 
     let client = reqwest::Client::builder().build()?;
@@ -1406,7 +1135,7 @@ mod tests {
             .await;
 
         // Temporarily redirect the model URL by downloading from our mock URL directly.
-        // We test via download_file (the internal helper) since WHISPER_MODELS URLs are hardcoded.
+        // We test via download_file (the raw HTTP helper) since model URLs come from the catalog.
         let tmp = TempDir::new().unwrap();
         let dest = tmp.path().join("ggml-base.en.bin");
         let url = format!("{}/ggml-base.en.bin", server.uri());

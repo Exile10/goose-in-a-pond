@@ -9,7 +9,7 @@ Welcome to the development guide for **Goose-in-a-Pond**. This project uses **He
 To keep our project modular and avoid version conflicts, we use **Workspace Inheritance**.
 
 ### Step A: Add to the Root `Cargo.toml`
-Always search for the dependency on [crates.io](https://crates.io) and add it to the root [Cargo.toml](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/Cargo.toml) under `[workspace.dependencies]`.
+Always search for the dependency on [crates.io](https://crates.io) and add it to the root `Cargo.toml` under `[workspace.dependencies]`.
 
 ```toml
 # Example: Adding a library like 'uuid'

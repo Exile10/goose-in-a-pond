@@ -1,0 +1,21 @@
+[package]
+name = "pond-adapters-weather"
+description = "OpenMeteoWeatherAdapter — free, no-key weather via open-meteo.com"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true }
+wiremock = { workspace = true }
