@@ -3,11 +3,14 @@
 //! ## Priority chain (highest to lowest)
 //! 1. File at `$DATA_DIR/prompts/system.md` — deployment-level override, rendered by callers
 //! 2. `Settings.custom_system_prompt` — per-user full override stored in DB
-//! 3. Built-in template selected by `Settings.prompt_style` ("balanced" | "concise" | "technical" | "warm")
-//! 4. `SYSTEM_PROMPT` constant — static fallback when Settings are unavailable
+//! 3. Template fetched from DB (`PromptTemplateRepository`) — call `build_system_prompt_from_template`
+//! 4. Built-in template selected by `Settings.prompt_style` ("balanced" | "concise" | "technical" | "warm")
+//! 5. `SYSTEM_PROMPT` constant — static fallback when Settings are unavailable
 //!
-//! Call `build_system_prompt(&Settings)` in production.
-//! `SYSTEM_PROMPT` is used in tests and as a last-resort fallback.
+//! ## Which function to call
+//! - `build_system_prompt_from_template(settings, content)` — preferred; GooseAdapter fetches `content` from DB
+//! - `build_system_prompt(settings)` — legacy; uses hard-coded `PROMPT_*` constants (routes, main, tests)
+//! - `SYSTEM_PROMPT` — in tests and absolute last-resort fallback
 
 use crate::domain::settings::Settings;
 
@@ -54,7 +57,7 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 // rendered identically by the file-override path in routes.rs / main.rs.
 
 /// Balanced — warm, practical, complete behaviour rules. Default for most households.
-const PROMPT_BALANCED: &str = "\
+pub const PROMPT_BALANCED: &str = "\
 You are {{assistant_name}}, a smart home AI assistant running entirely on {{user_name}}'s \
 local network. Powered by Goose In A Pond — privacy-first and fully on-device. \
 No data ever leaves this home.
@@ -72,7 +75,7 @@ If a request requires leaving the local network, say so clearly and wait for con
 If a routine includes a lock or alarm step, pause and ask for explicit confirmation before that step.";
 
 /// Concise — minimal, action-first. For power users who want brevity.
-const PROMPT_CONCISE: &str = "\
+pub const PROMPT_CONCISE: &str = "\
 You are {{assistant_name}}, a local AI home assistant for {{user_name}}. \
 Goose In A Pond — fully on-device, no data leaves the home. \
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
@@ -82,7 +85,7 @@ Door unlock / alarm: require explicit confirmation in the same message.
 Unknown device: say it is not set up yet. External network: ask before proceeding.";
 
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
-const PROMPT_TECHNICAL: &str = "\
+pub const PROMPT_TECHNICAL: &str = "\
 You are {{assistant_name}}, a privacy-first smart home AI assistant on {{user_name}}'s \
 local network. Goose In A Pond — every inference runs on-device; no telemetry, \
 no cloud calls, no data egress. \
@@ -100,7 +103,7 @@ unrecognised device: offer to add it; external egress: disclose destination and 
 routines with a lock or alarm step: pause and confirm that step separately.";
 
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
-const PROMPT_WARM: &str = "\
+pub const PROMPT_WARM: &str = "\
 Hey there! I'm {{assistant_name}}, your friendly home assistant. \
 I live right here on {{user_name}}'s home network — everything stays private \
 and on-device, powered by Goose In A Pond. \
@@ -251,6 +254,98 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
 
     // Assemble: base + profile lines + addendum
+    let mut parts = vec![base];
+    if !profile_lines.is_empty() {
+        parts.push(profile_lines.join(" "));
+    }
+    if !addendum.is_empty() {
+        parts.push(addendum);
+    }
+    parts.join("\n\n")
+}
+
+// ── DB-template variant ───────────────────────────────────────────────────────
+
+/// Build a personalised system prompt using an **explicitly provided** template
+/// string fetched from the `PromptTemplateRepository` (the DB).
+///
+/// `template_content` is the raw template body with `{{placeholder}}` variables.
+/// It is used as the base only when `settings.custom_system_prompt` is `None`.
+///
+/// This is the preferred entry point for the `GooseAdapter` which loads the
+/// template from the DB on every turn. All existing callers (`routes.rs`,
+/// `main.rs`, tests) continue to use `build_system_prompt(settings)` unchanged.
+pub fn build_system_prompt_from_template(settings: &Settings, template_content: &str) -> String {
+    build_system_prompt_from_template_with_profile(settings, None, template_content)
+}
+
+/// Full version — DB template + `ProfileContext`.
+pub fn build_system_prompt_from_template_with_profile(
+    settings: &Settings,
+    profile: Option<&ProfileContext>,
+    template_content: &str,
+) -> String {
+    let name    = sanitize_field(&settings.assistant_name, 50);
+    let user    = sanitize_field(&settings.user_name, 50);
+    let persona = sanitize_field(&settings.assistant_personality, 200);
+    let tz      = sanitize_field(&settings.timezone, 50);
+    let location = if settings.weather_location_name.is_empty() {
+        String::new()
+    } else {
+        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
+    };
+
+    let vars: &[(&str, &str)] = &[
+        ("assistant_name", name.as_str()),
+        ("user_name",      user.as_str()),
+        ("personality",    persona.as_str()),
+        ("timezone",       tz.as_str()),
+        ("location",       location.as_str()),
+    ];
+
+    let base = if let Some(ref custom) = settings.custom_system_prompt {
+        // custom_system_prompt always wins over the DB template
+        render_template(&sanitize_field(custom, 4000), vars)
+    } else {
+        render_template(template_content, vars)
+    };
+
+    // Append profile context and addendum (same logic as build_system_prompt_with_profile)
+    let mut profile_lines: Vec<String> = Vec::new();
+    if let Some(ctx) = profile {
+        if let Some(ref pname) = ctx.preferred_name {
+            let pname = sanitize_field(pname, 50);
+            if !pname.is_empty() && pname != user {
+                profile_lines.push(format!("The user prefers to be called {}.", pname));
+            }
+        }
+        if let Some(ref lang) = ctx.language {
+            let lang = sanitize_field(lang, 20);
+            if !lang.is_empty() && lang != "en" {
+                let lang_label = match lang.as_str() {
+                    "fr" => "French", "es" => "Spanish", "de" => "German",
+                    "sw" => "Swahili", "ar" => "Arabic", "pt" => "Portuguese",
+                    "zh" => "Chinese", "ja" => "Japanese", "ko" => "Korean",
+                    other => other,
+                };
+                profile_lines.push(format!("Always respond in {}.", lang_label));
+            }
+        }
+        if let Some(ref bday) = ctx.birthday {
+            let bday = sanitize_field(bday, 20);
+            if !bday.is_empty() {
+                profile_lines.push(format!("The user's birthday is {}.", bday));
+            }
+        }
+        if ctx.atypical_speech {
+            profile_lines.push(
+                "The user may have atypical speech — be patient, never correct speech patterns, \
+                 and interpret incomplete sentences charitably.".to_string()
+            );
+        }
+    }
+
+    let addendum = sanitize_field(&settings.prompt_addendum, 500);
     let mut parts = vec![base];
     if !profile_lines.is_empty() {
         parts.push(profile_lines.join(" "));

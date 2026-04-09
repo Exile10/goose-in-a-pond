@@ -25,10 +25,6 @@ impl FilesystemModelStorage {
     pub fn new(data_dir: &Path) -> Self {
         Self { data_dir: data_dir.to_path_buf() }
     }
-
-    pub fn models_dir(&self) -> PathBuf {
-        self.data_dir.join("models")
-    }
 }
 
 impl ModelStorage for FilesystemModelStorage {

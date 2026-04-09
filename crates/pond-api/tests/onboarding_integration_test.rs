@@ -112,6 +112,10 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         piper_http_port: None,
         model_catalog_provider: None,
         model_storage_dir: None,
+        prompt_template_repo: None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

@@ -1,6 +1,6 @@
 # Database Schema — Goose In A Pond
 
-> Last updated: March 2026 — reflects migrations 0001–0005 (system) and 0001–0003 (logs)
+> Last updated: April 2026 — reflects migrations 0001–0012 (system) and 0001–0003 (logs)
 
 ## Overview
 
@@ -111,7 +111,7 @@ Registered devices: GOTG mobile clients, smart home sensors, other Pond instance
 
 ### `settings`
 
-Flat key-value store for GIAP configuration. 14 keys across 4 categories.
+Flat key-value store for GIAP configuration.
 
 | Column | Type | Constraints |
 |--------|------|-------------|
@@ -130,6 +130,19 @@ Flat key-value store for GIAP configuration. 14 keys across 4 categories.
 | LLM behaviour | `llm_max_tokens` | `"1024"` |
 | | `llm_temperature` | `"0.7"` |
 | | `llm_provider` | `"llamafile"` |
+| | `chat_provider` | `"llamafile"` |
+| | `chat_model` | `""` |
+| | `think_provider` | `""` |
+| | `think_model` | `""` |
+| | `task_provider` | `""` |
+| | `task_model` | `""` |
+| Prompt system | `prompt_style` | `"balanced"` |
+| | `custom_system_prompt` | `""` |
+| | `prompt_addendum` | `""` |
+| Agent behaviour | `agent_goose_mode` | `"auto"` |
+| | `agent_max_turns` | `"20"` |
+| | `agent_memory_inject` | `"false"` |
+| | `agent_memory_limit` | `"5"` |
 | Voice pipeline | `voice_wake_word` | `"goose"` |
 | | `voice_tts_voice` | `"en_US-lessac-medium.onnx"` |
 | | `voice_recording_duration_secs` | `"5"` |
@@ -163,6 +176,63 @@ Indexes: `idx_memory_fragments_profile_id`, `idx_memory_fragments_created_at`
 - If embeddings exist → cosine similarity in Rust (O(n), fine at home-assistant scale)
 - If no embeddings stored yet → falls back to recency (`ORDER BY created_at DESC`)
 - Embeddings encoded as raw little-endian f32 BLOBs: `4 bytes × dims`
+
+---
+
+### `prompt_templates`
+
+Editable named system prompt templates. Seeded at `run_setup()` with 4 built-in styles (`balanced`, `concise`, `technical`, `warm`) via `INSERT OR IGNORE` so user edits are never overwritten. The active template is selected by `settings.prompt_style`.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-------------|-------|
+| `name` | TEXT | PK | `"balanced"`, `"concise"`, `"technical"`, `"warm"`, or user-defined |
+| `content` | TEXT | NOT NULL | Supports `{{assistant_name}}` etc. placeholders |
+| `description` | TEXT | NOT NULL, DEFAULT `''` | Human-readable label shown in UI |
+| `is_system` | INTEGER | NOT NULL, DEFAULT 0 | `1` = built-in (not deletable via API, still editable) |
+| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+
+---
+
+### `prompt_extras`
+
+Per-key extra instructions injected into the system prompt via `agent.extend_system_prompt(key, instruction)` on every turn.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-------------|-------|
+| `key` | TEXT | PK | e.g. `"safety"`, `"language"`, `"home_rules"` |
+| `instruction` | TEXT | NOT NULL | Extra instruction text |
+| `active` | INTEGER | NOT NULL, DEFAULT 1 | `1` = injected this turn |
+| `sort_order` | INTEGER | NOT NULL, DEFAULT 0 | Injection order |
+| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+
+---
+
+### `user_skills`
+
+User-defined skills injected as named system prompt extras (`skill:<name>`) on every turn.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-------------|-------|
+| `id` | TEXT | PK | UUID |
+| `name` | TEXT | NOT NULL, UNIQUE | Human-readable skill name |
+| `content` | TEXT | NOT NULL | Markdown instructions |
+| `active` | INTEGER | NOT NULL, DEFAULT 1 | `1` = injected this turn |
+| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+
+---
+
+### `agent_recipes`
+
+Goose Recipe YAML definitions runnable via `POST /api/v1/recipes/{name}/run`.
+
+| Column | Type | Constraints | Notes |
+|--------|------|-------------|-------|
+| `id` | TEXT | PK | UUID |
+| `name` | TEXT | NOT NULL, UNIQUE | Slug: `"morning_briefing"`, `"lock_doors"` |
+| `description` | TEXT | NOT NULL, DEFAULT `''` | |
+| `yaml` | TEXT | NOT NULL | Goose Recipe YAML content |
+| `active` | INTEGER | NOT NULL, DEFAULT 1 | |
+| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
 
 ---
 
@@ -248,7 +318,13 @@ profiles ───────────────────────�
 
 devices
 
-settings (flat KV, 14 keys)
+settings (flat KV)
+models + model_role_assignments
+
+prompt_templates    (named editable system prompts)
+prompt_extras       (per-key extra instructions)
+user_skills         (named skills injected per turn)
+agent_recipes       (Goose Recipe YAML definitions)
 
 pond_logs.db
 ─────────────────────────────────────────────────────────────
@@ -287,6 +363,11 @@ All retention values are read from the `settings` table at server startup.
 | `ProfileRepository` | `profiles` | System | ✅ Implemented |
 | `DeviceRegistry` | `devices` | System | ✅ Implemented |
 | `MemoryRepository` | `memory_fragments` | System | ✅ Implemented |
+| `ModelRepository` | `models`, `model_role_assignments` | System | ✅ Implemented |
+| `PromptTemplateRepository` | `prompt_templates` | System | ✅ Implemented |
+| `PromptExtraRepository` | `prompt_extras` | System | ✅ Implemented |
+| `UserSkillRepository` | `user_skills` | System | ✅ Implemented |
+| `AgentRecipeRepository` | `agent_recipes` | System | ✅ Implemented |
 | `EmbeddingProvider` | — (stateless, generates BLOBs) | — | ⚪ Stub — real model deferred |
 | `SensorStorage` | `sensor_readings` | Logs | ✅ Implemented |
 | `CameraStorage` | `camera_events` | Logs | ✅ Implemented |
@@ -294,7 +375,7 @@ All retention values are read from the `settings` table at server startup.
 | `VoiceInput` | — (real-time audio) | — | ✅ No table needed |
 | `VoiceOutput` | — (real-time audio) | — | ✅ No table needed |
 | `WakeWordDetector` | — (real-time audio) | — | ✅ No table needed |
-| `Agent` | — (delegates to LlmProvider) | — | ✅ No table needed |
+| `Agent` | — (Goose agentic loop) | — | ✅ No table needed |
 | `Handshake` | `auth_tokens` (planned) | System | 🔴 Table not yet created |
 | `NotificationSender` | `notifications` (planned) | System | 🔴 Table not yet created |
 
@@ -317,6 +398,18 @@ All retention values are read from the `settings` table at server startup.
 | `/api/v1/sensors/{device_id}` | GET | `sensor_readings` (logs DB) |
 | `/api/v1/camera/events` | GET, POST | `camera_events` (logs DB) |
 | `/api/v1/camera/events/{id}/acknowledge` | PATCH | `camera_events` (logs DB) |
+| `/api/v1/prompts` | GET | `prompt_templates` |
+| `/api/v1/prompts/{name}` | GET, PUT, DELETE | `prompt_templates` |
+| `/api/v1/agent/extras` | GET, POST | `prompt_extras` |
+| `/api/v1/agent/extras/{key}` | DELETE | `prompt_extras` |
+| `/api/v1/memories` | GET, POST | `memory_fragments` |
+| `/api/v1/memories/{id}` | DELETE | `memory_fragments` |
+| `/api/v1/skills` | GET, POST | `user_skills` |
+| `/api/v1/skills/{id}` | PUT, DELETE | `user_skills` |
+| `/api/v1/recipes` | GET, POST | `agent_recipes` |
+| `/api/v1/recipes/{id}` | PUT, DELETE | `agent_recipes` |
+| `/api/v1/recipes/{name}/run` | POST | `agent_recipes` (read) + agent |
+| `/api/v1/agent/tools` | GET | — (reads from Goose extension manager) |
 
 ---
 
@@ -331,6 +424,13 @@ All retention values are read from the `settings` table at server startup.
 | `0003_profiles.sql` | `profiles` table; adds `profile_id` + `input_mode` to sessions |
 | `0004_devices_enhanced.sql` | Adds `device_type`, `ip_address`, `capabilities`, `last_seen`, `is_online` to devices |
 | `0005_memory.sql` | `memory_fragments` table; adds `embedding` BLOB to `session_messages` |
+| `0006_settings_extended.sql` | New settings keys: `prompt_style`, `custom_system_prompt`, `prompt_addendum`, model role fields |
+| `0007_models.sql` | `models` table — persistent model catalog |
+| `0008_model_role_assignments.sql` | `model_role_assignments` join table |
+| `0009_prompt_templates.sql` | `prompt_templates` table — editable named system prompts |
+| `0010_prompt_extras.sql` | `prompt_extras` table — per-key extra instructions |
+| `0011_skills.sql` | `user_skills` table — named skills injected per turn |
+| `0012_recipes.sql` | `agent_recipes` table — Goose Recipe YAML definitions |
 
 ### Logs DB
 
@@ -372,7 +472,6 @@ SQLite cannot enforce FK constraints across attached databases. `device_id` in `
 | `notifications` | System | Push notifications to GOTG mobile app |
 | `routines` | System | Scheduled/triggered automations (Morning Routine, etc.) |
 | `feedback` | System | Upvote/downvote/correction loop for self-improvement |
-| `system_prompts` | System | Dynamic, versioned system prompt management |
 | `device_commands` | System | Audit trail for smart device commands |
 | `prompt_rewrites` | Logs | Audit trail for agent self-rewriting prompts |
 | `privacy_audit_log` | Logs | Per-action privacy audit ("what did Goose do?") |

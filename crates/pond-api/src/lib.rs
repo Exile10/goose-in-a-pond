@@ -56,9 +56,13 @@ use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::extension_manager::ExtensionManagerPort;
 use pond_core::ports::mcp_server::McpServerRepository;
 use pond_core::ports::profile::ProfileRepository;
+use pond_core::ports::prompt_extra::PromptExtraRepository;
+use pond_core::ports::prompt_template::PromptTemplateRepository;
+use pond_core::ports::recipe::AgentRecipeRepository;
 use pond_core::ports::scheduler::SchedulerPort;
 use pond_core::ports::sensor_storage::SensorStorage;
 use pond_core::ports::settings::SettingsRepository;
+use pond_core::ports::skill::UserSkillRepository;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
@@ -140,6 +144,18 @@ pub struct AppState {
     /// Used by the refresh handler to update `downloaded` flags.
     /// `None` in tests.
     pub model_storage_dir: Option<std::path::PathBuf>,
+    /// System prompt templates — editable by user, seeded from defaults at setup.
+    /// `None` in tests that don't exercise prompt template endpoints.
+    pub prompt_template_repo: Option<Arc<dyn PromptTemplateRepository + Send + Sync>>,
+    /// Per-key extra instructions injected into the system prompt each turn.
+    /// `None` in tests that don't exercise prompt extra endpoints.
+    pub prompt_extra_repo: Option<Arc<dyn PromptExtraRepository + Send + Sync>>,
+    /// User-defined skills injected as named system prompt extras.
+    /// `None` in tests that don't exercise skill endpoints.
+    pub skill_repo: Option<Arc<dyn UserSkillRepository + Send + Sync>>,
+    /// Agent recipes (Goose Recipe YAML definitions).
+    /// `None` in tests that don't exercise recipe endpoints.
+    pub recipe_repo: Option<Arc<dyn AgentRecipeRepository + Send + Sync>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

@@ -11,7 +11,7 @@ use axum::{
     http::{Response, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html, Json,
+        Html, IntoResponse, Json,
     },
     routing::{delete, get, patch, post, put},
     Router,
@@ -39,6 +39,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::domain::memory::MemoryFragment;
+use pond_core::domain::prompt_extra::PromptExtra;
+use pond_core::domain::prompt_template::PromptTemplate;
+use pond_core::domain::recipe::AgentRecipe;
+use pond_core::domain::skill::UserSkill;
 
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
 use crate::middleware::onboarding_guard::require_onboarding_complete;
@@ -112,6 +117,21 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
         .route("/extensions/{name}", delete(remove_extension_handler))
+        // ── Prompt Templates ───────────────────────────────────────────────────
+        .route("/prompts", get(list_prompt_templates))
+        .route("/prompts/{name}", get(get_prompt_template).put(upsert_prompt_template).delete(delete_prompt_template))
+        // ── System Prompt Extras ───────────────────────────────────────────────
+        .route("/agent/extras", get(list_prompt_extras).post(upsert_prompt_extra))
+        .route("/agent/extras/{key}", delete(delete_prompt_extra))
+        // ── Memories ──────────────────────────────────────────────────────────
+        .route("/memories", get(list_memories).post(save_memory))
+        .route("/memories/{id}", delete(delete_memory))
+        // ── Skills ────────────────────────────────────────────────────────────
+        .route("/skills", get(list_skills).post(create_skill))
+        .route("/skills/{id}", put(update_skill).delete(delete_skill))
+        // ── Recipes ───────────────────────────────────────────────────────────
+        .route("/recipes", get(list_recipes).post(create_recipe))
+        .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .layer(
             axum::middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
         );
@@ -291,78 +311,6 @@ async fn chat(
             })?;
     }
 
-    // Build the system prompt: user-supplied template file takes priority over
-    // the settings-based builder.  Mirrors Goose's `prompts/system.md` override.
-    let system_prompt = {
-        let settings = state.settings_repo.get().await.ok();
-
-        // Load primary profile preferences for context injection.
-        let profile_ctx: Option<ProfileContext> = if let Some(ref s) = settings {
-            if let Some(ref pid) = s.primary_profile_id {
-                state.profile_repo.get(pid).await.ok().flatten().map(|p| {
-                    let prefs = &p.preferences;
-                    ProfileContext {
-                        preferred_name: prefs.get("preferred_name").cloned(),
-                        birthday: prefs.get("birthday").cloned(),
-                        language: prefs.get("language").cloned(),
-                        atypical_speech: prefs.get("accessibility_atypical_speech")
-                            .map(|v| v == "true")
-                            .unwrap_or(false),
-                    }
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Try to load $DATA_DIR/prompts/system.md override
-        let file_template = state
-            .prompt_template_dir
-            .as_ref()
-            .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
-
-        match (file_template, settings) {
-            (Some(tmpl), Some(s)) => {
-                // File-override path: render the custom file template with all settings vars.
-                let name     = sanitize_field(&s.assistant_name, 50);
-                let user     = sanitize_field(&s.user_name, 50);
-                let persona  = sanitize_field(&s.assistant_personality, 200);
-                let tz       = sanitize_field(&s.timezone, 50);
-                let location = if s.weather_location_name.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nLocation: {}.", sanitize_field(&s.weather_location_name, 100))
-                };
-                let addendum = sanitize_field(&s.prompt_addendum, 500);
-                render_template(&tmpl, &[
-                    ("assistant_name",  name.as_str()),
-                    ("user_name",       user.as_str()),
-                    ("personality",     persona.as_str()),
-                    ("timezone",        tz.as_str()),
-                    ("location",        location.as_str()),
-                    ("prompt_addendum", addendum.as_str()),
-                ])
-            }
-            (None, Some(s)) => build_system_prompt_with_profile(&s, profile_ctx.as_ref()),
-            _ => SYSTEM_PROMPT.to_string(),
-        }
-    };
-
-    // Append MCP memory context to the system prompt when available.
-    let system_prompt = match &state.mcp_memory {
-        Some(m) => {
-            let mem = m.instructions();
-            if mem.is_empty() {
-                system_prompt
-            } else {
-                format!("{}\n\n---\n{}", system_prompt, mem)
-            }
-        }
-        None => system_prompt,
-    };
-
     // Classify the message to determine which model role will handle it
     let model_role = {
         use pond_core::domain::model_role::ModelRole;
@@ -373,19 +321,13 @@ async fn chat(
         }
     };
 
-    // Build ChatService — wires LLM provider when available, falls back to agent
-    let mut service = ChatService::new(
+    // Build ChatService — agent is always primary (GooseAdapter builds system
+    // prompt from DB settings, manages history, handles MCP tools internally).
+    let service = ChatService::new(
         state.agent.clone(),
         session_id.clone(),
         storage.clone(),
-    )
-    .with_system_prompt(system_prompt);
-    {
-        let guard = state.llm_provider.read().await;
-        if let Some(provider) = guard.as_ref() {
-            service = service.with_provider(provider.clone());
-        }
-    }
+    );
 
     let response_text = service
         .chat_once(req.message)
@@ -1234,7 +1176,6 @@ async fn refresh_model_registry(
 
     // Fetch in the background so we don't block on slow network.
     tokio::spawn(async move {
-        use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
         match catalog_provider.fetch(&url).await {
             Ok((models, _binaries)) => {
                 let count = models.len();
@@ -3353,5 +3294,402 @@ async fn remove_extension_handler(
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// ── Prompt Templates ─────────────────────────────────────────────────────────
+
+async fn list_prompt_templates(
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_template_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+    };
+    match repo.list().await {
+        Ok(templates) => Json(json!(templates)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn get_prompt_template(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_template_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+    };
+    match repo.get(&name).await {
+        Ok(Some(t)) => Json(json!(t)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "Template not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpsertTemplateRequest {
+    content: String,
+    #[serde(default)]
+    description: String,
+}
+
+async fn upsert_prompt_template(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    body: Result<Json<UpsertTemplateRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_template_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let template = PromptTemplate {
+        name: name.clone(),
+        content: req.content,
+        description: req.description,
+        is_system: false,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match repo.upsert(&template).await {
+        Ok(()) => Json(json!({"name": name, "status": "ok"})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_prompt_template(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_template_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+    };
+    // Don't allow deletion of system templates
+    if let Ok(Some(t)) = repo.get(&name).await {
+        if t.is_system {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": "Cannot delete built-in system templates"}))).into_response();
+        }
+    }
+    match repo.delete(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Prompt Extras ─────────────────────────────────────────────────────────────
+
+async fn list_prompt_extras(
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_extra_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+    };
+    match repo.list_all().await {
+        Ok(extras) => Json(json!(extras)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpsertExtraRequest {
+    key: String,
+    instruction: String,
+    #[serde(default = "bool_true")]
+    active: bool,
+    #[serde(default)]
+    sort_order: i32,
+}
+
+fn bool_true() -> bool { true }
+
+async fn upsert_prompt_extra(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<UpsertExtraRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_extra_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let extra = PromptExtra { key: req.key.clone(), instruction: req.instruction, active: req.active, sort_order: req.sort_order };
+    match repo.upsert(&extra).await {
+        Ok(()) => Json(json!({"key": req.key, "status": "ok"})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_prompt_extra(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_extra_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+    };
+    match repo.delete(&key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Memories ──────────────────────────────────────────────────────────────────
+
+async fn list_memories(
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    match state.memory_repo.search_recent(None, 50).await {
+        Ok(memories) => Json(json!(memories)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveMemoryRequest {
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_source")]
+    source: String,
+}
+fn default_source() -> String { "api".to_string() }
+
+async fn save_memory(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SaveMemoryRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let fragment = MemoryFragment {
+        id: Uuid::new_v4().to_string(),
+        profile_id: None,
+        session_id: None,
+        content: req.content,
+        embedding: None,
+        source: req.source,
+        tags: req.tags,
+        created_at: chrono::Utc::now(),
+    };
+    match state.memory_repo.add(fragment).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl axum::response::IntoResponse {
+    match state.memory_repo.delete(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Skills ────────────────────────────────────────────────────────────────────
+
+async fn list_skills(
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.skill_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+    };
+    match repo.list_all().await {
+        Ok(skills) => Json(json!(skills)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateSkillRequest {
+    name: String,
+    content: String,
+}
+
+async fn create_skill(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CreateSkillRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.skill_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let skill = UserSkill {
+        id: Uuid::new_v4().to_string(),
+        name: req.name,
+        content: req.content,
+        active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match repo.create(&skill).await {
+        Ok(()) => (StatusCode::CREATED, Json(json!(skill))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateSkillRequest {
+    content: Option<String>,
+    active: Option<bool>,
+}
+
+async fn update_skill(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateSkillRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.skill_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let existing = match repo.get(&id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Skill not found"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let updated = UserSkill {
+        id: existing.id,
+        name: existing.name,
+        content: req.content.unwrap_or(existing.content),
+        active: req.active.unwrap_or(existing.active),
+        created_at: existing.created_at,
+    };
+    match repo.update(&updated).await {
+        Ok(()) => Json(json!(updated)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_skill(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.skill_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+    };
+    match repo.delete(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Recipes ───────────────────────────────────────────────────────────────────
+
+async fn list_recipes(
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.recipe_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+    };
+    match repo.list().await {
+        Ok(recipes) => Json(json!(recipes)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateRecipeRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    yaml: String,
+}
+
+async fn create_recipe(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CreateRecipeRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.recipe_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let recipe = AgentRecipe {
+        id: Uuid::new_v4().to_string(),
+        name: req.name,
+        description: req.description,
+        yaml: req.yaml,
+        active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match repo.upsert(&recipe).await {
+        Ok(()) => (StatusCode::CREATED, Json(json!(recipe))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateRecipeRequest {
+    description: Option<String>,
+    yaml: Option<String>,
+    active: Option<bool>,
+}
+
+async fn update_recipe(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateRecipeRequest>, JsonRejection>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.recipe_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+    };
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let existing = match repo.get_by_id(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Recipe not found"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let updated = AgentRecipe {
+        id: existing.id,
+        name: existing.name,
+        description: req.description.unwrap_or(existing.description),
+        yaml: req.yaml.unwrap_or(existing.yaml),
+        active: req.active.unwrap_or(existing.active),
+        created_at: existing.created_at,
+    };
+    match repo.upsert(&updated).await {
+        Ok(()) => Json(json!(updated)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_recipe(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.recipe_repo {
+        Some(r) => r,
+        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+    };
+    match repo.delete(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
