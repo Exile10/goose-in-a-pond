@@ -120,6 +120,8 @@ pub struct AppState {
     pub scheduler: Option<Arc<dyn SchedulerPort>>,
     /// Memory-aware model scheduler. `None` when all roles use external providers.
     pub model_scheduler: Option<Arc<dyn ModelScheduler>>,
+    /// Memory-aware model scheduler. `None` when all roles use external providers.
+    pub model_scheduler: Option<Arc<dyn ModelScheduler>>,
     /// MCP-style persistent memory. `None` until `pond-adapters-mcp-memory` is wired in.
     pub mcp_memory: Option<Arc<dyn McpMemoryPort + Send + Sync>>,
     /// MCP extension manager — manages Goose extensions for tool calling.
@@ -180,6 +182,16 @@ pub struct ModelStatusEntry {
     pub downloaded:  bool,
     /// True if this is the currently active model for its category.
     pub active:      bool,
+    /// Download URL — None for HTTP TTS entries that have no downloadable file.
+    pub url:      Option<String>,
+    /// HuggingFace model spec (GGUF only): "author/repo:quantization"
+    pub hf_id:    Option<String>,
+    /// Filename on disk (used by the download route to determine the save path)
+    pub filename: Option<String>,
+    /// Approximate RAM required at runtime in MB. None for models without estimates.
+    pub ram_estimate_mb: Option<u64>,
+    /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
+    pub recommended_role: Option<String>,
     /// Download URL — None for HTTP TTS entries that have no downloadable file.
     pub url:      Option<String>,
     /// HuggingFace model spec (GGUF only): "author/repo:quantization"
