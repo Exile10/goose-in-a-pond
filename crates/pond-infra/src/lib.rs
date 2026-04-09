@@ -1,11 +1,16 @@
 pub mod db;
 pub mod mock_handshake;
+pub mod sqlite_model_repository;
 pub mod onboarding;
 pub mod pruning;
 pub mod sqlite_device_registry;
 pub mod sqlite_memory;
 pub mod sqlite_profile;
+pub mod sqlite_prompt_extra;
+pub mod sqlite_prompt_template;
+pub mod sqlite_recipe;
 pub mod sqlite_sensor;
 pub mod sqlite_session_storage;
+pub mod sqlite_mcp_servers;
 pub mod sqlite_settings;
-pub mod sqlite_storage;
+pub mod sqlite_skill;

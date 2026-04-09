@@ -186,10 +186,10 @@ mod tests {
     use pond_core::domain::sensor::{CameraEvent, SensorReading};
     use tempfile::tempdir;
 
-    async fn make_logs_pool() -> Pool<Sqlite> {
+    async fn make_logs_pool() -> (Pool<Sqlite>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        db.logs
+        (db.logs, tmp)
     }
 
     fn reading(device_id: &str, t: &str, v: f64) -> SensorReading {
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn sensor_record_and_get_latest() {
-        let pool = make_logs_pool().await;
+        let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
         storage.record(reading("room1", "temperature", 21.0)).await.unwrap();
         storage.record(reading("room1", "temperature", 22.5)).await.unwrap();
@@ -228,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn sensor_get_recent_respects_limit() {
-        let pool = make_logs_pool().await;
+        let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
         for i in 0..5 {
             storage.record(reading("dev1", "humidity", i as f64)).await.unwrap();
@@ -239,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn camera_record_and_acknowledge() {
-        let pool = make_logs_pool().await;
+        let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteCameraStorage::new(pool);
         let id = storage.record_event(cam_event("front")).await.unwrap();
         assert_eq!(id, 1);
@@ -250,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn camera_list_respects_camera_id_filter() {
-        let pool = make_logs_pool().await;
+        let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteCameraStorage::new(pool);
         storage.record_event(cam_event("front")).await.unwrap();
         storage.record_event(cam_event("back")).await.unwrap();

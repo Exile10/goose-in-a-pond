@@ -5,16 +5,46 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = ["goose-agent"]
+# Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
+# Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
+goose-agent = ["dep:pond-adapters-goose"]
+# Enable flat-file MCP memory (memories injected into system prompt every chat turn).
+# cargo run -p pond-server --features mcp-memory -- serve
+mcp-memory = ["dep:pond-adapters-mcp-memory"]
+# Enable in-process GGUF inference (no llamafile/Ollama subprocess required).
+# First build compiles llama-cpp-2 + candle — expect 5–15 min.
+# cargo run -p pond-server --features local-inference -- chat --provider local
+local-inference = ["dep:pond-adapters-local-inference"]
+
 [dependencies]
-pond-core = { workspace = true }
-pond-api = { workspace = true }
-pond-infra = { workspace = true }
+# Optional: only compiled when --features goose-agent is passed.
+pond-adapters-goose           = { path = "../pond-adapters-goose", optional = true }
+# Optional: only compiled when --features mcp-memory is passed.
+pond-adapters-mcp-memory      = { workspace = true, optional = true }
+# Optional: only compiled when --features local-inference is passed.
+pond-adapters-local-inference = { workspace = true, optional = true }
+pond-core              = { workspace = true }
+pond-api               = { workspace = true }
+pond-infra             = { workspace = true }
+pond-infra-scheduler   = { workspace = true }
+pond-adapters-weather  = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-qwen-tts  = { workspace = true }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
 pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
+# NOTE: pond-mcp-server and pond-adapters-goose are NOT deps here.
+# Both depend on the goose submodule which creates a diamond rmcp conflict when
+# linked into the workspace build. They are built in isolation:
+#   cargo build -p pond-mcp-server
+#   cargo build -p pond-adapters-goose
+# See crates/pond-mcp-server/ and docs/developer/goose_integrations.md
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,7 +58,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # Required to query pond_logs.db directly in the debug log-tail task.
 sqlx = { workspace = true }
 webbrowser = { workspace = true }
-zip = { workspace = true }
+zip = "2"
 flate2 = "1"
 tar = "0.4"
 

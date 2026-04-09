@@ -141,15 +141,15 @@ mod tests {
     use crate::db::Database;
     use tempfile::tempdir;
 
-    async fn make_pools() -> (Pool<Sqlite>, Pool<Sqlite>) {
+    async fn make_pools() -> (Pool<Sqlite>, Pool<Sqlite>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        (db.logs, db.system)
+        (db.logs, db.system, tmp)
     }
 
     #[tokio::test]
     async fn prune_event_log_removes_old_rows() {
-        let (logs, system) = make_pools().await;
+        let (logs, system, _tmp) = make_pools().await;
 
         // Insert 3 old rows and 2 fresh rows
         for _ in 0..3 {
@@ -184,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_sensor_readings_removes_old_rows() {
-        let (logs, system) = make_pools().await;
+        let (logs, system, _tmp) = make_pools().await;
 
         sqlx::query(
             "INSERT INTO sensor_readings (device_id, sensor_type, value, unit, created_at) \
@@ -213,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_camera_events_only_removes_acknowledged_old_rows() {
-        let (logs, system) = make_pools().await;
+        let (logs, system, _tmp) = make_pools().await;
 
         // Old + acknowledged → should be pruned
         sqlx::query(
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_session_messages_keeps_most_recent() {
-        let (logs, system) = make_pools().await;
+        let (logs, system, _tmp) = make_pools().await;
 
         // Create a session and insert 10 messages
         sqlx::query("INSERT INTO sessions (id, created_at, updated_at) VALUES ('s1', datetime('now'), datetime('now'))")
@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_is_idempotent() {
-        let (logs, system) = make_pools().await;
+        let (logs, system, _tmp) = make_pools().await;
         let config = PruningConfig::default();
         // Running on empty tables should not error
         prune_once(&logs, &system, &config).await;

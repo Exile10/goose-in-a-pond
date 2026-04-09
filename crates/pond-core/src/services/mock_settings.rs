@@ -44,6 +44,11 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
     if let Some(v) = store.get("retention_event_log_days")       { if let Ok(n) = v.parse() { s.retention_event_log_days = n; } }
     if let Some(v) = store.get("retention_sensor_days")          { if let Ok(n) = v.parse() { s.retention_sensor_days = n; } }
     if let Some(v) = store.get("retention_session_messages_keep"){ if let Ok(n) = v.parse() { s.retention_session_messages_keep = n; } }
+    if let Some(v) = store.get("prompt_style")         { s.prompt_style = v.clone(); }
+    if let Some(v) = store.get("custom_system_prompt") {
+        s.custom_system_prompt = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+    if let Some(v) = store.get("prompt_addendum")      { s.prompt_addendum = v.clone(); }
     s
 }
 
@@ -70,6 +75,9 @@ impl SettingsRepository for MockSettingsRepository {
         store.insert("retention_event_log_days".into(),        settings.retention_event_log_days.to_string());
         store.insert("retention_sensor_days".into(),           settings.retention_sensor_days.to_string());
         store.insert("retention_session_messages_keep".into(), settings.retention_session_messages_keep.to_string());
+        store.insert("prompt_style".into(),         settings.prompt_style.clone());
+        store.insert("custom_system_prompt".into(), settings.custom_system_prompt.as_deref().unwrap_or("").to_string());
+        store.insert("prompt_addendum".into(),      settings.prompt_addendum.clone());
         Ok(())
     }
 

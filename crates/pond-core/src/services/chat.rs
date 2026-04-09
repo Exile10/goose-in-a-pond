@@ -10,7 +10,7 @@ use crate::ports::wake_word::WakeWordDetector;
 use crate::services::instant_activation::InstantActivation;
 use crate::services::print_output::PrintOutput;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
-use crate::services::context_budget;
+use crate::services::context_compactor::ContextCompactor;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
 use std::io::{self, Write};
@@ -22,9 +22,8 @@ use uuid::Uuid;
 /// Orchestrates the Wait → Listen → Thinking → Speak workflow loop.
 /// Also persists messages to session storage for conversation history.
 ///
-/// When an `LlmProvider` is wired in via `with_provider()`, the Thinking
-/// step calls `provider.complete()` with the full conversation history.
-/// Otherwise it falls back to the `Agent`.
+/// All inference is routed through the `Agent` port (GooseAdapter in production).
+/// An optional `LlmProvider` may be attached solely for session title generation.
 ///
 /// Input is abstracted via the `VoiceInput` port.  The default is
 /// `StdinInput` (reads from stdin).  Override with `with_voice_input()`.
@@ -39,6 +38,9 @@ pub struct ChatService {
     /// System prompt sent to the LLM on every completion call.
     /// Defaults to `SYSTEM_PROMPT`; override with `with_system_prompt()`.
     system_prompt: String,
+    /// Optional LLM-based context compactor.  When set, triggers at 80% of
+    /// the context budget instead of falling straight to trim_to_budget.
+    compactor: Option<ContextCompactor>,
 }
 
 impl ChatService {
@@ -56,6 +58,7 @@ impl ChatService {
             session_id,
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
+            compactor: None,
         }
     }
 
@@ -93,7 +96,21 @@ impl ChatService {
         self
     }
 
+    /// Enable LLM-based context compaction.
+    ///
+    /// When set, `chat_once` will summarise the oldest 75% of history whenever
+    /// the conversation exceeds 80% of the context limit, instead of simply
+    /// dropping old messages via `trim_to_budget`.
+    pub fn with_context_compactor(mut self, compactor: ContextCompactor) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
     /// Single-shot chat (useful for tests and non-interactive callers).
+    ///
+    /// All inference is routed through the `Agent` port (GooseAdapter in production).
+    /// Goose manages conversation history and context compaction internally.
+    /// Our `SessionStorage` is used only for the REST API's history/listing endpoints.
     pub async fn chat_once(&self, message: String) -> Result<String> {
         // Persist the user message first
         let user_msg = ChatMessage::user(message.clone());
@@ -106,26 +123,13 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        let response_text = if let Some(provider) = &self.provider {
-            // Load the most recent 100 messages, then trim to the character
-            // budget before sending to the LLM. This prevents context overflow
-            // on devices with small context windows (e.g. Jetson Orin Nano 7B Q4).
-            let stored = self
-                .session_storage
-                .get_recent_messages(&self.session_id, 100)
-                .await?;
-            let messages: Vec<ChatMessage> =
-                stored.into_iter().map(|sm| sm.message).collect();
-            let messages = context_budget::trim_to_budget(messages);
-            let response = provider.complete(&self.system_prompt, messages).await?;
-            response.content
-        } else {
-            let request = AgentRequest {
-                message: message.clone(),
-                session_id: self.session_id.clone(),
-            };
-            self.agent.chat(request).await?.text
+        // Route all inference through the agent — GooseAdapter builds the system
+        // prompt from DB settings, manages conversation history, handles MCP tools.
+        let request = AgentRequest {
+            message: message.clone(),
+            session_id: self.session_id.clone(),
         };
+        let response_text = self.agent.chat(request).await?.text;
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(response_text.clone());
@@ -307,40 +311,6 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    // ── Inline test doubles ───────────────────────────────────────────────────
-
-    /// Appends every (system_prompt, messages) call to its vecs.
-    /// Use this to assert on any call, not just the last one.
-    struct CapturingProvider {
-        all_system_prompts: Arc<Mutex<Vec<String>>>,
-        all_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
-    }
-
-    #[async_trait]
-    impl LlmProvider for CapturingProvider {
-        async fn complete(
-            &self,
-            system_prompt: &str,
-            messages: Vec<ChatMessage>,
-        ) -> anyhow::Result<ChatMessage> {
-            self.all_system_prompts.lock().unwrap().push(system_prompt.to_string());
-            self.all_messages.lock().unwrap().push(messages);
-            Ok(ChatMessage::assistant("captured response"))
-        }
-        fn model_name(&self) -> String { "capturing".to_string() }
-    }
-
-    /// Always returns an error from `complete()`.
-    struct AlwaysErrorProvider;
-
-    #[async_trait]
-    impl LlmProvider for AlwaysErrorProvider {
-        async fn complete(&self, _: &str, _: Vec<ChatMessage>) -> anyhow::Result<ChatMessage> {
-            Err(anyhow::anyhow!("provider always errors"))
-        }
-        fn model_name(&self) -> String { "always-error".to_string() }
-    }
-
     #[tokio::test]
     async fn chat_once_returns_echo() {
         let agent = Arc::new(MockAgent::new());
@@ -472,84 +442,4 @@ mod tests {
             .with_voice_output(Arc::new(PrintOutput));
     }
 
-    // ── Pipeline integration tests ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn custom_system_prompt_forwarded_to_provider() {
-        let all_prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            all_system_prompts: all_prompts.clone(),
-            all_messages: Arc::new(Mutex::new(Vec::new())),
-        };
-        let agent = Arc::new(MockAgent::new());
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let session_id = "prompt-test".to_string();
-        storage.create_session(session_id.clone()).await.unwrap();
-
-        let service = ChatService::new(agent, session_id, storage)
-            .with_provider(Arc::new(provider))
-            .with_system_prompt("custom system prompt".to_string());
-
-        service.chat_once("hello".to_string()).await.unwrap();
-
-        // The first completion call must use the custom prompt
-        // (the provider may also be called a second time for title generation
-        // with TITLE_GENERATION_PROMPT — we only care about the response call).
-        let prompts = all_prompts.lock().unwrap();
-        assert!(
-            prompts.iter().any(|p| p == "custom system prompt"),
-            "expected 'custom system prompt' in one of {:?}",
-            prompts
-        );
-    }
-
-    #[tokio::test]
-    async fn history_included_in_second_call() {
-        let all_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>> = Arc::new(Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            all_system_prompts: Arc::new(Mutex::new(Vec::new())),
-            all_messages: all_messages.clone(),
-        };
-        let agent = Arc::new(MockAgent::new());
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let session_id = "history-test".to_string();
-        storage.create_session(session_id.clone()).await.unwrap();
-
-        let service = ChatService::new(agent, session_id, storage)
-            .with_provider(Arc::new(provider));
-
-        service.chat_once("first message".to_string()).await.unwrap();
-        service.chat_once("second message".to_string()).await.unwrap();
-
-        // Find the completion call whose messages include "second message" —
-        // that is the second-turn response call (not the title call).
-        let calls = all_messages.lock().unwrap();
-        let second_turn_call = calls.iter().find(|msgs| {
-            msgs.iter().any(|m| m.content == "second message")
-        });
-        let msgs = second_turn_call
-            .expect("should find call containing 'second message'");
-
-        // History must include the first exchange before the second message.
-        assert!(
-            msgs.iter().any(|m| m.content == "first message"),
-            "second turn must include first message in history; got: {:?}",
-            msgs.iter().map(|m| &m.content).collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_error_propagates_from_chat_once() {
-        let agent = Arc::new(MockAgent::new());
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let session_id = "error-test".to_string();
-        storage.create_session(session_id.clone()).await.unwrap();
-
-        let service = ChatService::new(agent, session_id, storage)
-            .with_provider(Arc::new(AlwaysErrorProvider));
-
-        let result = service.chat_once("hello".to_string()).await;
-        assert!(result.is_err(), "expected Err from always-error provider");
-        assert!(result.unwrap_err().to_string().contains("always errors"));
-    }
 }

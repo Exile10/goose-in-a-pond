@@ -88,6 +88,7 @@
   --ob-device-border: rgba(255, 255, 255, 0.6);
   --ob-add-border: #e5e7eb;
   --ob-type-tag-bg: #f3f4f6;
+  --ob-toggle-off: #d0d0dc;
 }
 
 a {
@@ -188,6 +189,7 @@ button:focus-visible {
     --ob-device-border: rgba(255, 255, 255, 0.1);
     --ob-add-border: #374151;
     --ob-type-tag-bg: #1f2937;
+    --ob-toggle-off: #3d3558;
   }
 }
 
@@ -249,6 +251,7 @@ button:focus-visible {
   --ob-device-border: rgba(255, 255, 255, 0.1);
   --ob-add-border: #374151;
   --ob-type-tag-bg: #1f2937;
+  --ob-toggle-off: #3d3558;
 }
 
 /* Manual light override (forces light even when OS is dark) */
@@ -309,4 +312,5 @@ button:focus-visible {
   --ob-device-border: rgba(255, 255, 255, 0.6);
   --ob-add-border: #e5e7eb;
   --ob-type-tag-bg: #f3f4f6;
+  --ob-toggle-off: #d0d0dc;
 }

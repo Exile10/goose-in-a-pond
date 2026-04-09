@@ -1,0 +1,24 @@
+[package]
+name = "pond-infra-scheduler"
+description = "CronSchedulerAdapter — tokio-cron-scheduler implementation of SchedulerPort"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core       = { workspace = true }
+anyhow          = { workspace = true }
+async-trait     = { workspace = true }
+tokio           = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+chrono          = { workspace = true }
+tracing         = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+uuid            = { workspace = true }
+reqwest         = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

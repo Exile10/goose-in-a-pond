@@ -3,7 +3,7 @@
 pub mod onboarding_guard;
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::{header::HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -98,7 +98,9 @@ impl RateLimiter {
     }
 }
 
-/// Routes that don't require authentication
+/// Routes that don't require authentication.
+///
+/// Must stay in sync with the public route set in `routes::api_routes()`.
 fn is_public_route(path: &str) -> bool {
     // Non-API paths are static web assets — always public
     if !path.starts_with("/api/") {
@@ -106,10 +108,27 @@ fn is_public_route(path: &str) -> bool {
     }
 
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
+
+    // Exact public matches
     matches!(
         path,
-        "/health" | "/handshake" | "/onboard" | "/onboard/complete" | "/onboard/status" | "/transcribe"
+        "/health"
+            | "/handshake"
+            | "/onboard"
+            | "/onboard/complete"
+            | "/onboard/status"
+            | "/transcribe"
+            | "/system/info"
+            | "/test"
+            | "/test/speak"
+            | "/dev/goose"
+            | "/dev/qwen-status"
+            | "/profiles"         // POST — create profile during onboarding
     )
+    // PUT /settings is public so onboarding steps can save before completion
+    || path == "/settings"
+    // PATCH /profiles/:id — update profile preferences during onboarding
+    || (path.starts_with("/profiles/") && !path.ends_with("/profiles/"))
 }
 
 /// Debug request/response logging middleware.
@@ -148,8 +167,14 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
     response
 }
 
-/// Global token-based authentication middleware
+/// Global token-based authentication middleware.
+///
+/// Uses `from_fn_with_state` so it can access `AppState::handshake` to
+/// validate the Bearer token against the in-memory token store.
+/// Public routes (health, handshake, onboarding, static assets) bypass
+/// token validation entirely.
 pub async fn auth_middleware(
+    State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
     path: axum::http::Uri,
     req: Request,
@@ -158,7 +183,19 @@ pub async fn auth_middleware(
     if is_public_route(path.path()) {
         return Ok(next.run(req).await);
     }
-    let _token = extract_bearer_token(&headers)?;
+
+    let token = extract_bearer_token(&headers)?;
+
+    let valid = state
+        .handshake
+        .validate_token(&token)
+        .await
+        .map_err(|_| AuthError::InvalidToken)?;
+
+    if !valid {
+        return Err(AuthError::InvalidToken);
+    }
+
     Ok(next.run(req).await)
 }
 
@@ -212,7 +249,8 @@ mod tests {
         assert!(is_public_route("/api/v1/transcribe"));
         assert!(!is_public_route("/api/v1/chat"));
         assert!(!is_public_route("/api/v1/devices"));
-        assert!(!is_public_route("/api/v1/settings"));
+        // PUT /settings is public so onboarding wizard steps can save before handshake completes
+        assert!(is_public_route("/api/v1/settings"));
         // Web dashboard static assets are always public
         assert!(is_public_route("/"));
         assert!(is_public_route("/index.html"));
