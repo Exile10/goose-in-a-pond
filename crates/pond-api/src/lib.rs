@@ -120,8 +120,6 @@ pub struct AppState {
     pub scheduler: Option<Arc<dyn SchedulerPort>>,
     /// Memory-aware model scheduler. `None` when all roles use external providers.
     pub model_scheduler: Option<Arc<dyn ModelScheduler>>,
-    /// Memory-aware model scheduler. `None` when all roles use external providers.
-    pub model_scheduler: Option<Arc<dyn ModelScheduler>>,
     /// MCP-style persistent memory. `None` until `pond-adapters-mcp-memory` is wired in.
     pub mcp_memory: Option<Arc<dyn McpMemoryPort + Send + Sync>>,
     /// MCP extension manager — manages Goose extensions for tool calling.
@@ -192,16 +190,6 @@ pub struct ModelStatusEntry {
     pub ram_estimate_mb: Option<u64>,
     /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
     pub recommended_role: Option<String>,
-    /// Download URL — None for HTTP TTS entries that have no downloadable file.
-    pub url:      Option<String>,
-    /// HuggingFace model spec (GGUF only): "author/repo:quantization"
-    pub hf_id:    Option<String>,
-    /// Filename on disk (used by the download route to determine the save path)
-    pub filename: Option<String>,
-    /// Approximate RAM required at runtime in MB. None for models without estimates.
-    pub ram_estimate_mb: Option<u64>,
-    /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
-    pub recommended_role: Option<String>,
 }
 
 /// Build the full API router.
@@ -223,9 +211,13 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         .nest("/api/v1", routes::api_routes(state.clone()))
         .fallback_service(routes::web_routes(static_dir))
         // Log every request/response at DEBUG level.
-        // Output is only visible when `--debug` is passed (sets the tracing
-        // filter to `debug`); at the default `info` level this is a no-op.
         .layer(axum::middleware::from_fn(middleware::log_requests))
+        // Enforce Bearer token authentication on all protected routes.
+        // Must come AFTER log_requests (layers apply in reverse order in axum).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ))
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();

@@ -39,6 +39,7 @@ const FALLBACK_PROMPT: &str =
 /// 7. Runs Goose's full agentic loop and returns aggregated text + tool-call metadata.
 pub struct GooseAdapter {
     agent:            Arc<GooseAgent>,
+    session_manager:  Arc<SessionManager>,
     settings_repo:    Arc<dyn SettingsRepository>,
     template_repo:    Arc<dyn PromptTemplateRepository>,
     extras_repo:      Arc<dyn PromptExtraRepository>,
@@ -49,6 +50,8 @@ pub struct GooseAdapter {
     last_provider_key: Mutex<String>,
     /// Sessions that have already had the "giap" builtin extension loaded.
     loaded_extensions: Mutex<HashSet<String>>,
+    /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
+    goose_session_map: Mutex<HashMap<String, String>>,
 }
 
 impl GooseAdapter {
@@ -65,7 +68,7 @@ impl GooseAdapter {
         let permission_manager = goose::config::permission::PermissionManager::instance();
 
         let config = AgentConfig::new(
-            session_manager,
+            session_manager.clone(),
             permission_manager,
             None,
             GooseMode::Auto,
@@ -77,6 +80,7 @@ impl GooseAdapter {
 
         Ok(Self {
             agent: Arc::new(agent),
+            session_manager,
             settings_repo,
             template_repo,
             extras_repo,
@@ -85,6 +89,7 @@ impl GooseAdapter {
             llamafile_url,
             last_provider_key: Mutex::new(String::new()),
             loaded_extensions: Mutex::new(HashSet::new()),
+            goose_session_map: Mutex::new(HashMap::new()),
         })
     }
 
@@ -129,6 +134,42 @@ impl GooseAdapter {
             .map_err(|e| anyhow!("Failed to add builtin extension '{}': {}", name, e))
     }
 
+    /// Resolve (and create if needed) the Goose-internal session for a given GIAP session ID.
+    ///
+    /// Goose uses its own SQLite sessions.db with auto-generated IDs (`YYYYMMDD_N`).
+    /// A GIAP session ID (UUID or arbitrary string) won't exist there unless we create it.
+    /// Returns the Goose session ID to use for all subsequent `agent.*` calls.
+    async fn resolve_goose_session(&self, giap_sid: &str) -> String {
+        // Fast path: already mapped this session.
+        if let Some(gid) = self.goose_session_map.lock().unwrap().get(giap_sid).cloned() {
+            return gid;
+        }
+        // Try using the GIAP session_id as-is (e.g. if Goose already stored it).
+        if self.session_manager.get_session(giap_sid, false).await.is_ok() {
+            self.goose_session_map.lock().unwrap()
+                .insert(giap_sid.to_string(), giap_sid.to_string());
+            return giap_sid.to_string();
+        }
+        // Create a brand-new Goose session; use the GIAP id as the human name.
+        match self.session_manager.create_session(
+            std::env::current_dir().unwrap_or_default(),
+            giap_sid.to_string(),
+            goose::session::session_manager::SessionType::User,
+            GooseMode::Auto,
+        ).await {
+            Ok(session) => {
+                let gid = session.id.clone();
+                self.goose_session_map.lock().unwrap()
+                    .insert(giap_sid.to_string(), gid.clone());
+                gid
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create Goose session for '{}': {e}", giap_sid);
+                giap_sid.to_string()
+            }
+        }
+    }
+
     /// Hot-swap the Goose provider when `chat_provider` / `chat_model` in settings changes.
     async fn ensure_provider_current(
         &self,
@@ -144,7 +185,13 @@ impl GooseAdapter {
         }
 
         let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
-            "llamafile" => {
+            // "local" uses llamafile as the HTTP backend (same wire format as Ollama).
+            // The server starts llamafile when provider=llamafile; for provider=local the
+            // GooseAdapter is expected to be the inference path.  When llamafile IS running
+            // (e.g. user started it manually or via `serve --provider llamafile`) this works
+            // transparently.  Without a running server the agentic loop will return a
+            // connection error.
+            "local" | "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()
@@ -155,7 +202,7 @@ impl GooseAdapter {
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
                     Ok(p) => Some(Arc::new(p)),
                     Err(e) => {
-                        tracing::warn!("Failed to build llamafile provider: {e}");
+                        tracing::warn!("Failed to build llamafile/local provider: {e}");
                         None
                     }
                 }
@@ -195,6 +242,11 @@ impl AgentPort for GooseAdapter {
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
         let settings = self.settings_repo.get().await.unwrap_or_default();
         let session_id = &request.session_id;
+
+        // Goose maintains its own sessions.db with auto-generated IDs.
+        // Ensure a Goose session exists for this GIAP session before calling agent.reply().
+        let goose_sid = self.resolve_goose_session(session_id).await;
+        let goose_sid = goose_sid.as_str();
 
         // ── 1. System prompt ──────────────────────────────────────────────────
         let template_content = self.template_repo
@@ -244,18 +296,18 @@ impl AgentPort for GooseAdapter {
         }
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
-        if let Err(e) = self.ensure_provider_current(&settings, session_id).await {
+        if let Err(e) = self.ensure_provider_current(&settings, goose_sid).await {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");
         }
 
         // ── 6. Auto-load "giap" builtin extension ─────────────────────────────
         let needs_extension_load = {
             let loaded = self.loaded_extensions.lock().unwrap();
-            !loaded.contains(session_id)
+            !loaded.contains(goose_sid)
         };
         if needs_extension_load {
-            self.add_builtin_extension("giap", session_id).await.ok();
-            self.loaded_extensions.lock().unwrap().insert(session_id.clone());
+            self.add_builtin_extension("giap", goose_sid).await.ok();
+            self.loaded_extensions.lock().unwrap().insert(goose_sid.to_string());
         }
 
         // ── 7. GooseMode from settings ────────────────────────────────────────
@@ -266,14 +318,14 @@ impl AgentPort for GooseAdapter {
             _              => GooseMode::Auto,
         };
         self.agent
-            .update_goose_mode(goose_mode, session_id)
+            .update_goose_mode(goose_mode, goose_sid)
             .await
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
         let user_msg = Message::user().with_text(&request.message);
         let session_cfg = goose::agents::types::SessionConfig {
-            id: session_id.clone(),
+            id: goose_sid.to_string(),
             schedule_id: None,
             max_turns: Some(settings.agent_max_turns as u32),
             retry_config: None,

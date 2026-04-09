@@ -86,6 +86,10 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("agent_max_turns",      settings.agent_max_turns.to_string());
         upsert!("agent_memory_inject",  if settings.agent_memory_inject { "true" } else { "false" });
         upsert!("agent_memory_limit",   settings.agent_memory_limit.to_string());
+        upsert!("weather_enabled",       if settings.weather_enabled { "true" } else { "false" });
+        upsert!("weather_latitude",      settings.weather_latitude.to_string());
+        upsert!("weather_longitude",     settings.weather_longitude.to_string());
+        upsert!("weather_location_name", &settings.weather_location_name);
 
         Ok(())
     }
@@ -177,6 +181,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "agent_memory_limit"   => {
             if let Ok(v) = value.parse() { s.agent_memory_limit = v; }
         }
+        "weather_enabled"       => s.weather_enabled = value == "true",
+        "weather_latitude"      => { if let Ok(v) = value.parse() { s.weather_latitude = v; } }
+        "weather_longitude"     => { if let Ok(v) = value.parse() { s.weather_longitude = v; } }
+        "weather_location_name" => s.weather_location_name = value.to_string(),
         _ => {} // unknown key — ignore
     }
 }
