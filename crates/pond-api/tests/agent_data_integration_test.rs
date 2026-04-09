@@ -75,10 +75,13 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let pool = db.system.clone();
     let db   = Arc::new(db);
 
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db:                  db,
         onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(MockHandshake::new()),
+        handshake:           Arc::new(mock_hs),
         whisper_url:         "http://127.0.0.1:9000".into(),
         session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
         http_client:         reqwest::Client::new(),
@@ -234,10 +237,13 @@ async fn prompt_template_delete_system_returns_403() {
         updated_at: String::new(),
     }).await.unwrap();
 
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db:                  Arc::new(db),
         onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(MockHandshake::new()),
+        handshake:           Arc::new(mock_hs),
         whisper_url:         "http://127.0.0.1:9000".into(),
         session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
         http_client:         reqwest::Client::new(),
@@ -501,10 +507,12 @@ async fn returns_501_when_repos_not_configured() {
     let tmp = tempfile::tempdir().unwrap();
     let db   = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
     let state = Arc::new(AppState {
         db:                  Arc::new(db),
         onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(MockHandshake::new()),
+        handshake:           Arc::new(mock_hs),
         whisper_url:         "http://127.0.0.1:9000".into(),
         session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
         http_client:         reqwest::Client::new(),

@@ -80,10 +80,14 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
 
     let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
         Arc::new(pond_infra::sqlite_session_storage::SqliteSessionStorage::new(db.system.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(MockRepo::new(step)) as Arc<dyn OnboardingRepository + Send + Sync>,
-        handshake: Arc::new(MockHandshake::new()),
+        handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: ReqwestClient::new(),
@@ -162,7 +166,9 @@ async fn system_info_is_accessible_before_onboarding() {
 async fn chat_is_blocked_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().method("POST").uri("/api/v1/chat").body(Body::empty()).unwrap())
+        .oneshot(Request::builder().method("POST").uri("/api/v1/chat")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -172,7 +178,9 @@ async fn chat_is_blocked_before_onboarding() {
 async fn devices_is_blocked_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/devices").body(Body::empty()).unwrap())
+        .oneshot(Request::builder().uri("/api/v1/devices")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);

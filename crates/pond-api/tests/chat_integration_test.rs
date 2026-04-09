@@ -70,10 +70,14 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
 
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
-        handshake: Arc::new(MockHandshake::new()),
+        handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: ReqwestClient::new(),
@@ -115,6 +119,7 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
         .method("POST")
         .uri("/api/v1/chat")
         .header("content-type", "application/json")
+        .header("Authorization", "Bearer test-token")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -202,6 +207,7 @@ async fn post_chat_returns_400_for_invalid_json() {
                 .method("POST")
                 .uri("/api/v1/chat")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
                 .body(Body::from("not json at all"))
                 .unwrap(),
         )

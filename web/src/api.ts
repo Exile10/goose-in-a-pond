@@ -180,6 +180,50 @@ export interface Settings {
   task_model:     string | null
 }
 
+// ── Agent data types ──────────────────────────────────────────────────────────
+
+export interface PromptTemplate {
+  name: string
+  content: string
+  description: string
+  is_system: boolean
+  updated_at: string
+}
+
+export interface PromptExtra {
+  key: string
+  instruction: string
+  active: boolean
+  sort_order: number
+}
+
+export interface UserSkill {
+  id: string
+  name: string
+  content: string
+  active: boolean
+  created_at: string
+}
+
+export interface AgentRecipe {
+  id: string
+  name: string
+  description: string
+  yaml: string
+  active: boolean
+  created_at: string
+}
+
+export interface MemoryFragment {
+  id: string
+  profile_id: string | null
+  session_id: string | null
+  content: string
+  source: string
+  tags: string[]
+  created_at: string
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function postReq<T>(path: string, body: unknown, token?: string): Promise<T> {
@@ -243,6 +287,18 @@ async function deleteReq<T>(path: string, token: string): Promise<T> {
   }
 
   return res.json()
+}
+
+async function deleteVoidReq(path: string, token: string): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${token}` },
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(text || `HTTP ${res.status}`)
+  }
 }
 
 // ── API calls ─────────────────────────────────────────────────────────────────
@@ -537,6 +593,88 @@ export const api = {
       reader.releaseLock()
     }
   },
+
+  // ── Prompt Templates ─────────────────────────────────────────────────────
+
+  listPromptTemplates: (token: string) =>
+    getReq<PromptTemplate[]>('/prompts', token),
+
+  getPromptTemplate: (name: string, token: string) =>
+    getReq<PromptTemplate>(`/prompts/${encodeURIComponent(name)}`, token),
+
+  updatePromptTemplate: (name: string, body: { content: string; description?: string }, token: string) =>
+    putReq<{ name: string; status: string }>(`/prompts/${encodeURIComponent(name)}`, body, token),
+
+  deletePromptTemplate: (name: string, token: string) =>
+    deleteVoidReq(`/prompts/${encodeURIComponent(name)}`, token),
+
+  // ── Prompt Extras ─────────────────────────────────────────────────────────
+
+  listPromptExtras: (token: string) =>
+    getReq<PromptExtra[]>('/agent/extras', token),
+
+  upsertPromptExtra: (body: { key: string; instruction: string; active?: boolean; sort_order?: number }, token: string) =>
+    postReq<{ key: string; status: string }>('/agent/extras', body, token),
+
+  deletePromptExtra: (key: string, token: string) =>
+    deleteVoidReq(`/agent/extras/${encodeURIComponent(key)}`, token),
+
+  // ── Agent Tools ───────────────────────────────────────────────────────────
+
+  listAgentTools: (token: string) =>
+    getReq<{ extensions: { name: string; tools: string[] }[] }>('/agent/tools', token),
+
+  // ── Skills ────────────────────────────────────────────────────────────────
+
+  listSkills: (token: string) =>
+    getReq<UserSkill[]>('/skills', token),
+
+  createSkill: (body: { name: string; content: string }, token: string) =>
+    postReq<UserSkill>('/skills', body, token),
+
+  updateSkill: (id: string, body: { content?: string; active?: boolean }, token: string) =>
+    putReq<UserSkill>(`/skills/${encodeURIComponent(id)}`, body, token),
+
+  deleteSkill: (id: string, token: string) =>
+    deleteVoidReq(`/skills/${encodeURIComponent(id)}`, token),
+
+  // ── Recipes ───────────────────────────────────────────────────────────────
+
+  listRecipes: (token: string) =>
+    getReq<AgentRecipe[]>('/recipes', token),
+
+  createRecipe: (body: { name: string; description?: string; yaml: string }, token: string) =>
+    postReq<AgentRecipe>('/recipes', body, token),
+
+  updateRecipe: (id: string, body: { description?: string; yaml?: string; active?: boolean }, token: string) =>
+    putReq<AgentRecipe>(`/recipes/${encodeURIComponent(id)}`, body, token),
+
+  deleteRecipe: (id: string, token: string) =>
+    deleteVoidReq(`/recipes/${encodeURIComponent(id)}`, token),
+
+  // Run a named recipe via the agent (uses POST /agent/chat with recipe YAML context)
+  runRecipe: (name: string, token: string) =>
+    postReq<{ session_id: string; response: string }>('/chat', { message: `Run recipe: ${name}` }, token),
+
+  // ── Memories ──────────────────────────────────────────────────────────────
+
+  listMemories: (token: string) =>
+    getReq<MemoryFragment[]>('/memories', token),
+
+  createMemory: async (body: { content: string; tags?: string[]; source?: string }, token: string): Promise<void> => {
+    const res = await fetch(`${BASE}/memories`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+  },
+
+  deleteMemory: (id: string, token: string) =>
+    deleteVoidReq(`/memories/${encodeURIComponent(id)}`, token),
 
   // ── Server-side TTS ───────────────────────────────────────────────────────
 
