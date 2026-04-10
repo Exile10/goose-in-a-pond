@@ -104,3 +104,48 @@ async fn system_prompt_is_first_message_in_request() {
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "hi");
 }
+
+#[tokio::test]
+async fn streaming_inference_returns_tokens() {
+    use futures::StreamExt;
+
+    let server = MockServer::start().await;
+
+    // Simulate an OpenAI SSE streaming response with multiple tokens
+    let sse_body = [
+        r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+        "",
+        r#"data: {"choices":[{"delta":{"content":" world"}}]}"#,
+        "",
+        r#"data: {"choices":[{"delta":{"content":"!"}}]}"#,
+        "",
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .append_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = LlamafileProvider::new(Some(&server.uri()));
+    let mut stream = provider.stream_complete("system", vec![ChatMessage::user("hi")]);
+
+    let mut tokens = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(token) => tokens.push(token),
+            Err(e) => panic!("stream error: {}", e),
+        }
+    }
+
+    assert!(!tokens.is_empty(), "expected at least one token, got none");
+    let combined: String = tokens.join("");
+    assert_eq!(combined, "Hello world!", "combined tokens should form 'Hello world!'");
+}

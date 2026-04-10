@@ -1156,7 +1156,7 @@ async fn scan_models(
     Json(json!({"found": count, "entries": entries}))
 }
 
-/// POST /api/v1/models/registry/refresh — fetch the latest registry from the online URL.
+/// POST /api/v1/models/registry/refresh — refresh the model catalog from upstream sources.
 async fn refresh_model_registry(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -1167,16 +1167,11 @@ async fn refresh_model_registry(
         return Ok(Json(json!({"status": "no_catalog_provider"})));
     };
 
-    let settings = state.settings_repo.get().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
-    })?;
-
-    let url = settings.model_registry_url.clone();
     let data_dir = state.model_storage_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Fetch in the background so we don't block on slow network.
     tokio::spawn(async move {
-        match catalog_provider.fetch(&url).await {
+        match catalog_provider.fetch().await {
             Ok((models, _binaries)) => {
                 let count = models.len();
                 for mut m in models {
@@ -1194,9 +1189,9 @@ async fn refresh_model_registry(
                         tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
                     }
                 }
-                tracing::info!("Model registry refreshed: {} records upserted from {}", count, url);
+                tracing::info!("Model registry refreshed: {} records upserted", count);
             }
-            Err(e) => tracing::warn!("Registry refresh failed from {}: {}", url, e),
+            Err(e) => tracing::warn!("Registry refresh failed: {}", e),
         }
     });
 

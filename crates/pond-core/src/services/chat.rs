@@ -123,13 +123,27 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        // Route all inference through the agent — GooseAdapter builds the system
-        // prompt from DB settings, manages conversation history, handles MCP tools.
-        let request = AgentRequest {
-            message: message.clone(),
-            session_id: self.session_id.clone(),
+        // When a direct LlmProvider is wired (e.g. CLI --provider local/ollama/llamafile),
+        // use it with the full conversation history from session storage.
+        // Otherwise route through the Agent port (GooseAdapter in production), which manages
+        // its own history, system prompt, and MCP tools internally.
+        let response_text = if let Some(provider) = &self.provider {
+            let history = self.session_storage
+                .get_messages(&self.session_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|sm| sm.message)
+                .collect::<Vec<_>>();
+            let response_msg = provider.complete(&self.system_prompt, history).await?;
+            response_msg.content
+        } else {
+            let request = AgentRequest {
+                message: message.clone(),
+                session_id: self.session_id.clone(),
+            };
+            self.agent.chat(request).await?.text
         };
-        let response_text = self.agent.chat(request).await?.text;
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(response_text.clone());
