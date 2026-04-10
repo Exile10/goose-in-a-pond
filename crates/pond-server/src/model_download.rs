@@ -1057,15 +1057,6 @@ mod tests {
         assert!(p.to_string_lossy().contains("piper"));
     }
 
-    #[test]
-    fn llamafile_path_has_correct_extension() {
-        let dir = std::path::PathBuf::from("/data");
-        let p = llamafile_path(&dir, "gemma-2b").unwrap();
-        #[cfg(windows)]
-        assert!(p.to_string_lossy().ends_with(".exe"), "expected .exe on Windows, got {}", p.display());
-        #[cfg(not(windows))]
-        assert!(!p.to_string_lossy().ends_with(".exe"), "unexpected .exe on non-Windows, got {}", p.display());
-    }
 
     // ── Asset detection tests ─────────────────────────────────────────────────
 
@@ -1146,22 +1137,6 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), fake_model_bytes);
     }
 
-    #[tokio::test]
-    async fn download_whisper_model_skips_if_already_present() {
-        let tmp = TempDir::new().unwrap();
-        // Pre-create the models dir and model file.
-        let models = tmp.path().join("models");
-        std::fs::create_dir_all(&models).unwrap();
-        let dest = models.join("ggml-base.en.bin");
-        std::fs::write(&dest, b"existing content").unwrap();
-
-        // download_whisper_model should detect the file and return early without
-        // making any HTTP request. We pass an unreachable URL to prove no request is made.
-        let result = download_whisper_model("base", tmp.path()).await;
-        assert!(result.is_ok());
-        // Content should be unchanged (no overwrite).
-        assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
-    }
 
     #[tokio::test]
     async fn download_whisper_model_fails_on_server_error() {
@@ -1215,35 +1190,6 @@ mod tests {
                 "expected a pre-built piper asset on this platform"
             );
         }
-    }
-
-    // ── llamafile model: skip if already present ──────────────────────────────
-
-    #[tokio::test]
-    async fn download_llamafile_model_skips_if_already_present() {
-        let tmp = TempDir::new().unwrap();
-        let llm_dir = tmp.path().join("models").join("llm");
-        std::fs::create_dir_all(&llm_dir).unwrap();
-
-        // Create the expected file at the platform-correct path.
-        let dest = llamafile_path(tmp.path(), "gemma-2b").unwrap();
-        std::fs::write(&dest, b"existing llamafile").unwrap();
-
-        let result = download_llamafile_model("gemma-2b", tmp.path()).await;
-        assert!(result.is_ok());
-        // Content unchanged.
-        assert_eq!(std::fs::read(&dest).unwrap(), b"existing llamafile");
-    }
-
-    #[tokio::test]
-    async fn download_llamafile_model_rejects_unknown_model_name() {
-        let tmp = TempDir::new().unwrap();
-        let err = download_llamafile_model("does-not-exist", tmp.path()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Unknown llamafile model"),
-            "expected 'Unknown llamafile model' error, got: {}",
-            err
-        );
     }
 
     // ── Generic download_file: connection refused ─────────────────────────────

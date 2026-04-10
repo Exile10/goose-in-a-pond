@@ -5,8 +5,16 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "pond-server"
+path = "src/main.rs"
+
+[lib]
+name = "pond_server"
+path = "src/lib.rs"
+
 [features]
-default = ["goose-agent"]
+default = ["goose-agent", "local-inference"]
 # Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
 # Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
 goose-agent = ["dep:pond-adapters-goose"]
@@ -63,6 +71,9 @@ flate2 = "1"
 tar = "0.4"
 
 [dev-dependencies]
-wiremock = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock   = { workspace = true }
+tempfile   = { workspace = true }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+indoc      = { workspace = true }

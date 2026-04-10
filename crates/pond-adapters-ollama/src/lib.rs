@@ -3,15 +3,16 @@
 //! Implements the GIAP `LlmProvider` port against a local Ollama instance
 //! at `http://localhost:11434` using the `/api/chat` endpoint.
 //!
+//! ## Auto-Pull
+//!
+//! When a model is not yet downloaded in Ollama, `complete()` automatically
+//! calls `POST /api/pull` to download it, then retries inference. This makes
+//! the system fully autonomous — no manual `ollama pull` needed.
+//!
 //! ## Running Ollama
 //!
 //! ```bash
 //! ollama serve
-//! ollama pull llama3.2   # or any other model
-//! ```
-//!
-//! Then start the assistant:
-//! ```bash
 //! pond-server chat --provider ollama --model llama3.2
 //! ```
 
@@ -58,10 +59,19 @@ struct ChatResponse {
     message: OllamaMessage,
 }
 
+// ── Pull request ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct PullRequest<'a> {
+    model: &'a str,
+    stream: bool,
+}
+
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 pub struct OllamaProvider {
     client: Client,
+    base_url: String,
     endpoint: String,
     model: String,
     max_tokens: Option<u32>,
@@ -76,6 +86,7 @@ impl OllamaProvider {
         let base = host.unwrap_or(DEFAULT_HOST).trim_end_matches('/');
         Self {
             client: Client::new(),
+            base_url: base.to_string(),
             endpoint: format!("{}/api/chat", base),
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
             max_tokens: None,
@@ -84,35 +95,51 @@ impl OllamaProvider {
     }
 
     /// Override the maximum number of tokens to generate.
-    /// When not set, Ollama uses its own default.
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = Some(n);
         self
     }
 
     /// Override the sampling temperature.
-    /// When not set, Ollama uses its own default.
     pub fn with_temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
         self
     }
-}
 
-#[async_trait]
-impl LlmProvider for OllamaProvider {
-    async fn complete(
-        &self,
-        system_prompt: &str,
-        messages: Vec<ChatMessage>,
-    ) -> Result<ChatMessage> {
-        // Build message list: system prompt first, then conversation history.
-        let mut ollama_messages: Vec<OllamaMessage> = vec![OllamaMessage {
+    /// Pull (download) a model from the Ollama registry.
+    ///
+    /// Blocks until the pull is complete. With `stream: false` Ollama returns
+    /// a single JSON response when done.
+    async fn pull_model(&self, model: &str) -> Result<()> {
+        let url = format!("{}/api/pull", self.base_url);
+        let body = PullRequest { model, stream: false };
+
+        tracing::info!("Ollama: pulling model '{}' — this may take a while...", model);
+
+        let resp = self.client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Ollama pull request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Ollama pull failed: {}", text));
+        }
+
+        tracing::info!("Ollama: model '{}' pulled successfully", model);
+        Ok(())
+    }
+
+    /// Build the Ollama message list from a system prompt + conversation history.
+    fn build_messages(&self, system_prompt: &str, messages: &[ChatMessage]) -> Vec<OllamaMessage> {
+        let mut out = vec![OllamaMessage {
             role: "system".to_string(),
             content: system_prompt.to_string(),
         }];
-
-        for m in &messages {
-            ollama_messages.push(OllamaMessage {
+        for m in messages {
+            out.push(OllamaMessage {
                 role: match m.role {
                     Role::User => "user",
                     Role::Assistant => "assistant",
@@ -122,21 +149,32 @@ impl LlmProvider for OllamaProvider {
                 content: m.content.clone(),
             });
         }
+        out
+    }
 
-        let options = if self.max_tokens.is_some() || self.temperature.is_some() {
+    /// Build the options struct from configured max_tokens / temperature.
+    fn build_options(&self) -> Option<OllamaOptions> {
+        if self.max_tokens.is_some() || self.temperature.is_some() {
             Some(OllamaOptions {
                 num_predict: self.max_tokens,
                 temperature: self.temperature,
             })
         } else {
             None
-        };
+        }
+    }
 
+    /// Send a single chat request and return the assistant response.
+    async fn send_chat(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+    ) -> Result<ChatMessage> {
         let body = ChatRequest {
             model: &self.model,
-            messages: ollama_messages,
+            messages: self.build_messages(system_prompt, messages),
             stream: false,
-            options,
+            options: self.build_options(),
         };
 
         let resp = self
@@ -160,6 +198,36 @@ impl LlmProvider for OllamaProvider {
 
         Ok(ChatMessage::assistant(parsed.message.content))
     }
+}
+
+#[async_trait]
+impl LlmProvider for OllamaProvider {
+    async fn complete(
+        &self,
+        system_prompt: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<ChatMessage> {
+        // First attempt
+        match self.send_chat(system_prompt, &messages).await {
+            Ok(msg) => Ok(msg),
+            Err(e) => {
+                let err_str = e.to_string();
+                // Check if this is a "model not found" error — auto-pull and retry
+                if err_str.contains("not found") || err_str.contains("no such model") {
+                    tracing::info!(
+                        "Ollama: model '{}' not found — attempting auto-pull...",
+                        self.model
+                    );
+                    self.pull_model(&self.model).await?;
+
+                    // Retry inference after pull
+                    self.send_chat(system_prompt, &messages).await
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
 
     fn model_name(&self) -> String {
         self.model.clone()
@@ -171,9 +239,10 @@ impl LlmProvider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Helper: spin up a mock Ollama server, send one turn, return the reply.
     async fn complete_with_mock(response_body: serde_json::Value) -> Result<ChatMessage> {
         let server = MockServer::start().await;
 
@@ -247,5 +316,120 @@ mod tests {
     async fn default_model_is_llama3_2() {
         let provider = OllamaProvider::new(None, None);
         assert_eq!(provider.model_name(), DEFAULT_MODEL);
+    }
+
+    // ── Auto-pull + inference tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_pulls_missing_model_then_completes_inference() {
+        let server = MockServer::start().await;
+
+        // First /api/chat call → 404 "model not found"
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string(r#"{"error":"model 'test-model' not found"}"#),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Pull endpoint — should be called exactly once
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .and(body_partial_json(serde_json::json!({"model": "test-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // After pull, the retry /api/chat should succeed
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "test-model",
+                "message": { "role": "assistant", "content": "I'm ready after being pulled!" },
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(Some(&server.uri()), Some("test-model"));
+        let reply = provider
+            .complete("You are helpful.", vec![ChatMessage::user("Hello")])
+            .await
+            .unwrap();
+
+        assert_eq!(reply.role, Role::Assistant);
+        assert_eq!(reply.content, "I'm ready after being pulled!");
+    }
+
+    #[tokio::test]
+    async fn does_not_pull_on_other_errors() {
+        let server = MockServer::start().await;
+
+        // Return a 500 error — should NOT trigger a pull
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("GPU out of memory"))
+            .mount(&server)
+            .await;
+
+        // Pull endpoint — should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(Some(&server.uri()), Some("test-model"));
+        let err = provider
+            .complete("sys", vec![ChatMessage::user("hi")])
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_succeeds_with_options() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3.2",
+                "message": { "role": "assistant", "content": "Options work!" },
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(Some(&server.uri()), Some("llama3.2"))
+            .with_max_tokens(512)
+            .with_temperature(0.3);
+
+        let reply = provider
+            .complete("sys", vec![ChatMessage::user("test")])
+            .await
+            .unwrap();
+
+        assert_eq!(reply.content, "Options work!");
+
+        // Verify the request body includes options
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["options"]["num_predict"], 512);
+        assert_eq!(body["options"]["temperature"], 0.3);
     }
 }
