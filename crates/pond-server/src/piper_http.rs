@@ -17,9 +17,8 @@ use axum::{
     Router,
 };
 use std::{io::Write as _, path::PathBuf, sync::Arc};
-use tokio::net::TcpListener;
 
-pub const DEFAULT_PORT: u16 = 8282;
+// Port is set in crate::ports::PIPER_TTS — no constant here.
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
@@ -128,20 +127,18 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Start the Piper HTTP server in a background task.
-/// Returns the port it bound to, or `Err` if piper is unavailable or the port
-/// is already in use.
+///
+/// The base port is taken from [`crate::ports::PIPER_TTS`].  If that port is
+/// busy, the next port in arithmetic sequence is tried automatically.
+/// Returns the port actually bound, or `Err` if no port could be secured.
 pub async fn start(
     piper_bin: PathBuf,
     model: PathBuf,
     espeak_data: Option<PathBuf>,
-    port: u16,
 ) -> Result<u16> {
-    let addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&addr)
+    let (listener, actual_port) = crate::ports::bind_with_fallback("127.0.0.1", crate::ports::PIPER_TTS)
         .await
-        .with_context(|| format!("piper-http: could not bind {addr}"))?;
-
-    let actual_port = listener.local_addr()?.port();
+        .with_context(|| format!("piper-http: could not bind port {}", crate::ports::PIPER_TTS))?;
 
     let state = Arc::new(PiperState { piper_bin, model, espeak_data });
     let app = Router::new()
@@ -158,6 +155,7 @@ pub async fn start(
 }
 
 /// Returns `true` if a piper-http server is already responding on `port`.
+#[allow(dead_code)]
 pub async fn is_running(port: u16) -> bool {
     reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/tts"))

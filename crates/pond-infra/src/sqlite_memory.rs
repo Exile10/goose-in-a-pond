@@ -195,15 +195,15 @@ mod tests {
     use crate::db::Database;
     use tempfile::tempdir;
 
-    async fn make_repo() -> SqliteMemoryRepository {
+    async fn make_repo() -> (SqliteMemoryRepository, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        SqliteMemoryRepository::new(db.system)
+        (SqliteMemoryRepository::new(db.system), tmp)
     }
 
     #[tokio::test]
     async fn add_and_search_recent() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         // Use profile_id=None — a real profile UUID would need to be inserted first
         let frag = MemoryFragment::from_chat(
             "f1".to_string(),
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_fragment() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         let frag = MemoryFragment::from_chat("del1".to_string(), None, None, "bye".to_string());
         repo.add(frag).await.unwrap();
         repo.delete("del1").await.unwrap();
@@ -228,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_similar_falls_back_to_recent_when_no_embeddings() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
         let frag = MemoryFragment::from_chat("f2".to_string(), None, None, "no embedding".to_string());
         repo.add(frag).await.unwrap();
         let query = vec![0.0f32; 4];
@@ -238,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_similar_ranks_by_cosine() {
-        let repo = make_repo().await;
+        let (repo, _tmp) = make_repo().await;
 
         let mut high = MemoryFragment::from_chat("high".to_string(), None, None, "high sim".to_string());
         high.embedding = Some(vec![1.0, 0.0, 0.0, 0.0]);

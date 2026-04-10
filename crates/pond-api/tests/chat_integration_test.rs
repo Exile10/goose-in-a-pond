@@ -10,12 +10,10 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use pond_adapters_llamafile::LlamafileProvider;
 use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::ports::provider::LlmProvider;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
@@ -25,8 +23,6 @@ use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use reqwest::Client as ReqwestClient;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── Minimal stubs ──────────────────────────────────────────────────────────────
 
@@ -68,25 +64,26 @@ impl DeviceRegistry for MockDeviceRegistry {
 // ── Test fixture ───────────────────────────────────────────────────────────────
 
 /// Build a test router backed by a real tempdir SQLite database.
-///
-/// Pass `llm_provider: Some(...)` to enable LLM-backed responses,
-/// or `None` to fall back to MockAgent echo.
-async fn make_app(
-    llm_provider: Option<Arc<dyn LlmProvider>>,
-) -> (axum::Router, tempfile::TempDir) {
+/// All chat goes through MockAgent (GooseAdapter in production).
+async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
 
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
-        handshake: Arc::new(MockHandshake::new()),
+        handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),
-        llm_provider,
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
@@ -96,8 +93,23 @@ async fn make_app(
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
-        model_status: None,
+        model_repo: None,
         data_dir: None,
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        qwen_tts_url: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
+        model_catalog_provider: None,
+        model_storage_dir: None,
+        prompt_template_repo: None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -107,21 +119,16 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
         .method("POST")
         .uri("/api/v1/chat")
         .header("content-type", "application/json")
+        .header("Authorization", "Bearer test-token")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
-}
-
-fn llamafile_response(content: &str) -> serde_json::Value {
-    serde_json::json!({
-        "choices": [{"message": {"content": content}}]
-    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn post_chat_returns_echo_via_agent() {
-    let (app, _tmp) = make_app(None).await;
+    let (app, _tmp) = make_app().await;
 
     let resp = app
         .oneshot(chat_request(serde_json::json!({"message": "hello"})))
@@ -147,7 +154,7 @@ async fn post_chat_returns_echo_via_agent() {
 
 #[tokio::test]
 async fn post_chat_auto_creates_session() {
-    let (app, _tmp) = make_app(None).await;
+    let (app, _tmp) = make_app().await;
 
     let resp = app
         .oneshot(chat_request(serde_json::json!({"message": "hi"})))
@@ -168,7 +175,7 @@ async fn post_chat_auto_creates_session() {
 
 #[tokio::test]
 async fn post_chat_reuses_provided_session_id() {
-    let (app, _tmp) = make_app(None).await;
+    let (app, _tmp) = make_app().await;
 
     let session_id = "my-known-session";
     let resp = app
@@ -189,111 +196,10 @@ async fn post_chat_reuses_provided_session_id() {
     assert_eq!(json["session_id"], session_id);
 }
 
-#[tokio::test]
-async fn post_chat_with_llm_provider_returns_llm_response() {
-    let llm_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(llamafile_response("The sky is blue.")),
-        )
-        .mount(&llm_server)
-        .await;
-
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(LlamafileProvider::new(Some(&llm_server.uri())));
-    let (app, _tmp) = make_app(Some(provider)).await;
-
-    let resp = app
-        .oneshot(chat_request(serde_json::json!({"message": "What color is the sky?"})))
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(json["response"], "The sky is blue.");
-}
-
-#[tokio::test]
-async fn post_chat_history_accumulates_across_turns() {
-    let llm_server = MockServer::start().await;
-    // Respond to any number of requests.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(llamafile_response("I remember everything.")),
-        )
-        .mount(&llm_server)
-        .await;
-
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(LlamafileProvider::new(Some(&llm_server.uri())));
-    let (app, _tmp) = make_app(Some(provider)).await;
-
-    let session_id = "history-session";
-
-    // First turn.
-    let resp1 = app
-        .clone()
-        .oneshot(chat_request(serde_json::json!({
-            "session_id": session_id,
-            "message": "first message"
-        })))
-        .await
-        .unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-
-    // Second turn.
-    let resp2 = app
-        .clone()
-        .oneshot(chat_request(serde_json::json!({
-            "session_id": session_id,
-            "message": "second message"
-        })))
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-
-    // The LLM is called at least twice (once per turn; first turn also calls
-    // it a second time for auto-title generation).
-    let requests = llm_server.received_requests().await.unwrap();
-    assert!(requests.len() >= 2, "LLM should have been called for each turn");
-
-    // Find the completion request that contains "second message" as a user
-    // message — that is the second-turn response call.
-    let second_turn = requests.iter().find(|r| {
-        let body: serde_json::Value =
-            serde_json::from_slice(&r.body).unwrap_or_default();
-        body["messages"]
-            .as_array()
-            .map(|msgs| msgs.iter().any(|m| m["content"] == "second message"))
-            .unwrap_or(false)
-    });
-    let second_turn = second_turn.expect("should find a request containing 'second message'");
-
-    let body: serde_json::Value = serde_json::from_slice(&second_turn.body).unwrap();
-    let messages = body["messages"].as_array().expect("messages array");
-    let contents: Vec<&str> = messages
-        .iter()
-        .filter_map(|m| m["content"].as_str())
-        .collect();
-    assert!(
-        contents.iter().any(|c| c.contains("first message")),
-        "second turn should include first message in history; messages: {:?}",
-        contents
-    );
-}
 
 #[tokio::test]
 async fn post_chat_returns_400_for_invalid_json() {
-    let (app, _tmp) = make_app(None).await;
+    let (app, _tmp) = make_app().await;
 
     let resp = app
         .oneshot(
@@ -301,6 +207,7 @@ async fn post_chat_returns_400_for_invalid_json() {
                 .method("POST")
                 .uri("/api/v1/chat")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
                 .body(Body::from("not json at all"))
                 .unwrap(),
         )
@@ -312,7 +219,7 @@ async fn post_chat_returns_400_for_invalid_json() {
 
 #[tokio::test]
 async fn post_chat_returns_400_for_missing_message_field() {
-    let (app, _tmp) = make_app(None).await;
+    let (app, _tmp) = make_app().await;
 
     let resp = app
         .oneshot(chat_request(serde_json::json!({"session_id": "s1"})))

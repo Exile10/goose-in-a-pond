@@ -1,0 +1,28 @@
+# Cross.toml — cross-compilation config for GIAP
+#
+# Usage (Jetson Orin Nano — ARM64 Linux, no CUDA):
+#   cargo install cross --locked
+#   cross build -p pond-server --target aarch64-unknown-linux-gnu --release
+#
+# For local-inference (GGUF in-process) on Jetson, compile natively on the device:
+#   cargo build -p pond-server --features local-inference --release
+#   # Add --features pond-adapters-local-inference/cuda for GPU acceleration
+
+[build.env]
+passthrough = ["SQLX_OFFLINE", "RUST_LOG"]
+
+[target.aarch64-unknown-linux-gnu]
+xargo = false
+pre-build = [
+    # Add ARM64 architecture for cross-arch apt packages
+    "dpkg --add-architecture arm64",
+    """
+    apt-get update --fix-missing && apt-get install -y \
+      pkg-config \
+      gcc-aarch64-linux-gnu \
+      g++-aarch64-linux-gnu \
+      libssl-dev:arm64 \
+      libasound2-dev:arm64 \
+      libdbus-1-dev:arm64
+    """,
+]

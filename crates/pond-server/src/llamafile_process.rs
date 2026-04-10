@@ -14,8 +14,6 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Child;
 
-use crate::model_download;
-
 // ── Guard ─────────────────────────────────────────────────────────────────────
 
 /// Holds the spawned llamafile child process.  Kills it on drop.
@@ -44,13 +42,18 @@ pub async fn is_running(port: u16) -> bool {
 
 /// Find the first downloaded llamafile model in `<data_dir>/models/llm/`.
 ///
-/// Searches in `LLAMAFILE_MODELS` order (lightest first).
+/// Scans the directory for any `.llamafile` (or `.llamafile.exe` on Windows) file.
 pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
-    for info in model_download::LLAMAFILE_MODELS {
-        if let Ok(path) = model_download::llamafile_path(data_dir, info.name) {
-            if path.exists() {
-                return Some(path);
-            }
+    let llm_dir = data_dir.join("models").join("llm");
+    let entries = std::fs::read_dir(&llm_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_llamafile = name.ends_with(".llamafile")
+            || name.ends_with(".llamafile.exe");
+        if is_llamafile {
+            return Some(path);
         }
     }
     None
@@ -99,17 +102,111 @@ async fn spawn(binary: &Path, port: u16) -> Result<LlamafileProcess> {
 
 // ── High-level entry point ────────────────────────────────────────────────────
 
+/// Base URL for llamafile given a port.
+pub fn url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{}", port)
+}
+
 /// Check → find → spawn.  Never returns an error — failures are printed as warnings.
 ///
-/// Returns `Some(guard)` if we started the process, `None` if it was already
-/// running or no model was found.
-pub async fn try_start(data_dir: &Path, port: u16) -> Option<LlamafileProcess> {
-    if is_running(port).await {
-        println!("  🧠 LLM already running at http://127.0.0.1:{}", port);
+/// The base port is [`crate::ports::LLAMAFILE`].  If busy, the next port in
+/// arithmetic sequence is tried automatically.
+///
+/// When `model_name` is provided, uses `ModelService::ensure_downloaded()` to
+/// autonomously download the model if it's not yet on disk.  Falls back to
+/// `find_model()` to locate any previously-downloaded model.
+///
+/// Returns `Some((guard, port))` with the actual port the process was started
+/// on, or `None` if already running (port = base) or no model was found.
+pub async fn try_start(
+    data_dir: &Path,
+    model_service: std::sync::Arc<pond_core::services::model_service::ModelService>,
+    model_name: Option<&str>,
+) -> Option<(LlamafileProcess, u16)> {
+    let base_port = crate::ports::LLAMAFILE;
+
+    if is_running(base_port).await {
+        println!("  🧠 LLM already running at {}", url_for(base_port));
         return None;
     }
 
-    let model = match find_model(data_dir) {
+    let port = match crate::ports::find_free_port(base_port).await {
+        Some(p) => p,
+        None => {
+            println!(
+                "  ⚠  No free port found near {} for llamafile",
+                base_port
+            );
+            return None;
+        }
+    };
+
+    // Try autonomous download via ModelService.
+    // When the name is empty/None, try to resolve from the assigned chat role
+    // or the first available llamafile model in the catalog.
+    let preferred_model = {
+        use pond_core::domain::model_record::ModelCategory;
+
+        let resolved_name: Option<String> = match model_name {
+            Some(name) if !name.is_empty() => Some(name.to_string()),
+            _ => {
+                // Try role assignment first
+                if let Ok(Some(record)) = model_service.model_for_role("chat").await {
+                    if record.category == ModelCategory::Llamafile {
+                        Some(record.name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    // Fall back to first available llamafile from catalog (blocking is fine at startup)
+                    None
+                })
+            }
+        };
+
+        // If we still don't have a name, try listing llamafile models from DB
+        let resolved_name = match resolved_name {
+            Some(n) => Some(n),
+            None => {
+                match model_service.list_by_category(&ModelCategory::Llamafile).await {
+                    Ok(models) => {
+                        // Prefer a downloaded model; otherwise take the first one
+                        let downloaded = models.iter().find(|m| m.downloaded);
+                        let first = downloaded.or(models.first());
+                        first.map(|m| m.name.clone())
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+
+        if let Some(ref name) = resolved_name {
+            let model_id = format!("llamafile/{}", name);
+            match model_service.ensure_downloaded(&model_id).await {
+                Ok(path) => {
+                    println!("  ✅ Model '{}' is ready", name);
+                    Some(path)
+                }
+                Err(e) => {
+                    println!("  ⚠  Could not ensure model '{}': {}", name, e);
+                    None
+                }
+            }
+        } else {
+            println!("  ⚠  No llamafile model configured or found in catalog");
+            None
+        }
+    };
+
+    // Prefer the downloaded model; fall back to any model in the models/llm/ directory.
+    let model = preferred_model
+        .filter(|p| p.exists())
+        .or_else(|| find_model(data_dir));
+
+    let model = match model {
         Some(p) => p,
         None => {
             println!("  ⚠  No LLM model found — run `pond-server setup` to download one.");
@@ -126,7 +223,7 @@ pub async fn try_start(data_dir: &Path, port: u16) -> Option<LlamafileProcess> {
     match spawn(&model, port).await {
         Ok(proc) => {
             println!("  ✅ LLM ready on port {}", port);
-            Some(proc)
+            Some((proc, port))
         }
         Err(e) => {
             println!("  ⚠  Failed to start llamafile: {}", e);

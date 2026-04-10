@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use goose::config::GooseMode;
 use goose::conversation::message::Message as GooseMessage;
 use goose::session::{Session as GooseSession, SessionManager, SessionType};
 use pond_core::domain::message::{ChatMessage, Role};
@@ -100,7 +101,7 @@ impl SessionStorage for GooseSessionAdapter {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let gs = self
             .manager
-            .create_session(working_dir, session_id, SessionType::User)
+            .create_session(working_dir, session_id, SessionType::User, GooseMode::default())
             .await
             .map_err(to_storage_err)?;
         Ok(goose_session_to_pond(&gs))
@@ -190,6 +191,16 @@ impl SessionStorage for GooseSessionAdapter {
         Ok(goose_sessions.iter().map(goose_session_to_pond).collect())
     }
 
+    async fn get_recent_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
+        let all = self.get_messages(session_id).await?;
+        let recent = all.into_iter().rev().take(limit).collect::<Vec<_>>().into_iter().rev().collect();
+        Ok(recent)
+    }
+
     async fn get_messages_paginated(
         &self,
         session_id: &str,
@@ -232,6 +243,7 @@ mod tests {
             message_count: 0,
             provider_name: None,
             model_config: None,
+            goose_mode: GooseMode::default(),
         };
 
         let pond = goose_session_to_pond(&gs);

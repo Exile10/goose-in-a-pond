@@ -1,20 +1,14 @@
 //! Qwen TTS adapter — implements [`VoiceOutput`] by calling a local
 //! OpenAI-compatible TTS HTTP server (`POST /v1/audio/speech`).
 //!
-//! Compatible with any server that speaks the OpenAI TTS API, including
-//! Qwen2.5-TTS, CosyVoice, and Kokoro served locally.
-//!
-//! # Quick start
-//!
-//! ```bash
-//! pip install qwen-tts
-//! qwen-tts serve --port 8181
-//! ```
+//! The server is the embedded `qwen_tts_serve.py` script in `pond-server`,
+//! which wraps the `qwen-tts` Python package (Qwen3-TTS).  The script is
+//! written to disk and spawned automatically via `qwen_tts_process::try_start`.
 //!
 //! The server accepts:
 //! ```json
 //! POST /v1/audio/speech
-//! {"model": "qwen2.5-tts", "input": "Hello world", "voice": "Chelsie"}
+//! {"model": "qwen3-tts", "input": "Hello world", "voice": "Vivian"}
 //! ```
 //! and returns raw WAV bytes.
 
@@ -24,10 +18,10 @@ use pond_core::ports::voice_output::VoiceOutput;
 
 /// Default server address for the Qwen TTS HTTP server.
 pub const DEFAULT_HOST: &str = "http://127.0.0.1:8181";
-/// Default voice name for Qwen2.5-TTS English.
-pub const DEFAULT_VOICE: &str = "Chelsie";
-/// Model identifier sent in the request body.
-pub const DEFAULT_MODEL: &str = "qwen2.5-tts";
+/// Default voice name for Qwen3-TTS CustomVoice.
+pub const DEFAULT_VOICE: &str = "Vivian";
+/// Model identifier sent in the request body (informational; server ignores it).
+pub const DEFAULT_MODEL: &str = "qwen3-tts";
 
 /// TTS adapter that calls a local OpenAI-compatible speech server.
 pub struct QwenTtsOutput {
@@ -50,7 +44,7 @@ impl QwenTtsOutput {
         }
     }
 
-    /// Override the TTS voice (e.g. "Chelsie", "alloy").
+    /// Override the TTS voice (e.g. "Vivian", "Chelsie").
     pub fn with_voice(mut self, voice: &str) -> Self {
         self.voice = voice.to_string();
         self
