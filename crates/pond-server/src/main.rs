@@ -18,13 +18,16 @@
 //!   8. Prompts for initial onboarding if not yet done
 
 mod filesystem_model_storage;
-mod http_model_catalog_provider;
+mod composite_model_catalog_provider;
+mod http_model_downloader;
 mod llamafile_process;
 mod model_download;
 mod piper_http;
 mod piper_process;
 mod ports;
 mod qwen_tts_process;
+mod reqwest_model_downloader;
+mod startup;
 mod system_deps;
 mod whisper_process;
 
@@ -425,8 +428,8 @@ async fn run_setup(model: &str) -> Result<()> {
     let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
     let setup_settings = SqliteSettingsRepository::new(db_setup.system.clone())
         .get().await.unwrap_or_default();
-    println!("  📋 Fetching model catalog from {}...", setup_settings.model_registry_url);
-    seed_model_catalog(&setup_model_repo, &setup_settings.model_registry_url, &data_dir).await;
+    println!("  📋 Fetching model catalog from upstream sources...");
+    seed_model_catalog(&setup_model_repo, &data_dir).await;
 
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
@@ -724,36 +727,63 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         }
     };
 
-    // LLM — only download + start llamafile when at least one role is configured to use it.
+    // ── Persistent model catalog & ModelService ────────────────────────────────
+    let model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
+        SqliteModelRepository::new(db.system.clone())
+    );
+    let model_service = Arc::new(pond_core::services::model_service::ModelService::new(
+        model_repo.clone(),
+        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+            reqwest::Client::builder()
+                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_default()
+        )),
+        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
+    ));
+
+    // Seed catalog from upstream sources (idempotent, safe to call every startup)
+    if let Err(e) = model_service.seed_catalog().await {
+        tracing::warn!("Failed to seed model catalog: {e}. Starting with existing DB records.");
+    }
+    // Correct any stale downloaded flags (files added/removed outside of GIAP)
+    if let Ok(n) = model_service.sync_disk_flags().await {
+        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+    }
+    sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
+
+    // Autonomous background download: any model assigned to a role but missing from disk.
+    // Runs as a detached task so the HTTP server is available immediately.
+    {
+        use crate::filesystem_model_storage::FilesystemModelStorage;
+        use crate::reqwest_model_downloader::ReqwestModelDownloader;
+        use crate::startup::auto_download_assigned_models;
+
+        let dl_repo:       Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync> =
+            model_repo.clone();
+        let dl_storage:    Arc<dyn pond_core::ports::model_storage::ModelStorage + Send + Sync> =
+            Arc::new(FilesystemModelStorage::new(&data_dir));
+        let dl_downloader: Arc<dyn pond_core::ports::model_downloader::ModelDownloader + Send + Sync> =
+            Arc::new(ReqwestModelDownloader);
+
+        tokio::spawn(async move {
+            let n = auto_download_assigned_models(dl_repo, dl_storage, dl_downloader).await;
+            if n > 0 {
+                tracing::info!("auto_download: triggered {n} download(s) for role-assigned models");
+            }
+        });
+    }
+
+    // LLM — only start llamafile when at least one role is configured to use it.
+    // ModelService handles downloading autonomously inside try_start.
     let any_role_needs_llamafile = settings.chat_provider == "llamafile"
         || settings.think_provider.as_deref() == Some("llamafile")
         || settings.task_provider.as_deref()  == Some("llamafile");
 
     let active_llm_name: String = settings.chat_model.clone();
     let (_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
-        // Resolve the on-disk path for the configured model from the catalog DB.
-        use pond_core::ports::model_storage::ModelStorage as _;
-        let fs_storage = crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir);
-        let llm_record = SqliteModelRepository::new(db.system.clone())
-            .get_by_id(&format!("llamafile/{}", active_llm_name)).await.ok().flatten();
-        let configured_llm_path = llm_record.as_ref().and_then(|r| fs_storage.path_for(r));
-        if configured_llm_path.as_ref().map_or(true, |p| !p.exists()) {
-            println!("  📥 LLM model not found — downloading {}...", active_llm_name);
-            if let Some(ref record) = llm_record {
-                if let (Some(url), Some(path)) = (record.url.as_deref(), configured_llm_path.as_ref()) {
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    match model_download::download_file(url, path, record.size_mb).await {
-                        Ok(_)  => {}
-                        Err(e) => println!("  ⚠  LLM download failed: {}", e),
-                    }
-                }
-            } else {
-                println!("  ⚠  LLM model '{}' not in catalog — cannot download", active_llm_name);
-            }
-        }
-        match llamafile_process::try_start(&data_dir, configured_llm_path.as_deref()).await {
+        match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name)).await {
             Some((proc, port)) => (Some(proc), port),
             None => (None, ports::LLAMAFILE),
         }
@@ -764,13 +794,6 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     println!("  ────────────────────────────────────────────────────\n");
-
-    // ── Persistent model catalog ─────────────────────────────────────────────
-    let model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
-        SqliteModelRepository::new(db.system.clone())
-    );
-    seed_model_catalog(&*model_repo, &settings.model_registry_url, &data_dir).await;
-    sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
@@ -1046,7 +1069,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port,
         model_catalog_provider: Some(Arc::new(
-            crate::http_model_catalog_provider::HttpModelCatalogProvider::new()
+            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .unwrap_or_default()
+            )
         )),
         model_storage_dir: Some(data_dir.clone()),
         prompt_template_repo: Some(prompt_template_repo),
@@ -1177,36 +1205,35 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     let whisper_url = whisper_process::url_for(whisper_port);
 
+    // ── Model catalog & ModelService (for autonomous downloading) ──────────────
+    let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
+        SqliteModelRepository::new(db.system.clone())
+    );
+    let chat_model_service = Arc::new(pond_core::services::model_service::ModelService::new(
+        chat_model_repo.clone(),
+        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+            reqwest::Client::builder()
+                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_default()
+        )),
+        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
+    ));
+
+    // Seed catalog so model records exist for resolution
+    if let Err(e) = chat_model_service.seed_catalog().await {
+        tracing::warn!("Failed to seed model catalog: {e}");
+    }
+    if let Ok(n) = chat_model_service.sync_disk_flags().await {
+        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+    }
+
     // Auto-start llamafile only when the provider is explicitly "llamafile".
     // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
     let mut llamafile_port = ports::LLAMAFILE;
     let _llamafile_guard = if effective_provider == "llamafile" {
-        // Resolve path from the catalog DB; fall back to treating effective_model as a direct path.
-        use pond_core::ports::model_storage::ModelStorage as _;
-        let fs_storage_chat = crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir);
-        let llm_record_chat = SqliteModelRepository::new(db.system.clone())
-            .get_by_id(&format!("llamafile/{}", effective_model)).await.ok().flatten();
-        let configured_llm_path = llm_record_chat.as_ref().and_then(|r| fs_storage_chat.path_for(r));
-        if let Some(ref path) = configured_llm_path {
-            if !path.exists() {
-                println!("  📥 LLM model not found — downloading {}...", effective_model);
-                if let Some(ref record) = llm_record_chat {
-                    if let Some(url) = record.url.as_deref() {
-                        if let Some(parent) = path.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
-                        }
-                        match model_download::download_file(url, path, record.size_mb).await {
-                            Ok(_)  => {}
-                            Err(e) => println!("  ⚠  LLM download failed: {}", e),
-                        }
-                    }
-                }
-            }
-        } else {
-            // Model name not in the catalog — treat effective_model as a direct file path.
-            println!("  ℹ  Model '{}' not in catalog — using as direct path", effective_model);
-        }
-        match llamafile_process::try_start(&data_dir, configured_llm_path.as_deref()).await {
+        match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model)).await {
             Some((proc, port)) => { llamafile_port = port; Some(proc) }
             None => None,
         }
@@ -1298,19 +1325,45 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             #[cfg(feature = "local-inference")]
             {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-                let model_id = effective_model;
-                println!("  Model:    {} (local GGUF in-process)", model_id);
-                let llm = Arc::new(LocalInferenceLlmAdapter::new(model_id).await?);
+                // Resolve catalog name → HF model ID ("owner/repo:quantization").
+                // effective_model is a catalog name like "gemma-4-E4B-it-Q4_K_S".
+                // new_with_data_dir registers the local GGUF path in Goose's model
+                // registry so LocalInferenceProvider can find the already-downloaded file.
+                // hf_id is already stored as "owner/repo:quantization" (e.g.
+                // "google/gemma-4-E4B-it-GGUF:Q4_K_S") — use it directly.
+                let hf_model_id = chat_model_repo
+                    .get_by_id(&format!("gguf/{}", effective_model))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.hf_id)
+                    .unwrap_or_else(|| effective_model.to_string());
+                println!("  Model:    {} (local GGUF in-process)", hf_model_id);
+                let llm = Arc::new(
+                    LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?
+                );
                 chat_service = chat_service.with_provider(llm);
             }
             #[cfg(not(feature = "local-inference"))]
             {
                 eprintln!(
-                    "  ERROR: --provider local requires the `local-inference` feature.\n\
-                     Rebuild with:\n  \
+                    "  WARN: --provider local requires the `local-inference` feature (not compiled in).\n\
+                     Falling back to llamafile. Rebuild with:\n  \
                      cargo run -p pond-server --features local-inference -- chat --provider local"
                 );
-                std::process::exit(1);
+                println!(
+                    "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
+                    effective_model,
+                    llamafile_url,
+                    settings.llm_max_tokens,
+                    settings.llm_temperature,
+                );
+                let llm = Arc::new(
+                    LlamafileProvider::new(Some(&llamafile_url))
+                        .with_max_tokens(settings.llm_max_tokens)
+                        .with_temperature(settings.llm_temperature),
+                );
+                chat_service = chat_service.with_provider(llm);
             }
         }
         _ => {
@@ -1565,6 +1618,11 @@ async fn run_status() -> Result<()> {
 }
 
 fn default_data_dir() -> std::path::PathBuf {
+    // `POND_DATA_DIR` lets tests (and power users) redirect all DB and model
+    // storage to an arbitrary directory without touching the real data store.
+    if let Ok(dir) = std::env::var("POND_DATA_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
     dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond")
@@ -1890,32 +1948,36 @@ async fn build_goose_backend(
 
 // ── Model catalog helpers ─────────────────────────────────────────────────────
 
-/// Seed the persistent model catalog from the online registry URL.
+/// Seed the persistent model catalog from upstream sources (static list + local Ollama).
 ///
-/// Fetches the catalog JSON, upserts all returned records (preserving `is_custom`
-/// rows), and sets `downloaded` by checking the filesystem.  A failure to fetch
-/// is non-fatal — the server starts with whatever models are already in the DB.
+/// Upserts all returned records (preserving `is_custom` rows) and sets `downloaded`
+/// by checking the filesystem.  A failure to fetch is non-fatal — the server starts
+/// with whatever models are already in the DB.
 async fn seed_model_catalog(
     repo: &dyn ModelRepository,
-    registry_url: &str,
     data_dir: &std::path::Path,
 ) {
-    use crate::http_model_catalog_provider::HttpModelCatalogProvider;
+    use crate::composite_model_catalog_provider::CompositeModelCatalogProvider;
     use crate::filesystem_model_storage::FilesystemModelStorage;
     use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
     use pond_core::ports::model_storage::ModelStorage;
 
-    let provider = HttpModelCatalogProvider::new();
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default();
+    let provider = CompositeModelCatalogProvider::new(client);
     let storage  = FilesystemModelStorage::new(data_dir);
 
-    let (models, _binaries) = match provider.fetch(registry_url).await {
+    let (models, _binaries) = match provider.fetch().await {
         Ok(result) => result,
         Err(e) => {
-            tracing::warn!("Failed to fetch model catalog from {registry_url}: {e}. Starting with existing DB records.");
+            tracing::warn!("Failed to fetch model catalog: {e}. Starting with existing DB records.");
             return;
         }
     };
 
+    let count = models.len();
     for mut record in models {
         record.downloaded = storage.is_present(&record);
         if let Err(e) = repo.upsert(&record).await {
@@ -1923,7 +1985,7 @@ async fn seed_model_catalog(
         }
     }
 
-    tracing::info!("model catalog seeded from {}", registry_url);
+    tracing::info!("model catalog seeded ({count} records)");
 }
 
 /// Sync role assignments from the join table to the settings KV hot-cache.
@@ -2571,4 +2633,150 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── category_to_provider ──────────────────────────────────────────────────
+
+    #[test]
+    fn ollama_category_maps_to_ollama_provider() {
+        assert_eq!(category_to_provider("ollama"), "ollama");
+    }
+
+    #[test]
+    fn gguf_category_maps_to_local_provider() {
+        assert_eq!(category_to_provider("gguf"), "local");
+    }
+
+    #[test]
+    fn llamafile_category_maps_to_llamafile_provider() {
+        assert_eq!(category_to_provider("llamafile"), "llamafile");
+    }
+
+    #[test]
+    fn unknown_category_defaults_to_llamafile() {
+        assert_eq!(category_to_provider("tts_piper"), "llamafile");
+        assert_eq!(category_to_provider("whisper"),   "llamafile");
+        assert_eq!(category_to_provider("unknown"),   "llamafile");
+    }
+
+    // ── sync_assignments_to_settings ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sync_ollama_chat_assignment_updates_settings() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id:               "ollama/llama3.2".to_string(),
+            category:         ModelCategory::Ollama,
+            name:             "llama3.2".to_string(),
+            filename:         None,
+            description:      "Ollama Llama 3.2".to_string(),
+            size_mb:          0,
+            url:              None,
+            hf_id:            None, ram_estimate_mb: None, recommended_role: None,
+            context_length:   None, quantization: None, asr_language: None,
+            asr_size:         None, tts_engine: None, tts_voice_name: None,
+            config_filename:  None, config_url: None, tts_url: None,
+            sample_rate:      None, downloaded: true, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("chat", "ollama/llama3.2").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "ollama");
+        assert_eq!(settings.chat_model,    "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn sync_gguf_chat_assignment_sets_local_provider() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id:               "gguf/llama-3b".to_string(),
+            category:         ModelCategory::Gguf,
+            name:             "llama-3b".to_string(),
+            filename:         Some("llama-3b.gguf".to_string()),
+            description:      "GGUF Llama 3B".to_string(),
+            size_mb:          2000,
+            url:              Some("https://example.com/llama-3b.gguf".to_string()),
+            hf_id:            None, ram_estimate_mb: Some(3000), recommended_role: None,
+            context_length:   None, quantization: Some("Q4_K_M".to_string()),
+            asr_language:     None, asr_size: None, tts_engine: None, tts_voice_name: None,
+            config_filename:  None, config_url: None, tts_url: None,
+            sample_rate:      None, downloaded: false, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("chat", "gguf/llama-3b").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "local",    "gguf category should map to 'local' provider");
+        assert_eq!(settings.chat_model,    "llama-3b", "model name should be extracted from id");
+    }
+
+    #[tokio::test]
+    async fn sync_think_and_task_roles_are_also_synced() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id: "ollama/gemma2".to_string(), category: ModelCategory::Ollama,
+            name: "gemma2".to_string(), filename: None,
+            description: String::new(), size_mb: 0, url: None,
+            hf_id: None, ram_estimate_mb: None, recommended_role: None,
+            context_length: None, quantization: None, asr_language: None,
+            asr_size: None, tts_engine: None, tts_voice_name: None,
+            config_filename: None, config_url: None, tts_url: None,
+            sample_rate: None, downloaded: true, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("think", "ollama/gemma2").await.unwrap();
+        repo.set_assignment("task",  "ollama/gemma2").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.think_provider.as_deref(), Some("ollama"));
+        assert_eq!(settings.think_model.as_deref(),    Some("gemma2"));
+        assert_eq!(settings.task_provider.as_deref(),  Some("ollama"));
+        assert_eq!(settings.task_model.as_deref(),     Some("gemma2"));
+    }
 }

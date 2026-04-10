@@ -160,7 +160,6 @@ export interface Settings {
   active_tts_model: string
   voice_tts_http_url: string
   voice_tts_http_voice: string
-  model_registry_url: string
   weather_enabled: boolean
   weather_latitude: number
   weather_longitude: number
