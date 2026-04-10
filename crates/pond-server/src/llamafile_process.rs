@@ -112,13 +112,17 @@ pub fn url_for(port: u16) -> String {
 /// The base port is [`crate::ports::LLAMAFILE`].  If busy, the next port in
 /// arithmetic sequence is tried automatically.
 ///
-/// `preferred_model` is the on-disk path for the model configured in Settings.
-/// If it exists it is started directly; otherwise `find_model` is used as a
-/// fallback so a previously-downloaded model is still used rather than nothing.
+/// When `model_name` is provided, uses `ModelService::ensure_downloaded()` to
+/// autonomously download the model if it's not yet on disk.  Falls back to
+/// `find_model()` to locate any previously-downloaded model.
 ///
 /// Returns `Some((guard, port))` with the actual port the process was started
 /// on, or `None` if already running (port = base) or no model was found.
-pub async fn try_start(data_dir: &Path, preferred_model: Option<&Path>) -> Option<(LlamafileProcess, u16)> {
+pub async fn try_start(
+    data_dir: &Path,
+    model_service: std::sync::Arc<pond_core::services::model_service::ModelService>,
+    model_name: Option<&str>,
+) -> Option<(LlamafileProcess, u16)> {
     let base_port = crate::ports::LLAMAFILE;
 
     if is_running(base_port).await {
@@ -137,10 +141,69 @@ pub async fn try_start(data_dir: &Path, preferred_model: Option<&Path>) -> Optio
         }
     };
 
-    // Prefer the configured model; fall back to any downloaded model.
+    // Try autonomous download via ModelService.
+    // When the name is empty/None, try to resolve from the assigned chat role
+    // or the first available llamafile model in the catalog.
+    let preferred_model = {
+        use pond_core::domain::model_record::ModelCategory;
+
+        let resolved_name: Option<String> = match model_name {
+            Some(name) if !name.is_empty() => Some(name.to_string()),
+            _ => {
+                // Try role assignment first
+                if let Ok(Some(record)) = model_service.model_for_role("chat").await {
+                    if record.category == ModelCategory::Llamafile {
+                        Some(record.name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    // Fall back to first available llamafile from catalog (blocking is fine at startup)
+                    None
+                })
+            }
+        };
+
+        // If we still don't have a name, try listing llamafile models from DB
+        let resolved_name = match resolved_name {
+            Some(n) => Some(n),
+            None => {
+                match model_service.list_by_category(&ModelCategory::Llamafile).await {
+                    Ok(models) => {
+                        // Prefer a downloaded model; otherwise take the first one
+                        let downloaded = models.iter().find(|m| m.downloaded);
+                        let first = downloaded.or(models.first());
+                        first.map(|m| m.name.clone())
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+
+        if let Some(ref name) = resolved_name {
+            let model_id = format!("llamafile/{}", name);
+            match model_service.ensure_downloaded(&model_id).await {
+                Ok(path) => {
+                    println!("  ✅ Model '{}' is ready", name);
+                    Some(path)
+                }
+                Err(e) => {
+                    println!("  ⚠  Could not ensure model '{}': {}", name, e);
+                    None
+                }
+            }
+        } else {
+            println!("  ⚠  No llamafile model configured or found in catalog");
+            None
+        }
+    };
+
+    // Prefer the downloaded model; fall back to any model in the models/llm/ directory.
     let model = preferred_model
         .filter(|p| p.exists())
-        .map(|p| p.to_path_buf())
         .or_else(|| find_model(data_dir));
 
     let model = match model {

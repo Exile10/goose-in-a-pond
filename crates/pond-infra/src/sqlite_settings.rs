@@ -75,7 +75,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("active_tts_model",                &settings.active_tts_model);
         upsert!("voice_tts_http_url",              &settings.voice_tts_http_url);
         upsert!("voice_tts_http_voice",            &settings.voice_tts_http_voice);
-        upsert!("model_registry_url",              &settings.model_registry_url);
         upsert!("retention_event_log_days",        settings.retention_event_log_days.to_string());
         upsert!("retention_sensor_days",           settings.retention_sensor_days.to_string());
         upsert!("retention_session_messages_keep", settings.retention_session_messages_keep.to_string());
@@ -158,7 +157,6 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "active_tts_model"                => s.active_tts_model = value.to_string(),
         "voice_tts_http_url"              => s.voice_tts_http_url = value.to_string(),
         "voice_tts_http_voice"            => s.voice_tts_http_voice = value.to_string(),
-        "model_registry_url"              => s.model_registry_url = value.to_string(),
         "retention_event_log_days"        => {
             if let Ok(v) = value.parse() { s.retention_event_log_days = v; }
         }
