@@ -17,12 +17,17 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
+mod filesystem_model_storage;
+mod composite_model_catalog_provider;
+mod http_model_downloader;
 mod llamafile_process;
 mod model_download;
-mod model_registry;
 mod piper_http;
 mod piper_process;
+mod ports;
 mod qwen_tts_process;
+mod reqwest_model_downloader;
+mod startup;
 mod system_deps;
 mod whisper_process;
 
@@ -42,21 +47,32 @@ use pond_api::AppState;
 use pond_core::ports::agent::Agent;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
+use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
-use pond_core::services::fallback_provider::FallbackProvider;
+use pond_core::services::model_router::ModelRouter;
 use pond_core::services::fallback_voice_output::FallbackVoiceOutput;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
+use pond_infra_scheduler::{CronSchedulerAdapter, WebhookTaskExecutor};
+use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
+use pond_infra::sqlite_model_repository::SqliteModelRepository;
+use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
+use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
+use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
+use pond_infra::sqlite_skill::SqliteSkillRepository;
+use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+use pond_core::ports::model_repository::ModelRepository;
 use std::sync::Arc;
 use pond_core::services::onboarding::OnboardingService;
 use pond_core::domain::onboarding::OnboardingStep;
@@ -85,10 +101,6 @@ enum Commands {
 
     /// Start the HTTP server (REST API + web dashboard)
     Serve {
-        /// Port to listen on (default: 4000)
-        #[arg(short, long, default_value = "4000")]
-        port: u16,
-
         /// Path to the built web dashboard assets (run `cd web && npm run build` first)
         #[arg(long, default_value = "web/dist")]
         static_dir: std::path::PathBuf,
@@ -100,13 +112,19 @@ enum Commands {
         /// Enable debug logging
         #[arg(long)]
         debug: bool,
+
+        /// Agent backend: goose (default, Block's Goose with MCP tool calls) or mock (fast, no LLM).
+        /// Override: cargo run -p pond-server -- serve --agent mock
+        #[arg(long, default_value = "goose")]
+        agent: String,
     },
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
     Chat {
-        /// LLM provider: mock, llamafile, or ollama
-        #[arg(short = 'P', long, default_value = "mock")]
-        provider: String,
+        /// LLM provider: mock, llamafile, ollama, or local (GGUF in-process, requires --features local-inference).
+        /// Defaults to the value stored in Settings (llm_provider field).
+        #[arg(short = 'P', long)]
+        provider: Option<String>,
 
         /// Model name (only used when --provider ollama, e.g. "llama3.2", "gemma2")
         #[arg(short = 'M', long)]
@@ -116,22 +134,20 @@ enum Commands {
         #[arg(short = 'I', long, default_value = "stdin")]
         input: String,
 
-        /// URL of the running whisper.cpp server (only used when --input whisper)
-        #[arg(long)]
-        whisper_url: Option<String>,
-
         /// Enable voice-based wake word detection (requires --input whisper).
         /// Say the trigger phrase to activate the assistant before each turn.
-        #[arg(long, default_value = "goose")]
+        /// Defaults to the wake word stored in Settings.
+        #[arg(long)]
         wake_word: Option<String>,
 
         /// Disable wake word detection (jump straight to listen on each turn).
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: qwen (default), piper, or none (print only)
-        #[arg(long, default_value = "qwen")]
-        tts: String,
+        /// Text-to-speech engine: qwen, piper, or none (print only).
+        /// Defaults to the active TTS model stored in Settings.
+        #[arg(long)]
+        tts: Option<String>,
 
         /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
         #[arg(long)]
@@ -147,8 +163,171 @@ enum Commands {
         #[arg(long)]
         reset: bool,
     },
+
+    /// Browse and manage AI models
+    Models {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+
+    /// One-shot agent chat via the Goose agentic loop (no voice I/O)
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Manage system prompt templates (DB-stored, editable at runtime)
+    Prompts {
+        #[command(subcommand)]
+        action: PromptAction,
+    },
+
+    /// Manage user skills injected into the agent system prompt
+    Skills {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
+    /// Manage agent recipes (Goose YAML automations stored in DB)
+    Recipes {
+        #[command(subcommand)]
+        action: RecipeAction,
+    },
+
+    /// Manage persistent memory fragments
+    Memories {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
 }
 
+#[derive(Subcommand)]
+enum ModelAction {
+    /// List all models in the catalog (grouped by category)
+    List {
+        /// Filter by category: gguf | llamafile | whisper | tts | ollama
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Download a model to disk
+    Download { category: String, name: String },
+    /// Delete a model file from disk (catalog record kept)
+    Delete { category: String, name: String },
+    /// Assign a model to a role
+    Activate {
+        category: String,
+        name: String,
+        /// Role to assign: chat | think | task | asr | tts
+        #[arg(long)]
+        role: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Send a message through the Goose agent and print the response
+    Chat {
+        /// The message to send to the agent
+        message: String,
+        /// Session ID for conversation continuity across calls
+        #[arg(long, default_value = "cli-agent")]
+        session: String,
+    },
+    /// List MCP tool extensions currently known to the agent
+    Tools,
+    /// List all system prompt extras from the database
+    Extras,
+}
+
+#[derive(Subcommand)]
+enum PromptAction {
+    /// List all prompt templates (built-in and user-defined)
+    List,
+    /// Show the full content of a named template
+    Show {
+        /// Template name: balanced | concise | technical | warm | <custom>
+        name: String,
+    },
+    /// Re-seed a built-in template to its factory default (overwrites DB record)
+    Reset {
+        /// Built-in template name: balanced | concise | technical | warm
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// List skills (active only by default; use --all for inactive too)
+    List {
+        /// Include inactive skills in the output
+        #[arg(long)]
+        all: bool,
+    },
+    /// Add a new skill (reads content from --content or stdin)
+    Add {
+        /// Unique skill slug (e.g. "morning_brief", "light_control")
+        name: String,
+        /// Markdown instruction content. Omit to read from stdin.
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Toggle a skill's active state by UUID
+    Toggle {
+        /// Skill UUID (from `pond skills list --all`)
+        id: String,
+    },
+    /// Permanently delete a skill by UUID
+    Remove {
+        /// Skill UUID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipeAction {
+    /// List all recipes
+    List,
+    /// Show a recipe's YAML content
+    Show {
+        /// Recipe slug name
+        name: String,
+    },
+    /// Import a recipe from a local YAML file
+    Import {
+        /// Recipe slug (e.g. "morning_brief")
+        name: String,
+        /// Path to the Goose recipe YAML file
+        file: std::path::PathBuf,
+        /// Short one-sentence description
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Delete a recipe by slug name
+    Remove {
+        /// Recipe slug name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// List recent memory fragments (newest last)
+    List {
+        /// Maximum number of fragments to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Save a new memory fragment
+    Add {
+        /// The text content of the memory
+        content: String,
+    },
+    /// Delete a memory fragment by UUID
+    Remove {
+        /// Memory fragment UUID
+        id: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -158,13 +337,13 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { port, static_dir, open, debug }) => {
+        Some(Commands::Serve { static_dir, open, debug, agent }) => {
             init_tracing(debug);
-            run_server(port, static_dir, open, debug).await
+            run_server(static_dir, open, debug, &agent).await
         }
-        Some(Commands::Chat { provider, model, input, whisper_url, wake_word, no_wake_word, tts, tts_model }) => {
+        Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
-            run_chat(&provider, model.as_deref(), &input, whisper_url.as_deref(), wake_word.as_deref(), no_wake_word, &tts, tts_model).await
+            run_chat(provider.as_deref(), model.as_deref(), &input, wake_word.as_deref(), no_wake_word, tts.as_deref(), tts_model).await
         }
         Some(Commands::Status) => {
             run_status().await
@@ -175,10 +354,29 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        None => {
-            // Default: run interactive chat (backward compat)
+        Some(Commands::Models { action }) => {
+            run_models(action).await
+        }
+        Some(Commands::Agent { action }) => {
             init_tracing(false);
-            run_chat("mock", None, "stdin", None, None, true, "none", None).await
+            run_agent_cmd(action).await
+        }
+        Some(Commands::Prompts { action }) => {
+            run_prompts_cmd(action).await
+        }
+        Some(Commands::Skills { action }) => {
+            run_skills_cmd(action).await
+        }
+        Some(Commands::Recipes { action }) => {
+            run_recipes_cmd(action).await
+        }
+        Some(Commands::Memories { action }) => {
+            run_memories_cmd(action).await
+        }
+        None => {
+            // Default: run interactive chat (backward compat) — provider comes from Settings
+            init_tracing(false);
+            run_chat(None, None, "stdin", None, true, Some("none"), None).await
         }
     }
 }
@@ -209,14 +407,12 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("  ║   🦆  Goose In A Pond — Setup         ║");
     println!("  ╚═══════════════════════════════════════╝");
 
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("goose-in-a-pond");
+    let data_dir = default_data_dir();
 
     println!("\n  📂 Data directory: {}", data_dir.display());
 
     // Step 1: Check + auto-install system dependencies (Linux/macOS only)
-    println!("\n  [1/7] Checking system dependencies...");
+    println!("\n  [1/6] Checking system dependencies...");
     if system_deps::ensure_system_deps().await {
         println!("  ✅ System dependencies OK");
     } else {
@@ -224,147 +420,277 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("     Continuing setup; some features may not work until deps are installed.");
     }
 
-    // Step 2: Initialize databases
-    println!("\n  [2/7] Initializing databases...");
-    Database::init(&data_dir).await?;
+    // Step 2: Initialize databases + seed model catalog
+    println!("\n  [2/6] Initializing databases...");
+    let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
-    // Step 3: Download Whisper ASR model
-    let effective_model = if model.is_empty() {
-        model_download::DEFAULT_WHISPER_MODEL
-    } else {
-        model
+    let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
+    let setup_settings = SqliteSettingsRepository::new(db_setup.system.clone())
+        .get().await.unwrap_or_default();
+    println!("  📋 Fetching model catalog from upstream sources...");
+    seed_model_catalog(&setup_model_repo, &data_dir).await;
+
+    // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+
+        let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, complete behaviour rules. Default for most households."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users who want brevity."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = template_repo.insert_if_absent(&t).await {
+                println!("  ⚠  Failed to seed prompt template '{name}': {e}");
+            }
+        }
+        println!("  ✅ Prompt templates seeded");
+    }
+
+    // Step 3: Download Whisper ASR model from catalog URL
+    let effective_model = if model.is_empty() { "base" } else { model };
+    let (expected_path, whisper_dl_url, whisper_dl_mb) = {
+        use crate::filesystem_model_storage::FilesystemModelStorage;
+        use pond_core::ports::model_storage::ModelStorage as _;
+        let storage = FilesystemModelStorage::new(&data_dir);
+        let model_id = format!("whisper/{}", effective_model);
+        match setup_model_repo.get_by_id(&model_id).await.ok().flatten() {
+            Some(r) => {
+                let path = storage.path_for(&r)
+                    .unwrap_or_else(|| data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model)));
+                (path, r.url.unwrap_or_default(), r.size_mb)
+            }
+            None => {
+                let path = data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model));
+                (path, String::new(), 0u64)
+            }
+        }
     };
-    let expected_path = model_download::model_path(&data_dir, effective_model)?;
-    println!("\n  [3/7] Downloading Whisper ASR model ({})...", effective_model);
+    println!("\n  [3/6] Downloading Whisper ASR model ({})...", effective_model);
     println!("  📁 Target: {}", expected_path.display());
-    let _model_path = model_download::download_whisper_model(effective_model, &data_dir).await?;
+    if expected_path.exists() {
+        println!("  ✅ Already downloaded: {}", expected_path.display());
+    } else if !whisper_dl_url.is_empty() {
+        if let Some(parent) = expected_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        model_download::download_file(&whisper_dl_url, &expected_path, whisper_dl_mb).await?;
+    } else {
+        println!("  ⚠  Model '{}' not found in catalog — skipping download", effective_model);
+    }
 
     // Step 4: Download whisper-server binary
-    println!("\n  [4/7] Downloading whisper-server binary...");
+    println!("\n  [4/6] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
     // Step 5: TTS — try Qwen first; if it fails, ensure Piper is fully set up.
-    println!("\n  [5/7] Setting up TTS...");
+    println!("\n  [5/6] Setting up TTS...");
     let qwen_ok = qwen_tts_process::setup_install(&data_dir).await;
 
-    // Step 6: Piper TTS — always set up (primary when Qwen unavailable, fallback otherwise)
-    println!("\n  [6/7] Setting up Piper TTS{}...",
+    // Step 6: Piper TTS binary — voice model is selected via the web Settings page
+    println!("\n  [6/6] Setting up Piper TTS binary{}...",
         if qwen_ok { " (fallback)" } else { " (primary — Qwen unavailable)" });
     let piper_bin_ok = model_download::download_piper_binary(&data_dir).await.is_ok();
-    let piper_model_ok = model_download::download_piper_model(&data_dir).await.is_ok();
-    if !qwen_ok && (!piper_bin_ok || !piper_model_ok) {
-        println!("  ⚠  Both Qwen TTS and Piper failed — voice output will be text-only.");
-    }
-
-    // Step 7: Download default LLM (Gemma 2 2B via llamafile)
-    println!(
-        "\n  [7/7] Downloading LLM model ({})...",
-        model_download::DEFAULT_LLAMAFILE_MODEL
-    );
-    match model_download::download_llamafile_model(
-        model_download::DEFAULT_LLAMAFILE_MODEL,
-        &data_dir,
-    )
-    .await
-    {
-        Ok(p) => println!("  ✅ LLM model ready: {}", p.display()),
-        Err(e) => println!("  ⚠  Could not download LLM model: {}", e),
+    if !qwen_ok && !piper_bin_ok {
+        println!("  ⚠  Both Qwen TTS and Piper binary unavailable — voice output will be text-only.");
+        println!("     Install piper manually or retry setup.");
+    } else if piper_bin_ok {
+        println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
     println!();
-    println!("  Run the server (all AI components start automatically):");
+    println!("  1. Run the server:");
     println!("       pond-server serve");
     println!();
-    println!("  Or run interactive CLI chat with voice + TTS:");
-    println!("       pond-server chat --provider llamafile --input whisper --tts piper");
+    println!("  2. Open the web UI and go to Models to download an LLM.");
+    println!("     Then go to Settings to configure voice, TTS voice model,");
+    println!("     and assign model roles (chat / think / task).");
+    println!();
+    println!("  Or run interactive CLI chat (configure voice + TTS via Settings first):");
+    println!("       pond-server chat --input whisper");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
 }
 
-async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug: bool) -> Result<()> {
+async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
 
     // Initialize databases
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("goose-in-a-pond");
+    let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
     // Soft system-dep check (non-fatal — just warn if something looks wrong)
     system_deps::warn_if_missing();
 
-    // ── Load registry + settings early (drives model selection) ─────────────
-    let registry = model_registry::ModelRegistry::load_cached(&data_dir);
+    // ── Load settings early (drives model selection) ─────────────────────────
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
 
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
-    // STT — whisper.cpp binary + model (use active_whisper_model from settings)
-    let active_whisper = registry
-        .find_whisper(&settings.active_whisper_model)
-        .unwrap_or_else(|| registry.whisper.first().expect("registry has no whisper models"));
-    let whisper_model = data_dir.join("models").join(&active_whisper.filename);
-    if !whisper_model.exists() {
-        println!("  📥 STT model not found — downloading ({})...", active_whisper.name);
-        match model_download::download_whisper_model(&active_whisper.name, &data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  STT model download failed: {}", e),
+    // STT — whisper.cpp binary + model (only when active_whisper_model is configured)
+    // Guard is held for the server lifetime; port is used to build the URL below.
+    let (_whisper_guard, whisper_port) = if settings.active_whisper_model.is_empty() {
+        println!("  ⏭  STT: whisper skipped (no whisper model configured in Settings)");
+        (None, ports::WHISPER)
+    } else {
+        // Derive filename and download URL from the model catalog DB.
+        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("whisper/{}", settings.active_whisper_model)).await.ok().flatten()
+            .map(|r| (
+                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", &settings.active_whisper_model)),
+                r.url.unwrap_or_default(),
+                r.size_mb,
+            ))
+            .unwrap_or_else(|| (
+                format!("ggml-{}.en.bin", &settings.active_whisper_model),
+                String::new(),
+                0u64,
+            ));
+        let whisper_model = data_dir.join("models").join(&whisper_filename);
+        if !whisper_model.exists() {
+            println!("  📥 STT model not found — downloading ({})...", settings.active_whisper_model);
+            if !whisper_url.is_empty() {
+                if let Some(parent) = whisper_model.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
+                    Ok(_) => {}
+                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                }
+            } else {
+                println!("  ⚠  STT model '{}' not in catalog — cannot download", settings.active_whisper_model);
+            }
         }
-    }
-    if !model_download::whisper_binary_path(&data_dir).exists() {
-        println!("  📥 STT binary not found — downloading...");
-        match model_download::download_whisper_binary(&data_dir).await {
-            Ok(_) => {}
-            Err(e) => println!("  ⚠  STT binary download failed: {}", e),
+        if !model_download::whisper_binary_path(&data_dir).exists() {
+            println!("  📥 STT binary not found — downloading...");
+            match model_download::download_whisper_binary(&data_dir).await {
+                Ok(_) => {}
+                Err(e) => println!("  ⚠  STT binary download failed: {}", e),
+            }
         }
-    }
-    let _whisper_guard = whisper_process::try_start(&data_dir, &whisper_model, 9000).await;
+        whisper_process::try_start(&data_dir, &whisper_model).await
+    };
+    // When the user has set a custom whisper URL (not the default 127.0.0.1:9000),
+    // honour it — this lets users point at an external whisper server.
+    // Otherwise use the auto-started local process URL.
+    const DEFAULT_WHISPER_URL: &str = "http://127.0.0.1:9000";
+    let whisper_url = if !settings.voice_whisper_url.is_empty()
+        && settings.voice_whisper_url != DEFAULT_WHISPER_URL
+    {
+        settings.voice_whisper_url.clone()
+    } else {
+        whisper_process::url_for(whisper_port)
+    };
 
     // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
-    let _qwen_tts_guard = qwen_tts_process::try_start(&settings.voice_tts_http_url, &data_dir).await;
-    let qwen_tts_available = qwen_tts_process::is_running(&settings.voice_tts_http_url).await;
+    // try_start returns (process, confirmed_running). If it was already running before
+    // we called try_start (returns None), fall back to a live is_running check.
+    let (_qwen_tts_guard, qwen_tts_url, qwen_tts_available) =
+        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
+            Some((proc, port, confirmed)) => {
+                (Some(proc), qwen_tts_process::url_for(port), confirmed)
+            }
+            None => {
+                // Prefer settings URL if the user configured a custom Qwen TTS server.
+                const DEFAULT_QWEN_URL: &str = "http://127.0.0.1:8181";
+                let url = if !settings.voice_tts_http_url.is_empty()
+                    && settings.voice_tts_http_url != DEFAULT_QWEN_URL
+                {
+                    settings.voice_tts_http_url.clone()
+                } else {
+                    qwen_tts_process::url_for(ports::QWEN_TTS)
+                };
+                let running = qwen_tts_process::is_running(&url).await;
+                (None, url, running)
+            }
+        };
 
-    let piper_model = model_download::tts_models_dir(&data_dir)
-        .join(model_download::PIPER_MODEL_FILENAME);
+    // Piper voice path — None when no voice is configured (skips all piper startup).
+    // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
+    // do not fall back to a hardcoded default.
+    let piper_model: Option<std::path::PathBuf> = if settings.voice_tts_voice.is_empty() {
+        None
+    } else {
+        Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
+    };
 
-    // Ensure piper binary + model + espeak-ng-data are present.
-    if !model_download::piper_binary_path(&data_dir).exists() {
-        let _ = model_download::download_piper_binary(&data_dir).await;
+    // Only download/install piper components when piper is the configured active TTS
+    // AND a specific voice model has been chosen by the user.
+    let piper_is_primary = settings.active_tts_model.starts_with("piper");
+    if piper_is_primary {
+        if let Some(ref piper_model_path) = piper_model {
+            if !model_download::piper_binary_path(&data_dir).exists() {
+                println!("  📥 Piper binary not found — downloading...");
+                let _ = model_download::download_piper_binary(&data_dir).await;
+            }
+            if !piper_model_path.exists() {
+                // Look up the exact voice in the DB to get the correct download URL.
+                let voice_filename = &settings.voice_tts_voice;
+                let registry_entry = SqliteModelRepository::new(db.system.clone())
+                    .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.filename.as_deref() == Some(voice_filename.as_str()))
+                    .and_then(|m| {
+                        let mf = m.filename?;
+                        let cf = m.config_filename?;
+                        let mu = m.url?;
+                        let cu = m.config_url?;
+                        Some((mf, cf, mu, cu, m.size_mb))
+                    });
+                if let Some((mf, cf, mu, cu, sz)) = registry_entry {
+                    let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                } else {
+                    println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                }
+            }
+            model_download::ensure_espeak_ng_data(&data_dir).await;
+        } else {
+            println!("  ⏭  Piper: active_tts_model=piper but no voice model configured — configure one in Settings");
+        }
     }
-    if !piper_model.exists() {
-        let _ = model_download::download_piper_model(&data_dir).await;
-    }
-    // Always ensure espeak-ng-data is present (may be missing after source build).
-    model_download::ensure_espeak_ng_data(&data_dir).await;
 
     // Start piper as a persistent HTTP server so it shows up in the service list.
+    // Only starts when both the binary and a configured voice model are present on disk.
     let espeak_data = {
         let p = model_download::piper_espeak_data_path(&data_dir);
         if p.exists() { Some(p) } else { None }
     };
+    let mut piper_http_port: Option<u16> = None;
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
-        match piper_process::find_binary(&data_dir) {
-            Some(bin) if piper_model.exists() => {
+        match (piper_process::find_binary(&data_dir), &piper_model) {
+            (Some(bin), Some(model_path)) if model_path.exists() => {
                 let ed = espeak_data.clone();
-                match piper_http::start(bin.clone(), piper_model.clone(), ed, piper_http::DEFAULT_PORT).await {
+                match piper_http::start(bin.clone(), model_path.clone(), ed).await {
                     Ok(port) => {
                         println!("  ✅ Piper TTS running on port {}", port);
-                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        piper_http_port = Some(port);
+                        let mut out = PiperOutput::new(bin, model_path.clone());
                         if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
                         Some(Arc::new(out))
                     }
                     Err(e) => {
                         tracing::warn!("piper-http failed to start: {e}");
-                        let mut out = PiperOutput::new(bin, piper_model.clone());
+                        let mut out = PiperOutput::new(bin, model_path.clone());
                         if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
                         Some(Arc::new(out))
                     }
@@ -374,7 +700,7 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         };
     let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = if qwen_tts_available {
         let qwen_tts = Arc::new(
-            QwenTtsOutput::new(Some(&settings.voice_tts_http_url))
+            QwenTtsOutput::new(Some(&qwen_tts_url))
                 .with_voice(&settings.voice_tts_http_voice),
         );
         Some(match piper_tts {
@@ -401,31 +727,73 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         }
     };
 
-    // LLM — llamafile auto-download + auto-start (use active_llm_model from settings)
-    let active_llm = registry
-        .find_llamafile(&settings.active_llm_model)
-        .unwrap_or_else(|| registry.llamafile.first().expect("registry has no llamafile models"));
-    let llm_model_path = llamafile_process::find_model(&data_dir);
-    if llm_model_path.is_none() {
-        println!("  📥 LLM model not found — downloading {}...", active_llm.name);
-        match model_download::download_llamafile_model(&active_llm.name, &data_dir).await {
-            Ok(_)  => {}
-            Err(e) => println!("  ⚠  LLM download failed: {}", e),
-        }
+    // ── Persistent model catalog & ModelService ────────────────────────────────
+    let model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
+        SqliteModelRepository::new(db.system.clone())
+    );
+    let model_service = Arc::new(pond_core::services::model_service::ModelService::new(
+        model_repo.clone(),
+        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+            reqwest::Client::builder()
+                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_default()
+        )),
+        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
+    ));
+
+    // Seed catalog from upstream sources (idempotent, safe to call every startup)
+    if let Err(e) = model_service.seed_catalog().await {
+        tracing::warn!("Failed to seed model catalog: {e}. Starting with existing DB records.");
     }
-    let _llamafile_guard = llamafile_process::try_start(&data_dir, 8080).await;
+    // Correct any stale downloaded flags (files added/removed outside of GIAP)
+    if let Ok(n) = model_service.sync_disk_flags().await {
+        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+    }
+    sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
+
+    // Autonomous background download: any model assigned to a role but missing from disk.
+    // Runs as a detached task so the HTTP server is available immediately.
+    {
+        use crate::filesystem_model_storage::FilesystemModelStorage;
+        use crate::reqwest_model_downloader::ReqwestModelDownloader;
+        use crate::startup::auto_download_assigned_models;
+
+        let dl_repo:       Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync> =
+            model_repo.clone();
+        let dl_storage:    Arc<dyn pond_core::ports::model_storage::ModelStorage + Send + Sync> =
+            Arc::new(FilesystemModelStorage::new(&data_dir));
+        let dl_downloader: Arc<dyn pond_core::ports::model_downloader::ModelDownloader + Send + Sync> =
+            Arc::new(ReqwestModelDownloader);
+
+        tokio::spawn(async move {
+            let n = auto_download_assigned_models(dl_repo, dl_storage, dl_downloader).await;
+            if n > 0 {
+                tracing::info!("auto_download: triggered {n} download(s) for role-assigned models");
+            }
+        });
+    }
+
+    // LLM — only start llamafile when at least one role is configured to use it.
+    // ModelService handles downloading autonomously inside try_start.
+    let any_role_needs_llamafile = settings.chat_provider == "llamafile"
+        || settings.think_provider.as_deref() == Some("llamafile")
+        || settings.task_provider.as_deref()  == Some("llamafile");
+
+    let active_llm_name: String = settings.chat_model.clone();
+    let (_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
+        match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name)).await {
+            Some((proc, port)) => (Some(proc), port),
+            None => (None, ports::LLAMAFILE),
+        }
+    } else {
+        println!("  ⏭  LLM: llamafile skipped (provider = {})", settings.chat_provider);
+        (None, ports::LLAMAFILE)
+    };
+    let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     println!("  ────────────────────────────────────────────────────\n");
-
-    // Build model status snapshot for API
-    let model_status_entries = model_registry::build_model_status(
-        &registry,
-        &settings.active_whisper_model,
-        &settings.active_llm_model,
-        &settings.active_tts_model,
-        &data_dir,
-    );
-    let model_status = Arc::new(tokio::sync::RwLock::new(model_status_entries));
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
@@ -444,13 +812,76 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
-    let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
-    // Fallback chain: llamafile → ollama → (if both down, ChatService falls back to agent echo)
-    let llamafile = Arc::new(LlamafileProvider::new(None).with_max_tokens(1024));
-    let ollama = Arc::new(OllamaProvider::new(None, None).with_max_tokens(1024));
-    let llm_provider: Option<Arc<dyn LlmProvider>> = Some(
-        Arc::new(FallbackProvider::new(llamafile, ollama))
-    );
+    let prompt_template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let prompt_extra_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+        Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+
+    let effective_chat_provider = settings.chat_provider.clone();
+    let effective_chat_model    = settings.chat_model.clone();
+
+    // ── Build per-role LLM providers ────────────────────────────────────────
+    // Each role (Chat / Think / Task) may use a different provider + model.
+    // Token budget and temperature are baked in at startup.
+    //
+    // Helper: build one Arc<dyn LlmProvider> for a given (provider, model) pair.
+    let build_provider = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+        match provider {
+            "ollama" => Arc::new(
+                OllamaProvider::new(None, Some(model))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+            "local" => {
+                // Local GGUF inference is managed by GooseAdapter, which hot-swaps providers
+                // from settings on every turn. The server's llm_provider field is only used by
+                // legacy non-Goose API paths. Use llamafile as a stand-in — it won't be called
+                // during normal production operation when GooseAdapter is active.
+                tracing::info!(
+                    "chat_provider=local: GooseAdapter handles GGUF inference; \
+                     server llm_provider defaults to llamafile for non-Goose paths"
+                );
+                Arc::new(
+                    LlamafileProvider::new(Some(&llamafile_url))
+                        .with_max_tokens(settings.llm_max_tokens)
+                        .with_temperature(settings.llm_temperature),
+                ) as Arc<dyn LlmProvider>
+            }
+            _ => Arc::new(
+                // Default: llamafile (covers "llamafile" and unknown provider values)
+                LlamafileProvider::new(Some(&llamafile_url))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            ) as Arc<dyn LlmProvider>,
+        }
+    };
+
+    let chat_provider_arc = build_provider(&effective_chat_provider, &effective_chat_model);
+
+    // Think role: reuse chat Arc if not separately configured.
+    let think_provider_arc: Arc<dyn LlmProvider> =
+        if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
+            build_provider(tp, tm)
+        } else {
+            chat_provider_arc.clone()
+        };
+
+    // Task role: reuse chat Arc if not separately configured.
+    let task_provider_arc: Arc<dyn LlmProvider> =
+        if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
+            build_provider(tp, tm)
+        } else {
+            chat_provider_arc.clone()
+        };
+
+    let llm_provider = Arc::new(tokio::sync::RwLock::new(Some(
+        Arc::new(ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc))
+            as Arc<dyn LlmProvider>
+    )));
 
     let db = Arc::new(db);
 
@@ -473,15 +904,150 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         });
     }
 
+    // Weather — fed into GiapServiceHandles (MCP tool), not AppState.
+    // The LLM calls giap__get_current_weather when it needs weather data.
+    let weather: Option<Arc<dyn WeatherProvider>> = {
+        if settings.weather_enabled
+            && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+        {
+            let loc = if settings.weather_location_name.is_empty() {
+                format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+            } else {
+                settings.weather_location_name.clone()
+            };
+            tracing::info!(
+                "weather enabled: {} ({}, {})",
+                loc, settings.weather_latitude, settings.weather_longitude
+            );
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(
+                settings.weather_latitude,
+                settings.weather_longitude,
+                loc,
+            )))
+        } else {
+            tracing::info!("weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)");
+            None
+        }
+    };
+
+    // Scheduler — persist task list next to the databases
+    let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
+        let exec = Arc::new(WebhookTaskExecutor::new());
+        match CronSchedulerAdapter::new(data_dir.join("schedules.json"), exec).await {
+            Ok(s) => {
+                tracing::info!("scheduler ready ({})", data_dir.join("schedules.json").display());
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!("scheduler init failed: {e} — schedule endpoints will return 503");
+                None
+            }
+        }
+    };
+
+    // MCP Memory — enabled when --features mcp-memory is passed at build time.
+    #[cfg(feature = "mcp-memory")]
+    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = {
+        use pond_adapters_mcp_memory::GooseMcpMemoryAdapter;
+        let adapter = GooseMcpMemoryAdapter::new(data_dir.join("memory"));
+        tracing::info!("MCP memory enabled ({})", data_dir.join("memory").display());
+        Some(Arc::new(adapter))
+    };
+    #[cfg(not(feature = "mcp-memory"))]
+    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = None;
+
+    // ── Agent backend ────────────────────────────────────────────────────────────
+    #[cfg(feature = "goose-agent")]
+    let (agent, extension_manager) = build_goose_backend(
+        agent_backend,
+        &llamafile_url,
+        weather.clone(),
+        device_registry.clone(),
+        scheduler.clone(),
+        settings_repo.clone(),
+        memory_repo.clone(),
+        skill_repo.clone(),
+        recipe_repo.clone(),
+        prompt_template_repo.clone(),
+        prompt_extra_repo.clone(),
+    ).await;
+
+    #[cfg(not(feature = "goose-agent"))]
+    let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
+        if agent_backend == "goose" {
+            tracing::warn!(
+                "Goose agent backend requested but this binary was compiled without the `goose-agent` feature. \
+                 Rebuild with: cargo run -p pond-server -- serve  (goose-agent is a default feature). \
+                 Falling back to mock agent."
+            );
+        }
+        (Arc::new(MockAgent::new()), None)
+    };
+
+    // MCP client — load persisted server configs and auto-connect enabled ones.
+    let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
+        let repo = Arc::new(SqliteMcpServerRepository::new(db.system.clone()));
+        // Auto-connect saved external MCP servers if the extension manager is available.
+        if let Some(mgr) = &extension_manager {
+            match repo.list().await {
+                Ok(servers) => {
+                    for srv in servers.into_iter().filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled) {
+                        use pond_core::ports::extension_manager::AddExtensionRequest;
+                        let req = AddExtensionRequest {
+                            name:        srv.name.clone(),
+                            kind:        srv.kind.clone(),
+                            description: srv.description.clone(),
+                            command:     srv.command.clone(),
+                            args:        srv.args.clone(),
+                            env:         srv.env.clone(),
+                            uri:         srv.uri.clone(),
+                        };
+                        match mgr.add_extension(req).await {
+                            Ok(_) => tracing::info!("auto-connected MCP server '{}'", srv.name),
+                            Err(e) => tracing::warn!("failed to auto-connect MCP server '{}': {e}", srv.name),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("failed to load saved MCP servers: {e}"),
+            }
+        }
+        Some(repo)
+    };
+
+    // Memory-aware model scheduler — only meaningful for in-process GGUF inference.
+    // When the local-inference feature is compiled in, create a ResourceAwareModelScheduler
+    // and spawn a background pre-loader that warms the model slot on wake-word detection.
+    // For llamafile / Ollama those backends manage their own memory; use None there.
+    #[cfg(feature = "local-inference")]
+    let model_scheduler: Option<Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>> = {
+        use pond_adapters_local_inference::ResourceAwareModelScheduler;
+        let (sched, mut wake_rx) = ResourceAwareModelScheduler::new();
+        let sched_arc = Arc::new(sched);
+        tokio::spawn(async move {
+            while wake_rx.changed().await.is_ok() {
+                if *wake_rx.borrow() {
+                    // GooseAdapter's LocalInferenceProvider loads on first complete() call.
+                    // Future: trigger a no-op inference call here to warm the model slot
+                    // before the user finishes speaking.
+                    tracing::info!("model scheduler: wake word detected — model warm-up hint");
+                }
+            }
+        });
+        Some(sched_arc as Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>)
+    };
+    #[cfg(not(feature = "local-inference"))]
+    let model_scheduler: Option<Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>> = None;
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
         handshake: Arc::new(MockHandshake::new()),
-        whisper_url: "http://127.0.0.1:9000".to_string(),
+        whisper_url: whisper_url.clone(),
         session_storage,
         http_client: reqwest::Client::new(),
         agent,
         llm_provider,
+        llamafile_url: llamafile_url.clone(),
         tts,
         settings_repo,
         profile_repo,
@@ -491,8 +1057,30 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
-        model_status: Some(model_status),
+        model_repo: Some(model_repo),
         data_dir: Some(data_dir.clone()),
+        skip_onboarding: false,
+        scheduler,
+        model_scheduler,
+        mcp_memory,
+        extension_manager,
+        mcp_server_repo,
+        qwen_tts_url: if qwen_tts_available { Some(qwen_tts_url.clone()) } else { None },
+        download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port,
+        model_catalog_provider: Some(Arc::new(
+            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .unwrap_or_default()
+            )
+        )),
+        model_storage_dir: Some(data_dir.clone()),
+        prompt_template_repo: Some(prompt_template_repo),
+        prompt_extra_repo: Some(prompt_extra_repo),
+        skill_repo: Some(skill_repo.clone()),
+        recipe_repo: Some(recipe_repo.clone()),
     });
 
     // Warn if static assets haven't been built yet
@@ -513,14 +1101,14 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
         .unwrap_or_else(|_| "localhost".to_string());
     let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
 
-    let bind_addr = format!("0.0.0.0:{}", port);
-    let display_url = if port == 80 {
+    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
+    let display_url = if api_port == 80 {
         format!("http://pond.{}.local", hostname)
     } else {
-        format!("http://pond.{}.local:{}", hostname, port)
+        format!("http://pond.{}.local:{}", hostname, api_port)
     };
 
-    println!("  🌐 Listening on {}", bind_addr);
+    println!("  🌐 Listening on 0.0.0.0:{}", api_port);
     println!("  📡 Dashboard: {}", display_url);
     println!("  📡 API:       {}/api/v1/health", display_url);
     println!();
@@ -531,101 +1119,174 @@ async fn run_server(port: u16, static_dir: std::path::PathBuf, open: bool, debug
     // On Linux a display requires DISPLAY (X11) or WAYLAND_DISPLAY to be set.
     // On macOS and Windows a display is always assumed to be present.
     if open || (debug && has_display()) {
-        let url = format!("http://localhost:{}", port);
+        let url = format!("http://localhost:{}", api_port);
         if webbrowser::open(&url).is_err() {
             tracing::warn!("Could not open browser — no display available or xdg-open missing");
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url: Option<&str>, wake_word: Option<&str>, no_wake_word: bool, tts: &str, tts_model: Option<std::path::PathBuf>) -> Result<()> {
+async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: Option<&str>, tts_model: Option<std::path::PathBuf>) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║   Wait → Listen → Think → Speak      ║");
     println!("  ╚═══════════════════════════════════════╝");
-    println!("  Provider: {}", provider);
 
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("goose-in-a-pond");
+    let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
-    // Auto-start whisper.cpp when voice input is requested.
-    let _whisper_guard = if input == "whisper" {
-        let whisper_model = model_download::model_path(&data_dir, model_download::DEFAULT_WHISPER_MODEL)
-            .unwrap_or_else(|_| data_dir.join("models").join("ggml-base.en.bin"));
-        if !whisper_model.exists() {
-            println!("  📥 STT model not found — downloading ({})...", model_download::DEFAULT_WHISPER_MODEL);
-            match model_download::download_whisper_model(model_download::DEFAULT_WHISPER_MODEL, &data_dir).await {
-                Ok(_)  => {}
-                Err(e) => println!("  ⚠  STT model download failed: {}", e),
-            }
-        }
-        whisper_process::try_start(&data_dir, &whisper_model, 9000).await
-    } else {
-        None
-    };
+    // Load settings and model registry early — drives provider, model, TTS, and wake word.
+    // Falls back to Settings::default() when the DB has no rows yet (first run).
+    let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
+    let settings = settings_repo_chat.get().await.unwrap_or_default();
 
-    // Auto-start llamafile when --provider llamafile is requested.
-    let _llamafile_guard = if provider == "llamafile" {
-        if llamafile_process::find_model(&data_dir).is_none() {
-            println!("  📥 LLM model not found — downloading {}...",
-                model_download::DEFAULT_LLAMAFILE_MODEL);
-            match model_download::download_llamafile_model(
-                model_download::DEFAULT_LLAMAFILE_MODEL, &data_dir,
-            ).await {
-                Ok(_)  => {}
-                Err(e) => println!("  ⚠  LLM download failed: {}", e),
+    // CLI args override settings; settings provide the defaults from the chat role.
+    let settings_provider = settings.chat_provider.clone();
+    let effective_provider: &str = provider.unwrap_or(&settings_provider);
+
+    let settings_model = settings.chat_model.clone();
+    let effective_model: &str = model.unwrap_or(&settings_model);
+    // Resolve TTS engine from CLI flag or settings. Normalise piper-* variants to "piper".
+    let effective_tts_owned: String;
+    let effective_tts: &str = match tts {
+        Some(t) => t,
+        None => {
+            effective_tts_owned = if settings.active_tts_model.starts_with("piper") {
+                "piper".to_string()
+            } else {
+                settings.active_tts_model.clone()
+            };
+            &effective_tts_owned
+        }
+    };
+    println!("  Provider: {} (model: {})", effective_provider, effective_model);
+
+    // Auto-start whisper.cpp when voice input is requested.
+    let mut whisper_port = ports::WHISPER;
+    let _whisper_guard = if input == "whisper" {
+        let whisper_model_name = settings.active_whisper_model.as_str();
+        // Look up filename and URL from the catalog DB.
+        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
+            .get_by_id(&format!("whisper/{}", whisper_model_name)).await.ok().flatten()
+            .map(|r| (
+                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name)),
+                r.url.unwrap_or_default(),
+                r.size_mb,
+            ))
+            .unwrap_or_else(|| (
+                format!("ggml-{}.en.bin", whisper_model_name),
+                String::new(),
+                0u64,
+            ));
+        let whisper_model = data_dir.join("models").join(&whisper_filename);
+        if !whisper_model.exists() {
+            println!("  📥 STT model not found — downloading ({})...", whisper_model_name);
+            if !whisper_url.is_empty() {
+                if let Some(parent) = whisper_model.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
+                    Ok(_)  => {}
+                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                }
+            } else {
+                println!("  ⚠  STT model '{}' not in catalog — cannot download", whisper_model_name);
             }
         }
-        llamafile_process::try_start(&data_dir, 8080).await
+        let (guard, port) = whisper_process::try_start(&data_dir, &whisper_model).await;
+        whisper_port = port;
+        guard
     } else {
         None
     };
+    let whisper_url = whisper_process::url_for(whisper_port);
+
+    // ── Model catalog & ModelService (for autonomous downloading) ──────────────
+    let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
+        SqliteModelRepository::new(db.system.clone())
+    );
+    let chat_model_service = Arc::new(pond_core::services::model_service::ModelService::new(
+        chat_model_repo.clone(),
+        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+            reqwest::Client::builder()
+                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_default()
+        )),
+        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
+    ));
+
+    // Seed catalog so model records exist for resolution
+    if let Err(e) = chat_model_service.seed_catalog().await {
+        tracing::warn!("Failed to seed model catalog: {e}");
+    }
+    if let Ok(n) = chat_model_service.sync_disk_flags().await {
+        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+    }
+
+    // Auto-start llamafile only when the provider is explicitly "llamafile".
+    // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
+    let mut llamafile_port = ports::LLAMAFILE;
+    let _llamafile_guard = if effective_provider == "llamafile" {
+        match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model)).await {
+            Some((proc, port)) => { llamafile_port = port; Some(proc) }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     let session_id = "default-session".to_string();
+    // MockAgent is the fallback for ChatService when no LLM provider is wired.
+    // In practice the with_provider() builder always overrides it below,
+    // but ChatService::new() requires an agent at construction time.
     let agent = Arc::new(MockAgent::new());
 
-    // Resolve the system prompt:
-    // 1. If $DATA_DIR/prompts/system.md exists, load and render it with settings vars.
-    // 2. Otherwise, build from settings values.
-    // 3. Fall back to the static SYSTEM_PROMPT constant if settings are unavailable.
-    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+    // Resolve the system prompt using the already-loaded settings:
+    // 1. File at $DATA_DIR/prompts/system.md (deployment override, rendered with all vars)
+    // 2. build_system_prompt(&settings) — honours custom_system_prompt + prompt_style + addendum
     let system_prompt = {
-        let settings = settings_repo.get().await.ok();
-        let prompt_dir = data_dir.join("prompts");
+        let prompt_dir    = data_dir.join("prompts");
         let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
-
-        match (file_template, settings) {
-            (Some(tmpl), Some(s)) => {
+        match file_template {
+            Some(tmpl) => {
                 println!("  Prompt:   custom ({})", prompt_dir.join("system.md").display());
-                let name    = pond_core::prompts::sanitize_field(&s.assistant_name, 50);
-                let user    = pond_core::prompts::sanitize_field(&s.user_name, 50);
-                let persona = pond_core::prompts::sanitize_field(&s.assistant_personality, 200);
-                let tz      = pond_core::prompts::sanitize_field(&s.timezone, 50);
+                let name     = pond_core::prompts::sanitize_field(&settings.assistant_name, 50);
+                let user     = pond_core::prompts::sanitize_field(&settings.user_name, 50);
+                let persona  = pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
+                let tz       = pond_core::prompts::sanitize_field(&settings.timezone, 50);
+                let location = if settings.weather_location_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nLocation: {}.", pond_core::prompts::sanitize_field(&settings.weather_location_name, 100))
+                };
+                let addendum = pond_core::prompts::sanitize_field(&settings.prompt_addendum, 500);
                 pond_core::prompts::render_template(&tmpl, &[
-                    ("assistant_name", name.as_str()),
-                    ("user_name",      user.as_str()),
-                    ("personality",    persona.as_str()),
-                    ("timezone",       tz.as_str()),
+                    ("assistant_name",  name.as_str()),
+                    ("user_name",       user.as_str()),
+                    ("personality",     persona.as_str()),
+                    ("timezone",        tz.as_str()),
+                    ("location",        location.as_str()),
+                    ("prompt_addendum", addendum.as_str()),
                 ])
             }
-            (None, Some(s)) => {
+            None => {
                 println!(
-                    "  Assistant: {} / greeting: {}",
-                    s.assistant_name, s.user_name
+                    "  Assistant: {} / style: {} / user: {}",
+                    settings.assistant_name, settings.prompt_style, settings.user_name
                 );
-                build_system_prompt(&s.assistant_name, &s.user_name, &s.assistant_personality, &s.timezone)
+                build_system_prompt(&settings)
             }
-            _ => pond_core::prompts::SYSTEM_PROMPT.to_string(),
         }
     };
 
+    let db_system = db.system.clone();
     let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
@@ -641,38 +1302,93 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
         .with_system_prompt(system_prompt);
 
-    // ── Wire LLM provider ──
-    match provider {
-        "llamafile" => {
+    // ── Wire LLM provider (settings drive token budget + temperature) ──
+    // Default / fallback is always llamafile — it is auto-started above for any provider
+    // that is not "ollama" or "local".
+    match effective_provider {
+        "ollama" => {
             println!(
-                "  Model:    {} (llamafile @ {})",
-                pond_adapters_llamafile::DEFAULT_MODEL,
-                pond_adapters_llamafile::DEFAULT_HOST
+                "  Model:    {} (ollama @ {}, max_tokens={}, temp={})",
+                effective_model,
+                pond_adapters_ollama::DEFAULT_HOST,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
             );
-            let llm = Arc::new(LlamafileProvider::new(None));
+            let llm = Arc::new(
+                OllamaProvider::new(None, Some(effective_model))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            );
             chat_service = chat_service.with_provider(llm);
         }
-        "ollama" => {
-            let ollama_model = model.unwrap_or(pond_adapters_ollama::DEFAULT_MODEL);
-            println!(
-                "  Model:    {} (ollama @ {})",
-                ollama_model,
-                pond_adapters_ollama::DEFAULT_HOST
-            );
-            let llm = Arc::new(OllamaProvider::new(None, Some(ollama_model)));
-            chat_service = chat_service.with_provider(llm);
+        "local" => {
+            #[cfg(feature = "local-inference")]
+            {
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                // Resolve catalog name → HF model ID ("owner/repo:quantization").
+                // effective_model is a catalog name like "gemma-4-E4B-it-Q4_K_S".
+                // new_with_data_dir registers the local GGUF path in Goose's model
+                // registry so LocalInferenceProvider can find the already-downloaded file.
+                // hf_id is already stored as "owner/repo:quantization" (e.g.
+                // "google/gemma-4-E4B-it-GGUF:Q4_K_S") — use it directly.
+                let hf_model_id = chat_model_repo
+                    .get_by_id(&format!("gguf/{}", effective_model))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.hf_id)
+                    .unwrap_or_else(|| effective_model.to_string());
+                println!("  Model:    {} (local GGUF in-process)", hf_model_id);
+                let llm = Arc::new(
+                    LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?
+                );
+                chat_service = chat_service.with_provider(llm);
+            }
+            #[cfg(not(feature = "local-inference"))]
+            {
+                eprintln!(
+                    "  WARN: --provider local requires the `local-inference` feature (not compiled in).\n\
+                     Falling back to llamafile. Rebuild with:\n  \
+                     cargo run -p pond-server --features local-inference -- chat --provider local"
+                );
+                println!(
+                    "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
+                    effective_model,
+                    llamafile_url,
+                    settings.llm_max_tokens,
+                    settings.llm_temperature,
+                );
+                let llm = Arc::new(
+                    LlamafileProvider::new(Some(&llamafile_url))
+                        .with_max_tokens(settings.llm_max_tokens)
+                        .with_temperature(settings.llm_temperature),
+                );
+                chat_service = chat_service.with_provider(llm);
+            }
         }
         _ => {
-            println!("  Model:    mock (echo)");
+            // "llamafile" and any unrecognised value — use the llamafile process started above.
+            println!(
+                "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
+                effective_model,
+                llamafile_url,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
+            );
+            let llm = Arc::new(
+                LlamafileProvider::new(Some(&llamafile_url))
+                    .with_max_tokens(settings.llm_max_tokens)
+                    .with_temperature(settings.llm_temperature),
+            );
+            chat_service = chat_service.with_provider(llm);
         }
     }
 
     // ── Wire voice input ──
     let voice: Arc<dyn VoiceInput> = match input {
         "whisper" => {
-            let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
-            println!("  Input:    whisper (@ {})", url);
-            Arc::new(WhisperInput::new(Some(url)))
+            println!("  Input:    whisper (@ {})", whisper_url);
+            Arc::new(WhisperInput::new(Some(&whisper_url)))
         }
         _ => {
             println!("  Input:    stdin");
@@ -685,73 +1401,106 @@ async fn run_chat(provider: &str, model: Option<&str>, input: &str, whisper_url:
     let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
         Arc::new(InstantActivation)
     } else {
-        let trigger = wake_word.unwrap_or("goose");
-        let url = whisper_url.unwrap_or(pond_adapters_whisper::DEFAULT_HOST);
-        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, url);
-        Arc::new(WhisperKeywordDetector::new(Some(url), trigger))
+        let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
+        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, whisper_url);
+        Arc::new(WhisperKeywordDetector::new(Some(&whisper_url), trigger))
     };
     chat_service = chat_service.with_wake_word_detector(detector);
 
     // Auto-start Qwen TTS server before the match (guard must outlive voice_out).
-    let _qwen_tts_chat_guard = if tts == "qwen" || tts == "qwen-tts" {
-        qwen_tts_process::try_start(pond_adapters_qwen_tts::DEFAULT_HOST, &data_dir).await
+    let mut qwen_chat_port = ports::QWEN_TTS;
+    let _qwen_tts_chat_guard = if effective_tts == "qwen" || effective_tts == "qwen-tts" {
+        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
+            Some((proc, port, _confirmed)) => { qwen_chat_port = port; Some(proc) }
+            None => None,
+        }
     } else {
         None
     };
+    let qwen_chat_url = qwen_tts_process::url_for(qwen_chat_port);
 
     // ── Wire TTS output ──
-    let voice_out: Arc<dyn VoiceOutput> = match tts {
+    let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "qwen" | "qwen-tts" => {
-            let qwen = Arc::new(QwenTtsOutput::new(None));
+            let qwen = Arc::new(QwenTtsOutput::new(Some(&qwen_chat_url)));
 
-            // Build piper if available (auto-download if needed).
-            let piper_model = data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME);
-            if piper_process::find_binary(&data_dir).is_none() {
-                let _ = model_download::download_piper_binary(&data_dir).await;
-            }
-            if !piper_model.exists() {
-                let _ = model_download::download_piper_model(&data_dir).await;
-            }
-            match piper_process::find_binary(&data_dir) {
-                Some(bin) if piper_model.exists() => {
-                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
-                    Arc::new(FallbackVoiceOutput::new(
-                        qwen as Arc<dyn VoiceOutput>,
-                        Arc::new(PiperOutput::new(bin, piper_model)),
-                    ))
+            // Offer piper as a silent fallback only when already installed on disk.
+            // Never auto-download piper for this path — user must configure piper explicitly.
+            let piper_opt: Option<Arc<dyn VoiceOutput>> = if !settings.voice_tts_voice.is_empty() {
+                let model_path = model_download::tts_models_dir(&data_dir)
+                    .join(&settings.voice_tts_voice);
+                match piper_process::find_binary(&data_dir) {
+                    Some(bin) if model_path.exists() => {
+                        Some(Arc::new(PiperOutput::new(bin, model_path)))
+                    }
+                    _ => None,
                 }
-                _ => {
+            } else {
+                None
+            };
+            match piper_opt {
+                Some(piper) => {
+                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
+                    Arc::new(FallbackVoiceOutput::new(qwen as Arc<dyn VoiceOutput>, piper))
+                }
+                None => {
                     println!("  TTS:      qwen-tts");
                     qwen as Arc<dyn VoiceOutput>
                 }
             }
         }
         "piper" => {
-            let model_path = tts_model.unwrap_or_else(|| {
-                data_dir.join("models").join("tts").join(model_download::PIPER_MODEL_FILENAME)
-            });
-            if piper_process::find_binary(&data_dir).is_none() {
-                println!("  📥 TTS binary not found — downloading...");
-                match model_download::download_piper_binary(&data_dir).await {
-                    Ok(_)  => {}
-                    Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
-                }
-            }
-            if !model_path.exists() {
-                println!("  📥 TTS model not found — downloading...");
-                match model_download::download_piper_model(&data_dir).await {
-                    Ok(_)  => {}
-                    Err(e) => println!("  ⚠  TTS model download failed: {}", e),
-                }
-            }
-            match piper_process::find_binary(&data_dir) {
-                Some(bin) => {
-                    println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
-                    Arc::new(PiperOutput::new(bin, model_path))
-                }
-                None => {
-                    println!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                    Arc::new(PrintOutput)
+            // Resolve model path: CLI arg → settings → warn and fall back to text
+            let model_path_opt: Option<std::path::PathBuf> = if let Some(p) = tts_model {
+                Some(p)
+            } else if !settings.voice_tts_voice.is_empty() {
+                Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
+            } else {
+                println!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
+                println!("     Set a piper voice in the web UI, then restart. Using text output.");
+                None
+            };
+            match model_path_opt {
+                None => Arc::new(PrintOutput),
+                Some(model_path) => {
+                    if piper_process::find_binary(&data_dir).is_none() {
+                        println!("  📥 TTS binary not found — downloading...");
+                        match model_download::download_piper_binary(&data_dir).await {
+                            Ok(_)  => {}
+                            Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                        }
+                    }
+                    if !model_path.exists() {
+                        println!("  📥 TTS model not found — downloading configured voice...");
+                        // Look up in DB by filename to get the correct download URL.
+                        let voice_filename = settings.voice_tts_voice.as_str();
+                        let registry_entry = SqliteModelRepository::new(db_system.clone())
+                            .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                            .into_iter()
+                            .find(|m| m.filename.as_deref() == Some(voice_filename))
+                            .and_then(|m| {
+                                let mf = m.filename?;
+                                let cf = m.config_filename?;
+                                let mu = m.url?;
+                                let cu = m.config_url?;
+                                Some((mf, cf, mu, cu, m.size_mb))
+                            });
+                        if let Some((mf, cf, mu, cu, sz)) = registry_entry {
+                            let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                        } else {
+                            println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                        }
+                    }
+                    match piper_process::find_binary(&data_dir) {
+                        Some(bin) => {
+                            println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
+                            Arc::new(PiperOutput::new(bin, model_path))
+                        }
+                        None => {
+                            println!("  TTS:      piper unavailable (binary not found) — falling back to print");
+                            Arc::new(PrintOutput)
+                        }
+                    }
                 }
             }
         }
@@ -785,7 +1534,7 @@ fn has_display() -> bool {
 
 /// Background task that tails the `event_log` table in `pond_logs.db`.
 ///
-/// On startup it records the current maximum row ID so that pre-existing log
+/// On startup, it records the current maximum row ID so that pre-existing log
 /// history is not replayed. It then polls every second and prints any new rows
 /// to stdout. This is intentionally a plain `println!` rather than a tracing
 /// event so the output is always visible alongside the tracing output, making
@@ -846,11 +1595,37 @@ async fn run_status() -> Result<()> {
     println!("  Hostname:  {}", hostname);
     println!("  Platform:  {} / {}", std::env::consts::OS, std::env::consts::ARCH);
 
-    // TODO: Check DB status, onboarding state, running services
-    println!("  Database:  TODO — check connection");
-    println!("  Onboarded: TODO — check onboarding state");
+    let data_dir = default_data_dir();
+    let db_path = data_dir.join("pond_system.db");
+    println!("  Database:  {}", db_path.display());
+    if db_path.exists() {
+        if let Ok(db) = Database::init(&data_dir).await {
+            let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+            if let Ok(s) = settings_repo.get().await {
+                println!("  Assistant: {} | Provider: {} | Model: {}",
+                    s.assistant_name, s.chat_provider, s.active_llm_model);
+                println!("  Wake word: {}", s.voice_wake_word);
+            }
+            let onboard_repo = SqlxOnboardingRepository::new(db.system.clone());
+            let svc = OnboardingService::new(onboard_repo);
+            println!("  Onboarded: {:?}", svc.status().await);
+        }
+    } else {
+        println!("  (not found — run `pond-server setup` first)");
+    }
 
     Ok(())
+}
+
+fn default_data_dir() -> std::path::PathBuf {
+    // `POND_DATA_DIR` lets tests (and power users) redirect all DB and model
+    // storage to an arbitrary directory without touching the real data store.
+    if let Ok(dir) = std::env::var("POND_DATA_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("goose-in-a-pond")
 }
 
 fn get_local_ip() -> Option<String> {
@@ -892,14 +1667,10 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat("mock", None, "stdin", None, None, true, "none", None).await?;
+                run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
             }
             "2" => {
-                println!("Enter port (default 4000): ");
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                let port: u16 = input.trim().parse().unwrap_or(4000);
-                run_server(port, std::path::PathBuf::from("web/dist"), false, false).await?;
+                run_server(std::path::PathBuf::from("web/dist"), false, false, "goose").await?;
             }
             "3" => {
                 run_status().await?;
@@ -919,19 +1690,17 @@ async fn run_main_menu() -> Result<()> {
 async fn run_onboard(reset: bool) -> Result<()> {
     println!("🦆 Goose In A Pond — Interactive Onboarding Wizard\n");
 
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("goose-in-a-pond");
+    let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
     let repo = SqlxOnboardingRepository::new(db.system.clone());
     let service = OnboardingService::new(repo);
+    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
 
     if reset {
         service.reset().await?;
         println!("Onboarding reset. Starting from scratch...\n");
     }
 
-    // TODO: persist user_data once UserProfile domain + port exist
     let mut user_data: HashMap<String, String> = HashMap::new();
 
     loop {
@@ -943,8 +1712,8 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 service.start().await?;
             }
 
-            Some(OnboardingStep::VerifyDevice) => {
-                println!("Step: Verify Device");
+            Some(OnboardingStep::Welcome) => {
+                println!("Step: Welcome");
 
                 if let Some(ip) = get_local_ip() {
                     println!("Detected device IP: {}", ip);
@@ -957,51 +1726,127 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::CreateProfile) => {
-                println!("Step: Create Profile");
+            Some(OnboardingStep::Basics) => {
+                println!("Step: Basics");
 
-                let username = prompt_nonempty("Enter your username: ")?;
-                user_data.insert("username".to_string(), username);
+                let username = prompt_nonempty("Enter your name: ")?;
+                user_data.insert("user_name".to_string(), username);
 
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::ConfigurePersonality) => {
-                println!("Step: Configure Personality");
+            Some(OnboardingStep::Location) => {
+                println!("Step: Language & Location");
+                println!("(Press Enter to skip any field — configure later in Settings)");
 
-                let personalities = vec![
-                    "Friendly",
-                    "Professional",
-                    "Casual",
-                    "Funny",
-                    "Stoic",
-                ];
+                print!("Timezone (e.g. Africa/Nairobi): ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut timezone = String::new();
+                let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut timezone);
+                if !timezone.trim().is_empty() {
+                    user_data.insert("timezone".to_string(), timezone.trim().to_string());
+                }
 
-                println!("Choose a personality for your assistant:");
-                for (i, p) in personalities.iter().enumerate() {
-                    println!("  {}) {}", i + 1, p);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Accessibility) => {
+                println!("Step: Accessibility");
+                println!("(All accessibility options can be configured in Settings later)");
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Personality) => {
+                println!("Step: Personality");
+
+                let styles = vec!["balanced", "concise", "technical", "warm"];
+                println!("Choose a conversation style:");
+                for (i, s) in styles.iter().enumerate() {
+                    println!("  {}) {}", i + 1, s);
                 }
 
                 let selected = loop {
                     let choice = prompt_nonempty("Enter the number of your choice: ")?;
                     if let Ok(index) = choice.parse::<usize>() {
-                        if index >= 1 && index <= personalities.len() {
-                            break personalities[index - 1].to_string();
+                        if index >= 1 && index <= styles.len() {
+                            break styles[index - 1].to_string();
                         }
                     }
                     println!("Invalid choice. Try again.");
                 };
 
                 println!("You selected: {}", selected);
-                user_data.insert("personality".to_string(), selected);
+                user_data.insert("prompt_style".to_string(), selected);
 
                 service.advance().await?;
             }
 
-            Some(OnboardingStep::ConnectDevices) => {
-                println!("Step: Connect Devices");
-                println!("Press ENTER when all devices are connected...");
-                let _ = io::stdin().read_line(&mut String::new())?;
+            Some(OnboardingStep::GooseIdentity) => {
+                println!("Step: Goose's Identity");
+
+                print!("Assistant name (default: Goose): ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut name = String::new();
+                let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut name);
+                let name = if name.trim().is_empty() { "Goose".to_string() } else { name.trim().to_string() };
+                user_data.insert("assistant_name".to_string(), name);
+
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::WakeWord) => {
+                println!("Step: Wake Word");
+                println!("Presets: 1) goose  2) hey goose  3) ok computer  4) custom");
+
+                let wake_word = loop {
+                    let choice = prompt_nonempty("Enter number or type a custom phrase: ")?;
+                    break match choice.trim() {
+                        "1" => "goose".to_string(),
+                        "2" => "hey goose".to_string(),
+                        "3" => "ok computer".to_string(),
+                        "4" => prompt_nonempty("Enter your custom wake phrase: ")?,
+                        other => other.to_string(),
+                    };
+                };
+
+                user_data.insert("voice_wake_word".to_string(), wake_word);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Model) => {
+                println!("Step: AI Model");
+                // Show LLM models available in the catalog DB so users can pick by number.
+                let model_repo = SqliteModelRepository::new(db.system.clone());
+                let catalog_models: Vec<_> = model_repo.list_all().await.unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| m.category.is_llm())
+                    .collect();
+                let model_name = if catalog_models.is_empty() {
+                    println!("(No models in catalog yet — run `pond setup` to populate it)");
+                    prompt_nonempty("Enter a model name (e.g. gemma-2b): ")?
+                } else {
+                    println!("Available models (✓ = downloaded):");
+                    for (i, m) in catalog_models.iter().enumerate() {
+                        let dl = if m.downloaded { "✓" } else { " " };
+                        println!("  {}) [{}] {} ({}, {} MB)",
+                            i + 1, dl, m.name, m.category.as_str(), m.size_mb);
+                    }
+                    println!();
+                    let input = prompt_nonempty("Enter number to select, or type a name directly: ")?;
+                    match input.parse::<usize>() {
+                        Ok(idx) if idx >= 1 && idx <= catalog_models.len() => {
+                            catalog_models[idx - 1].name.clone()
+                        }
+                        _ => input,
+                    }
+                };
+                user_data.insert("chat_model".to_string(), model_name);
+                service.advance().await?;
+            }
+
+            Some(OnboardingStep::Extensions) => {
+                println!("Step: Extensions");
+                println!("(Extensions can be enabled from Settings later)");
                 service.advance().await?;
             }
 
@@ -1010,10 +1855,19 @@ async fn run_onboard(reset: bool) -> Result<()> {
                     println!("You are already onboarded!");
                     println!("Run with --reset to start over.");
                 } else {
-                    println!("\n Onboarding complete! Here’s your info:\n");
-                    for (key, value) in &user_data {
-                        println!("  {}: {}", key, value);
+                    println!("\nOnboarding complete! Saving your settings...\n");
+                    let mut settings = settings_repo.get().await.unwrap_or_default();
+                    if let Some(v) = user_data.get("user_name")       { settings.user_name = v.clone(); }
+                    if let Some(v) = user_data.get("timezone")        { settings.timezone = v.clone(); }
+                    if let Some(v) = user_data.get("prompt_style")    { settings.prompt_style = v.clone(); }
+                    if let Some(v) = user_data.get("assistant_name")  { settings.assistant_name = v.clone(); }
+                    if let Some(v) = user_data.get("voice_wake_word") { settings.voice_wake_word = v.clone(); }
+                    if let Some(v) = user_data.get("chat_model") {
+                        settings.chat_model = v.clone();
+                        settings.active_llm_model = v.clone();
                     }
+                    settings_repo.update(&settings).await?;
+                    println!("  Settings saved to database.");
                 }
                 run_main_menu().await?;
                 break;
@@ -1022,4 +1876,907 @@ async fn run_onboard(reset: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Goose agent backend ───────────────────────────────────────────────────────
+
+/// Build a Goose-backed agent + extension manager.
+///
+/// Only compiled when the `goose-agent` feature is enabled (default).
+/// Falls back to MockAgent when `--agent mock` is explicitly passed.
+#[cfg(feature = "goose-agent")]
+async fn build_goose_backend(
+    agent_backend: &str,
+    llamafile_url: &str,
+    weather: Option<Arc<dyn WeatherProvider>>,
+    device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
+    scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
+    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
+    memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync>,
+    recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
+    template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync>,
+    extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
+) -> (
+    Arc<dyn Agent>,
+    Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+) {
+    use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
+    use pond_core::ports::extension_manager::ExtensionManagerPort;
+
+    if agent_backend != "goose" {
+        return (Arc::new(MockAgent::new()), None);
+    }
+
+    // Register the GIAP MCP server into Goose's builtin extension registry.
+    let handles = Arc::new(GiapServiceHandles {
+        weather,
+        device_registry,
+        scheduler,
+        settings_repo: settings_repo.clone(),
+        memory_repo: memory_repo.clone(),
+        skill_repo: skill_repo.clone(),
+        recipe_repo: recipe_repo.clone(),
+    });
+    if let Err(e) = register_giap_extension(handles) {
+        tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
+        return (Arc::new(MockAgent::new()), None);
+    }
+
+    // Build the adapter with all repos injected.
+    match GooseAdapter::new(
+        settings_repo,
+        template_repo,
+        extras_repo,
+        skill_repo,
+        memory_repo,
+        llamafile_url.to_string(),
+    ).await {
+        Ok(adapter) => {
+            let ext_mgr: Arc<dyn ExtensionManagerPort> =
+                Arc::new(adapter.extension_manager("server".to_string()));
+            tracing::info!("Goose agent active — GIAP MCP extension registered");
+            let agent: Arc<dyn Agent> = Arc::new(adapter);
+            (agent, Some(ext_mgr))
+        }
+        Err(e) => {
+            tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
+            (Arc::new(MockAgent::new()), None)
+        }
+    }
+}
+
+// ── Model catalog helpers ─────────────────────────────────────────────────────
+
+/// Seed the persistent model catalog from upstream sources (static list + local Ollama).
+///
+/// Upserts all returned records (preserving `is_custom` rows) and sets `downloaded`
+/// by checking the filesystem.  A failure to fetch is non-fatal — the server starts
+/// with whatever models are already in the DB.
+async fn seed_model_catalog(
+    repo: &dyn ModelRepository,
+    data_dir: &std::path::Path,
+) {
+    use crate::composite_model_catalog_provider::CompositeModelCatalogProvider;
+    use crate::filesystem_model_storage::FilesystemModelStorage;
+    use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
+    use pond_core::ports::model_storage::ModelStorage;
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .unwrap_or_default();
+    let provider = CompositeModelCatalogProvider::new(client);
+    let storage  = FilesystemModelStorage::new(data_dir);
+
+    let (models, _binaries) = match provider.fetch().await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("Failed to fetch model catalog: {e}. Starting with existing DB records.");
+            return;
+        }
+    };
+
+    let count = models.len();
+    for mut record in models {
+        record.downloaded = storage.is_present(&record);
+        if let Err(e) = repo.upsert(&record).await {
+            tracing::warn!("Failed to seed model '{}': {e}", record.name);
+        }
+    }
+
+    tracing::info!("model catalog seeded ({count} records)");
+}
+
+/// Sync role assignments from the join table to the settings KV hot-cache.
+///
+/// The join table is the source of truth.  If a role has no assignment row yet,
+/// the settings KV value is left unchanged (backward-compat with existing installs
+/// that only have the legacy single-model settings fields).
+async fn sync_assignments_to_settings(
+    repo: &dyn ModelRepository,
+    settings_repo: &dyn pond_core::ports::settings::SettingsRepository,
+) {
+    let assignments = match repo.list_assignments().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("sync_assignments_to_settings: failed to read assignments: {e}");
+            return;
+        }
+    };
+
+    for a in &assignments {
+        // model_id format: "{category}/{name}"
+        let model_name = a.model_id.split('/').nth(1).unwrap_or(&a.model_id);
+        let category   = a.model_id.split('/').next().unwrap_or("");
+
+        match a.role.as_str() {
+            "chat" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("chat_provider", provider).await;
+                let _ = settings_repo.set_key("chat_model",    model_name.to_string()).await;
+            }
+            "think" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("think_provider", provider).await;
+                let _ = settings_repo.set_key("think_model",    model_name.to_string()).await;
+            }
+            "task" => {
+                let provider = category_to_provider(category);
+                let _ = settings_repo.set_key("task_provider", provider).await;
+                let _ = settings_repo.set_key("task_model",    model_name.to_string()).await;
+            }
+            "asr" => {
+                let _ = settings_repo.set_key("active_whisper_model", model_name.to_string()).await;
+            }
+            "tts" => {
+                let _ = settings_repo.set_key("active_tts_model", model_name.to_string()).await;
+                // For piper models also sync voice_tts_voice to the .onnx filename.
+                if category == "tts_piper" {
+                    if let Ok(Some(record)) = repo.get_by_id(&a.model_id).await {
+                        if let Some(fname) = record.filename {
+                            let _ = settings_repo.set_key("voice_tts_voice", fname).await;
+                        }
+                    }
+                }
+            }
+            other => {
+                tracing::debug!("sync_assignments_to_settings: unknown role '{other}', skipping");
+            }
+        }
+    }
+
+    if !assignments.is_empty() {
+        tracing::info!("synced {} role assignment(s) to settings KV", assignments.len());
+    }
+}
+
+fn category_to_provider(category: &str) -> String {
+    match category {
+        "ollama"    => "ollama".to_string(),
+        "gguf"      => "local".to_string(),
+        _           => "llamafile".to_string(),
+    }
+}
+
+/// Direct-SQLite model management CLI — no HTTP server started.
+async fn run_models(action: ModelAction) -> Result<()> {
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let repo = Arc::new(SqliteModelRepository::new(db.system.clone()));
+
+    match action {
+        ModelAction::List { category } => {
+            let models = if let Some(cat_str) = &category {
+                match ModelCategory::from_str(cat_str) {
+                    Some(cat) => repo.list_by_category(&cat).await?,
+                    None => {
+                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                repo.list_all().await?
+            };
+
+            let assignments = repo.list_assignments().await.unwrap_or_default();
+
+            println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  Role",
+                "Category", "Name", "Size(MB)", "DL?", "RAM(MB)");
+            println!("{}", "─".repeat(78));
+
+            for m in &models {
+                let role = assignments.iter()
+                    .find(|a| a.model_id == m.id)
+                    .map(|a| a.role.as_str())
+                    .unwrap_or("—");
+                let dl  = if m.downloaded { "✓" } else { "✗" };
+                let ram = m.ram_estimate_mb
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  {}",
+                    m.category.as_str(), m.name, m.size_mb, dl, ram, role);
+            }
+        }
+
+        ModelAction::Download { category, name } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            let record = repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            let url = record.url.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no download URL"))?;
+            let filename = record.filename.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no filename"))?;
+
+            let subdir = match cat {
+                ModelCategory::Whisper  => "models",
+                ModelCategory::Llamafile => "models/llm",
+                ModelCategory::Gguf     => "models/gguf",
+                ModelCategory::TtsPiper => "models/tts",
+                _                       => "models",
+            };
+            let dest = data_dir.join(subdir).join(filename);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            println!("Downloading {} → {}", url, dest.display());
+            model_download::download_file(url, &dest, record.size_mb).await?;
+
+            // For Piper TTS models also download the companion .onnx.json config file.
+            if cat == ModelCategory::TtsPiper {
+                if let (Some(cf), Some(cu)) = (&record.config_filename, &record.config_url) {
+                    let config_dest = data_dir.join(subdir).join(cf);
+                    if !config_dest.exists() {
+                        println!("Downloading config {} → {}", cu, config_dest.display());
+                        if let Err(e) = model_download::download_file(cu, &config_dest, 0).await {
+                            println!("⚠  Config download failed (non-fatal): {e}");
+                        } else {
+                            println!("✓ Downloaded {}", cf);
+                        }
+                    }
+                }
+            }
+
+            repo.set_downloaded(&id, true).await?;
+            println!("✓ Downloaded {}", filename);
+        }
+
+        ModelAction::Delete { category, name } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            let record = repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            let assignments = repo.list_assignments().await?;
+            if let Some(a) = assignments.iter().find(|a| a.model_id == id) {
+                anyhow::bail!(
+                    "Model is assigned to role '{}'. Deactivate it first.", a.role
+                );
+            }
+
+            if let Some(filename) = &record.filename {
+                let subdir = match cat {
+                    ModelCategory::Whisper   => "models",
+                    ModelCategory::Llamafile => "models/llm",
+                    ModelCategory::Gguf      => "models/gguf",
+                    ModelCategory::TtsPiper  => "models/tts",
+                    _                        => "models",
+                };
+                let path = data_dir.join(subdir).join(filename);
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    println!("✓ Deleted {}", path.display());
+                } else {
+                    println!("File not on disk (already absent): {}", path.display());
+                }
+            }
+            repo.set_downloaded(&id, false).await?;
+        }
+
+        ModelAction::Activate { category, name, role } => {
+            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+                anyhow::anyhow!("Unknown category '{category}'")
+            })?;
+            let id = ModelRecord::id_for(&cat, &name);
+            repo.get_by_id(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
+
+            use pond_core::domain::model_record::ModelRoleAssignment;
+            if !ModelRoleAssignment::category_matches_role(&cat, &role) {
+                anyhow::bail!(
+                    "Category '{}' is not compatible with role '{}'. \
+                     (whisper→asr, tts_piper/tts_http→tts, gguf/llamafile/ollama→chat|think|task)",
+                    cat.as_str(), role
+                );
+            }
+
+            let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+            repo.set_assignment(&role, &id).await?;
+            sync_assignments_to_settings(&*repo, &settings_repo).await;
+            println!("✓ {} assigned to role '{}'", id, role);
+        }
+    }
+
+    Ok(())
+}
+
+// ── Agent CLI ─────────────────────────────────────────────────────────────────
+
+/// One-shot Goose agent chat from the CLI.
+///
+/// Builds the full GooseAdapter + GIAP MCP backend (same as `run_server`),
+/// sends a single message, prints the text response, then exits.
+async fn run_agent_cmd(action: AgentAction) -> Result<()> {
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+
+    // Build all repos once — shared across Chat, Tools, and Extras arms.
+    let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
+        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+        Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+    let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
+        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+
+    let settings = settings_repo.get().await.unwrap_or_default();
+    // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
+    // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
+    let llamafile_url = format!("http://127.0.0.1:{}", ports::LLAMAFILE);
+
+    // Wire weather from settings so giap__get_current_weather MCP tool is available.
+    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
+        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+    {
+        let loc = if settings.weather_location_name.is_empty() {
+            format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+        } else {
+            settings.weather_location_name.clone()
+        };
+        Some(Arc::new(OpenMeteoWeatherAdapter::new(
+            settings.weather_latitude,
+            settings.weather_longitude,
+            loc,
+        )))
+    } else {
+        None
+    };
+
+    match action {
+        AgentAction::Chat { message, session } => {
+            use pond_core::domain::agent::AgentRequest;
+
+            println!("Agent: {} | Provider: {} | Model: {}",
+                settings.assistant_name, settings.chat_provider, settings.chat_model);
+            println!("Sending: {message}\n");
+
+            let (agent, _ext_mgr) = build_goose_backend(
+                "goose",
+                &llamafile_url,
+                weather,
+                device_registry,
+                None,
+                settings_repo,
+                memory_repo,
+                skill_repo,
+                recipe_repo,
+                template_repo,
+                extras_repo,
+            ).await;
+
+            let request = AgentRequest { message, session_id: session };
+            match agent.chat(request).await {
+                Ok(response) => {
+                    println!("{}", response.text);
+                    if let Some(calls) = response.metadata.get("tool_calls") {
+                        if !calls.is_empty() {
+                            eprintln!("\n[tool calls: {}]", calls);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Agent error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        AgentAction::Tools => {
+            let (_agent, ext_mgr) = build_goose_backend(
+                "goose",
+                &llamafile_url,
+                weather,
+                device_registry,
+                None,
+                settings_repo,
+                memory_repo,
+                skill_repo,
+                recipe_repo,
+                template_repo,
+                extras_repo,
+            ).await;
+
+            match ext_mgr {
+                None => println!("No extension manager available (agent backend may be 'mock')."),
+                Some(mgr) => {
+                    let extensions = mgr.list_extensions().await.unwrap_or_default();
+                    if extensions.is_empty() {
+                        println!("No extensions loaded yet (start the server to initialise sessions).");
+                    } else {
+                        println!("{:<20} {}", "Extension", "Tools");
+                        println!("{}", "─".repeat(60));
+                        for ext in &extensions {
+                            let tools = ext.tools.join(", ");
+                            println!("{:<20} {}", ext.name, tools);
+                        }
+                    }
+                }
+            }
+        }
+
+        AgentAction::Extras => {
+            let extras = extras_repo.list_all().await?;
+            if extras.is_empty() {
+                println!("No prompt extras defined. Add via POST /api/v1/agent/extras");
+                return Ok(());
+            }
+            println!("{:<4} {:<20} {:<6} {}", "Ord", "Key", "Active", "Instruction");
+            println!("{}", "─".repeat(72));
+            for e in &extras {
+                let active = if e.active { "✓" } else { "✗" };
+                let preview = if e.instruction.len() > 40 {
+                    format!("{}…", &e.instruction[..39])
+                } else {
+                    e.instruction.clone()
+                };
+                println!("{:<4} {:<20} {:<6} {}", e.sort_order, e.key, active, preview);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Prompts CLI ───────────────────────────────────────────────────────────────
+
+async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
+    use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let repo = SqlitePromptTemplateRepository::new(db.system.clone());
+
+    match action {
+        PromptAction::List => {
+            let templates = repo.list().await?;
+            if templates.is_empty() {
+                println!("No templates found. Run `pond setup` to seed built-ins.");
+                return Ok(());
+            }
+            println!("{:<16} {:<8} {}", "Name", "System", "Description");
+            println!("{}", "─".repeat(60));
+            for t in &templates {
+                let sys = if t.is_system { "✓" } else { "—" };
+                println!("{:<16} {:<8} {}", t.name, sys, t.description);
+            }
+        }
+
+        PromptAction::Show { name } => {
+            match repo.get(&name).await? {
+                None => {
+                    eprintln!("Template '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(t) => {
+                    println!("─── {} ─── (system={})", t.name, t.is_system);
+                    println!("{}", t.content);
+                }
+            }
+        }
+
+        PromptAction::Reset { name } => {
+            use pond_core::domain::prompt_template::PromptTemplate;
+            use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+
+            let (content, description) = match name.as_str() {
+                "balanced"  => (PROMPT_BALANCED, "Warm, practical, complete behaviour rules. Default for most households."),
+                "concise"   => (PROMPT_CONCISE,  "Minimal, action-first. For power users who want brevity."),
+                "technical" => (PROMPT_TECHNICAL,"Verbose, tool-aware, narrates reasoning. For developers."),
+                "warm"      => (PROMPT_WARM,     "Conversational, family-friendly, personality-forward."),
+                other => {
+                    eprintln!("'{other}' is not a built-in template. Only balanced | concise | technical | warm can be reset.");
+                    std::process::exit(1);
+                }
+            };
+            let t = PromptTemplate {
+                name: name.clone(),
+                content: content.to_string(),
+                description: description.to_string(),
+                is_system: true,
+                updated_at: String::new(),
+            };
+            repo.upsert(&t).await?;
+            println!("✓ Template '{name}' reset to factory default.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Skills CLI ────────────────────────────────────────────────────────────────
+
+async fn run_skills_cmd(action: SkillAction) -> Result<()> {
+    use pond_core::ports::skill::UserSkillRepository as _;
+
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteSkillRepository::new(db.system.clone());
+
+    match action {
+        SkillAction::List { all } => {
+            let skills = if all {
+                repo.list_all().await?
+            } else {
+                repo.list_active().await?
+            };
+            if skills.is_empty() {
+                let hint = if all { "" } else { " (use --all to include inactive)" };
+                println!("No skills found{hint}.");
+                return Ok(());
+            }
+            println!("{:<38} {:<6} {}", "ID", "Active", "Name");
+            println!("{}", "─".repeat(60));
+            for s in &skills {
+                let active = if s.active { "✓" } else { "✗" };
+                println!("{:<38} {:<6} {}", s.id, active, s.name);
+            }
+        }
+
+        SkillAction::Add { name, content } => {
+            use pond_core::domain::skill::UserSkill;
+
+            let content = match content {
+                Some(c) => c,
+                None => {
+                    eprintln!("Reading skill content from stdin (Ctrl-D to finish)...");
+                    let mut buf = String::new();
+                    use std::io::Read as _;
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim().to_string()
+                }
+            };
+            if content.is_empty() {
+                eprintln!("Skill content cannot be empty.");
+                std::process::exit(1);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let skill = UserSkill {
+                id: id.clone(),
+                name: name.clone(),
+                content,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            repo.create(&skill).await?;
+            println!("✓ Skill '{name}' created (id: {id})");
+        }
+
+        SkillAction::Toggle { id } => {
+            use pond_core::ports::skill::UserSkillRepository as _;
+
+            let skill = repo.get(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("Skill '{id}' not found"))?;
+            let updated = pond_core::domain::skill::UserSkill {
+                active: !skill.active,
+                ..skill.clone()
+            };
+            repo.update(&updated).await?;
+            let state = if updated.active { "enabled" } else { "disabled" };
+            println!("✓ Skill '{}' {state}", skill.name);
+        }
+
+        SkillAction::Remove { id } => {
+            repo.delete(&id).await?;
+            println!("✓ Skill {id} deleted.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Recipes CLI ───────────────────────────────────────────────────────────────
+
+async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
+    use pond_core::ports::recipe::AgentRecipeRepository as _;
+
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteRecipeRepository::new(db.system.clone());
+
+    match action {
+        RecipeAction::List => {
+            let recipes = repo.list().await?;
+            if recipes.is_empty() {
+                println!("No recipes found. Import one with `pond recipes import <name> <file.yaml>`");
+                return Ok(());
+            }
+            println!("{:<38} {:<6} {:<20} {}", "ID", "Active", "Name", "Description");
+            println!("{}", "─".repeat(80));
+            for r in &recipes {
+                let active = if r.active { "✓" } else { "✗" };
+                let desc = if r.description.len() > 30 {
+                    format!("{}…", &r.description[..29])
+                } else {
+                    r.description.clone()
+                };
+                println!("{:<38} {:<6} {:<20} {}", r.id, active, r.name, desc);
+            }
+        }
+
+        RecipeAction::Show { name } => {
+            match repo.get_by_name(&name).await? {
+                None => {
+                    eprintln!("Recipe '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(r) => {
+                    println!("─── {} ─── (active={})", r.name, r.active);
+                    if !r.description.is_empty() {
+                        println!("# {}\n", r.description);
+                    }
+                    println!("{}", r.yaml);
+                }
+            }
+        }
+
+        RecipeAction::Import { name, file, description } => {
+            use pond_core::domain::recipe::AgentRecipe;
+
+            let yaml = tokio::fs::read_to_string(&file).await
+                .map_err(|e| anyhow::anyhow!("Cannot read '{}': {e}", file.display()))?;
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let recipe = AgentRecipe {
+                id: id.clone(),
+                name: name.clone(),
+                description,
+                yaml,
+                active: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            repo.upsert(&recipe).await?;
+            println!("✓ Recipe '{name}' imported (id: {id})");
+        }
+
+        RecipeAction::Remove { name } => {
+            match repo.get_by_name(&name).await? {
+                None => {
+                    eprintln!("Recipe '{name}' not found.");
+                    std::process::exit(1);
+                }
+                Some(r) => {
+                    repo.delete(&r.id).await?;
+                    println!("✓ Recipe '{name}' deleted.");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Memories CLI ──────────────────────────────────────────────────────────────
+
+async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
+    use pond_core::ports::memory_repository::MemoryRepository as _;
+
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let repo = SqliteMemoryRepository::new(db.system.clone());
+
+    match action {
+        MemoryAction::List { limit } => {
+            let fragments = repo.search_recent(None, limit).await?;
+            if fragments.is_empty() {
+                println!("No memory fragments found.");
+                return Ok(());
+            }
+            println!("{:<38} {:<24} {}", "ID", "Created", "Content");
+            println!("{}", "─".repeat(80));
+            for f in &fragments {
+                let ts = f.created_at.format("%Y-%m-%d %H:%M").to_string();
+                let preview = if f.content.len() > 40 {
+                    format!("{}…", &f.content[..39])
+                } else {
+                    f.content.clone()
+                };
+                println!("{:<38} {:<24} {}", f.id, ts, preview);
+            }
+        }
+
+        MemoryAction::Add { content } => {
+            use pond_core::domain::memory::MemoryFragment;
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let fragment = MemoryFragment {
+                id: id.clone(),
+                profile_id: None,
+                session_id: None,
+                content: content.clone(),
+                embedding: None,
+                source: "cli".to_string(),
+                tags: vec![],
+                created_at: chrono::Utc::now(),
+            };
+            repo.add(fragment).await?;
+            println!("✓ Memory saved (id: {id})");
+        }
+
+        MemoryAction::Remove { id } => {
+            repo.delete(&id).await?;
+            println!("✓ Memory {id} deleted.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── category_to_provider ──────────────────────────────────────────────────
+
+    #[test]
+    fn ollama_category_maps_to_ollama_provider() {
+        assert_eq!(category_to_provider("ollama"), "ollama");
+    }
+
+    #[test]
+    fn gguf_category_maps_to_local_provider() {
+        assert_eq!(category_to_provider("gguf"), "local");
+    }
+
+    #[test]
+    fn llamafile_category_maps_to_llamafile_provider() {
+        assert_eq!(category_to_provider("llamafile"), "llamafile");
+    }
+
+    #[test]
+    fn unknown_category_defaults_to_llamafile() {
+        assert_eq!(category_to_provider("tts_piper"), "llamafile");
+        assert_eq!(category_to_provider("whisper"),   "llamafile");
+        assert_eq!(category_to_provider("unknown"),   "llamafile");
+    }
+
+    // ── sync_assignments_to_settings ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sync_ollama_chat_assignment_updates_settings() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id:               "ollama/llama3.2".to_string(),
+            category:         ModelCategory::Ollama,
+            name:             "llama3.2".to_string(),
+            filename:         None,
+            description:      "Ollama Llama 3.2".to_string(),
+            size_mb:          0,
+            url:              None,
+            hf_id:            None, ram_estimate_mb: None, recommended_role: None,
+            context_length:   None, quantization: None, asr_language: None,
+            asr_size:         None, tts_engine: None, tts_voice_name: None,
+            config_filename:  None, config_url: None, tts_url: None,
+            sample_rate:      None, downloaded: true, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("chat", "ollama/llama3.2").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "ollama");
+        assert_eq!(settings.chat_model,    "llama3.2");
+    }
+
+    #[tokio::test]
+    async fn sync_gguf_chat_assignment_sets_local_provider() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id:               "gguf/llama-3b".to_string(),
+            category:         ModelCategory::Gguf,
+            name:             "llama-3b".to_string(),
+            filename:         Some("llama-3b.gguf".to_string()),
+            description:      "GGUF Llama 3B".to_string(),
+            size_mb:          2000,
+            url:              Some("https://example.com/llama-3b.gguf".to_string()),
+            hf_id:            None, ram_estimate_mb: Some(3000), recommended_role: None,
+            context_length:   None, quantization: Some("Q4_K_M".to_string()),
+            asr_language:     None, asr_size: None, tts_engine: None, tts_voice_name: None,
+            config_filename:  None, config_url: None, tts_url: None,
+            sample_rate:      None, downloaded: false, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("chat", "gguf/llama-3b").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "local",    "gguf category should map to 'local' provider");
+        assert_eq!(settings.chat_model,    "llama-3b", "model name should be extracted from id");
+    }
+
+    #[tokio::test]
+    async fn sync_think_and_task_roles_are_also_synced() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db  = Database::init(tmp.path()).await.unwrap();
+        let repo          = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id: "ollama/gemma2".to_string(), category: ModelCategory::Ollama,
+            name: "gemma2".to_string(), filename: None,
+            description: String::new(), size_mb: 0, url: None,
+            hf_id: None, ram_estimate_mb: None, recommended_role: None,
+            context_length: None, quantization: None, asr_language: None,
+            asr_size: None, tts_engine: None, tts_voice_name: None,
+            config_filename: None, config_url: None, tts_url: None,
+            sample_rate: None, downloaded: true, is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("think", "ollama/gemma2").await.unwrap();
+        repo.set_assignment("task",  "ollama/gemma2").await.unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.think_provider.as_deref(), Some("ollama"));
+        assert_eq!(settings.think_model.as_deref(),    Some("gemma2"));
+        assert_eq!(settings.task_provider.as_deref(),  Some("ollama"));
+        assert_eq!(settings.task_model.as_deref(),     Some("gemma2"));
+    }
 }

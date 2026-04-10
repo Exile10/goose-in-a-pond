@@ -16,7 +16,7 @@ impl<R: OnboardingRepository> OnboardingService<R> {
 
     /// Start onboarding
     pub async fn start(&self) -> Result<()> {
-        self.repo.save_step(OnboardingStep::VerifyDevice).await?;
+        self.repo.save_step(OnboardingStep::Welcome).await?;
         Ok(())
     }
 
@@ -82,7 +82,7 @@ mod tests {
     async fn start_sets_initial_step() -> Result<()> {
         let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
-        assert_eq!(service.status().await, Some(OnboardingStep::VerifyDevice));
+        assert_eq!(service.status().await, Some(OnboardingStep::Welcome));
         Ok(())
     }
 
@@ -98,7 +98,7 @@ mod tests {
         let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
         service.advance().await?;
-        assert_eq!(service.status().await, Some(OnboardingStep::CreateProfile));
+        assert_eq!(service.status().await, Some(OnboardingStep::Basics));
         Ok(())
     }
 
@@ -106,10 +106,11 @@ mod tests {
     async fn advance_through_all_steps_reaches_completed() -> Result<()> {
         let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
-        service.advance().await?;
-        service.advance().await?;
-        service.advance().await?;
-        service.advance().await?;
+        // 9 advances: Welcome→Basics→Location→Accessibility→Personality
+        //             →GooseIdentity→WakeWord→Model→Extensions→Completed
+        for _ in 0..9 {
+            service.advance().await?;
+        }
         assert_eq!(service.status().await, Some(OnboardingStep::Completed));
         Ok(())
     }
@@ -145,10 +146,9 @@ mod tests {
     async fn status_is_complete_after_all_steps() -> Result<()> {
         let service = OnboardingService::new(MockRepo::new());
         service.start().await?;
-        service.advance().await?;
-        service.advance().await?;
-        service.advance().await?;
-        service.advance().await?;
+        for _ in 0..9 {
+            service.advance().await?;
+        }
         assert_eq!(service.status().await, Some(OnboardingStep::Completed));
         Ok(())
     }

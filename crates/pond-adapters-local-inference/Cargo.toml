@@ -1,0 +1,32 @@
+[package]
+name = "pond-adapters-local-inference"
+description = "In-process GGUF inference via Goose's LocalInferenceProvider (no external LLM server required)"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# ── Build note ────────────────────────────────────────────────────────────────
+# This crate compiles llama-cpp-2 + candle (heavy C++ / Rust ML libs).
+# First compile takes 5–15 min. Metal (macOS) activates automatically via
+# llama-cpp-2's target_os cfg. CUDA (Jetson) requires --features cuda.
+#
+# To build:
+#   cargo build -p pond-adapters-local-inference
+#   cargo build -p pond-adapters-local-inference --features cuda   # Jetson
+
+[features]
+default = []
+# Enable CUDA kernel compilation for Jetson Orin Nano / NVIDIA GPUs.
+cuda = ["goose/cuda"]
+
+[dependencies]
+pond-core            = { workspace = true }
+pond-adapters-goose  = { path = "../pond-adapters-goose" }
+goose                = { path = "../../goose/crates/goose", default-features = false,
+                         features = ["local-inference", "rustls-tls"] }
+anyhow               = { workspace = true }
+async-trait          = { workspace = true }
+tokio                = { workspace = true }
+uuid                 = { workspace = true }
+tracing              = { workspace = true }

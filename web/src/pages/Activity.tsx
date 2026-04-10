@@ -1,6 +1,10 @@
 import ActivityFeed from '../components/ActivityFeed'
 
-export default function Activity() {
+interface Props {
+  token: string
+}
+
+export default function Activity({ token }: Props) {
   return (
     <div className="db-page">
       <div className="db-page-header">
@@ -8,7 +12,7 @@ export default function Activity() {
         <p className="db-page-subtitle">A log of messages sent and device events.</p>
       </div>
       <div className="db-page-content">
-        <ActivityFeed />
+        <ActivityFeed token={token} />
       </div>
     </div>
   )
