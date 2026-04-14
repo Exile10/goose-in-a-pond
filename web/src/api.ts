@@ -236,7 +236,11 @@ export interface MemoryFragment {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async function postReq<T>(path: string, body: unknown, token?: string): Promise<T> {
+function handleUnauthorized() {
+  window.dispatchEvent(new CustomEvent('pond-unauthorized'))
+}
+
+async function post<T>(path: string, body: unknown, token?: string): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
@@ -246,6 +250,7 @@ async function postReq<T>(path: string, body: unknown, token?: string): Promise<
     body: JSON.stringify(body),
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
@@ -264,6 +269,7 @@ async function putReq<T>(path: string, body: unknown, token: string): Promise<T>
     body: JSON.stringify(body),
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
@@ -291,6 +297,7 @@ async function deleteReq<T>(path: string, token: string): Promise<T> {
     headers: { 'Authorization': `Bearer ${token}` },
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
