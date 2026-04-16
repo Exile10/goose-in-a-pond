@@ -47,9 +47,9 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SERVER_STARTING" });
     }).then((u) => unlisten.push(u));
 
-    // Global summon hotkey (voice mode trigger)
+    // Global voice activation hotkey
     listen("desktop-summon", () => {
-      dispatch({ type: "INCREMENT_SUMMON" });
+      dispatch({ type: "VOICE_ACTIVATE" });
     }).then((u) => unlisten.push(u));
 
     // Recording lifecycle

@@ -80,7 +80,9 @@
   --orb-error:     #FF3B30;   /* red — error */
 
   /* ── Layout ─────────────────────────────────────────────── */
-  --sidebar-width:    220px;
+  --sidebar-width:           220px;
+  --sidebar-width-collapsed:  52px;
+  --sidebar-transition: width 200ms ease, min-width 200ms ease;
   --toolbar-height:    48px;
   --row-height-sm:     36px;
   --row-height-md:     44px;
