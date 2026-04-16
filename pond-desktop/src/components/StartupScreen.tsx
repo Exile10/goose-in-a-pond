@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import logoSrc from "../assets/logo.png";
 
 interface Props {
   onReady: () => void;
@@ -82,8 +83,8 @@ export function StartupScreen({ onReady }: Props) {
   return (
     <div style={styles.root}>
       <div style={styles.card}>
-        {/* Jarida goose mark */}
-        <div style={styles.logoMark}>🪿</div>
+        {/* Jarida logo */}
+        <img src={logoSrc} alt="Goose In A Pond" style={styles.logoMark} />
 
         <h1 style={styles.title}>Goose In A Pond</h1>
         <p style={styles.subtitle}>by Jarida Open Source</p>
@@ -136,8 +137,9 @@ const styles: Record<string, React.CSSProperties> = {
     width: "340px",
   },
   logoMark: {
-    fontSize: "52px",
-    lineHeight: "1",
+    width: "96px",
+    height: "96px",
+    objectFit: "contain",
     marginBottom: "4px",
   },
   title: {
