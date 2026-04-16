@@ -19,12 +19,16 @@ export function StartupScreen({ onReady }: Props) {
     setPhase("starting");
     setError(null);
 
-    try {
-      await invoke("ensure_server_running");
-    } catch (e) {
-      // The command may fail if no binary is found — we still try polling
-      // in case the user has a manually running server.
-      console.warn("[GIAP] ensure_server_running error:", e);
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+    if (isTauri) {
+      try {
+        await invoke("ensure_server_running");
+      } catch (e) {
+        // The command may fail if no binary is found — we still try polling
+        // in case the user has a manually running server.
+        console.warn("[GIAP] ensure_server_running error:", e);
+      }
     }
 
     setPhase("connecting");
@@ -32,6 +36,8 @@ export function StartupScreen({ onReady }: Props) {
     // Poll health endpoint
     for (let i = 0; i < MAX_POLLS; i++) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      if (!isTauri) break; // In browser dev, don't poll forever
+
       try {
         const healthy = await invoke<boolean>("server_health");
         if (healthy) {
@@ -47,7 +53,11 @@ export function StartupScreen({ onReady }: Props) {
     }
 
     setPhase("error");
-    setError("Could not connect to pond-server within 30 seconds.");
+    setError(
+      isTauri
+        ? "Could not connect to pond-server within 30 seconds."
+        : "Not running inside Tauri. Launch via `npm run tauri dev`."
+    );
   }, [onReady]);
 
   // Animated dots

@@ -9,7 +9,7 @@ import { AppContextProvider } from "./state/AppContext";
 import { App } from "./App";
 
 function Root() {
-  const [ready, setReady] = useState(true); // DEV BYPASS
+  const [ready, setReady] = useState(false);
 
   if (!ready) {
     return <StartupScreen onReady={() => setReady(true)} />;
