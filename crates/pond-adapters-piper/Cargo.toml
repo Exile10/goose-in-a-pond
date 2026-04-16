@@ -14,3 +14,7 @@ tracing     = { workspace = true }
 # rodio is isolated here — not added to workspace deps to avoid pulling
 # audio playback into every crate.
 rodio = "0.19"
+
+[dev-dependencies]
+pond-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
