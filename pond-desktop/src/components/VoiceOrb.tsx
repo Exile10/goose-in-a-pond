@@ -24,7 +24,7 @@ const STATE_COLORS: Record<VoiceState, string> = {
 };
 
 const STATE_LABELS: Record<VoiceState, string> = {
-  idle:      "Idle",
+  idle:      "Ready",
   recording: "Listening",
   thinking:  "Thinking",
   speaking:  "Speaking",
@@ -57,9 +57,9 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
       const cy = px / 2;
       const baseRadius = px * 0.36;
 
-      // Outer glow ring (animated for active states)
+      // Outer glow ring (animated for active states) — solid concentric circles, no gradient
       if (state !== "idle") {
-        const glowAlpha =
+        const glowIntensity =
           state === "recording"
             ? 0.18 + audioLevel * 0.22
             : state === "thinking"
@@ -70,13 +70,19 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
             ? baseRadius * (1.35 + audioLevel * 0.25)
             : baseRadius * 1.35;
 
-        const grad = ctx.createRadialGradient(cx, cy, baseRadius * 0.8, cx, cy, glowRadius * 1.3);
-        grad.addColorStop(0, color + Math.round(glowAlpha * 255).toString(16).padStart(2, "0"));
-        grad.addColorStop(1, color + "00");
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, glowRadius * 1.3, 0, Math.PI * 2);
-        ctx.fill();
+        // Three concentric circles at decreasing opacity (outer → inner)
+        const glowLayers = [
+          { r: glowRadius * 1.4,  alpha: Math.round(glowIntensity * 0.40 * 255) },
+          { r: glowRadius * 1.15, alpha: Math.round(glowIntensity * 0.65 * 255) },
+          { r: glowRadius * 0.95, alpha: Math.round(glowIntensity * 1.00 * 255) },
+        ];
+        for (const layer of glowLayers) {
+          const alphaHex = Math.min(255, layer.alpha).toString(16).padStart(2, "0");
+          ctx.fillStyle = color + alphaHex;
+          ctx.beginPath();
+          ctx.arc(cx, cy, layer.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
 
       // Ripple ring for thinking / speaking
@@ -91,20 +97,16 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
         ctx.stroke();
       }
 
-      // Main orb
-      const mainGrad = ctx.createRadialGradient(
-        cx - baseRadius * 0.2,
-        cy - baseRadius * 0.2,
-        baseRadius * 0.1,
-        cx,
-        cy,
-        baseRadius,
-      );
-      mainGrad.addColorStop(0, lighten(color, 0.35));
-      mainGrad.addColorStop(1, color);
-      ctx.fillStyle = mainGrad;
+      // Main orb — solid base + smaller offset highlight circle (no gradient)
+      ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Inner highlight circle — lighter solid color, offset top-left
+      ctx.fillStyle = solidLighten(color, 0.30);
+      ctx.beginPath();
+      ctx.arc(cx - baseRadius * 0.18, cy - baseRadius * 0.18, baseRadius * 0.45, 0, Math.PI * 2);
       ctx.fill();
 
       // Audio level bars for recording state
@@ -170,7 +172,7 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
   );
 }
 
-function lighten(hex: string, amount: number): string {
+function solidLighten(hex: string, amount: number): string {
   const n = parseInt(hex.slice(1), 16);
   const r = Math.min(255, ((n >> 16) & 0xff) + Math.round(255 * amount));
   const g = Math.min(255, ((n >> 8) & 0xff) + Math.round(255 * amount));

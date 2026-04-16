@@ -57,5 +57,5 @@ const styles: Record<string, React.CSSProperties> = {
   table: { width: "100%", borderCollapse: "collapse" as const },
   th: { textAlign: "left" as const, fontFamily: "var(--font-display)", fontWeight: 600, fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", textTransform: "uppercase" as const, letterSpacing: "0.05em", padding: "var(--space-2) var(--space-3)", borderBottom: "1px solid var(--color-border)" },
   tr: { borderBottom: "1px solid var(--color-border)" },
-  td: { padding: "var(--space-3)", fontSize: "var(--text-base)", color: "var(--color-text)", height: "var(--row-height-md)", verticalAlign: "middle" as const },
+  td: { padding: "var(--space-3) var(--space-4)", fontSize: "var(--text-base)", color: "var(--color-text)", height: "48px", verticalAlign: "middle" as const },
 };

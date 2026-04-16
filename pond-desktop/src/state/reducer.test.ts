@@ -28,7 +28,7 @@ const BASE: AppState = {
   voiceError: null,
   transcript: [],
   contextCards: [],
-  summonRequestId: 0,
+  voiceRequestId: 0,
 };
 
 function msg(overrides?: Partial<TranscriptMessage>): TranscriptMessage {
@@ -181,12 +181,12 @@ describe("reducer — context cards", () => {
   });
 });
 
-describe("reducer — summon", () => {
-  it("INCREMENT_SUMMON increments the counter", () => {
-    const s1 = reducer(BASE, { type: "INCREMENT_SUMMON" });
-    expect(s1.summonRequestId).toBe(1);
-    const s2 = reducer(s1, { type: "INCREMENT_SUMMON" });
-    expect(s2.summonRequestId).toBe(2);
+describe("reducer — voice activation", () => {
+  it("VOICE_ACTIVATE increments the counter", () => {
+    const s1 = reducer(BASE, { type: "VOICE_ACTIVATE" });
+    expect(s1.voiceRequestId).toBe(1);
+    const s2 = reducer(s1, { type: "VOICE_ACTIVATE" });
+    expect(s2.voiceRequestId).toBe(2);
   });
 });
 

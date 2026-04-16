@@ -1,12 +1,12 @@
-export type SummonDecision = "start-recording" | "stop-and-send" | "noop";
+export type VoiceDecision = "start-recording" | "stop-and-send" | "noop";
 
-export interface SummonDecisionInput {
+export interface VoiceDecisionInput {
   serverHealthy: boolean;
   isRecording: boolean;
   isProcessing: boolean;
 }
 
-export function resolveSummonDecision(input: SummonDecisionInput): SummonDecision {
+export function resolveVoiceDecision(input: VoiceDecisionInput): VoiceDecision {
   if (!input.serverHealthy) {
     return "noop";
   }

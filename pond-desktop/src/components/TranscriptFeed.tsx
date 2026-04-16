@@ -19,7 +19,7 @@ export function TranscriptFeed({ messages, maxHeight = "200px", compact = false 
     return (
       <div style={{ ...styles.root, maxHeight }}>
         <p style={styles.empty}>
-          {compact ? "Say something…" : "No messages yet. Summon Pond to start."}
+          {compact ? "Say something…" : "No messages yet. Start listening to begin."}
         </p>
       </div>
     );

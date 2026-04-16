@@ -72,7 +72,7 @@ const styles: Record<string, React.CSSProperties> = {
   error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
   hint: { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 },
   list: { listStyle: "none", display: "flex", flexDirection: "column", gap: "4px" },
-  item: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)" },
+  item: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", minHeight: "48px" },
   toggleBtn: { width: "28px", height: "28px", borderRadius: "50%", border: "1px solid var(--color-border-strong)", cursor: "pointer", fontSize: "16px", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
   skillName: { margin: 0, fontSize: "var(--text-base)", fontWeight: 600, color: "var(--color-text)" },
   skillContent: { margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-secondary)" },

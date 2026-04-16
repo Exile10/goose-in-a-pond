@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { resolveSummonDecision } from "./voiceSummon";
+import { resolveVoiceDecision } from "./voiceSummon";
 
-describe("voiceSummon", () => {
+describe("resolveVoiceDecision", () => {
   it("returns noop when server is offline", () => {
     expect(
-      resolveSummonDecision({
+      resolveVoiceDecision({
         serverHealthy: false,
         isRecording: false,
         isProcessing: false,
@@ -14,7 +14,7 @@ describe("voiceSummon", () => {
 
   it("returns stop-and-send when currently recording", () => {
     expect(
-      resolveSummonDecision({
+      resolveVoiceDecision({
         serverHealthy: true,
         isRecording: true,
         isProcessing: false,
@@ -24,7 +24,7 @@ describe("voiceSummon", () => {
 
   it("returns noop when already processing", () => {
     expect(
-      resolveSummonDecision({
+      resolveVoiceDecision({
         serverHealthy: true,
         isRecording: false,
         isProcessing: true,
@@ -34,7 +34,7 @@ describe("voiceSummon", () => {
 
   it("returns start-recording when healthy and idle", () => {
     expect(
-      resolveSummonDecision({
+      resolveVoiceDecision({
         serverHealthy: true,
         isRecording: false,
         isProcessing: false,
