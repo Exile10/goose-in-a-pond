@@ -1,129 +1,71 @@
-# Goose-in-a-pond
+# Goose In A Pond — Documentation
 
-**Goose In A Pond** is a privacy-first, fully local, agentic smart home assistant built on an open, modular architecture. It runs entirely on edge hardware, giving users full control over their data, devices, and automation, without mandatory cloud dependency.
-
----
-
-##  Problem
-
-Modern smart home assistants are:
-
-- Cloud-dependent  
-- Vendor-controlled  
-- Limited in customization  
-- Weak on privacy  
-- Locked into proprietary ecosystems  
-
-Users sacrifice control and data ownership for convenience.
+Welcome to the GIAP documentation. This index covers architecture, development guides, and contribution workflows.
 
 ---
 
-##  Solution
+## Architecture
 
-Goose In A Pond delivers:
-
--  Local AI inference (no required cloud)
--  Privacy-first architecture
--  Modular multi-agent system
--  Companion mobile integration
--  Extensible open-source framework
-
-The system is designed to run on edge AI hardware and operate fully offline while remaining customizable and developer-friendly.
+| Document | Description |
+|---|---|
+| [Component Breakdown](./architecture/components.md) | Purpose and structure of every crate in `crates/` and `pond-desktop/` |
+| [Data Flow & Lifecycle](./architecture/data_flow.md) | How a chat request travels from HTTP → Core → Goose → response |
+| [Visual Workflow](./architecture/visual_workflow.md) | Flowcharts and sequence diagrams using the Weather feature as an example |
+| [Data Pipeline](./architecture/data_pipeline.md) | Constrained inference architecture for edge hardware (Jetson Orin Nano) |
 
 ---
 
-## 📚 Development & Documentation
+## Developer Guides
 
-### Core Concepts
-- **[Architecture Overview](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/overview.md)**: Deep dive into the Hexagonal (Ports & Adapters) design.
-- **[Component Breakdown](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/components.md)**: Detailed purpose of each crate in `crates/`.
-- **[Data Flow & Lifecycle](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/architecture/data_flow.md)**: How requests travel through the system.
-
-### Guides
-- **[Developer Tutorial: Clean Code & Dependencies](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/developer/clean_code_and_dependencies.md)**: How to add libraries and maintain modularity.
-- **[TDD Guide](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/testing/tdd_guide.md)**: Writing unit and integration tests in the Pond.
-- **[Contributing Guide](file:///C:/Users/jerry/Documents/Jarida/GrantApps/goose-in-a-pond/docs/CONTRIBUTING.md)**: Workflow for contributing to the project.
+| Document | Description |
+|---|---|
+| [Creating Ports & Adapters](../docs/creating-ports-and-adapters.md) | Step-by-step guide for adding new capabilities while keeping the Core pure |
+| [TDD Guide](./testing/tdd_guide.md) | Test-driven development practices — Core mocks first, then real adapters |
+| [Onboarding System](./Onboarding_Doc/Onboarding_guide.md) | Multi-step device onboarding flow and API protection |
 
 ---
 
-##  Key Features
+## Contributing
 
-- **Offline Voice Assistant** (wake word + local speech processing)
-- **Smart Device Control** (SDK & SDK-less integration)
-- **Modular Architecture** (OS layer, shell layer, optional GUI)
-- **Persistent Local Memory**
-- **Self-Improving Agent System**
-- **Mobile Companion App (“Goose On The Go”)**
-- **Cross-Platform Support** (Linux, Windows, macOS, Android)
+| Document | Description |
+|---|---|
+| [Contributing Guide](./CONTRIBUTING.md) | Fork, branch, test, and PR workflow |
 
 ---
 
-##  Extensibility
+## Key Concepts
 
-Built with a modular capability protocol (MCP) system that allows:
+### Hexagonal Architecture (Ports & Adapters)
 
-- Vision detection modules
-- Sensor aggregators
-- Routine schedulers
-- Privacy auditing tools
-- Inter-agent coordination
-- Additional community-built extensions
+The `pond-core` crate contains all domain logic. It never imports from Goose, SQLx, or Axum. Everything external is hidden behind a `trait` (a **port**). Concrete implementations (**adapters**) live in separate crates and are injected at startup in `pond-server/src/main.rs`.
 
----
+This means:
+- You can test all business logic with zero database or network setup
+- Swapping LLM backends, databases, or voice engines requires no core changes
+- The domain compiles and tests in seconds, not minutes
 
-## Roadmap
+### The Agent Loop
 
-- Smart device integration
-- Enhanced self-learning agent capabilities
-- Security system integration
-- Public open-source release
-
----
-
-##  Vision
-
-To democratize personal AI by making intelligent, private, and locally controlled smart home systems accessible to everyone.
-
----
-
-##  Contributing
-
-We welcome open-source developers, AI engineers, embedded systems developers, mobile developers, and security researchers.
-
-Fork the repo, open issues, and submit pull requests.
-
-Check out the [`contributing guidelines`](./Contributing.md). 
-
----
-
-## Licenses
-
-Goose In a Pond is licensed under the **Apache License, Version 2.0** [![Apache License 2.0][apache-shield]][apache]
-
-[apache]: https://www.apache.org/licenses/LICENSE-2.0
-[apache-shield]: https://img.shields.io/badge/License-Apache%202.0-blue.svg
-
-You may use, modify, and distribute this project, including for commercial purposes, provided you comply with the license terms.
-
-See the full license in the [`LICENSE`](./LICENSE) file.
-
-
-This project is also licensed under the **Creative Commons Attribution 4.0** [CC by 4.0](http://creativecommons.org/licenses/by/4.0/).
-[![CC BY 4.0][cc-by-shield]][cc-by]
-
-[cc-by]: http://creativecommons.org/licenses/by/4.0/
-[cc-by-shield]: https://licensebuttons.net/l/by/4.0/88x31.png
-
-You are free to share and adapt the material for any purpose, even commercially, as long as appropriate credit is given.
-
-## Attribution
-If you redistribute or use Goose In a Pond, include:
+`pond-core::services::chat::ChatService::run_loop()` implements the four-state machine:
 
 ```
-This product includes software developed by the Goose In a Pond contributors
-and licensed under the Apache License, Version 2.0 and CC BY 4.0.
+Wait (wake word) → Listen (ASR) → Think (LLM via Goose) → Speak (TTS)
 ```
 
+In production, all inference routes through `GooseAdapter` which wraps Block's Goose agent, loads prompt templates, injects memory and user skills, and manages the MCP extension lifecycle.
 
+### GIAP as a Goose MCP Extension
 
+GIAP exposes 9 MCP tools to the Goose agent under the `giap__` prefix:
 
+| Tool | Description |
+|---|---|
+| `giap__get_current_weather` | Open-Meteo weather lookup |
+| `giap__list_registered_devices` | Device registry query |
+| `giap__list_schedules` | Cron task listing |
+| `giap__get_user_profile` | User name, timezone, location |
+| `giap__get_model_assignments` | Current LLM role assignments |
+| `giap__recall_memories` | Search memory fragments |
+| `giap__save_memory` | Persist a memory fragment |
+| `giap__get_recipe` | Fetch a Goose recipe YAML |
+| `giap__list_skills` | List active user skills |
