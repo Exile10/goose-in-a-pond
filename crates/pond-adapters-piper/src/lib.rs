@@ -69,7 +69,11 @@ impl PiperOutput {
         self
     }
 
-    /// Assemble the piper command arguments (useful for tests without a real binary).
+    /// Assemble the piper command arguments.
+    ///
+    /// Exposed for integration tests that verify builder configuration without
+    /// running a real piper binary. Not part of the stable public API.
+    #[doc(hidden)]
     pub fn build_args(&self) -> Vec<String> {
         let mut args = vec![
             "--model".to_string(),
