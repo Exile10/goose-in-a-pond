@@ -11,7 +11,7 @@ export function Prompts() {
   const [error, setError]     = useState<string | null>(null);
 
   useEffect(() => {
-    api.listPrompts().then((p) => { setPrompts(p); if (p.length) select(p[0].name); })
+    api.listPrompts().then((p) => { const list = Array.isArray(p) ? p : []; setPrompts(list); if (list.length) select(list[0].name); })
       .catch((e) => setError(String(e))).finally(() => setLoading(false));
   }, []);
 

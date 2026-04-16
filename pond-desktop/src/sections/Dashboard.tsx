@@ -79,7 +79,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "var(--color-bg)",
     border: "1px solid var(--color-border)",
     borderRadius: "var(--radius-lg)",
-    padding: "var(--space-5)",
+    padding: "var(--space-4)",
     display: "flex",
     flexDirection: "column",
     gap: "var(--space-3)",

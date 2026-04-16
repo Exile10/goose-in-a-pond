@@ -34,7 +34,7 @@ export interface AppState {
   voiceError: string | null;
   transcript: TranscriptMessage[];
   contextCards: ContextCard[];
-  summonRequestId: number;
+  voiceRequestId: number;
 }
 
 export type AppAction =
@@ -52,7 +52,7 @@ export type AppAction =
   | { type: "CLEAR_TRANSCRIPT" }
   | { type: "PUSH_CONTEXT_CARD"; payload: ContextCard }
   | { type: "CLEAR_CONTEXT_CARDS" }
-  | { type: "INCREMENT_SUMMON" };
+  | { type: "VOICE_ACTIVATE" };
 
 let _transcriptIdCounter = 0;
 let _cardIdCounter = 0;
@@ -76,7 +76,7 @@ export function buildInitialState(): AppState {
     voiceError: null,
     transcript: [],
     contextCards: [],
-    summonRequestId: 0,
+    voiceRequestId: 0,
   };
 }
 
@@ -154,8 +154,8 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "CLEAR_CONTEXT_CARDS":
       return { ...state, contextCards: [] };
 
-    case "INCREMENT_SUMMON":
-      return { ...state, summonRequestId: state.summonRequestId + 1 };
+    case "VOICE_ACTIVATE":
+      return { ...state, voiceRequestId: state.voiceRequestId + 1 };
 
     default:
       return state;

@@ -11,24 +11,59 @@ export interface HealthResponse {
 
 // ── Settings ─────────────────────────────────────────────────
 export interface Settings {
+  // Identity
+  primary_profile_id?: string | null;
   assistant_name: string;
   user_name: string;
-  location?: string;
+  assistant_personality?: string;
+  location?: string;       // legacy alias
+  personality?: string;    // legacy alias
   timezone?: string;
-  personality?: string;
-  prompt_style: string;
-  custom_system_prompt?: string;
-  prompt_addendum?: string;
+
+  // Voice pipeline
+  voice_wake_word?: string;
+  wake_word?: string;      // legacy alias
+  voice_recording_duration_secs?: number;
+  voice_whisper_url?: string;
+  active_whisper_model?: string;
+  active_tts_model?: string;
+  voice_tts_voice?: string;
+
+  // Model roles
   chat_provider?: string;
   chat_model?: string;
-  think_provider?: string;
-  think_model?: string;
-  task_provider?: string;
-  task_model?: string;
-  wake_word?: string;
+  think_provider?: string | null;
+  think_model?: string | null;
+  task_provider?: string | null;
+  task_model?: string | null;
+  llm_provider?: string;
+  llm_temperature?: number;
+  llm_max_tokens?: number;
+  active_llm_model?: string;
+
+  // Prompts
+  prompt_style: string;
+  custom_system_prompt?: string | null;
+  prompt_addendum?: string;
+
+  // Location / Weather
+  weather_enabled?: boolean;
+  weather_location_name?: string;
+  weather_latitude?: number;
+  weather_longitude?: number;
+  lat?: number;  // legacy alias
+  lon?: number;  // legacy alias
+
+  // Agent behaviour
+  agent_goose_mode?: string;
+  agent_max_turns?: number;
   agent_memory_inject: boolean;
-  lat?: number;
-  lon?: number;
+  agent_memory_limit?: number;
+
+  // Data retention
+  retention_event_log_days?: number;
+  retention_sensor_days?: number;
+  retention_session_messages_keep?: number;
 }
 
 // ── Devices ───────────────────────────────────────────────────
