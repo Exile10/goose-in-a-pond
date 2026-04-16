@@ -30,6 +30,10 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const unlisten: Array<() => void> = [];
 
+    // Guard: Tauri IPC may not be available in non-Tauri environments (browser dev, tests)
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!isTauri) return;
+
     // Server online/offline status
     listen<boolean>("server-status", (e) => {
       if (e.payload) {

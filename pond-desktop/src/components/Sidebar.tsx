@@ -2,6 +2,7 @@ import { type JSX } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
+import logoSrc from "../assets/logo.png";
 
 // ── Inline SVG Icons ─────────────────────────────────────────────────────────
 
@@ -95,7 +96,7 @@ export function Sidebar() {
     <aside style={styles.sidebar} aria-label="Navigation">
       {/* Brand */}
       <div style={styles.brand}>
-        <span style={styles.brandEmoji}>🪿</span>
+        <img src={logoSrc} alt="" style={styles.brandLogo} aria-hidden="true" />
         <span style={styles.brandName}>Goose In A Pond</span>
       </div>
 
@@ -189,9 +190,10 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "16px 12px 12px",
     userSelect: "none",
   },
-  brandEmoji: {
-    fontSize: "20px",
-    lineHeight: "1",
+  brandLogo: {
+    width: "28px",
+    height: "28px",
+    objectFit: "contain",
     flexShrink: 0,
   },
   brandName: {

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import logoSrc from "../assets/logo.png";
 
 interface Props {
   onReady: () => void;
@@ -19,12 +20,16 @@ export function StartupScreen({ onReady }: Props) {
     setPhase("starting");
     setError(null);
 
-    try {
-      await invoke("ensure_server_running");
-    } catch (e) {
-      // The command may fail if no binary is found — we still try polling
-      // in case the user has a manually running server.
-      console.warn("[GIAP] ensure_server_running error:", e);
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+    if (isTauri) {
+      try {
+        await invoke("ensure_server_running");
+      } catch (e) {
+        // The command may fail if no binary is found — we still try polling
+        // in case the user has a manually running server.
+        console.warn("[GIAP] ensure_server_running error:", e);
+      }
     }
 
     setPhase("connecting");
@@ -32,6 +37,8 @@ export function StartupScreen({ onReady }: Props) {
     // Poll health endpoint
     for (let i = 0; i < MAX_POLLS; i++) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      if (!isTauri) break; // In browser dev, don't poll forever
+
       try {
         const healthy = await invoke<boolean>("server_health");
         if (healthy) {
@@ -47,7 +54,11 @@ export function StartupScreen({ onReady }: Props) {
     }
 
     setPhase("error");
-    setError("Could not connect to pond-server within 30 seconds.");
+    setError(
+      isTauri
+        ? "Could not connect to pond-server within 30 seconds."
+        : "Not running inside Tauri. Launch via `npm run tauri dev`."
+    );
   }, [onReady]);
 
   // Animated dots
@@ -72,8 +83,8 @@ export function StartupScreen({ onReady }: Props) {
   return (
     <div style={styles.root}>
       <div style={styles.card}>
-        {/* Jarida goose mark */}
-        <div style={styles.logoMark}>🪿</div>
+        {/* Jarida logo */}
+        <img src={logoSrc} alt="Goose In A Pond" style={styles.logoMark} />
 
         <h1 style={styles.title}>Goose In A Pond</h1>
         <p style={styles.subtitle}>by Jarida Open Source</p>
@@ -126,8 +137,9 @@ const styles: Record<string, React.CSSProperties> = {
     width: "340px",
   },
   logoMark: {
-    fontSize: "52px",
-    lineHeight: "1",
+    width: "96px",
+    height: "96px",
+    objectFit: "contain",
     marginBottom: "4px",
   },
   title: {
