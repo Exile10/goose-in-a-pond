@@ -60,7 +60,7 @@ const styles: Record<string, React.CSSProperties> = {
   error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
   hint: { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 },
   list: { listStyle: "none", display: "flex", flexDirection: "column", gap: "4px" },
-  item: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)" },
+  item: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", minHeight: "48px" },
   content: { flex: 1, fontSize: "var(--text-base)", color: "var(--color-text)", userSelect: "text" as const },
   date: { fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)", flexShrink: 0 },
   del: { background: "none", border: "none", cursor: "pointer", color: "var(--color-text-tertiary)", fontSize: "18px", padding: "0 4px", borderRadius: "4px", lineHeight: "1", flexShrink: 0 },

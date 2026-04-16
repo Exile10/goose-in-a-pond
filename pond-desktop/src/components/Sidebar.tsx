@@ -1,4 +1,4 @@
-import { type JSX } from "react";
+import { useState, useEffect, type JSX } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
@@ -73,11 +73,50 @@ function NavIcon({ name }: { name: string }) {
   return icons[name] ?? <span style={{ width: 16, height: 16, display: "inline-block" }} />;
 }
 
+// Chevron icons
+function ChevronRight() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M4 2l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+function ChevronLeft() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M8 2L4 6l4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
 // ── Sidebar Component ─────────────────────────────────────────────────────────
 
 export function Sidebar() {
   const state = useAppState();
   const dispatch = useAppDispatch();
+
+  // Initialize from localStorage; auto-collapse below 960px only if no explicit preference set
+  const [collapsed, setCollapsed] = useState<boolean>(
+    () => localStorage.getItem("pond_sidebar_collapsed") === "true"
+  );
+
+  // Auto-collapse on narrow windows (only when no explicit user preference)
+  useEffect(() => {
+    function onResize() {
+      if (window.innerWidth < 960 && !localStorage.getItem("pond_sidebar_collapsed")) {
+        setCollapsed(true);
+      }
+    }
+    window.addEventListener("resize", onResize);
+    onResize(); // check on mount
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  function toggleCollapsed() {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem("pond_sidebar_collapsed", String(next));
+  }
 
   function navigate(section: GuiSection) {
     dispatch({ type: "SET_SECTION", payload: section });
@@ -92,12 +131,25 @@ export function Sidebar() {
     try { await invoke("show_canvas"); } catch { /* ignore */ }
   }
 
+  const sidebarStyle: React.CSSProperties = {
+    width: collapsed ? "var(--sidebar-width-collapsed)" : "var(--sidebar-width)",
+    minWidth: collapsed ? "var(--sidebar-width-collapsed)" : "var(--sidebar-width)",
+    transition: "var(--sidebar-transition)",
+    height: "100%",
+    background: "var(--color-sidebar)",
+    borderRight: "1px solid var(--color-border)",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+    flexShrink: 0,
+  };
+
   return (
-    <aside style={styles.sidebar} aria-label="Navigation">
+    <aside style={sidebarStyle} aria-label="Navigation">
       {/* Brand */}
       <div style={styles.brand}>
         <img src={logoSrc} alt="" style={styles.brandLogo} aria-hidden="true" />
-        <span style={styles.brandName}>Goose In A Pond</span>
+        {!collapsed && <span style={styles.brandName}>Goose In A Pond</span>}
       </div>
 
       <hr style={styles.divider} />
@@ -106,7 +158,7 @@ export function Sidebar() {
       <nav style={styles.nav}>
         {SIDEBAR_GROUPS.map((group, gi) => (
           <div key={gi} style={styles.group}>
-            {group.label && (
+            {group.label && !collapsed && (
               <p style={styles.groupLabel}>{group.label}</p>
             )}
             {group.sections.map((item) => {
@@ -117,16 +169,20 @@ export function Sidebar() {
                   style={{
                     ...styles.navItem,
                     ...(active ? styles.navItemActive : {}),
+                    ...(collapsed ? styles.navItemCollapsed : {}),
                   }}
                   onClick={() => navigate(item.section)}
                   aria-current={active ? "page" : undefined}
+                  title={collapsed ? item.label : undefined}
                 >
-                  <span style={{ color: active ? "var(--color-accent)" : "var(--color-text-secondary)" }}>
+                  <span style={{ color: active ? "var(--color-accent)" : "var(--color-text-secondary)", flexShrink: 0 }}>
                     <NavIcon name={item.icon} />
                   </span>
-                  <span style={{ color: active ? "var(--color-accent)" : "var(--color-text)" }}>
-                    {item.label}
-                  </span>
+                  {!collapsed && (
+                    <span style={{ color: active ? "var(--color-accent)" : "var(--color-text)" }}>
+                      {item.label}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -137,58 +193,65 @@ export function Sidebar() {
       {/* Footer */}
       <div style={styles.footer}>
         <hr style={styles.divider} />
-        <div style={styles.serverStatus}>
+
+        {/* Server status */}
+        <div style={{ ...styles.serverStatus, justifyContent: collapsed ? "center" : "flex-start" }}>
           <span
             style={{
               ...styles.statusDot,
               background: state.serverOnline ? "var(--color-success)" : "var(--color-neutral)",
             }}
           />
-          <span style={styles.statusText}>
-            {state.serverOnline ? "Connected" : state.serverStarting ? "Starting…" : "Offline"}
-          </span>
+          {!collapsed && (
+            <span style={styles.statusText}>
+              {state.serverOnline ? "Connected" : state.serverStarting ? "Starting…" : "Offline"}
+            </span>
+          )}
         </div>
-        <div style={styles.modeButtons}>
+
+        {/* Mode buttons */}
+        <div style={{ ...styles.modeButtons, gap: collapsed ? "4px" : "4px", flexDirection: collapsed ? "column" : "row" }}>
           <button
-            style={styles.modeBtn}
+            style={{ ...styles.modeBtn, flex: collapsed ? undefined : 1 }}
             onClick={switchToVoice}
-            title="Switch to Voice mode"
+            title={collapsed ? "Switch to Voice mode" : "Switch to Voice mode"}
             aria-label="Voice mode"
           >
-            🎙 Voice
+            {collapsed ? "🎙" : "🎙 Voice"}
           </button>
           <button
-            style={styles.modeBtn}
+            style={{ ...styles.modeBtn, flex: collapsed ? undefined : 1 }}
             onClick={switchToCanvas}
-            title="Open Canvas overlay"
+            title={collapsed ? "Open Canvas overlay" : "Open Canvas overlay"}
             aria-label="Canvas mode"
           >
-            ✦ Canvas
+            {collapsed ? "✦" : "✦ Canvas"}
           </button>
         </div>
+
+        {/* Collapse/expand chevron toggle */}
+        <button
+          style={styles.chevronBtn}
+          onClick={toggleCollapsed}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? <ChevronRight /> : <ChevronLeft />}
+        </button>
       </div>
     </aside>
   );
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  sidebar: {
-    width: "var(--sidebar-width)",
-    minWidth: "var(--sidebar-width)",
-    height: "100%",
-    background: "var(--color-sidebar)",
-    borderRight: "1px solid var(--color-border)",
-    display: "flex",
-    flexDirection: "column",
-    overflow: "hidden",
-    flexShrink: 0,
-  },
   brand: {
     display: "flex",
     alignItems: "center",
     gap: "8px",
     padding: "16px 12px 12px",
     userSelect: "none",
+    overflow: "hidden",
+    flexShrink: 0,
   },
   brandLogo: {
     width: "28px",
@@ -202,15 +265,19 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "13px",
     color: "var(--color-text)",
     lineHeight: "1.3",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
   },
   divider: {
     border: "none",
     borderTop: "1px solid var(--color-border)",
     margin: 0,
+    flexShrink: 0,
   },
   nav: {
     flex: 1,
     overflowY: "auto",
+    overflowX: "hidden",
     padding: "8px 0",
     display: "flex",
     flexDirection: "column",
@@ -229,6 +296,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "8px 6px 4px",
     margin: 0,
     textTransform: "uppercase",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
   },
   navItem: {
     width: "100%",
@@ -247,6 +316,12 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "left",
     transition: "background var(--transition-fast)",
     userSelect: "none",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+  },
+  navItemCollapsed: {
+    justifyContent: "center",
+    padding: "0",
   },
   navItemActive: {
     background: "var(--color-accent-soft)",
@@ -257,12 +332,14 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     gap: "8px",
+    flexShrink: 0,
   },
   serverStatus: {
     display: "flex",
     alignItems: "center",
     gap: "6px",
     padding: "8px 12px 4px",
+    overflow: "hidden",
   },
   statusDot: {
     width: "7px",
@@ -274,14 +351,14 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: "var(--font-body)",
     fontSize: "var(--text-sm)",
     color: "var(--color-text-secondary)",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
   },
   modeButtons: {
     display: "flex",
-    gap: "4px",
     padding: "0 8px",
   },
   modeBtn: {
-    flex: 1,
     height: "28px",
     fontSize: "11px",
     fontFamily: "var(--font-body)",
@@ -293,5 +370,20 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     transition: "background var(--transition-fast), color var(--transition-fast)",
     whiteSpace: "nowrap",
+    padding: "0 6px",
+  },
+  chevronBtn: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    height: "28px",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    color: "var(--color-text-tertiary)",
+    borderRadius: "var(--radius-sm)",
+    margin: "0 8px",
+    width: "calc(100% - 16px)",
+    transition: "color var(--transition-fast), background var(--transition-fast)",
   },
 };

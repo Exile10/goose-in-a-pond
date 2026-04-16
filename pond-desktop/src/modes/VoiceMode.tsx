@@ -4,22 +4,30 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { VoiceOrb } from "../components/VoiceOrb";
 import { TranscriptFeed } from "../components/TranscriptFeed";
-import { resolveSummonDecision } from "../voiceSummon";
+import { resolveVoiceDecision } from "../voiceSummon";
 import { nextTranscriptId } from "../state/reducer";
 
 const STATE_LABELS: Record<string, string> = {
-  idle:      "Idle — ready to listen",
+  idle:      "Ready",
   recording: "Listening…",
   thinking:  "Thinking…",
   speaking:  "Speaking…",
-  error:     "Something went wrong",
+  error:     "Error",
 };
 
 export function VoiceMode() {
   const state = useAppState();
   const dispatch = useAppDispatch();
   const audioLevelRef = useRef(0);
-  const summonHandledRef = useRef(0);
+  const voiceHandledRef = useRef(0);
+
+  // Hide canvas overlay when Voice mode activates (exclusive takeover)
+  useEffect(() => {
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (isTauri) {
+      invoke("hide_canvas").catch(() => undefined);
+    }
+  }, []);
 
   // Track audio levels for orb animation
   useEffect(() => {
@@ -30,12 +38,12 @@ export function VoiceMode() {
     return () => { unlisten?.(); };
   }, []);
 
-  // Respond to global summon hotkey
+  // Respond to global voice activation hotkey
   useEffect(() => {
-    if (state.summonRequestId === summonHandledRef.current) return;
-    summonHandledRef.current = state.summonRequestId;
+    if (state.voiceRequestId === voiceHandledRef.current) return;
+    voiceHandledRef.current = state.voiceRequestId;
 
-    const decision = resolveSummonDecision({
+    const decision = resolveVoiceDecision({
       serverHealthy: state.serverOnline,
       isRecording: state.voiceState === "recording",
       isProcessing: state.voiceState === "thinking" || state.voiceState === "speaking",
@@ -46,7 +54,7 @@ export function VoiceMode() {
     } else if (decision === "stop-and-send") {
       stopAndSend();
     }
-  }, [state.summonRequestId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [state.voiceRequestId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function startRecording() {
     try {
@@ -128,29 +136,21 @@ export function VoiceMode() {
               onClick={startRecording}
               disabled={serverDown}
             >
-              🎙 Summon
+              🎙 Start Listening
             </button>
           )}
           {isRecording && (
-            <>
-              <button
-                style={{ ...styles.actionBtn, ...styles.primaryBtn }}
-                onClick={stopAndSend}
-              >
-                ↑ Send
-              </button>
-              <button
-                style={{ ...styles.actionBtn, ...styles.ghostBtn }}
-                onClick={abortRecording}
-              >
-                ✕ Cancel
-              </button>
-            </>
+            <button
+              style={{ ...styles.actionBtn, ...styles.ghostBtn }}
+              onClick={abortRecording}
+            >
+              Stop
+            </button>
           )}
           {isBusy && (
             <button
               style={{ ...styles.actionBtn, ...styles.ghostBtn }}
-              onClick={abortRecording}
+              disabled
             >
               Stop
             </button>
@@ -173,7 +173,7 @@ export function VoiceMode() {
           <kbd style={styles.kbd}>⌘⇧V</kbd>
           {" "}or{" "}
           <kbd style={styles.kbd}>Ctrl+Shift+V</kbd>
-          {" "}to summon
+          {" "}to activate voice
         </p>
       </div>
     </div>
