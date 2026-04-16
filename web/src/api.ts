@@ -1,4 +1,15 @@
-const BASE = '/api/v1'
+// Support Tauri desktop app: main.rs injects window.__GIAP_SERVER_URL__
+// before the React app loads, allowing the desktop app to connect to any
+// pond-server (local or remote Jetson). The web dashboard uses relative paths.
+declare global {
+  interface Window {
+    __GIAP_SERVER_URL__?: string
+  }
+}
+
+const BASE = window.__GIAP_SERVER_URL__
+  ? `${window.__GIAP_SERVER_URL__.replace(/\/$/, '')}/api/v1`
+  : '/api/v1'
 
 export const DEV_MOCK_TOKEN = 'dev-mock-token'
 export const isPreviewMode = (token: string) => token === DEV_MOCK_TOKEN

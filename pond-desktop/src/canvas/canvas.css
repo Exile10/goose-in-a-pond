@@ -1,0 +1,162 @@
+/* =============================================================================
+   GIAP Canvas Overlay — Jarida Brand · Warm Frosted Glass · Light Mode
+   ============================================================================= */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  color-scheme: light;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+}
+
+/* ── Root overlay card ─────────────────────────────────────── */
+
+.canvas-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+
+  /* Warm frosted glass — light mode */
+  background: rgba(255, 249, 249, 0.90);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+
+  /* Fallback for Linux without compositor: solid warm white */
+  @supports not (backdrop-filter: blur(1px)) {
+    background: #FFF9F9;
+  }
+
+  border: 1px solid rgba(23, 22, 22, 0.12);
+  border-radius: 18px;
+  overflow: hidden;
+  color: #171616;
+  box-shadow: 0 8px 32px rgba(23,22,22,0.18), 0 2px 8px rgba(23,22,22,0.08);
+  user-select: none;
+}
+
+/* ── Header row (drag handle, orb, status, dismiss) ─────── */
+
+.canvas-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 10px 10px;
+  border-bottom: 1px solid rgba(23,22,22,0.07);
+  cursor: grab;
+  flex-shrink: 0;
+}
+
+.canvas-header:active {
+  cursor: grabbing;
+}
+
+.canvas-drag-pill {
+  width: 28px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.canvas-drag-pill::after {
+  content: "";
+  display: block;
+  width: 24px;
+  height: 4px;
+  background: rgba(23,22,22,0.14);
+  border-radius: 2px;
+}
+
+.canvas-status-label {
+  flex: 1;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(23,22,22,0.50);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.canvas-dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: rgba(23,22,22,0.35);
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+.canvas-dismiss:hover {
+  color: #171616;
+  background: rgba(23,22,22,0.06);
+}
+
+/* ── Transcript area ────────────────────────────────────── */
+
+.canvas-transcript {
+  padding: 8px 12px;
+  overflow-y: auto;
+  max-height: 120px;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+
+.canvas-transcript::-webkit-scrollbar { display: none; }
+
+/* ── Context cards ──────────────────────────────────────── */
+
+.canvas-cards {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(23,22,22,0.15) transparent;
+}
+
+.canvas-cards::-webkit-scrollbar { width: 4px; }
+.canvas-cards::-webkit-scrollbar-thumb {
+  background: rgba(23,22,22,0.15);
+  border-radius: 2px;
+}
+
+/* ── Animations ─────────────────────────────────────────── */
+
+@keyframes progressSlide {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(0%); }
+  100% { transform: translateX(100%); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.canvas-card-in {
+  animation: fadeIn 0.2s ease;
+}
