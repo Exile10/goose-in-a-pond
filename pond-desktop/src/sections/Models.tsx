@@ -1,0 +1,49 @@
+import { useState, useEffect } from "react";
+import { api } from "../api/PondApiClient";
+import type { ModelEntry } from "../api/types";
+
+export function Models() {
+  const [models, setModels] = useState<ModelEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]   = useState<string | null>(null);
+
+  useEffect(() => {
+    api.listModels().then(setModels).catch((e) => setError(String(e))).finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <p style={hint}>Loading models…</p>;
+  if (error)   return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
+  if (!models.length) return <p style={hint}>No models configured. Run <code>pond-server setup</code>.</p>;
+
+  return (
+    <div style={styles.root}>
+      {models.map((m) => (
+        <div key={m.id} style={styles.card}>
+          <div style={styles.cardHeader}>
+            <span style={styles.modelName}>{m.display_name ?? m.name}</span>
+            <span style={styles.provider}>{m.provider}</span>
+            {m.recommended_role && (
+              <span style={styles.rolePill}>{m.recommended_role}</span>
+            )}
+            {m.is_active && <span style={styles.activePill}>Active</span>}
+          </div>
+          {m.ram_estimate_mb && (
+            <p style={styles.ramText}>RAM: ~{m.ram_estimate_mb} MB</p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
+const styles: Record<string, React.CSSProperties> = {
+  root: { display: "flex", flexDirection: "column", gap: "var(--space-3)", maxWidth: "var(--content-max-width)" },
+  card: { background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
+  cardHeader: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const },
+  modelName: { fontWeight: 600, fontSize: "var(--text-base)", color: "var(--color-text)" },
+  provider: { fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", marginLeft: "auto" },
+  rolePill: { fontSize: "var(--text-xs)", fontWeight: 600, background: "var(--color-accent-soft)", color: "var(--color-accent)", padding: "2px 7px", borderRadius: "var(--radius-pill)" },
+  activePill: { fontSize: "var(--text-xs)", fontWeight: 600, background: "var(--color-success-soft)", color: "var(--color-success)", padding: "2px 7px", borderRadius: "var(--radius-pill)" },
+  ramText: { margin: "var(--space-2) 0 0", fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)" },
+};

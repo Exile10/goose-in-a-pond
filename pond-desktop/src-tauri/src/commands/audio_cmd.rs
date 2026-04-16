@@ -73,6 +73,9 @@ pub async fn abort_recording(
 /// Full voice pipeline:
 /// (caller passes WAV bytes from stop_recording) → transcribe → chat stream → speak
 ///
+/// `auth_token` — the pond session token from localStorage; empty string for unauthenticated
+///   loopback connections (pond-server accepts any well-formed Bearer on loopback).
+///
 /// Emits:
 ///   `transcript`      — {text: string}
 ///   `response-token`  — {token: string, done: bool}
@@ -84,10 +87,18 @@ pub async fn abort_recording(
 pub async fn run_voice_pipeline(
     app: AppHandle,
     wav_bytes: Vec<u8>,
+    auth_token: String,
     server: State<'_, ServerProcess>,
 ) -> Result<(), String> {
     let base_url = server.get_url();
     let client = reqwest::Client::new();
+
+    // Build a helper that adds the Authorization header when a token is present.
+    let bearer = if auth_token.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {}", auth_token))
+    };
 
     // ── 1. Transcribe ────────────────────────────────────────────────────────
     let part = multipart::Part::bytes(wav_bytes)
@@ -96,9 +107,14 @@ pub async fn run_voice_pipeline(
         .map_err(|e| e.to_string())?;
     let form = multipart::Form::new().part("file", part);
 
-    let transcript_res = client
+    let mut transcribe_req = client
         .post(format!("{}/api/v1/transcribe", base_url))
-        .multipart(form)
+        .multipart(form);
+    if let Some(ref auth) = bearer {
+        transcribe_req = transcribe_req.header("Authorization", auth.as_str());
+    }
+
+    let transcript_res = transcribe_req
         .send()
         .await
         .map_err(|e| {
@@ -126,10 +142,14 @@ pub async fn run_voice_pipeline(
         "session_id": "canvas-voice"
     });
 
-    // Note: pond-server exempts loopback from auth — empty token is fine here
-    let mut chat_res = client
+    let mut chat_builder = client
         .post(format!("{}/api/v1/chat/stream", base_url))
-        .json(&chat_req)
+        .json(&chat_req);
+    if let Some(ref auth) = bearer {
+        chat_builder = chat_builder.header("Authorization", auth.as_str());
+    }
+
+    let mut chat_res = chat_builder
         .send()
         .await
         .map_err(|e| {
@@ -175,12 +195,17 @@ pub async fn run_voice_pipeline(
 }
 
 async fn play_tts(client: &reqwest::Client, base_url: &str, text: &str) -> Result<(), String> {
-    let res = client
-        .post(format!("{}/api/v1/tts", base_url))
-        .json(&serde_json::json!({ "text": text }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    // 30-second timeout on the HTTP request to the TTS endpoint
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client
+            .post(format!("{}/api/v1/tts", base_url))
+            .json(&serde_json::json!({ "text": text }))
+            .send(),
+    )
+    .await
+    .map_err(|_| "TTS HTTP request timed out after 30s".to_string())?
+    .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
         return Err(format!("TTS server error: {}", res.status()));
@@ -188,16 +213,21 @@ async fn play_tts(client: &reqwest::Client, base_url: &str, text: &str) -> Resul
 
     let bytes = res.bytes().await.map_err(|e| e.to_string())?.to_vec();
 
-    tokio::task::spawn_blocking(move || {
-        use rodio::{Decoder, OutputStream, Sink};
-        let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
-        let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
-        let cursor = std::io::Cursor::new(bytes);
-        let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
-        sink.append(source);
-        sink.sleep_until_end();
-        Ok::<_, String>(())
-    })
+    // 60-second timeout on rodio playback (guards against stuck audio sinks)
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || {
+            use rodio::{Decoder, OutputStream, Sink};
+            let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+            let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
+            let cursor = std::io::Cursor::new(bytes);
+            let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
+            sink.append(source);
+            sink.sleep_until_end();
+            Ok::<_, String>(())
+        }),
+    )
     .await
+    .map_err(|_| "TTS playback timed out after 60s".to_string())?
     .map_err(|e| e.to_string())?
 }

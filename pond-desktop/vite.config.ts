@@ -6,11 +6,19 @@ import { resolve } from "path";
 export default defineConfig(async () => ({
   plugins: [react()],
 
-  // Alias so pond-desktop can import all existing web/src components
+  // React resolution: force all imports to pond-desktop's own node_modules
+  // so that web/ and pond-desktop/ never mix React instances.
+  // The @web alias is intentionally removed — pond-desktop is now standalone.
   resolve: {
-    alias: {
-      "@web": resolve(__dirname, "../web/src"),
-    },
+    alias: [
+      { find: "react/jsx-runtime",     replacement: resolve(__dirname, "node_modules/react/jsx-runtime.js") },
+      { find: "react/jsx-dev-runtime", replacement: resolve(__dirname, "node_modules/react/jsx-dev-runtime.js") },
+      { find: "react-dom/client",      replacement: resolve(__dirname, "node_modules/react-dom/client.js") },
+      { find: "react-dom/server",      replacement: resolve(__dirname, "node_modules/react-dom/server.js") },
+      { find: "react-dom",             replacement: resolve(__dirname, "node_modules/react-dom/index.js") },
+      { find: "react",                 replacement: resolve(__dirname, "node_modules/react/index.js") },
+    ],
+    dedupe: ["react", "react-dom"],
   },
 
   // Dual-entry: main window + canvas overlay window
@@ -34,7 +42,6 @@ export default defineConfig(async () => ({
       port: 1421,
     },
     watch: {
-      // Watch web/src too for hot-reload
       ignored: ["**/src-tauri/**"],
     },
   },
