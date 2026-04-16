@@ -1,8 +1,26 @@
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 /// Default global hotkey: Cmd/Ctrl + Shift + G
 pub const DEFAULT_HOTKEY: &str = "CmdOrCtrl+Shift+G";
+/// Dedicated voice summon hotkey: Cmd/Ctrl + Shift + V
+pub const DEFAULT_SUMMON_HOTKEY: &str = "CmdOrCtrl+Shift+V";
+
+/// Managed state that tracks the currently registered canvas hotkey string.
+/// Needed so `re_register_hotkey` can unregister the *current* hotkey rather
+/// than always falling back to the compile-time default.
+pub struct HotkeyState {
+    pub current: Mutex<String>,
+}
+
+impl HotkeyState {
+    pub fn new() -> Self {
+        Self {
+            current: Mutex::new(DEFAULT_HOTKEY.to_string()),
+        }
+    }
+}
 
 /// Register the canvas toggle hotkey.
 /// When triggered:
@@ -24,12 +42,33 @@ pub fn register_canvas_hotkey(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Re-register the hotkey with a new key combination (called from Settings).
-#[allow(dead_code)]
-pub fn re_register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
-    // Unregister old default first (ignore errors — may not be registered)
-    if let Ok(old) = parse_shortcut(DEFAULT_HOTKEY) {
-        let _ = app.global_shortcut().unregister(old);
+/// Register a dedicated global hotkey that triggers a desktop voice summon turn.
+pub fn register_summon_hotkey(app: &AppHandle) -> Result<(), String> {
+    let shortcut = parse_shortcut(DEFAULT_SUMMON_HOTKEY)?;
+
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |app_handle, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = app_handle.emit("desktop-summon", ());
+            }
+        })
+        .map_err(|e| format!("Failed to register summon hotkey: {e}"))?;
+
+    tracing::info!("Summon hotkey registered: {}", DEFAULT_SUMMON_HOTKEY);
+    Ok(())
+}
+
+/// Re-register the canvas hotkey with a new key combination (called from Settings).
+///
+/// Reads the currently registered hotkey from `HotkeyState`, unregisters it,
+/// registers the new one, and updates the stored value.
+pub fn re_register_hotkey(app: &AppHandle, hotkey: &str, state: &HotkeyState) -> Result<(), String> {
+    // Unregister whichever hotkey is currently active
+    {
+        let current = state.current.lock().unwrap();
+        if let Ok(old) = parse_shortcut(&current) {
+            let _ = app.global_shortcut().unregister(old);
+        }
     }
 
     let shortcut = parse_shortcut(hotkey)?;
@@ -39,7 +78,12 @@ pub fn re_register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
                 handle_hotkey(app_handle);
             }
         })
-        .map_err(|e| format!("Failed to register hotkey '{hotkey}': {e}"))
+        .map_err(|e| format!("Failed to register hotkey '{hotkey}': {e}"))?;
+
+    // Persist the newly registered hotkey
+    *state.current.lock().unwrap() = hotkey.to_string();
+    tracing::info!("Canvas hotkey updated to: {hotkey}");
+    Ok(())
 }
 
 fn handle_hotkey(app: &AppHandle) {

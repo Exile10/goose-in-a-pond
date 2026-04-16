@@ -1,17 +1,18 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "Open GIAP").build(app)?;
+    let summon = MenuItemBuilder::with_id("summon", "Summon (Voice)").build(app)?;
     let canvas = MenuItemBuilder::with_id("canvas", "Toggle Canvas").build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
-        .items(&[&open, &canvas, &separator, &quit])
+        .items(&[&open, &summon, &canvas, &separator, &quit])
         .build()?;
 
     // Load tray icon from the icons directory if it exists, otherwise use a default.
@@ -39,6 +40,9 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
+            "summon" => {
+                let _ = app.emit("desktop-summon", ());
+            }
             "canvas" => tray_toggle_canvas(app),
             "quit" => app.exit(0),
             _ => {}

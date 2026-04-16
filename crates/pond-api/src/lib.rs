@@ -40,6 +40,7 @@ pub mod middleware;
 pub mod routes;
 
 use axum::{middleware::Next, Router};
+use tower_http::cors::{Any, CorsLayer};
 use pond_core::ports::agent::Agent;
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
@@ -223,6 +224,15 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
             let limiter = rate_limiter.clone();
             rate_limit_with_limiter(req, next, limiter)
         }))
+        // CORS — allow any origin so the Tauri desktop app (tauri://localhost or
+        // http://localhost:1420 in dev) and GOTG mobile clients can reach the API.
+        // pond-server only binds to the local network, so open CORS is safe here.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 

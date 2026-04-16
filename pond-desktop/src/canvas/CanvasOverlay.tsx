@@ -1,162 +1,208 @@
-import { useEffect, useState, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import VoiceOrb, { OrbState } from "./VoiceOrb";
-import TranscriptFeed from "./TranscriptFeed";
-import ContextCards from "./ContextCards";
-import AgentTrace from "./AgentTrace";
+import "./canvas.css";
+import { VoiceOrb } from "../components/VoiceOrb";
+import { TranscriptFeed } from "../components/TranscriptFeed";
+import { ContextCard } from "../components/ContextCard";
+import type { VoiceState, TranscriptMessage, ContextCard as ContextCardType } from "../state/reducer";
+import { nextTranscriptId, nextCardId } from "../state/reducer";
 
-export default function CanvasOverlay() {
-  const [orbState, setOrbState] = useState<OrbState>("idle");
-  const [isDragging, setIsDragging] = useState(false);
+const SILENCE_TIMEOUT_MS = 1500;
 
-  // Listen for pipeline state events from Rust backend
-  useEffect(() => {
-    const unsubs: Array<Promise<() => void>> = [];
+export function CanvasOverlay() {
+  const [orbState, setOrbState]     = useState<VoiceState>("idle");
+  const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [cards, setCards]           = useState<ContextCardType[]>([]);
+  const [audioLevel, setAudioLevel] = useState(0);
 
-    unsubs.push(
-      listen("canvas-start-listen", async () => {
-        setOrbState("listening");
-        await invoke("start_recording").catch(console.error);
-      })
-    );
+  const isRecordingRef  = useRef(false);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    unsubs.push(
-      listen("canvas-hotkey", async () => {
-        if (orbState === "listening") {
-          await commitRecording();
-        } else if (orbState === "idle") {
-          await getCurrentWindow().hide();
-        }
-      })
-    );
-
-    unsubs.push(
-      listen("transcript", () => setOrbState("thinking"))
-    );
-
-    unsubs.push(
-      listen("tts-start", () => setOrbState("speaking"))
-    );
-
-    unsubs.push(
-      listen("tts-end", () => setOrbState("idle"))
-    );
-
-    unsubs.push(
-      listen("pipeline-error", () => {
-        setOrbState("error");
-        setTimeout(() => setOrbState("idle"), 3000);
-      })
-    );
-
-    // When response-token done arrives (no TTS), go back to idle
-    unsubs.push(
-      listen<{ done: boolean }>("response-token", (e) => {
-        if (e.payload.done && orbState === "thinking") {
-          // If TTS plays, tts-start will override this
-          setTimeout(() => {
-            setOrbState((s) => (s === "thinking" ? "idle" : s));
-          }, 500);
-        }
-      })
-    );
-
-    return () => {
-      unsubs.forEach((p) => p.then((fn) => fn()));
-    };
-  }, [orbState]);
-
-  const commitRecording = useCallback(async () => {
-    setOrbState("thinking");
-    try {
-      const wavBytes = await invoke<number[]>("stop_recording");
-      await invoke("run_voice_pipeline", { wavBytes });
-    } catch (e) {
-      console.error("Voice pipeline error:", e);
-      setOrbState("error");
-      setTimeout(() => setOrbState("idle"), 3000);
+  // ── Silence detection ───────────────────────────────────
+  const clearSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current !== null) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
   }, []);
 
-  // VAD: auto-commit after 1.5s of silence (detect via low audio level)
-  const silenceTimeoutRef = { current: 0 };
-  useEffect(() => {
-    const unlisten = listen<number>("audio-level", (e) => {
-      if (orbState !== "listening") return;
-      const level = e.payload;
-      if (level < 0.02) {
-        // Silence detected
-        if (!silenceTimeoutRef.current) {
-          silenceTimeoutRef.current = window.setTimeout(() => {
-            silenceTimeoutRef.current = 0;
-            commitRecording();
-          }, 1500);
-        }
-      } else {
-        // Speech detected — cancel silence timer
-        if (silenceTimeoutRef.current) {
-          clearTimeout(silenceTimeoutRef.current);
-          silenceTimeoutRef.current = 0;
-        }
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-    };
-  }, [orbState, commitRecording]);
+  const startSilenceTimer = useCallback(() => {
+    clearSilenceTimer();
+    silenceTimerRef.current = setTimeout(() => {
+      if (isRecordingRef.current) stopAndSend();
+    }, SILENCE_TIMEOUT_MS);
+  }, [clearSilenceTimer]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Keyboard: Escape dismisses canvas
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        if (orbState === "listening") {
-          invoke("abort_recording");
-          setOrbState("idle");
-        }
-        getCurrentWindow().hide();
-      }
+  // ── Voice pipeline ───────────────────────────────────────
+  async function startRecording() {
+    isRecordingRef.current = true;
+    setOrbState("recording");
+    setTranscript([]);
+    setCards([]);
+    try {
+      await invoke("start_recording");
+    } catch (e) {
+      console.error("start_recording:", e);
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [orbState]);
-
-  // Drag to reposition — use Tauri's startDragging
-  async function onDragStart(e: React.MouseEvent) {
-    if ((e.target as HTMLElement).closest(".canvas-dismiss")) return;
-    e.preventDefault();
-    setIsDragging(true);
-    await getCurrentWindow().startDragging();
-    setIsDragging(false);
   }
 
+  async function stopAndSend() {
+    if (!isRecordingRef.current) return;
+    isRecordingRef.current = false;
+    clearSilenceTimer();
+    setOrbState("thinking");
+    try {
+      const wavBytes = await invoke<number[]>("stop_recording");
+      // Seed empty agent message for token streaming
+      setTranscript((prev) => [
+        ...prev,
+        { id: nextTranscriptId(), role: "agent" as const, text: "", timestamp: Date.now() },
+      ]);
+      await invoke("run_voice_pipeline", { wavBytes, sessionId: undefined, authToken: "" });
+    } catch (e) {
+      console.error("voice pipeline:", e);
+      setOrbState("error");
+      setTimeout(() => setOrbState("idle"), 3000);
+    }
+  }
+
+  async function hide() {
+    clearSilenceTimer();
+    if (isRecordingRef.current) {
+      isRecordingRef.current = false;
+      try { await invoke("abort_recording"); } catch { /* ignore */ }
+    }
+    setOrbState("idle");
+    try { await invoke("hide_canvas"); } catch { /* ignore */ }
+  }
+
+  // ── Keyboard ─────────────────────────────────────────────
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === "Escape") hide(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Tauri events ─────────────────────────────────────────
+  useEffect(() => {
+    const unlisten: Array<() => void> = [];
+
+    listen("canvas-start-listen", () => {
+      if (!isRecordingRef.current) startRecording();
+    }).then((u) => unlisten.push(u));
+
+    listen("canvas-hotkey", () => {
+      if (isRecordingRef.current) stopAndSend();
+    }).then((u) => unlisten.push(u));
+
+    listen("recording-started", () => {
+      isRecordingRef.current = true;
+      setOrbState("recording");
+    }).then((u) => unlisten.push(u));
+
+    listen("recording-aborted", () => {
+      isRecordingRef.current = false;
+      clearSilenceTimer();
+      setOrbState("idle");
+    }).then((u) => unlisten.push(u));
+
+    listen<number>("audio-level", (e) => {
+      const level = e.payload;
+      setAudioLevel(level);
+      if (isRecordingRef.current) {
+        if (level > 0.015) clearSilenceTimer();
+        else startSilenceTimer();
+      }
+    }).then((u) => unlisten.push(u));
+
+    listen<string>("transcript", (e) => {
+      setTranscript((prev) => [
+        ...prev,
+        { id: nextTranscriptId(), role: "user" as const, text: e.payload, timestamp: Date.now() },
+      ]);
+      setOrbState("thinking");
+    }).then((u) => unlisten.push(u));
+
+    listen<{ token: string; done: boolean }>("response-token", (e) => {
+      setTranscript((prev) => {
+        if (!prev.length) return prev;
+        const last = prev[prev.length - 1];
+        if (last.role !== "agent") return prev;
+        return [...prev.slice(0, -1), { ...last, text: last.text + e.payload.token }];
+      });
+    }).then((u) => unlisten.push(u));
+
+    listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number }>(
+      "tool-result",
+      (e) => {
+        setCards((prev) => [
+          ...prev,
+          { id: nextCardId(), tool: e.payload.tool, data: e.payload.data, timestamp_ms: e.payload.timestamp_ms },
+        ]);
+      },
+    ).then((u) => unlisten.push(u));
+
+    listen("tts-start", () => setOrbState("speaking")).then((u) => unlisten.push(u));
+    listen("tts-end",   () => setOrbState("idle")).then((u) => unlisten.push(u));
+
+    listen<string>("pipeline-error", () => {
+      setOrbState("error");
+      setTimeout(() => setOrbState("idle"), 3500);
+    }).then((u) => unlisten.push(u));
+
+    return () => {
+      clearSilenceTimer();
+      unlisten.forEach((u) => u());
+    };
+  }, [clearSilenceTimer, startSilenceTimer]);
+
+  const stateLabels: Record<VoiceState, string> = {
+    idle:      "Idle — say something",
+    recording: "Listening…",
+    thinking:  "Thinking…",
+    speaking:  "Speaking…",
+    error:     "Error",
+  };
+
   return (
-    <div className="canvas-overlay" style={{ cursor: isDragging ? "grabbing" : undefined }}>
-      {/* Drag handle */}
-      <div className="canvas-drag-handle" onMouseDown={onDragStart} />
-
-      {/* Dismiss button */}
-      <button
-        className="canvas-dismiss"
-        onClick={() => getCurrentWindow().hide()}
-        title="Hide canvas (Escape)"
+    <div className="canvas-overlay">
+      {/* Header — drag handle */}
+      <header
+        className="canvas-header"
+        onMouseDown={async () => {
+          try { await getCurrentWindow().startDragging(); } catch { /* ignore */ }
+        }}
       >
-        ×
-      </button>
+        <div className="canvas-drag-pill" />
+        <VoiceOrb state={orbState} size="sm" audioLevel={audioLevel} />
+        <span className="canvas-status-label">{stateLabels[orbState]}</span>
+        <button
+          className="canvas-dismiss"
+          onClick={hide}
+          onMouseDown={(e) => e.stopPropagation()}
+          aria-label="Close canvas"
+        >
+          ×
+        </button>
+      </header>
 
-      {/* Voice orb — always shown */}
-      <VoiceOrb state={orbState} />
+      {/* Transcript */}
+      <div className="canvas-transcript">
+        <TranscriptFeed messages={transcript} maxHeight="120px" compact />
+      </div>
 
-      {/* Live transcript */}
-      <TranscriptFeed />
-
-      {/* Dynamic context cards from tool calls */}
-      <ContextCards />
-
-      {/* Agent tool-call breadcrumb */}
-      <AgentTrace />
+      {/* Context cards */}
+      {cards.length > 0 && (
+        <div className="canvas-cards">
+          {cards.map((card) => (
+            <div key={card.id} className="canvas-card-in">
+              <ContextCard card={card} />
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

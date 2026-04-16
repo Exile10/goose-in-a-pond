@@ -79,6 +79,12 @@ export default function Settings({ token }: Props) {
   const [ttsHttpUrl, setTtsHttpUrl]           = useState(() => localStorage.getItem('pond_tts_http_url') ?? '')
   const [ttsHttpVoice, setTtsHttpVoice]       = useState(() => localStorage.getItem('pond_tts_http_voice') ?? '')
 
+  // ── Desktop App (Tauri only) ──
+  const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+  const [serverUrl,  setServerUrl]  = useState('')
+  const [canvasPos,  setCanvasPos]  = useState<'left' | 'center' | 'right'>('right')
+  const [autoStart,  setAutoStart]  = useState(false)
+
   // ── UI state ──
   const [saving, setSaving]   = useState(false)
   const [saved, setSaved]     = useState(false)
@@ -118,6 +124,24 @@ export default function Settings({ token }: Props) {
     if (s.voice_tts_http_url)            setTtsHttpUrl(s.voice_tts_http_url)
     if (s.voice_tts_http_voice)          setTtsHttpVoice(s.voice_tts_http_voice)
   }, [ctxSettings, token])
+
+  // Load desktop settings from Tauri on first render
+  useEffect(() => {
+    if (!isTauri) return
+    ;(async () => {
+      try {
+        // window.__TAURI__ is injected by Tauri 2.0 — no npm import needed
+        const invoke = (window as any).__TAURI__?.core?.invoke
+        if (!invoke) return
+        const [url, enabled] = await Promise.all([
+          invoke('get_server_url') as Promise<string>,
+          invoke('is_autostart_enabled') as Promise<boolean>,
+        ])
+        setServerUrl(url)
+        setAutoStart(enabled)
+      } catch { /* non-Tauri build or command unavailable */ }
+    })()
+  }, [isTauri])
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
@@ -162,6 +186,19 @@ export default function Settings({ token }: Props) {
       }
 
       await refetch()
+
+      // Save desktop-specific settings via Tauri commands (no-op in browser)
+      if (isTauri) {
+        const invoke = (window as any).__TAURI__?.core?.invoke
+        if (invoke) {
+          await Promise.all([
+            serverUrl.trim() ? invoke('set_server_url', { url: serverUrl.trim() }) : Promise.resolve(),
+            autoStart ? invoke('enable_autostart') : invoke('disable_autostart'),
+            invoke('position_canvas', { position: canvasPos }),
+          ]).catch(() => { /* desktop commands optional */ })
+        }
+      }
+
       logActivity('chat', 'Settings updated')
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
@@ -476,6 +513,56 @@ export default function Settings({ token }: Props) {
             </div>
           )}
         </div>
+
+        {/* ── Desktop App (Tauri only) ── */}
+        {isTauri && (
+          <div className="db-card">
+            <div className="db-card-header"><h3>Desktop App</h3></div>
+            <p className="db-settings-hint">
+              Settings specific to the native desktop application.
+            </p>
+
+            <div className="db-settings-field">
+              <label className="db-settings-label" htmlFor="serverUrl">pond-server URL</label>
+              <p className="db-settings-hint">
+                Address of the pond-server. Use the default for local setup, or enter your Jetson's IP to connect remotely.
+              </p>
+              <input
+                id="serverUrl"
+                className="db-settings-input"
+                type="url"
+                value={serverUrl}
+                onChange={e => setServerUrl(e.target.value)}
+                placeholder="http://127.0.0.1:4000"
+                maxLength={200}
+              />
+            </div>
+
+            <div className="db-settings-field">
+              <label className="db-settings-label">Canvas overlay position</label>
+              <p className="db-settings-hint">Where the canvas overlay snaps when opened via hotkey.</p>
+              <div className="db-settings-radio-group" style={{ flexDirection: 'row' }}>
+                {(['left', 'center', 'right'] as const).map(pos => (
+                  <label key={pos} className={`db-settings-radio-card ${canvasPos === pos ? 'selected' : ''}`} style={{ flex: 1 }}>
+                    <input type="radio" name="canvasPos" value={pos} checked={canvasPos === pos} onChange={() => setCanvasPos(pos)} />
+                    <div><strong>{pos.charAt(0).toUpperCase() + pos.slice(1)}</strong></div>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="db-settings-field" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <label className="db-settings-label">Launch at login</label>
+                <p className="db-settings-hint" style={{ marginBottom: 0 }}>Start Goose In A Pond automatically when you log in (tray-only mode).</p>
+              </div>
+              <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem', flexShrink: 0, paddingLeft: '1rem' }}>
+                <input type="checkbox" checked={autoStart} onChange={e => setAutoStart(e.target.checked)} />
+                <span style={{ fontSize: '0.85rem', opacity: 0.7 }}>{autoStart ? 'On' : 'Off'}</span>
+              </label>
+            </div>
+          </div>
+        )}
 
         {error && <p className="db-error">{error}</p>}
 

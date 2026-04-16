@@ -117,6 +117,12 @@ enum Commands {
         /// Override: cargo run -p pond-server -- serve --agent mock
         #[arg(long, default_value = "goose")]
         agent: String,
+
+        /// Also launch the native Tauri desktop app after the server starts.
+        /// Searches for the binary in pond-desktop/src-tauri/target/debug/ and
+        /// pond-desktop/src-tauri/target/release/bundle/macos/.
+        #[arg(long)]
+        native: bool,
     },
 
     /// Interactive CLI chat (Wait→Listen→Think→Speak loop)
@@ -337,9 +343,9 @@ async fn main() -> Result<()> {
         Some(Commands::Setup { model }) => {
             run_setup(&model).await
         }
-        Some(Commands::Serve { static_dir, open, debug, agent }) => {
+        Some(Commands::Serve { static_dir, open, debug, agent, native }) => {
             init_tracing(debug);
-            run_server(static_dir, open, debug, &agent).await
+            run_server(static_dir, open, debug, &agent, native).await
         }
         Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
             init_tracing(false);
@@ -528,7 +534,7 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str) -> Result<()> {
+async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str, native: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
@@ -1125,9 +1131,56 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         }
     }
 
+    // --native: spawn the Tauri desktop app binary after the server is ready.
+    if native {
+        spawn_desktop_app(api_port);
+    }
+
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Locate and spawn the pond-desktop Tauri binary.
+///
+/// Search order (relative to the workspace root, i.e. where the server binary
+/// is invoked from):
+///   1. `pond-desktop/src-tauri/target/debug/pond-desktop`          — `cargo tauri dev`
+///   2. `pond-desktop/src-tauri/target/release/pond-desktop`        — release build
+///   3. `pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond`
+///
+/// The child process is detached (not joined) so the server keeps running.
+fn spawn_desktop_app(server_port: u16) {
+    let candidates: &[&str] = &[
+        "pond-desktop/src-tauri/target/debug/pond-desktop",
+        "pond-desktop/src-tauri/target/release/pond-desktop",
+        "pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond",
+    ];
+
+    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
+
+    match found {
+        Some(path) => {
+            tracing::info!("Launching native desktop app: {}", path);
+            match std::process::Command::new(path)
+                .env("GIAP_SERVER_PORT", server_port.to_string())
+                .spawn()
+            {
+                Ok(child) => {
+                    tracing::info!("Desktop app started (pid {})", child.id());
+                    // Drop child handle — process runs independently.
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to launch desktop app at {}: {}", path, e);
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "--native: desktop binary not found. Build it first:\n  cd pond-desktop && npm run tauri build\nor for dev:\n  cd pond-desktop && npm run tauri dev"
+            );
+        }
+    }
 }
 
 async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: Option<&str>, tts_model: Option<std::path::PathBuf>) -> Result<()> {
@@ -1670,7 +1723,7 @@ async fn run_main_menu() -> Result<()> {
                 run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
             }
             "2" => {
-                run_server(std::path::PathBuf::from("web/dist"), false, false, "goose").await?;
+                run_server(std::path::PathBuf::from("web/dist"), false, false, "goose", false).await?;
             }
             "3" => {
                 run_status().await?;
