@@ -54,12 +54,7 @@ impl ScriptedVoiceInput {
 #[async_trait]
 impl VoiceInput for ScriptedVoiceInput {
     async fn listen(&self) -> Result<Option<String>> {
-        Ok(self
-            .script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(None))
+        Ok(self.script.lock().unwrap().pop_front().flatten())
     }
 }
 

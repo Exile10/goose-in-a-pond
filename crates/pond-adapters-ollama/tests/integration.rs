@@ -161,10 +161,44 @@ async fn options_absent_when_not_configured() {
         serde_json::from_slice(&requests[0].body).expect("request body is not valid JSON");
 
     assert!(
-        body.get("options").is_none() || body["options"].is_null(),
-        "options should be absent when not configured; got: {}",
+        body.get("options").is_none(),
+        "options key must be absent when not configured (not null, not empty); got: {}",
         body["options"]
     );
+}
+
+// ── Error paths ───────────────────────────────────────────────────────────────
+
+/// When Ollama returns HTTP 500 the provider must propagate an error
+/// rather than returning a partial or empty response.
+#[tokio::test]
+async fn server_error_propagates_as_err() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .mount(&server)
+        .await;
+
+    let provider = OllamaProvider::new(Some(&server.uri()), None);
+    let result = provider
+        .complete("sys", vec![ChatMessage::user("hi")])
+        .await;
+
+    assert!(result.is_err(), "expected Err on HTTP 500, got Ok");
+}
+
+/// When Ollama is unreachable (connection refused) the provider must return
+/// an error, not panic or hang.
+#[tokio::test]
+async fn connection_refused_propagates_as_err() {
+    // Port 1 is reserved and will always refuse connections.
+    let provider = OllamaProvider::new(Some("http://127.0.0.1:1"), None);
+    let result = provider
+        .complete("sys", vec![ChatMessage::user("hi")])
+        .await;
+
+    assert!(result.is_err(), "expected Err for connection refused, got Ok");
 }
 
 // ── Live smoke test ───────────────────────────────────────────────────────────
