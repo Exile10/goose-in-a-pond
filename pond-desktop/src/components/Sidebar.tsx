@@ -303,6 +303,7 @@ const styles: Record<string, React.CSSProperties> = {
     width: "100%",
     display: "flex",
     alignItems: "center",
+    justifyContent: "flex-start",
     gap: "8px",
     height: "var(--row-height-sm)",
     padding: "0 8px",
