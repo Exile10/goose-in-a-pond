@@ -1,129 +1,200 @@
-# Contributing to  Goose in a Pond
+# Contributing to Goose In A Pond
 
----
+Thank you for your interest in contributing to **Goose In A Pond (GIAP)**. GIAP is an open-source, privacy-first AI smart home assistant built by [Jarida](https://jarida.io) on top of [Block's Goose](https://github.com/block/goose) agent framework.
 
-Thank you for your interest in contributing to **Goose in a Pond**.
-Goose in a Pond is a project that seeks to develop privacy first home assistants that utilise AI offline.
-
-We welcome contributions from developers, writers, designers, researchers, and community members.
+We welcome contributions from Rust developers, embedded systems engineers, AI/ML researchers, mobile developers, and technical writers.
 
 ---
 
 ## Ways to Contribute
 
-You can contribute to Jarida in the following ways:
-
-* Reporting bugs or issues
-* Suggesting features or improvements
-* Submitting code contributions
-* Improving documentation
-* Reviewing pull requests
-* Contributing articles, datasets, or research (where applicable)
+- Report bugs or unexpected behavior
+- Suggest features or improvements
+- Submit code — new adapters, ports, API routes, UI components
+- Improve documentation
+- Review open pull requests
+- Contribute voice models, datasets, or research
 
 ---
 
 ## Before You Start
 
-* Check existing **Issues** and **Pull Requests** to avoid duplication
-* For major changes, open an issue first to discuss your proposal
-* Ensure your contribution aligns with Jarida’s mission and values
+- Check [open Issues](https://github.com/jarida-io/goose-in-a-pond/issues) and [Pull Requests](https://github.com/jarida-io/goose-in-a-pond/pulls) to avoid duplicate work
+- For large changes, open an issue first to discuss your approach
+- All contributions must align with the hexagonal architecture — the `pond-core` crate must stay free of framework dependencies
 
 ---
 
-## Getting Started (Code Contributions)
+## Setup
 
-1. **Fork the repository** and clone it locally.
-2. **Setup your environment**:
-   - Ensure the latest stable **Rust** is installed.
-   - Initialize the `goose` submodule:
-     ```bash
-     git submodule update --init --recursive
-     ```
-3. **Build the Workspace**:
-   ```bash
-   cargo build --workspace
-   ```
-4. **Create a new branch**:
-   ```bash
-   git checkout -b feature/short-description
-   ```
-5. **Make your changes** following the **Hexagonal Architecture** pattern.
-6. **Verify your work**:
-   ```bash
-   cargo test --workspace
-   ```
-7. **Commit & Push**.
+### Prerequisites
 
----
+- **Rust** stable — install via [rustup](https://rustup.rs)
+- **Node.js** 20+ and **npm** — for desktop app work
+- **Git** with submodule support
 
-## Technical Contribution Guidelines
+### Clone
 
-To keep the project healthy and maintainable, we follow the **Ports & Adapters (Hexagonal)** pattern:
+```bash
+git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
+cd goose-in-a-pond
+```
 
-- **Logic First**: Implement business logic in `crates/pond-core` using **TDD (Test-Driven Development)**.
-- **Port-Based**: Define traits in the Core and implement them in `crates/pond-infra` or `crates/pond-adapters-goose`.
-- **Pure Core**: Keep the `pond-core` crate free of database or network dependencies.
-- **Clean Code**: Follow the styles defined in the [Clean Code & Dependencies Guide](./docs/developer/clean_code_and_dependencies.md).
-- **Format & Lint**: Run `cargo fmt` and `cargo clippy` before submitting.
+### Build (fast path)
+
+```bash
+# Skip Goose submodule compilation — use this for most development
+cargo build -p pond-core -p pond-infra -p pond-api -p pond-server
+```
+
+### Full workspace build
+
+```bash
+# Compiles Goose from source — ~10 min first time, ~2 min after
+cargo build --workspace
+```
 
 ---
 
-## Licensing of Contributions (Important)
+## Development Workflow
 
-By submitting a contribution to Jarida, you agree that:
+```bash
+# 1. Create a branch
+git checkout -b feat/short-description
 
-* Your contribution will be licensed under the **Apache License 2.0** and the **CC by 4.0**.
+# 2. Write tests first (see TDD Guide)
+cargo test -p pond-core
 
-If you do not agree with these terms, please do not submit a contribution.
+# 3. Implement
+# ... your changes ...
+
+# 4. Verify
+cargo fmt
+cargo clippy
+cargo test -p pond-core -p pond-api -p pond-infra   # fast crates only
+
+# 5. Commit and push
+git push origin feat/short-description
+
+# 6. Open a Pull Request on GitHub
+```
 
 ---
 
-## Intellectual Property & Patents
+## Architecture Rules
 
-* You confirm that you have the right to submit the contribution
-* You agree not to knowingly contribute code or content that infringes third-party rights
-* Patent protection and retaliation clauses apply as defined in the applicable license
+GIAP enforces a strict **Ports & Adapters** structure. Before writing code, understand these rules:
+
+### The Core must stay pure
+
+`pond-core` must **never** import from:
+- `goose::*`
+- `sqlx::*`
+- `axum::*`
+- Any HTTP client or filesystem library
+
+If the core needs an external capability, define a `trait` in `pond-core/src/ports/` and implement it in a separate adapter crate.
+
+### Port/Adapter sequence
+
+When adding a new capability, follow this order (see [Creating Ports & Adapters](./creating-ports-and-adapters.md)):
+
+1. **Domain types** — `pond-core/src/domain/<name>.rs`
+2. **Port trait** — `pond-core/src/ports/<name>.rs` with `async_trait`
+3. **Mock implementation** — `pond-core/src/services/mock_<name>.rs` (test this first)
+4. **Real adapter** — `crates/pond-adapters-<name>/src/lib.rs`
+5. **Wire** — `pond-server/src/main.rs`
+
+### Workspace exclusions
+
+`pond-adapters-goose`, `pond-mcp-server`, and any crate that depends on Goose must remain in `workspace.exclude` in the root `Cargo.toml`. See [CLAUDE.md](../CLAUDE.md) for the `rmcp` version conflict reason.
 
 ---
 
-## Reporting Issues
+## Testing Standards
 
-When reporting bugs or issues, please include:
+We require tests for all new functionality. See the [TDD Guide](./testing/tdd_guide.md) for full details.
 
-* A clear and descriptive title
-* Steps to reproduce the issue
-* Expected vs actual behavior
-* Screenshots, logs, or error messages where helpful
+**Quick rules:**
+- Unit tests for `pond-core` use mocks only — no database, no network
+- Integration tests use `wiremock` for HTTP services, `tempfile` for SQLite
+- Live tests (real hardware) are gated behind `#[ignore]` with a clear comment
+- New adapters must have at minimum: a happy path test, an error path test, and a trait-object conformance test
+- Run `cargo test -p pond-core` before every commit — it's fast (~2s)
+
+---
+
+## Code Style
+
+```bash
+cargo fmt        # format all Rust code
+cargo clippy     # lint (fix all warnings before submitting)
+```
+
+For the desktop app:
+```bash
+cd pond-desktop
+npx tsc --noEmit   # TypeScript type check
+npm test           # vitest unit tests
+```
+
+---
+
+## Commit Messages
+
+Use the conventional commit format:
+
+```
+<type>(<scope>): <short summary>
+
+<body — optional, wrap at 72 chars>
+```
+
+Types: `feat`, `fix`, `test`, `docs`, `refactor`, `chore`, `perf`
+
+Examples:
+```
+feat(api): add DELETE /api/v1/memories/:id endpoint
+fix(whisper): handle empty transcript from whisper.cpp server
+test(ollama): add HTTP 500 error path integration test
+docs: update Getting Started with Ollama provider instructions
+```
+
+---
+
+## Pull Request Checklist
+
+Before opening a PR:
+
+- [ ] Tests pass: `cargo test -p pond-core -p pond-api`
+- [ ] No clippy warnings: `cargo clippy`
+- [ ] Code formatted: `cargo fmt`
+- [ ] New ports have a mock and tests in `pond-core`
+- [ ] `pond-core` has no new external dependencies
+- [ ] Live tests are `#[ignore]`d with setup instructions
+- [ ] `node_modules/` is not committed (covered by `.gitignore`)
+
+---
+
+## Licensing of Contributions
+
+By submitting a contribution, you agree that it will be licensed under both:
+
+- **Apache License 2.0** (source code)
+- **CC BY 4.0** (documentation and media)
+
+You confirm you have the right to submit the contribution and that it does not knowingly infringe third-party rights.
 
 ---
 
 ## Code of Conduct
 
-All contributors are expected to:
-
-* Be respectful and inclusive
-* Engage constructively and professionally
-* Assume good faith in discussions
-
-Harassment, discrimination, or abusive behavior will not be tolerated.
+All contributors are expected to be respectful, inclusive, and professional. Harassment, discrimination, or abusive behavior will not be tolerated.
 
 ---
 
-## Review Process
+## Questions?
 
-* Maintainers will review contributions as time allows
-* Feedback or changes may be requested
-* Approved contributions will be merged by a maintainer
+Open an issue or contact us at [info@jarida.io](mailto:info@jarida.io).
 
----
-
-## Questions or Clarifications
-
-If you have questions about contributing, licensing, or commercial use, please contact:
-
-**Jarida**
-[info@jarida.io]
-
----
-
-Thank you for contributing to **Goose In a Pond** and helping build a privacy first smart home assistant.
+Thank you for helping build a privacy-first AI assistant for everyone.
