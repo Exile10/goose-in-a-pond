@@ -1,4 +1,6 @@
 import { useState, useEffect } from "react";
+import { Tabs, Button, Chip, TextArea } from "@heroui/react";
+import { Trash2, Plus } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { AgentTool, AgentRecipe, PromptExtra } from "../api/types";
 
@@ -9,20 +11,30 @@ export function Agent() {
 
   return (
     <div style={styles.root}>
-      <div style={styles.tabs}>
-        {(["tools", "extras", "recipes"] as Tab[]).map((t) => (
-          <button
-            key={t}
-            style={{ ...styles.tab, ...(tab === t ? styles.tabActive : {}) }}
-            onClick={() => setTab(t)}
-          >
-            {t === "tools" ? "MCP Tools" : t === "extras" ? "Prompt Extras" : "Recipes"}
-          </button>
-        ))}
-      </div>
-      {tab === "tools"   && <ToolsPanel />}
-      {tab === "extras"  && <ExtrasPanel />}
-      {tab === "recipes" && <RecipesPanel />}
+      <Tabs
+        selectedKey={tab}
+        onSelectionChange={(k) => setTab(k as Tab)}
+      >
+        <Tabs.ListContainer>
+          <Tabs.List aria-label="Agent sections">
+            <Tabs.Tab id="tools">
+              <Tabs.Indicator />
+              MCP Tools
+            </Tabs.Tab>
+            <Tabs.Tab id="extras">
+              <Tabs.Indicator />
+              Prompt Extras
+            </Tabs.Tab>
+            <Tabs.Tab id="recipes">
+              <Tabs.Indicator />
+              Recipes
+            </Tabs.Tab>
+          </Tabs.List>
+        </Tabs.ListContainer>
+        <Tabs.Panel id="tools"><ToolsPanel /></Tabs.Panel>
+        <Tabs.Panel id="extras"><ExtrasPanel /></Tabs.Panel>
+        <Tabs.Panel id="recipes"><RecipesPanel /></Tabs.Panel>
+      </Tabs>
     </div>
   );
 }
@@ -53,7 +65,7 @@ function ToolsPanel() {
       {Object.entries(byExtension).map(([ext, extTools]) => (
         <div key={ext} style={styles.group}>
           <div style={styles.groupHeader}>
-            <span style={styles.extBadge}>{ext}</span>
+            <Chip variant="primary" size="sm">{ext}</Chip>
             <span style={styles.toolCount}>{extTools.length} tool{extTools.length !== 1 ? "s" : ""}</span>
           </div>
           <ul style={styles.toolList}>
@@ -78,6 +90,7 @@ function ExtrasPanel() {
   const [key, setKey]         = useState("");
   const [content, setContent] = useState("");
   const [saving, setSaving]   = useState(false);
+  const [showForm, setShowForm] = useState(false);
   const [error, setError]     = useState<string | null>(null);
 
   function load() {
@@ -92,7 +105,7 @@ function ExtrasPanel() {
     setSaving(true);
     try {
       await api.addExtra(key.trim(), content.trim());
-      setKey(""); setContent(""); load();
+      setKey(""); setContent(""); setShowForm(false); load();
     } catch (e) { setError(String(e)); } finally { setSaving(false); }
   }
 
@@ -102,31 +115,41 @@ function ExtrasPanel() {
 
   return (
     <div style={styles.panelRoot}>
-      <details style={styles.addCard}>
-        <summary style={styles.summary}>+ Add Extra</summary>
-        <div style={styles.addForm}>
+      <div>
+        <Button
+          variant="outline"
+          onPress={() => setShowForm((v) => !v)}
+        >
+          <Plus size={14} /> Add Extra
+        </Button>
+      </div>
+
+      {showForm && (
+        <div style={styles.addCard}>
           <input
-            style={styles.input}
             value={key}
             onChange={(e) => setKey(e.target.value)}
             placeholder="Key (e.g. context_note)"
+            aria-label="Extra key"
+            style={inputStyle}
           />
-          <textarea
-            style={styles.textarea}
+          <TextArea
             value={content}
             onChange={(e) => setContent(e.target.value)}
             placeholder="Content injected into system prompt…"
+            aria-label="Extra content"
             rows={3}
           />
-          <button
-            style={styles.addBtn}
-            onClick={add}
-            disabled={saving || !key.trim() || !content.trim()}
+          <Button
+            variant="primary"
+            onPress={add}
+            isDisabled={saving || !key.trim() || !content.trim()}
           >
             {saving ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
-      </details>
+      )}
+
       {error && <p style={styles.error}>{error}</p>}
       {loading ? <p style={hint}>Loading…</p> : extras.length === 0 ? (
         <p style={hint}>No prompt extras. Extras are injected into every agent system prompt.</p>
@@ -137,13 +160,19 @@ function ExtrasPanel() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={styles.extraHeader}>
                   <code style={styles.extraKey}>{ex.key}</code>
-                  {!ex.enabled && <span style={styles.disabledPill}>Disabled</span>}
+                  {!ex.enabled && <Chip size="sm" variant="soft">Disabled</Chip>}
                 </div>
                 <p style={styles.extraContent}>
                   {ex.content.length > 120 ? ex.content.slice(0, 120) + "…" : ex.content}
                 </p>
               </div>
-              <button style={styles.del} onClick={() => remove(ex.key)} title="Delete extra">×</button>
+              <Button
+                variant="danger-soft"
+                onPress={() => remove(ex.key)}
+                aria-label="Delete extra"
+              >
+                <Trash2 size={14} />
+              </Button>
             </li>
           ))}
         </ul>
@@ -214,23 +243,18 @@ function RecipesPanel() {
 // ── Styles ───────────────────────────────────────────────────
 
 const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
+const inputStyle: React.CSSProperties = { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", background: "var(--color-bg)", color: "var(--color-text)", width: "100%" };
 const inlineCode: React.CSSProperties = { fontFamily: "var(--font-mono)", fontSize: "0.85em", background: "rgba(23,22,22,0.06)", padding: "1px 5px", borderRadius: "4px" };
 
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
 
-  // Tabs
-  tabs: { display: "flex", gap: "4px", flexWrap: "wrap" as const },
-  tab: { height: "30px", padding: "0 var(--space-4)", borderRadius: "var(--radius-md)", border: "1px solid var(--color-border)", background: "transparent", cursor: "pointer", fontSize: "var(--text-sm)", fontFamily: "var(--font-body)", color: "var(--color-text-secondary)" },
-  tabActive: { background: "var(--color-accent-soft)", color: "var(--color-accent)", borderColor: "var(--color-accent-soft)", fontWeight: 600 },
-
   // Panel
-  panelRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)" },
+  panelRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)", paddingTop: "var(--space-3)" },
 
   // Tools
   group: { background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", overflow: "hidden" },
   groupHeader: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", borderBottom: "1px solid var(--color-border)", background: "rgba(23,22,22,0.02)" },
-  extBadge: { fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", fontWeight: 600, color: "var(--color-accent)", background: "var(--color-accent-soft)", padding: "2px 8px", borderRadius: "var(--radius-pill)" },
   toolCount: { fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", marginLeft: "auto" },
   toolList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "0" },
   toolItem: { padding: "var(--space-3) var(--space-4)", borderBottom: "1px solid var(--color-border)", display: "flex", flexDirection: "column", gap: "2px" },
@@ -238,20 +262,13 @@ const styles: Record<string, React.CSSProperties> = {
   toolDesc: { margin: 0, fontSize: "var(--text-xs)", color: "var(--color-text-secondary)", lineHeight: "1.5" },
 
   // Extras
-  addCard: { background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
-  summary: { cursor: "pointer", fontWeight: 600, fontSize: "var(--text-base)", color: "var(--color-accent)", userSelect: "none" as const },
-  addForm: { display: "flex", flexDirection: "column", gap: "var(--space-3)", marginTop: "var(--space-3)" },
-  input: { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", fontFamily: "var(--font-body)", background: "var(--color-bg)", color: "var(--color-text)", userSelect: "text" as const },
-  textarea: { border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "var(--space-2) var(--space-3)", fontSize: "var(--text-sm)", fontFamily: "var(--font-mono)", background: "var(--color-bg)", color: "var(--color-text)", resize: "vertical" as const, lineHeight: "1.6", userSelect: "text" as const },
-  addBtn: { height: "36px", padding: "0 var(--space-5)", borderRadius: "var(--radius-md)", background: "var(--color-accent)", color: "#fff", border: "none", cursor: "pointer", fontSize: "var(--text-base)", fontWeight: 600, fontFamily: "var(--font-body)", alignSelf: "flex-start" },
+  addCard: { display: "flex", flexDirection: "column", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
   error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
   extraList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "4px" },
   extraItem: { display: "flex", alignItems: "flex-start", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)" },
   extraHeader: { display: "flex", alignItems: "center", gap: "var(--space-2)", marginBottom: "2px" },
   extraKey: { fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: "var(--color-accent)", fontWeight: 600 },
-  disabledPill: { fontSize: "var(--text-xs)", fontWeight: 600, background: "rgba(23,22,22,0.06)", color: "var(--color-text-tertiary)", padding: "1px 6px", borderRadius: "var(--radius-pill)" },
   extraContent: { margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", lineHeight: "1.5" },
-  del: { background: "none", border: "none", cursor: "pointer", color: "var(--color-text-tertiary)", fontSize: "18px", padding: "0 4px", borderRadius: "4px", lineHeight: "1", flexShrink: 0 },
 
   // Recipes
   recipeLayout: { display: "flex", gap: "var(--space-3)", minHeight: "320px" },

@@ -1,8 +1,10 @@
-import { useState, useEffect, useId } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Tabs, Switch, Button } from "@heroui/react";
 import { api } from "../api/PondApiClient";
 import { useAppDispatch, useAppState } from "../state/AppContext";
 import type { Settings as SettingsType } from "../api/types";
+import { ModelPickerModal, type ModelRole } from "../components/ModelPickerModal";
 
 // ── Tab definitions ───────────────────────────────────────────
 
@@ -38,30 +40,6 @@ function FormRow({ label, hint, children }: { label: string; hint?: string; chil
       </div>
       <div style={rowStyles.control}>{children}</div>
     </div>
-  );
-}
-
-interface ToggleProps {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-  label?: string;
-}
-
-function Toggle({ checked, onChange, disabled = false, label }: ToggleProps) {
-  return (
-    <label className="toggle-wrap">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        disabled={disabled}
-      />
-      <span className="toggle-track">
-        <span className="toggle-thumb" />
-      </span>
-      {label && <span className="toggle-label">{label}</span>}
-    </label>
   );
 }
 
@@ -189,12 +167,13 @@ function VoiceTab({
   setHotkey: (v: string) => void;
   applyHotkey: () => void;
 }) {
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const recDur = s.voice_recording_duration_secs ?? 5;
 
   return (
     <div style={panelStyles.root}>
-      <FormSection title="Wake Word">
-        <FormRow label="Wake word" hint="Word or phrase that activates voice mode">
+      <FormSection title="Voice Activation">
+        <FormRow label="Wake phrase" hint="Say this phrase to activate voice mode">
           <input
             style={inp}
             value={s.voice_wake_word ?? s.wake_word ?? ""}
@@ -202,7 +181,7 @@ function VoiceTab({
             placeholder="goose"
           />
         </FormRow>
-        <FormRow label="Voice hotkey" hint="Global keyboard shortcut to activate voice">
+        <FormRow label="Keyboard shortcut" hint="Press this to activate voice from anywhere">
           <div style={{ display: "flex", gap: "var(--space-2)" }}>
             <input
               style={inp}
@@ -210,141 +189,174 @@ function VoiceTab({
               onChange={(e) => setHotkey(e.target.value)}
               placeholder="CmdOrCtrl+Shift+V"
             />
-            <button style={inlineBtn} onClick={applyHotkey}>Apply</button>
+            <Button variant="outline" onPress={applyHotkey}>Apply</Button>
           </div>
         </FormRow>
       </FormSection>
 
-      <FormSection title="Recording">
-        <FormRow label={`Max duration: ${recDur}s`} hint="Maximum microphone recording time">
-          <input
-            type="range"
-            min={2}
-            max={15}
-            step={1}
-            value={recDur}
-            onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))}
-          />
-        </FormRow>
-      </FormSection>
+      {/* Advanced toggle */}
+      <button
+        style={advancedToggleStyle}
+        onClick={() => setShowAdvanced((v) => !v)}
+        aria-expanded={showAdvanced}
+      >
+        {showAdvanced ? "▾" : "▸"} Advanced voice settings
+      </button>
 
-      <FormSection title="Speech Recognition (STT)">
-        <FormRow label="Whisper URL" hint="Default: http://127.0.0.1:9000">
-          <input
-            style={inp}
-            value={s.voice_whisper_url ?? ""}
-            onChange={(e) => patch("voice_whisper_url", e.target.value)}
-            placeholder="http://127.0.0.1:9000"
-          />
-        </FormRow>
-        <FormRow label="Whisper model" hint="e.g. ggml-base.bin">
-          <input
-            style={inp}
-            value={s.active_whisper_model ?? ""}
-            onChange={(e) => patch("active_whisper_model", e.target.value)}
-            placeholder="ggml-base.bin"
-          />
-        </FormRow>
-      </FormSection>
+      {showAdvanced && (
+        <>
+          <FormSection title="Recording">
+            <FormRow label={`Max listen time: ${recDur}s`} hint="Stops recording automatically after this duration">
+              <input
+                type="range"
+                min={2}
+                max={15}
+                step={1}
+                value={recDur}
+                onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </FormRow>
+          </FormSection>
 
-      <FormSection title="Text-to-Speech (TTS)">
-        <FormRow label="TTS model" hint="Piper model filename">
-          <input
-            style={inp}
-            value={s.active_tts_model ?? ""}
-            onChange={(e) => patch("active_tts_model", e.target.value)}
-            placeholder="en_US-lessac-medium.onnx"
-          />
-        </FormRow>
-        <FormRow label="TTS voice" hint="Voice configuration file">
-          <input
-            style={inp}
-            value={s.voice_tts_voice ?? ""}
-            onChange={(e) => patch("voice_tts_voice", e.target.value)}
-            placeholder="en_US-lessac-medium.onnx"
-          />
-        </FormRow>
-      </FormSection>
+          <FormSection title="Speech Recognition">
+            <FormRow label="Server address" hint="Where the speech-to-text server is running">
+              <input
+                style={inp}
+                value={s.voice_whisper_url ?? ""}
+                onChange={(e) => patch("voice_whisper_url", e.target.value)}
+                placeholder="http://127.0.0.1:9000"
+              />
+            </FormRow>
+            <FormRow label="Model file" hint="Speech recognition model (e.g. ggml-base.bin)">
+              <input
+                style={inp}
+                value={s.active_whisper_model ?? ""}
+                onChange={(e) => patch("active_whisper_model", e.target.value)}
+                placeholder="ggml-base.bin"
+              />
+            </FormRow>
+          </FormSection>
+
+          <FormSection title="Voice Synthesis">
+            <FormRow label="Voice model" hint="Piper voice model file (.onnx)">
+              <input
+                style={inp}
+                value={s.active_tts_model ?? ""}
+                onChange={(e) => patch("active_tts_model", e.target.value)}
+                placeholder="en_US-lessac-medium.onnx"
+              />
+            </FormRow>
+            <FormRow label="Voice name">
+              <input
+                style={inp}
+                value={s.voice_tts_voice ?? ""}
+                onChange={(e) => patch("voice_tts_voice", e.target.value)}
+                placeholder="en_US-lessac-medium.onnx"
+              />
+            </FormRow>
+          </FormSection>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Helper that shows the current model assignment and a "Change…" button
+function ModelRoleRow({
+  provider,
+  model,
+  onPick,
+}: {
+  provider?: string | null;
+  model?: string | null;
+  onPick: () => void;
+}) {
+  const label = provider && model ? `${provider} / ${model}` : "Not set";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", width: "100%" }}>
+      <span style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: provider ? "var(--color-text)" : "var(--color-text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {label}
+      </span>
+      <Button variant="outline" onPress={onPick}>Change…</Button>
     </div>
   );
 }
 
 function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
-  const [thinkSameAsChat, setThinkSameAsChat] = useState(
-    !s.think_provider && !s.think_model
-  );
-  const [taskSameAsChat, setTaskSameAsChat] = useState(
-    !s.task_provider && !s.task_model
-  );
+  const [pickerRole, setPickerRole] = useState<ModelRole | null>(null);
+  const [thinkSameAsChat, setThinkSameAsChat] = useState(!s.think_provider && !s.think_model);
+  const [taskSameAsChat, setTaskSameAsChat]   = useState(!s.task_provider && !s.task_model);
 
   const temp = s.llm_temperature ?? 0.7;
   const maxTokenOpts = [128, 256, 512, 1024, 2048, 4096];
 
-  const llmProviderOpts = [
-    { value: "llamafile" as const, label: "Llamafile", desc: "Local HTTP server compatible with OpenAI API" },
-    { value: "ollama" as const, label: "Ollama", desc: "Local model server with broad model support" },
-    { value: "local" as const, label: "Local (GGUF)", desc: "In-process GGUF inference — no server needed" },
-    { value: "mock" as const, label: "Mock", desc: "Deterministic mock responses for testing" },
-  ];
+  function handleModelSelect(role: ModelRole, provider: string, model: string) {
+    patch(`${role}_provider`, provider);
+    patch(`${role}_model`, model);
+    setPickerRole(null);
+  }
 
   return (
     <div style={panelStyles.root}>
-      <FormSection title="LLM Provider">
-        <RadioGroup
-          name="llm_provider"
-          options={llmProviderOpts}
-          value={(s.llm_provider ?? "llamafile") as "llamafile" | "ollama" | "local" | "mock"}
-          onChange={(v) => patch("llm_provider", v)}
-        />
-      </FormSection>
-
-      <FormSection title="Chat Model">
-        <FormRow label="Provider">
-          <input style={inp} value={s.chat_provider ?? ""} onChange={(e) => patch("chat_provider", e.target.value)} placeholder="openai" />
-        </FormRow>
-        <FormRow label="Model">
-          <input style={inp} value={s.chat_model ?? ""} onChange={(e) => patch("chat_model", e.target.value)} placeholder="gpt-4o-mini" />
-        </FormRow>
-      </FormSection>
-
-      <FormSection title="Think Model">
-        <FormRow label="Same as Chat">
-          <Toggle
-            checked={thinkSameAsChat}
-            onChange={(v) => {
-              setThinkSameAsChat(v);
-              if (v) { patch("think_provider", null); patch("think_model", null); }
-            }}
+      <FormSection title="AI Models">
+        <FormRow label="Conversation" hint="Used for everyday chat and questions">
+          <ModelRoleRow
+            provider={s.chat_provider}
+            model={s.chat_model}
+            onPick={() => setPickerRole("chat")}
           />
         </FormRow>
-        <FormRow label="Provider">
-          <input style={{ ...inp, opacity: thinkSameAsChat ? 0.45 : 1 }} disabled={thinkSameAsChat} value={s.think_provider ?? ""} onChange={(e) => patch("think_provider", e.target.value)} placeholder="openai" />
+
+        <FormRow label="Reasoning" hint="Used for complex, multi-step thinking">
+          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+              <Switch
+                isSelected={thinkSameAsChat}
+                onChange={(v) => {
+                  setThinkSameAsChat(v);
+                  if (v) { patch("think_provider", null); patch("think_model", null); }
+                }}
+              >
+                Same as Conversation
+              </Switch>
+            </div>
+            {!thinkSameAsChat && (
+              <ModelRoleRow
+                provider={s.think_provider}
+                model={s.think_model}
+                onPick={() => setPickerRole("think")}
+              />
+            )}
+          </div>
         </FormRow>
-        <FormRow label="Model">
-          <input style={{ ...inp, opacity: thinkSameAsChat ? 0.45 : 1 }} disabled={thinkSameAsChat} value={s.think_model ?? ""} onChange={(e) => patch("think_model", e.target.value)} placeholder="o1-mini" />
+
+        <FormRow label="Tools & Tasks" hint="Used when running actions or automations">
+          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+              <Switch
+                isSelected={taskSameAsChat}
+                onChange={(v) => {
+                  setTaskSameAsChat(v);
+                  if (v) { patch("task_provider", null); patch("task_model", null); }
+                }}
+              >
+                Same as Conversation
+              </Switch>
+            </div>
+            {!taskSameAsChat && (
+              <ModelRoleRow
+                provider={s.task_provider}
+                model={s.task_model}
+                onPick={() => setPickerRole("task")}
+              />
+            )}
+          </div>
         </FormRow>
       </FormSection>
 
-      <FormSection title="Task Model">
-        <FormRow label="Same as Chat">
-          <Toggle
-            checked={taskSameAsChat}
-            onChange={(v) => {
-              setTaskSameAsChat(v);
-              if (v) { patch("task_provider", null); patch("task_model", null); }
-            }}
-          />
-        </FormRow>
-        <FormRow label="Provider">
-          <input style={{ ...inp, opacity: taskSameAsChat ? 0.45 : 1 }} disabled={taskSameAsChat} value={s.task_provider ?? ""} onChange={(e) => patch("task_provider", e.target.value)} placeholder="openai" />
-        </FormRow>
-        <FormRow label="Model">
-          <input style={{ ...inp, opacity: taskSameAsChat ? 0.45 : 1 }} disabled={taskSameAsChat} value={s.task_model ?? ""} onChange={(e) => patch("task_model", e.target.value)} placeholder="gpt-4o-mini" />
-        </FormRow>
-      </FormSection>
-
-      <FormSection title="Inference Parameters">
-        <FormRow label={`Temperature: ${temp.toFixed(1)}`} hint="Higher = more creative, lower = more focused">
+      <FormSection title="Response Quality">
+        <FormRow label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
           <input
             type="range"
             min={0}
@@ -352,14 +364,25 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             step={0.1}
             value={temp}
             onChange={(e) => patch("llm_temperature", Number(e.target.value))}
+            style={{ width: "100%" }}
           />
         </FormRow>
-        <FormRow label="Max tokens" hint="Maximum response length">
+        <FormRow label="Response length" hint="Maximum length of each response">
           <select style={inp} value={s.llm_max_tokens ?? 1024} onChange={(e) => patch("llm_max_tokens", Number(e.target.value))}>
-            {maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()}</option>)}
+            {maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
           </select>
         </FormRow>
       </FormSection>
+
+      {pickerRole && (
+        <ModelPickerModal
+          role={pickerRole}
+          currentProvider={pickerRole === "chat" ? s.chat_provider : pickerRole === "think" ? s.think_provider : s.task_provider}
+          currentModel={pickerRole === "chat" ? s.chat_model : pickerRole === "think" ? s.think_model : s.task_model}
+          onSelect={(provider, model) => handleModelSelect(pickerRole, provider, model)}
+          onClose={() => setPickerRole(null)}
+        />
+      )}
     </div>
   );
 }
@@ -406,8 +429,8 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
 
       <FormSection title="Custom System Prompt">
         <FormRow label="Enable custom prompt">
-          <Toggle
-            checked={customEnabled}
+          <Switch
+            isSelected={customEnabled}
             onChange={(v) => {
               setCustomEnabled(v);
               if (!v) patch("custom_system_prompt", null);
@@ -439,10 +462,12 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
     <div style={panelStyles.root}>
       <FormSection title="Weather">
         <FormRow label="Enable weather" hint="Allow the assistant to fetch current weather data">
-          <Toggle
-            checked={enabled}
+          <Switch
+            isSelected={enabled}
             onChange={(v) => patch("weather_enabled", v)}
-          />
+          >
+            Enable weather
+          </Switch>
         </FormRow>
         <FormRow label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
           <input
@@ -484,14 +509,14 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
   const memInject = s.agent_memory_inject ?? false;
 
   const modeOpts = [
-    { value: "auto" as const, label: "Auto", desc: "Goose decides when to use tools" },
-    { value: "chat" as const, label: "Chat only", desc: "Chat only — no tool calls" },
-    { value: "smart" as const, label: "Smart", desc: "Proactively uses tools to complete tasks" },
+    { value: "auto" as const, label: "Smart (recommended)", desc: "Pond decides when to look things up or take actions" },
+    { value: "chat" as const, label: "Chat only", desc: "Conversation only — Pond won't use any tools" },
+    { value: "smart" as const, label: "Proactive", desc: "Pond actively uses tools to give more detailed answers" },
   ];
 
   return (
     <div style={panelStyles.root}>
-      <FormSection title="Agent Mode">
+      <FormSection title="How thorough should Pond be?">
         <RadioGroup
           name="agent_goose_mode"
           options={modeOpts}
@@ -500,8 +525,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
         />
       </FormSection>
 
-      <FormSection title="Limits">
-        <FormRow label="Max turns" hint="Maximum agent tool-call turns per request (1–50)">
+      <FormSection title="Behaviour">
+        <FormRow label="How thorough" hint="How many steps Pond will take to answer a question (1–50)">
           <input
             type="number"
             style={inp}
@@ -514,13 +539,15 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
       </FormSection>
 
       <FormSection title="Memory">
-        <FormRow label="Inject memories" hint="Include recent memories in every system prompt">
-          <Toggle
-            checked={memInject}
+        <FormRow label="Remember context" hint="Pond recalls facts from past conversations to give better answers">
+          <Switch
+            isSelected={memInject}
             onChange={(v) => patch("agent_memory_inject", v)}
-          />
+          >
+            Use conversation memory
+          </Switch>
         </FormRow>
-        <FormRow label="Memory limit" hint="Max number of memories to inject (1–20)">
+        <FormRow label="How much to recall" hint="Number of past memories to include (1–20)">
           <input
             type="number"
             style={{ ...inp, opacity: memInject ? 1 : 0.45 }}
@@ -653,23 +680,27 @@ export function Settings() {
 
   return (
     <div style={styles.root}>
-      {/* Tab bar — mirrors Agent.tsx pattern */}
-      <div style={styles.tabs}>
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            style={{ ...styles.tab, ...(tab === t.id ? styles.tabActive : {}) }}
-            onClick={() => setTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      {/* HeroUI Tab bar */}
+      <Tabs
+        selectedKey={tab}
+        onSelectionChange={(k) => setTab(k as SettingsTab)}
+      >
+        <Tabs.ListContainer>
+          <Tabs.List aria-label="Settings sections">
+            {TABS.map((t) => (
+              <Tabs.Tab key={t.id} id={t.id} onClick={() => setTab(t.id)}>
+                <Tabs.Indicator />
+                {t.label}
+              </Tabs.Tab>
+            ))}
+          </Tabs.List>
+        </Tabs.ListContainer>
+      </Tabs>
 
       {/* Error banner */}
       {error && <p style={styles.error}>{error}</p>}
 
-      {/* Panel area */}
+      {/* Panel area — conditionally rendered for test compatibility */}
       <div style={styles.panel}>
         {loading ? (
           <p style={styles.hint}>Loading settings…</p>
@@ -688,9 +719,9 @@ export function Settings() {
 
       {/* Save bar */}
       <div style={styles.saveBar}>
-        <button style={styles.saveBtn} onClick={save} disabled={saving || loading}>
-          {saving ? "Saving…" : saved ? "Saved ✓" : "Save Settings"}
-        </button>
+        <Button variant="primary" onPress={save} isDisabled={saving || loading}>
+          {saving ? "Saving…" : saved ? "Saved" : "Save Settings"}
+        </Button>
       </div>
     </div>
   );
@@ -709,21 +740,6 @@ const inp: React.CSSProperties = {
   color: "var(--color-text)",
   width: "100%",
   userSelect: "text",
-};
-
-const inlineBtn: React.CSSProperties = {
-  height: "36px",
-  padding: "0 var(--space-4)",
-  borderRadius: "var(--radius-md)",
-  border: "1px solid var(--color-border-strong)",
-  background: "transparent",
-  cursor: "pointer",
-  fontSize: "var(--text-base)",
-  fontFamily: "var(--font-body)",
-  fontWeight: 500,
-  color: "var(--color-text)",
-  flexShrink: 0,
-  whiteSpace: "nowrap",
 };
 
 const charCounter: React.CSSProperties = {
@@ -749,33 +765,6 @@ const styles: Record<string, React.CSSProperties> = {
     gap: "var(--space-4)",
     maxWidth: "var(--content-max-width)",
   },
-  tabs: {
-    display: "flex",
-    gap: "2px",
-    borderBottom: "1px solid var(--color-border)",
-    paddingBottom: "0",
-    flexWrap: "wrap" as const,
-    flexShrink: 0,
-  },
-  tab: {
-    height: "32px",
-    padding: "0 var(--space-3)",
-    borderRadius: "var(--radius-sm) var(--radius-sm) 0 0",
-    border: "none",
-    background: "transparent",
-    cursor: "pointer",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-display)",
-    fontWeight: 600,
-    color: "var(--color-text-secondary)",
-    transition: "color var(--transition-fast)",
-    borderBottom: "2px solid transparent",
-    marginBottom: "-1px",
-  },
-  tabActive: {
-    color: "var(--color-accent)",
-    borderBottom: "2px solid var(--color-accent)",
-  },
   error: {
     color: "var(--color-destructive)",
     fontSize: "var(--text-sm)",
@@ -796,18 +785,20 @@ const styles: Record<string, React.CSSProperties> = {
     paddingTop: "var(--space-3)",
     borderTop: "1px solid var(--color-border)",
   },
-  saveBtn: {
-    height: "36px",
-    padding: "0 var(--space-6)",
-    borderRadius: "var(--radius-md)",
-    background: "var(--color-accent)",
-    color: "#FFFFFF",
-    border: "none",
-    cursor: "pointer",
-    fontSize: "var(--text-base)",
-    fontWeight: 600,
-    fontFamily: "var(--font-body)",
-  },
+};
+
+const advancedToggleStyle: React.CSSProperties = {
+  background: "none",
+  border: "none",
+  cursor: "pointer",
+  fontSize: "var(--text-sm)",
+  color: "var(--color-text-secondary)",
+  padding: "0",
+  textAlign: "left",
+  fontFamily: "var(--font-body)",
+  display: "flex",
+  alignItems: "center",
+  gap: "var(--space-1)",
 };
 
 const panelStyles: Record<string, React.CSSProperties> = {

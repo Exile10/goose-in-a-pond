@@ -28,6 +28,8 @@ export interface Settings {
   active_whisper_model?: string;
   active_tts_model?: string;
   voice_tts_voice?: string;
+  voice_tts_http_url?: string;
+  voice_tts_http_voice?: string;
 
   // Model roles
   chat_provider?: string;
@@ -100,7 +102,8 @@ export interface UserSkill {
   id: string;
   name: string;
   content: string;
-  enabled: boolean;
+  active: boolean;    // backend field name
+  enabled?: boolean;  // alias — some code uses this; prefer active
   created_at?: string;
 }
 
@@ -163,6 +166,43 @@ export interface ChatEvent {
 // ── Transcription ─────────────────────────────────────────────
 export interface TranscribeResponse {
   text: string;
+}
+
+// ── Auth / Handshake ──────────────────────────────────────────
+export interface HandshakeResponse {
+  token: string;
+  expires_in?: number;
+}
+
+// ── Model Role Assignments ────────────────────────────────────
+export interface ModelRoleAssignment {
+  provider: string;
+  model: string;
+}
+
+export interface ModelActiveRoles {
+  chat:  ModelRoleAssignment | null;
+  think: ModelRoleAssignment | null;
+  task:  ModelRoleAssignment | null;
+  asr:   ModelRoleAssignment | null;
+  tts:   ModelRoleAssignment | null;
+}
+
+// ── Sessions ──────────────────────────────────────────────────
+export interface SessionSummary {
+  id: string;
+  title?: string;
+  created_at: string;
+  updated_at: string;
+  message_count?: number;
+}
+
+export interface SessionMessage {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
 }
 
 // ── API Error ─────────────────────────────────────────────────
