@@ -1,6 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { Button } from "@heroui/react";
+import { ArrowUp } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { useAppState } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/AppContext";
+import { nextCardId } from "../state/reducer";
 import type { ChatEvent } from "../api/types";
 
 interface Message {
@@ -13,12 +16,44 @@ interface Message {
 let msgId = 0;
 
 export function Chat() {
-  const state = useAppState();
+  const state    = useAppState();
+  const dispatch = useAppDispatch();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
+
+  // Keep sessionIdRef in sync with state
+  useEffect(() => {
+    sessionIdRef.current = state.sessionId ?? undefined;
+  }, [state.sessionId]);
+
+  // Load most recent session on mount (once server is online)
+  useEffect(() => {
+    if (!state.serverOnline || messages.length > 0) return;
+    api.listSessions()
+      .then((sessions) => {
+        if (sessions.length === 0) return;
+        const latest = sessions[0];
+        dispatch({ type: "SET_SESSION_ID", payload: latest.id });
+        sessionIdRef.current = latest.id;
+        return api.getSessionMessages(latest.id);
+      })
+      .then((msgs) => {
+        if (!msgs || msgs.length === 0) return;
+        setMessages(
+          msgs.map((m) => ({
+            id: ++msgId,
+            role: m.role === "user" ? "user" : "agent",
+            text: m.content,
+          })),
+        );
+      })
+      .catch(() => {/* session loading is best-effort */});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.serverOnline]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -37,7 +72,7 @@ export function Chat() {
 
     try {
       api.setToken(state.sessionToken);
-      for await (const event of api.chatStream(text, undefined, state.sessionToken ?? undefined)) {
+      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined)) {
         const ev = event as ChatEvent;
         if (ev.type === "text" && ev.content) {
           setMessages((prev) => {
@@ -45,6 +80,17 @@ export function Chat() {
             if (!last || last.role !== "agent") return prev;
             return [...prev.slice(0, -1), { ...last, text: last.text + ev.content }];
           });
+        } else if (ev.type === "tool_call" && ev.tool) {
+          dispatch({ type: "PUSH_CONTEXT_CARD", payload: {
+            id: nextCardId(),
+            tool: ev.tool,
+            data: (ev.result as Record<string, unknown>) ?? {},
+            timestamp_ms: Date.now(),
+          }});
+        } else if (ev.type === "done" && (ev as { session_id?: string }).session_id) {
+          const sid = (ev as { session_id?: string }).session_id!;
+          sessionIdRef.current = sid;
+          dispatch({ type: "SET_SESSION_ID", payload: sid });
         }
       }
     } catch (e) {
@@ -62,7 +108,7 @@ export function Chat() {
       setBusy(false);
       textareaRef.current?.focus();
     }
-  }, [input, busy, state.serverOnline, state.sessionToken]);
+  }, [input, busy, state.serverOnline, state.sessionToken, dispatch]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -116,17 +162,14 @@ export function Chat() {
           rows={1}
           aria-label="Message input"
         />
-        <button
-          style={{
-            ...styles.sendBtn,
-            opacity: (!input.trim() || !state.serverOnline || busy) ? 0.4 : 1,
-          }}
-          onClick={sendMessage}
-          disabled={!input.trim() || !state.serverOnline || busy}
+        <Button
+          variant="primary"
+          isDisabled={!input.trim() || !state.serverOnline || busy}
+          onPress={sendMessage}
           aria-label="Send message"
         >
-          ↑
-        </button>
+          <ArrowUp size={16} />
+        </Button>
       </div>
     </div>
   );
@@ -225,20 +268,5 @@ const styles: Record<string, React.CSSProperties> = {
     maxHeight: "120px",
     overflowY: "auto",
     userSelect: "text",
-  },
-  sendBtn: {
-    width: "36px",
-    height: "36px",
-    flexShrink: 0,
-    background: "var(--color-accent)",
-    color: "#FFFFFF",
-    border: "none",
-    borderRadius: "var(--radius-md)",
-    fontSize: "18px",
-    cursor: "pointer",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    transition: "opacity var(--transition-fast)",
   },
 };

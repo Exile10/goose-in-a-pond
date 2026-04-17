@@ -1,3 +1,4 @@
+import { Card, Chip } from "@heroui/react";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 
 interface Props {
@@ -9,14 +10,14 @@ export function ContextCard({ card }: Props) {
   const toolName = tool.includes("__") ? tool.split("__")[1] : tool;
 
   return (
-    <div style={styles.card} role="article" aria-label={`Tool result: ${toolName}`}>
+    <Card role="article" aria-label={`Tool result: ${toolName}`}>
       <div style={styles.header}>
-        <span style={styles.toolName}>{formatToolName(toolName)}</span>
+        <Chip size="sm" variant="primary">{formatToolName(toolName)}</Chip>
       </div>
       <div style={styles.body}>
         <ToolContent toolName={toolName} data={data} />
       </div>
-    </div>
+    </Card>
   );
 }
 

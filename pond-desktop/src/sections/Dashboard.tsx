@@ -1,3 +1,5 @@
+import { Button, Card } from "@heroui/react";
+import { Mic, MessageSquare } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 
 export function Dashboard() {
@@ -9,65 +11,71 @@ export function Dashboard() {
   return (
     <div style={styles.root}>
       {/* Server status card */}
-      <section style={styles.card}>
-        <h3 style={styles.cardTitle}>Server Status</h3>
-        <div style={styles.statusRow}>
-          <span style={{
-            ...styles.statusDot,
-            background: state.serverOnline
-              ? "var(--color-success)"
-              : state.serverStarting
-              ? "var(--color-warning)"
-              : "var(--color-neutral)",
-          }} />
-          <span style={styles.statusLabel}>
-            {state.serverOnline ? "Connected" : state.serverStarting ? "Starting…" : "Offline"}
-          </span>
-          <span style={styles.statusUrl}>{state.serverUrl}</span>
+      <Card>
+        <div style={styles.cardBody}>
+          <h3 style={styles.cardTitle}>Server Status</h3>
+          <div style={styles.statusRow}>
+            <span style={{
+              ...styles.statusDot,
+              background: state.serverOnline
+                ? "var(--color-success)"
+                : state.serverStarting
+                ? "var(--color-warning)"
+                : "var(--color-neutral)",
+            }} />
+            <span style={styles.statusLabel}>
+              {state.serverOnline ? "Connected" : state.serverStarting ? "Starting…" : "Offline"}
+            </span>
+            <span style={styles.statusUrl}>{state.serverUrl}</span>
+          </div>
         </div>
-      </section>
+      </Card>
 
       {/* Quick actions */}
-      <section style={styles.card}>
-        <h3 style={styles.cardTitle}>Quick Actions</h3>
-        <div style={styles.actionsRow}>
-          <button
-            style={styles.actionBtn}
-            disabled={!state.serverOnline}
-            onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
-          >
-            🎙 Start Voice
-          </button>
-          <button
-            style={styles.actionBtn}
-            disabled={!state.serverOnline}
-            onClick={() => dispatch({ type: "SET_SECTION", payload: "chat" })}
-          >
-            💬 Open Chat
-          </button>
+      <Card>
+        <div style={styles.cardBody}>
+          <h3 style={styles.cardTitle}>Quick Actions</h3>
+          <div style={styles.actionsRow}>
+            <Button
+              variant="outline"
+              isDisabled={!state.serverOnline}
+              onPress={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+            >
+              <Mic size={14} /> Start Voice
+            </Button>
+            <Button
+              variant="outline"
+              isDisabled={!state.serverOnline}
+              onPress={() => dispatch({ type: "SET_SECTION", payload: "chat" })}
+            >
+              <MessageSquare size={14} /> Open Chat
+            </Button>
+          </div>
         </div>
-      </section>
+      </Card>
 
       {/* Recent activity */}
       {recentMessages.length > 0 && (
-        <section style={styles.card}>
-          <h3 style={styles.cardTitle}>Recent</h3>
-          <ul style={styles.activityList}>
-            {recentMessages.map((msg) => (
-              <li key={msg.id} style={styles.activityItem}>
-                <span style={{
-                  ...styles.activityRole,
-                  color: msg.role === "agent" ? "var(--color-accent)" : "var(--color-text-secondary)",
-                }}>
-                  {msg.role === "user" ? "You" : "Pond"}
-                </span>
-                <span style={styles.activityText}>
-                  {msg.text.length > 80 ? msg.text.slice(0, 80) + "…" : msg.text}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
+        <Card>
+          <div style={styles.cardBody}>
+            <h3 style={styles.cardTitle}>Recent</h3>
+            <ul style={styles.activityList}>
+              {recentMessages.map((msg) => (
+                <li key={msg.id} style={styles.activityItem}>
+                  <span style={{
+                    ...styles.activityRole,
+                    color: msg.role === "agent" ? "var(--color-accent)" : "var(--color-text-secondary)",
+                  }}>
+                    {msg.role === "user" ? "You" : "Pond"}
+                  </span>
+                  <span style={styles.activityText}>
+                    {msg.text.length > 80 ? msg.text.slice(0, 80) + "…" : msg.text}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </Card>
       )}
     </div>
   );
@@ -75,10 +83,7 @@ export function Dashboard() {
 
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
-  card: {
-    background: "var(--color-bg)",
-    border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-lg)",
+  cardBody: {
     padding: "var(--space-4)",
     display: "flex",
     flexDirection: "column",
@@ -96,22 +101,6 @@ const styles: Record<string, React.CSSProperties> = {
   statusLabel: { fontSize: "var(--text-base)", color: "var(--color-text)", fontWeight: 500 },
   statusUrl: { fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)", marginLeft: "auto", fontFamily: "var(--font-mono)" },
   actionsRow: { display: "flex", gap: "var(--space-3)" },
-  actionBtn: {
-    height: "36px",
-    padding: "0 var(--space-5)",
-    borderRadius: "var(--radius-md)",
-    border: "1px solid var(--color-border-strong)",
-    background: "transparent",
-    fontFamily: "var(--font-body)",
-    fontSize: "var(--text-base)",
-    fontWeight: 500,
-    color: "var(--color-text)",
-    cursor: "pointer",
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "var(--space-2)",
-    transition: "background var(--transition-fast)",
-  },
   activityList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "var(--space-2)" },
   activityItem: { display: "flex", gap: "var(--space-2)", alignItems: "baseline" },
   activityRole: { fontSize: "var(--text-xs)", fontWeight: 600, fontFamily: "var(--font-display)", textTransform: "uppercase" as const, flexShrink: 0, letterSpacing: "0.04em" },
