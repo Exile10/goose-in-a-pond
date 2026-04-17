@@ -7,6 +7,7 @@ import React, {
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { api } from "../api/PondApiClient";
 import {
   reducer,
   buildInitialState,
@@ -32,12 +33,25 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
 
     // Guard: Tauri IPC may not be available in non-Tauri environments (browser dev, tests)
     const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!isTauri) return;
+    if (!isTauri) {
+      // Browser dev / Playwright mode: mark server online immediately so
+      // all sections can load. Auth token not needed (loopback bypass).
+      dispatch({ type: "SERVER_ONLINE" });
+      return;
+    }
 
     // Server online/offline status
     listen<boolean>("server-status", (e) => {
       if (e.payload) {
         dispatch({ type: "SERVER_ONLINE" });
+        // Always re-handshake when server comes online — the server restarts
+        // alongside the app, so any previously stored token is invalid.
+        api.handshake("pond-desktop")
+          .then((res) => {
+            api.setToken(res.token);
+            dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
+          })
+          .catch((err) => console.warn("Handshake failed (non-fatal):", err));
       } else {
         dispatch({ type: "SERVER_OFFLINE" });
       }

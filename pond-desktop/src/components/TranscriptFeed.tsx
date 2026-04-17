@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Chip } from "@heroui/react";
 import type { TranscriptMessage } from "../state/reducer";
 
 interface Props {
@@ -37,12 +38,12 @@ export function TranscriptFeed({ messages, maxHeight = "200px", compact = false 
           }}
         >
           {!compact && (
-            <span style={{
-              ...styles.roleLabel,
-              color: msg.role === "user" ? "rgba(23,22,22,0.45)" : "#8C52FF",
-            }}>
+            <Chip
+              size="sm"
+              variant={msg.role === "user" ? "soft" : "primary"}
+            >
               {msg.role === "user" ? "You" : "Pond"}
-            </span>
+            </Chip>
           )}
           <p style={{ ...styles.text, fontSize: compact ? "12px" : "13px" }}>
             {msg.text || (msg.role === "agent" ? <span style={styles.thinking}>●●●</span> : "")}

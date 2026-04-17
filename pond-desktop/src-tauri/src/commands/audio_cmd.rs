@@ -88,6 +88,7 @@ pub async fn run_voice_pipeline(
     app: AppHandle,
     wav_bytes: Vec<u8>,
     auth_token: String,
+    session_id: Option<String>,
     server: State<'_, ServerProcess>,
 ) -> Result<(), String> {
     let base_url = server.get_url();
@@ -137,9 +138,10 @@ pub async fn run_voice_pipeline(
     let _ = app.emit("transcript", TranscriptResult { text: transcript.clone() });
 
     // ── 2. Chat (streaming SSE) ──────────────────────────────────────────────
+    let effective_session_id = session_id.unwrap_or_else(|| "voice".to_string());
     let chat_req = serde_json::json!({
         "message": transcript,
-        "session_id": "canvas-voice"
+        "session_id": effective_session_id
     });
 
     let mut chat_builder = client

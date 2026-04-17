@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Button } from "@heroui/react";
 import logoSrc from "../assets/logo.png";
 
 interface Props {
@@ -34,10 +35,34 @@ export function StartupScreen({ onReady }: Props) {
 
     setPhase("connecting");
 
-    // Poll health endpoint
+    if (!isTauri) {
+      // Browser dev mode: poll the health endpoint directly via fetch.
+      // This lets Playwright and web browser testing work without Tauri.
+      const serverUrl =
+        (window as { __GIAP_SERVER_URL__?: string }).__GIAP_SERVER_URL__ ??
+        "http://127.0.0.1:4000";
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+        try {
+          const res = await fetch(`${serverUrl}/api/v1/health`);
+          if (res.ok) {
+            setPhase("ready");
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            onReady();
+            return;
+          }
+        } catch {
+          // Server not yet available — keep polling
+        }
+      }
+      setPhase("error");
+      setError("Could not reach pond-server at " + serverUrl + ". Make sure it is running.");
+      return;
+    }
+
+    // Poll health endpoint via Tauri IPC
     for (let i = 0; i < MAX_POLLS; i++) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      if (!isTauri) break; // In browser dev, don't poll forever
 
       try {
         const healthy = await invoke<boolean>("server_health");
@@ -54,11 +79,7 @@ export function StartupScreen({ onReady }: Props) {
     }
 
     setPhase("error");
-    setError(
-      isTauri
-        ? "Could not connect to pond-server within 30 seconds."
-        : "Not running inside Tauri. Launch via `npm run tauri dev`."
-    );
+    setError("Could not connect to pond-server within 30 seconds.");
   }, [onReady]);
 
   // Animated dots
@@ -109,9 +130,9 @@ export function StartupScreen({ onReady }: Props) {
               <code style={styles.code}>cargo run -p pond-server -- serve</code>{" "}
               in a terminal.
             </p>
-            <button style={styles.retryBtn} onClick={tryStartup}>
+            <Button variant="primary" onPress={tryStartup}>
               Retry
-            </button>
+            </Button>
           </div>
         )}
       </div>

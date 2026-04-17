@@ -4,13 +4,17 @@ import {
   type AgentTool,
   type ChatEvent,
   type Device,
+  type HandshakeResponse,
   type HealthResponse,
   type MemoryFragment,
+  type ModelActiveRoles,
   type ModelEntry,
   type ModelMemoryStatus,
   type PromptExtra,
   type PromptTemplate,
   type Schedule,
+  type SessionMessage,
+  type SessionSummary,
   type Settings,
   type TranscribeResponse,
   type UserSkill,
@@ -59,6 +63,9 @@ export class PondApiClient {
       try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
+    // 204 No Content and any other empty body — return undefined cast to T
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.status === 204 || !ct.includes("json")) return undefined as unknown as T;
     return res.json() as Promise<T>;
   }
 
@@ -86,7 +93,9 @@ export class PondApiClient {
   // ── Devices ───────────────────────────────────────────────
 
   listDevices(): Promise<Device[]> {
-    return this.get("/api/v1/devices");
+    return this.get<{ devices: Device[] } | Device[]>("/api/v1/devices").then((r) =>
+      Array.isArray(r) ? r : (r as { devices: Device[] }).devices ?? [],
+    );
   }
 
   // ── Schedules ─────────────────────────────────────────────
@@ -127,22 +136,72 @@ export class PondApiClient {
     return this.post("/api/v1/skills", { name, content });
   }
 
-  toggleSkill(id: string): Promise<UserSkill> {
-    return this.put(`/api/v1/skills/${id}/toggle`);
+  toggleSkill(id: string, currentEnabled: boolean): Promise<UserSkill> {
+    return this.put(`/api/v1/skills/${id}`, { active: !currentEnabled });
   }
 
   removeSkill(id: string): Promise<void> {
     return this.del(`/api/v1/skills/${id}`);
   }
 
+  // ── Auth / Handshake ─────────────────────────────────────────
+
+  handshake(clientId: string): Promise<HandshakeResponse> {
+    return this.post("/api/v1/handshake", { client_id: clientId });
+  }
+
   // ── Models ────────────────────────────────────────────────
 
   listModels(): Promise<ModelEntry[]> {
-    return this.get("/api/v1/models");
+    // Backend returns { gguf: [...], llamafile: [...], tts: [...], whisper: [...] }
+    // each entry has: name, category, active, ram_estimate_mb, recommended_role, description
+    return this.get<ModelEntry[] | Record<string, unknown[]>>("/api/v1/models").then((r) => {
+      if (Array.isArray(r)) return r;
+      // Flatten grouped object into ModelEntry[]
+      const entries: ModelEntry[] = [];
+      for (const [category, items] of Object.entries(r)) {
+        for (const item of items as Record<string, unknown>[]) {
+          entries.push({
+            id: `${category}/${item.name as string}`,
+            provider: category,
+            name: item.name as string,
+            display_name: (item.description as string | undefined) ?? (item.name as string),
+            is_active: (item.active as boolean | undefined) ?? false,
+            ram_estimate_mb: item.ram_estimate_mb as number | undefined,
+            recommended_role: item.recommended_role as string | undefined,
+          });
+        }
+      }
+      return entries;
+    });
   }
 
   getMemoryStatus(): Promise<ModelMemoryStatus> {
     return this.get("/api/v1/models/memory-status");
+  }
+
+  getActiveRoles(): Promise<ModelActiveRoles> {
+    return this.get("/api/v1/models/active-roles");
+  }
+
+  activateModel(provider: string, name: string, role: string): Promise<void> {
+    return this.post(`/api/v1/models/${encodeURIComponent(provider)}/${encodeURIComponent(name)}/activate`, { role });
+  }
+
+  // ── Sessions ──────────────────────────────────────────────
+
+  listSessions(): Promise<SessionSummary[]> {
+    return this.get<{ sessions: SessionSummary[] } | SessionSummary[]>("/api/v1/sessions").then((r) =>
+      Array.isArray(r) ? r : (r as { sessions: SessionSummary[] }).sessions ?? [],
+    );
+  }
+
+  getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
+    return this.get<{ messages: SessionMessage[] } | SessionMessage[]>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+    ).then((r) =>
+      Array.isArray(r) ? r : (r as { messages: SessionMessage[] }).messages ?? [],
+    );
   }
 
   // ── Prompts ───────────────────────────────────────────────
@@ -166,11 +225,20 @@ export class PondApiClient {
   // ── Agent extras ──────────────────────────────────────────
 
   listExtras(): Promise<PromptExtra[]> {
-    return this.get("/api/v1/agent/extras");
+    // Backend uses field name "instruction"; normalize to "content" and "enabled"
+    return this.get<Array<Record<string, unknown>>>("/api/v1/agent/extras").then((items) =>
+      items.map((e) => ({
+        key: e.key as string,
+        content: (e.content ?? e.instruction ?? "") as string,
+        enabled: (e.enabled ?? e.active ?? true) as boolean,
+      })),
+    );
   }
 
   addExtra(key: string, content: string): Promise<PromptExtra> {
-    return this.post("/api/v1/agent/extras", { key, content });
+    // Backend expects field name "instruction" not "content"
+    return this.post<Record<string, unknown>>("/api/v1/agent/extras", { key, instruction: content, active: true })
+      .then(() => ({ key, content, enabled: true }));
   }
 
   deleteExtra(key: string): Promise<void> {

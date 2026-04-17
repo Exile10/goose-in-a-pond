@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Card, Chip } from "@heroui/react";
 import { api } from "../api/PondApiClient";
 import type { ModelEntry } from "../api/types";
 
@@ -18,19 +19,21 @@ export function Models() {
   return (
     <div style={styles.root}>
       {models.map((m) => (
-        <div key={m.id} style={styles.card}>
-          <div style={styles.cardHeader}>
-            <span style={styles.modelName}>{m.display_name ?? m.name}</span>
-            <span style={styles.provider}>{m.provider}</span>
-            {m.recommended_role && (
-              <span style={styles.rolePill}>{m.recommended_role}</span>
+        <Card key={m.id}>
+          <div style={styles.cardBody}>
+            <div style={styles.cardHeader}>
+              <span style={styles.modelName}>{m.display_name ?? m.name}</span>
+              <span style={styles.provider}>{m.provider}</span>
+              {m.recommended_role && (
+                <Chip variant="primary" size="sm">{m.recommended_role}</Chip>
+              )}
+              {m.is_active && <Chip color="success" variant="soft" size="sm">Active</Chip>}
+            </div>
+            {m.ram_estimate_mb && (
+              <p style={styles.ramText}>RAM: ~{m.ram_estimate_mb} MB</p>
             )}
-            {m.is_active && <span style={styles.activePill}>Active</span>}
           </div>
-          {m.ram_estimate_mb && (
-            <p style={styles.ramText}>RAM: ~{m.ram_estimate_mb} MB</p>
-          )}
-        </div>
+        </Card>
       ))}
     </div>
   );
@@ -39,11 +42,9 @@ export function Models() {
 const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-3)", maxWidth: "var(--content-max-width)" },
-  card: { background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
+  cardBody: { padding: "var(--space-4)" },
   cardHeader: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const },
   modelName: { fontWeight: 600, fontSize: "var(--text-base)", color: "var(--color-text)" },
   provider: { fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", marginLeft: "auto" },
-  rolePill: { fontSize: "var(--text-xs)", fontWeight: 600, background: "var(--color-accent-soft)", color: "var(--color-accent)", padding: "2px 7px", borderRadius: "var(--radius-pill)" },
-  activePill: { fontSize: "var(--text-xs)", fontWeight: 600, background: "var(--color-success-soft)", color: "var(--color-success)", padding: "2px 7px", borderRadius: "var(--radius-pill)" },
   ramText: { margin: "var(--space-2) 0 0", fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)" },
 };
