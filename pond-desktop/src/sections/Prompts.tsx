@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Tabs, Button } from "@heroui/react";
 import { api } from "../api/PondApiClient";
 import type { PromptTemplate } from "../api/types";
 
@@ -32,20 +33,31 @@ export function Prompts() {
 
   if (loading) return <p style={hint}>Loading…</p>;
   if (error)   return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
+  if (!prompts.length) return <p style={hint}>No prompt templates found. Prompts are created automatically when the agent runs for the first time.</p>;
 
   return (
     <div style={styles.root}>
-      <div style={styles.tabs}>
-        {prompts.map((p) => (
-          <button key={p.name} style={{ ...styles.tab, ...(selected === p.name ? styles.tabActive : {}) }} onClick={() => select(p.name)}>
-            {p.name}
-          </button>
-        ))}
-      </div>
+      {prompts.length > 0 && (
+        <Tabs
+          selectedKey={selected ?? undefined}
+          onSelectionChange={(k) => select(String(k))}
+        >
+          <Tabs.ListContainer>
+            <Tabs.List aria-label="Prompt templates">
+              {prompts.map((p) => (
+                <Tabs.Tab key={p.name} id={p.name}>
+                  <Tabs.Indicator />
+                  {p.name}
+                </Tabs.Tab>
+              ))}
+            </Tabs.List>
+          </Tabs.ListContainer>
+        </Tabs>
+      )}
       {selected && (
         <>
           <textarea style={styles.editor} value={content} onChange={(e) => setContent(e.target.value)} rows={16} spellCheck={false} />
-          <button style={styles.saveBtn} onClick={save} disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+          <Button variant="primary" onPress={save} isDisabled={saving}>{saving ? "Saving…" : "Save"}</Button>
         </>
       )}
     </div>
@@ -55,9 +67,5 @@ export function Prompts() {
 const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
-  tabs: { display: "flex", gap: "4px", flexWrap: "wrap" as const },
-  tab: { height: "30px", padding: "0 var(--space-4)", borderRadius: "var(--radius-md)", border: "1px solid var(--color-border)", background: "transparent", cursor: "pointer", fontSize: "var(--text-sm)", fontFamily: "var(--font-body)", color: "var(--color-text-secondary)" },
-  tabActive: { background: "var(--color-accent-soft)", color: "var(--color-accent)", borderColor: "var(--color-accent-soft)", fontWeight: 600 },
   editor: { border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "var(--space-4)", fontSize: "var(--text-sm)", fontFamily: "var(--font-mono)", background: "var(--color-bg)", color: "var(--color-text)", resize: "vertical" as const, lineHeight: "1.6", userSelect: "text" as const },
-  saveBtn: { height: "36px", padding: "0 var(--space-6)", borderRadius: "var(--radius-md)", background: "var(--color-accent)", color: "#fff", border: "none", cursor: "pointer", fontSize: "var(--text-base)", fontWeight: 600, fontFamily: "var(--font-body)", alignSelf: "flex-start" },
 };

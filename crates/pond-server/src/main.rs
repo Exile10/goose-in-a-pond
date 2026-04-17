@@ -1136,7 +1136,11 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         spawn_desktop_app(api_port);
     }
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
