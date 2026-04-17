@@ -30,6 +30,7 @@ export interface AppState {
   serverStarting: boolean;
   serverUrl: string;
   sessionToken: string | null;
+  sessionId: string | null;
   voiceState: VoiceState;
   voiceError: string | null;
   transcript: TranscriptMessage[];
@@ -45,6 +46,7 @@ export type AppAction =
   | { type: "SERVER_STARTING" }
   | { type: "SET_SERVER_URL"; payload: string }
   | { type: "SET_SESSION_TOKEN"; payload: string | null }
+  | { type: "SET_SESSION_ID"; payload: string | null }
   | { type: "SET_VOICE_STATE"; payload: VoiceState }
   | { type: "SET_VOICE_ERROR"; payload: string | null }
   | { type: "APPEND_TRANSCRIPT"; payload: TranscriptMessage }
@@ -72,6 +74,7 @@ export function buildInitialState(): AppState {
     serverStarting: true,
     serverUrl: storedUrl,
     sessionToken: storedToken,
+    sessionId: null,
     voiceState: "idle",
     voiceError: null,
     transcript: [],
@@ -114,6 +117,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
       }
       return { ...state, sessionToken: action.payload };
     }
+
+    case "SET_SESSION_ID":
+      return { ...state, sessionId: action.payload };
 
     case "SET_VOICE_STATE":
       return { ...state, voiceState: action.payload, voiceError: null };

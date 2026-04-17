@@ -120,6 +120,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Prompt Templates ───────────────────────────────────────────────────
         .route("/prompts", get(list_prompt_templates))
         .route("/prompts/{name}", get(get_prompt_template).put(upsert_prompt_template).delete(delete_prompt_template))
+        // ── Agent Tools (MCP) ─────────────────────────────────────────────────
+        .route("/agent/tools", get(list_agent_tools))
         // ── System Prompt Extras ───────────────────────────────────────────────
         .route("/agent/extras", get(list_prompt_extras).post(upsert_prompt_extra))
         .route("/agent/extras/{key}", delete(delete_prompt_extra))
@@ -3195,6 +3197,29 @@ async fn run_schedule_now(
     }
 }
 
+// ── Agent tools handler ───────────────────────────────────────────────────────
+
+/// `GET /api/v1/agent/tools` — list all MCP tools currently loaded by the agent.
+///
+/// Returns a flat array of `{ extension, name, description }` objects.
+/// Returns an empty array when no extension manager is active (no-crash fallback).
+async fn list_agent_tools(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(manager) = &state.extension_manager else {
+        return Json(json!([])).into_response();
+    };
+    match manager.list_tools().await {
+        Ok(tools) => Json(json!(tools)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Extension management handlers ─────────────────────────────────────────────
 
 /// `GET /api/v1/extensions` — list all active Goose/MCP extensions.
@@ -3474,8 +3499,8 @@ async fn save_memory(
         tags: req.tags,
         created_at: chrono::Utc::now(),
     };
-    match state.memory_repo.add(fragment).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
+    match state.memory_repo.add(fragment.clone()).await {
+        Ok(()) => (StatusCode::CREATED, Json(json!(fragment))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

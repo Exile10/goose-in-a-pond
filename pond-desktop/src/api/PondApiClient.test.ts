@@ -162,11 +162,11 @@ describe("listExtras()", () => {
 });
 
 describe("addExtra()", () => {
-  it("POSTs key + content", async () => {
-    fetchMock.mockResolvedValueOnce(okJson({ key: "tz", content: "Africa/Nairobi", enabled: true }));
+  it("POSTs key + instruction + active", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ key: "tz", instruction: "Africa/Nairobi", active: true }));
     await client().addExtra("tz", "Africa/Nairobi");
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ key: "tz", content: "Africa/Nairobi" });
+    expect(JSON.parse(init.body as string)).toEqual({ key: "tz", instruction: "Africa/Nairobi", active: true });
   });
 });
 

@@ -28,6 +28,7 @@ vi.mock("../api/PondApiClient", () => ({
       retention_session_messages_keep: 100,
     }),
     updateSettings: vi.fn().mockResolvedValue({}),
+    listModels: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -52,8 +53,13 @@ async function renderSettings() {
 }
 
 function clickTab(label: string) {
-  // Tab bar buttons are the first elements with that text
-  fireEvent.click(screen.getAllByText(label)[0]);
+  // HeroUI Tabs renders tabs with role="tab" — try that first, fall back to text
+  const byRole = screen.queryAllByRole("tab", { name: new RegExp(label, "i") });
+  if (byRole.length > 0) {
+    fireEvent.click(byRole[0]);
+  } else {
+    fireEvent.click(screen.getAllByText(label)[0]);
+  }
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -83,17 +89,21 @@ describe("Settings", () => {
     expect(screen.getByPlaceholderText("goose")).toBeTruthy();
   });
 
-  it("Models tab shows chat_provider field and llm_provider radio group", async () => {
+  it("Models tab shows model role rows with Change buttons", async () => {
     await renderSettings();
     clickTab("Models");
-    // chat_provider input has placeholder "openai"
+    // The new UI shows "Conversation", "Reasoning", "Tools & Tasks" labels
     await waitFor(() => {
-      if (!screen.queryByText("Llamafile")) throw new Error("not rendered");
+      if (!screen.queryByText("Conversation")) throw new Error("not rendered");
     });
-    expect(screen.getAllByPlaceholderText("openai").length).toBeGreaterThan(0);
-    // llm_provider radio options
-    expect(screen.getByText("Llamafile")).toBeTruthy();
-    expect(screen.getByText("Ollama")).toBeTruthy();
+    expect(screen.getByText("Conversation")).toBeTruthy();
+    expect(screen.getByText("Reasoning")).toBeTruthy();
+    expect(screen.getByText("Tools & Tasks")).toBeTruthy();
+    // Each role row shows a "Change…" button
+    const changeBtns = screen.getAllByText("Change…");
+    expect(changeBtns.length).toBeGreaterThanOrEqual(1);
+    // Current chat model is shown in the display row
+    expect(screen.getByText("llamafile / llama3.2")).toBeTruthy();
   });
 
   it("Prompts tab renders 4 prompt_style radio options", async () => {
@@ -112,9 +122,9 @@ describe("Settings", () => {
     await renderSettings();
     clickTab("Location");
     await waitFor(() => {
-      if (!screen.queryByText("Enable weather")) throw new Error("not rendered");
+      if (screen.queryAllByText("Enable weather").length === 0) throw new Error("not rendered");
     });
-    expect(screen.getByText("Enable weather")).toBeTruthy();
+    expect(screen.queryAllByText("Enable weather").length).toBeGreaterThan(0);
     // lat input is disabled when weather_enabled is false
     const latInput = screen.getByPlaceholderText("-1.2921") as HTMLInputElement;
     expect(latInput.disabled).toBe(true);
@@ -124,11 +134,12 @@ describe("Settings", () => {
     await renderSettings();
     clickTab("Agent");
     await waitFor(() => {
-      if (!screen.queryByText("Auto")) throw new Error("not rendered");
+      if (!screen.queryByText("Smart (recommended)")) throw new Error("not rendered");
     });
-    expect(screen.getByText("Auto")).toBeTruthy();
+    // New friendly labels
+    expect(screen.getByText("Smart (recommended)")).toBeTruthy();
     expect(screen.getByText("Chat only")).toBeTruthy();
-    expect(screen.getByText("Smart")).toBeTruthy();
+    expect(screen.getByText("Proactive")).toBeTruthy();
     // memory_limit number input is disabled when agent_memory_inject is false
     // It's a spinbutton with value "5" from mock data
     const spinbtns = screen.getAllByRole("spinbutton") as HTMLInputElement[];
