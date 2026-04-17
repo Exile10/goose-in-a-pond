@@ -184,6 +184,22 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
+    // Same-device clients (loopback 127.0.0.1 / ::1) skip token validation —
+    // mirrors the rate limiter exemption in lib.rs. The desktop app and server
+    // always run on the same machine, so requiring a Bearer token that is lost
+    // on every server restart creates unnecessary friction.
+    //
+    // Axum stores the peer address as ConnectInfo<SocketAddr> (not bare SocketAddr)
+    // when the server is started with into_make_service_with_connect_info.
+    let is_loopback = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+    if is_loopback {
+        return Ok(next.run(req).await);
+    }
+
     let token = extract_bearer_token(&headers)?;
 
     let valid = state

@@ -241,16 +241,20 @@ async fn rate_limit_with_limiter(
     next: Next,
     limiter: Arc<middleware::RateLimiter>,
 ) -> Result<axum::response::Response, middleware::AuthError> {
-    // Extract client IP from ConnectInfo if available
-    let client_ip = req
+    // Extract client IP from ConnectInfo<SocketAddr> (populated by
+    // into_make_service_with_connect_info in main.rs).
+    let connect_info = req
         .extensions()
-        .get::<std::net::SocketAddr>()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+
+    let client_ip = connect_info
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     // Loopback clients are the local web dashboard — never rate limit them.
     // Rate limiting only applies to remote clients (GOTG app, external integrations).
-    if client_ip == "127.0.0.1" || client_ip == "::1" {
+    if connect_info.map(|a| a.ip().is_loopback()).unwrap_or(false) {
         return Ok(next.run(req).await);
     }
 

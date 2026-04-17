@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Button } from "@heroui/react";
+import { ChevronLeft, Mic } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { VoiceOrb } from "../components/VoiceOrb";
 import { TranscriptFeed } from "../components/TranscriptFeed";
@@ -68,12 +70,12 @@ export function VoiceMode() {
     try {
       dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
       const wavBytes = await invoke<number[]>("stop_recording");
-      const sessionId = undefined;
       const authToken = state.sessionToken ?? "";
+      const sessionId = state.sessionId ?? undefined;
       await invoke("run_voice_pipeline", {
         wavBytes,
-        sessionId,
         authToken,
+        sessionId,
       });
     } catch (e) {
       console.error("voice pipeline failed:", e);
@@ -103,9 +105,9 @@ export function VoiceMode() {
     <div style={styles.root}>
       {/* Header */}
       <header style={styles.header}>
-        <button style={styles.backBtn} onClick={backToGui} aria-label="Back to GUI mode">
-          ← Back
-        </button>
+        <Button variant="ghost" onPress={backToGui} aria-label="Back to GUI mode">
+          <ChevronLeft size={14} /> Back
+        </Button>
         <h1 style={styles.headerTitle}>Voice Mode</h1>
         <div style={{ width: 64 }} />
       </header>
@@ -131,40 +133,40 @@ export function VoiceMode() {
         {/* Action buttons */}
         <div style={styles.actions}>
           {isIdle && (
-            <button
-              style={{ ...styles.actionBtn, ...styles.primaryBtn }}
-              onClick={startRecording}
-              disabled={serverDown}
+            <Button
+              variant="primary"
+              onPress={startRecording}
+              isDisabled={serverDown}
             >
-              🎙 Start Listening
-            </button>
+              <Mic size={16} /> Start Listening
+            </Button>
           )}
           {isRecording && (
-            <button
-              style={{ ...styles.actionBtn, ...styles.ghostBtn }}
-              onClick={abortRecording}
+            <Button
+              variant="ghost"
+              onPress={abortRecording}
             >
               Stop
-            </button>
+            </Button>
           )}
           {isBusy && (
-            <button
-              style={{ ...styles.actionBtn, ...styles.ghostBtn }}
-              disabled
+            <Button
+              variant="ghost"
+              isDisabled
             >
               Stop
-            </button>
+            </Button>
           )}
           {isError && (
-            <button
-              style={{ ...styles.actionBtn, ...styles.primaryBtn }}
-              onClick={() => {
+            <Button
+              variant="primary"
+              onPress={() => {
                 dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
                 dispatch({ type: "SET_VOICE_ERROR", payload: null });
               }}
             >
               Dismiss
-            </button>
+            </Button>
           )}
         </div>
 
@@ -205,16 +207,7 @@ const styles: Record<string, React.CSSProperties> = {
     margin: 0,
   },
   backBtn: {
-    fontFamily: "var(--font-body)",
-    fontSize: "var(--text-base)",
-    color: "var(--color-accent)",
-    background: "transparent",
-    border: "none",
-    cursor: "pointer",
-    padding: "4px 0",
     width: "64px",
-    textAlign: "left",
-    fontWeight: 500,
   },
   centerCol: {
     flex: 1,
@@ -244,28 +237,6 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     gap: "var(--space-3)",
     alignItems: "center",
-  },
-  actionBtn: {
-    height: "40px",
-    padding: "0 var(--space-6)",
-    borderRadius: "var(--radius-pill)",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-body)",
-    fontWeight: 600,
-    border: "none",
-    cursor: "pointer",
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "var(--space-2)",
-    transition: "opacity var(--transition-fast), background var(--transition-fast)",
-  },
-  primaryBtn: {
-    background: "var(--color-accent)",
-    color: "#FFFFFF",
-  },
-  ghostBtn: {
-    background: "rgba(23,22,22,0.06)",
-    color: "var(--color-text-secondary)",
   },
   hint: {
     fontSize: "var(--text-sm)",
