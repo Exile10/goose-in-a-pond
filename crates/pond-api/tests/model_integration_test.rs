@@ -94,6 +94,7 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         embedding_provider:  None,
         sensor_storage:      Arc::new(MockSensorStorage::new()),
         camera_storage:      Arc::new(MockCameraStorage::new()),
+        face_recognition:    None,
         prompt_template_dir: None,
         model_repo:          Some(model_repo.clone()),
         data_dir:            Some(tmp.path().to_path_buf()),
@@ -112,6 +113,7 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), model_repo, tmp)

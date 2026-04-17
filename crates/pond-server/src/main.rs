@@ -818,6 +818,13 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
+    // ── Face recognition (Phase 2) ──────────────────────────────────────────
+    // Built only when the --features face-onnx build flag is enabled AND an
+    // ONNX embedding model is present on disk.  Missing model file → None
+    // (server starts normally; /api/v1/faces/* return 503).
+    let face_recognition: Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> =
+        build_face_recognition(&data_dir, db.system.clone());
+
     let prompt_template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
         Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
     let prompt_extra_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
@@ -1087,6 +1094,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         prompt_extra_repo: Some(prompt_extra_repo),
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
+        face_recognition,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     // Warn if static assets haven't been built yet
@@ -1679,6 +1688,81 @@ fn default_data_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond")
+}
+
+/// Build the face-recognition service for Phase 2.
+///
+/// Returns `None` in three cases:
+///   1. The `face-onnx` Cargo feature is disabled.
+///   2. No ONNX embedding model is present at `$DATA_DIR/models/face/arcface.onnx`.
+///   3. The ONNX Runtime shared library could not be loaded.
+///
+/// In all cases the server continues to start normally; the face endpoints
+/// return 503 until a model is supplied.
+#[cfg(feature = "face-onnx")]
+fn build_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+    use pond_adapters_face_onnx::{EmbeddingModel, OnnxFaceEmbeddingExtractor};
+    use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
+
+    // Allow operators to override with $POND_FACE_MODEL_PATH for testing.
+    let model_path = std::env::var("POND_FACE_MODEL_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("models/face/arcface.onnx"));
+
+    if !model_path.exists() {
+        tracing::info!(
+            "face-onnx feature enabled but no model at {}; face recognition disabled",
+            model_path.display()
+        );
+        return None;
+    }
+
+    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
+        EmbeddingModel::MobileFaceNet128
+    } else {
+        EmbeddingModel::ArcFace512
+    };
+
+    let extractor: Arc<dyn FaceEmbeddingExtractor> =
+        match OnnxFaceEmbeddingExtractor::new(&model_path, model_kind) {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                tracing::warn!("face recognition disabled: {e:#}");
+                return None;
+            }
+        };
+
+    let threshold = match model_kind {
+        EmbeddingModel::ArcFace512 => 0.60,
+        EmbeddingModel::MobileFaceNet128 => 0.55,
+    };
+
+    tracing::info!(
+        "face recognition enabled (model={:?}, threshold={})",
+        model_kind,
+        threshold
+    );
+
+    Some(Arc::new(
+        SqliteFaceRecognition::new(pool, extractor)
+            .with_threshold(threshold)
+            .with_model_name(match model_kind {
+                EmbeddingModel::ArcFace512 => "arcface-512",
+                EmbeddingModel::MobileFaceNet128 => "mobilefacenet-128",
+            }),
+    ))
+}
+
+#[cfg(not(feature = "face-onnx"))]
+fn build_face_recognition(
+    _data_dir: &std::path::Path,
+    _pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+    None
 }
 
 fn get_local_ip() -> Option<String> {
