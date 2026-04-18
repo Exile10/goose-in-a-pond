@@ -96,6 +96,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider:  None,
         sensor_storage:      Arc::new(MockSensorStorage::new()),
         camera_storage:      Arc::new(MockCameraStorage::new()),
+        face_recognition:    None,
         prompt_template_dir: None,
         model_repo:          None,
         data_dir:            Some(tmp.path().to_path_buf()),
@@ -115,6 +116,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         recipe_repo:         Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
         event_log_repo: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
@@ -259,6 +261,7 @@ async fn prompt_template_delete_system_returns_403() {
         embedding_provider:  None,
         sensor_storage:      Arc::new(MockSensorStorage::new()),
         camera_storage:      Arc::new(MockCameraStorage::new()),
+        face_recognition:    None,
         prompt_template_dir: None,
         model_repo:          None,
         data_dir:            None,
@@ -278,6 +281,7 @@ async fn prompt_template_delete_system_returns_403() {
         recipe_repo:         None,
         llamafile_manager: None,
         event_log_repo: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -529,6 +533,7 @@ async fn returns_501_when_repos_not_configured() {
         embedding_provider:  None,
         sensor_storage:      Arc::new(MockSensorStorage::new()),
         camera_storage:      Arc::new(MockCameraStorage::new()),
+        face_recognition:    None,
         prompt_template_dir: None,
         model_repo:          None,
         data_dir:            None,
@@ -548,6 +553,7 @@ async fn returns_501_when_repos_not_configured() {
         recipe_repo:         None,
         llamafile_manager: None,
         event_log_repo: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

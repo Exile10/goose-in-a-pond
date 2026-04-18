@@ -4,5 +4,7 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Goose In A Pond uses the microphone for voice commands and wake word detection.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Goose In A Pond uses the camera for face-based user recognition during enrollment and wake-on-face identification.</string>
 </dict>
 </plist>

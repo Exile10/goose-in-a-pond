@@ -25,6 +25,11 @@ mcp-memory = ["dep:pond-adapters-mcp-memory"]
 # First build compiles llama-cpp-2 + candle — expect 5–15 min.
 # cargo run -p pond-server --features local-inference -- chat --provider local
 local-inference = ["dep:pond-adapters-local-inference", "pond-api/local-inference"]
+# Enable ONNX face recognition (Phase 2 biometric user differentiation).
+# Requires the ONNX Runtime shared library to be available at startup
+# (set ORT_DYLIB_PATH, or place libonnxruntime in the system library path).
+# cargo run -p pond-server --features face-onnx -- serve
+face-onnx = ["dep:pond-adapters-face-onnx"]
 
 [dependencies]
 # Optional: only compiled when --features goose-agent is passed.
@@ -33,6 +38,8 @@ pond-adapters-goose           = { path = "../pond-adapters-goose", optional = tr
 pond-adapters-mcp-memory      = { workspace = true, optional = true }
 # Optional: only compiled when --features local-inference is passed.
 pond-adapters-local-inference = { workspace = true, optional = true }
+# Optional: only compiled when --features face-onnx is passed.
+pond-adapters-face-onnx       = { workspace = true, optional = true }
 pond-core              = { workspace = true }
 pond-api               = { workspace = true }
 pond-infra             = { workspace = true }
