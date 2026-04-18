@@ -10,13 +10,14 @@ import Schedules from "./pages/Schedules";
 import Models from "./pages/Models";
 import Agent from "./pages/Agent";
 import Prompts from "./pages/Prompts";
+import FaceEnrollment from "./pages/FaceEnrollment";
 import Onboarding from "./pages/Onboarding";
 import LoggedOut from "./pages/LoggedOut";
 import logo from "./assets/logo.png";
 import logoDark from "./assets/Logodark.png";
 import "./dashboard.css";
 
-type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models" | "agent" | "prompts";
+type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models" | "agent" | "prompts" | "faces";
 
 function getInitials(name: string): string {
     return name.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'
@@ -117,6 +118,16 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
                 <line x1="3" y1="6" x2="3.01" y2="6" />
                 <line x1="3" y1="12" x2="3.01" y2="12" />
                 <line x1="3" y1="18" x2="3.01" y2="18" />
+            </svg>
+        ),
+    },
+    {
+        page: "faces",
+        label: "Faces",
+        icon: (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="8" r="4" />
+                <path d="M4 21a8 8 0 0 1 16 0" />
             </svg>
         ),
     },
@@ -329,6 +340,7 @@ function App() {
                 {page === "settings"  && <Settings token={token} />}
                 {page === "agent"     && <Agent token={token} />}
                 {page === "prompts"   && <Prompts token={token} />}
+                {page === "faces"     && <FaceEnrollment token={token} />}
             </main>
 
 

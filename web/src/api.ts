@@ -381,6 +381,10 @@ export const api = {
 
   // ── Profiles ─────────────────────────────────────────────────────────────
 
+  /** List all household profiles */
+  listProfiles: (token: string) =>
+    getReq<{ profiles: { id: string; display_name: string; avatar_emoji: string; preferences: Record<string, string> }[] }>('/profiles', token),
+
   /** Create a new household profile (public — callable during onboarding) */
   createProfile: (req: { display_name: string; avatar_emoji: string }, token: string) =>
     post<{ id: string; display_name: string; avatar_emoji: string; preferences: Record<string, string> }>('/profiles', req, token),
@@ -716,5 +720,78 @@ export const api = {
     } catch {
       return null
     }
+  },
+
+  // ── Face Biometrics (Phase 2) ────────────────────────────────────────────
+  //
+  // Backed by `pond-server` compiled with `--features face-onnx`.  When the
+  // feature is disabled these endpoints return 503 — the UI should surface a
+  // "face recognition unavailable" state instead of erroring out.
+
+  /** Register a face enrollment for the given profile. */
+  registerFace: async (
+    profileId: string,
+    imageBlob: Blob,
+    token: string,
+    bbox?: { x: number; y: number; width: number; height: number },
+  ): Promise<{ id: string; profile_id: string; model_dims: number; created_at: string }> => {
+    const form = new FormData()
+    form.append('profile_id', profileId)
+    form.append('image', imageBlob, 'face.jpg')
+    if (bbox) form.append('bbox', `${bbox.x},${bbox.y},${bbox.width},${bbox.height}`)
+    const res = await fetch(`${BASE}/faces/register`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body: form,
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+    return res.json()
+  },
+
+  /** Identify a face against all enrolled profiles. */
+  identifyFace: async (
+    imageBlob: Blob,
+    token: string,
+    bbox?: { x: number; y: number; width: number; height: number },
+  ): Promise<{ identified: boolean; profile_id: string | null; confidence: number | null; threshold: number }> => {
+    const form = new FormData()
+    form.append('image', imageBlob, 'face.jpg')
+    if (bbox) form.append('bbox', `${bbox.x},${bbox.y},${bbox.width},${bbox.height}`)
+    const res = await fetch(`${BASE}/faces/identify`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body: form,
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+    return res.json()
+  },
+
+  /** List all face enrollments for a profile (metadata only — embeddings stay server-side). */
+  listFaceEnrollments: (profileId: string, token: string) =>
+    getReq<{ profile_id: string; enrollments: { id: string; profile_id: string; model_dims: number; created_at: string }[]; count: number }>(
+      `/faces/profile/${profileId}`,
+      token,
+    ),
+
+  /** Delete every biometric record for a profile (face embeddings today; voice prints once Phase 1 lands). */
+  deleteUserBiometrics: async (
+    profileId: string,
+    token: string,
+  ): Promise<{ profile_id: string; face_embeddings_deleted: number }> => {
+    const res = await fetch(`${BASE}/users/${profileId}/biometrics`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}` },
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+    return res.json()
   },
 }

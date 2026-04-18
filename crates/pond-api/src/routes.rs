@@ -137,6 +137,14 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Recipes ───────────────────────────────────────────────────────────
         .route("/recipes", get(list_recipes).post(create_recipe))
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
+        // ── Face biometrics (Phase 2) ─────────────────────────────────────────
+        .route("/faces/register", post(register_face_handler))
+        .route("/faces/identify", post(identify_face_handler))
+        .route("/faces/profile/{profile_id}", get(list_face_enrollments))
+        .route("/users/{profile_id}/biometrics", delete(delete_user_biometrics))
+        // Wake-on-face: bind an identified profile to an active chat session
+        .route("/sessions/{session_id}/identify-user", post(identify_session_user_handler))
+        .route("/sessions/{session_id}/user", get(get_session_user_handler).delete(clear_session_user_handler))
         .layer(
             axum::middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
         );
@@ -4031,4 +4039,302 @@ async fn delete_recipe(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+// ───────────────────────── Face Biometrics (Phase 2) ────────────────────────
+//
+// Endpoints operate over multipart/form-data so the frontend can POST raw
+// camera frames without a base64 round trip.
+//
+// Expected fields:
+//   - `profile_id` (register only): text field naming the household member.
+//   - `image`:      binary JPEG/PNG/WebP bytes.
+//   - `bbox`:       optional `"x,y,w,h"` string naming the face crop region
+//                   in source-pixel coordinates.  When absent the adapter
+//                   falls back to a center-square crop (works for headshot
+//                   framings; a real face detector should be wired in front
+//                   for wide photos).
+//
+// When `AppState.face_recognition` is `None` (no ONNX model configured),
+// every endpoint returns 503 Service Unavailable — callers should hide
+// the biometric UI in that state.
+
+fn face_unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "Face recognition is not configured on this server",
+            "hint":  "Install an ONNX face embedding model (see docs) and restart pond-server",
+        })),
+    )
+}
+
+/// Read `profile_id` + `image` + optional `bbox` out of a multipart body.
+async fn read_face_multipart(
+    mut multipart: Multipart,
+) -> Result<
+    (
+        Option<String>,
+        Vec<u8>,
+        Option<pond_core::domain::face_recognition::BoundingBox>,
+    ),
+    (StatusCode, Json<Value>),
+> {
+    let mut profile_id: Option<String> = None;
+    let mut image_bytes: Option<Vec<u8>> = None;
+    let mut bbox: Option<pond_core::domain::face_recognition::BoundingBox> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("multipart error: {}", e)})),
+        )
+    })? {
+        match field.name() {
+            Some("profile_id") => {
+                let text = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("read error: {}", e)})),
+                    )
+                })?;
+                profile_id = Some(text);
+            }
+            Some("image") => {
+                let bytes = field.bytes().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("read error: {}", e)})),
+                    )
+                })?;
+                image_bytes = Some(bytes.to_vec());
+            }
+            Some("bbox") => {
+                let text = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("read error: {}", e)})),
+                    )
+                })?;
+                bbox = pond_core::domain::face_recognition::BoundingBox::parse_csv(&text);
+                if bbox.is_none() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid 'bbox' field — expected \"x,y,w,h\" unsigned integers"
+                        })),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let image = image_bytes.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing 'image' field in multipart body"})),
+        )
+    })?;
+    Ok((profile_id, image, bbox))
+}
+
+/// POST /api/v1/faces/register — enroll a face for a household member.
+///
+/// Accepts `multipart/form-data` with `profile_id` and `image` fields.
+/// Multiple enrollments per profile are allowed and recommended (3+ samples
+/// per the acceptance criteria).
+async fn register_face_handler(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+
+    let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
+    let profile_id = profile_id.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing 'profile_id' field"})),
+        )
+    })?;
+
+    // Validate that the profile exists before touching biometric storage.
+    match state.profile_repo.get(&profile_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("profile {} not found", profile_id)})),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("profile lookup failed: {}", e)})),
+            ));
+        }
+    }
+
+    let stored = face.register_face(&profile_id, &image, bbox).await.map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "id":         stored.id,
+        "profile_id": stored.profile_id,
+        "model_dims": stored.model_dims,
+        "created_at": stored.created_at,
+    })))
+}
+
+/// POST /api/v1/faces/identify — identify a face against all enrolled profiles.
+///
+/// Accepts `multipart/form-data` with an `image` field.  Returns the best
+/// matching profile when cosine similarity exceeds the configured threshold.
+async fn identify_face_handler(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
+
+    let result = face.identify_face(&image, bbox).await.map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "identified": result.identified,
+        "profile_id": result.profile_id,
+        "confidence": result.confidence,
+        "threshold":  face.match_threshold(),
+    })))
+}
+
+/// GET /api/v1/faces/profile/:profile_id — list enrollments for a profile.
+///
+/// Returns embedding metadata (id, dims, timestamp) without the raw vector,
+/// matching the privacy requirement that embeddings remain opaque BLOBs.
+async fn list_face_enrollments(
+    State(state): State<Arc<AppState>>,
+    Path(profile_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let rows = face.list_embeddings(&profile_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|e| {
+            json!({
+                "id":         e.id,
+                "profile_id": e.profile_id,
+                "model_dims": e.model_dims,
+                "created_at": e.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "profile_id":  profile_id,
+        "enrollments": items,
+        "count":       rows.len(),
+    })))
+}
+
+/// DELETE /api/v1/users/:profile_id/biometrics — forget all biometric data
+/// for a household member.  Part of the Phase 3 privacy contract; implemented
+/// for face embeddings now, extended to voice prints when Phase 1 lands.
+async fn delete_user_biometrics(
+    State(state): State<Arc<AppState>>,
+    Path(profile_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let deleted = face.delete_embeddings(&profile_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "profile_id":      profile_id,
+        "face_embeddings_deleted": deleted,
+        // `voice_prints_deleted` will be populated once Phase 1 lands.
+    })))
+}
+
+/// POST /api/v1/sessions/:session_id/identify-user — wake-on-face hook.
+///
+/// Accepts the same multipart payload as `/faces/identify` (plus optional
+/// `bbox` field).  On a confident match the identified `profile_id` is
+/// bound to the given session via the in-memory registry, so subsequent
+/// chat turns can personalise the system prompt to the recognised user.
+///
+/// Returns the same body as `/faces/identify`, plus the `session_id` that
+/// was bound.  `identified=false` leaves the binding untouched.
+async fn identify_session_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
+
+    let result = face.identify_face(&image, bbox).await.map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    if result.identified {
+        if let Some(pid) = result.profile_id.clone() {
+            let mut guard = state.session_user_bindings.write().await;
+            guard.insert(session_id.clone(), pid);
+        }
+    }
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "identified": result.identified,
+        "profile_id": result.profile_id,
+        "confidence": result.confidence,
+        "threshold":  face.match_threshold(),
+    })))
+}
+
+/// GET /api/v1/sessions/:session_id/user — read the bound profile.
+async fn get_session_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let guard = state.session_user_bindings.read().await;
+    let profile_id = guard.get(&session_id).cloned();
+    Ok(Json(json!({
+        "session_id": session_id,
+        "profile_id": profile_id,
+    })))
+}
+
+/// DELETE /api/v1/sessions/:session_id/user — release the binding.
+async fn clear_session_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut guard = state.session_user_bindings.write().await;
+    let removed = guard.remove(&session_id).is_some();
+    Ok(Json(json!({
+        "session_id": session_id,
+        "cleared":    removed,
+    })))
 }
