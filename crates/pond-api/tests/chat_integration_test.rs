@@ -92,6 +92,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
         prompt_template_dir: None,
         model_repo: None,
         data_dir: None,
@@ -110,6 +111,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         prompt_extra_repo: None,
         skill_repo: None,
         recipe_repo: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -287,7 +289,8 @@ async fn health_endpoint_accessible_without_auth() {
     let resp = app
         .oneshot(
             Request::builder()
-                .get("/api/v1/health")
+                .method("GET")
+                .uri("/api/v1/health")
                 .body(Body::empty())
                 .unwrap(),
         )

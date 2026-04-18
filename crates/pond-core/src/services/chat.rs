@@ -1,7 +1,9 @@
 use crate::domain::agent::{AgentRequest, WorkflowEvent, WorkflowState};
+use crate::domain::face_recognition::BoundingBox;
 use crate::domain::message::ChatMessage;
 use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
+use crate::ports::face_recognition::FaceRecognition;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
 use crate::ports::voice_input::VoiceInput;
@@ -41,6 +43,14 @@ pub struct ChatService {
     /// Optional LLM-based context compactor.  When set, triggers at 80% of
     /// the context budget instead of falling straight to trim_to_budget.
     compactor: Option<ContextCompactor>,
+    /// Optional face-recognition port.  When set, callers can identify the
+    /// current speaker from a camera frame at session start via
+    /// [`ChatService::identify_session_user`].
+    face_recognition: Option<Arc<dyn FaceRecognition>>,
+    /// Profile bound to this chat session (once identified).  Used by future
+    /// per-user personalisation hooks; currently surfaced via
+    /// [`ChatService::session_user_profile_id`].
+    session_user: std::sync::Mutex<Option<String>>,
 }
 
 impl ChatService {
@@ -59,7 +69,54 @@ impl ChatService {
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
             compactor: None,
+            face_recognition: None,
+            session_user: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach a [`FaceRecognition`] port so the chat service can identify
+    /// the current speaker from a camera frame at session start.
+    pub fn with_face_recognition(mut self, face: Arc<dyn FaceRecognition>) -> Self {
+        self.face_recognition = Some(face);
+        self
+    }
+
+    /// Identify the user currently in front of the camera and bind the
+    /// resulting `profile_id` to this chat session.
+    ///
+    /// Call this once at session start (e.g. from the greeting flow or on a
+    /// fresh wake-word trigger) with a freshly captured camera frame.
+    /// Returns the identified profile id (if any) alongside the confidence
+    /// score.  A `None` profile means the face was either unrecognised or
+    /// no face could be extracted from the image.
+    ///
+    /// When no [`FaceRecognition`] port was attached the call is a no-op
+    /// and returns `Ok(None)` — the chat flow continues anonymously.
+    pub async fn identify_session_user(
+        &self,
+        image_bytes: &[u8],
+        bbox: Option<BoundingBox>,
+    ) -> Result<Option<(String, f32)>> {
+        let face = match &self.face_recognition {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let result = face.identify_face(image_bytes, bbox).await?;
+        if result.identified {
+            if let (Some(pid), Some(conf)) = (result.profile_id.clone(), result.confidence) {
+                if let Ok(mut guard) = self.session_user.lock() {
+                    *guard = Some(pid.clone());
+                }
+                return Ok(Some((pid, conf)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Profile ID bound to this chat session via a prior call to
+    /// [`Self::identify_session_user`], if any.
+    pub fn session_user_profile_id(&self) -> Option<String> {
+        self.session_user.lock().ok().and_then(|g| g.clone())
     }
 
     /// Attach a real LLM provider. When set, `chat_once` calls the provider
@@ -456,4 +513,92 @@ mod tests {
             .with_voice_output(Arc::new(PrintOutput));
     }
 
+    // ── Face recognition hook ────────────────────────────────────────────────
+
+    use crate::domain::face_recognition::{FaceEmbedding, FaceIdentification};
+
+    /// Stub `FaceRecognition` whose `identify_face` response is programmable
+    /// per-test.  Registration / listing / deletion are unused here.
+    struct FakeFaceRecognition {
+        response: FaceIdentification,
+    }
+
+    #[async_trait]
+    impl FaceRecognition for FakeFaceRecognition {
+        async fn register_face(
+            &self,
+            _profile_id: &str,
+            _image_bytes: &[u8],
+            _bbox: Option<BoundingBox>,
+        ) -> Result<FaceEmbedding> {
+            unreachable!("register not exercised in these tests")
+        }
+        async fn identify_face(
+            &self,
+            _image_bytes: &[u8],
+            _bbox: Option<BoundingBox>,
+        ) -> Result<FaceIdentification> {
+            Ok(self.response.clone())
+        }
+        async fn list_embeddings(&self, _pid: &str) -> Result<Vec<FaceEmbedding>> {
+            Ok(vec![])
+        }
+        async fn delete_embeddings(&self, _pid: &str) -> Result<u64> {
+            Ok(0)
+        }
+        fn match_threshold(&self) -> f32 {
+            0.6
+        }
+    }
+
+    fn new_chat_service_with_face(face: FakeFaceRecognition) -> ChatService {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        ChatService::new(agent, session_id, storage).with_face_recognition(Arc::new(face))
+    }
+
+    #[tokio::test]
+    async fn identify_session_user_binds_profile_on_match() {
+        let face = FakeFaceRecognition {
+            response: FaceIdentification::found("alice-id".to_string(), 0.83),
+        };
+        let svc = new_chat_service_with_face(face);
+
+        let result = svc
+            .identify_session_user(b"fake-image", None)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(("alice-id".to_string(), 0.83)));
+        assert_eq!(svc.session_user_profile_id(), Some("alice-id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn identify_session_user_returns_none_on_unknown() {
+        let face = FakeFaceRecognition {
+            response: FaceIdentification::unknown(Some(0.42)),
+        };
+        let svc = new_chat_service_with_face(face);
+
+        let result = svc
+            .identify_session_user(b"fake-image", None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(svc.session_user_profile_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn identify_session_user_is_noop_when_face_port_absent() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let svc = ChatService::new(agent, "sess".into(), storage);
+        // No face port wired — must not error, just return None.
+        let result = svc
+            .identify_session_user(b"anything", None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(svc.session_user_profile_id().is_none());
+    }
 }
