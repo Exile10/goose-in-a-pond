@@ -3,34 +3,6 @@ import { api, isPreviewMode } from '../api'
 import { useSettings } from '../context/SettingsContext'
 import { logActivity } from '../activityLog'
 
-// Minimal SpeechRecognition types (not in default TS lib)
-interface ISpeechRecognition extends EventTarget {
-  lang: string
-  continuous: boolean
-  interimResults: boolean
-  onstart: (() => void) | null
-  onresult: ((event: { results: { [i: number]: { [i: number]: { transcript: string } } } }) => void) | null
-  onerror: (() => void) | null
-  onend: (() => void) | null
-  start(): void
-  stop(): void
-  abort(): void
-}
-
-declare global {
-  interface Window {
-    SpeechRecognition: new () => ISpeechRecognition
-    webkitSpeechRecognition: new () => ISpeechRecognition
-  }
-}
-
-type SpeechRecognitionCtor = new () => ISpeechRecognition
-
-const SpeechRecognitionAPI: SpeechRecognitionCtor | null =
-  typeof window !== 'undefined'
-    ? (window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null)
-    : null
-
 interface Props {
   token: string
 }
@@ -104,7 +76,10 @@ export default function ChatWidget({ token }: Props) {
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [listening, setListening] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [converting, setConverting] = useState(false)  // WAV encoding step between recording and transcribing
+  const [transcribing, setTranscribing] = useState(false)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
   const [showSuggestions, setShowSuggestions] = useState(true)
   const [agentRunning, setAgentRunning] = useState(true)
   const [sessionId, setSessionId] = useState<string | undefined>(() =>
@@ -114,7 +89,10 @@ export default function ChatWidget({ token }: Props) {
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const suggestions = getSuggestions()
   const bottomRef = useRef<HTMLDivElement>(null)
-  const recognitionRef = useRef<ISpeechRecognition | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const streamRef = useRef<MediaStream | null>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Update greeting when settings load (only if the greeting message is still shown)
   useEffect(() => {
@@ -156,25 +134,26 @@ export default function ChatWidget({ token }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // Stop and clean up any active recording on unmount
   useEffect(() => {
-    return () => { recognitionRef.current?.abort() }
-  }, [])
-
-  // Sync muted state with localStorage (VoiceOrb may change it)
-  useEffect(() => {
-    function onStorage(e: StorageEvent) {
-      if (e.key === 'pond_tts_muted') {
-        setMuted(e.newValue === 'true')
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current)
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop()
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
       }
     }
-    window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
   }, [])
 
-  /**
-   * Synthesise speech via the server's TTS backend.
-   * Returns immediately if muted. Falls back silently if server TTS is unavailable.
-   */
+  // Clear voice errors after 4 seconds
+  useEffect(() => {
+    if (!voiceError) return
+    const t = setTimeout(() => setVoiceError(null), 4000)
+    return () => clearTimeout(t)
+  }, [voiceError])
+
   const speakText = useCallback(async (text: string) => {
     if (muted) return
     const blobUrl = await api.speak(text, token)
@@ -190,27 +169,158 @@ export default function ChatWidget({ token }: Props) {
     localStorage.setItem('pond_tts_muted', String(next))
   }
 
-  function toggleListening() {
-    if (listening) {
-      recognitionRef.current?.stop()
-      setListening(false)
+  /**
+   * Converts any browser-recorded audio blob (webm, mp4, ogg) into a
+   * 16kHz mono 16-bit PCM WAV blob that whisper.cpp accepts.
+   *
+   * Whisper expects WAV input — the browser's MediaRecorder produces compressed
+   * formats (webm/opus on Chrome, mp4/aac on Safari) which whisper rejects with
+   * "Invalid request". We use the Web Audio API to decode the compressed audio
+   * into raw PCM, mix it down to mono, and re-encode it as a standard WAV file.
+   */
+  async function encodeWav(audioBlob: Blob): Promise<Blob> {
+    const arrayBuffer = await audioBlob.arrayBuffer()
+
+    // Decode the compressed browser audio into raw PCM at 16kHz
+    const audioCtx = new AudioContext({ sampleRate: 16000 })
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer)
+    await audioCtx.close()
+
+    const numSamples = decoded.length
+    // Start with the left (or only) channel
+    const channelData = decoded.getChannelData(0)
+
+    // If stereo, average both channels to produce mono
+    if (decoded.numberOfChannels > 1) {
+      const ch1 = decoded.getChannelData(1)
+      for (let i = 0; i < numSamples; i++) {
+        channelData[i] = (channelData[i] + ch1[i]) / 2
+      }
+    }
+
+    // Build a standard WAV file: 44-byte header + 16-bit PCM samples
+    const dataLen = numSamples * 2 // 2 bytes per i16 sample
+    const buf = new ArrayBuffer(44 + dataLen)
+    const view = new DataView(buf)
+    const writeStr = (off: number, s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i))
+    }
+
+    // RIFF chunk descriptor
+    writeStr(0, 'RIFF')
+    view.setUint32(4, 36 + dataLen, true)   // file size minus 8 bytes
+    writeStr(8, 'WAVE')
+
+    // fmt sub-chunk (PCM format, mono, 16kHz, 16-bit)
+    writeStr(12, 'fmt ')
+    view.setUint32(16, 16, true)            // sub-chunk size
+    view.setUint16(20, 1, true)             // audio format: PCM = 1
+    view.setUint16(22, 1, true)             // channels: mono
+    view.setUint32(24, 16000, true)         // sample rate: 16kHz
+    view.setUint32(28, 32000, true)         // byte rate: 16000 * 1 * 2
+    view.setUint16(32, 2, true)             // block align: 1 channel * 2 bytes
+    view.setUint16(34, 16, true)            // bits per sample
+
+    // data sub-chunk
+    writeStr(36, 'data')
+    view.setUint32(40, dataLen, true)
+
+    // Write PCM samples as signed 16-bit little-endian integers
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, channelData[i]))
+      view.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true)
+    }
+
+    return new Blob([buf], { type: 'audio/wav' })
+  }
+
+  /**
+   * Called when the MediaRecorder stops. Converts the recorded chunks to a
+   * 16kHz mono WAV, sends it to the server's Whisper transcription endpoint,
+   * then auto-submits the resulting text as a chat message.
+   *
+   * @param chunks   Raw audio chunks from MediaRecorder.ondataavailable
+   * @param mimeType The MIME type the browser actually recorded (e.g. audio/webm, audio/mp4)
+   */
+  async function handleVoiceStop(chunks: Blob[], mimeType: string) {
+    if (chunks.length === 0) return
+    try {
+      // Step 1: convert compressed browser audio to 16kHz mono WAV
+      setConverting(true)
+      const rawBlob = new Blob(chunks, { type: mimeType })
+      const wavBlob = await encodeWav(rawBlob)
+      setConverting(false)
+
+      // Step 2: send WAV to whisper for transcription
+      setTranscribing(true)
+      const formData = new FormData()
+      formData.append('audio', wavBlob, 'audio.wav')
+
+      const res = await fetch('/api/v1/transcribe', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData,
+      })
+      if (!res.ok) {
+        // Surface the real whisper error (e.g. model not loaded, unsupported format)
+        const body = await res.json().catch(() => ({})) as { error?: string }
+        throw new Error(body.error || `Transcription failed (${res.status})`)
+      }
+      const { text } = await res.json() as { text: string }
+      if (text?.trim()) {
+        setInput(text.trim())
+        await sendMessage(text.trim())
+      }
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : 'Transcription failed')
+    } finally {
+      // Always clear both processing states on completion or error
+      setConverting(false)
+      setTranscribing(false)
+    }
+  }
+
+  async function toggleVoice() {
+    if (recording) {
+      if (timerRef.current) clearTimeout(timerRef.current)
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop()
+      }
       return
     }
-    if (!SpeechRecognitionAPI) return
-    const Ctor = SpeechRecognitionAPI
-    const recognition = new Ctor()
-    recognition.lang = 'en-US'
-    recognition.continuous = false
-    recognition.interimResults = false
-    recognition.onstart = () => setListening(true)
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript
-      setInput(transcript)
+
+    setVoiceError(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      const recorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
+      audioChunksRef.current = []
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
+      }
+      recorder.onstop = () => {
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop())
+          streamRef.current = null
+        }
+        setRecording(false)
+        void handleVoiceStop(audioChunksRef.current, recorder.mimeType)
+      }
+
+      recorder.start()
+      setRecording(true)
+
+      // Auto-stop after 30 seconds
+      timerRef.current = setTimeout(() => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop()
+        }
+      }, 30000)
+    } catch {
+      setVoiceError('Microphone access denied')
     }
-    recognition.onerror = () => setListening(false)
-    recognition.onend = () => setListening(false)
-    recognitionRef.current = recognition
-    recognition.start()
   }
 
   async function sendMessage(text: string) {
@@ -237,7 +347,6 @@ export default function ChatWidget({ token }: Props) {
       text,
       token,
       sessionId,
-      // onToken — called for each incremental token
       (tokenText) => {
         fullText += tokenText
         if (!streamingStarted) {
@@ -256,7 +365,6 @@ export default function ChatWidget({ token }: Props) {
           })
         }
       },
-      // onDone — called when the stream completes
       (newSessionId, modelRole) => {
         setSessionId(newSessionId)
         localStorage.setItem('pond_chat_session_id', newSessionId)
@@ -269,7 +377,6 @@ export default function ChatWidget({ token }: Props) {
         setLoading(false)
         void speakText(fullText)
       },
-      // onError — called on network or LLM failure
       (err) => {
         const errText = `Error: ${err}`
         if (!streamingStarted) {
@@ -294,10 +401,6 @@ export default function ChatWidget({ token }: Props) {
     e.preventDefault()
     const text = input.trim()
     if (!text) return
-    if (listening) {
-      recognitionRef.current?.stop()
-      setListening(false)
-    }
     await sendMessage(text)
   }
 
@@ -325,6 +428,10 @@ export default function ChatWidget({ token }: Props) {
     }])
     setShowSuggestions(false)
   }
+
+  // True when user input should be blocked (processing in progress, not during recording
+  // since the user needs to be able to click the mic button to stop recording)
+  const voiceBusy = converting || transcribing
 
   if (!historyLoaded) {
     return <div className="db-loading">Loading conversation…</div>
@@ -451,35 +558,85 @@ export default function ChatWidget({ token }: Props) {
       </div>
 
       <form onSubmit={handleSend} className="db-chat-input-row">
-        {listening && (
+        {/* Voice state badges — one shown at a time reflecting the current pipeline step */}
+        {recording && (
           <span className="db-chat-listening-badge">
             <span className="db-chat-listening-dot" />
-            Listening…
+            Recording — tap mic to stop
           </span>
         )}
+        {converting && (
+          <span className="db-chat-listening-badge db-chat-listening-badge--converting">
+            Converting audio…
+          </span>
+        )}
+        {transcribing && (
+          <span className="db-chat-listening-badge db-chat-listening-badge--transcribing">
+            Transcribing…
+          </span>
+        )}
+        {voiceError && (
+          <span className="db-chat-listening-badge db-chat-listening-badge--error">
+            {voiceError}
+          </span>
+        )}
+
         <input
           type="text"
-          placeholder={!agentRunning ? 'Agent is stopped — press Start to resume…' : listening ? 'Speak now…' : 'Type a message or use the mic…'}
+          placeholder={
+            !agentRunning ? 'Agent is stopped — press Start to resume…' :
+            recording     ? 'Tap the mic again to stop recording…' :
+            converting    ? 'Converting audio…' :
+            transcribing  ? 'Transcribing your message…' :
+                            'Type a message or tap the mic…'
+          }
           value={input}
           onChange={e => setInput(e.target.value)}
-          disabled={loading || !agentRunning}
+          // Keep input locked during recording so the user's focus stays on the mic button
+          disabled={loading || !agentRunning || recording || voiceBusy}
         />
-        {SpeechRecognitionAPI && (
-          <button
-            type="button"
-            className={`db-chat-mic-btn ${listening ? 'active' : ''}`}
-            onClick={toggleListening}
-            disabled={loading}
-            title={listening ? 'Stop listening' : 'Voice input'}
-          >
-            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+
+        <button
+          type="button"
+          className={`db-chat-mic-btn ${recording ? 'active' : ''} ${converting ? 'converting' : ''} ${transcribing ? 'transcribing' : ''}`}
+          onClick={toggleVoice}
+          // Only lock out the mic button during converting/transcribing — during recording
+          // it must stay enabled so the user can tap it to stop
+          disabled={loading || !agentRunning || voiceBusy}
+          title={
+            recording    ? 'Tap to stop recording' :
+            converting   ? 'Converting audio…' :
+            transcribing ? 'Transcribing…' :
+                           'Voice input (Whisper)'
+          }
+          aria-label={
+            recording    ? 'Stop recording' :
+            converting   ? 'Converting audio' :
+            transcribing ? 'Transcribing' :
+                           'Start voice input'
+          }
+        >
+          {converting || transcribing ? (
+            // Spinner during post-processing (converting WAV or waiting for whisper)
+            <svg className="db-chat-mic-spinner" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+          ) : recording ? (
+            // Stop square — user can click this to end recording early
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="5" y="5" width="14" height="14" rx="2" />
+            </svg>
+          ) : (
+            // Idle mic icon
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <rect x="9" y="2" width="6" height="11" rx="3" />
               <path d="M5 10a7 7 0 0 0 14 0" />
               <line x1="12" y1="19" x2="12" y2="22" />
               <line x1="8" y1="22" x2="16" y2="22" />
             </svg>
-          </button>
-        )}
+          )}
+        </button>
+
         <button type="submit" className="db-btn-primary" disabled={loading || !input.trim() || !agentRunning}>
           Send
         </button>
