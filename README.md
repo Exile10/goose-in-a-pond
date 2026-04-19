@@ -5,7 +5,7 @@
 
   **Privacy-first, fully local AI smart home assistant**
 
-  Built on [Goose](https://github.com/block/goose) · Runs on your hardware · No cloud required
+  Built on [Goose](https://github.com/aaif-goose/goose) · Runs on your hardware · No cloud required
 
   [![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
   [![CC BY 4.0](https://licensebuttons.net/l/by/4.0/80x15.png)](http://creativecommons.org/licenses/by/4.0/)
@@ -20,7 +20,7 @@
 
 **Goose In A Pond (GIAP)** is a fully offline, privacy-first AI assistant for your smart home. It runs entirely on edge hardware — primarily targeting the **NVIDIA Jetson Orin Nano** — with no mandatory cloud dependency. Your data, devices, and conversations never leave your local network.
 
-GIAP is built on [Block's Goose](https://github.com/block/goose) open-source agent framework and extends it with a complete smart home layer: device registry, voice I/O, cron scheduling, memory, and a companion mobile app called **Goose On The Go (GOTG)**.
+GIAP is built on [Block's Goose](https://github.com/aaif-goose/goose) open-source agent framework and extends it with a complete smart home layer: device registry, voice I/O, cron scheduling, memory, and a companion mobile app called **Goose On The Go (GOTG)**.
 
 ### Key capabilities
 
@@ -239,7 +239,7 @@ See the [TDD Guide](./docs/testing/tdd_guide.md) for the full testing philosophy
 | Layer | Technology |
 |---|---|
 | Core language | Rust (stable) |
-| Agent framework | [Goose](https://github.com/block/goose) by Block |
+| Agent framework | [Goose](https://github.com/aaif-goose/goose) by Block |
 | HTTP API | Axum 0.8 |
 | Database | SQLite via SQLx (two DBs: `pond_system.db`, `pond_logs.db`) |
 | Desktop shell | Tauri 2.0 |
@@ -290,12 +290,12 @@ Read the [Contributing Guide](./docs/CONTRIBUTING.md) then:
         <strong>Block</strong>
       </a>
       <br/>
-      <sub>Creator of <a href="https://github.com/block/goose">Goose</a>, the open-source AI agent framework that powers GIAP</sub>
+      <sub>Creator of <a href="https://github.com/aaif-goose/goose">Goose</a>, the open-source AI agent framework that powers GIAP</sub>
     </td>
   </tr>
 </table>
 
-Goose In A Pond is built on [Goose](https://github.com/block/goose), the open-source agentic AI framework created and maintained by [Block](https://block.xyz). We are grateful for their commitment to open-source AI tooling.
+Goose In A Pond is built on [Goose](https://github.com/aaif-goose/goose), the open-source agentic AI framework created and maintained by [Block](https://block.xyz). We are grateful for their commitment to open-source AI tooling.
 
 > Interested in sponsoring GIAP? Contact us at [info@jarida.io](mailto:info@jarida.io).
 
