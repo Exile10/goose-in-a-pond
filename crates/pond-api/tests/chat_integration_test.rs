@@ -234,3 +234,65 @@ async fn post_chat_returns_400_for_missing_message_field() {
         resp.status()
     );
 }
+
+// ── Auth boundary tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn post_chat_returns_401_when_authorization_header_missing() {
+    let (app, _tmp) = make_app().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"message": "hello"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn post_chat_returns_401_for_invalid_token() {
+    let (app, _tmp) = make_app().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer not-a-real-token")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"message": "hello"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn health_endpoint_accessible_without_auth() {
+    let (app, _tmp) = make_app().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .get("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+}

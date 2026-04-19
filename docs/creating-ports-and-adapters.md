@@ -1,209 +1,320 @@
-# Creating Ports and Adapters in Goose-in-a-Pond
+# Creating Ports and Adapters
 
-This guide documents how to create a new port (trait) in `pond-core` and its
-corresponding adapter in `pond-adapters-goose`. Follow these steps to keep the
-hexagonal architecture consistent.
+This guide shows how to add a new capability to GIAP while keeping the hexagonal architecture intact. Follow these steps in order — the mock must exist and pass tests before any real adapter is written.
 
 ---
 
-## 1. Define Domain Types
+## The Five Steps
 
-Create the types that your port needs in `pond-core/src/domain/`.
+```
+1. Domain types  (pond-core/src/domain/)
+2. Port trait    (pond-core/src/ports/)
+3. Mock + tests  (pond-core/src/services/)
+4. Real adapter  (crates/pond-adapters-<name>/)
+5. Wire          (pond-server/src/main.rs)
+```
 
-**File:** `crates/pond-core/src/domain/<your_types>.rs`
+---
+
+## Step 1 — Domain Types
+
+Create the pure Rust types your port will use. No external imports allowed.
+
+**File:** `crates/pond-core/src/domain/<name>.rs`
 
 ```rust
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct YourDomainType {
-    pub field: String,
+pub struct NotificationMessage {
+    pub title: String,
+    pub body: String,
+    pub priority: NotificationPriority,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NotificationPriority { Low, Normal, High }
 ```
 
-Then register the module:
-
+Register in `crates/pond-core/src/domain/mod.rs`:
 ```rust
-// crates/pond-core/src/domain/mod.rs
-pub mod your_types;
+pub mod notification;
 ```
 
-> **Rule:** Domain types must NOT import from `goose::*`. They belong to the
-> pond domain and must be adapter-agnostic.
+> **Rule:** Domain types must never import from `goose::*`, `sqlx::*`, `reqwest::*`, or any external framework.
 
 ---
 
-## 2. Define the Port Trait
+## Step 2 — Port Trait
 
-Create the trait in `pond-core/src/ports/`.
+Define the interface the Core will use. One trait per capability.
 
-**File:** `crates/pond-core/src/ports/<your_port>.rs`
+**File:** `crates/pond-core/src/ports/notification.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::your_types::YourDomainType;
+use crate::domain::notification::NotificationMessage;
 
-/// Driven Port: <PortName>
+/// Driven Port: push notification delivery.
 ///
-/// Describe what this port abstracts.
+/// Implemented by adapters that send alerts to connected clients
+/// (e.g. GOTG mobile app via FCM, or a local desktop notification).
 #[async_trait]
-pub trait YourPort: Send + Sync {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType>;
-    fn name(&self) -> String;
+pub trait NotificationSender: Send + Sync {
+    /// Send a push notification. Returns Ok(()) on delivery, Err on failure.
+    async fn send(&self, msg: NotificationMessage) -> Result<()>;
 }
 ```
 
-Register:
-
+Register in `crates/pond-core/src/ports/mod.rs`:
 ```rust
-// crates/pond-core/src/ports/mod.rs
-pub mod your_port;
+pub mod notification;
 ```
 
 ---
 
-## 3. Create a Mock Implementation
+## Step 3 — Mock Implementation and Tests
 
-Create a mock for testing in `pond-core/src/services/`.
+Write the mock before anything else. This is the test double used by all Core tests.
 
-**File:** `crates/pond-core/src/services/mock_<name>.rs`
+**File:** `crates/pond-core/src/services/mock_notification.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::your_types::YourDomainType;
-use crate::ports::your_port::YourPort;
+use std::sync::Mutex;
+use crate::domain::notification::NotificationMessage;
+use crate::ports::notification::NotificationSender;
 
-pub struct MockYourPort;
+/// Test double — captures sent notifications for assertion.
+pub struct MockNotificationSender {
+    sent: Mutex<Vec<NotificationMessage>>,
+}
 
-impl MockYourPort {
-    pub fn new() -> Self { Self }
+impl MockNotificationSender {
+    pub fn new() -> Self {
+        Self { sent: Mutex::new(vec![]) }
+    }
+
+    pub fn sent(&self) -> Vec<NotificationMessage> {
+        self.sent.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
-impl YourPort for MockYourPort {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType> {
-        Ok(YourDomainType { field: format!("Mock: {}", input.field) })
+impl NotificationSender for MockNotificationSender {
+    async fn send(&self, msg: NotificationMessage) -> Result<()> {
+        self.sent.lock().unwrap().push(msg);
+        Ok(())
     }
-    fn name(&self) -> String { "mock".to_string() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::notification::NotificationPriority;
 
     #[tokio::test]
-    async fn test_mock() {
-        let mock = MockYourPort::new();
-        let result = mock.do_something(YourDomainType { field: "hi".into() }).await.unwrap();
-        assert_eq!(result.field, "Mock: hi");
+    async fn send_captures_message() {
+        let sender = MockNotificationSender::new();
+        sender.send(NotificationMessage {
+            title: "Alert".into(),
+            body: "Motion detected".into(),
+            priority: NotificationPriority::High,
+        }).await.unwrap();
+
+        let sent = sender.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].title, "Alert");
+    }
+
+    #[tokio::test]
+    async fn trait_object_conformance() {
+        use std::sync::Arc;
+        let _: Arc<dyn NotificationSender> = Arc::new(MockNotificationSender::new());
     }
 }
 ```
 
-Register:
-
+Register in `crates/pond-core/src/services/mod.rs`:
 ```rust
-// crates/pond-core/src/services/mod.rs
-pub mod mock_your_port;
+pub mod mock_notification;
+```
+
+Run tests — they must pass before continuing:
+```bash
+cargo test -p pond-core -- notification
 ```
 
 ---
 
-## 4. Create the Goose Adapter
+## Step 4 — Real Adapter
 
-Create the adapter in `pond-adapters-goose/src/`.
+Create a new crate (or add to an existing adapter crate if it's closely related).
 
-**File:** `crates/pond-adapters-goose/src/<name>_adapter.rs`
+**`crates/pond-adapters-gotg/Cargo.toml`**
+```toml
+[package]
+name = "pond-adapters-gotg"
+version.workspace = true
+edition.workspace = true
 
+[dependencies]
+pond-core   = { workspace = true }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+reqwest     = { workspace = true, features = ["json"] }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = { workspace = true }
+```
+
+**`crates/pond-adapters-gotg/src/notification_adapter.rs`**
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::your_types::YourDomainType;
-use pond_core::ports::your_port::YourPort;
-use std::sync::Arc;
+use pond_core::domain::notification::NotificationMessage;
+use pond_core::ports::notification::NotificationSender;
 
-// Import the Goose type you're wrapping
-use goose::some_module::GooseThing;
-
-pub struct GooseYourPortAdapter {
-    inner: Arc<GooseThing>,
+pub struct GotgNotificationAdapter {
+    endpoint: String,
+    client: reqwest::Client,
 }
 
-impl GooseYourPortAdapter {
-    pub fn new(inner: Arc<GooseThing>) -> Self {
-        Self { inner }
+impl GotgNotificationAdapter {
+    pub fn new(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        }
     }
-
-    // Conversion: pond domain → Goose
-    fn to_goose(input: &YourDomainType) -> GooseInput { /* ... */ }
-
-    // Conversion: Goose → pond domain
-    fn from_goose(output: &GooseOutput) -> YourDomainType { /* ... */ }
 }
 
 #[async_trait]
-impl YourPort for GooseYourPortAdapter {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType> {
-        let goose_input = Self::to_goose(&input);
-        let goose_output = self.inner.goose_method(goose_input).await?;
-        Ok(Self::from_goose(&goose_output))
+impl NotificationSender for GotgNotificationAdapter {
+    async fn send(&self, msg: NotificationMessage) -> Result<()> {
+        self.client
+            .post(&self.endpoint)
+            .json(&serde_json::json!({
+                "title": msg.title,
+                "body":  msg.body,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
-    fn name(&self) -> String { "goose".to_string() }
 }
 ```
 
-Register:
-
+**Integration tests — `crates/pond-adapters-gotg/tests/integration.rs`**
 ```rust
-// crates/pond-adapters-goose/src/lib.rs
-pub mod your_port_adapter;
-pub use your_port_adapter::GooseYourPortAdapter;
+use pond_adapters_gotg::GotgNotificationAdapter;
+use pond_core::domain::notification::{NotificationMessage, NotificationPriority};
+use pond_core::ports::notification::NotificationSender;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{method, path};
+
+#[tokio::test]
+async fn send_posts_to_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/notify"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server).await;
+
+    let adapter = GotgNotificationAdapter::new(&format!("{}/notify", server.uri()));
+    adapter.send(NotificationMessage {
+        title: "Test".into(),
+        body: "Hello".into(),
+        priority: NotificationPriority::Normal,
+    }).await.unwrap();
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn server_error_propagates() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/notify"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server).await;
+
+    let adapter = GotgNotificationAdapter::new(&format!("{}/notify", server.uri()));
+    let result = adapter.send(NotificationMessage {
+        title: "Test".into(), body: "Hello".into(),
+        priority: NotificationPriority::Normal,
+    }).await;
+
+    assert!(result.is_err(), "expected Err on HTTP 500");
+}
+
+#[test]
+fn trait_object_conformance() {
+    use std::sync::Arc;
+    let _: Arc<dyn NotificationSender> =
+        Arc::new(GotgNotificationAdapter::new("http://localhost:1234/notify"));
+}
 ```
 
 ---
 
-## 5. Wire Into the Service Layer
+## Step 5 — Wire Into pond-server
 
-Inject the port in `ChatService` or create a new service:
-
+**`crates/pond-server/src/main.rs`**
 ```rust
-let port = Arc::new(MockYourPort::new());  // or GooseYourPortAdapter
-let service = YourService::new(port);
+use pond_adapters_gotg::GotgNotificationAdapter;
+
+// In the AppState construction block:
+let notification_sender: Arc<dyn NotificationSender> = Arc::new(
+    GotgNotificationAdapter::new("http://gotg-device:8080/notify")
+);
+
+let state = Arc::new(AppState {
+    // ...
+    notification_sender,
+});
 ```
 
 ---
 
-## 6. Verify
+## Workspace Note for Goose-dependent Crates
 
-```bash
-# Unit tests
-cargo test -p pond-core
-
-# Full workspace build
-cargo build
-
-# Run the server
-cargo run -p pond-server
-```
+If your adapter imports from `goose::*`, it must be listed in `workspace.exclude` in the root `Cargo.toml` and use `default-features = false` on the `goose` dependency. See `CLAUDE.md` for the full explanation of the `rmcp` version conflict.
 
 ---
 
-## Reference: Existing Ports
+## Existing Ports Reference
 
-| Port | Domain Types | Mock | Goose Adapter |
+| Port | File | Mock | Adapter(s) |
 |---|---|---|---|
-| `Agent` | `AgentRequest`, `AgentResponse` | `MockAgent` | `GooseAdapter` |
-| `LlmProvider` | `ChatMessage`, `Role` | `MockProvider` | `GooseProviderAdapter` |
-| `Storage` | *(empty)* | — | — |
+| `Agent` | `ports/agent.rs` | `MockAgent` | `GooseAdapter` |
+| `LlmProvider` | `ports/provider.rs` | `MockProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `OllamaProvider` |
+| `SessionStorage` | `ports/session_storage.rs` | `InMemorySessionStorage` | `SqliteSessionStorage`, `GooseSessionAdapter` |
+| `VoiceInput` | `ports/voice_input.rs` | `StdinInput` | `WhisperInput` |
+| `VoiceOutput` | `ports/voice_output.rs` | `PrintOutput` | `PiperOutput` |
+| `WakeWordDetector` | `ports/wake_word.rs` | `InstantActivation` | `WhisperKeywordDetector` |
+| `DeviceRegistry` | `ports/device_registry.rs` | — | `SqliteDeviceRegistry` |
+| `SettingsRepository` | `ports/settings.rs` | `MockSettingsRepository` | `SqliteSettingsRepository` |
+| `MemoryRepository` | `ports/memory_repository.rs` | `MockMemoryRepository` | `SqliteMemoryRepository` |
+| `UserSkillRepository` | `ports/skill.rs` | `MockSkillRepository` | `SqliteSkillRepository` |
+| `PromptTemplateRepository` | `ports/prompt_template.rs` | `MockPromptTemplateRepository` | `SqlitePromptTemplateRepository` |
+| `SchedulerPort` | `ports/scheduler.rs` | — | `CronSchedulerAdapter` |
+| `NotificationSender` | `ports/notification.rs` | — | `GotgNotificationAdapter` |
+| `McpMemoryPort` | `ports/mcp_memory.rs` | — | `GooseMcpMemoryAdapter` |
 
 ---
 
 ## Key Principles
 
-1. **Domain types are adapter-agnostic** — never import `goose::*` in `pond-core`
-2. **Adapters convert at the boundary** — `to_goose()` / `from_goose()` methods
-3. **Always create a mock first** — enables testing without Goose compilation
-4. **One port per service** — don't merge unrelated capabilities
-5. **Port traits are `Send + Sync`** — required for async multi-threaded use
+1. **Domain types are framework-agnostic** — never import `goose::*` in `pond-core`
+2. **Mock first, adapt second** — tests must pass on the mock before the real adapter exists
+3. **Adapters translate at the boundary** — conversion logic belongs in the adapter, not the core
+4. **One port per capability** — don't bundle unrelated operations into one trait
+5. **All port traits are `Send + Sync`** — required for `Arc<dyn Port>` in async code
+6. **Integration tests cover error paths** — happy path + HTTP 500 + connection refused minimum

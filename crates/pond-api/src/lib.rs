@@ -40,6 +40,7 @@ pub mod middleware;
 pub mod routes;
 
 use axum::{middleware::Next, Router};
+use tower_http::cors::{Any, CorsLayer};
 use pond_core::ports::agent::Agent;
 use pond_core::ports::handshake::Handshake;
 use pond_core::ports::onboarding::OnboardingRepository;
@@ -223,6 +224,15 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
             let limiter = rate_limiter.clone();
             rate_limit_with_limiter(req, next, limiter)
         }))
+        // CORS — allow any origin so the Tauri desktop app (tauri://localhost or
+        // http://localhost:1420 in dev) and GOTG mobile clients can reach the API.
+        // pond-server only binds to the local network, so open CORS is safe here.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 
@@ -231,16 +241,20 @@ async fn rate_limit_with_limiter(
     next: Next,
     limiter: Arc<middleware::RateLimiter>,
 ) -> Result<axum::response::Response, middleware::AuthError> {
-    // Extract client IP from ConnectInfo if available
-    let client_ip = req
+    // Extract client IP from ConnectInfo<SocketAddr> (populated by
+    // into_make_service_with_connect_info in main.rs).
+    let connect_info = req
         .extensions()
-        .get::<std::net::SocketAddr>()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+
+    let client_ip = connect_info
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     // Loopback clients are the local web dashboard — never rate limit them.
     // Rate limiting only applies to remote clients (GOTG app, external integrations).
-    if client_ip == "127.0.0.1" || client_ip == "::1" {
+    if connect_info.map(|a| a.ip().is_loopback()).unwrap_or(false) {
         return Ok(next.run(req).await);
     }
 
