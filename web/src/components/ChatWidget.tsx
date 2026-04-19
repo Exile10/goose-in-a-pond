@@ -86,6 +86,8 @@ export default function ChatWidget({ token }: Props) {
     localStorage.getItem('pond_chat_session_id') ?? undefined
   )
   const [muted, setMuted] = useState(() => localStorage.getItem('pond_tts_muted') === 'true')
+  const [speaking, setSpeaking] = useState(false)          // true while TTS audio is playing
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null) // which bubble to glow
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const suggestions = getSuggestions()
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -93,6 +95,7 @@ export default function ChatWidget({ token }: Props) {
   const audioChunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)    // current TTS audio element
 
   // Update greeting when settings load (only if the greeting message is still shown)
   useEffect(() => {
@@ -134,7 +137,7 @@ export default function ChatWidget({ token }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Stop and clean up any active recording on unmount
+  // Stop and clean up any active recording or TTS on unmount
   useEffect(() => {
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current)
@@ -143,6 +146,10 @@ export default function ChatWidget({ token }: Props) {
       }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(t => t.stop())
+      }
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current = null
       }
     }
   }, [])
@@ -154,12 +161,20 @@ export default function ChatWidget({ token }: Props) {
     return () => clearTimeout(t)
   }, [voiceError])
 
-  const speakText = useCallback(async (text: string) => {
+  const speakText = useCallback(async (text: string, msgId?: string) => {
     if (muted) return
     const blobUrl = await api.speak(text, token)
     if (!blobUrl) return
     const audio = new Audio(blobUrl)
-    audio.onended = () => URL.revokeObjectURL(blobUrl)
+    audioRef.current = audio
+    setSpeaking(true)
+    if (msgId) setSpeakingMsgId(msgId)
+    audio.onended = () => {
+      URL.revokeObjectURL(blobUrl)
+      audioRef.current = null
+      setSpeaking(false)
+      setSpeakingMsgId(null)
+    }
     void audio.play()
   }, [muted, token])
 
@@ -167,6 +182,13 @@ export default function ChatWidget({ token }: Props) {
     const next = !muted
     setMuted(next)
     localStorage.setItem('pond_tts_muted', String(next))
+    // Stop any current TTS immediately when muting
+    if (next && audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+      setSpeaking(false)
+      setSpeakingMsgId(null)
+    }
   }
 
   /**
@@ -375,7 +397,7 @@ export default function ChatWidget({ token }: Props) {
           return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)]
         })
         setLoading(false)
-        void speakText(fullText)
+        void speakText(fullText, assistantMsgId)
       },
       (err) => {
         const errText = `Error: ${err}`
@@ -447,13 +469,17 @@ export default function ChatWidget({ token }: Props) {
           {agentRunning ? 'Agent Online' : 'Agent Offline'}
         </span>
         <div className="db-chat-control-btns">
-          {/* Mute/unmute TTS */}
+          {/* Mute/unmute TTS — shows animated sound bars while Goose is speaking */}
           <button
-            className="db-chat-control-btn"
+            className={`db-chat-control-btn db-chat-mute-btn ${speaking && !muted ? 'speaking' : ''}`}
             onClick={toggleMute}
-            title={muted ? 'Unmute voice' : 'Mute voice'}
+            title={muted ? 'Unmute voice' : speaking ? 'Goose is speaking — click to mute' : 'Mute voice'}
           >
-            {muted ? (
+            {speaking && !muted ? (
+              <span className="db-chat-speak-wave-mini">
+                <span /><span /><span /><span /><span />
+              </span>
+            ) : muted ? (
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="1" y1="1" x2="23" y2="23" />
                 <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
@@ -468,7 +494,7 @@ export default function ChatWidget({ token }: Props) {
                 <line x1="8" y1="22" x2="16" y2="22" />
               </svg>
             )}
-            {muted ? 'Unmute' : 'Mute'}
+            {speaking && !muted ? 'Speaking' : muted ? 'Unmute' : 'Mute'}
           </button>
 
           <button
@@ -524,7 +550,7 @@ export default function ChatWidget({ token }: Props) {
                 </span>
               </div>
             )}
-            <span className="db-chat-bubble">
+            <span className={`db-chat-bubble ${msg.streaming ? 'streaming' : ''} ${speakingMsgId === msg.id ? 'speaking' : ''}`}>
               {msg.text}
               {msg.streaming && <span className="db-chat-cursor" />}
             </span>
@@ -561,18 +587,23 @@ export default function ChatWidget({ token }: Props) {
         {/* Voice state badges — one shown at a time reflecting the current pipeline step */}
         {recording && (
           <span className="db-chat-listening-badge">
-            <span className="db-chat-listening-dot" />
-            Recording — tap mic to stop
+            <span className="db-chat-speak-wave-mini">
+              <span /><span /><span /><span /><span />
+            </span>
+            Listening — tap mic to stop
           </span>
         )}
-        {converting && (
-          <span className="db-chat-listening-badge db-chat-listening-badge--converting">
-            Converting audio…
-          </span>
-        )}
-        {transcribing && (
+        {(converting || transcribing) && (
           <span className="db-chat-listening-badge db-chat-listening-badge--transcribing">
-            Transcribing…
+            Thinking…
+          </span>
+        )}
+        {speaking && !muted && (
+          <span className="db-chat-listening-badge db-chat-listening-badge--speaking">
+            <span className="db-chat-speak-wave-mini">
+              <span /><span /><span /><span /><span />
+            </span>
+            Goose is speaking — click Mute to stop
           </span>
         )}
         {voiceError && (
@@ -584,11 +615,10 @@ export default function ChatWidget({ token }: Props) {
         <input
           type="text"
           placeholder={
-            !agentRunning ? 'Agent is stopped — press Start to resume…' :
-            recording     ? 'Tap the mic again to stop recording…' :
-            converting    ? 'Converting audio…' :
-            transcribing  ? 'Transcribing your message…' :
-                            'Type a message or tap the mic…'
+            !agentRunning         ? 'Agent is stopped — press Start to resume…' :
+            recording             ? 'Listening — tap mic to stop…' :
+            converting || transcribing ? 'Thinking…' :
+                                    'Type a message or tap the mic…'
           }
           value={input}
           onChange={e => setInput(e.target.value)}
@@ -600,32 +630,29 @@ export default function ChatWidget({ token }: Props) {
           type="button"
           className={`db-chat-mic-btn ${recording ? 'active' : ''} ${converting ? 'converting' : ''} ${transcribing ? 'transcribing' : ''}`}
           onClick={toggleVoice}
-          // Only lock out the mic button during converting/transcribing — during recording
-          // it must stay enabled so the user can tap it to stop
+          // Locked only during converting/transcribing; enabled during recording so user can tap to stop
           disabled={loading || !agentRunning || voiceBusy}
           title={
-            recording    ? 'Tap to stop recording' :
-            converting   ? 'Converting audio…' :
-            transcribing ? 'Transcribing…' :
-                           'Voice input (Whisper)'
+            recording             ? 'Tap to stop' :
+            converting || transcribing ? 'Thinking…' :
+                                    'Voice input'
           }
           aria-label={
-            recording    ? 'Stop recording' :
-            converting   ? 'Converting audio' :
-            transcribing ? 'Transcribing' :
-                           'Start voice input'
+            recording             ? 'Stop recording' :
+            converting || transcribing ? 'Thinking' :
+                                    'Start voice input'
           }
         >
           {converting || transcribing ? (
-            // Spinner during post-processing (converting WAV or waiting for whisper)
+            // Spinner while Goose processes the audio
             <svg className="db-chat-mic-spinner" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
               <path d="M21 12a9 9 0 1 1-6.219-8.56" />
             </svg>
           ) : recording ? (
-            // Stop square — user can click this to end recording early
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="5" y="5" width="14" height="14" rx="2" />
-            </svg>
+            // Waveform animation — the user is speaking
+            <span className="db-chat-speak-wave">
+              <span /><span /><span /><span /><span />
+            </span>
           ) : (
             // Idle mic icon
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
