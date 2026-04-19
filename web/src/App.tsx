@@ -169,6 +169,10 @@ function App() {
             if (res.accepted && res.session_token) {
                 localStorage.setItem("pond_session_token", res.session_token);
                 setToken(res.session_token);
+                const settings = await api.getSettings(res.session_token);
+                const name = settings.user_name ?? "";
+                localStorage.setItem("pond_display_name", name);
+                setDisplayName(name);
                 setOnboarded(true);
             } else {
                 setOnboarded(false);
@@ -211,7 +215,9 @@ function App() {
         return () => window.removeEventListener('pond-unauthorized', handler);
     }, []);
 
-    // Re-handshake using the stored client ID, no full onboarding needed
+    // Re-handshake using the stored client ID, then verify onboarding status.
+    // If the backend DB was wiped and re-initialized, the pond may not be onboarded
+    // yet — in that case redirect to the wizard instead of the dashboard.
     const handleReconnect = useCallback(async () => {
         let clientId = localStorage.getItem("pond_client_id") ?? "";
         if (!clientId) {
@@ -225,7 +231,17 @@ function App() {
             localStorage.setItem("pond_session_token", res.session_token);
             setToken(res.session_token);
             setLoggedOut(false);
-            setPage("chat");
+            const status = await api.onboardingStatus();
+            if (!status.onboarded) {
+                setOnboarded(false);
+            } else {
+                const settings = await api.getSettings(res.session_token);
+                const name = settings.user_name ?? "";
+                localStorage.setItem("pond_display_name", name);
+                setDisplayName(name);
+                setOnboarded(true);
+                setPage("chat");
+            }
         } else {
             throw new Error(res.rejection_reason ?? "Handshake rejected");
         }
@@ -247,6 +263,7 @@ function App() {
     if (!onboarded) {
         return (
             <Onboarding onComplete={(t, name) => {
+                localStorage.setItem("pond_display_name", name);
                 setToken(t);
                 setDisplayName(name);
                 setOnboarded(true);
