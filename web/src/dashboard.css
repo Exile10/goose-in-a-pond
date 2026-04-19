@@ -48,6 +48,19 @@
   mix-blend-mode: var(--logo-blend);
 }
 
+/* Logo theme switching — show light logo by default, dark logo in dark mode */
+.db-logo-dark { display: none; }
+
+/* System dark mode (no explicit theme set) */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) .db-logo-light { display: none; }
+  :root:not([data-theme="light"]):not([data-theme="dark"]) .db-logo-dark  { display: block; }
+}
+
+/* Explicit dark theme */
+:root[data-theme="dark"] .db-logo-light { display: none; }
+:root[data-theme="dark"] .db-logo-dark  { display: block; }
+
 .db-sidebar-nav {
   flex: 1;
   padding: 0.5rem 0.4rem;
@@ -247,6 +260,8 @@
 .db-dashboard-chat {
   flex: 1;
   min-width: 0;
+  min-height: 0;      /* prevent flex child from expanding beyond parent height */
+  overflow: hidden;   /* keep input row anchored to the bottom of the visible area */
   display: flex;
   flex-direction: column;
 }
@@ -590,7 +605,7 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 1.25rem 1.5rem;
+  padding: 1.25rem 0 1.25rem 1.5rem; /* no right padding — scrollbar sits flush at the edge */
   box-sizing: border-box;
 }
 
@@ -600,7 +615,7 @@
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
-  padding: 0.25rem 0 0.75rem;
+  padding: 0.25rem 1rem 1.5rem 0; /* right padding = gap between messages and the scrollbar */
 }
 
 .db-chat-msg { display: flex; }
@@ -630,6 +645,32 @@
   border: 1px solid var(--bubble-assistant-border);
 }
 
+/* Goose is still writing — border pulses softly while streaming, stops when done */
+.db-chat-msg-assistant .db-chat-bubble.streaming {
+  animation: db-bubble-stream 2s ease-in-out infinite;
+}
+
+@keyframes db-bubble-stream {
+  0%, 100% { border-color: rgba(169, 111, 245, 0.2); box-shadow: none; }
+  50%       { border-color: rgba(169, 111, 245, 0.55); box-shadow: 0 0 10px rgba(169, 111, 245, 0.12); }
+}
+
+/* Goose is reading this bubble aloud — slower, deeper glow than the streaming pulse */
+.db-chat-msg-assistant .db-chat-bubble.speaking {
+  animation: db-bubble-speak 2.2s ease-in-out infinite;
+}
+
+@keyframes db-bubble-speak {
+  0%, 100% {
+    border-color: rgba(169, 111, 245, 0.15);
+    box-shadow: none;
+  }
+  50% {
+    border-color: rgba(169, 111, 245, 0.65);
+    box-shadow: 0 0 18px rgba(169, 111, 245, 0.18), 0 0 6px rgba(169, 111, 245, 0.1);
+  }
+}
+
 /* ── Chat controls bar ────────────────────────────────────────────────────── */
 
 .db-chat-controls {
@@ -655,6 +696,19 @@
 
 .db-chat-agent-status.online  { color: #15803d; }
 .db-chat-agent-status.offline { color: var(--text-faint); }
+
+/* Light mode: only the mute/unmute button gets white text — other buttons keep their own colours */
+:root[data-theme="light"] .db-chat-mute-btn { color: #ffffff; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]):not([data-theme="light"]) .db-chat-mute-btn { color: #ffffff; }
+}
+
+/* Mute button — speaking state: purple accent, sound bars replace icon */
+.db-chat-mute-btn.speaking {
+  color: #a96ff5;
+  background: rgba(169, 111, 245, 0.12);
+  border-color: rgba(169, 111, 245, 0.35);
+}
 
 .db-chat-agent-dot {
   width: 8px;
@@ -796,6 +850,7 @@
   display: flex;
   gap: 0.4rem;
   padding-top: 0.5rem;
+  padding-right: 1rem; /* mirror the messages right padding so buttons don't sit at the edge */
   border-top: 1px solid rgba(179, 134, 255, 0.25);
   margin-top: auto;
 }
@@ -835,10 +890,12 @@
   transition: background 0.15s;
 }
 
-/* Scale the icon with the button so it stays readable at small sizes */
+/* Scale the icon with the button — !important overrides the inline width/height
+   attributes on the SVG elements so the icon always fits the button size */
 .db-chat-mic-btn svg {
-  width: clamp(16px, 40%, 22px);
-  height: clamp(16px, 40%, 22px);
+  width: clamp(18px, 45%, 22px) !important;
+  height: clamp(18px, 45%, 22px) !important;
+  flex-shrink: 0;
 }
 
 .db-chat-mic-btn:hover:not(:disabled) {
@@ -846,9 +903,9 @@
 }
 
 .db-chat-mic-btn.active {
-  background: var(--error-bg);
-  color: #ef4444;
-  border-color: #fca5a5;
+  background: #059669;
+  color: #ffffff;
+  border-color: transparent;
   animation: db-mic-pulse 1.5s ease-in-out infinite;
 }
 
@@ -858,17 +915,17 @@
 }
 
 @keyframes db-mic-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.3); }
-  50%       { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  0%, 100% { box-shadow: 0 0 0 0   rgba(5, 150, 105, 0.35); }
+  50%       { box-shadow: 0 0 0 7px rgba(5, 150, 105, 0); }
 }
 
 .db-chat-listening-badge {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.5rem;
   font-size: 0.78rem;
   font-weight: 500;
-  color: #ef4444;
+  color: #059669;
 }
 
 /* Converting step — amber to signal "working on it" */
@@ -879,6 +936,12 @@
 /* Transcribing step — purple to match the assistant accent colour */
 .db-chat-listening-badge--transcribing {
   color: #a96ff5;
+}
+
+/* Goose is speaking badge — purple to match the assistant accent */
+.db-chat-listening-badge--speaking {
+  color: #a96ff5;
+  gap: 0.5rem;
 }
 
 /* Error badge */
@@ -907,6 +970,56 @@
   color: #ffffff;
   cursor: not-allowed;
 }
+
+/* ── Waveform — shown inside the mic button while the user is recording ─── */
+
+.db-chat-speak-wave {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.db-chat-speak-wave span {
+  display: block;
+  width: 3px;
+  border-radius: 2px;
+  background: currentColor;
+  animation: db-speak-wave 1s ease-in-out infinite;
+}
+
+/* 5 bars at different heights for a natural waveform shape */
+.db-chat-speak-wave span:nth-child(1) { height: 6px;  animation-delay: 0s; }
+.db-chat-speak-wave span:nth-child(2) { height: 12px; animation-delay: 0.1s; }
+.db-chat-speak-wave span:nth-child(3) { height: 18px; animation-delay: 0.2s; }
+.db-chat-speak-wave span:nth-child(4) { height: 12px; animation-delay: 0.3s; }
+.db-chat-speak-wave span:nth-child(5) { height: 6px;  animation-delay: 0.4s; }
+
+@keyframes db-speak-wave {
+  0%, 100% { transform: scaleY(0.35); opacity: 0.55; }
+  50%       { transform: scaleY(1);   opacity: 1; }
+}
+
+/* ── Mini waveform inside the badge ─────────────────────────────────────── */
+
+.db-chat-speak-wave-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.5px;
+}
+
+.db-chat-speak-wave-mini span {
+  display: inline-block;
+  width: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  animation: db-speak-wave 1s ease-in-out infinite;
+}
+
+.db-chat-speak-wave-mini span:nth-child(1) { height: 4px;  animation-delay: 0s; }
+.db-chat-speak-wave-mini span:nth-child(2) { height: 8px;  animation-delay: 0.1s; }
+.db-chat-speak-wave-mini span:nth-child(3) { height: 11px; animation-delay: 0.2s; }
+.db-chat-speak-wave-mini span:nth-child(4) { height: 8px;  animation-delay: 0.3s; }
+.db-chat-speak-wave-mini span:nth-child(5) { height: 4px;  animation-delay: 0.4s; }
 
 /* ── Settings page ────────────────────────────────────────────────────────── */
 
@@ -1130,8 +1243,9 @@
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 
 @media (max-width: 768px) {
-  /* Sidebar collapses to a narrow 56px icon-only vertical rail on the left.
-     This keeps the nav reachable without covering the chat input area. */
+  /* ── Sidebar ──────────────────────────────────────────────────────────────
+     Collapses to a narrow 56px icon-only vertical rail on the left.
+     Keeps nav reachable without covering the main content area. */
   .db-sidebar {
     width: 56px;
   }
@@ -1289,6 +1403,93 @@
   .db-chat-bubble {
     max-width: 85%;
   }
+
+  /* ── Page header ────────────────────────────────────────────────────────── */
+  .db-page-header {
+    margin-bottom: 1rem;
+  }
+
+  .db-page-title {
+    font-size: 1.25rem;
+  }
+
+  /* ── Card headers — stack title and action button vertically when tight ── */
+  .db-card-header {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  /* ── Chat controls bar — wrap buttons below status on narrow widths ────── */
+  .db-chat-controls {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .db-chat-control-btns {
+    flex-wrap: wrap;
+  }
+
+  /* ── Settings — full-width inputs and stacked danger rows ──────────────── */
+  .db-settings-input,
+  .db-settings-textarea {
+    max-width: 100%;
+  }
+
+  .db-settings-actions {
+    justify-content: stretch;
+  }
+
+  .db-settings-actions .db-btn-primary {
+    width: 100%;
+  }
+
+  /* ── Schedules table — enable horizontal scroll so columns don't collapse */
+  .db-table-wrapper {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .db-table {
+    min-width: 540px; /* prevents columns from collapsing to nothing */
+  }
+
+  /* ── Add-schedule / add-device forms — stack fields vertically ─────────── */
+  .db-add-form {
+    flex-direction: column;
+  }
+
+  .db-add-form input,
+  .db-add-form select {
+    width: 100%;
+  }
+
+  /* ── Models page — cards wrap info and actions vertically ─────────────── */
+  .db-model-card {
+    flex-direction: column;
+  }
+
+  .db-model-card-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  /* Toolbar (Scan / Refresh) wraps to a second line */
+  .db-models-toolbar {
+    flex-wrap: wrap;
+    justify-content: flex-start !important;
+  }
+
+  .db-models-toolbar .db-btn-sm {
+    flex: 1;
+    text-align: center;
+  }
+
+  /* AI Pipeline role rows — label + model name + actions wrap gracefully */
+  .db-role-row {
+    flex-wrap: wrap;
+    row-gap: 0.4rem;
+  }
 }
 
 @media (max-width: 480px) {
@@ -1354,6 +1555,70 @@
 
   .db-settings-danger-row {
     align-items: flex-start;
+  }
+
+  /* ── Page header ─────────────────────────────────────────────────────────── */
+  .db-page-header {
+    margin-bottom: 0.75rem;
+  }
+
+  /* ── Card — reduce padding on very small screens ──────────────────────── */
+  .db-card-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  /* ── Schedules table — tighter min-width on phones ─────────────────────── */
+  .db-table {
+    min-width: 480px;
+  }
+
+  /* ── Table action buttons — icon only to save horizontal space ─────────── */
+  .db-table-actions .db-btn-sm {
+    padding: 0.3rem 0.5rem;
+    font-size: 0.72rem;
+  }
+
+  /* ── Activity rows — truncate long text cleanly ─────────────────────────── */
+  .db-activity-text {
+    max-width: calc(100vw - 140px);
+  }
+
+  /* ── Settings danger row — fully stacked ───────────────────────────────── */
+  .db-settings-danger-row {
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .db-btn-danger-outline {
+    width: 100%;
+    text-align: center;
+  }
+
+  /* ── Page title ─────────────────────────────────────────────────────────── */
+  .db-page-subtitle {
+    font-size: 0.8rem;
+  }
+
+  /* ── Models page — tighter cards and fully stacked role rows ────────────── */
+  .db-model-card {
+    padding: 0.65rem 0.75rem;
+    gap: 0.65rem;
+  }
+
+  .db-model-card-name {
+    font-size: 0.8rem;
+  }
+
+  .db-role-row {
+    flex-direction: column;
+    align-items: flex-start !important;
+  }
+
+  .db-models-toolbar .db-btn-sm {
+    flex: unset;
+    width: 100%;
+    text-align: center;
   }
 }
 

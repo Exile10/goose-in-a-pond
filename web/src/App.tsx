@@ -13,6 +13,7 @@ import Prompts from "./pages/Prompts";
 import Onboarding from "./pages/Onboarding";
 import LoggedOut from "./pages/LoggedOut";
 import logo from "./assets/logo.png";
+import logoDark from "./assets/Logodark.png";
 import "./dashboard.css";
 
 type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models" | "agent" | "prompts";
@@ -278,7 +279,10 @@ function App() {
             <aside className="db-sidebar">
                 {/* Logo */}
                 <div className="db-sidebar-logo">
-                    <img src={logo} alt="Goose In A Pond" className="db-sidebar-logo-img" />
+                    {/* Light logo — hidden in dark mode */}
+                    <img src={logo}     alt="Goose In A Pond" className="db-sidebar-logo-img db-logo-light" />
+                    {/* Dark logo — hidden in light mode */}
+                    <img src={logoDark} alt="Goose In A Pond" className="db-sidebar-logo-img db-logo-dark" />
                 </div>
 
                 {/* Nav links */}
