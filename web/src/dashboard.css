@@ -825,12 +825,20 @@
   justify-content: center;
   width: 55px;
   height: 55px;
+  min-width: 44px;   /* never shrink below a usable touch target */
+  min-height: 44px;
   border-radius: 8px;
   border: none;
   background: #b386ff;
   color: #ffffff;
   cursor: pointer;
   transition: background 0.15s;
+}
+
+/* Scale the icon with the button so it stays readable at small sizes */
+.db-chat-mic-btn svg {
+  width: clamp(16px, 40%, 22px);
+  height: clamp(16px, 40%, 22px);
 }
 
 .db-chat-mic-btn:hover:not(:disabled) {
@@ -863,12 +871,41 @@
   color: #ef4444;
 }
 
+/* Converting step — amber to signal "working on it" */
+.db-chat-listening-badge--converting {
+  color: #f59e0b;
+}
+
+/* Transcribing step — purple to match the assistant accent colour */
+.db-chat-listening-badge--transcribing {
+  color: #a96ff5;
+}
+
+/* Error badge */
+.db-chat-listening-badge--error {
+  color: var(--color-error, #f87171);
+}
+
 .db-chat-listening-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #ef4444;
   animation: db-mic-pulse 1s ease-in-out infinite;
+}
+
+/* Mic button — converting state (amber spinner) */
+.db-chat-mic-btn.converting {
+  background: #f59e0b;
+  color: #ffffff;
+  cursor: not-allowed;
+}
+
+/* Mic button — transcribing state (purple spinner, matches assistant colour) */
+.db-chat-mic-btn.transcribing {
+  background: #a96ff5;
+  color: #ffffff;
+  cursor: not-allowed;
 }
 
 /* ── Settings page ────────────────────────────────────────────────────────── */
@@ -1099,6 +1136,10 @@
     width: 56px;
   }
 
+  .voice-orb-container {
+    left: calc(56px + 1rem);
+  }
+
   /* Show logo at reduced size so it stays visible in the narrow rail */
   .db-sidebar-logo {
     display: flex;
@@ -1220,8 +1261,8 @@
   }
 
   .db-chat-mic-btn {
-    width: 42px;
-    height: 42px;
+    width: 44px;
+    height: 44px;
   }
 
   .db-chat-input-row .db-btn-primary {
@@ -1287,12 +1328,26 @@
     font-size: 0.78rem;
   }
 
+  /* At 480px wrap the text input onto its own line so the buttons always
+     have enough room — input spans full width, mic + send sit below it */
+  .db-chat-input-row {
+    flex-wrap: wrap;
+  }
+
+  .db-chat-input-row input {
+    flex-basis: 100%;  /* full-width row on its own line */
+  }
+
+  /* Buttons share the second row; mic stays at minimum touch target */
   .db-chat-mic-btn {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
+    flex: 1;           /* grow to fill remaining space alongside Send */
+    max-width: 60px;
   }
 
   .db-chat-input-row .db-btn-primary {
+    flex: 2;           /* Send button takes more width than the mic */
     padding: 0.25rem 0.6rem;
     font-size: 0.75rem;
   }
@@ -1326,7 +1381,7 @@
 .voice-orb-container {
   position: fixed;
   bottom: 1.75rem;
-  right: 1.75rem;
+  left: calc(165px + 1rem);
   z-index: 200;
   display: flex;
   flex-direction: column;
