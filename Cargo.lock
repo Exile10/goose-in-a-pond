@@ -6641,7 +6641,9 @@ name = "pond-adapters-ollama"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
+ "futures",
  "pond-core",
  "reqwest 0.13.2",
  "serde",
@@ -6722,6 +6724,7 @@ dependencies = [
  "futures",
  "hostname",
  "pond-adapters-llamafile",
+ "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-core",
  "pond-infra",
@@ -6825,6 +6828,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "futures",
  "hostname",
  "indoc",
  "pond-adapters-goose",

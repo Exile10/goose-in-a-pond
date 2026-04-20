@@ -42,7 +42,7 @@
       "icons/icon.png"
     ],
     "macOS": {
-      "infoPlist": null
+      "infoPlist": "Info.plist"
     }
   }
 }

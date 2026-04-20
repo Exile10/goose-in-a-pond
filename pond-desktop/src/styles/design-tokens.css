@@ -8,7 +8,8 @@
 :root {
   /* ── Fonts ──────────────────────────────────────────────── */
   --font-display: "Quicksand", "Comfortaa", "Helvetica Neue", Arial, sans-serif;
-  --font-body:    "Inter", "Helvetica Neue", Arial, sans-serif;
+  --font-body:    "Quicksand", "Comfortaa", "Helvetica Neue", Arial, sans-serif;
+  --font-body-alt:"Comfortaa", "Quicksand", "Helvetica Neue", Arial, sans-serif;
   --font-mono:    "JetBrains Mono", "Menlo", "Consolas", monospace;
 
   /* Font sizes */
@@ -34,13 +35,30 @@
 
   /* ── Jarida Brand Colors ────────────────────────────────── */
 
+  /* Jarida Purple scale — #8C4BFF is the canonical brand purple */
+  --purple-50:  #F4ECFF;
+  --purple-100: #E6D6FF;
+  --purple-200: #CFB0FF;
+  --purple-300: #B386FF;
+  --purple-400: #9D63FF;
+  --purple-500: #8C4BFF;  /* Jarida Purple — primary */
+  --purple-600: #7636E6;
+  --purple-700: #5D23C2;  /* Ink outline — logo depth */
+  --purple-800: #421593;
+  --purple-900: #2A0C66;
+
   /* Primary accent — Jarida Purple */
-  --color-accent:        #8C52FF;
-  --color-accent-hover:  #7A3FF0;
-  --color-accent-active: #6830DC;
-  --color-accent-soft:   rgba(140, 82, 255, 0.11);
-  --color-accent-subtle: rgba(140, 82, 255, 0.06);
+  --color-accent:        #8C4BFF;
+  --color-accent-hover:  #7636E6;
+  --color-accent-active: #5D23C2;
+  --color-accent-soft:   rgba(140, 75, 255, 0.11);
+  --color-accent-subtle: rgba(140, 75, 255, 0.06);
   --color-text-on-accent: #FFFFFF;
+
+  /* Ink style — signature Jarida outlined look */
+  --border-ink:  #5D23C2;
+  --shadow-ink:  4px 4px 0 #5D23C2;
+  --bg-brand-soft: #F4ECFF;  /* alias: --purple-50 */
 
   /* Text — Jarida Charcoal */
   --color-text:           #171616;
@@ -122,5 +140,6 @@
   --shadow-md:     0 2px 8px rgba(23, 22, 22, 0.08);
   --shadow-lg:     0 4px 16px rgba(23, 22, 22, 0.10);
   --shadow-canvas: 0 8px 32px rgba(23, 22, 22, 0.18), 0 2px 8px rgba(23, 22, 22, 0.10);
-  --shadow-orb:    0 0 24px rgba(140, 82, 255, 0.30);  /* purple glow when active */
+  --shadow-brand:  0 10px 24px rgba(140, 75, 255, 0.28); /* hero CTA glow */
+  --shadow-orb:    0 0 24px rgba(140, 75, 255, 0.30);  /* purple glow when active */
 }

@@ -17,7 +17,8 @@ const SIZE_PX: Record<OrbSize, number> = {
 
 const STATE_COLORS: Record<VoiceState, string> = {
   idle:      "#8E8E93",
-  recording: "#8C52FF",  // Jarida Purple
+  wait:      "#8C4BFF",  // dim Jarida Purple — alert but calm
+  recording: "#8C4BFF",  // Jarida Purple
   thinking:  "#FF9500",  // warm amber
   speaking:  "#34C759",  // green
   error:     "#FF3B30",
@@ -25,6 +26,7 @@ const STATE_COLORS: Record<VoiceState, string> = {
 
 const STATE_LABELS: Record<VoiceState, string> = {
   idle:      "Ready",
+  wait:      "Waiting…",
   recording: "Listening",
   thinking:  "Thinking",
   speaking:  "Speaking",
@@ -60,7 +62,9 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
       // Outer glow ring (animated for active states) — solid concentric circles, no gradient
       if (state !== "idle") {
         const glowIntensity =
-          state === "recording"
+          state === "wait"
+            ? 0.06 + Math.sin(phaseRef.current) * 0.04  // dim, slow pulse
+            : state === "recording"
             ? 0.18 + audioLevel * 0.22
             : state === "thinking"
             ? 0.12 + Math.sin(phaseRef.current * 2) * 0.06
@@ -130,8 +134,8 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
       }
 
       // Icon for sm size (no bars)
-      if (size === "sm" || state === "idle" || state === "error") {
-        const icon = state === "error" ? "!" : state === "idle" ? "·" : "";
+      if (size === "sm" || state === "idle" || state === "wait" || state === "error") {
+        const icon = state === "error" ? "!" : state === "idle" ? "·" : state === "wait" ? "·" : "";
         if (icon) {
           ctx.fillStyle = "rgba(255,255,255,0.90)";
           ctx.font = `${Math.round(baseRadius * 0.8)}px Inter, sans-serif`;
@@ -141,7 +145,10 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
         }
       }
 
-      phaseRef.current += state === "thinking" ? 0.04 : state === "speaking" ? 0.06 : 0.025;
+      phaseRef.current +=
+        state === "wait"     ? 0.015 :
+        state === "thinking" ? 0.04  :
+        state === "speaking" ? 0.06  : 0.025;
       animRef.current = requestAnimationFrame(draw);
     }
 

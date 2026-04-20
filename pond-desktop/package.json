@@ -13,9 +13,10 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource-variable/comfortaa": "^5.2.8",
+    "@fontsource-variable/quicksand": "^5.2.10",
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
-    "@fontsource/quicksand": "^5.2.10",
     "@heroui/react": "^3.0.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-autostart": "^2",
@@ -28,6 +29,7 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2",
     "@testing-library/react": "^16.3.2",

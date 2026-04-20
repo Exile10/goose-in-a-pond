@@ -201,6 +201,84 @@ async fn connection_refused_propagates_as_err() {
     assert!(result.is_err(), "expected Err for connection refused, got Ok");
 }
 
+// ── Model name ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn model_name_returns_configured_value() {
+    let provider = OllamaProvider::new(None, Some("llama3.2"));
+    assert_eq!(provider.model_name(), "llama3.2");
+}
+
+#[tokio::test]
+async fn model_name_in_request_body_matches_configured_model() {
+    let server = MockServer::start().await;
+    mount_ok(&server, "ok").await;
+
+    let provider = OllamaProvider::new(Some(&server.uri()), Some("mistral"));
+    provider.complete("sys", vec![ChatMessage::user("hi")]).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "mistral", "request body model must match configured model");
+}
+
+// ── stream_complete + usage ───────────────────────────────────────────────────
+
+/// stream_complete should yield the assistant text as a single Text token.
+#[tokio::test]
+async fn stream_complete_yields_full_text_as_one_chunk() {
+    use futures::StreamExt;
+    use pond_core::ports::provider::StreamToken;
+
+    let server = MockServer::start().await;
+    mount_ok(&server, "Hello from Ollama!").await;
+
+    let provider = OllamaProvider::new(Some(&server.uri()), Some("llama3.2"));
+    let mut stream = provider.stream_complete("sys", vec![ChatMessage::user("hi")]);
+
+    let mut texts = Vec::new();
+    while let Some(Ok(item)) = stream.next().await {
+        if let StreamToken::Text(t) = item { texts.push(t); }
+    }
+
+    assert_eq!(texts, vec!["Hello from Ollama!".to_string()]);
+}
+
+/// When the response includes prompt_eval_count and eval_count, stream_complete
+/// must yield a final Usage token with the parsed counts.
+#[tokio::test]
+async fn stream_complete_yields_usage_from_response() {
+    use futures::StreamExt;
+    use pond_core::ports::provider::StreamToken;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3.2",
+                "message": { "role": "assistant", "content": "Four." },
+                "done": true,
+                "prompt_eval_count": 28,
+                "eval_count": 5
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OllamaProvider::new(Some(&server.uri()), Some("llama3.2"));
+    let mut stream = provider.stream_complete("sys", vec![ChatMessage::user("2+2?")]);
+
+    let mut usage_opt = None;
+    while let Some(Ok(item)) = stream.next().await {
+        if let StreamToken::Usage(u) = item { usage_opt = Some(u); }
+    }
+
+    let usage = usage_opt.expect("expected a Usage token in stream");
+    assert_eq!(usage.prompt_tokens, 28, "prompt_tokens mismatch");
+    assert_eq!(usage.completion_tokens, 5, "completion_tokens mismatch");
+}
+
 // ── Live smoke test ───────────────────────────────────────────────────────────
 
 /// Run with:

@@ -110,6 +110,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         prompt_extra_repo: None,
         skill_repo: None,
         recipe_repo: None,
+        llamafile_manager: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -287,7 +288,8 @@ async fn health_endpoint_accessible_without_auth() {
     let resp = app
         .oneshot(
             Request::builder()
-                .get("/api/v1/health")
+                .method("GET")
+                .uri("/api/v1/health")
                 .body(Body::empty())
                 .unwrap(),
         )
