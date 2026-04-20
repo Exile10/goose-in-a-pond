@@ -81,12 +81,15 @@ pond-desktop                (Tauri 2 desktop app — React + Rust)
 - **Git** with submodule support
 - For voice: [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server + [Piper](https://github.com/rhasspy/piper) binary
 
+## Fork the repository.  
+
 ### 1. Clone
 
 ```bash
-git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
+git clone --recursive https://github.com/your-username/goose-in-a-pond.git
 cd goose-in-a-pond
 ```
+[Click here](https://github.com/settings/tokens/new) to generate a new access token when asked for password, copy token generated and paste it in the password field.
 
 ### 2. Build
 
