@@ -160,16 +160,37 @@ export default function FaceEnrollment({ token }: Props) {
   }
 
   async function handleIdentify() {
+    // Production-style verification: always capture a 5-frame burst and
+    // send it through /faces/identify-burst.  That endpoint runs
+    // inter-frame embedding sameness + landmark pixel-motion gates which
+    // a single frame cannot perform — so a held-up photo / phone screen
+    // comes back as `identified: false, reason: "liveness_failed"`.
     setError(null); setBanner(null); setLastResult(null)
-    const blob = await captureFrame()
-    if (!blob) {
-      setError('Could not capture a frame — is the camera running?')
-      return
-    }
     setBusy('identifying')
     try {
-      const result = await api.identifyFace(blob, token)
-      setLastResult(result)
+      const frames: Blob[] = []
+      for (let i = 0; i < 5; i++) {
+        if (i > 0) await new Promise(r => setTimeout(r, 400))
+        const blob = await captureFrame()
+        if (!blob) {
+          setError('Could not capture a frame — is the camera running?')
+          return
+        }
+        frames.push(blob)
+      }
+      const result = await api.identifyFaceBurst(frames, token)
+      if (result.reason === 'liveness_failed') {
+        setError(
+          'Liveness check failed — this looked like a still image (no head motion across frames). ' +
+          'Hold the camera steady on a live face and try again.',
+        )
+      }
+      setLastResult({
+        identified: result.identified,
+        profile_id: result.profile_id,
+        confidence: result.confidence,
+        threshold: result.threshold,
+      })
     } catch (err) {
       handleBackendError(err)
     } finally {
@@ -254,7 +275,7 @@ export default function FaceEnrollment({ token }: Props) {
               </div>
             )}
             <canvas ref={canvasRef} style={{ display: 'none' }} />
-            <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8 }}>
               Keep your face inside the dashed square. The server auto-crops to the largest
               centered square when no bounding box is supplied.
             </p>
@@ -304,7 +325,7 @@ export default function FaceEnrollment({ token }: Props) {
             </div>
 
             {lastResult && (
-              <div style={{ marginTop: 16, padding: 12, background: '#f3f4f6', borderRadius: 8 }}>
+              <div style={{ marginTop: 16, padding: 12, background: 'var(--surface-muted)', color: 'var(--text-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Last identification</div>
                 {lastResult.identified ? (
                   <div>
@@ -325,19 +346,19 @@ export default function FaceEnrollment({ token }: Props) {
         <section style={{ ...panelStyle, marginTop: 20 }}>
           <h2 style={panelHeading}>
             Enrollments for {selectedProfile ? profileName(selectedProfile) : '—'}
-            {enrollments.length > 0 && <span style={{ fontSize: 13, fontWeight: 400, color: '#6b7280' }}> · {enrollments.length} sample(s)</span>}
+            {enrollments.length > 0 && <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-muted)' }}> · {enrollments.length} sample(s)</span>}
           </h2>
           {enrollments.length === 0 ? (
-            <p style={{ color: '#6b7280', fontSize: 14 }}>
+            <p style={{ color: 'var(--text-muted)', fontSize: 14 }}>
               No samples enrolled yet. Capture 3+ samples (different lighting / angles) for best accuracy.
             </p>
           ) : (
             <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
               {enrollments.map(e => (
-                <li key={e.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #e5e7eb', fontSize: 13 }}>
-                  <code style={{ color: '#6b7280' }}>{e.id.slice(0, 12)}…</code>
+                <li key={e.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--surface-border)', fontSize: 13, color: 'var(--text-primary)' }}>
+                  <code style={{ color: 'var(--text-muted)' }}>{e.id.slice(0, 12)}…</code>
                   <span>{e.model_dims}-d</span>
-                  <span style={{ color: '#6b7280' }}>{new Date(e.created_at).toLocaleString()}</span>
+                  <span style={{ color: 'var(--text-muted)' }}>{new Date(e.created_at).toLocaleString()}</span>
                 </li>
               ))}
             </ul>
@@ -349,24 +370,29 @@ export default function FaceEnrollment({ token }: Props) {
 }
 
 // ── Inline styles (kept here to avoid reshuffling global CSS) ───────────────
+// All surface / text tokens route through CSS variables so light + dark
+// themes render legibly without per-style overrides.
 const panelStyle: React.CSSProperties = {
-  background: 'var(--db-card-bg, #fff)',
-  border: '1px solid var(--db-border, #e5e7eb)',
+  background: 'var(--surface)',
+  border: '1px solid var(--surface-border)',
   borderRadius: 12,
   padding: 16,
+  color: 'var(--text-primary)',
 }
 const panelHeading: React.CSSProperties = {
   margin: '0 0 12px',
   fontSize: 15,
   fontWeight: 600,
+  color: 'var(--text-primary)',
 }
 const selectStyle: React.CSSProperties = {
   width: '100%',
   padding: '8px 10px',
   borderRadius: 8,
-  border: '1px solid #d1d5db',
+  border: '1px solid var(--input-border)',
   fontSize: 14,
-  background: '#fff',
+  background: 'var(--input-bg)',
+  color: 'var(--input-text)',
 }
 const baseButton: React.CSSProperties = {
   padding: '8px 14px',
@@ -380,7 +406,9 @@ const primaryButton: React.CSSProperties = {
   ...baseButton, background: '#2563eb', color: '#fff',
 }
 const secondaryButton: React.CSSProperties = {
-  ...baseButton, background: '#e5e7eb', color: '#111827',
+  ...baseButton,
+  background: 'var(--btn-secondary-bg)',
+  color: 'var(--btn-secondary-text)',
 }
 const dangerButton: React.CSSProperties = {
   ...baseButton, background: '#fee2e2', color: '#991b1b',

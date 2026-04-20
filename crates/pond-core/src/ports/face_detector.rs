@@ -1,16 +1,13 @@
 //! FaceDetector port — optional face-localisation stage.
 //!
 //! A [`FaceDetector`] finds the primary face in an image and returns its
-//! bounding box.  The embedding pipeline then crops to that box before
-//! producing an embedding vector.
+//! bounding box plus (optionally) five canonical landmarks.  The embedding
+//! pipeline then either
 //!
-//! # Why a separate port?
-//!
-//! Phase 2 ships with a center-square crop fallback in the ONNX embedder,
-//! which works for well-framed headshots but fails on wide photos.  Wiring
-//! mtCNN (or ULFG, RetinaFace, etc.) in front of the embedder is a Phase 2+
-//! follow-up — this port is the seam that lets us drop a real detector in
-//! without touching the rest of the pipeline.
+//!   * crops to the bbox, if only a bbox is returned; or
+//!   * warps the image to the canonical 112×112 pose using a similarity
+//!     transform fitted to the landmarks, which is what ArcFace was trained
+//!     on and what real-world accuracy requires.
 //!
 //! # No-op default
 //!
@@ -20,7 +17,7 @@
 //! [`crate::ports::face_recognition`] in environments that do not bundle a
 //! detection model.
 
-use crate::domain::face_recognition::BoundingBox;
+use crate::domain::face_recognition::DetectedFace;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -29,10 +26,17 @@ use async_trait::async_trait;
 pub trait FaceDetector: Send + Sync {
     /// Detect the primary face in `image_bytes`.
     ///
-    /// Returns `Ok(Some(bbox))` when a face is confidently located,
+    /// Returns `Ok(Some(face))` when a face is confidently located,
     /// `Ok(None)` when no face is detected or the detector is unsure,
     /// and `Err` only for infrastructure failures (model load, decode).
-    async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<BoundingBox>>;
+    async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>>;
+
+    /// Whether this detector emits the five-point landmark set required for
+    /// similarity-transform alignment.  Callers can short-circuit to the
+    /// crop-only path when this returns `false`.
+    fn produces_landmarks(&self) -> bool {
+        false
+    }
 }
 
 /// No-op detector: always returns `Ok(None)`.  Callers fall back to
@@ -41,7 +45,7 @@ pub struct NoopFaceDetector;
 
 #[async_trait]
 impl FaceDetector for NoopFaceDetector {
-    async fn detect_face(&self, _image_bytes: &[u8]) -> Result<Option<BoundingBox>> {
+    async fn detect_face(&self, _image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
         Ok(None)
     }
 }
@@ -54,5 +58,10 @@ mod tests {
     async fn noop_detector_returns_none() {
         let d = NoopFaceDetector;
         assert!(d.detect_face(b"whatever").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn noop_does_not_produce_landmarks() {
+        assert!(!NoopFaceDetector.produces_landmarks());
     }
 }

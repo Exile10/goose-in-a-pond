@@ -549,6 +549,11 @@ mod tests {
         fn match_threshold(&self) -> f32 {
             0.6
         }
+        async fn pairwise_similarities(
+            &self,
+        ) -> Result<Vec<crate::ports::face_recognition::PairwiseSimilarity>> {
+            Ok(vec![])
+        }
     }
 
     fn new_chat_service_with_face(face: FakeFaceRecognition) -> ChatService {

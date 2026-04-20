@@ -539,6 +539,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
 
+    // Bake in the face-recognition runtime defaults so the server Just Works
+    // on a fresh macOS install without the operator having to remember a
+    // four-line env-var incantation.  Every var stays overridable — we only
+    // set it when it is currently *unset*.
+    apply_face_recognition_defaults();
+
     // Initialize databases
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -1145,7 +1151,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         spawn_desktop_app(api_port);
     }
 
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` makes the peer `SocketAddr`
+    // available via `req.extensions().get::<SocketAddr>()`, which the
+    // auth + rate-limit middleware uses to recognise loopback clients.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1679,6 +1692,63 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// Populate the face-recognition env vars with values that are known to
+/// work end-to-end on a fresh macOS dev install, so the operator no longer
+/// has to remember:
+///
+/// ```bash
+/// ORT_DYLIB_PATH=… POND_FACE_ANTISPOOF_PATH=… \
+/// POND_FACE_ANTISPOOF_LIVE_INDEX=2 \
+/// POND_FACE_ANTISPOOF_PIXEL_SCALE=unit \
+/// cargo run … serve
+/// ```
+///
+/// Each var is only set when currently **unset** — explicit values from
+/// the operator's shell keep taking precedence, so nothing a power user
+/// has configured gets clobbered.
+///
+/// The anti-spoof tuning (`LIVE_INDEX=2`, `PIXEL_SCALE=unit`) reflects the
+/// specific 3-class Silent-Face ONNX file we shipped install instructions
+/// for — on that export, slot 2 is the live class and the preprocess
+/// expects `[0, 1]` pixels.  Other exports need different values; override
+/// at the shell if you swap the model file.
+fn apply_face_recognition_defaults() {
+    // ONNX Runtime dylib — Homebrew installs to /opt/homebrew on Apple
+    // Silicon and /usr/local on Intel.  Try both.
+    let ort_candidates = [
+        "/opt/homebrew/lib/libonnxruntime.dylib",
+        "/usr/local/lib/libonnxruntime.dylib",
+    ];
+    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        for p in ort_candidates {
+            if std::path::Path::new(p).exists() {
+                // SAFETY: single-threaded setup, before any worker spawns.
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+                break;
+            }
+        }
+    }
+
+    // Anti-spoof ONNX model — default to the canonical location under the
+    // platform data dir so users who followed the README land here too.
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
+        let default_path = default_data_dir()
+            .join("models").join("face").join("antispoof.onnx");
+        if default_path.exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
+        }
+    }
+
+    // Tuning for the specific 3-class Silent-Face export we ship.
+    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2") };
+    }
+    if std::env::var_os("POND_FACE_ANTISPOOF_PIXEL_SCALE").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PIXEL_SCALE", "unit") };
+    }
+}
+
 fn default_data_dir() -> std::path::PathBuf {
     // `POND_DATA_DIR` lets tests (and power users) redirect all DB and model
     // storage to an arbitrary directory without touching the real data store.
@@ -1704,18 +1774,20 @@ fn build_face_recognition(
     data_dir: &std::path::Path,
     pool: sqlx::Pool<sqlx::Sqlite>,
 ) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
-    use pond_adapters_face_onnx::{EmbeddingModel, OnnxFaceEmbeddingExtractor};
+    use pond_adapters_face_onnx::{
+        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
+    };
+    use pond_core::ports::face_detector::FaceDetector;
     use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
     use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
 
-    // Allow operators to override with $POND_FACE_MODEL_PATH for testing.
     let model_path = std::env::var("POND_FACE_MODEL_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("models/face/arcface.onnx"));
 
     if !model_path.exists() {
         tracing::info!(
-            "face-onnx feature enabled but no model at {}; face recognition disabled",
+            "face-onnx feature enabled but no embedding model at {}; face recognition disabled",
             model_path.display()
         );
         return None;
@@ -1727,34 +1799,144 @@ fn build_face_recognition(
         EmbeddingModel::ArcFace512
     };
 
-    let extractor: Arc<dyn FaceEmbeddingExtractor> =
-        match OnnxFaceEmbeddingExtractor::new(&model_path, model_kind) {
-            Ok(e) => Arc::new(e),
-            Err(e) => {
-                tracing::warn!("face recognition disabled: {e:#}");
-                return None;
-            }
-        };
-
-    let threshold = match model_kind {
-        EmbeddingModel::ArcFace512 => 0.60,
-        EmbeddingModel::MobileFaceNet128 => 0.55,
+    // ONNX Runtime initialises lazily on the first `Session::builder()` call
+    // and *panics* (rather than returning Err) when its dynamic library is
+    // missing — see the `ort` crate.  Wrap the entire constructor in
+    // `catch_unwind` so a missing libonnxruntime.dylib downgrades to
+    // "face disabled" instead of taking down the whole server.  This makes
+    // the misconfigured-ORT case behave the same as the missing-model case.
+    let extractor: Arc<dyn FaceEmbeddingExtractor> = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| OnnxFaceEmbeddingExtractor::new(&model_path, model_kind)),
+    ) {
+        Ok(Ok(e)) => Arc::new(e),
+        Ok(Err(e)) => {
+            tracing::warn!("face recognition disabled: {e:#}");
+            return None;
+        }
+        Err(panic) => {
+            // Best-effort: ort's panic payload is a String; surface it.
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "ort init panicked (unknown payload)".to_string());
+            tracing::warn!(
+                "face recognition disabled: ONNX Runtime failed to initialise — {} \
+                 (hint: install onnxruntime and set ORT_DYLIB_PATH)",
+                msg
+            );
+            return None;
+        }
     };
 
+    // Detector resolution order:
+    //   1. SCRFD at $POND_FACE_SCRFD_PATH or $DATA_DIR/models/face/scrfd.onnx
+    //      — landmark-producing, drives similarity-transform alignment
+    //      (dramatically better real-world accuracy).
+    //   2. UltraFace at $POND_FACE_DETECTOR_PATH or $DATA_DIR/models/face/ultraface.onnx
+    //      — bbox only; no alignment, roughly phase-2 baseline behaviour.
+    //   3. No detector; adapter falls back to center-square cropping.  Safe
+    //      but prone to the "everyone matches" failure mode — log loudly.
+    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("models/face/scrfd.onnx"));
+    let ultraface_path = std::env::var("POND_FACE_DETECTOR_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("models/face/ultraface.onnx"));
+
+    let detector: Option<Arc<dyn FaceDetector>> = if scrfd_path.exists() {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ScrfdDetector::new(&scrfd_path, 0.5, 0.4)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("SCRFD ort init panicked"))) {
+            Ok(d) => {
+                tracing::info!(
+                    "SCRFD face detector loaded from {} — landmark alignment enabled",
+                    scrfd_path.display()
+                );
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                tracing::warn!("SCRFD detector unavailable: {e:#}; falling back to UltraFace");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let detector = detector.or_else(|| {
+        if ultraface_path.exists() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                UltraFaceDetector::new(&ultraface_path, 0.85, 0.3)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("UltraFace ort init panicked"))) {
+                Ok(d) => {
+                    tracing::warn!(
+                        "SCRFD model not found at {}; using UltraFace fallback (no landmark alignment). \
+                         Download SCRFD to restore real-world accuracy.",
+                        scrfd_path.display()
+                    );
+                    Some(Arc::new(d) as Arc<dyn FaceDetector>)
+                }
+                Err(e) => {
+                    tracing::warn!("UltraFace detector unavailable: {e:#}");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                "No face detector model found (looked at {} and {}). \
+                 Face recognition will use center-square fallback — \
+                 accuracy will be poor.",
+                scrfd_path.display(), ultraface_path.display(),
+            );
+            None
+        }
+    });
+
+    // Thresholds calibrated against ArcFace R100 on Umeyama-aligned 112×112
+    // crops.  The previous 0.50 floor was tuned for small in-house test
+    // sets where every profile was visually distinct; on real webcams
+    // with lighting / pose variance, 0.50 admits far too many
+    // cross-identity near-neighbours (a different person can trivially
+    // hit 0.55–0.65 post-blend once S-norm + centroid weights are in
+    // play).  The new floors sit inside the empirically-safe 0.68–0.75
+    // band for ArcFace aligned.  `POND_FACE_MATCH_THRESHOLD` still
+    // overrides via the env-driven default, but only when this code
+    // path does NOT call `.with_threshold()` — see below.
+    let threshold = match (&detector, model_kind) {
+        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
+        (Some(_), EmbeddingModel::ArcFace512)                            => 0.72,
+        (None, EmbeddingModel::ArcFace512)                                => 0.85,
+        (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
+        (Some(_), EmbeddingModel::MobileFaceNet128)                      => 0.72,
+        (None, EmbeddingModel::MobileFaceNet128)                         => 0.85,
+    };
+    // Allow a shell-level override to take precedence over the
+    // model-aware default — useful when a power user has tuned the gate
+    // for their specific enrollment quality.
+    let threshold = std::env::var("POND_FACE_MATCH_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(threshold);
+
     tracing::info!(
-        "face recognition enabled (model={:?}, threshold={})",
+        "face recognition enabled (model={:?}, threshold={}, aligned={})",
         model_kind,
-        threshold
+        threshold,
+        detector.as_ref().map(|d| d.produces_landmarks()).unwrap_or(false),
     );
 
-    Some(Arc::new(
-        SqliteFaceRecognition::new(pool, extractor)
-            .with_threshold(threshold)
-            .with_model_name(match model_kind {
-                EmbeddingModel::ArcFace512 => "arcface-512",
-                EmbeddingModel::MobileFaceNet128 => "mobilefacenet-128",
-            }),
-    ))
+    let mut svc = SqliteFaceRecognition::new(pool, extractor)
+        .with_threshold(threshold)
+        .with_model_name(match model_kind {
+            EmbeddingModel::ArcFace512 => "arcface-512",
+            EmbeddingModel::MobileFaceNet128 => "mobilefacenet-128",
+        });
+    if let Some(d) = detector { svc = svc.with_detector(d); }
+    Some(Arc::new(svc))
 }
 
 #[cfg(not(feature = "face-onnx"))]

@@ -14,6 +14,7 @@ import FaceEnrollment from "./pages/FaceEnrollment";
 import Onboarding from "./pages/Onboarding";
 import VoiceOrb from "./components/VoiceOrb";
 import logo from "./assets/logo.png";
+import logoDark from "./assets/Logodark.png";
 import "./dashboard.css";
 
 type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models" | "agent" | "prompts" | "faces";
@@ -135,14 +136,57 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
 function App() {
     const [page, setPage] = useState<Page>("chat");
 
-    // Apply saved theme preference on mount
-    useEffect(() => {
+    // Resolved theme drives the logo swap — we watch both the explicit
+    // `pond_theme` setting and (when set to `system`) the OS preference,
+    // so a user toggling dark mode in macOS System Settings immediately
+    // gets the matching logo asset.
+    const [resolvedTheme, setResolvedTheme] = useState<"light" | "dark">(() => {
         const saved = localStorage.getItem("pond_theme") ?? "system";
-        if (saved === "system") {
-            delete document.documentElement.dataset.theme;
-        } else {
-            document.documentElement.dataset.theme = saved;
-        }
+        if (saved === "dark") return "dark";
+        if (saved === "light") return "light";
+        return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    });
+
+    // Apply saved theme preference on mount + whenever it (or the OS
+    // preference) changes.  We deliberately do NOT observe mutations on
+    // `data-theme` — the previous implementation watched the same attribute
+    // it wrote to, which caused a feedback loop that could hang the UI when
+    // the Settings page toggled the theme.  Settings now fires a custom
+    // `pond-theme-change` event after writing localStorage, which is the
+    // single same-tab signal path.
+    useEffect(() => {
+        const readResolved = (): "light" | "dark" => {
+            const saved = localStorage.getItem("pond_theme") ?? "system";
+            if (saved === "dark") return "dark";
+            if (saved === "light") return "light";
+            return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        };
+        const applyTheme = () => {
+            const saved = localStorage.getItem("pond_theme") ?? "system";
+            if (saved === "system") {
+                if (document.documentElement.dataset.theme) {
+                    delete document.documentElement.dataset.theme;
+                }
+            } else if (document.documentElement.dataset.theme !== saved) {
+                document.documentElement.dataset.theme = saved;
+            }
+            const next = readResolved();
+            setResolvedTheme((prev) => (prev === next ? prev : next));
+        };
+        applyTheme();
+
+        const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+        const onMq = () => applyTheme();
+        mq?.addEventListener?.("change", onMq);
+        const onStorage = (e: StorageEvent) => { if (e.key === "pond_theme") applyTheme(); };
+        window.addEventListener("storage", onStorage);
+        const onCustom = () => applyTheme();
+        window.addEventListener("pond-theme-change", onCustom);
+        return () => {
+            mq?.removeEventListener?.("change", onMq);
+            window.removeEventListener("storage", onStorage);
+            window.removeEventListener("pond-theme-change", onCustom);
+        };
     }, []);
     const [token, setToken] = useState<string>(
         () => localStorage.getItem("pond_session_token") ?? ""
@@ -240,7 +284,11 @@ function App() {
             <aside className="db-sidebar">
                 {/* Logo */}
                 <div className="db-sidebar-logo">
-                    <img src={logo} alt="Goose In A Pond" className="db-sidebar-logo-img" />
+                    <img
+                        src={resolvedTheme === "dark" ? logoDark : logo}
+                        alt="Goose In A Pond"
+                        className="db-sidebar-logo-img"
+                    />
                 </div>
 
                 {/* Nav links */}

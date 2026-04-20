@@ -217,6 +217,8 @@ export default function Settings({ token }: Props) {
     } else {
       document.documentElement.dataset.theme = value
     }
+    // Notify same-tab listeners (App.tsx swaps the logo asset on this).
+    window.dispatchEvent(new Event('pond-theme-change'))
   }
 
   function handleClearActivity() {

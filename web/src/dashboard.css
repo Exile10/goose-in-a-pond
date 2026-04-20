@@ -45,7 +45,10 @@
   height: 70px;
   width: 70px;
   display: block;
-  mix-blend-mode: var(--logo-blend);
+  /* We swap asset files between themes (`logo.png` in light, `Logodark.png`
+     in dark — see App.tsx) so the logo is always visible against the
+     sidebar background.  No blend-mode needed — each PNG is pre-designed
+     for its theme, and blend modes were washing the glyph out. */
 }
 
 .db-sidebar-nav {
@@ -1444,23 +1447,69 @@
 }
 
 /* Mute toggle */
+/* Mute button — theme-aware solid pill, icon always high-contrast.
+   The SVG's `stroke="currentColor"` attribute is overridden via CSS so
+   neither `color: <system default>` nor the global `button` rule can
+   make the icon invisible. */
 .voice-orb-mute-btn {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  border: 1px solid var(--glass-border);
-  background: var(--glass-bg);
-  backdrop-filter: blur(8px);
-  color: var(--text-muted);
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  color: #111827;
+  padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
 }
-
-.voice-orb-mute-btn:hover { background: var(--surface-muted); color: var(--text-secondary); }
-.voice-orb-mute-btn.muted { color: #dc2626; }
+.voice-orb-mute-btn svg { stroke: #111827 !important; fill: none !important; }
+.voice-orb-mute-btn:hover {
+  background: #f3f4f6;
+  border-color: #9ca3af;
+}
+:root[data-theme="dark"] .voice-orb-mute-btn,
+:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn {
+  background: #1f2937;
+  border-color: #4b5563;
+  color: #f9fafb;
+}
+:root[data-theme="dark"] .voice-orb-mute-btn svg,
+:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn svg {
+  stroke: #f9fafb !important;
+}
+:root[data-theme="dark"] .voice-orb-mute-btn:hover,
+:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn:hover {
+  background: #374151;
+  border-color: #6b7280;
+}
+/* In system mode we only darken when the OS is actually dark. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .voice-orb-mute-btn {
+    background: #ffffff;
+    border-color: #d1d5db;
+    color: #111827;
+  }
+  :root:not([data-theme="dark"]) .voice-orb-mute-btn svg {
+    stroke: #111827 !important;
+  }
+}
+.voice-orb-mute-btn.muted,
+:root[data-theme="dark"] .voice-orb-mute-btn.muted,
+:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn.muted {
+  color: #ffffff;
+  background: #dc2626;
+  border-color: #b91c1c;
+}
+.voice-orb-mute-btn.muted svg,
+:root[data-theme="dark"] .voice-orb-mute-btn.muted svg,
+:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn.muted svg {
+  stroke: #ffffff !important;
+}
+.voice-orb-mute-btn.muted:hover { background: #b91c1c; }
 
 /* Transcript / response overlay */
 .voice-orb-overlay {

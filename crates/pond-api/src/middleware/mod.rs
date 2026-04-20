@@ -184,6 +184,19 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
+    // Loopback clients (the local web dashboard / dev pages served from this
+    // process) are exempted from token auth — same trust boundary as the
+    // rate limiter exemption in `lib::rate_limit_with_limiter`. Remote LAN
+    // clients still must present a Bearer token.
+    let is_loopback = req
+        .extensions()
+        .get::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false);
+    if is_loopback {
+        return Ok(next.run(req).await);
+    }
+
     let token = extract_bearer_token(&headers)?;
 
     let valid = state
