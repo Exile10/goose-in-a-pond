@@ -24,7 +24,7 @@ mcp-memory = ["dep:pond-adapters-mcp-memory"]
 # Enable in-process GGUF inference (no llamafile/Ollama subprocess required).
 # First build compiles llama-cpp-2 + candle — expect 5–15 min.
 # cargo run -p pond-server --features local-inference -- chat --provider local
-local-inference = ["dep:pond-adapters-local-inference"]
+local-inference = ["dep:pond-adapters-local-inference", "pond-api/local-inference"]
 
 [dependencies]
 # Optional: only compiled when --features goose-agent is passed.
@@ -77,3 +77,4 @@ tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 indoc      = { workspace = true }
+futures    = { workspace = true }

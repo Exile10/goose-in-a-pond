@@ -22,6 +22,9 @@ pub struct ScheduledTask {
     pub next_run: Option<DateTime<Utc>>,
     pub paused: bool,
     pub currently_running: bool,
+    /// The JSON payload stored with this task (e.g. `{"prompt": "..."}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Request payload for creating a new scheduled task.

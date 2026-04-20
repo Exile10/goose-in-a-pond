@@ -43,7 +43,7 @@ use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::services::instant_activation::InstantActivation;
 use pond_core::services::print_output::PrintOutput;
-use pond_api::AppState;
+use pond_api::{AppState, LlamafileManager};
 use pond_core::ports::agent::Agent;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
@@ -534,6 +534,61 @@ async fn run_setup(model: &str) -> Result<()> {
     Ok(())
 }
 
+// ── LlamafileManager implementation ──────────────────────────────────────────
+
+/// Manages the llamafile child process lifecycle.
+///
+/// Implements [`LlamafileManager`] so `pond-api`'s `rebuild_model_router`
+/// can start the process when the user switches to the "llamafile" provider
+/// without `pond-api` having any process-management knowledge.
+struct LlamafileManagerImpl {
+    data_dir:      std::path::PathBuf,
+    model_service: Arc<pond_core::services::model_service::ModelService>,
+    /// Holds the spawned process guard so it stays alive as long as AppState does.
+    guard: Arc<tokio::sync::Mutex<Option<llamafile_process::LlamafileProcess>>>,
+}
+
+#[async_trait::async_trait]
+impl LlamafileManager for LlamafileManagerImpl {
+    async fn ensure_started(&self, model_name: Option<&str>) -> String {
+        let base_port = crate::ports::LLAMAFILE;
+
+        // Fast path: already answering requests
+        if llamafile_process::is_running(base_port).await {
+            return llamafile_process::url_for(base_port);
+        }
+
+        // Spawn in background so the settings-save HTTP response is not delayed
+        // by the 5–30 s model-loading time.  The process guard is stored inside
+        // `LlamafileManagerImpl` (via the shared `Arc<Mutex<…>>`) so it lives
+        // for the lifetime of AppState.
+        let data_dir      = self.data_dir.clone();
+        let model_service = self.model_service.clone();
+        let model_hint    = model_name.map(|s| s.to_string());
+        let guard_arc     = Arc::clone(&self.guard);
+
+        tokio::spawn(async move {
+            // Double-check under the lock to avoid a race where two concurrent
+            // requests both reach the is_running() fast-path as false.
+            let mut guard = guard_arc.lock().await;
+            if llamafile_process::is_running(base_port).await {
+                return; // someone else already started it
+            }
+            match llamafile_process::try_start(&data_dir, model_service, model_hint.as_deref()).await {
+                Some((proc, port)) => {
+                    tracing::info!("llamafile started on port {}", port);
+                    *guard = Some(proc);
+                }
+                None => {
+                    tracing::warn!("llamafile could not be started (no model found or already running)");
+                }
+            }
+        });
+
+        llamafile_process::url_for(base_port)
+    }
+}
+
 async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str, native: bool) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
@@ -788,7 +843,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         || settings.task_provider.as_deref()  == Some("llamafile");
 
     let active_llm_name: String = settings.chat_model.clone();
-    let (_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
+    let (initial_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
         match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name)).await {
             Some((proc, port)) => (Some(proc), port),
             None => (None, ports::LLAMAFILE),
@@ -798,6 +853,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         (None, ports::LLAMAFILE)
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
+
+    // Build the LlamafileManager — holds the guard so the process stays alive and
+    // can start the process on demand when the user switches to the llamafile provider.
+    let llamafile_manager: Arc<dyn LlamafileManager> = Arc::new(LlamafileManagerImpl {
+        data_dir:      data_dir.clone(),
+        model_service: model_service.clone(),
+        guard: Arc::new(tokio::sync::Mutex::new(initial_llamafile_guard)),
+    });
 
     println!("  ────────────────────────────────────────────────────\n");
 
@@ -834,44 +897,71 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Each role (Chat / Think / Task) may use a different provider + model.
     // Token budget and temperature are baked in at startup.
     //
-    // Helper: build one Arc<dyn LlmProvider> for a given (provider, model) pair.
-    let build_provider = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+    // Async helper so we can await LocalInferenceLlmAdapter::new() for the
+    // "local" (in-process GGUF) provider without blocking the Tokio runtime.
+    async fn build_provider(
+        provider: &str,
+        model: &str,
+        llamafile_url: &str,
+        data_dir: Option<&std::path::Path>,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Arc<dyn LlmProvider> {
         match provider {
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
+
+            #[cfg(feature = "local-inference")]
             "local" => {
-                // Local GGUF inference is managed by GooseAdapter, which hot-swaps providers
-                // from settings on every turn. The server's llm_provider field is only used by
-                // legacy non-Goose API paths. Use llamafile as a stand-in — it won't be called
-                // during normal production operation when GooseAdapter is active.
-                tracing::info!(
-                    "chat_provider=local: GooseAdapter handles GGUF inference; \
-                     server llm_provider defaults to llamafile for non-Goose paths"
-                );
-                Arc::new(
-                    LlamafileProvider::new(Some(&llamafile_url))
-                        .with_max_tokens(settings.llm_max_tokens)
-                        .with_temperature(settings.llm_temperature),
-                ) as Arc<dyn LlmProvider>
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                tracing::info!("Building LocalInferenceLlmAdapter for model: {}", model);
+                let result = match data_dir {
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
+                    None      => LocalInferenceLlmAdapter::new(model).await,
+                };
+                match result {
+                    Ok(adapter) => {
+                        tracing::info!("LocalInferenceLlmAdapter ready for '{}'", model);
+                        Arc::new(adapter) as Arc<dyn LlmProvider>
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
+                             falling back to llamafile",
+                            model, e
+                        );
+                        Arc::new(LlamafileProvider::new(Some(llamafile_url))
+                            .with_max_tokens(max_tokens)
+                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                    }
+                }
             }
+
             _ => Arc::new(
                 // Default: llamafile (covers "llamafile" and unknown provider values)
-                LlamafileProvider::new(Some(&llamafile_url))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                LlamafileProvider::new(Some(llamafile_url))
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
         }
-    };
+    }
 
-    let chat_provider_arc = build_provider(&effective_chat_provider, &effective_chat_model);
+    let data_dir_ref = Some(data_dir.as_path());
+    let max_tokens   = settings.llm_max_tokens;
+    let temperature  = settings.llm_temperature;
+
+    let chat_provider_arc = build_provider(
+        &effective_chat_provider, &effective_chat_model,
+        &llamafile_url, data_dir_ref, max_tokens, temperature,
+    ).await;
 
     // Think role: reuse chat Arc if not separately configured.
     let think_provider_arc: Arc<dyn LlmProvider> =
         if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-            build_provider(tp, tm)
+            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
         } else {
             chat_provider_arc.clone()
         };
@@ -879,7 +969,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Task role: reuse chat Arc if not separately configured.
     let task_provider_arc: Arc<dyn LlmProvider> =
         if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-            build_provider(tp, tm)
+            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
         } else {
             chat_provider_arc.clone()
         };
@@ -1087,6 +1177,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         prompt_extra_repo: Some(prompt_extra_repo),
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
+        llamafile_manager: Some(llamafile_manager),
     });
 
     // Warn if static assets haven't been built yet

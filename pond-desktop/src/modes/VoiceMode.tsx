@@ -7,13 +7,13 @@ import { useAppState, useAppDispatch } from "../state/AppContext";
 import { AudioWaves } from "../components/AudioWaves";
 import { TranscriptFeed } from "../components/TranscriptFeed";
 import { resolveVoiceDecision } from "../voiceSummon";
-import { nextTranscriptId } from "../state/reducer";
 import { api } from "../api/PondApiClient";
 
 // ── State colours ────────────────────────────────────────────
 const STATE_COLORS: Record<string, string> = {
   idle:      "#8E8E93",
-  recording: "#8C52FF",
+  wait:      "#8C4BFF",  // dim brand purple — passive wake-word watch
+  recording: "#8C4BFF",
   thinking:  "#FF9500",
   speaking:  "#34C759",
   error:     "#FF3B30",
@@ -21,6 +21,7 @@ const STATE_COLORS: Record<string, string> = {
 
 const STATE_LABELS: Record<string, string> = {
   idle:      "Ready",
+  wait:      "Waiting…",
   recording: "Listening…",
   thinking:  "Thinking…",
   speaking:  "Speaking…",
@@ -69,6 +70,23 @@ export function VoiceMode() {
   const [audioLevel, setAudioLevel] = useState(0);
   const audioLevelRef = useRef(0);
   const voiceHandledRef = useRef(0);
+  const prevVoiceStateRef = useRef(state.voiceState);
+
+  // Live refs to the latest startRecording / stopAndSend so that the
+  // wake-word listener (registered once at mount) always calls the
+  // current version of these functions — avoiding stale-closure bugs
+  // where maxSecs or sessionToken captured at mount are outdated.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const startRecordingRef = useRef<() => Promise<void>>(async () => {});
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const stopAndSendRef = useRef<() => Promise<void>>(async () => {});
+
+  // Always keep refs pointing at the current render's versions.
+  // (Must be assigned in the render body, before any effects run.)
+  // These are updated below after the functions are defined.
+
+  // Active wake word (shown in the wait state UI)
+  const [wakeWord, setWakeWord] = useState("");
 
   // Auto-stop timer
   const [maxSecs, setMaxSecs] = useState(30);
@@ -92,8 +110,10 @@ export function VoiceMode() {
       .catch(() => undefined);
   }, []);
 
-  // Track audio levels
+  // Track audio levels (Tauri only — listen() crashes in browser env)
   useEffect(() => {
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!isTauri) return;
     let unlisten: (() => void) | null = null;
     listen<number>("audio-level", (e) => {
       audioLevelRef.current = e.payload;
@@ -101,6 +121,86 @@ export function VoiceMode() {
     }).then((u) => { unlisten = u; });
     return () => { unlisten?.(); };
   }, []);
+
+  // ── Wake word listener ───────────────────────────────────────
+  // On mount: load wake word setting and start passive listening loop if configured.
+  useEffect(() => {
+    let wakeUnlisten: (() => void) | null = null;
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+    api.getSettings()
+      .then(async (s) => {
+        const wakeWord = (s as Record<string, unknown>).voice_wake_word;
+        if (!wakeWord || typeof wakeWord !== "string" || !wakeWord.trim()) return;
+
+        setWakeWord(wakeWord.trim());
+
+        // Enter wait state and start the passive listener
+        dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+        if (isTauri) {
+          try {
+            await invoke("start_wake_listener", { wakeWord: wakeWord.trim() });
+          } catch (e) {
+            // Most likely cause: microphone permission denied on macOS.
+            // Show the error so the user knows why it's silent.
+            const msg = String(e);
+            const isMicDenied =
+              msg.toLowerCase().includes("permission") ||
+              msg.toLowerCase().includes("access") ||
+              msg.toLowerCase().includes("device") ||
+              msg.toLowerCase().includes("denied");
+
+            dispatch({
+              type: "SET_VOICE_ERROR",
+              payload: isMicDenied
+                ? "Microphone access denied. Go to System Settings → Privacy → Microphone and allow this app."
+                : `Wake listener failed: ${msg}`,
+            });
+            dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+            return; // don't register the listener if the backend failed
+          }
+
+          // Listen for wake word detection → hand off to record.
+          wakeUnlisten = await listen("wake-word-detected", () => {
+            invoke("stop_wake_listener").catch(() => undefined);
+            startRecordingRef.current();
+          });
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      // Teardown: stop passive listener and return to idle
+      wakeUnlisten?.();
+      if (isTauri) {
+        invoke("stop_wake_listener").catch(() => undefined);
+      }
+      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Speak → Wait loop closure ────────────────────────────────
+  // After the pipeline finishes (speaking/error → idle), restart the passive
+  // wake listener so the cycle completes: wait → listen → think → speak → wait
+  useEffect(() => {
+    const prev = prevVoiceStateRef.current;
+    prevVoiceStateRef.current = state.voiceState;
+
+    if (state.voiceState === "idle" && (prev === "speaking" || prev === "error")) {
+      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      api.getSettings()
+        .then(async (s) => {
+          const ww = (s as Record<string, unknown>).voice_wake_word;
+          if (!ww || typeof ww !== "string" || !ww.trim()) return;
+          setWakeWord(ww.trim());
+          dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+          if (isTauri) {
+            await invoke("start_wake_listener", { wakeWord: ww.trim() }).catch(() => undefined);
+          }
+        })
+        .catch(() => undefined);
+    }
+  }, [state.voiceState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Clear countdown timers
   const clearTimers = useCallback(() => {
@@ -141,14 +241,16 @@ export function VoiceMode() {
       isProcessing: state.voiceState === "thinking" || state.voiceState === "speaking",
     });
 
-    if (decision === "start-recording") startRecording();
-    else if (decision === "stop-and-send") stopAndSend();
+    if (decision === "start-recording") startRecordingRef.current();
+    else if (decision === "stop-and-send") stopAndSendRef.current();
   }, [state.voiceRequestId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function startRecording() {
     try {
       await invoke("start_recording");
-      startCountdown(maxSecs, stopAndSend);
+      // Use a ref-wrapped callback so stopAndSend is always the latest version
+      // even when called from the countdown timer set up here.
+      startCountdown(maxSecs, () => stopAndSendRef.current());
     } catch (e) {
       console.error("start_recording failed:", e);
     }
@@ -159,6 +261,8 @@ export function VoiceMode() {
     try {
       dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
       const wavBytes = await invoke<number[]>("stop_recording");
+      // Read directly from state — this function is always the latest render's
+      // version (kept alive via stopAndSendRef), so state is never stale here.
       const authToken = state.sessionToken ?? "";
       const sessionId = state.sessionId ?? undefined;
       await invoke("run_voice_pipeline", { wavBytes, authToken, sessionId });
@@ -169,10 +273,26 @@ export function VoiceMode() {
     }
   }
 
+  // Sync live refs — runs on every render so the wake listener always calls
+  // the most up-to-date versions of these functions.
+  startRecordingRef.current = startRecording;
+  stopAndSendRef.current = stopAndSend;
+
   async function abortRecording() {
     clearTimers();
     try {
       await invoke("abort_recording");
+      // Return to "wait" if the wake listener is active, otherwise "idle"
+      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      if (isTauri) {
+        const s = await api.getSettings().catch(() => ({}));
+        const wakeWord = (s as Record<string, unknown>).voice_wake_word;
+        if (wakeWord && typeof wakeWord === "string" && wakeWord.trim()) {
+          await invoke("start_wake_listener", { wakeWord: wakeWord.trim() }).catch(() => undefined);
+          dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+          return;
+        }
+      }
       dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
     } catch { /* ignore */ }
   }
@@ -191,6 +311,7 @@ export function VoiceMode() {
   const isThinking  = voiceState === "thinking";
   const isSpeaking  = voiceState === "speaking";
   const isIdle      = voiceState === "idle";
+  const isWaiting   = voiceState === "wait";
   const isError     = voiceState === "error";
   const serverDown  = !state.serverOnline;
   const stateColor  = STATE_COLORS[voiceState] ?? "#8E8E93";
@@ -261,6 +382,25 @@ export function VoiceMode() {
           </Button>
         )}
 
+        {isWaiting && (
+          <div style={styles.waitRow}>
+            <span style={styles.waitIndicator} aria-label="wake word active">
+              <span style={styles.waitPulse} />
+              Listening for &ldquo;{wakeWord}&rdquo;
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onPress={startRecording}
+              isDisabled={serverDown}
+              style={styles.recordNowBtn}
+            >
+              <Mic size={13} />
+              Record now
+            </Button>
+          </div>
+        )}
+
         {isRecording && (
           <div style={styles.recordingRow}>
             <CountdownRing seconds={secsLeft} maxSeconds={maxSecs} />
@@ -301,15 +441,32 @@ export function VoiceMode() {
         )}
 
         {isError && (
-          <Button
-            variant="ghost"
-            onPress={() => {
-              dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-              dispatch({ type: "SET_VOICE_ERROR", payload: null });
-            }}
-          >
-            Dismiss
-          </Button>
+          <div style={styles.errorRow}>
+            {state.voiceError?.includes("Microphone access denied") && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onPress={() => {
+                  const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+                  if (isTauri) {
+                    invoke("open_privacy_mic").catch(() => undefined);
+                  }
+                }}
+                style={styles.openSettingsBtn}
+              >
+                Open Privacy Settings
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              onPress={() => {
+                dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+                dispatch({ type: "SET_VOICE_ERROR", payload: null });
+              }}
+            >
+              Dismiss
+            </Button>
+          </div>
         )}
 
         <p style={styles.hint}>
@@ -422,6 +579,34 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "12px",
     color: "var(--color-text-secondary)",
   },
+  waitRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+  },
+  waitIndicator: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "13px",
+    color: "#8C4BFF",
+    fontWeight: 500,
+  },
+  waitPulse: {
+    width: "8px",
+    height: "8px",
+    borderRadius: "50%",
+    background: "#8C4BFF",
+    flexShrink: 0,
+    animation: "pulse 1.4s ease infinite",
+  },
+  recordNowBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "4px",
+    fontSize: "12px",
+    color: "var(--color-text-secondary)",
+  },
   busyRow: {
     display: "flex",
     alignItems: "center",
@@ -438,6 +623,16 @@ const styles: Record<string, React.CSSProperties> = {
   },
   interruptBtn: {
     color: "var(--color-text-secondary)",
+  },
+  errorRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+  },
+  openSettingsBtn: {
+    fontSize: "12px",
+    color: "#FF3B30",
+    borderColor: "rgba(255,59,48,0.3)",
   },
 
   hint: {

@@ -19,6 +19,19 @@ pub fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// Open macOS System Settings → Privacy → Microphone so the user can grant access.
+#[tauri::command]
+pub fn open_privacy_mic() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Re-register the global canvas hotkey with a new key combination.
 /// The string format is the same as the default: e.g. "CmdOrCtrl+Shift+G".
 #[tauri::command]

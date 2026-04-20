@@ -4,12 +4,13 @@
    ============================================================================= */
 
 /* ── Font Imports (offline-first via fontsource) ───────────── */
+@import "@fontsource-variable/quicksand";
+@import "@fontsource-variable/comfortaa";
+@import "@fontsource/jetbrains-mono/400.css";
+/* Inter kept for HeroUI component library compatibility */
 @import "@fontsource/inter/400.css";
 @import "@fontsource/inter/500.css";
 @import "@fontsource/inter/600.css";
-@import "@fontsource/quicksand/600.css";
-@import "@fontsource/quicksand/700.css";
-@import "@fontsource/jetbrains-mono/400.css";
 
 /* ── Reset ──────────────────────────────────────────────────── */
 *,

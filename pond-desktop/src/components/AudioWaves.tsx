@@ -4,7 +4,8 @@ import type { VoiceState } from "../state/reducer";
 // ── Palette ────────────────────────────────────────────────────
 const COLORS: Record<VoiceState, string> = {
   idle:      "#8E8E93",
-  recording: "#8C52FF",
+  wait:      "#8C4BFF",
+  recording: "#8C4BFF",
   thinking:  "#FF9500",
   speaking:  "#34C759",
   error:     "#FF3B30",
@@ -22,6 +23,7 @@ const MAX_H_RATIO = 0.88; // maximum bar height as fraction of canvas height
 // Per-state phase increment per frame
 const PHASE_STEP: Record<VoiceState, number> = {
   idle:      0.018,
+  wait:      0.012,  // slower than idle — barely-breathing passive state
   recording: 0.05,
   thinking:  0.065,
   speaking:  0.042,
@@ -100,6 +102,12 @@ export function AudioWaves({ state, audioLevel, size = "lg", style }: AudioWaves
         const centerWeight = 1 - Math.abs(norm) * 0.4; // center bars are taller
 
         switch (state) {
+          case "wait": {
+            // Near-static breath — much slower and shallower than idle
+            const breath = Math.sin(phase + (i / n) * Math.PI) * 0.5 + 0.5;
+            heightFraction = Math.min(0.40, (0.08 + breath * 0.18) * centerWeight);
+            break;
+          }
           case "idle": {
             // Gentle breathing: all bars follow a slow sine, phase offset by position
             const breath = Math.sin(phase + (i / n) * Math.PI) * 0.5 + 0.5;
