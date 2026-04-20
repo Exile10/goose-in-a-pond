@@ -24,7 +24,7 @@ use image::GenericImageView;
 use ndarray::Array4;
 use ort::session::Session;
 use ort::value::Tensor;
-use pond_core::domain::face_recognition::BoundingBox;
+use pond_core::domain::face_recognition::{BoundingBox, DetectedFace};
 use pond_core::ports::face_detector::FaceDetector;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -105,7 +105,7 @@ impl UltraFaceDetector {
 
 #[async_trait]
 impl FaceDetector for UltraFaceDetector {
-    async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<BoundingBox>> {
+    async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
         let bytes = image_bytes.to_vec();
         let session = Arc::clone(&self.session);
         let score_thresh = self.score_thresh;
@@ -113,7 +113,7 @@ impl FaceDetector for UltraFaceDetector {
         let this_input = (self.input_w, self.input_h);
 
         // ONNX inference is CPU-bound — offload to a blocking thread.
-        let res = tokio::task::spawn_blocking(move || -> Result<Option<BoundingBox>> {
+        let res = tokio::task::spawn_blocking(move || -> Result<Option<DetectedFace>> {
             // Preprocess inside the blocking thread so image decode doesn't
             // hog the async runtime.
             let det = UltraFaceDetector {
@@ -201,18 +201,24 @@ impl FaceDetector for UltraFaceDetector {
             }
 
             // Return the highest-scoring remaining box, rescaled to the
-            // original image's pixel coordinates.
+            // original image's pixel coordinates.  UltraFace does not emit
+            // landmarks, so the embedding stage will fall back to the
+            // crop-and-resize path (no similarity-warp alignment).
             let top = kept.first().copied();
-            Ok(top.map(|([x1, y1, x2, y2], _)| {
+            Ok(top.map(|([x1, y1, x2, y2], score)| {
                 let px1 = (x1 * orig_w as f32).round().clamp(0.0, orig_w as f32 - 1.0) as u32;
                 let py1 = (y1 * orig_h as f32).round().clamp(0.0, orig_h as f32 - 1.0) as u32;
                 let px2 = (x2 * orig_w as f32).round().clamp(0.0, orig_w as f32) as u32;
                 let py2 = (y2 * orig_h as f32).round().clamp(0.0, orig_h as f32) as u32;
-                BoundingBox {
-                    x:      px1,
-                    y:      py1,
-                    width:  px2.saturating_sub(px1),
-                    height: py2.saturating_sub(py1),
+                DetectedFace {
+                    bbox: BoundingBox {
+                        x:      px1,
+                        y:      py1,
+                        width:  px2.saturating_sub(px1),
+                        height: py2.saturating_sub(py1),
+                    },
+                    landmarks: None,
+                    score,
                 }
             }))
         })
