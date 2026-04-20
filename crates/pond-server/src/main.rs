@@ -536,36 +536,44 @@ struct LlamafileManagerImpl {
     model_service: Arc<pond_core::services::model_service::ModelService>,
     /// Holds the spawned process guard so it stays alive as long as AppState does.
     guard: Arc<tokio::sync::Mutex<Option<llamafile_process::LlamafileProcess>>>,
+    /// The port the process actually bound to.
+    /// Initialised from the port returned by the startup `try_start` call, or the
+    /// base port as a fallback.  Updated by the background spawn task when
+    /// `ensure_started` starts a new process on a non-base port.
+    actual_port: Arc<std::sync::atomic::AtomicU16>,
 }
 
 #[async_trait::async_trait]
 impl LlamafileManager for LlamafileManagerImpl {
     async fn ensure_started(&self, model_name: Option<&str>) -> String {
-        let base_port = crate::ports::LLAMAFILE;
+        let effective = self.effective_port();
 
         // Fast path: already answering requests
-        if llamafile_process::is_running(base_port).await {
-            return llamafile_process::url_for(base_port);
+        if llamafile_process::is_running(effective).await {
+            return llamafile_process::url_for(effective);
         }
 
         // Spawn in background so the settings-save HTTP response is not delayed
         // by the 5–30 s model-loading time.  The process guard is stored inside
         // `LlamafileManagerImpl` (via the shared `Arc<Mutex<…>>`) so it lives
         // for the lifetime of AppState.
-        let data_dir      = self.data_dir.clone();
-        let model_service = self.model_service.clone();
-        let model_hint    = model_name.map(|s| s.to_string());
-        let guard_arc     = Arc::clone(&self.guard);
+        let data_dir       = self.data_dir.clone();
+        let model_service  = self.model_service.clone();
+        let model_hint     = model_name.map(|s| s.to_string());
+        let guard_arc      = Arc::clone(&self.guard);
+        let actual_port_arc = Arc::clone(&self.actual_port);
 
         tokio::spawn(async move {
             // Double-check under the lock to avoid a race where two concurrent
             // requests both reach the is_running() fast-path as false.
             let mut guard = guard_arc.lock().await;
-            if llamafile_process::is_running(base_port).await {
+            let cur = actual_port_arc.load(std::sync::atomic::Ordering::Acquire);
+            if llamafile_process::is_running(cur).await {
                 return; // someone else already started it
             }
             match llamafile_process::try_start(&data_dir, model_service, model_hint.as_deref()).await {
                 Some((proc, port)) => {
+                    actual_port_arc.store(port, std::sync::atomic::Ordering::Release);
                     tracing::info!("llamafile started on port {}", port);
                     *guard = Some(proc);
                 }
@@ -575,11 +583,11 @@ impl LlamafileManager for LlamafileManagerImpl {
             }
         });
 
-        llamafile_process::url_for(base_port)
+        llamafile_process::url_for(effective)
     }
 
     async fn is_running(&self) -> bool {
-        llamafile_process::is_running(crate::ports::LLAMAFILE).await
+        llamafile_process::is_running(self.effective_port()).await
     }
 
     async fn ensure_started_and_wait(
@@ -587,27 +595,52 @@ impl LlamafileManager for LlamafileManagerImpl {
         model_name: Option<&str>,
         timeout_secs: u64,
     ) -> (String, bool) {
-        let base_port = crate::ports::LLAMAFILE;
-        let url = llamafile_process::url_for(base_port);
+        let port = self.effective_port();
+        let url  = llamafile_process::url_for(port);
 
         // Fast path: already running
-        if llamafile_process::is_running(base_port).await {
+        if llamafile_process::is_running(port).await {
             return (url, true);
         }
 
         // Kick off background startup (reuses existing spawn+lock logic)
         self.ensure_started(model_name).await;
 
-        // Poll until ready or timeout
+        // Poll until ready or timeout, re-reading actual_port each iteration
+        // in case a just-started process chose a different port.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(timeout_secs);
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if llamafile_process::is_running(base_port).await {
-                return (url, true);
+            let cur_port = self.effective_port();
+            if llamafile_process::is_running(cur_port).await {
+                return (llamafile_process::url_for(cur_port), true);
             }
         }
-        (url, false)
+        (llamafile_process::url_for(self.effective_port()), false)
+    }
+}
+
+impl LlamafileManagerImpl {
+    /// Construct the manager, seeding `actual_port` with the port chosen at
+    /// initial startup (or the base port if the process was not started yet).
+    fn new(
+        data_dir: std::path::PathBuf,
+        model_service: Arc<pond_core::services::model_service::ModelService>,
+        initial_guard: Option<llamafile_process::LlamafileProcess>,
+        initial_port: u16,
+    ) -> Self {
+        Self {
+            data_dir,
+            model_service,
+            guard: Arc::new(tokio::sync::Mutex::new(initial_guard)),
+            actual_port: Arc::new(std::sync::atomic::AtomicU16::new(initial_port)),
+        }
+    }
+
+    /// Return the port the llamafile process is (or should be) listening on.
+    fn effective_port(&self) -> u16 {
+        self.actual_port.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -837,11 +870,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // Build the LlamafileManager — holds the guard so the process stays alive and
     // can start the process on demand when the user switches to the llamafile provider.
-    let llamafile_manager: Arc<dyn LlamafileManager> = Arc::new(LlamafileManagerImpl {
-        data_dir:      data_dir.clone(),
-        model_service: model_service.clone(),
-        guard: Arc::new(tokio::sync::Mutex::new(initial_llamafile_guard)),
-    });
+    let llamafile_manager: Arc<dyn LlamafileManager> = Arc::new(LlamafileManagerImpl::new(
+        data_dir.clone(),
+        model_service.clone(),
+        initial_llamafile_guard,
+        llamafile_port,
+    ));
 
     println!("  ────────────────────────────────────────────────────\n");
 
