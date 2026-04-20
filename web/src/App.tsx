@@ -11,8 +11,9 @@ import Models from "./pages/Models";
 import Agent from "./pages/Agent";
 import Prompts from "./pages/Prompts";
 import Onboarding from "./pages/Onboarding";
-import VoiceOrb from "./components/VoiceOrb";
+import LoggedOut from "./pages/LoggedOut";
 import logo from "./assets/logo.png";
+import logoDark from "./assets/Logodark.png";
 import "./dashboard.css";
 
 type Page = "chat" | "devices" | "activity" | "status" | "settings" | "schedules" | "models" | "agent" | "prompts";
@@ -143,6 +144,7 @@ function App() {
     const [onboarded, setOnboarded] = useState<boolean | null>(
         () => localStorage.getItem("pond_session_token") ? true : null
     );
+    const [loggedOut, setLoggedOut] = useState(false);
     const [menuOpen, setMenuOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
 
@@ -168,6 +170,10 @@ function App() {
             if (res.accepted && res.session_token) {
                 localStorage.setItem("pond_session_token", res.session_token);
                 setToken(res.session_token);
+                const settings = await api.getSettings(res.session_token);
+                const name = settings.user_name ?? "";
+                localStorage.setItem("pond_display_name", name);
+                setDisplayName(name);
                 setOnboarded(true);
             } else {
                 setOnboarded(false);
@@ -197,10 +203,53 @@ function App() {
     function handleSignOut() {
         localStorage.removeItem("pond_session_token");
         localStorage.removeItem("pond_display_name");
-        localStorage.removeItem("pond_client_id");
         setToken("");
         setDisplayName("");
         setMenuOpen(false);
+        setLoggedOut(true);
+    }
+
+    // Listen for 401s fired by api.ts and treat them as a sign-out
+    useEffect(() => {
+        const handler = () => handleSignOut();
+        window.addEventListener('pond-unauthorized', handler);
+        return () => window.removeEventListener('pond-unauthorized', handler);
+    }, []);
+
+    // Re-handshake using the stored client ID, then verify onboarding status.
+    // If the backend DB was wiped and re-initialized, the pond may not be onboarded
+    // yet — in that case redirect to the wizard instead of the dashboard.
+    const handleReconnect = useCallback(async () => {
+        let clientId = localStorage.getItem("pond_client_id") ?? "";
+        if (!clientId) {
+            clientId = typeof crypto.randomUUID === "function"
+                ? crypto.randomUUID()
+                : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+            localStorage.setItem("pond_client_id", clientId);
+        }
+        const res = await api.handshake({ client_id: clientId, client_type: "web", client_version: "1.0.0" });
+        if (res.accepted && res.session_token) {
+            localStorage.setItem("pond_session_token", res.session_token);
+            setToken(res.session_token);
+            setLoggedOut(false);
+            const status = await api.onboardingStatus();
+            if (!status.onboarded) {
+                setOnboarded(false);
+            } else {
+                const settings = await api.getSettings(res.session_token);
+                const name = settings.user_name ?? "";
+                localStorage.setItem("pond_display_name", name);
+                setDisplayName(name);
+                setOnboarded(true);
+                setPage("chat");
+            }
+        } else {
+            throw new Error(res.rejection_reason ?? "Handshake rejected");
+        }
+    }, []);
+
+    if (loggedOut) {
+        return <LoggedOut onSignIn={handleReconnect} />;
     }
 
     if (onboarded === null) {
@@ -215,6 +264,7 @@ function App() {
     if (!onboarded) {
         return (
             <Onboarding onComplete={(t, name) => {
+                localStorage.setItem("pond_display_name", name);
                 setToken(t);
                 setDisplayName(name);
                 setOnboarded(true);
@@ -229,7 +279,10 @@ function App() {
             <aside className="db-sidebar">
                 {/* Logo */}
                 <div className="db-sidebar-logo">
-                    <img src={logo} alt="Goose In A Pond" className="db-sidebar-logo-img" />
+                    {/* Light logo — hidden in dark mode */}
+                    <img src={logo}     alt="Goose In A Pond" className="db-sidebar-logo-img db-logo-light" />
+                    {/* Dark logo — hidden in light mode */}
+                    <img src={logoDark} alt="Goose In A Pond" className="db-sidebar-logo-img db-logo-dark" />
                 </div>
 
                 {/* Nav links */}
@@ -278,8 +331,7 @@ function App() {
                 {page === "prompts"   && <Prompts token={token} />}
             </main>
 
-            {/* Voice orb — always accessible regardless of page */}
-            <VoiceOrb token={token} />
+
         </div>
         </SettingsProvider>
     );
