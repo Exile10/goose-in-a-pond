@@ -204,7 +204,7 @@ cargo run -p pond-server
 | `LlmProvider` | `ChatMessage`, `Role` | `MockProvider`, `FallbackProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `LocalInferenceProvider` |
 | `SessionStorage` | `ChatSession`, `ChatMessage` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra), `GooseSessionAdapter` (pond-adapters-goose) |
 | `VoiceInput` | — | `StdinInput` | `WhisperInput` (pond-adapters-whisper) |
-| `VoiceOutput` | — | `PrintOutput` | `PiperOutput` (pond-adapters-piper), `QwenTtsOutput` (pond-adapters-qwen-tts) |
+| `VoiceOutput` | — | `PrintOutput` | `PiperOutput` (pond-adapters-piper) |
 | `WakeWordDetector` | — | `InstantActivation` | `WhisperKeywordDetector` (pond-adapters-whisper) |
 | `OnboardingRepository` | `OnboardingStep` | *(inline in tests)* | `SqlxOnboardingRepository` (pond-infra) |
 | `DeviceRegistry` | `Device`, `RegisterDeviceRequest` | *(inline in tests)* | `SqliteDeviceRegistry` (pond-infra) |

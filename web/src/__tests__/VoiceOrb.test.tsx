@@ -1,20 +1,47 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import VoiceOrb from '../components/VoiceOrb'
-import { mockSpeak, mockCancel } from '../test-setup'
 
 const TOKEN = 'test-token'
 
-function mockTranscribeAndChat(transcript: string, reply: string) {
-  vi.spyOn(globalThis, 'fetch')
+function mockSseResponse(events: Array<Record<string, unknown>>): Response {
+  const payload = events.map((ev) => `data: ${JSON.stringify(ev)}\n`).join('')
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(payload))
+      controller.close()
+    },
+  })
+  return { ok: true, body } as unknown as Response
+}
+
+function mockChatStreamResponse(sessionId: string, text: string): Response {
+  return mockSseResponse([
+    { type: 'text', content: text, token: text },
+    { done: true, session_id: sessionId, model_role: 'chat' },
+  ])
+}
+
+function mockTtsResponse(): Response {
+  return {
+    ok: true,
+    blob: () => Promise.resolve(new Blob(['wav'], { type: 'audio/wav' })),
+  } as unknown as Response
+}
+
+function mockTranscribeAndChat(transcript: string, reply: string, withTts = false) {
+  const fetchSpy = vi.spyOn(globalThis, 'fetch')
     .mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({ text: transcript }),
     } as Response)
-    .mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ session_id: 'sess-1', response: reply }),
-    } as Response)
+    .mockResolvedValueOnce(mockChatStreamResponse('sess-1', reply))
+
+  if (withTts) {
+    fetchSpy.mockResolvedValueOnce(mockTtsResponse())
+  }
+
+  return fetchSpy
 }
 
 beforeEach(() => {
@@ -51,7 +78,24 @@ describe('VoiceOrb mute toggle', () => {
 
   it('cancels speech if muted while speaking', async () => {
     localStorage.setItem('pond_tts_muted', 'false')
-    mockTranscribeAndChat('hello', 'hi there')
+    const pauseSpy = vi.fn()
+    const playSpy = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('Audio', vi.fn(() => ({
+      play: playSpy,
+      pause: pauseSpy,
+      onended: null,
+      onerror: null,
+    })) as unknown as typeof Audio)
+    Object.defineProperty(URL, 'createObjectURL', {
+      value: vi.fn(() => 'blob:voice'),
+      configurable: true,
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      value: vi.fn(() => {}),
+      configurable: true,
+    })
+
+    mockTranscribeAndChat('hello', 'hi there', true)
     render(<VoiceOrb token={TOKEN} />)
 
     // Start listening
@@ -71,9 +115,10 @@ describe('VoiceOrb mute toggle', () => {
       expect(screen.getByLabelText('Speaking…')).toBeTruthy()
     }, { timeout: 2000 })
 
-    // Mute while in speak state — should cancel speech synthesis
+    // Mute while in speak state — should cancel current audio playback
     fireEvent.click(screen.getByLabelText('Mute voice output'))
-    expect(mockCancel).toHaveBeenCalled()
+    expect(pauseSpy).toHaveBeenCalled()
+    expect(screen.getByLabelText('Tap to speak')).toBeTruthy()
   })
 })
 
@@ -146,16 +191,24 @@ describe('VoiceOrb error handling', () => {
 describe('VoiceOrb full loop muted', () => {
   it('completes listen→think→wait without speaking when muted', async () => {
     localStorage.setItem('pond_tts_muted', 'true')
-    mockTranscribeAndChat('turn on lights', 'Done, lights on.')
+    const fetchSpy = mockTranscribeAndChat('turn on lights', 'Done, lights on.')
     render(<VoiceOrb token={TOKEN} />)
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Tap to speak'))
-      await new Promise(r => setTimeout(r, 200))
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Listening…'))
+      await new Promise(r => setTimeout(r, 120))
     })
 
     await waitFor(() => {
-      expect(mockSpeak).not.toHaveBeenCalled()
+      expect(screen.getByLabelText('Tap to speak')).toBeTruthy()
     }, { timeout: 2000 })
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).includes('/api/v1/tts'))).toBe(false)
   })
 })

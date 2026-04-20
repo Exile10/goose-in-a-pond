@@ -386,7 +386,7 @@ sqlite3 "$DATA_DIR/pond_system.db" "SELECT id, downloaded FROM models ORDER BY i
 | Listen (Whisper ASR) | Done | `cargo run -- chat --input whisper` |
 | Data pipeline (P1–P4) | Done | `cargo test -p pond-core -- context_budget` |
 | Wait (Wake word) | Done | `cargo run -- chat --input whisper` (says "goose") |
-| Speak (TTS — Piper + Qwen) | Done | `cargo run -- chat --tts piper` |
+| Speak (TTS — Piper) | Done | `cargo run -- chat --tts piper` |
 | Model catalog + roles (DB-driven) | Done | `cargo test -p pond-api --test model_integration_test` |
 | Goose agent + MCP extensions | Done | `cargo run -- serve` + trigger agent |
 | Deployment (Jetson ARM64) | Pending | — |

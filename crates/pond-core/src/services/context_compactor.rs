@@ -3,9 +3,9 @@
 //! When conversation history grows large, `trim_to_budget` simply drops the
 //! oldest messages.  `ContextCompactor` does something smarter: once the
 //! history approaches `threshold` (default 80%) of the model's context limit
-//! it asks the LLM to write a concise summary of the oldest 75% of messages,
-//! then splices that summary back as a single `User` message, keeping only the
-//! most recent 25% verbatim.
+//! it asks the LLM to write a concise summary of older messages, then splices
+//! that summary back as a single `User` message while preserving the most
+//! recent messages verbatim.
 //!
 //! If the LLM call fails for any reason, `compact` falls back to
 //! `trim_to_budget` so the chat loop is never interrupted.
@@ -17,6 +17,7 @@ use anyhow::Result;
 
 /// 4 characters per token is a common heuristic for English text.
 const CHARS_PER_TOKEN: usize = 4;
+const KEEP_RECENT_MESSAGES: usize = 6;
 
 pub struct ContextCompactor {
     /// Fraction of the usable history budget that triggers compaction.
@@ -48,7 +49,7 @@ impl ContextCompactor {
         estimated_tokens as f64 / self.context_limit_tokens as f64 >= self.threshold
     }
 
-    /// Compact history by LLM-summarising the oldest 75% of messages.
+    /// Compact history by LLM-summarising older messages.
     ///
     /// Returns messages in chronological (oldest-first) order, ready to pass
     /// directly to `LlmProvider::complete()`.
@@ -59,13 +60,11 @@ impl ContextCompactor {
         provider: &dyn LlmProvider,
         messages: Vec<ChatMessage>,
     ) -> Vec<ChatMessage> {
-        if messages.is_empty() {
+        if messages.is_empty() || !self.needs_compaction(&messages) {
             return messages;
         }
 
-        // Keep the newest 25% verbatim; summarise the rest.
-        let keep_count = (messages.len() as f64 * 0.25).ceil() as usize;
-        let keep_count = keep_count.max(1);
+        let keep_count = messages.len().min(KEEP_RECENT_MESSAGES).max(1);
 
         let split = if messages.len() > keep_count {
             messages.len() - keep_count
@@ -127,10 +126,48 @@ async fn summarise(provider: &dyn LlmProvider, messages: &[ChatMessage]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::provider::LlmProvider;
     use crate::services::context_budget::USABLE_HISTORY_CHARS;
+    use async_trait::async_trait;
+
+    struct StubProvider {
+        summary: String,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StubProvider {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _messages: Vec<ChatMessage>,
+        ) -> anyhow::Result<ChatMessage> {
+            if self.fail {
+                Err(anyhow::anyhow!("forced failure"))
+            } else {
+                Ok(ChatMessage {
+                    role: Role::Assistant,
+                    content: self.summary.clone(),
+                })
+            }
+        }
+
+        fn model_name(&self) -> String {
+            "stub".to_string()
+        }
+    }
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage { role, content: content.to_string() }
+    }
+
+    fn big_history(count: usize, payload_len: usize) -> Vec<ChatMessage> {
+        (0..count)
+            .map(|i| {
+                let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+                msg(role, &format!("m{}:{}", i, "x".repeat(payload_len)))
+            })
+            .collect()
     }
 
     #[test]
@@ -149,27 +186,66 @@ mod tests {
         assert!(compactor.needs_compaction(&messages));
     }
 
-    #[test]
-    fn compact_returns_unchanged_when_empty() {
-        // Synchronous check — compact with empty vec stays empty
+    #[tokio::test]
+    async fn compress_noop_when_within_budget() {
         let compactor = ContextCompactor::default();
-        // We can't easily test the async path without a mock provider here;
-        // just verify needs_compaction is false for empty.
-        assert!(!compactor.needs_compaction(&[]));
+        let provider = StubProvider {
+            summary: "unused".to_string(),
+            fail: false,
+        };
+        let messages = vec![
+            msg(Role::User, "hello"),
+            msg(Role::Assistant, "hi"),
+            msg(Role::User, "quick question"),
+        ];
+
+        let result = compactor.compact(&provider, messages.clone()).await;
+        assert_eq!(result, messages);
     }
 
-    #[test]
-    fn split_calculates_correctly() {
-        // 4 messages → keep 1 (ceil(4*0.25)=1), summarise 3
-        let n = 4usize;
-        let keep = (n as f64 * 0.25).ceil() as usize;
-        assert_eq!(keep, 1);
-        assert_eq!(n - keep, 3);
+    #[tokio::test]
+    async fn compress_summarizes_old_messages() {
+        let compactor = ContextCompactor::default();
+        let provider = StubProvider {
+            summary: "summary of old turns".to_string(),
+            fail: false,
+        };
+        let messages = big_history(100, 200);
 
-        // 10 messages → keep 3 (ceil(10*0.25)=3), summarise 7
-        let n = 10usize;
-        let keep = (n as f64 * 0.25).ceil() as usize;
-        assert_eq!(keep, 3);
-        assert_eq!(n - keep, 7);
+        let result = compactor.compact(&provider, messages).await;
+        assert_eq!(result.len(), KEEP_RECENT_MESSAGES + 1);
+        assert_eq!(result[0].role, Role::User);
+        assert!(result[0].content.contains("summary of old turns"));
+    }
+
+    #[tokio::test]
+    async fn compress_preserves_last_six_verbatim() {
+        let compactor = ContextCompactor::default();
+        let provider = StubProvider {
+            summary: "summary".to_string(),
+            fail: false,
+        };
+        let messages = big_history(100, 220);
+        let expected_tail = messages[messages.len() - KEEP_RECENT_MESSAGES..].to_vec();
+
+        let result = compactor.compact(&provider, messages).await;
+        let actual_tail = result[result.len() - KEEP_RECENT_MESSAGES..].to_vec();
+        assert_eq!(actual_tail, expected_tail);
+    }
+
+    #[tokio::test]
+    async fn compress_fallback_when_llm_fails() {
+        let compactor = ContextCompactor::default();
+        let provider = StubProvider {
+            summary: "unused".to_string(),
+            fail: true,
+        };
+        let messages = big_history(100, 240);
+
+        let result = compactor.compact(&provider, messages).await;
+        let total_chars: usize = result.iter().map(|m| m.content.len()).sum();
+        assert!(total_chars <= USABLE_HISTORY_CHARS);
+        assert!(!result.is_empty());
+        assert!(!result[0].content.contains("[Earlier conversation summary]"));
     }
 }

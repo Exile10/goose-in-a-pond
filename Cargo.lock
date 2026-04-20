@@ -6666,22 +6666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pond-adapters-qwen-tts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "pond-core",
- "reqwest 0.13.2",
- "rodio",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
 name = "pond-adapters-weather"
 version = "0.1.0"
 dependencies = [
@@ -6837,7 +6821,6 @@ dependencies = [
  "pond-adapters-mcp-memory",
  "pond-adapters-ollama",
  "pond-adapters-piper",
- "pond-adapters-qwen-tts",
  "pond-adapters-weather",
  "pond-adapters-whisper",
  "pond-api",

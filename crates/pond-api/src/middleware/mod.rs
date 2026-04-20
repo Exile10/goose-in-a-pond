@@ -122,7 +122,6 @@ fn is_public_route(path: &str) -> bool {
             | "/test"
             | "/test/speak"
             | "/dev/goose"
-            | "/dev/qwen-status"
             | "/profiles"         // POST — create profile during onboarding
     )
     // PUT /settings is public so onboarding steps can save before completion

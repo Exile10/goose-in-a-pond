@@ -107,6 +107,24 @@ impl LocalInferenceLlmAdapter {
 
         let gguf_dir = data_dir.join("models").join("gguf");
 
+        // ── Filename stem (e.g. "gemma-4-E2B-it-Q4_K_M") ───────────────────
+        // Detected when: no '/', no ':', no ".gguf" extension.
+        // The model catalog stores name = stem (without extension); the file on
+        // disk is {stem}.gguf in the gguf directory.  Normalise by appending
+        // ".gguf" and falling through to the raw filename path below.
+        let owned_with_ext;
+        let model_id = if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
+            let candidate = gguf_dir.join(format!("{}.gguf", model_id));
+            if candidate.exists() {
+                owned_with_ext = format!("{}.gguf", model_id);
+                owned_with_ext.as_str()
+            } else {
+                model_id // not a local stem — fall through to HF path
+            }
+        } else {
+            model_id
+        };
+
         // ── Raw filename (e.g. "gemma-4-E2B-it-Q4_K_M.gguf") ────────────────
         // Detected when: no ':' separator and ends with ".gguf".
         if model_id.ends_with(".gguf") && !model_id.contains(':') {
@@ -254,6 +272,35 @@ impl LocalInferenceLlmAdapter {
     }
 }
 
+/// Strip thinking-token preambles emitted by reasoning-capable models.
+///
+/// Gemma 4 format: `<|channel>thought … <|channel>ACTUAL REPLY`
+/// The function finds the last `<|channel>` occurrence that is NOT immediately
+/// followed by `thought` and returns everything after it, trimmed.
+/// If the pattern is not present the original text is returned unchanged.
+fn strip_thinking_tokens(text: &str) -> String {
+    const TAG: &str = "<|channel>";
+    const THOUGHT: &str = "thought";
+
+    // Walk through all occurrences of the tag, keep track of the last one
+    // that is the *closing* tag (not followed by "thought").
+    let mut last_close: Option<usize> = None;
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(TAG) {
+        let abs = search_from + pos;
+        let after = &text[abs + TAG.len()..];
+        if !after.starts_with(THOUGHT) {
+            last_close = Some(abs + TAG.len());
+        }
+        search_from = abs + 1;
+    }
+
+    match last_close {
+        Some(start) => text[start..].trim().to_string(),
+        None        => text.to_string(),
+    }
+}
+
 #[async_trait]
 impl LlmProvider for LocalInferenceLlmAdapter {
     async fn complete(
@@ -261,7 +308,9 @@ impl LlmProvider for LocalInferenceLlmAdapter {
         system: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<ChatMessage> {
-        self.inner.complete(system, messages).await
+        let mut msg = self.inner.complete(system, messages).await?;
+        msg.content = strip_thinking_tokens(&msg.content);
+        Ok(msg)
     }
 
     fn model_name(&self) -> String {
@@ -364,6 +413,24 @@ mod tests {
         assert!(source_url.starts_with("https://huggingface.co/"));
         assert!(source_url.contains("/resolve/main/"));
         assert!(source_url.ends_with(filename));
+    }
+
+    #[test]
+    fn strip_thinking_tokens_removes_gemma4_preamble() {
+        let raw = "<|channel>thought Some reasoning here.<|channel>Hello! I am Goose.";
+        assert_eq!(strip_thinking_tokens(raw), "Hello! I am Goose.");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_no_tag_returns_original() {
+        let raw = "Hello! I am Goose.";
+        assert_eq!(strip_thinking_tokens(raw), "Hello! I am Goose.");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_multiline_thinking() {
+        let raw = "<|channel>thought\nStep 1.\nStep 2.\n<|channel>The answer is 4.";
+        assert_eq!(strip_thinking_tokens(raw), "The answer is 4.");
     }
 
     #[test]
