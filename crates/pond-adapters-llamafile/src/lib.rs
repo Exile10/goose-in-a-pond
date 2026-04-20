@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::{LlmProvider, TokenStream};
+use pond_core::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -249,10 +249,19 @@ impl LlmProvider for LlamafileProvider {
                             return;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            // Emit text token if present
                             if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
                                 let token = strip_stop_tokens(token.to_string());
                                 if !token.is_empty() {
-                                    yield Ok(token);
+                                    yield Ok(StreamToken::Text(token));
+                                }
+                            }
+                            // Emit usage stats if the final chunk includes them
+                            if let Some(usage) = v.get("usage") {
+                                let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+                                let completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+                                if prompt_tokens > 0 || completion_tokens > 0 {
+                                    yield Ok(StreamToken::Usage(UsageStats { prompt_tokens, completion_tokens }));
                                 }
                             }
                         }

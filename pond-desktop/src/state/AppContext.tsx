@@ -40,6 +40,19 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    // Ensure onboarding is complete so protected routes are accessible.
+    // pond-desktop has no onboarding wizard UI, so we auto-complete on first connect.
+    const ensureOnboarded = async () => {
+      try {
+        const status = await api.getOnboardingStatus();
+        if (!status.onboarded) {
+          await api.completeOnboarding();
+        }
+      } catch (err) {
+        console.warn("Onboarding check failed (non-fatal):", err);
+      }
+    };
+
     // Server online/offline status
     listen<boolean>("server-status", (e) => {
       if (e.payload) {
@@ -47,9 +60,11 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
         // Always re-handshake when server comes online — the server restarts
         // alongside the app, so any previously stored token is invalid.
         api.handshake("pond-desktop")
-          .then((res) => {
+          .then(async (res) => {
             api.setToken(res.token);
             dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
+            // Ensure onboarding is complete before any protected route is called
+            await ensureOnboarded();
           })
           .catch((err) => console.warn("Handshake failed (non-fatal):", err));
       } else {
@@ -72,16 +87,19 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SET_VOICE_STATE", payload: "recording" });
     }).then((u) => unlisten.push(u));
 
+    // recording-aborted: VoiceMode handles the state transition itself
+    // (it knows whether to return to "wait" or "idle"), so no dispatch here.
     listen("recording-aborted", () => {
-      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+      agentMessageStarted.current = false;
     }).then((u) => unlisten.push(u));
 
     // Transcript (user text after ASR)
-    listen<string>("transcript", (e) => {
+    // Rust emits TranscriptResult { text: String } → payload is { text: "..." }
+    listen<{ text: string }>("transcript", (e) => {
       const msg: TranscriptMessage = {
         id: nextTranscriptId(),
         role: "user",
-        text: e.payload,
+        text: e.payload.text,
         timestamp: Date.now(),
       };
       dispatch({ type: "APPEND_TRANSCRIPT", payload: msg });
@@ -143,6 +161,12 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
         dispatch({ type: "SET_VOICE_ERROR", payload: null });
       }, 4000);
+    }).then((u) => unlisten.push(u));
+
+    // Backend-assigned session ID — emitted at end of chat/stream SSE.
+    // Ensures the frontend sessionId tracks the canonical backend session.
+    listen<{ session_id: string; model_role: string }>("session-created", (e) => {
+      dispatch({ type: "SET_SESSION_ID", payload: e.payload.session_id });
     }).then((u) => unlisten.push(u));
 
     return () => {

@@ -96,11 +96,63 @@ impl LocalInferenceLlmAdapter {
     /// global model registry so that `LocalInferenceProvider` can find the GGUF
     /// file at `$data_dir/models/gguf/{filename}` instead of Goose's default
     /// `~/.local/share/goose/models/` location.
+    ///
+    /// Accepts two formats:
+    /// - HuggingFace: `"bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"`
+    /// - Raw filename: `"gemma-4-E2B-it-Q4_K_M.gguf"` (file must exist in `$data_dir/models/gguf/`)
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, LocalModelEntry, ModelSettings, model_id_from_repo,
         };
 
+        let gguf_dir = data_dir.join("models").join("gguf");
+
+        // ── Raw filename (e.g. "gemma-4-E2B-it-Q4_K_M.gguf") ────────────────
+        // Detected when: no ':' separator and ends with ".gguf".
+        if model_id.ends_with(".gguf") && !model_id.contains(':') {
+            let path = std::path::Path::new(model_id);
+            let filename = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| model_id.to_string());
+
+            // Stable synthetic registry key = stem (strip ".gguf").
+            let stem = filename.trim_end_matches(".gguf").to_string();
+
+            // Use absolute path if provided, otherwise place under data_dir.
+            let local_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                gguf_dir.join(&filename)
+            };
+
+            {
+                match get_registry().lock() {
+                    Ok(mut registry) => {
+                        if !registry.has_model(&stem) {
+                            let entry = LocalModelEntry {
+                                id:           stem.clone(),
+                                repo_id:      format!("local/{}", stem),
+                                filename:     filename.clone(),
+                                quantization: String::new(),
+                                local_path,
+                                source_url:   String::new(),
+                                settings:     ModelSettings::default(),
+                                size_bytes:   0,
+                            };
+                            if let Err(e) = registry.add_model(entry) {
+                                tracing::warn!("Could not register GGUF model '{}': {}", stem, e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("GGUF registry lock poisoned: {}", e),
+                }
+            }
+
+            return Self::new(&stem).await;
+        }
+
+        // ── HuggingFace format ("repo_id:quantization") ───────────────────────
         // Parse "repo_id:quantization" — e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
         let (repo_id, quantization) = model_id
             .rsplit_once(':')
@@ -113,7 +165,6 @@ impl LocalInferenceLlmAdapter {
         let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
         let filename   = format!("{}-{}.gguf", base_name, quantization);
 
-        let gguf_dir   = data_dir.join("models").join("gguf");
         let local_path = gguf_dir.join(&filename);
         let source_url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
@@ -230,8 +281,99 @@ mod tests {
     /// GIAP_TEST_MODEL_PATH=/path/to/model.gguf \
     ///   cargo test -p pond-adapters-local-inference -- --ignored
     /// ```
+    use super::*;
+
     #[test]
     fn default_model_constant_is_set() {
-        assert!(!super::DEFAULT_MODEL.is_empty());
+        assert!(!DEFAULT_MODEL.is_empty());
+    }
+
+    #[test]
+    fn default_model_has_huggingface_format() {
+        // Expected: "org/repo-GGUF:QUANTIZATION"
+        assert!(
+            DEFAULT_MODEL.contains('/'),
+            "DEFAULT_MODEL should be a HuggingFace repo path: {DEFAULT_MODEL}"
+        );
+        assert!(
+            DEFAULT_MODEL.contains(':'),
+            "DEFAULT_MODEL should have a quantization suffix (':'): {DEFAULT_MODEL}"
+        );
+    }
+
+    #[test]
+    fn associated_constant_matches_module_constant() {
+        assert_eq!(
+            LocalInferenceLlmAdapter::DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            "associated constant must re-export the same value"
+        );
+    }
+
+    // ── data_dir path-construction logic (no model weights required) ──────────
+
+    /// Exercise the filename-derivation logic inside `new_with_data_dir` without
+    /// touching the filesystem or loading a model.  We cannot call
+    /// `new_with_data_dir` directly (it eventually calls `LocalInferenceProvider::
+    /// from_env` which tries to download weights), so we replicate the pure
+    /// filename logic here and assert the expected result.
+    #[test]
+    fn data_dir_filename_derivation_strips_gguf_suffix() {
+        let model_id = "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M";
+        let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
+        let model_name = repo_id.split('/').last().unwrap();
+        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename   = format!("{}-{}.gguf", base_name, quantization);
+
+        assert_eq!(filename, "Llama-3.2-3B-Instruct-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn data_dir_filename_without_gguf_suffix_kept_as_is() {
+        let model_id = "bartowski/SomeModel:Q8_0";
+        let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
+        let model_name = repo_id.split('/').last().unwrap();
+        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename   = format!("{}-{}.gguf", base_name, quantization);
+
+        assert_eq!(filename, "SomeModel-Q8_0.gguf");
+    }
+
+    #[test]
+    fn data_dir_gguf_path_is_under_models_gguf() {
+        let data_dir = std::path::Path::new("/home/user/.giap");
+        let filename = "Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+        let gguf_dir = data_dir.join("models").join("gguf");
+        let local_path = gguf_dir.join(filename);
+
+        assert_eq!(
+            local_path.to_string_lossy(),
+            "/home/user/.giap/models/gguf/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn data_dir_source_url_is_huggingface_resolve() {
+        let repo_id = "bartowski/Llama-3.2-3B-Instruct-GGUF";
+        let filename = "Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+        let source_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            repo_id, filename
+        );
+
+        assert!(source_url.starts_with("https://huggingface.co/"));
+        assert!(source_url.contains("/resolve/main/"));
+        assert!(source_url.ends_with(filename));
+    }
+
+    #[test]
+    fn model_id_rsplit_fallback_uses_q4_k_m() {
+        // When no ':' quantization suffix is present, rsplit_once returns None
+        // and the fallback "Q4_K_M" is used.
+        let model_id = "some-model-without-quant";
+        let (_repo_id, quantization) = model_id
+            .rsplit_once(':')
+            .unwrap_or((model_id, "Q4_K_M"));
+        assert_eq!(quantization, "Q4_K_M");
     }
 }

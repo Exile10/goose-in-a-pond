@@ -114,6 +114,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         prompt_extra_repo:   Some(Arc::new(SqlitePromptExtraRepository::new(pool.clone()))),
         skill_repo:          Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo:         Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
+        llamafile_manager: None,
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
@@ -276,6 +277,7 @@ async fn prompt_template_delete_system_returns_403() {
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -545,6 +547,7 @@ async fn returns_501_when_repos_not_configured() {
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

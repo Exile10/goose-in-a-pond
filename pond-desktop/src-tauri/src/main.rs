@@ -9,7 +9,7 @@ mod notifications;
 mod process;
 mod tray;
 
-use audio::AudioState;
+use audio::{AudioState, WakeListenerState};
 use commands::{audio_cmd, desktop_cmd, server_cmd, window_cmd};
 use process::ServerProcess;
 use serde::Serialize;
@@ -106,6 +106,7 @@ fn main() {
         // ── Managed state ────────────────────────────────────────────────────
         .manage(ServerProcess::new())
         .manage(AudioState::new())
+        .manage(WakeListenerState::new())
         .manage(hotkey::HotkeyState::new())
         // ── Commands ─────────────────────────────────────────────────────────
         .invoke_handler(tauri::generate_handler![
@@ -122,10 +123,13 @@ fn main() {
             audio_cmd::stop_recording,
             audio_cmd::abort_recording,
             audio_cmd::run_voice_pipeline,
+            audio_cmd::start_wake_listener,
+            audio_cmd::stop_wake_listener,
             desktop_cmd::enable_autostart,
             desktop_cmd::disable_autostart,
             desktop_cmd::is_autostart_enabled,
             desktop_cmd::set_hotkey,
+            desktop_cmd::open_privacy_mic,
         ])
         // ── App lifecycle ─────────────────────────────────────────────────────
         .setup(|app| {

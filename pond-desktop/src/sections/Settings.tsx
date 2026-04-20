@@ -194,11 +194,11 @@ function VoiceTab({
             placeholder="goose"
           />
         </FormRow>
-        {/* Wake word disclaimer */}
+        {/* Wake word info */}
         <div style={wakeWordNote}>
-          <span style={wakeWordNoteIcon}>⚠</span>
+          <span style={wakeWordNoteIcon}>ℹ</span>
           <span>
-            Wake word detection is not yet active. Use the keyboard shortcut above to activate voice mode.
+            When set, the app listens passively while Voice mode is open and activates automatically when the phrase is heard. Leave blank to use the keyboard shortcut only.
           </span>
         </div>
       </FormSection>
@@ -300,6 +300,27 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
   const [pickerRole, setPickerRole] = useState<ModelRole | null>(null);
   const [thinkSameAsChat, setThinkSameAsChat] = useState(!s.think_provider && !s.think_model);
   const [taskSameAsChat, setTaskSameAsChat]   = useState(!s.task_provider && !s.task_model);
+
+  // Seed model fields from live active roles if settings don't already have them
+  useEffect(() => {
+    api.getActiveRoles().then((roles) => {
+      if (!s.chat_provider && roles.chat) {
+        patch("chat_provider", roles.chat.provider);
+        patch("chat_model", roles.chat.model);
+      }
+      if (!s.think_provider && !s.think_model && roles.think) {
+        setThinkSameAsChat(false);
+        patch("think_provider", roles.think.provider);
+        patch("think_model", roles.think.model);
+      }
+      if (!s.task_provider && !s.task_model && roles.task) {
+        setTaskSameAsChat(false);
+        patch("task_provider", roles.task.provider);
+        patch("task_model", roles.task.model);
+      }
+    }).catch(() => {/* non-fatal */});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const temp = s.llm_temperature ?? 0.7;
   const maxTokenOpts = [128, 256, 512, 1024, 2048, 4096];

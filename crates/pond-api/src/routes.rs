@@ -550,15 +550,25 @@ async fn chat_stream(
         };
 
         let mut full_text = String::new();
+        let mut usage_prompt_tokens: u32 = 0;
+        let mut usage_completion_tokens: u32 = 0;
 
         if let Some(provider) = provider_opt {
+            use pond_core::ports::provider::StreamToken;
             let mut token_stream = provider.stream_complete(&system_prompt, history);
             while let Some(result) = token_stream.next().await {
                 match result {
-                    Ok(token) => {
+                    Ok(StreamToken::Text(token)) => {
                         full_text.push_str(&token);
-                        let data = json!({"token": token}).to_string();
+                        // Emit both formats: {"type":"text","content":"..."} is the canonical
+                        // format consumed by the Tauri voice pipeline (canvas_feed.rs + audio_cmd.rs);
+                        // {"token":"..."} is kept for backwards-compat with any direct SSE consumers.
+                        let data = json!({"type": "text", "content": token, "token": token}).to_string();
                         yield Ok(Event::default().data(data));
+                    }
+                    Ok(StreamToken::Usage(u)) => {
+                        usage_prompt_tokens = u.prompt_tokens;
+                        usage_completion_tokens = u.completion_tokens;
                     }
                     Err(e) => {
                         let data = json!({"error": e.to_string()}).to_string();
@@ -577,7 +587,7 @@ async fn chat_stream(
             match state.agent.chat(agent_req).await {
                 Ok(resp) => {
                     full_text = resp.text.clone();
-                    let data = json!({"token": resp.text}).to_string();
+                    let data = json!({"type": "text", "content": resp.text, "token": resp.text}).to_string();
                     yield Ok(Event::default().data(data));
                 }
                 Err(e) => {
@@ -598,7 +608,15 @@ async fn chat_stream(
         }
 
         // Done event
-        let data = json!({"done": true, "session_id": session_id, "model_role": model_role}).to_string();
+        let data = json!({
+            "done": true,
+            "session_id": session_id,
+            "model_role": model_role,
+            "usage": {
+                "prompt_tokens": usage_prompt_tokens,
+                "completion_tokens": usage_completion_tokens,
+            }
+        }).to_string();
         yield Ok(Event::default().data(data));
     };
 
@@ -893,7 +911,9 @@ async fn update_settings(
         }
     }
 
-    Ok(Json(json!({ "status": "ok" })))
+    // Return the full merged Settings so the frontend can sync its local state
+    // without a second GET request.
+    Ok(Json(serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" }))))
 }
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
@@ -905,32 +925,99 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
     use pond_core::ports::provider::LlmProvider as _;
 
     let url = &state.llamafile_url;
+    let data_dir = state.data_dir.clone();
+    let max_tokens   = settings.llm_max_tokens;
+    let temperature  = settings.llm_temperature;
 
-    let build = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+    /// Build one `Arc<dyn LlmProvider>` for a given (provider, model) pair.
+    ///
+    /// `"local"` → `LocalInferenceLlmAdapter` (compiled in with the
+    ///   `local-inference` feature; falls back to llamafile otherwise).
+    /// `"ollama"` → `OllamaProvider`.
+    /// anything else → `LlamafileProvider`.
+    async fn build_one(
+        provider: &str,
+        model: &str,
+        url: &str,
+        data_dir: Option<std::path::PathBuf>,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Arc<dyn LlmProvider> {
         match provider {
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
+
+            #[cfg(feature = "local-inference")]
+            "local" => {
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+
+                // `new_with_data_dir` handles both raw ".gguf" filenames and
+                // HuggingFace "repo:quant" IDs, registering the model in Goose's
+                // global registry so LocalInferenceProvider can locate the file.
+                let result = match &data_dir {
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
+                    None      => LocalInferenceLlmAdapter::new(model).await,
+                };
+                match result {
+                    Ok(adapter) => Arc::new(adapter) as Arc<dyn LlmProvider>,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
+                             falling back to llamafile",
+                            model, e
+                        );
+                        Arc::new(LlamafileProvider::new(Some(url))
+                            .with_max_tokens(max_tokens)
+                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                    }
+                }
+            }
+
             _ => Arc::new(
                 LlamafileProvider::new(Some(url))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
         }
-    };
+    }
 
-    let effective_chat_provider = &settings.chat_provider;
-    let effective_chat_model    = &settings.chat_model;
+    let effective_chat_provider = settings.chat_provider.clone();
+    let effective_chat_model    = settings.chat_model.clone();
 
-    let chat  = build(effective_chat_provider, effective_chat_model);
+    let chat = build_one(&effective_chat_provider, &effective_chat_model,
+                         url, data_dir.clone(), max_tokens, temperature).await;
     let think = if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-        build(tp, tm)
+        build_one(tp, tm, url, data_dir.clone(), max_tokens, temperature).await
     } else { chat.clone() };
     let task  = if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-        build(tp, tm)
+        build_one(tp, tm, url, data_dir, max_tokens, temperature).await
     } else { chat.clone() };
+
+    // If any role uses llamafile, ensure the process is running before
+    // the new router goes live (so the first request doesn't time out).
+    let any_llamafile = effective_chat_provider == "llamafile"
+        || settings.think_provider.as_deref() == Some("llamafile")
+        || settings.task_provider.as_deref()  == Some("llamafile");
+
+    if any_llamafile {
+        if let Some(manager) = &state.llamafile_manager {
+            tracing::info!("llamafile provider selected — ensuring server is running");
+            let model_hint = if effective_chat_provider == "llamafile" {
+                Some(effective_chat_model.as_str())
+            } else {
+                None
+            };
+            manager.ensure_started(model_hint).await;
+        } else {
+            tracing::warn!(
+                "llamafile provider selected but no LlamafileManager wired in AppState; \
+                 process will not be auto-started"
+            );
+        }
+    }
 
     let new_router: Arc<dyn LlmProvider> = Arc::new(ModelRouter::new(chat, think, task));
     *state.llm_provider.write().await = Some(new_router);
