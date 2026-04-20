@@ -76,8 +76,6 @@ export default function Settings({ token }: Props) {
   const [recordingDuration, setRecordingDuration] = useState(() => load('pond_recording_duration', 5))
   const [ttsModel, setTtsModel]               = useState(() => localStorage.getItem('pond_tts_model') ?? '')
   const [ttsVoice, setTtsVoice]               = useState(() => localStorage.getItem('pond_tts_voice') ?? '')
-  const [ttsHttpUrl, setTtsHttpUrl]           = useState(() => localStorage.getItem('pond_tts_http_url') ?? '')
-  const [ttsHttpVoice, setTtsHttpVoice]       = useState(() => localStorage.getItem('pond_tts_http_voice') ?? '')
 
   // ── Desktop App (Tauri only) ──
   const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -121,8 +119,6 @@ export default function Settings({ token }: Props) {
     if (s.voice_recording_duration_secs) setRecordingDuration(s.voice_recording_duration_secs)
     if (s.active_tts_model)              setTtsModel(s.active_tts_model)
     if (s.voice_tts_voice)               setTtsVoice(s.voice_tts_voice)
-    if (s.voice_tts_http_url)            setTtsHttpUrl(s.voice_tts_http_url)
-    if (s.voice_tts_http_voice)          setTtsHttpVoice(s.voice_tts_http_voice)
   }, [ctxSettings, token])
 
   // Load desktop settings from Tauri on first render
@@ -172,8 +168,6 @@ export default function Settings({ token }: Props) {
             voice_recording_duration_secs: recordingDuration,
             active_tts_model:             ttsModel.trim(),
             voice_tts_voice:              ttsVoice.trim(),
-            voice_tts_http_url:           ttsHttpUrl.trim(),
-            voice_tts_http_voice:         ttsHttpVoice.trim(),
             chat_provider:         chatProvider.trim(),
             chat_model:            chatModel.trim(),
             think_provider:        thinkSameAsChat ? null : thinkProvider.trim() || null,
@@ -247,8 +241,6 @@ export default function Settings({ token }: Props) {
     localStorage.removeItem('pond_recording_duration')
     localStorage.removeItem('pond_tts_model')
     localStorage.removeItem('pond_tts_voice')
-    localStorage.removeItem('pond_tts_http_url')
-    localStorage.removeItem('pond_tts_http_voice')
     delete document.documentElement.dataset.theme
     window.location.reload()
   }
@@ -445,40 +437,21 @@ export default function Settings({ token }: Props) {
         <div className="db-card">
           <div className="db-card-header"><h3>Text-to-Speech (TTS)</h3></div>
           <p className="db-settings-hint">
-            GIAP supports two TTS engines: <strong>Qwen TTS</strong> (HTTP server, natural voices) and
-            <strong> Piper</strong> (local subprocess, fast and offline). Configure whichever you use.
+            GIAP uses <strong>Piper</strong> for local, low-latency text-to-speech.
           </p>
 
           {/* Active TTS model */}
           <div className="db-settings-field">
             <label className="db-settings-label" htmlFor="ttsModel">Active TTS model</label>
             <p className="db-settings-hint">
-              Name from the registry: <code>qwen-tts</code> uses the HTTP server below.
-              <code> piper-lessac</code> (or any <code>piper-*</code>) uses the Piper engine.
+              Name from the registry: <code>piper-lessac</code> (or any <code>piper-*</code>) uses the Piper engine.
               Use the <strong>Models</strong> page to see all TTS options.
             </p>
-            <input id="ttsModel" className="db-settings-input" type="text" value={ttsModel} onChange={e => setTtsModel(e.target.value)} placeholder="qwen-tts" maxLength={50} />
-          </div>
-
-          {/* Qwen TTS config */}
-          <div style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem', marginTop: '0.25rem' }}>
-            <p className="db-settings-label" style={{ marginBottom: '0.25rem' }}>Qwen TTS (HTTP server)</p>
-            <div className="db-settings-field" style={{ marginTop: '0.5rem' }}>
-              <label className="db-settings-label" htmlFor="ttsHttpUrl">Server URL</label>
-              <p className="db-settings-hint">Base URL of the Qwen TTS server (OpenAI-compatible <code>/v1/audio/speech</code>).</p>
-              <input id="ttsHttpUrl" className="db-settings-input" type="url" value={ttsHttpUrl} onChange={e => setTtsHttpUrl(e.target.value)} placeholder="http://127.0.0.1:8181" maxLength={200} />
-            </div>
-            <div className="db-settings-field">
-              <label className="db-settings-label" htmlFor="ttsHttpVoice">Voice name</label>
-              <p className="db-settings-hint">
-                Voice sent to the server. Qwen2.5-TTS supports: <code>Vivian</code>, <code>Chelsie</code>, <code>Ethan</code>, <code>Dylan</code>.
-              </p>
-              <input id="ttsHttpVoice" className="db-settings-input" type="text" value={ttsHttpVoice} onChange={e => setTtsHttpVoice(e.target.value)} placeholder="Vivian" maxLength={50} />
-            </div>
+            <input id="ttsModel" className="db-settings-input" type="text" value={ttsModel} onChange={e => setTtsModel(e.target.value)} placeholder="piper-lessac" maxLength={50} />
           </div>
 
           {/* Piper config */}
-          <div style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem' }}>
+          <div style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem', marginTop: '0.25rem' }}>
             <p className="db-settings-label" style={{ marginBottom: '0.25rem' }}>Piper (local subprocess)</p>
             <div className="db-settings-field" style={{ marginTop: '0.5rem' }}>
               <label className="db-settings-label" htmlFor="ttsVoice">Voice model filename</label>

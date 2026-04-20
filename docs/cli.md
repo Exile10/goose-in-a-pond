@@ -105,7 +105,7 @@ pond-server chat [OPTIONS]
 | `--input` | `-I` | `stdin` | Input source: `stdin` (keyboard) or `whisper` (microphone → ASR) |
 | `--wake-word` | | from Settings | Custom wake word phrase |
 | `--no-wake-word` | | off | Skip wake-word detection; activate immediately on each turn |
-| `--tts` | | from Settings | TTS engine: `qwen`, `piper`, or `none` (text only) |
+| `--tts` | | from Settings | TTS engine: `piper` or `none` (text only) |
 | `--tts-model PATH` | | auto-detected | Path to a Piper `.onnx` voice model |
 
 ```bash

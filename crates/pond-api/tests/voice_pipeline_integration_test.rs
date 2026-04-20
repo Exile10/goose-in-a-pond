@@ -15,9 +15,11 @@ use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::provider::LlmProvider;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
+use pond_core::services::mock_provider::MockProvider;
 use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::services::mock_settings::MockSettingsRepository;
 use pond_infra::mock_handshake::MockHandshake;
@@ -66,6 +68,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
+    let llm_provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new());
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
@@ -78,7 +81,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         session_storage,
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),
-        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(Some(llm_provider))),
         llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
@@ -97,7 +100,6 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,

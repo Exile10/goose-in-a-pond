@@ -169,8 +169,6 @@ export interface Settings {
   active_llm_model: string
   active_whisper_model: string
   active_tts_model: string
-  voice_tts_http_url: string
-  voice_tts_http_voice: string
   weather_enabled: boolean
   weather_latitude: number
   weather_longitude: number
@@ -698,7 +696,7 @@ export const api = {
   /**
    * Synthesise speech server-side and return a blob URL for playback.
    *
-   * The server routes to Piper HTTP or Qwen TTS based on its configuration.
+    * The server routes to Piper based on its configuration.
    * Returns `null` if no TTS backend is running (caller should skip audio).
    * Caller is responsible for calling `URL.revokeObjectURL()` after playback.
    */

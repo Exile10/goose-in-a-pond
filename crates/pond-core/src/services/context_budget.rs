@@ -8,7 +8,13 @@
 //! the character budget is exhausted, then reverses to restore chronological order.
 //! This ensures the most recent context is always preserved.
 
-use crate::domain::message::ChatMessage;
+use crate::domain::message::{ChatMessage, Role};
+
+const CHARS_PER_TOKEN: usize = 4;
+const MIN_USABLE_HISTORY_CHARS: usize = 256;
+
+/// Maximum assistant tool-output size kept verbatim in history.
+pub const TOOL_RESULT_MAX_CHARS: usize = 1_500;
 
 /// Approximate total context window in characters (8K tokens × 4 chars/token).
 pub const MAX_CONTEXT_CHARS: usize = 12_000;
@@ -19,18 +25,21 @@ pub const RESERVE_FOR_RESPONSE_CHARS: usize = 2_048;
 /// Characters available for conversation history after reserving for response.
 pub const USABLE_HISTORY_CHARS: usize = MAX_CONTEXT_CHARS - RESERVE_FOR_RESPONSE_CHARS;
 
-/// Trim a message list to fit within [`USABLE_HISTORY_CHARS`].
-///
-/// Walks messages newest-first, keeping each message until the budget is
-/// exhausted.  Returns the surviving messages in chronological (oldest-first)
-/// order so they can be passed directly to `LlmProvider::complete()`.
-///
-/// An individual message that exceeds the entire budget on its own is
-/// truncated to `USABLE_HISTORY_CHARS` characters so the caller always
-/// receives at least one message.
-pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+fn truncate_at_byte_budget(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let mut end = max_bytes.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].to_string()
+}
+
+fn trim_to_char_budget(messages: Vec<ChatMessage>, usable_history_chars: usize) -> Vec<ChatMessage> {
     let mut kept: Vec<ChatMessage> = Vec::new();
-    let mut remaining = USABLE_HISTORY_CHARS;
+    let mut remaining = usable_history_chars;
 
     for msg in messages.into_iter().rev() {
         let len = msg.content.len();
@@ -42,7 +51,7 @@ pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
             kept.push(msg);
         } else if kept.is_empty() {
             // First (most recent) message exceeds budget — truncate rather than drop.
-            let truncated = msg.content[..remaining].to_string();
+            let truncated = truncate_at_byte_budget(&msg.content, remaining);
             kept.push(ChatMessage { content: truncated, ..msg });
             break;
         } else {
@@ -53,6 +62,64 @@ pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 
     kept.reverse();
     kept
+}
+
+/// Truncate oversized assistant tool outputs before history trimming.
+///
+/// This targets assistant messages that look like structured tool output
+/// payloads (JSON/code blocks) and keeps the first [`TOOL_RESULT_MAX_CHARS`]
+/// characters plus a small marker.
+pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .map(|msg| {
+            if msg.role != Role::Assistant || msg.content.len() <= TOOL_RESULT_MAX_CHARS {
+                return msg;
+            }
+
+            let looks_like_tool_output = msg.content.contains("```json")
+                || msg.content.contains("\"tool\"")
+                || msg.content.contains("\"result\"")
+                || (msg.content.contains('{') && msg.content.contains('}'));
+
+            if !looks_like_tool_output {
+                return msg;
+            }
+
+            let mut truncated = truncate_at_byte_budget(&msg.content, TOOL_RESULT_MAX_CHARS);
+            truncated.push_str("\n\n[tool output truncated]");
+            ChatMessage {
+                content: truncated,
+                ..msg
+            }
+        })
+        .collect()
+}
+
+/// Trim a message list to fit within a context-token budget.
+///
+/// The token limit is converted to an approximate char budget via 4 chars/token,
+/// with [`RESERVE_FOR_RESPONSE_CHARS`] held back for model generation.
+pub fn trim_to_budget_with_limit(messages: Vec<ChatMessage>, context_limit_tokens: usize) -> Vec<ChatMessage> {
+    let usable_history_chars = context_limit_tokens
+        .saturating_mul(CHARS_PER_TOKEN)
+        .saturating_sub(RESERVE_FOR_RESPONSE_CHARS)
+        .max(MIN_USABLE_HISTORY_CHARS);
+
+    trim_to_char_budget(messages, usable_history_chars)
+}
+
+/// Trim a message list to fit within [`USABLE_HISTORY_CHARS`].
+///
+/// Walks messages newest-first, keeping each message until the budget is
+/// exhausted.  Returns the surviving messages in chronological (oldest-first)
+/// order so they can be passed directly to `LlmProvider::complete()`.
+///
+/// An individual message that exceeds the entire budget on its own is
+/// truncated to `USABLE_HISTORY_CHARS` characters so the caller always
+/// receives at least one message.
+pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    trim_to_char_budget(messages, USABLE_HISTORY_CHARS)
 }
 
 #[cfg(test)]
@@ -134,5 +201,37 @@ mod tests {
         let result = trim_to_budget(messages);
         assert_eq!(result.len(), 4);
         assert_eq!(total_chars(&result), USABLE_HISTORY_CHARS);
+    }
+
+    #[test]
+    fn trim_to_budget_with_limit_respects_smaller_context() {
+        // context_limit_tokens=1024 -> usable chars = 4096-2048=2048
+        let messages: Vec<ChatMessage> = (0..20).map(|_| msg(&"x".repeat(200))).collect();
+        let result = trim_to_budget_with_limit(messages, 1024);
+        assert!(total_chars(&result) <= 2048);
+    }
+
+    #[test]
+    fn truncate_tool_outputs_truncates_large_assistant_payloads() {
+        let messages = vec![
+            ChatMessage { role: Role::Assistant, content: format!("{{\"tool\":\"weather\",\"result\":\"{}\"}}", "x".repeat(TOOL_RESULT_MAX_CHARS + 300)) },
+            msg("normal user message"),
+        ];
+
+        let result = truncate_tool_outputs(messages);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].content.len() <= TOOL_RESULT_MAX_CHARS + 40);
+        assert!(result[0].content.contains("[tool output truncated]"));
+        assert_eq!(result[1].content, "normal user message");
+    }
+
+    #[test]
+    fn truncate_tool_outputs_keeps_regular_assistant_text() {
+        let plain_assistant = ChatMessage {
+            role: Role::Assistant,
+            content: "This is a normal answer without tool payload markers.".to_string(),
+        };
+        let result = truncate_tool_outputs(vec![plain_assistant.clone()]);
+        assert_eq!(result[0].content, plain_assistant.content);
     }
 }
