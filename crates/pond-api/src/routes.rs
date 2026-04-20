@@ -572,10 +572,26 @@ async fn chat_stream(
         if let Some(mgr) = &state.extension_manager {
             match mgr.list_extensions().await {
                 Ok(extensions) => {
+                    const MAX_TOOL_GUIDANCE_CHARS: usize = 4_000;
+                    const TOOL_GUIDANCE_TRUNCATION_NOTE: &str =
+                        "\n\n[tool guidance truncated; additional tools omitted]";
+
                     let guidance = render_tool_guidance_from_extensions(&extensions);
                     if !guidance.is_empty() {
+                        let bounded_guidance = if guidance.len() > MAX_TOOL_GUIDANCE_CHARS {
+                            let reserved = TOOL_GUIDANCE_TRUNCATION_NOTE.len();
+                            let max_content_len = MAX_TOOL_GUIDANCE_CHARS.saturating_sub(reserved);
+                            let mut cut = max_content_len.min(guidance.len());
+                            while cut > 0 && !guidance.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            format!("{}{}", &guidance[..cut], TOOL_GUIDANCE_TRUNCATION_NOTE)
+                        } else {
+                            guidance
+                        };
+
                         system_prompt.push_str("\n\n");
-                        system_prompt.push_str(&guidance);
+                        system_prompt.push_str(&bounded_guidance);
                     }
                 }
                 Err(e) => {
@@ -619,7 +635,14 @@ async fn chat_stream(
             }
         };
 
-        let context_limit_tokens = (settings.llm_max_tokens as usize).max(256);
+        // `llm_max_tokens` caps generation length, not the model's full context window.
+        // Use a conservative context-window budget and reserve the generation cap from it.
+        // A future improvement: read context_length from the model catalog DB.
+        const FALLBACK_CONTEXT_WINDOW_TOKENS: usize = 8_192;
+        let reserved_response_tokens = (settings.llm_max_tokens as usize).max(256);
+        let context_limit_tokens = FALLBACK_CONTEXT_WINDOW_TOKENS
+            .saturating_sub(reserved_response_tokens)
+            .max(256);
         let mut history = pond_core::services::context_budget::truncate_tool_outputs(raw_history);
         history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
 
@@ -667,13 +690,13 @@ async fn chat_stream(
             guard.as_ref().cloned()
         };
 
-        if settings.agent_memory_inject {
-            if let Some(provider) = &provider_opt {
-                let compactor = pond_core::services::context_compactor::ContextCompactor::default();
-                if compactor.needs_compaction(&history) {
-                    history = compactor.compact(provider.as_ref(), history).await;
-                    history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
-                }
+        // Context compaction runs independently of the memory-injection setting.
+        // `agent_memory_inject` controls memory-fragment prepending only.
+        if let Some(provider) = &provider_opt {
+            let compactor = pond_core::services::context_compactor::ContextCompactor::default();
+            if compactor.needs_compaction(&history) {
+                history = compactor.compact(provider.as_ref(), history).await;
+                history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
             }
         }
 
