@@ -85,7 +85,7 @@ export default function VoiceOrb({ token }: Props) {
       setShowOverlay(true)
 
       // Stream chat response
-      const sessionId = localStorage.getItem('pond_voice_session_id') ?? undefined
+      const sessionId = localStorage.getItem('pond_chat_session_id') ?? undefined
       let replyText = ''
       let newSessionId = ''
 
@@ -98,7 +98,7 @@ export default function VoiceOrb({ token }: Props) {
         (err) => { throw new Error(err) },
       )
 
-      if (newSessionId) localStorage.setItem('pond_voice_session_id', newSessionId)
+      if (newSessionId) localStorage.setItem('pond_chat_session_id', newSessionId)
       setResponse(replyText)
 
       if (muted || !replyText) {

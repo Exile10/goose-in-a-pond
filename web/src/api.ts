@@ -234,7 +234,11 @@ export interface MemoryFragment {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async function postReq<T>(path: string, body: unknown, token?: string): Promise<T> {
+function handleUnauthorized() {
+  window.dispatchEvent(new CustomEvent('pond-unauthorized'))
+}
+
+async function post<T>(path: string, body: unknown, token?: string): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
@@ -244,6 +248,7 @@ async function postReq<T>(path: string, body: unknown, token?: string): Promise<
     body: JSON.stringify(body),
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
@@ -262,6 +267,7 @@ async function putReq<T>(path: string, body: unknown, token: string): Promise<T>
     body: JSON.stringify(body),
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
@@ -289,6 +295,7 @@ async function deleteReq<T>(path: string, token: string): Promise<T> {
     headers: { 'Authorization': `Bearer ${token}` },
   })
 
+  if (res.status === 401) { handleUnauthorized(); throw new Error('Unauthorized') }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(text || `HTTP ${res.status}`)
@@ -316,11 +323,11 @@ export const api = {
 
   /** Step 1: verify this device and get a session token */
   handshake: (req: HandshakeRequest) =>
-    postReq<HandshakeResponse>('/handshake', req),
+    post<HandshakeResponse>('/handshake', req),
 
   /** Step 2: start onboarding tracking on the backend */
   startOnboarding: () =>
-    postReq<{ status: string }>('/onboard', {}),
+    post<{ status: string }>('/onboard', {}),
 
   /** Check whether this device has completed onboarding */
   onboardingStatus: () =>
@@ -328,7 +335,7 @@ export const api = {
 
   /** Mark onboarding as complete on the backend, unlocking protected routes */
   completeOnboarding: () =>
-    postReq<{ status: string }>('/onboard/complete', {}),
+    post<{ status: string }>('/onboard/complete', {}),
 
   // ── Settings ─────────────────────────────────────────────────────────────
 
@@ -354,7 +361,7 @@ export const api = {
 
   /** Send a chat message */
   chat: (message: string, token: string, sessionId?: string) =>
-    postReq<{ session_id: string; response: string; model_role?: string }>('/chat', { message, session_id: sessionId }, token),
+    post<{ session_id: string; response: string; model_role?: string }>('/chat', { message, session_id: sessionId }, token),
 
   /** List all sessions */
   listSessions: (token: string) =>
@@ -376,7 +383,7 @@ export const api = {
 
   /** Create a new household profile (public — callable during onboarding) */
   createProfile: (req: { display_name: string; avatar_emoji: string }, token: string) =>
-    postReq<{ id: string; display_name: string; avatar_emoji: string; preferences: Record<string, string> }>('/profiles', req, token),
+    post<{ id: string; display_name: string; avatar_emoji: string; preferences: Record<string, string> }>('/profiles', req, token),
 
   /** Update a profile's preferences (public — callable during onboarding) */
   updateProfilePreferences: (id: string, preferences: Record<string, string>, token: string) =>
@@ -393,11 +400,11 @@ export const api = {
 
   /** List already-registered devices */
   listDevices: (token: string) =>
-    getReq<{ devices: { id: string; name: string }[] }>('/devices', token),
+    getReq<{ devices: { id: string; name: string; device_type: string }[] }>('/devices', token),
 
   /** Register a new device */
-  registerDevice: (device: { name: string; type: string }, token: string) =>
-    postReq<{ status: string }>('/devices', device, token),
+  registerDevice: (device: { name: string; device_type: string; hostname?: string; capabilities: string[] }, token: string) =>
+    post<{ status: string }>('/devices', device, token),
 
   // ── Sensors ──────────────────────────────────────────────────────────────
 
@@ -419,7 +426,7 @@ export const api = {
 
   /** Create a new scheduled task */
   createSchedule: (req: CreateScheduleRequest, token: string) =>
-    postReq<ScheduledTask>('/schedules', req, token),
+    post<ScheduledTask>('/schedules', req, token),
 
   /** Delete a scheduled task */
   deleteSchedule: (id: string, token: string) =>
@@ -427,15 +434,15 @@ export const api = {
 
   /** Pause a scheduled task */
   pauseSchedule: (id: string, token: string) =>
-    postReq<{ status: string }>(`/schedules/${id}/pause`, {}, token),
+    post<{ status: string }>(`/schedules/${id}/pause`, {}, token),
 
   /** Resume a paused task */
   resumeSchedule: (id: string, token: string) =>
-    postReq<{ status: string }>(`/schedules/${id}/resume`, {}, token),
+    post<{ status: string }>(`/schedules/${id}/resume`, {}, token),
 
   /** Trigger a task to run immediately */
   runScheduleNow: (id: string, token: string) =>
-    postReq<{ status: string }>(`/schedules/${id}/run-now`, {}, token),
+    post<{ status: string }>(`/schedules/${id}/run-now`, {}, token),
 
   // ── Models ───────────────────────────────────────────────────────────────
 
@@ -445,15 +452,15 @@ export const api = {
 
   /** Trigger an async download for a model */
   downloadModel: (category: string, name: string, token: string) =>
-    postReq<{ status: string; name: string; category: string }>(`/models/${category}/${name}/download`, {}, token),
+    post<{ status: string; name: string; category: string }>(`/models/${category}/${name}/download`, {}, token),
 
   /** Refresh the model registry from the online URL */
   refreshModelRegistry: (token: string) =>
-    postReq<{ status: string }>('/models/registry/refresh', {}, token),
+    post<{ status: string }>('/models/registry/refresh', {}, token),
 
   /** Scan model directories for files not yet in the registry */
   scanModels: (token: string) =>
-    postReq<{ found: number; entries: ModelStatusEntry[] }>('/models/scan', {}, token),
+    post<{ found: number; entries: ModelStatusEntry[] }>('/models/scan', {}, token),
 
   /** Get the currently wired provider+model for each role */
   getActiveRoles: (token: string) =>
@@ -472,7 +479,7 @@ export const api = {
 
   /** Pull an Ollama model by name (non-blocking on the server) */
   pullOllamaModel: (model: string, token: string) =>
-    postReq<{ status: string; model: string }>('/models/ollama/pull', { model }, token),
+    post<{ status: string; model: string }>('/models/ollama/pull', { model }, token),
 
   /** Search HuggingFace for GGUF models */
   searchGgufModels: (q: string, token: string) =>
@@ -484,7 +491,7 @@ export const api = {
 
   /** Download a model file by URL into the server's models folder */
   downloadModelFromUrl: (url: string, category: string, filename: string, token: string) =>
-    postReq<{ status: string; filename: string; category: string }>('/models/download/url', { url, category, filename }, token),
+    post<{ status: string; filename: string; category: string }>('/models/download/url', { url, category, filename }, token),
 
   /** Get progress for all active/recent downloads */
   getDownloadProgress: (token: string) =>
@@ -512,7 +519,7 @@ export const api = {
 
   /** Assign a model to a role, rebuilding the ModelRouter live. */
   activateModel: (category: string, name: string, role: string, token: string) =>
-    postReq<{ role: string; model_id: string }>(`/models/${category}/${name}/activate`, { role }, token),
+    post<{ role: string; model_id: string }>(`/models/${category}/${name}/activate`, { role }, token),
 
   // ── Streaming chat ────────────────────────────────────────────────────────
 
@@ -622,7 +629,7 @@ export const api = {
     getReq<PromptExtra[]>('/agent/extras', token),
 
   upsertPromptExtra: (body: { key: string; instruction: string; active?: boolean; sort_order?: number }, token: string) =>
-    postReq<{ key: string; status: string }>('/agent/extras', body, token),
+    post<{ key: string; status: string }>('/agent/extras', body, token),
 
   deletePromptExtra: (key: string, token: string) =>
     deleteVoidReq(`/agent/extras/${encodeURIComponent(key)}`, token),
@@ -638,7 +645,7 @@ export const api = {
     getReq<UserSkill[]>('/skills', token),
 
   createSkill: (body: { name: string; content: string }, token: string) =>
-    postReq<UserSkill>('/skills', body, token),
+    post<UserSkill>('/skills', body, token),
 
   updateSkill: (id: string, body: { content?: string; active?: boolean }, token: string) =>
     putReq<UserSkill>(`/skills/${encodeURIComponent(id)}`, body, token),
@@ -652,7 +659,7 @@ export const api = {
     getReq<AgentRecipe[]>('/recipes', token),
 
   createRecipe: (body: { name: string; description?: string; yaml: string }, token: string) =>
-    postReq<AgentRecipe>('/recipes', body, token),
+    post<AgentRecipe>('/recipes', body, token),
 
   updateRecipe: (id: string, body: { description?: string; yaml?: string; active?: boolean }, token: string) =>
     putReq<AgentRecipe>(`/recipes/${encodeURIComponent(id)}`, body, token),
@@ -662,7 +669,7 @@ export const api = {
 
   // Run a named recipe via the agent (uses POST /agent/chat with recipe YAML context)
   runRecipe: (name: string, token: string) =>
-    postReq<{ session_id: string; response: string }>('/chat', { message: `Run recipe: ${name}` }, token),
+    post<{ session_id: string; response: string }>('/chat', { message: `Run recipe: ${name}` }, token),
 
   // ── Memories ──────────────────────────────────────────────────────────────
 

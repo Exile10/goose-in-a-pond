@@ -2271,7 +2271,9 @@ async fn transcribe(
         })?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        tracing::warn!("whisper returned {}: {}", status, body);
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": body})),
