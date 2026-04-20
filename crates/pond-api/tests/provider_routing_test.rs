@@ -13,7 +13,9 @@ use axum::http::{Request, StatusCode};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::ports::agent::{Agent, AgentRequest, AgentResponse};
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::ports::extension_manager::{AddExtensionRequest, ExtensionInfo, ExtensionManagerPort};
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
@@ -63,6 +65,49 @@ impl DeviceRegistry for NoDevices {
     async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
     async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
     async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+}
+
+struct StubExtensionManager;
+
+#[async_trait::async_trait]
+impl ExtensionManagerPort for StubExtensionManager {
+    async fn list_extensions(&self) -> anyhow::Result<Vec<ExtensionInfo>> {
+        Ok(vec![ExtensionInfo {
+            name: "giap".to_string(),
+            kind: "builtin".to_string(),
+            description: "GIAP builtin tools".to_string(),
+            tools: vec!["giap__get_current_weather".to_string()],
+        }])
+    }
+
+    async fn add_extension(&self, _request: AddExtensionRequest) -> anyhow::Result<ExtensionInfo> {
+        anyhow::bail!("not implemented in test")
+    }
+
+    async fn remove_extension(&self, _name: &str) -> anyhow::Result<()> {
+        anyhow::bail!("not implemented in test")
+    }
+
+    async fn list_tools(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec!["giap__get_current_weather".to_string()])
+    }
+}
+
+struct ToolCallingAgent;
+
+#[async_trait::async_trait]
+impl Agent for ToolCallingAgent {
+    async fn chat(&self, _request: AgentRequest) -> anyhow::Result<AgentResponse> {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "tool_calls".to_string(),
+            serde_json::json!(["giap__get_current_weather"]).to_string(),
+        );
+        Ok(AgentResponse {
+            text: "Task completed from agent".to_string(),
+            metadata,
+        })
+    }
 }
 
 // ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -127,7 +172,6 @@ async fn make_app_with_provider(
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -353,10 +397,10 @@ async fn done_event_has_usage_when_provider_includes_it() {
     assert_eq!(completion, 47, "expected completion_tokens=47 in done event: {:?}", done);
 }
 
-/// When no provider is configured (llm_provider = None), the echo agent is used
-/// and the stream still produces text and a done event.
+/// When no provider is configured and a non-task message is sent, the stream
+/// emits an explicit error event.
 #[tokio::test]
-async fn fallback_agent_used_when_no_provider_configured() {
+async fn no_provider_emits_error_event_for_non_task_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -364,7 +408,6 @@ async fn fallback_agent_used_when_no_provider_configured() {
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
-    // llm_provider = None → MockAgent (echo) is used
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
@@ -392,7 +435,6 @@ async fn fallback_agent_used_when_no_provider_configured() {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -412,12 +454,78 @@ async fn fallback_agent_used_when_no_provider_configured() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let events = collect_sse_events(resp.into_body()).await;
-    assert!(done_event(&events).is_some(), "expected done event: {:?}", events);
+    let error_event = events.iter().find(|e| e.get("error").is_some());
+    assert!(error_event.is_some(), "expected error event: {:?}", events);
+    assert_eq!(
+        error_event
+            .and_then(|e| e.get("error"))
+            .and_then(|e| e.as_str()),
+        Some("no LLM provider configured")
+    );
+}
 
-    // MockAgent echoes the message — verify text came back
-    let text_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .collect();
-    assert!(!text_events.is_empty(), "expected text event from echo agent");
+/// When task routing is active and Goose extensions are available, task
+/// requests run through the agent loop even if llm_provider is None.
+#[tokio::test]
+async fn task_message_uses_agent_with_tool_call_events_without_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
+    let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
+    let state = Arc::new(AppState {
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(CompletedOnboarding),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".to_string(),
+        session_storage,
+        http_client: ReqwestClient::new(),
+        agent: Arc::new(ToolCallingAgent),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".to_string(),
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(NoDevices),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        prompt_template_dir: None,
+        model_repo: None,
+        data_dir: None,
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: Some(Arc::new(StubExtensionManager)),
+        mcp_server_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
+        model_catalog_provider: None,
+        model_storage_dir: None,
+        prompt_template_repo: None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
+        llamafile_manager: None,
+    });
+    let app = build_router(state, std::path::PathBuf::from("web/dist"));
+
+    let resp = app
+        .oneshot(stream_request(serde_json::json!({"message": "remind me to water plants at 6"})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let events = collect_sse_events(resp.into_body()).await;
+    let tool_event = events.iter().find(|e| {
+        e.get("type").and_then(|t| t.as_str()) == Some("tool_call")
+    });
+    assert!(tool_event.is_some(), "expected tool_call event: {:?}", events);
+
+    let done = done_event(&events).expect("no done event");
+    assert_eq!(done["model_role"].as_str(), Some("task"));
 }

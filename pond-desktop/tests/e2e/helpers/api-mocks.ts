@@ -1,5 +1,10 @@
 import type { Page } from "@playwright/test";
 
+/** Build a text/event-stream body from JSON event payloads. */
+export function mockSseStream(events: Array<Record<string, unknown>>): string {
+  return `${events.map((ev) => `data: ${JSON.stringify(ev)}`).join("\n\n")}\n\n`;
+}
+
 /**
  * Intercept all pond-api calls and return sensible mock data.
  * This prevents tests from requiring a running pond-server.

@@ -7,7 +7,7 @@
  * Run: cd pond-desktop && npx playwright test tests/e2e/chat.spec.ts
  */
 import { test, expect } from "@playwright/test";
-import { mockAllApiRoutes } from "./helpers/api-mocks";
+import { mockAllApiRoutes, mockSseStream } from "./helpers/api-mocks";
 
 // ── Helper: build a mock SSE body ─────────────────────────────────────────────
 
@@ -20,22 +20,25 @@ function sseStream(
   } = {},
 ): string {
   if (opts.error) {
-    return [
-      `data: {"error":"${opts.error}"}`,
-      "",
-    ].join("\n");
+    return mockSseStream([{ error: opts.error }]);
   }
 
-  const usageField = opts.usage
-    ? `,"usage":{"prompt_tokens":${opts.usage.prompt_tokens},"completion_tokens":${opts.usage.completion_tokens}}`
-    : "";
-  const roleField = opts.model_role ? `,"model_role":"${opts.model_role}"` : `,"model_role":"chat"`;
+  const donePayload: Record<string, unknown> = {
+    done: true,
+    session_id: "e2e-session",
+    model_role: opts.model_role ?? "chat",
+  };
+  if (opts.usage) {
+    donePayload.usage = {
+      prompt_tokens: opts.usage.prompt_tokens,
+      completion_tokens: opts.usage.completion_tokens,
+    };
+  }
 
-  return [
-    `data: {"type":"text","content":"${textContent}","token":"${textContent}"}`,
-    `data: {"done":true,"session_id":"e2e-session"${roleField}${usageField}}`,
-    "",
-  ].join("\n");
+  return mockSseStream([
+    { type: "text", content: textContent, token: textContent },
+    donePayload,
+  ]);
 }
 
 // ── Navigate to the Chat section ──────────────────────────────────────────────
@@ -110,6 +113,29 @@ test.describe("Chat section — response rendering", () => {
     await textarea.fill("remind me to call mum at 9am");
     await textarea.press("Meta+Enter");
 
+    await expect(page.getByText(/task/i)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("tool_call event renders before task response", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: mockSseStream([
+          { type: "tool_call", tool: "giap__get_current_weather", result: { temperature: 24, condition: "Sunny" } },
+          { type: "text", content: "Set. It will be sunny.", token: "Set. It will be sunny." },
+          { done: true, session_id: "e2e-session", model_role: "task" },
+        ]),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("remind me to walk at sunset if weather is clear");
+    await textarea.press("Meta+Enter");
+
+    await expect(page.getByText(/Set\. It will be sunny\./i)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("article", { name: /tool result/i }).first()).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText(/task/i)).toBeVisible({ timeout: 10_000 });
   });
 

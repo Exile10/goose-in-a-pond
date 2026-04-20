@@ -277,13 +277,6 @@ The catalog URL (default: `settings.model_registry_url`) must serve a JSON docum
       "sample_rate":      22050,
       "voice":            "lessac",
       "description":      "Piper TTS English (lessac, medium quality)"
-    },
-    {
-      "engine":           "http",
-      "name":             "qwen-tts",
-      "default_url":      "http://127.0.0.1:8181",
-      "size_mb":          0,
-      "description":      "HTTP TTS — OpenAI-compatible /v1/audio/speech endpoint"
     }
   ]
 }
@@ -554,8 +547,6 @@ These are the **authoritative** fields read at runtime. Written by `sync_assignm
 | `voice_recording_duration_secs` | `u32` | `5` | Microphone capture duration per Whisper inference call |
 | `voice_whisper_url` | `String` | `"http://127.0.0.1:9000"` | Custom remote whisper.cpp server URL |
 | `voice_tts_voice` | `String` | `""` | Piper ONNX voice filename (e.g. `"en_US-lessac-medium.onnx"`) |
-| `voice_tts_http_url` | `String` | `"http://127.0.0.1:8181"` | HTTP TTS server base URL (OpenAI-compatible `/v1/audio/speech`) |
-| `voice_tts_http_voice` | `String` | `""` | Voice name sent to HTTP TTS server (e.g. `"Vivian"`, `"Chelsie"`) |
 
 ### Active Model Selection (hot-cache)
 
@@ -564,7 +555,7 @@ These are written by `sync_assignments_to_settings()` from `model_role_assignmen
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `active_whisper_model` | `String` | `""` | Model name for the `"asr"` role (e.g. `"base"`, `"small"`) |
-| `active_tts_model` | `String` | `""` | Model name for the `"tts"` role (e.g. `"en-lessac"`, `"qwen-tts"`) |
+| `active_tts_model` | `String` | `""` | Model name for the `"tts"` role (e.g. `"en-lessac"`) |
 
 ### Model Catalog
 

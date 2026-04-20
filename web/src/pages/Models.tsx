@@ -467,7 +467,7 @@ function RolePanel({
     think: 'Deep reasoning, analysis, explanations',
     task:  'Actions, scheduling, device control',
     asr:   'Speech-to-text (Whisper)',
-    tts:   'Text-to-speech (Piper / Qwen)',
+    tts:   'Text-to-speech (Piper)',
   }
 
   const ALL_ROLE_ICONS: Record<string, string> = {

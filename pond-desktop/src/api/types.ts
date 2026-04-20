@@ -28,8 +28,6 @@ export interface Settings {
   active_whisper_model?: string;
   active_tts_model?: string;
   voice_tts_voice?: string;
-  voice_tts_http_url?: string;
-  voice_tts_http_voice?: string;
 
   // Model roles
   chat_provider?: string;

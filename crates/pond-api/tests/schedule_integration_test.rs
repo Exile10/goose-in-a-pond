@@ -158,7 +158,6 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,

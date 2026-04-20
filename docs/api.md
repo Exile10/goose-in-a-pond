@@ -47,7 +47,6 @@ All errors return JSON:
 | GET | /test | Public | Probe all backend services |
 | POST | /test/speak | Public | Play text on server speakers |
 | GET | /dev/goose | Public | Goose agent + MCP tool status |
-| GET | /dev/qwen-status | Public | Qwen TTS server status |
 | POST | /transcribe | Public | Proxy audio to Whisper ASR |
 | GET | /settings | Protected | Get all settings |
 | PUT | /settings | Public | Update settings (partial) |
@@ -204,25 +203,6 @@ Reports Goose agent status and loaded MCP tools. Useful for verifying the GIAP b
   "tool_count": 9
 }
 ```
-
----
-
-### GET /dev/qwen-status
-
-Probes the Qwen TTS server (3-second timeout).
-
-**Response 200**
-```json
-{
-  "configured": true,
-  "url": "http://127.0.0.1:8181",
-  "server": "up",
-  "model": "ready",
-  "message": "Qwen TTS ready"
-}
-```
-
-`model` values: `"ready"` | `"loading"` | `"error"` | `"none"`
 
 ---
 
@@ -452,7 +432,7 @@ data: {"error": "Agent failed: ..."}
 
 ### POST /tts
 
-Synthesises speech on the server and returns a WAV audio file. Priority: Piper HTTP → Qwen TTS → 503.
+Synthesises speech on the server and returns a WAV audio file. Priority: Piper HTTP → 503.
 
 **Request**
 ```json
