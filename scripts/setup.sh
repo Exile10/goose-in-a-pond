@@ -14,7 +14,7 @@
 #   --help             Show this message
 #
 # What this script does:
-#   1. Checks prerequisites (cargo, systemd, avahi)
+#   1. Checks prerequisites (cargo, systemd, avahi, LLVM tools — auto-installs if missing)
 #   2. Builds pond-server in release mode
 #   3. Detects or prompts for dedicated vs shared mode
 #   4. Selects an available port
@@ -115,6 +115,57 @@ if ! command -v avahi-daemon &>/dev/null; then
         AVAHI_OK=false
     fi
 fi
+
+# ── 1b. LLVM tools ────────────────────────────────────────────────────────────
+step "Checking LLVM tools"
+
+ensure_llvm() {
+    local tools=(clang llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-ranlib lld)
+    local missing=()
+    for t in "${tools[@]}"; do
+        command -v "$t" &>/dev/null || missing+=("$t")
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        ok "LLVM tools present"
+        return
+    fi
+
+    warn "Missing LLVM tools: ${missing[*]}"
+
+    # Detect package manager and install
+    if command -v apt-get &>/dev/null; then
+        # Find the latest available LLVM version
+        LLVM_VER=$(apt-cache search '^llvm-[0-9]+$' 2>/dev/null \
+            | awk '{print $1}' | grep -oP '\d+' | sort -rn | head -1)
+        LLVM_VER="${LLVM_VER:-17}"
+        info "Installing LLVM ${LLVM_VER} via apt..."
+        sudo apt-get install -y \
+            "clang-${LLVM_VER}" \
+            "llvm-${LLVM_VER}" \
+            "lld-${LLVM_VER}" || err "Failed to install LLVM tools"
+        # Create unversioned symlinks if missing
+        for bin in clang llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-ranlib lld; do
+            local versioned="/usr/bin/${bin}-${LLVM_VER}"
+            local unversioned="/usr/local/bin/${bin}"
+            if [[ -f "$versioned" && ! -e "$unversioned" ]]; then
+                sudo ln -sf "$versioned" "$unversioned"
+            fi
+        done
+    elif command -v dnf &>/dev/null; then
+        info "Installing LLVM via dnf..."
+        sudo dnf install -y clang llvm lld || err "Failed to install LLVM tools"
+    elif command -v pacman &>/dev/null; then
+        info "Installing LLVM via pacman..."
+        sudo pacman -S --noconfirm clang llvm lld || err "Failed to install LLVM tools"
+    else
+        err "Cannot auto-install LLVM: no supported package manager found (apt/dnf/pacman). Install clang + llvm + lld manually."
+    fi
+
+    ok "LLVM tools installed"
+}
+
+ensure_llvm
 
 # ── 2. Build pond-server ───────────────────────────────────────────────────────
 step "Building pond-server (release)"
