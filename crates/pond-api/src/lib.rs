@@ -39,6 +39,22 @@
 pub mod middleware;
 pub mod routes;
 
+/// Controls the lifecycle of the local llamafile server process.
+///
+/// Injected by `pond-server` so `pond-api` has no process-management logic.
+/// `None` in tests — route handlers check `Option<Arc<dyn LlamafileManager>>`.
+#[async_trait::async_trait]
+pub trait LlamafileManager: Send + Sync {
+    /// Ensure the llamafile server is running, starting it if necessary.
+    ///
+    /// `model_name` hints which model to start; the implementation resolves
+    /// it from the model catalog if `None` or empty.
+    ///
+    /// Returns the base URL (`http://127.0.0.1:<port>`) the server is
+    /// reachable at (even if startup is still in progress).
+    async fn ensure_started(&self, model_name: Option<&str>) -> String;
+}
+
 use axum::{middleware::Next, Router};
 use tower_http::cors::{Any, CorsLayer};
 use pond_core::ports::agent::Agent;
@@ -157,6 +173,10 @@ pub struct AppState {
     /// Agent recipes (Goose Recipe YAML definitions).
     /// `None` in tests that don't exercise recipe endpoints.
     pub recipe_repo: Option<Arc<dyn AgentRecipeRepository + Send + Sync>>,
+    /// Controls the llamafile server lifecycle.
+    /// Set by pond-server when `chat_provider` may be "llamafile".
+    /// `None` in tests and when the llamafile backend is not available.
+    pub llamafile_manager: Option<Arc<dyn LlamafileManager>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

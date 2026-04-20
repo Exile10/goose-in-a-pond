@@ -119,9 +119,9 @@ export interface ModelEntry {
 }
 
 export interface ModelMemoryStatus {
-  available_mb: number;
-  used_mb: number;
-  models: Array<{ id: string; name: string; ram_estimate_mb: number; role?: string }>;
+  total_mb: number;
+  available_for_llm_mb: number;
+  loaded_model: string | null;
 }
 
 // ── Prompt Templates ──────────────────────────────────────────
@@ -157,10 +157,17 @@ export type ChatEventType = "text" | "tool_call" | "done" | "error";
 export interface ChatEvent {
   type: ChatEventType;
   content?: string;         // for "text" events
+  token?: string;           // legacy backend alias for content
   tool?: string;            // for "tool_call" events
   result?: unknown;         // for "tool_call" events
   error?: string;           // for "error" events
   done?: boolean;
+  session_id?: string;      // present on done events
+  model_role?: string;      // present on done events (chat | think | task)
+  usage?: {                 // token usage — present on done events when provider reports it
+    prompt_tokens: number;
+    completion_tokens: number;
+  };
 }
 
 // ── Transcription ─────────────────────────────────────────────
@@ -203,6 +210,49 @@ export interface SessionMessage {
   role: "user" | "assistant";
   content: string;
   created_at: string;
+}
+
+// ── HuggingFace / Model Download ──────────────────────────────
+export interface HfModel {
+  id: string;
+  downloads: number;
+  likes: number;
+  tags: string[];
+  url: string;
+}
+
+export interface HfModelFile {
+  filename: string;
+  size_mb?: number;
+  url: string;
+}
+
+export interface DownloadEntry {
+  filename: string;
+  category: string;
+  progress_pct: number;
+  status: string;
+  error?: string;
+}
+
+// ── Ollama ────────────────────────────────────────────────────
+export interface OllamaModel {
+  name: string;
+  size?: number;           // bytes
+  modified_at?: string;
+  details?: {
+    family?: string;
+    parameter_size?: string;
+    quantization_level?: string;
+  };
+}
+
+// ── Llamafile GitHub Releases ─────────────────────────────────
+export interface LlamafileRelease {
+  name: string;            // filename e.g. "gemma-2b-it.llamafile"
+  size_mb?: number;
+  download_url: string;
+  tag: string;             // GitHub release tag e.g. "0.9.1"
 }
 
 // ── API Error ─────────────────────────────────────────────────

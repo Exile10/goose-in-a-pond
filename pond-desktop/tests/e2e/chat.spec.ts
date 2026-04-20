@@ -1,0 +1,211 @@
+/**
+ * Playwright E2E tests for the Chat section.
+ *
+ * All tests use mocked API routes — no running pond-server required.
+ * The chat stream mock is overridden per-test to simulate different provider responses.
+ *
+ * Run: cd pond-desktop && npx playwright test tests/e2e/chat.spec.ts
+ */
+import { test, expect } from "@playwright/test";
+import { mockAllApiRoutes } from "./helpers/api-mocks";
+
+// ── Helper: build a mock SSE body ─────────────────────────────────────────────
+
+function sseStream(
+  textContent: string,
+  opts: {
+    model_role?: string;
+    usage?: { prompt_tokens: number; completion_tokens: number };
+    error?: string;
+  } = {},
+): string {
+  if (opts.error) {
+    return [
+      `data: {"error":"${opts.error}"}`,
+      "",
+    ].join("\n");
+  }
+
+  const usageField = opts.usage
+    ? `,"usage":{"prompt_tokens":${opts.usage.prompt_tokens},"completion_tokens":${opts.usage.completion_tokens}}`
+    : "";
+  const roleField = opts.model_role ? `,"model_role":"${opts.model_role}"` : `,"model_role":"chat"`;
+
+  return [
+    `data: {"type":"text","content":"${textContent}","token":"${textContent}"}`,
+    `data: {"done":true,"session_id":"e2e-session"${roleField}${usageField}}`,
+    "",
+  ].join("\n");
+}
+
+// ── Navigate to the Chat section ──────────────────────────────────────────────
+
+async function goToChat(page: Parameters<typeof mockAllApiRoutes>[0]) {
+  await page.goto("/");
+  // Click the Chat nav button
+  const chatBtn = page
+    .getByRole("button", { name: /chat/i })
+    .or(page.locator('[title="Chat"]'))
+    .first();
+  await chatBtn.click({ timeout: 10_000 });
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────��────
+
+test.describe("Chat section — response rendering", () => {
+  test.beforeEach(async ({ page }) => {
+    await mockAllApiRoutes(page);
+  });
+
+  test("chat response renders in agent bubble", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Hello from Pond, I am your assistant."),
+      }),
+    );
+
+    await goToChat(page);
+
+    // Type and send a message
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("Hello");
+    await textarea.press("Meta+Enter");
+
+    // Agent bubble should appear with the response text
+    await expect(page.getByText("Hello from Pond, I am your assistant.")).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
+  test("think role badge appears on agent bubble", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Light scatters due to Rayleigh scattering.", { model_role: "think" }),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("explain why the sky is blue");
+    await textarea.press("Meta+Enter");
+
+    await expect(page.getByText(/think/i)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("task role badge appears on agent bubble", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Reminder set for 9 AM.", { model_role: "task" }),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("remind me to call mum at 9am");
+    await textarea.press("Meta+Enter");
+
+    await expect(page.getByText(/task/i)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("token usage appears in model role badge when reported", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("I'm counting tokens!", {
+          model_role: "chat",
+          usage: { prompt_tokens: 10, completion_tokens: 47 },
+        }),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("hello");
+    await textarea.press("Meta+Enter");
+
+    // Badge should show "chat · 47 tokens"
+    await expect(page.getByText(/47 tokens/i)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("error event shows error text in bubble", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("", { error: "llamafile stream request failed: connection refused" }),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("hello");
+    await textarea.press("Meta+Enter");
+
+    // Error message should appear
+    await expect(
+      page.getByText(/error|llamafile|connection refused/i).first()
+    ).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("multi-turn conversation: both user messages visible", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Acknowledged."),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+
+    // First message
+    await textarea.fill("First message");
+    await textarea.press("Meta+Enter");
+    await page.waitForTimeout(500);
+
+    // Second message
+    await textarea.fill("Second message");
+    await textarea.press("Meta+Enter");
+
+    // Both user messages should be visible
+    await expect(page.getByText("First message")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Second message")).toBeVisible({ timeout: 10_000 });
+  });
+});
+
+// ── Live E2E tests (require running pond-server) ───────────────────────────────
+
+const LIVE = !!process.env.GIAP_SERVER_URL;
+
+test.describe("Chat — live provider tests", () => {
+  test.skip(!LIVE, "Set GIAP_SERVER_URL to run live provider tests");
+
+  test("live chat with provider returns streamed tokens", async ({ page }) => {
+    await page.goto(process.env.GIAP_SERVER_URL!);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("Hello! What is 2 + 2?");
+    await textarea.press("Meta+Enter");
+
+    // Wait for agent bubble with non-empty response
+    await expect(
+      page.locator("text=/four|4/i").first()
+    ).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("live think badge shows on reasoning query", async ({ page }) => {
+    await page.goto(process.env.GIAP_SERVER_URL!);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("Explain in detail why the sky is blue.");
+    await textarea.press("Meta+Enter");
+
+    await expect(page.getByText(/think/i)).toBeVisible({ timeout: 30_000 });
+  });
+});

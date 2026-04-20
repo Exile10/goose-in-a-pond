@@ -4,12 +4,17 @@ import {
   type AgentTool,
   type ChatEvent,
   type Device,
+  type DownloadEntry,
   type HandshakeResponse,
   type HealthResponse,
+  type HfModel,
+  type HfModelFile,
+  type LlamafileRelease,
   type MemoryFragment,
   type ModelActiveRoles,
   type ModelEntry,
   type ModelMemoryStatus,
+  type OllamaModel,
   type PromptExtra,
   type PromptTemplate,
   type Schedule,
@@ -80,6 +85,16 @@ export class PondApiClient {
     return this.get("/api/v1/health");
   }
 
+  // ── Onboarding ────────────────────────────────────────────
+
+  getOnboardingStatus(): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {
+    return this.get("/api/v1/onboard/status");
+  }
+
+  completeOnboarding(): Promise<{ status: string }> {
+    return this.post("/api/v1/onboard/complete");
+  }
+
   // ── Settings ──────────────────────────────────────────────
 
   getSettings(): Promise<Settings> {
@@ -99,13 +114,35 @@ export class PondApiClient {
   }
 
   // ── Schedules ─────────────────────────────────────────────
+  // Backend field mapping: label ↔ name, payload.prompt ↔ prompt, paused ↔ !enabled
 
   listSchedules(): Promise<Schedule[]> {
-    return this.get("/api/v1/schedules");
+    return this.get<Array<Record<string, unknown>>>("/api/v1/schedules").then((items) =>
+      (Array.isArray(items) ? items : []).map((t) => ({
+        id: t.id as string,
+        name: (t.label ?? t.name ?? "") as string,
+        cron: t.cron as string,
+        prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? "",
+        enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
+        created_at: t.created_at as string | undefined,
+      })),
+    );
   }
 
   createSchedule(body: Omit<Schedule, "id" | "created_at">): Promise<Schedule> {
-    return this.post("/api/v1/schedules", body);
+    const id = crypto.randomUUID();
+    return this.post<Record<string, unknown>>("/api/v1/schedules", {
+      id,
+      label: body.name,
+      cron: body.cron,
+      payload: { prompt: body.prompt },
+    }).then((t) => ({
+      id: t.id as string,
+      name: (t.label ?? t.name ?? body.name) as string,
+      cron: t.cron as string,
+      prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? body.prompt,
+      enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
+    }));
   }
 
   deleteSchedule(id: string): Promise<void> {
@@ -181,7 +218,29 @@ export class PondApiClient {
   }
 
   getActiveRoles(): Promise<ModelActiveRoles> {
-    return this.get("/api/v1/models/active-roles");
+    // Backend may return { model_id: "provider/name" } for ASR/TTS instead of { provider, model }.
+    // Normalize all roles to { provider, model } | null.
+    return this.get<Record<string, unknown>>("/api/v1/models/active-roles").then((raw) => {
+      function normalize(r: unknown): { provider: string; model: string } | null {
+        if (!r || typeof r !== "object") return null;
+        const obj = r as Record<string, unknown>;
+        // Already has provider + model
+        if (obj.provider && obj.model) return { provider: obj.provider as string, model: obj.model as string };
+        // Has model_id like "whisper/base.en" or "gguf/gemma-2b"
+        if (typeof obj.model_id === "string" && obj.model_id.includes("/")) {
+          const [provider, ...rest] = obj.model_id.split("/");
+          return { provider, model: rest.join("/") };
+        }
+        return null;
+      }
+      return {
+        chat:  normalize(raw.chat),
+        think: normalize(raw.think),
+        task:  normalize(raw.task),
+        asr:   normalize(raw.asr),
+        tts:   normalize(raw.tts),
+      } as ModelActiveRoles;
+    });
   }
 
   activateModel(provider: string, name: string, role: string): Promise<void> {
@@ -321,6 +380,64 @@ export class PondApiClient {
     }
   }
 
+  // ── Schedule actions ──────────────────────────────────────────
+
+  pauseSchedule(id: string): Promise<void> {
+    return this.post(`/api/v1/schedules/${encodeURIComponent(id)}/pause`);
+  }
+
+  resumeSchedule(id: string): Promise<void> {
+    return this.post(`/api/v1/schedules/${encodeURIComponent(id)}/resume`);
+  }
+
+  runScheduleNow(id: string): Promise<void> {
+    return this.post(`/api/v1/schedules/${encodeURIComponent(id)}/run-now`);
+  }
+
+  // ── GGUF / HuggingFace model search & download ────────────────
+
+  searchGgufModels(q: string): Promise<{ models: HfModel[] }> {
+    return this.get(`/api/v1/models/search/gguf?q=${encodeURIComponent(q)}`);
+  }
+
+  listHfModelFiles(repo: string): Promise<{ files: HfModelFile[] }> {
+    return this.get(`/api/v1/models/search/gguf/files?repo=${encodeURIComponent(repo)}`);
+  }
+
+  downloadModelFromUrl(url: string, category: string, filename: string): Promise<{ status: string }> {
+    return this.post("/api/v1/models/download/url", { url, category, filename });
+  }
+
+  getDownloadProgress(): Promise<{ downloads: DownloadEntry[] }> {
+    return this.get("/api/v1/models/download/progress");
+  }
+
+  scanModels(): Promise<{ found: number }> {
+    return this.post("/api/v1/models/scan");
+  }
+
+  // Delete model file from disk (409 ApiError if model is active in a role)
+  deleteModel(category: string, name: string): Promise<void> {
+    return this.del(`/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}`);
+  }
+
+  // ── Ollama ────────────────────────────────────────────────
+
+  listOllamaModels(): Promise<{ models: OllamaModel[]; error?: string }> {
+    return this.get("/api/v1/models/ollama");
+  }
+
+  pullOllamaModel(model: string): Promise<{ status: string }> {
+    return this.post("/api/v1/models/ollama/pull", { model });
+  }
+
+  // ── Llamafile GitHub releases ─────────────────────────────
+
+  searchLlamafileModels(q?: string): Promise<{ models: LlamafileRelease[] }> {
+    const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+    return this.get(`/api/v1/models/search/llamafile${qs}`);
+  }
+
   // ── Transcription ─────────────────────────────────────────
 
   async transcribe(wav: ArrayBuffer, token?: string): Promise<TranscribeResponse> {
@@ -329,7 +446,7 @@ export class PondApiClient {
     if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
     const form = new FormData();
-    form.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
+    form.append("audio", new Blob([wav], { type: "audio/wav" }), "audio.wav");
 
     const res = await fetch(`${this.base}/api/v1/transcribe`, {
       method: "POST",

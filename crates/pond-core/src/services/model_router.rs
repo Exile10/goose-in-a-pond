@@ -82,6 +82,26 @@ impl LlmProvider for ModelRouter {
             self.task.model_name(),
         )
     }
+
+    fn stream_complete<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        messages: Vec<ChatMessage>,
+    ) -> crate::ports::provider::TokenStream<'a> {
+        // Classify up-front so the borrow of `messages` ends before it is moved.
+        let role = {
+            let last_user = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            classify_request(last_user)
+        };
+        // Delegate to the concrete provider (e.g. LlamafileProvider), which
+        // implements native token-by-token streaming via "stream": true.
+        self.provider_for(role).stream_complete(system_prompt, messages)
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +165,41 @@ mod tests {
         router.complete("sys", vec![ChatMessage::user("remind me at 9am")]).await.unwrap();
 
         assert_eq!(task.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_complete_delegates_to_correct_provider() {
+        use futures::StreamExt;
+
+        let chat  = Arc::new(CountingMock::new("chat-model"));
+        let think = Arc::new(CountingMock::new("think-model"));
+        let task  = Arc::new(CountingMock::new("task-model"));
+        let router = ModelRouter::new(chat.clone(), think.clone(), task);
+
+        let messages = vec![ChatMessage::user("hello there")];
+        let mut stream = router.stream_complete("sys", messages);
+        let first = stream.next().await;
+        assert!(first.is_some());
+        assert!(first.unwrap().is_ok());
+        // stream_complete should route "hello there" to chat provider
+        assert_eq!(chat.call_count(), 1);
+        assert_eq!(think.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_complete_routes_think_to_think_provider() {
+        use futures::StreamExt;
+
+        let chat  = Arc::new(CountingMock::new("chat-model"));
+        let think = Arc::new(CountingMock::new("think-model"));
+        let task  = Arc::new(CountingMock::new("task-model"));
+        let router = ModelRouter::new(chat.clone(), think.clone(), task);
+
+        let messages = vec![ChatMessage::user("explain why the sky is blue")];
+        let mut stream = router.stream_complete("sys", messages);
+        let _ = stream.next().await;
+        assert_eq!(think.call_count(), 1);
+        assert_eq!(chat.call_count(), 0);
     }
 
     #[tokio::test]

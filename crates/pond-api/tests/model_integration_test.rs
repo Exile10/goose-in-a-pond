@@ -112,6 +112,7 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), model_repo, tmp)

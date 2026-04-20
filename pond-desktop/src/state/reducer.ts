@@ -5,7 +5,7 @@ import {
   normalizeGuiSection,
 } from "../desktopState";
 
-export type VoiceState = "idle" | "recording" | "thinking" | "speaking" | "error";
+export type VoiceState = "idle" | "wait" | "recording" | "thinking" | "speaking" | "error";
 
 export interface TranscriptMessage {
   id: number;
