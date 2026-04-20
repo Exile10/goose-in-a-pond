@@ -23,6 +23,31 @@ JETSON_DEPLOY_DIR="${JETSON_DEPLOY_DIR:-/opt/giap}"
 TARGET="aarch64-unknown-linux-gnu"
 FEATURES="${@}"
 
+if ! command -v clang &>/dev/null; then
+  echo "==> clang not found — installing..."
+  if command -v apt-get &>/dev/null; then
+    LLVM_VER=$(apt-cache search '^clang-[0-9]+$' 2>/dev/null \
+      | awk '{print $1}' | grep -oP '\d+' | sort -rn | head -1)
+    LLVM_VER="${LLVM_VER:-17}"
+    sudo apt-get install -y "clang-${LLVM_VER}"
+    sudo ln -sf "/usr/bin/clang-${LLVM_VER}" /usr/local/bin/clang
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y clang
+  elif command -v pacman &>/dev/null; then
+    sudo pacman -S --noconfirm clang
+  else
+    echo "ERROR: Cannot auto-install clang — no supported package manager (apt/dnf/pacman). Install it manually."
+    exit 1
+  fi
+  echo "==> clang installed: $(clang --version | head -1)"
+fi
+
+if ! command -v cross &>/dev/null; then
+  echo "ERROR: 'cross' not found. Install it with:"
+  echo " cargo install cross "
+  exit 1
+fi
+
 echo "==> Building pond-server for ${TARGET}..."
 cross build -p pond-server --target "${TARGET}" --release ${FEATURES}
 
