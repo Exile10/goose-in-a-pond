@@ -97,3 +97,47 @@ impl BoundingBox {
         })
     }
 }
+
+/// Five canonical facial landmarks in source-image pixel coordinates.
+///
+/// Order matches the ArcFace/SCRFD convention: left eye, right eye, nose tip,
+/// left mouth corner, right mouth corner.  These drive the similarity-transform
+/// alignment that warps every face into the canonical 112×112 pose ArcFace was
+/// trained on — the single biggest lever for real-world identification
+/// accuracy.  Without alignment, identical faces photographed at different
+/// head poses land in different regions of the embedding space and ArcFace
+/// produces ~0.5 similarity for truly-different people, which is why the
+/// "anyone passes the threshold" failure mode emerges.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FaceLandmarks {
+    pub left_eye:    (f32, f32),
+    pub right_eye:   (f32, f32),
+    pub nose:        (f32, f32),
+    pub left_mouth:  (f32, f32),
+    pub right_mouth: (f32, f32),
+}
+
+impl FaceLandmarks {
+    /// Flat `[lx, ly, rx, ry, nx, ny, mlx, mly, mrx, mry]` — handy for
+    /// iterating when computing the similarity transform.
+    pub fn as_array(&self) -> [(f32, f32); 5] {
+        [
+            self.left_eye,
+            self.right_eye,
+            self.nose,
+            self.left_mouth,
+            self.right_mouth,
+        ]
+    }
+}
+
+/// Detector output: a localised face, a confidence score, and optional
+/// landmarks.  Bbox-only detectors (UltraFace) leave `landmarks = None`;
+/// alignment-capable detectors (SCRFD, RetinaFace) populate them so the
+/// embedder can warp the crop to the canonical 112×112 pose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedFace {
+    pub bbox:      BoundingBox,
+    pub landmarks: Option<FaceLandmarks>,
+    pub score:     f32,
+}

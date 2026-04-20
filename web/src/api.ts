@@ -751,7 +751,9 @@ export const api = {
     return res.json()
   },
 
-  /** Identify a face against all enrolled profiles. */
+  /** Legacy single-frame identify — retained for API callers but
+   *  vulnerable to photo attacks (no liveness signal across frames).
+   *  Prefer `identifyFaceBurst` for anything user-facing. */
   identifyFace: async (
     imageBlob: Blob,
     token: string,
@@ -761,6 +763,44 @@ export const api = {
     form.append('image', imageBlob, 'face.jpg')
     if (bbox) form.append('bbox', `${bbox.x},${bbox.y},${bbox.width},${bbox.height}`)
     const res = await fetch(`${BASE}/faces/identify`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body: form,
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || `HTTP ${res.status}`)
+    }
+    return res.json()
+  },
+
+  /** Production-style identify: 5-frame burst with multi-frame liveness
+   *  gates.  Inter-frame embedding sameness + landmark pixel-motion
+   *  std-dev catch photo/phone-screen attacks that single-frame can't see.
+   *  Response adds `reason: "liveness_failed"` when a still-image
+   *  presentation attack is detected. */
+  identifyFaceBurst: async (
+    frames: Blob[],
+    token: string,
+    bbox?: { x: number; y: number; width: number; height: number },
+  ): Promise<{
+    identified: boolean
+    profile_id: string | null
+    confidence: number | null
+    threshold: number
+    reason?: string
+    liveness?: {
+      hard_reject: boolean
+      suspicious: boolean
+      mean_inter_cos: number
+      landmark_motion: number
+      eye_ratio_spread: number
+    }
+  }> => {
+    const form = new FormData()
+    frames.forEach((f, i) => form.append('image', f, `frame${i}.jpg`))
+    if (bbox) form.append('bbox', `${bbox.x},${bbox.y},${bbox.width},${bbox.height}`)
+    const res = await fetch(`${BASE}/faces/identify-burst`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` },
       body: form,

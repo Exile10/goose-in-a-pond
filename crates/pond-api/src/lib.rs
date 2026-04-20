@@ -260,6 +260,7 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
     Router::new()
         // Dev test page — no auth required, returns HTML
         .route("/dev/test", axum::routing::get(routes::dev_test_page))
+        .route("/dev/face", axum::routing::get(routes::dev_face_page))
         .nest("/api/v1", routes::api_routes(state.clone()))
         .fallback_service(routes::web_routes(static_dir))
         // Log every request/response at DEBUG level.
