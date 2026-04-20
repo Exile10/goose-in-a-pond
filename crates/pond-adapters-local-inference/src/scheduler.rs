@@ -34,7 +34,7 @@ pub const JETSON_TOTAL_RAM_MB: u64 = 8192;
 const SYSTEM_OVERHEAD_MB: u64 = 1500;
 /// Whisper base model resident size (MB).
 const STT_RESERVED_MB: u64 = 200;
-/// Piper / Qwen TTS resident size (MB).
+/// Reserved TTS resident size (MB).
 const TTS_RESERVED_MB: u64 = 100;
 /// Approximate MB available for a single LLM slot.
 pub const LLM_BUDGET_MB: u64 =

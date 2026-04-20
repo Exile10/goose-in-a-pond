@@ -185,13 +185,14 @@ impl GooseAdapter {
         }
 
         let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
-            // "local" uses llamafile as the HTTP backend (same wire format as Ollama).
+            // "local" (and legacy alias "gguf") uses llamafile as the HTTP backend
+            // (same wire format as Ollama).
             // The server starts llamafile when provider=llamafile; for provider=local the
             // GooseAdapter is expected to be the inference path.  When llamafile IS running
             // (e.g. user started it manually or via `serve --provider llamafile`) this works
             // transparently.  Without a running server the agentic loop will return a
             // connection error.
-            "local" | "llamafile" => {
+            "local" | "gguf" | "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()

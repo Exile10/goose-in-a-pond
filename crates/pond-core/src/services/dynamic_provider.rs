@@ -36,8 +36,9 @@ impl DynamicProvider {
     }
 
     fn pick(&self, name: &str) -> Arc<dyn LlmProvider> {
+        let normalized = if name == "gguf" { "local" } else { name };
         self.providers
-            .get(name)
+            .get(normalized)
             .or_else(|| self.providers.get(&self.fallback_name))
             .cloned()
             .unwrap_or_else(|| {
