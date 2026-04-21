@@ -150,7 +150,7 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "tool_call" | "done" | "error";
+export type ChatEventType = "text" | "tool_call" | "done" | "error" | "status";
 
 export interface ChatEvent {
   type: ChatEventType;
@@ -162,6 +162,7 @@ export interface ChatEvent {
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)
+  model_name?: string;      // present on done events — name of the model that responded
   usage?: {                 // token usage — present on done events when provider reports it
     prompt_tokens: number;
     completion_tokens: number;
@@ -251,6 +252,35 @@ export interface LlamafileRelease {
   size_mb?: number;
   download_url: string;
   tag: string;             // GitHub release tag e.g. "0.9.1"
+}
+
+// ── Extensions / Tools ───────────────────────────────────────
+export interface Extension {
+  name: string;
+  kind: string;
+  description: string;
+  tools: string[];
+  enabled: boolean;
+}
+
+export interface AddExtensionRequest {
+  name: string;
+  kind: string;
+  command?: string;
+  uri?: string;
+  description?: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+// ── Logs / Telemetry ─────────────────────────────────────────
+export interface LogEntry {
+  id: number;
+  timestamp: string;
+  level: string;      // INFO | WARN | ERROR
+  source: string;
+  message: string;
+  metadata?: string;  // JSON string
 }
 
 // ── API Error ─────────────────────────────────────────────────

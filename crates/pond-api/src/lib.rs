@@ -190,6 +190,10 @@ pub struct AppState {
     /// Set by pond-server when `chat_provider` may be "llamafile".
     /// `None` in tests and when the llamafile backend is not available.
     pub llamafile_manager: Option<Arc<dyn LlamafileManager>>,
+    /// Read/write access to the `event_log` table in `pond_logs.db`.
+    /// Used by the `/api/v1/logs` endpoint.
+    /// `None` in tests.
+    pub event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

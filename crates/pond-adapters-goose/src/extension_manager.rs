@@ -5,16 +5,24 @@ use goose::agents::extension::Envs;
 use pond_core::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct GiapGooseExtensionManager {
     agent: Arc<GooseAgent>,
     session_id: String,
+    /// Names of extensions that have been disabled by the user.
+    /// Kept in memory; persists until server restart.
+    disabled: Arc<tokio::sync::RwLock<HashSet<String>>>,
 }
 
 impl GiapGooseExtensionManager {
     pub fn new(agent: Arc<GooseAgent>, session_id: String) -> Self {
-        Self { agent, session_id }
+        Self {
+            agent,
+            session_id,
+            disabled: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+        }
     }
 }
 
@@ -43,11 +51,13 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             }
         }
 
+        let disabled = self.disabled.read().await;
         Ok(ext_map
             .into_iter()
             .map(|(name, tools)| ExtensionInfo {
                 kind: "builtin".to_string(),
                 description: String::new(),
+                enabled: !disabled.contains(&name),
                 name,
                 tools,
             })
@@ -113,6 +123,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             kind: request.kind,
             description: request.description,
             tools: vec![],
+            enabled: true,
         })
     }
 
@@ -126,5 +137,15 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
     async fn list_tools(&self) -> Result<Vec<String>> {
         let tools = self.agent.list_tools(&self.session_id, None).await;
         Ok(tools.iter().map(|t| t.name.as_ref().to_string()).collect())
+    }
+
+    async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        let mut disabled = self.disabled.write().await;
+        if enabled {
+            disabled.remove(name);
+        } else {
+            disabled.insert(name.to_string());
+        }
+        Ok(())
     }
 }

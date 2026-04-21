@@ -274,30 +274,19 @@ impl LocalInferenceLlmAdapter {
 
 /// Strip thinking-token preambles emitted by reasoning-capable models.
 ///
-/// Gemma 4 format: `<|channel>thought … <|channel>ACTUAL REPLY`
-/// The function finds the last `<|channel>` occurrence that is NOT immediately
-/// followed by `thought` and returns everything after it, trimmed.
+/// Gemma 4 actual format: `<|channel>thought … <channel|>ACTUAL REPLY`
+/// The opening tag is `<|channel>thought` and the *closing* tag is the
+/// reversed form `<channel|>`.  Everything after the last `<channel|>` is
+/// the real response; everything before it is internal reasoning that should
+/// not be shown to users.
+///
 /// If the pattern is not present the original text is returned unchanged.
 fn strip_thinking_tokens(text: &str) -> String {
-    const TAG: &str = "<|channel>";
-    const THOUGHT: &str = "thought";
-
-    // Walk through all occurrences of the tag, keep track of the last one
-    // that is the *closing* tag (not followed by "thought").
-    let mut last_close: Option<usize> = None;
-    let mut search_from = 0;
-    while let Some(pos) = text[search_from..].find(TAG) {
-        let abs = search_from + pos;
-        let after = &text[abs + TAG.len()..];
-        if !after.starts_with(THOUGHT) {
-            last_close = Some(abs + TAG.len());
-        }
-        search_from = abs + 1;
-    }
-
-    match last_close {
-        Some(start) => text[start..].trim().to_string(),
-        None        => text.to_string(),
+    const CLOSE_TAG: &str = "<channel|>";
+    if let Some(pos) = text.rfind(CLOSE_TAG) {
+        text[pos + CLOSE_TAG.len()..].trim().to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -417,7 +406,8 @@ mod tests {
 
     #[test]
     fn strip_thinking_tokens_removes_gemma4_preamble() {
-        let raw = "<|channel>thought Some reasoning here.<|channel>Hello! I am Goose.";
+        // Actual Gemma 4 format: opening = <|channel>thought, closing = <channel|>
+        let raw = "<|channel>thought Some reasoning here.<channel|>Hello! I am Goose.";
         assert_eq!(strip_thinking_tokens(raw), "Hello! I am Goose.");
     }
 
@@ -429,8 +419,15 @@ mod tests {
 
     #[test]
     fn strip_thinking_tokens_multiline_thinking() {
-        let raw = "<|channel>thought\nStep 1.\nStep 2.\n<|channel>The answer is 4.";
+        let raw = "<|channel>thought\nStep 1.\nStep 2.\n<channel|>The answer is 4.";
         assert_eq!(strip_thinking_tokens(raw), "The answer is 4.");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_uses_last_close_tag() {
+        // If multiple <channel|> appear, we take everything after the last one
+        let raw = "<|channel>thought Step 1.<channel|>intermediate<channel|>Final answer.";
+        assert_eq!(strip_thinking_tokens(raw), "Final answer.");
     }
 
     #[test]

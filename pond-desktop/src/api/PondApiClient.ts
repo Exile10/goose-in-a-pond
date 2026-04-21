@@ -1,15 +1,18 @@
 import {
   ApiError,
+  type AddExtensionRequest,
   type AgentRecipe,
   type AgentTool,
   type ChatEvent,
   type Device,
   type DownloadEntry,
+  type Extension,
   type HandshakeResponse,
   type HealthResponse,
   type HfModel,
   type HfModelFile,
   type LlamafileRelease,
+  type LogEntry,
   type MemoryFragment,
   type ModelActiveRoles,
   type ModelEntry,
@@ -74,10 +77,11 @@ export class PondApiClient {
     return res.json() as Promise<T>;
   }
 
-  private get<T>(path: string): Promise<T>                  { return this.request<T>("GET", path); }
-  private post<T>(path: string, body?: unknown): Promise<T>  { return this.request<T>("POST", path, body); }
-  private put<T>(path: string, body?: unknown): Promise<T>   { return this.request<T>("PUT", path, body); }
-  private del<T = void>(path: string): Promise<T>            { return this.request<T>("DELETE", path); }
+  private get<T>(path: string): Promise<T>                       { return this.request<T>("GET", path); }
+  private post<T>(path: string, body?: unknown): Promise<T>       { return this.request<T>("POST", path, body); }
+  private put<T>(path: string, body?: unknown): Promise<T>        { return this.request<T>("PUT", path, body); }
+  private patch<T = void>(path: string, body?: unknown): Promise<T> { return this.request<T>("PATCH", path, body); }
+  private del<T = void>(path: string): Promise<T>                 { return this.request<T>("DELETE", path); }
 
   // ── Health ────────────────────────────────────────────────
 
@@ -436,6 +440,81 @@ export class PondApiClient {
   searchLlamafileModels(q?: string): Promise<{ models: LlamafileRelease[] }> {
     const qs = q ? `?q=${encodeURIComponent(q)}` : "";
     return this.get(`/api/v1/models/search/llamafile${qs}`);
+  }
+
+  // ── Agent chat (agentic mode with tool calls) ─────────────
+
+  async *agentChatStream(message: string, sessionId?: string): AsyncGenerator<ChatEvent> {
+    const body: Record<string, string> = { message };
+    if (sessionId) body.session_id = sessionId;
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+
+    const res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok || !res.body) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      throw new ApiError(res.status, msg);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === "data: [DONE]") continue;
+          const data = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
+          try { yield JSON.parse(data) as ChatEvent; } catch { /* malformed */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  // ── Extensions ───────────────────────────────────────────
+
+  listExtensions(): Promise<{ extensions: Extension[] }> {
+    return this.get("/api/v1/extensions");
+  }
+
+  toggleExtension(name: string, enabled: boolean): Promise<void> {
+    return this.patch(`/api/v1/extensions/${encodeURIComponent(name)}`, { enabled });
+  }
+
+  addExtension(req: AddExtensionRequest): Promise<Extension> {
+    return this.post("/api/v1/extensions", req);
+  }
+
+  removeExtension(name: string): Promise<void> {
+    return this.del(`/api/v1/extensions/${encodeURIComponent(name)}`);
+  }
+
+  // ── Logs ─────────────────────────────────────────────────
+
+  listLogs(params?: { limit?: number; level?: string }): Promise<LogEntry[]> {
+    const qs = new URLSearchParams();
+    if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params?.level) qs.set("level", params.level);
+    const q = qs.toString();
+    return this.get(`/api/v1/logs${q ? `?${q}` : ""}`);
+  }
+
+  exportLogsUrl(): string {
+    return `${this.base}/api/v1/logs/export`;
   }
 
   // ── Transcription ─────────────────────────────────────────
