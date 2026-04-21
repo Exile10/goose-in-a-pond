@@ -36,8 +36,8 @@ describe("desktopState", () => {
     expect(normalizeGuiSection(undefined)).toBe("dashboard");
   });
 
-  it("DESKTOP_SECTIONS is a flat ordered list of all 10 sidebar items", () => {
-    expect(DESKTOP_SECTIONS).toHaveLength(10);
+  it("DESKTOP_SECTIONS is a flat ordered list of all 11 sidebar items", () => {
+    expect(DESKTOP_SECTIONS).toHaveLength(11);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
     // Verify all expected sections are present
@@ -50,6 +50,7 @@ describe("desktopState", () => {
     expect(sectionKeys).toContain("prompts");
     expect(sectionKeys).toContain("settings");
     expect(sectionKeys).toContain("agent");
+    expect(sectionKeys).toContain("logs");
   });
 
   it("derives consistent desktop section labels", () => {

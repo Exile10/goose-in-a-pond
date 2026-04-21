@@ -68,6 +68,7 @@ use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
+use pond_infra::sqlite_event_log::SqliteEventLogRepository;
 use pond_core::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::ports::model_repository::ModelRepository;
 use std::sync::Arc;
@@ -1149,6 +1150,10 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     #[cfg(not(feature = "local-inference"))]
     let model_scheduler: Option<Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>> = None;
 
+    // Capture logs pool before `db` is moved into AppState
+    let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
+        Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -1192,6 +1197,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
+        event_log_repo: event_log_repo,
     });
 
     // Warn if static assets haven't been built yet

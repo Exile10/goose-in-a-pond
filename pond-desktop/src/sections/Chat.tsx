@@ -137,6 +137,16 @@ export function Chat() {
               ...(ev.usage && ev.usage.completion_tokens > 0 ? { tokenUsage: ev.usage } : {}),
             }];
           });
+          if (ev.model_name && ev.model_role) {
+            dispatch({
+              type: "SET_LAST_RESPONSE_META",
+              payload: {
+                modelName: ev.model_name,
+                modelRole: ev.model_role,
+                completionTokens: ev.usage?.completion_tokens ?? 0,
+              },
+            });
+          }
         }
       }
     } catch (e) {
