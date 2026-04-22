@@ -257,6 +257,7 @@ mod tests {
                 "giap__get_current_weather".to_string(),
                 "giap__get_forecast".to_string(),
             ],
+            enabled: true,
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);
@@ -271,6 +272,7 @@ mod tests {
             kind: "builtin".to_string(),
             description: "No tools".to_string(),
             tools: vec![],
+            enabled: true,
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);

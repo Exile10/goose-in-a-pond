@@ -6,7 +6,7 @@ use goose::config::GooseMode;
 use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
-use pond_core::ports::agent::{Agent as AgentPort, AgentRequest, AgentResponse};
+use pond_core::ports::agent::{Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent};
 use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
@@ -14,6 +14,8 @@ use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
 use pond_core::prompts::build_system_prompt_from_template;
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::extension_manager::GiapGooseExtensionManager;
@@ -38,15 +40,20 @@ const FALLBACK_PROMPT: &str =
 /// 6. Auto-loads the `"giap"` builtin MCP extension (once per session).
 /// 7. Runs Goose's full agentic loop and returns aggregated text + tool-call metadata.
 pub struct GooseAdapter {
-    agent:            Arc<GooseAgent>,
-    session_manager:  Arc<SessionManager>,
-    settings_repo:    Arc<dyn SettingsRepository>,
-    template_repo:    Arc<dyn PromptTemplateRepository>,
-    extras_repo:      Arc<dyn PromptExtraRepository>,
-    skill_repo:       Arc<dyn UserSkillRepository>,
-    memory_repo:      Arc<dyn MemoryRepository>,
-    llamafile_url:    String,
-    /// Tracks the last `"chat_provider:chat_model"` key we wired into Goose.
+    agent: Arc<GooseAgent>,
+    session_manager: Arc<SessionManager>,
+    settings_repo: Arc<dyn SettingsRepository>,
+    template_repo: Arc<dyn PromptTemplateRepository>,
+    extras_repo: Arc<dyn PromptExtraRepository>,
+    skill_repo: Arc<dyn UserSkillRepository>,
+    memory_repo: Arc<dyn MemoryRepository>,
+    llamafile_url: String,
+    /// GIAP data directory — used to resolve GGUF model paths under
+    /// `$data_dir/models/gguf/` for the in-process LocalInferenceProvider.
+    data_dir: Option<PathBuf>,
+    /// Shared manager for extensions.
+    extension_manager: Arc<GiapGooseExtensionManager>,
+    /// Tracks the last "chat_provider:chat_model" key we wired into Goose.
     last_provider_key: Mutex<String>,
     /// Sessions that have already had the "giap" builtin extension loaded.
     loaded_extensions: Mutex<HashSet<String>>,
@@ -59,10 +66,11 @@ impl GooseAdapter {
     pub async fn new(
         settings_repo: Arc<dyn SettingsRepository>,
         template_repo: Arc<dyn PromptTemplateRepository>,
-        extras_repo:   Arc<dyn PromptExtraRepository>,
-        skill_repo:    Arc<dyn UserSkillRepository>,
-        memory_repo:   Arc<dyn MemoryRepository>,
+        extras_repo: Arc<dyn PromptExtraRepository>,
+        skill_repo: Arc<dyn UserSkillRepository>,
+        memory_repo: Arc<dyn MemoryRepository>,
         llamafile_url: String,
+        data_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let session_manager = Arc::new(SessionManager::instance());
         let permission_manager = goose::config::permission::PermissionManager::instance();
@@ -76,10 +84,15 @@ impl GooseAdapter {
             GoosePlatform::GooseCli,
         );
 
-        let agent = GooseAgent::with_config(config);
+        let agent = Arc::new(GooseAgent::with_config(config));
+        // Initialize extension manager with an empty session_id (it will be updated per call or we'll need to rethink its session_id binding)
+        // Actually, the ExtensionManagerPort trait doesn't take session_id, so the manager must be bound to one, or we change the trait.
+        // Looking at ExtensionManagerPort, it doesn't have session_id in methods.
+        // This means GIAP currently assumes a single session or the manager is per-session.
+        let extension_manager = Arc::new(GiapGooseExtensionManager::new(agent.clone(), "default".to_string()));
 
         Ok(Self {
-            agent: Arc::new(agent),
+            agent,
             session_manager,
             settings_repo,
             template_repo,
@@ -87,6 +100,8 @@ impl GooseAdapter {
             skill_repo,
             memory_repo,
             llamafile_url,
+            data_dir,
+            extension_manager,
             last_provider_key: Mutex::new(String::new()),
             loaded_extensions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
@@ -110,12 +125,13 @@ impl GooseAdapter {
             Arc::new(MockSkillRepository::default()),
             Arc::new(MockMemoryRepository::default()),
             url,
+            None,
         ).await
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
-    pub fn extension_manager(&self, session_id: String) -> GiapGooseExtensionManager {
-        GiapGooseExtensionManager::new(self.agent.clone(), session_id)
+    pub fn extension_manager(&self) -> Arc<GiapGooseExtensionManager> {
+        self.extension_manager.clone()
     }
 
     /// Add a named builtin extension to a Goose session (idempotent).
@@ -128,6 +144,12 @@ impl GooseAdapter {
             bundled: Some(false),
             available_tools: vec![],
         };
+
+        // Also register it with the extension manager so it can be re-enabled if disabled
+        self.extension_manager
+            .register_config(name.to_string(), config.clone())
+            .await;
+
         self.agent
             .add_extension(config, session_id)
             .await
@@ -185,14 +207,33 @@ impl GooseAdapter {
         }
 
         let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
-            // "local" (and legacy alias "gguf") uses llamafile as the HTTP backend
-            // (same wire format as Ollama).
-            // The server starts llamafile when provider=llamafile; for provider=local the
-            // GooseAdapter is expected to be the inference path.  When llamafile IS running
-            // (e.g. user started it manually or via `serve --provider llamafile`) this works
-            // transparently.  Without a running server the agentic loop will return a
-            // connection error.
-            "local" | "gguf" | "llamafile" => {
+            // In-process GGUF inference via llama.cpp — no HTTP server needed.
+            // Registers the model in Goose's local_model_registry so
+            // LocalInferenceProvider can locate the .gguf file on disk.
+            "local" | "gguf" => {
+                let model_name = if settings.chat_model.is_empty() {
+                    "llamafile".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                // Register the GGUF model path in Goose's global registry
+                if let Some(ref dd) = self.data_dir {
+                    Self::register_gguf_model(&model_name, dd);
+                }
+                let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
+                match goose::providers::local_inference::LocalInferenceProvider::from_env(cfg, vec![]).await {
+                    Ok(p) => {
+                        tracing::info!("Built LocalInferenceProvider for model '{}'", model_name);
+                        Some(Arc::new(p))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to build local inference provider for '{}': {e}", model_name);
+                        None
+                    }
+                }
+            }
+            // llamafile uses the Ollama wire protocol over HTTP.
+            "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()
@@ -203,7 +244,7 @@ impl GooseAdapter {
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
                     Ok(p) => Some(Arc::new(p)),
                     Err(e) => {
-                        tracing::warn!("Failed to build llamafile/local provider: {e}");
+                        tracing::warn!("Failed to build llamafile provider: {e}");
                         None
                     }
                 }
@@ -236,18 +277,72 @@ impl GooseAdapter {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl AgentPort for GooseAdapter {
-    async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
+    /// Register a GGUF model in Goose's global `local_model_registry` so that
+    /// `LocalInferenceProvider` can find the file at `$data_dir/models/gguf/`.
+    ///
+    /// Handles two formats:
+    /// - Bare stem: `"qwen2.5-3b-instruct-q4_k_m"` → looks for `{stem}.gguf`
+    /// - Raw filename: `"model.gguf"` → uses as-is
+    ///
+    /// Idempotent: skips registration if the model is already known.
+    fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) {
+        use goose::providers::local_inference::local_model_registry::{
+            get_registry, LocalModelEntry, ModelSettings,
+        };
+
+        let gguf_dir = data_dir.join("models").join("gguf");
+
+        // Derive filename and registry key from the model name
+        let (stem, filename) = if model_name.ends_with(".gguf") {
+            let s = model_name.trim_end_matches(".gguf").to_string();
+            (s, model_name.to_string())
+        } else {
+            (model_name.to_string(), format!("{}.gguf", model_name))
+        };
+
+        let local_path = gguf_dir.join(&filename);
+        if !local_path.exists() {
+            tracing::warn!(
+                "GGUF model file not found at {} — LocalInferenceProvider may fail to load",
+                local_path.display()
+            );
+        }
+
+        match get_registry().lock() {
+            Ok(mut registry) => {
+                let registry: &mut goose::providers::local_inference::local_model_registry::LocalModelRegistry = &mut registry;
+                if !registry.has_model(&stem) {
+                    let entry = LocalModelEntry {
+                        id:           stem.clone(),
+                        repo_id:      format!("local/{}", stem),
+                        filename:     filename.clone(),
+                        quantization: String::new(),
+                        local_path,
+                        source_url:   String::new(),
+                        settings:     ModelSettings::default(),
+                        size_bytes:   0,
+                    };
+                    match registry.add_model(entry) {
+                        Ok(_) => tracing::info!("Registered GGUF model '{}' in local registry", stem),
+                        Err(e) => tracing::warn!("Could not register GGUF model '{}': {}", stem, e),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("GGUF registry lock poisoned: {}", e),
+        }
+    }
+
+    pub async fn chat_stream(
+        &self,
+        request: AgentRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<AgentStreamEvent>>> {
         let settings = self.settings_repo.get().await.unwrap_or_default();
-        let session_id = &request.session_id;
+        let session_id = request.session_id.clone();
+        let model_role = request.model_role.clone();
 
         // Goose maintains its own sessions.db with auto-generated IDs.
-        // Ensure a Goose session exists for this GIAP session before calling agent.reply().
-        let goose_sid = self.resolve_goose_session(session_id).await;
-        let goose_sid = goose_sid.as_str();
+        let goose_sid = self.resolve_goose_session(&session_id).await;
 
         // ── 1. System prompt ──────────────────────────────────────────────────
         let template_content = self.template_repo
@@ -297,71 +392,137 @@ impl AgentPort for GooseAdapter {
         }
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
-        if let Err(e) = self.ensure_provider_current(&settings, goose_sid).await {
+        if let Err(e) = self.ensure_provider_current(&settings, &goose_sid).await {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");
         }
 
         // ── 6. Auto-load "giap" builtin extension ─────────────────────────────
         let needs_extension_load = {
             let loaded = self.loaded_extensions.lock().unwrap();
-            !loaded.contains(goose_sid)
+            !loaded.contains(&goose_sid)
         };
         if needs_extension_load {
-            self.add_builtin_extension("giap", goose_sid).await.ok();
-            self.loaded_extensions.lock().unwrap().insert(goose_sid.to_string());
+            self.add_builtin_extension("giap", &goose_sid).await.ok();
+            self.loaded_extensions.lock().unwrap().insert(goose_sid.clone());
         }
 
-        // ── 7. GooseMode from settings ────────────────────────────────────────
-        let goose_mode = match settings.agent_goose_mode.as_str() {
-            "chat"         => GooseMode::Chat,
-            "smart_approve"=> GooseMode::SmartApprove,
-            "approve"      => GooseMode::Approve,
-            _              => GooseMode::Auto,
+        // ── 7. GooseMode from model_role ──────────────────────────────────────
+        let goose_mode = match model_role.as_str() {
+            "task" => GooseMode::Auto,
+            _ => GooseMode::Chat,
         };
         self.agent
-            .update_goose_mode(goose_mode, goose_sid)
+            .update_goose_mode(goose_mode, &goose_sid)
             .await
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
         let user_msg = Message::user().with_text(&request.message);
         let session_cfg = goose::agents::types::SessionConfig {
-            id: goose_sid.to_string(),
+            id: goose_sid.clone(),
             schedule_id: None,
             max_turns: Some(settings.agent_max_turns as u32),
             retry_config: None,
         };
 
-        let mut stream = self.agent.reply(user_msg, session_cfg, None).await?;
+        let agent_clone = self.agent.clone();
 
-        // ── 9. Collect streamed events ────────────────────────────────────────
-        let mut text = String::new();
-        let mut tool_call_ids: Vec<String> = vec![];
+        let stream = async_stream::stream! {
+            yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
 
-        while let Some(event_result) = stream.next().await {
-            let event = event_result?;
-            match event {
-                goose::agents::AgentEvent::Message(msg) => {
-                    let chunk = msg.as_concat_text();
-                    if !chunk.is_empty() {
-                        text.push_str(&chunk);
-                    }
-                    // Capture tool request IDs for metadata
-                    for content in &msg.content {
-                        if let goose::conversation::message::MessageContent::ToolRequest(tr) = content {
-                            tracing::info!("Agent tool call id={}", tr.id);
-                            tool_call_ids.push(tr.id.clone());
+            let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, None).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Ok(AgentStreamEvent::Error { content: e.to_string() });
+                    return;
+                }
+            };
+
+            while let Some(event_result) = goose_stream.next().await {
+                match event_result {
+                    Ok(event) => match event {
+                        goose::agents::AgentEvent::Message(msg) => {
+                            // Emit tool call and result events
+                            for content in &msg.content {
+                                match content {
+                                    goose::conversation::message::MessageContent::ToolRequest(tr) => {
+                                        if let Ok(tool_call) = &tr.tool_call {
+                                            yield Ok(AgentStreamEvent::ToolCall {
+                                                id: tr.id.clone(),
+                                                tool: tool_call.name.to_string(),
+                                                input: tool_call.arguments.clone().map(serde_json::Value::Object),
+                                            });
+                                        }
+                                    }
+                                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                                        if let Ok(tool_result) = &tr.tool_result {
+                                            let content_text = tool_result
+                                                .content
+                                                .iter()
+                                                .filter_map(|c| match c.deref() {
+                                                    rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                                                    _ => None,
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+
+                                            yield Ok(AgentStreamEvent::ToolResult {
+                                                id: tr.id.clone(),
+                                                tool: String::new(), // Goose ToolResponse doesn't store tool name directly in new version
+                                                content: content_text,
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Emit text
+                            let text = msg.as_concat_text();
+                            if !text.is_empty() {
+                                yield Ok(AgentStreamEvent::Text { content: text });
+                            }
                         }
+                        goose::agents::AgentEvent::HistoryReplaced(_) => {
+                            yield Ok(AgentStreamEvent::Status { content: "Compacting context...".to_string() });
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        yield Ok(AgentStreamEvent::Error { content: e.to_string() });
                     }
                 }
-                goose::agents::AgentEvent::HistoryReplaced(_) => {
-                    tracing::debug!("Goose compacted context history");
+            }
+            yield Ok(AgentStreamEvent::Done { session_id, model_role });
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl AgentPort for GooseAdapter {
+    async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
+        let mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>> =
+            self.chat_stream(request).await?;
+        let mut full_text = String::new();
+        let mut tool_call_ids = Vec::new();
+
+        while let Some(event_result) = stream.next().await {
+            match event_result? {
+                AgentStreamEvent::Text { content } => {
+                    full_text.push_str(&content);
+                }
+                AgentStreamEvent::ToolCall { id, .. } => {
+                    tool_call_ids.push(id);
+                }
+                AgentStreamEvent::Error { content } => {
+                    return Err(anyhow!(content));
                 }
                 _ => {}
             }
         }
 
-        if text.is_empty() {
+        if full_text.is_empty() {
             return Err(anyhow!("Received empty response from Goose agent"));
         }
 
@@ -372,8 +533,46 @@ impl AgentPort for GooseAdapter {
                 serde_json::to_string(&tool_call_ids).unwrap_or_default(),
             );
         }
-        metadata.insert("session_id".to_string(), session_id.clone());
 
-        Ok(AgentResponse { text, metadata })
+        Ok(AgentResponse {
+            text: full_text,
+            metadata,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        request: AgentRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<AgentStreamEvent>>> {
+        self.chat_stream(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires llamafile at http://127.0.0.1:8080"]
+    async fn test_goose_adapter_chat_stream_live() {
+        let adapter = GooseAdapter::with_llamafile(None).await.unwrap();
+        let request = AgentRequest {
+            message: "Say hello and nothing else".to_string(),
+            session_id: "test-session".to_string(),
+            model_role: "chat".to_string(),
+        };
+
+        let mut stream = adapter.chat_stream(request).await.unwrap();
+        let mut saw_text = false;
+
+        while let Some(event_result) = stream.next().await {
+            let event = event_result.unwrap();
+            match event {
+                AgentStreamEvent::Text { .. } => saw_text = true,
+                AgentStreamEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_text);
     }
 }
