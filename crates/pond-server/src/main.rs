@@ -1073,6 +1073,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let (agent, extension_manager) = build_goose_backend(
         agent_backend,
         &llamafile_url,
+        &data_dir,
         weather.clone(),
         device_registry.clone(),
         scheduler.clone(),
@@ -2016,6 +2017,7 @@ async fn run_onboard(reset: bool) -> Result<()> {
 async fn build_goose_backend(
     agent_backend: &str,
     llamafile_url: &str,
+    data_dir: &std::path::Path,
     weather: Option<Arc<dyn WeatherProvider>>,
     device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
     scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
@@ -2059,10 +2061,11 @@ async fn build_goose_backend(
         skill_repo,
         memory_repo,
         llamafile_url.to_string(),
+        Some(data_dir.to_path_buf()),
     ).await {
         Ok(adapter) => {
             let ext_mgr: Arc<dyn ExtensionManagerPort> =
-                Arc::new(adapter.extension_manager("server".to_string()));
+                adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
             let agent: Arc<dyn Agent> = Arc::new(adapter);
             (agent, Some(ext_mgr))
@@ -2395,6 +2398,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             let (agent, _ext_mgr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
+                &data_dir,
                 weather,
                 device_registry,
                 None,
@@ -2406,7 +2410,11 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 extras_repo,
             ).await;
 
-            let request = AgentRequest { message, session_id: session };
+            let request = AgentRequest {
+                message,
+                session_id: session,
+                model_role: "task".to_string(),
+            };
             match agent.chat(request).await {
                 Ok(response) => {
                     println!("{}", response.text);
@@ -2427,6 +2435,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             let (_agent, ext_mgr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
+                &data_dir,
                 weather,
                 device_registry,
                 None,

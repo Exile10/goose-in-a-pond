@@ -112,6 +112,25 @@ impl Agent for ToolCallingAgent {
             metadata,
         })
     }
+
+    async fn chat_stream(
+        &self,
+        request: AgentRequest,
+    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<pond_core::domain::agent::AgentStreamEvent>>> {
+        let stream = async_stream::stream! {
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::ToolCall {
+                id: "test-tool-call-id".to_string(),
+                tool: "giap__get_current_weather".to_string(),
+                input: None,
+            });
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::Text { content: "Task completed from agent".to_string() });
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::Done {
+                session_id: request.session_id,
+                model_role: request.model_role,
+            });
+        };
+        Ok(futures::stream::StreamExt::boxed(stream))
+    }
 }
 
 // ── SSE helpers ───────────────────────────────────────────────────────────────

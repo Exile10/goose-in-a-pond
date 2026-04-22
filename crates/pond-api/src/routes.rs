@@ -498,6 +498,8 @@ async fn chat_stream(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+    use futures::StreamExt;
+    use pond_core::ports::agent::AgentStreamEvent;
     let Json(req) = body.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
     })?;
@@ -686,30 +688,54 @@ async fn chat_stream(
         let agent_req = AgentRequest {
             message: req.message.clone(),
             session_id: session_id.clone(),
+            model_role: model_role.to_string(),
         };
 
-        let full_text = match state.agent.chat(agent_req).await {
-            Ok(resp) => {
-                if let Some(raw_calls) = resp.metadata.get("tool_calls") {
-                    if let Ok(tool_calls) = serde_json::from_str::<Vec<String>>(raw_calls) {
-                        for tool_name in tool_calls {
-                            let data = json!({"type": "tool_call", "tool": tool_name, "result": {}}).to_string();
-                            yield Ok(Event::default().data(data));
-                        }
-                    }
-                }
-
-                let text = resp.text;
-                let data = json!({"type": "text", "content": &text, "token": &text}).to_string();
-                yield Ok(Event::default().data(data));
-                text
-            }
+        let mut full_text = String::new();
+        let mut agent_stream = match state.agent.chat_stream(agent_req).await {
+            Ok(s) => s,
             Err(e) => {
                 let data = json!({"error": e.to_string()}).to_string();
                 yield Ok(Event::default().data(data));
                 return;
             }
         };
+
+        while let Some(event_result) = agent_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    let data = match event {
+                        AgentStreamEvent::Status { content } => {
+                            json!({"type": "status", "content": content}).to_string()
+                        }
+                        AgentStreamEvent::ToolCall { tool, id, input } => {
+                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                        }
+                        AgentStreamEvent::ToolResult { tool, id, content } => {
+                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                        }
+                        AgentStreamEvent::Text { content } => {
+                            full_text.push_str(&content);
+                            json!({"type": "text", "content": content, "token": content}).to_string()
+                        }
+                        AgentStreamEvent::Done { .. } => {
+                            // Handled at the end of the loop
+                            continue;
+                        }
+                        AgentStreamEvent::Error { content } => {
+                            json!({"error": content}).to_string()
+                        }
+                    };
+                    yield Ok(Event::default().data(data));
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    let data = json!({"error": err_msg}).to_string();
+                    yield Ok(Event::default().data(data));
+                    return;
+                }
+            }
+        }
 
         // Persist full assistant response
         {
@@ -3327,6 +3353,8 @@ async fn agent_chat_stream(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use pond_core::domain::agent::AgentRequest;
+    use pond_core::ports::agent::AgentStreamEvent;
+    use futures::stream::StreamExt;
 
     let body = match body {
         Ok(b) => b.0,
@@ -3344,39 +3372,51 @@ async fn agent_chat_stream(
     let agent = state.agent.clone();
 
     let stream = async_stream::stream! {
-        // Heartbeat: keeps the SSE connection alive while the agent loop runs
-        // (GooseAdapter may take 10-60s depending on number of tool calls)
-        let status = json!({"type": "status", "content": "Agent working…"}).to_string();
-        yield Ok::<Event, std::convert::Infallible>(Event::default().data(status));
+        let request = AgentRequest {
+            message,
+            session_id: session_id.clone(),
+            model_role: "task".to_string(),
+        };
 
-        let request = AgentRequest { message, session_id: session_id.clone() };
-        match agent.chat(request).await {
+        let mut agent_stream = match agent.chat_stream(request).await {
+            Ok(s) => s,
             Err(e) => {
                 let data = json!({"error": e.to_string()}).to_string();
                 yield Ok(Event::default().data(data));
+                return;
             }
-            Ok(resp) => {
-                // Emit one event per tool that was called during the loop
-                if let Some(ids_json) = resp.metadata.get("tool_calls") {
-                    if let Ok(ids) = serde_json::from_str::<Vec<String>>(ids_json) {
-                        for id in &ids {
-                            let ev = json!({"type": "tool_call", "tool": id}).to_string();
-                            yield Ok(Event::default().data(ev));
+        };
+
+        while let Some(event_result) = agent_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    let data = match event {
+                        AgentStreamEvent::Status { content } => {
+                            json!({"type": "status", "content": content}).to_string()
                         }
-                    }
+                        AgentStreamEvent::ToolCall { tool, id, input } => {
+                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                        }
+                        AgentStreamEvent::ToolResult { tool, id, content } => {
+                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                        }
+                        AgentStreamEvent::Text { content } => {
+                            json!({"type": "text", "content": content, "token": content}).to_string()
+                        }
+                        AgentStreamEvent::Done { .. } => {
+                            json!({"done": true, "session_id": session_id.clone()}).to_string()
+                        }
+                        AgentStreamEvent::Error { content } => {
+                            json!({"error": content}).to_string()
+                        }
+                    };
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                 }
-
-                // Emit the full response text as a single token chunk
-                let tok = json!({
-                    "type": "text",
-                    "content": resp.text,
-                    "token": resp.text,
-                }).to_string();
-                yield Ok(Event::default().data(tok));
-
-                // Done
-                let done = json!({"done": true, "session_id": session_id}).to_string();
-                yield Ok(Event::default().data(done));
+                Err(e) => {
+                    let data = json!({"error": e.to_string()}).to_string();
+                    yield Ok(Event::default().data(data));
+                    return;
+                }
             }
         }
     };

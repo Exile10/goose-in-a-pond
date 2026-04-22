@@ -13,6 +13,7 @@ interface Message {
   role: "user" | "agent";
   text: string;
   streaming?: boolean;
+  status?: string;       // current activity description (e.g. "Thinking...", "Using tool...")
   cards?: ContextCardType[];  // inline tool call results attached to this message
   modelRole?: string;         // which role answered (chat/think/task)
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
@@ -100,7 +101,14 @@ export function Chat() {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, text: last.text + tok }];
+            return [...prev.slice(0, -1), { ...last, text: last.text + tok, status: undefined }];
+          });
+
+        } else if (ev.type === "status" && ev.content) {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || last.role !== "agent") return prev;
+            return [...prev.slice(0, -1), { ...last, status: ev.content }];
           });
 
         } else if (ev.type === "tool_call" && ev.tool) {
@@ -114,7 +122,24 @@ export function Chat() {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, cards: [...(last.cards ?? []), card] }];
+            return [...prev.slice(0, -1), { 
+              ...last, 
+              cards: [...(last.cards ?? []), card],
+              status: `Using tool: ${ev.tool}`
+            }];
+          });
+
+        } else if (ev.type === "tool_result" && ev.id) {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || last.role !== "agent" || !last.cards) return prev;
+            // Update the data for the specific card
+            const newCards = last.cards.map(c => 
+              // We don't have tool_call_id on ContextCardType yet, but we can match by tool name if it was the last one
+              // or better: let's just update the last one for now or add id to card
+              c.tool === ev.tool ? { ...c, data: { result: ev.content } } : c
+            );
+            return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
           });
 
         } else if (ev.type === "error" || ev.error) {
@@ -223,7 +248,12 @@ export function Chat() {
               ...styles.bubbleText,
               ...(msg.error ? styles.bubbleError : {}),
             }}>
-              {msg.text || (msg.streaming ? <span style={styles.thinkingDots}>●●●</span> : "")}
+              {msg.text || (msg.streaming ? (
+                <span style={styles.thinkingContainer}>
+                  {msg.status && <span style={styles.statusText}>{msg.status}</span>}
+                  <span style={styles.thinkingDots}>●●●</span>
+                </span>
+              ) : "")}
             </p>
 
             {/* Inline tool call result cards */}
@@ -353,6 +383,16 @@ const styles: Record<string, React.CSSProperties> = {
   bubbleError: {
     borderColor: "var(--color-destructive)",
     color: "var(--color-destructive)",
+  },
+  thinkingContainer: {
+    display: "flex",
+    alignItems: "center",
+    gap: "var(--space-2)",
+  },
+  statusText: {
+    fontSize: "var(--text-sm)",
+    color: "var(--color-text-secondary)",
+    fontStyle: "italic",
   },
   thinkingDots: {
     color: "var(--color-text-tertiary)",
