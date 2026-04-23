@@ -14,6 +14,7 @@ import { Models } from "../sections/Models";
 import { Prompts } from "../sections/Prompts";
 import { Settings } from "../sections/Settings";
 import { Agent } from "../sections/Agent";
+import { Logs } from "../sections/Logs";
 
 function SectionContent({ section }: { section: GuiSection }) {
   switch (section) {
@@ -27,6 +28,7 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "prompts":   return <Prompts />;
     case "settings":  return <Settings />;
     case "agent":     return <Agent />;
+    case "logs":      return <Logs />;
   }
 }
 

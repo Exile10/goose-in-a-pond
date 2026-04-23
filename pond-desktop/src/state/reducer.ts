@@ -23,6 +23,12 @@ export interface ContextCard {
 
 const TRANSCRIPT_CAP = 50;
 
+export interface LastResponseMeta {
+  modelName: string;
+  modelRole: string;
+  completionTokens: number;
+}
+
 export interface AppState {
   mode: DesktopMode;
   section: GuiSection;
@@ -36,6 +42,7 @@ export interface AppState {
   transcript: TranscriptMessage[];
   contextCards: ContextCard[];
   voiceRequestId: number;
+  lastResponseMeta: LastResponseMeta | null;
 }
 
 export type AppAction =
@@ -54,7 +61,8 @@ export type AppAction =
   | { type: "CLEAR_TRANSCRIPT" }
   | { type: "PUSH_CONTEXT_CARD"; payload: ContextCard }
   | { type: "CLEAR_CONTEXT_CARDS" }
-  | { type: "VOICE_ACTIVATE" };
+  | { type: "VOICE_ACTIVATE" }
+  | { type: "SET_LAST_RESPONSE_META"; payload: LastResponseMeta };
 
 let _transcriptIdCounter = 0;
 let _cardIdCounter = 0;
@@ -80,6 +88,7 @@ export function buildInitialState(): AppState {
     transcript: [],
     contextCards: [],
     voiceRequestId: 0,
+    lastResponseMeta: null,
   };
 }
 
@@ -162,6 +171,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "VOICE_ACTIVATE":
       return { ...state, voiceRequestId: state.voiceRequestId + 1 };
+
+    case "SET_LAST_RESPONSE_META":
+      return { ...state, lastResponseMeta: action.payload };
 
     default:
       return state;

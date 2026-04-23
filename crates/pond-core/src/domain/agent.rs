@@ -5,12 +5,41 @@ use std::fmt;
 pub struct AgentRequest {
     pub message: String,
     pub session_id: String,
+    pub model_role: String, // "chat" | "think" | "task"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
     pub text: String,
     pub metadata: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentStreamEvent {
+    Status {
+        content: String,
+    },
+    ToolCall {
+        id: String,
+        tool: String,
+        input: Option<serde_json::Value>,
+    },
+    ToolResult {
+        id: String,
+        tool: String,
+        content: String,
+    },
+    Text {
+        content: String,
+    },
+    Done {
+        session_id: String,
+        model_role: String,
+    },
+    Error {
+        content: String,
+    },
 }
 
 /// The four states of the workflow loop.

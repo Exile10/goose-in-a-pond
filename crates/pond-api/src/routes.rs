@@ -16,7 +16,6 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
-use futures::StreamExt;
 use pond_core::domain::message::ChatMessage;
 use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
@@ -115,15 +114,20 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
-        .route("/extensions/{name}", delete(remove_extension_handler))
+        .route("/extensions/{name}", delete(remove_extension_handler).patch(toggle_extension_handler))
         // ── Prompt Templates ───────────────────────────────────────────────────
         .route("/prompts", get(list_prompt_templates))
         .route("/prompts/{name}", get(get_prompt_template).put(upsert_prompt_template).delete(delete_prompt_template))
         // ── Agent Tools (MCP) ─────────────────────────────────────────────────
         .route("/agent/tools", get(list_agent_tools))
+        // ── Agent chat stream (agentic tool-use loop) ─────────────────────────
+        .route("/agent/chat/stream", post(agent_chat_stream))
         // ── System Prompt Extras ───────────────────────────────────────────────
         .route("/agent/extras", get(list_prompt_extras).post(upsert_prompt_extra))
         .route("/agent/extras/{key}", delete(delete_prompt_extra))
+        // ── Event log / telemetry ─────────────────────────────────────────────
+        .route("/logs", get(list_logs))
+        .route("/logs/export", get(export_logs_csv))
         // ── Memories ──────────────────────────────────────────────────────────
         .route("/memories", get(list_memories).post(save_memory))
         .route("/memories/{id}", delete(delete_memory))
@@ -494,6 +498,8 @@ async fn chat_stream(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+    use futures::StreamExt;
+    use pond_core::ports::agent::AgentStreamEvent;
     let Json(req) = body.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
     })?;
@@ -561,7 +567,7 @@ async fn chat_stream(
             }
         };
 
-        let mut system_prompt = match &state.mcp_memory {
+        let mut _system_prompt = match &state.mcp_memory {
             Some(m) => {
                 let mem = m.instructions();
                 if mem.is_empty() { system_prompt } else { format!("{}\n\n---\n{}", system_prompt, mem) }
@@ -590,8 +596,8 @@ async fn chat_stream(
                             guidance
                         };
 
-                        system_prompt.push_str("\n\n");
-                        system_prompt.push_str(&bounded_guidance);
+                        _system_prompt.push_str("\n\n");
+                        _system_prompt.push_str(&bounded_guidance);
                     }
                 }
                 Err(e) => {
@@ -622,29 +628,6 @@ async fn chat_stream(
                 return;
             }
         }
-
-        // Load conversation history and apply context budget
-        let raw_history = match storage.get_recent_messages(&session_id, 100).await {
-            Ok(msgs) => {
-                msgs.into_iter().map(|sm| sm.message).collect::<Vec<ChatMessage>>()
-            }
-            Err(e) => {
-                let data = json!({"error": format!("Failed to load history: {}", e)}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
-            }
-        };
-
-        // `llm_max_tokens` caps generation length, not the model's full context window.
-        // Use a conservative context-window budget and reserve the generation cap from it.
-        // A future improvement: read context_length from the model catalog DB.
-        const FALLBACK_CONTEXT_WINDOW_TOKENS: usize = 8_192;
-        let reserved_response_tokens = (settings.llm_max_tokens as usize).max(256);
-        let context_limit_tokens = FALLBACK_CONTEXT_WINDOW_TOKENS
-            .saturating_sub(reserved_response_tokens)
-            .max(256);
-        let mut history = pond_core::services::context_budget::truncate_tool_outputs(raw_history);
-        history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
 
         // ── On-demand llamafile startup ─────────────────────────────────────
         // If any role uses llamafile and the process is not responding, emit a
@@ -684,85 +667,74 @@ async fn chat_stream(
             }
         }
 
-        // Acquire provider for compaction and streaming.
-        let provider_opt = {
-            let guard = state.llm_provider.read().await;
-            guard.as_ref().cloned()
+        let usage_prompt_tokens: u32 = 0;
+        let usage_completion_tokens: u32 = 0;
+
+        let model_name_for_done = match model_role {
+            "think" => settings
+                .think_model
+                .as_deref()
+                .unwrap_or(settings.chat_model.as_str())
+                .to_string(),
+            "task" => settings
+                .task_model
+                .as_deref()
+                .unwrap_or(settings.chat_model.as_str())
+                .to_string(),
+            _ => settings.chat_model.clone(),
         };
 
-        // Context compaction runs independently of the memory-injection setting.
-        // `agent_memory_inject` controls memory-fragment prepending only.
-        if let Some(provider) = &provider_opt {
-            let compactor = pond_core::services::context_compactor::ContextCompactor::default();
-            if compactor.needs_compaction(&history) {
-                history = compactor.compact(provider.as_ref(), history).await;
-                history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
-            }
-        }
+        use pond_core::domain::agent::AgentRequest;
+        let agent_req = AgentRequest {
+            message: req.message.clone(),
+            session_id: session_id.clone(),
+            model_role: model_role.to_string(),
+        };
 
         let mut full_text = String::new();
-        let mut usage_prompt_tokens: u32 = 0;
-        let mut usage_completion_tokens: u32 = 0;
-        let use_agent = model_role == "task"
-            && settings.agent_goose_mode != "off"
-            && state.extension_manager.is_some();
+        let mut agent_stream = match state.agent.chat_stream(agent_req).await {
+            Ok(s) => s,
+            Err(e) => {
+                let data = json!({"error": e.to_string()}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
+        };
 
-        if use_agent {
-            use pond_core::domain::agent::AgentRequest;
-            let agent_req = AgentRequest {
-                message: req.message.clone(),
-                session_id: session_id.clone(),
-            };
-
-            match state.agent.chat(agent_req).await {
-                Ok(resp) => {
-                    if let Some(raw_calls) = resp.metadata.get("tool_calls") {
-                        if let Ok(tool_calls) = serde_json::from_str::<Vec<String>>(raw_calls) {
-                            for tool_name in tool_calls {
-                                let data = json!({"type": "tool_call", "tool": tool_name, "result": {}}).to_string();
-                                yield Ok(Event::default().data(data));
-                            }
+        while let Some(event_result) = agent_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    let data = match event {
+                        AgentStreamEvent::Status { content } => {
+                            json!({"type": "status", "content": content}).to_string()
                         }
-                    }
-
-                    full_text = resp.text.clone();
-                    let data = json!({"type": "text", "content": resp.text, "token": resp.text}).to_string();
+                        AgentStreamEvent::ToolCall { tool, id, input } => {
+                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                        }
+                        AgentStreamEvent::ToolResult { tool, id, content } => {
+                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                        }
+                        AgentStreamEvent::Text { content } => {
+                            full_text.push_str(&content);
+                            json!({"type": "text", "content": content, "token": content}).to_string()
+                        }
+                        AgentStreamEvent::Done { .. } => {
+                            // Handled at the end of the loop
+                            continue;
+                        }
+                        AgentStreamEvent::Error { content } => {
+                            json!({"error": content}).to_string()
+                        }
+                    };
                     yield Ok(Event::default().data(data));
                 }
                 Err(e) => {
-                    let data = json!({"error": e.to_string()}).to_string();
+                    let err_msg = e.to_string();
+                    let data = json!({"error": err_msg}).to_string();
                     yield Ok(Event::default().data(data));
                     return;
                 }
             }
-        } else if let Some(provider) = provider_opt {
-            use pond_core::ports::provider::StreamToken;
-            let mut token_stream = provider.stream_complete(&system_prompt, history);
-            while let Some(result) = token_stream.next().await {
-                match result {
-                    Ok(StreamToken::Text(token)) => {
-                        full_text.push_str(&token);
-                        // Emit both formats: {"type":"text","content":"..."} is the canonical
-                        // format consumed by the Tauri voice pipeline (canvas_feed.rs + audio_cmd.rs);
-                        // {"token":"..."} is kept for backwards-compat with any direct SSE consumers.
-                        let data = json!({"type": "text", "content": token, "token": token}).to_string();
-                        yield Ok(Event::default().data(data));
-                    }
-                    Ok(StreamToken::Usage(u)) => {
-                        usage_prompt_tokens = u.prompt_tokens;
-                        usage_completion_tokens = u.completion_tokens;
-                    }
-                    Err(e) => {
-                        let data = json!({"error": e.to_string()}).to_string();
-                        yield Ok(Event::default().data(data));
-                        return;
-                    }
-                }
-            }
-        } else {
-            let data = json!({"error": "no LLM provider configured"}).to_string();
-            yield Ok(Event::default().data(data));
-            return;
         }
 
         // Persist full assistant response
@@ -779,6 +751,7 @@ async fn chat_stream(
             "done": true,
             "session_id": session_id,
             "model_role": model_role,
+            "model_name": model_name_for_done,
             "usage": {
                 "prompt_tokens": usage_prompt_tokens,
                 "completion_tokens": usage_completion_tokens,
@@ -3359,6 +3332,178 @@ async fn list_agent_tools(
     }
 }
 
+// ── Agent chat stream ─────────────────────────────────────────────────────────
+
+/// `POST /api/v1/agent/chat/stream` — run a full agentic loop (Goose + MCP tools)
+/// and stream the result via SSE.
+///
+/// Unlike `/chat/stream` (which uses the LlmProvider directly), this handler
+/// runs the GooseAdapter's agentic loop which can call MCP tools, multi-step
+/// reasoning, etc. while keeping the SSE connection alive with status events.
+///
+/// Event shapes:
+/// - `{"type":"status","content":"Agent working…"}` — heartbeat while loop runs
+/// - `{"type":"tool_call","tool":"<id>"}` — each MCP tool that was invoked
+/// - `{"type":"text","content":"...","token":"..."}` — final response text
+/// - `{"done":true,"session_id":"..."}` — completion
+/// - `{"error":"..."}` — on failure
+async fn agent_chat_stream(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use pond_core::domain::agent::AgentRequest;
+    use pond_core::ports::agent::AgentStreamEvent;
+    use futures::stream::StreamExt;
+
+    let body = match body {
+        Ok(b) => b.0,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+
+    let message = body["message"].as_str().unwrap_or("").to_string();
+    let session_id = body["session_id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let agent = state.agent.clone();
+
+    let stream = async_stream::stream! {
+        let request = AgentRequest {
+            message,
+            session_id: session_id.clone(),
+            model_role: "task".to_string(),
+        };
+
+        let mut agent_stream = match agent.chat_stream(request).await {
+            Ok(s) => s,
+            Err(e) => {
+                let data = json!({"error": e.to_string()}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
+        };
+
+        while let Some(event_result) = agent_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    let data = match event {
+                        AgentStreamEvent::Status { content } => {
+                            json!({"type": "status", "content": content}).to_string()
+                        }
+                        AgentStreamEvent::ToolCall { tool, id, input } => {
+                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                        }
+                        AgentStreamEvent::ToolResult { tool, id, content } => {
+                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                        }
+                        AgentStreamEvent::Text { content } => {
+                            json!({"type": "text", "content": content, "token": content}).to_string()
+                        }
+                        AgentStreamEvent::Done { .. } => {
+                            json!({"done": true, "session_id": session_id.clone()}).to_string()
+                        }
+                        AgentStreamEvent::Error { content } => {
+                            json!({"error": content}).to_string()
+                        }
+                    };
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                }
+                Err(e) => {
+                    let data = json!({"error": e.to_string()}).to_string();
+                    yield Ok(Event::default().data(data));
+                    return;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// ── Event log / telemetry ─────────────────────────────────────────────────────
+
+/// `GET /api/v1/logs` — return recent entries from the `event_log` table.
+///
+/// Query params:
+/// - `limit` (default 200, max 2000)
+/// - `level` — filter to `INFO`, `WARN`, or `ERROR`
+async fn list_logs(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.event_log_repo else {
+        return Json(json!([])).into_response();
+    };
+
+    let limit = params.get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(200)
+        .min(2000);
+    let level = params.get("level").map(|s| s.as_str());
+
+    match repo.list(limit, level).await {
+        Ok(entries) => Json(json!(entries)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ).into_response(),
+    }
+}
+
+/// `GET /api/v1/logs/export` — download the event log as a CSV file.
+///
+/// Returns up to 10,000 rows across all severity levels.
+async fn export_logs_csv(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(repo) = &state.event_log_repo else {
+        return (StatusCode::NOT_IMPLEMENTED, "Event log not configured").into_response();
+    };
+
+    let entries = match repo.list(10_000, None).await {
+        Ok(e) => e,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let mut csv = "id,timestamp,level,source,message,metadata\n".to_string();
+    for entry in &entries {
+        fn esc(s: &str) -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        }
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            entry.id,
+            esc(&entry.timestamp),
+            esc(&entry.level),
+            esc(&entry.source),
+            esc(&entry.message),
+            esc(entry.metadata.as_deref().unwrap_or("")),
+        ));
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/csv; charset=utf-8")
+        .header("Content-Disposition", "attachment; filename=\"pond-logs.csv\"")
+        .body(Body::from(csv))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 // ── Extension management handlers ─────────────────────────────────────────────
 
 /// `GET /api/v1/extensions` — list all active Goose/MCP extensions.
@@ -3453,6 +3598,41 @@ async fn remove_extension_handler(
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// `PATCH /api/v1/extensions/{name}` — enable or disable an extension.
+///
+/// Body: `{"enabled": true}` or `{"enabled": false}`.
+/// Disabled extensions are excluded from future Goose agent sessions.
+async fn toggle_extension_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(manager) = &state.extension_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Extension manager not available"})),
+        ).into_response();
+    };
+
+    let body = match body {
+        Ok(b) => b.0,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+
+    let enabled = body["enabled"].as_bool().unwrap_or(true);
+
+    match manager.set_enabled(&name, enabled).await {
+        Ok(()) => Json(json!({"name": name, "enabled": enabled})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ).into_response(),
     }
 }
 

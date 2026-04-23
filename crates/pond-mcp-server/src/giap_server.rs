@@ -61,7 +61,9 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         match &self.services.weather {
             None => Ok(CallToolResult::success(vec![Content::text(
-                "Weather is not configured on this GIAP instance.",
+                "The weather service is not configured on this GIAP instance. \
+                 Inform the user that they need to configure a weather location in their settings. \
+                 DO NOT attempt to fetch weather using any other tool, shell command, or external request.",
             )])),
             Some(w) => match w.current().await {
                 Ok(data) => Ok(CallToolResult::success(vec![Content::text(
@@ -116,7 +118,8 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         match &self.services.scheduler {
             None => Ok(CallToolResult::success(vec![Content::text(
-                "Scheduler is not configured.",
+                "The scheduler service is not configured on this GIAP instance. \
+                 Inform the user directly. DO NOT attempt to use any other tool to create or list schedules.",
             )])),
             Some(s) => match s.list_tasks().await {
                 Ok(tasks) => {
@@ -298,7 +301,10 @@ impl ServerHandler for GiapMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP (Goose In A Pond) MCP server. Provides tools to interact with the local smart home AI assistant.",
+                "GIAP (Goose In A Pond) MCP server. This is your primary interface for interacting with the local home environment. \
+                 It provides tools for fetching current weather, managing the smart home device registry, \
+                 recalling and saving personal memories, and accessing assistant skills. \
+                 Always prefer these tools for home-related tasks.",
             )
     }
 }

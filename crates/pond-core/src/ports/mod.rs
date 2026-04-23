@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod event_log;
 pub mod model_catalog_provider;
 pub mod model_downloader;
 pub mod model_repository;
