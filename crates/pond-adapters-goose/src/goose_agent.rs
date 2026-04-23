@@ -25,7 +25,20 @@ use crate::extension_manager::GiapGooseExtensionManager;
 const FALLBACK_PROMPT: &str =
     "You are {{assistant_name}}, a privacy-first local AI home assistant. \
      No data leaves this home. Be concise, warm, and practical. \
-     No Markdown. Never emit pipeline control tokens.";
+     No Markdown. Never emit pipeline control tokens. \
+     IMPORTANT: You must ONLY use the tools explicitly listed in your tool schema. \
+     NEVER use shell commands, bash, python, curl, or any execution tool to fetch information. \
+     If a service or tool is unavailable or not configured, tell the user directly and stop.
+
+        {% if (extensions is defined) and extensions %}
+        # Extensions
+        Extensions provide additional tools and context.
+        {% for extension in extensions %}
+        ## {{extension.name}}
+        {% if extension.instructions %}{{extension.instructions}}{% endif %}
+        {% endfor %}
+        {% endif %}";
+
 
 /// Adapter: GooseAdapter
 ///
@@ -140,7 +153,7 @@ impl GooseAdapter {
             name: name.to_string(),
             description: String::new(),
             display_name: None,
-            timeout: None,
+            timeout: Some(600),
             bundled: Some(false),
             available_tools: vec![],
         };
@@ -235,6 +248,7 @@ impl GooseAdapter {
             // llamafile uses the Ollama wire protocol over HTTP.
             "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()
                 } else {
@@ -250,6 +264,7 @@ impl GooseAdapter {
                 }
             }
             "ollama" => {
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
                 let model_name = if settings.chat_model.is_empty() {
                     "llama3.2".to_string()
                 } else {
@@ -313,6 +328,8 @@ impl GooseAdapter {
             Ok(mut registry) => {
                 let registry: &mut goose::providers::local_inference::local_model_registry::LocalModelRegistry = &mut registry;
                 if !registry.has_model(&stem) {
+                    let mut settings = ModelSettings::default();
+                    settings.native_tool_calling = true;
                     let entry = LocalModelEntry {
                         id:           stem.clone(),
                         repo_id:      format!("local/{}", stem),
@@ -320,12 +337,18 @@ impl GooseAdapter {
                         quantization: String::new(),
                         local_path,
                         source_url:   String::new(),
-                        settings:     ModelSettings::default(),
+                        settings,
                         size_bytes:   0,
                     };
                     match registry.add_model(entry) {
                         Ok(_) => tracing::info!("Registered GGUF model '{}' in local registry", stem),
                         Err(e) => tracing::warn!("Could not register GGUF model '{}': {}", stem, e),
+                    }
+                } else if let Some(entry) = registry.get_model(&stem) {
+                    let mut s = entry.settings.clone();
+                    if !s.native_tool_calling {
+                        s.native_tool_calling = true;
+                        let _ = registry.update_model_settings(&stem, s);
                     }
                 }
             }
@@ -402,15 +425,30 @@ impl GooseAdapter {
             !loaded.contains(&goose_sid)
         };
         if needs_extension_load {
-            self.add_builtin_extension("giap", &goose_sid).await.ok();
+            if let Err(e) = self.add_builtin_extension("giap", &goose_sid).await {
+                tracing::error!(
+                    session = %goose_sid,
+                    error = %e,
+                    "Failed to load GIAP builtin extension — agent will have no tools"
+                );
+            }
+
+            // Remove all Goose platform/builtin extensions that may have bled in
+            // from ~/.config/goose/config.yaml or prior sessions.  GIAP only exposes
+            // the "giap" MCP extension; everything else is noise or a security risk.
+            for ext in &[
+                "developer", "computercontroller", "extensionmanager",
+                "todo", "apps", "analyze", "summon", "summarize",
+                "orchestrator", "tom",
+            ] {
+                self.agent.remove_extension(ext, &goose_sid).await.ok();
+            }
+
             self.loaded_extensions.lock().unwrap().insert(goose_sid.clone());
         }
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
-        let goose_mode = match model_role.as_str() {
-            "task" => GooseMode::Auto,
-            _ => GooseMode::Chat,
-        };
+        let goose_mode = GooseMode::Auto;
         self.agent
             .update_goose_mode(goose_mode, &goose_sid)
             .await
@@ -426,6 +464,18 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
+
+        // Build the set of valid tool names before the stream starts.
+        // Any ToolCall event whose name isn't in this set is a hallucination
+        // and must be suppressed before it reaches the UI / SSE serialiser.
+        let allowed_tools: std::collections::HashSet<String> = agent_clone
+            .list_tools(&goose_sid, None)
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        
+        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
@@ -447,9 +497,21 @@ impl GooseAdapter {
                                 match content {
                                     goose::conversation::message::MessageContent::ToolRequest(tr) => {
                                         if let Ok(tool_call) = &tr.tool_call {
+                                            let tool_name = tool_call.name.to_string();
+                                            // Guard: suppress tool calls not in the validated schema.
+                                            // An empty allowed_tools set means no extensions loaded —
+                                            // every call is a hallucination and must be blocked.
+                                            if !allowed_tools.contains(&tool_name) {
+                                                tracing::warn!(
+                                                    tool = %tool_name,
+                                                    allowed = ?allowed_tools,
+                                                    "Blocked unauthorized tool call (not in schema or no tools loaded)",
+                                                );
+                                                continue;
+                                            }
                                             yield Ok(AgentStreamEvent::ToolCall {
                                                 id: tr.id.clone(),
-                                                tool: tool_call.name.to_string(),
+                                                tool: tool_name,
                                                 input: tool_call.arguments.clone().map(serde_json::Value::Object),
                                             });
                                         }
@@ -498,6 +560,7 @@ impl GooseAdapter {
         Ok(Box::pin(stream))
     }
 }
+
 
 #[async_trait]
 impl AgentPort for GooseAdapter {
