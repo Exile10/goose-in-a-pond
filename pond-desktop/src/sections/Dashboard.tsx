@@ -3,6 +3,25 @@ import { Mic, MessageSquare } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { AudioWaves } from "../components/AudioWaves";
 
+function abbreviateModel(name: string): string {
+  // "org/model-name" → "model-name"; truncate to 32 chars
+  const bare = name.includes("/") ? name.split("/").pop() ?? name : name;
+  return bare.length > 32 ? bare.slice(0, 29) + "…" : bare;
+}
+
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10000) return "~" + (n / 1000).toFixed(1) + "k";
+  return "~" + Math.round(n / 1000) + "k";
+}
+
+function roleColor(role: string): React.CSSProperties {
+  if (role === "think") return { background: "rgba(255,149,0,0.12)", color: "#b36200", borderColor: "rgba(255,149,0,0.3)" };
+  if (role === "task")  return { background: "rgba(52,199,89,0.12)",  color: "#1a7a3a", borderColor: "rgba(52,199,89,0.3)" };
+  // chat (default) — purple accent
+  return { background: "rgba(140,75,255,0.10)", color: "var(--color-accent)", borderColor: "rgba(140,75,255,0.25)" };
+}
+
 export function Dashboard() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
@@ -63,6 +82,26 @@ export function Dashboard() {
           </div>
         </div>
       </Card>
+
+      {/* ── Last response metadata ────────────────────────── */}
+      {state.lastResponseMeta && (
+        <Card>
+          <div style={styles.cardBody}>
+            <h3 style={styles.cardTitle}>Last Response</h3>
+            <div style={styles.metaRow}>
+              <span style={styles.metaModel}>
+                {abbreviateModel(state.lastResponseMeta.modelName)}
+              </span>
+              <span style={{ ...styles.metaRolePill, ...roleColor(state.lastResponseMeta.modelRole) }}>
+                {state.lastResponseMeta.modelRole}
+              </span>
+              <span style={styles.metaTokens}>
+                {formatTokens(state.lastResponseMeta.completionTokens)} tokens
+              </span>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {/* ── Quick actions ─────────────────────────────────── */}
       <Card>
@@ -191,6 +230,12 @@ const styles: Record<string, React.CSSProperties> = {
   activityItem: { display: "flex", gap: "var(--space-2)", alignItems: "baseline" },
   activityRole: { fontSize: "var(--text-xs)", fontWeight: 600, fontFamily: "var(--font-display)", textTransform: "uppercase" as const, flexShrink: 0, letterSpacing: "0.04em" },
   activityText: { fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const },
+
+  // Last response metadata
+  metaRow: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const },
+  metaModel: { fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: "var(--color-text)", fontWeight: 500 },
+  metaRolePill: { fontSize: "var(--text-xs)", fontWeight: 600, padding: "2px 8px", borderRadius: "var(--radius-lg)", border: "1px solid", letterSpacing: "0.04em", textTransform: "uppercase" as const, fontFamily: "var(--font-mono)" },
+  metaTokens: { fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", marginLeft: "auto", fontFamily: "var(--font-mono)" },
   kbd: {
     display: "inline-block",
     fontFamily: "var(--font-mono)",

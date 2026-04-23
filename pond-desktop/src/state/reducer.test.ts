@@ -30,6 +30,7 @@ const BASE: AppState = {
   transcript: [],
   contextCards: [],
   voiceRequestId: 0,
+  lastResponseMeta: null,
 };
 
 function msg(overrides?: Partial<TranscriptMessage>): TranscriptMessage {
