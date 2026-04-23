@@ -1,13 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Tabs, Button, Chip, TextArea } from "@heroui/react";
-import { Trash2, Plus } from "lucide-react";
+import { Trash2, Plus, Send, Wrench } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { AgentTool, AgentRecipe, PromptExtra } from "../api/types";
+import type { AgentTool, AgentRecipe, PromptExtra, ChatEvent } from "../api/types";
 
-type Tab = "tools" | "extras" | "recipes";
+type Tab = "chat" | "tools" | "extras" | "recipes";
 
 export function Agent() {
-  const [tab, setTab] = useState<Tab>("tools");
+  const [tab, setTab] = useState<Tab>("chat");
 
   return (
     <div style={styles.root}>
@@ -17,6 +17,10 @@ export function Agent() {
       >
         <Tabs.ListContainer>
           <Tabs.List aria-label="Agent sections">
+            <Tabs.Tab id="chat">
+              <Tabs.Indicator />
+              Chat
+            </Tabs.Tab>
             <Tabs.Tab id="tools">
               <Tabs.Indicator />
               MCP Tools
@@ -31,10 +35,117 @@ export function Agent() {
             </Tabs.Tab>
           </Tabs.List>
         </Tabs.ListContainer>
+        <Tabs.Panel id="chat"><AgentChatPanel /></Tabs.Panel>
         <Tabs.Panel id="tools"><ToolsPanel /></Tabs.Panel>
         <Tabs.Panel id="extras"><ExtrasPanel /></Tabs.Panel>
         <Tabs.Panel id="recipes"><RecipesPanel /></Tabs.Panel>
       </Tabs>
+    </div>
+  );
+}
+
+// ── Agent Chat ────────────────────────────────────────────────
+
+type AgentMsg =
+  | { kind: "user"; text: string }
+  | { kind: "status"; text: string }
+  | { kind: "tool_call"; tool: string }
+  | { kind: "assistant"; text: string }
+  | { kind: "error"; text: string };
+
+function AgentChatPanel() {
+  const [messages, setMessages] = useState<AgentMsg[]>([]);
+  const [input, setInput]       = useState("");
+  const [busy, setBusy]         = useState(false);
+  const sessionId               = useRef<string | undefined>(undefined);
+  const bottomRef               = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput("");
+    setBusy(true);
+    setMessages((m) => [...m, { kind: "user", text }]);
+
+    try {
+      for await (const ev of api.agentChatStream(text, sessionId.current)) {
+        handleAgentEvent(ev);
+      }
+    } catch (e) {
+      setMessages((m) => [...m, { kind: "error", text: String(e) }]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleAgentEvent(ev: ChatEvent) {
+    if (ev.type === "status" && ev.content) {
+      setMessages((m) => [...m, { kind: "status", text: ev.content! }]);
+    } else if (ev.type === "tool_call" && ev.tool) {
+      setMessages((m) => [...m, { kind: "tool_call", tool: ev.tool! }]);
+    } else if (ev.type === "text" && ev.content) {
+      setMessages((m) => {
+        const last = m[m.length - 1];
+        if (last?.kind === "assistant") {
+          return [...m.slice(0, -1), { kind: "assistant", text: last.text + ev.content! }];
+        }
+        return [...m, { kind: "assistant", text: ev.content! }];
+      });
+    } else if (ev.done && ev.session_id) {
+      sessionId.current = ev.session_id;
+    } else if (ev.error) {
+      setMessages((m) => [...m, { kind: "error", text: ev.error! }]);
+    }
+  }
+
+  return (
+    <div style={styles.chatRoot}>
+      <div style={styles.chatMessages}>
+        {messages.length === 0 && (
+          <p style={hint}>Send a message. The agent can use MCP tools to take real actions.</p>
+        )}
+        {messages.map((msg, i) => {
+          if (msg.kind === "user") return (
+            <div key={i} style={styles.chatUserBubble}>{msg.text}</div>
+          );
+          if (msg.kind === "assistant") return (
+            <div key={i} style={styles.chatAssistantBubble}><pre style={styles.chatPre}>{msg.text}</pre></div>
+          );
+          if (msg.kind === "tool_call") return (
+            <div key={i} style={styles.chatToolCard}>
+              <Wrench size={12} style={{ flexShrink: 0, opacity: 0.7 }} />
+              <code style={{ fontSize: "var(--text-xs)" }}>{msg.tool}</code>
+            </div>
+          );
+          if (msg.kind === "status") return (
+            <div key={i} style={styles.chatStatus}>{msg.text}</div>
+          );
+          if (msg.kind === "error") return (
+            <div key={i} style={{ ...styles.chatStatus, color: "var(--color-destructive)" }}>{msg.text}</div>
+          );
+          return null;
+        })}
+        {busy && <div style={styles.chatStatus}>Agent working…</div>}
+        <div ref={bottomRef} />
+      </div>
+      <div style={styles.chatInputRow}>
+        <input
+          style={{ ...inputStyle, flex: 1 }}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          placeholder="Ask the agent…"
+          disabled={busy}
+          aria-label="Agent message"
+        />
+        <Button variant="primary" onPress={send} isDisabled={busy || !input.trim()}>
+          <Send size={14} />
+        </Button>
+      </div>
     </div>
   );
 }
@@ -248,6 +359,16 @@ const inlineCode: React.CSSProperties = { fontFamily: "var(--font-mono)", fontSi
 
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
+
+  // Agent chat
+  chatRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)", paddingTop: "var(--space-3)", height: "480px" },
+  chatMessages: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "var(--space-2)", paddingRight: "var(--space-1)" },
+  chatInputRow: { display: "flex", gap: "var(--space-2)", alignItems: "center" },
+  chatUserBubble: { alignSelf: "flex-end", background: "var(--color-accent)", color: "#fff", borderRadius: "var(--radius-md) var(--radius-md) 2px var(--radius-md)", padding: "var(--space-2) var(--space-3)", fontSize: "var(--text-sm)", maxWidth: "80%", whiteSpace: "pre-wrap" as const },
+  chatAssistantBubble: { alignSelf: "flex-start", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "2px var(--radius-md) var(--radius-md) var(--radius-md)", padding: "var(--space-2) var(--space-3)", fontSize: "var(--text-sm)", maxWidth: "90%" },
+  chatPre: { margin: 0, fontFamily: "inherit", whiteSpace: "pre-wrap" as const, lineHeight: "1.55" },
+  chatToolCard: { display: "flex", alignItems: "center", gap: "var(--space-2)", alignSelf: "flex-start", background: "rgba(23,22,22,0.04)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-sm)", padding: "2px var(--space-2)", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" },
+  chatStatus: { alignSelf: "flex-start", fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", fontStyle: "italic" },
 
   // Panel
   panelRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)", paddingTop: "var(--space-3)" },

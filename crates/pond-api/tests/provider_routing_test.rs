@@ -1,8 +1,7 @@
-//! Provider routing integration tests for POST /api/v1/chat/stream.
+//! Universal loop routing integration tests for POST /api/v1/chat/stream.
 //!
-//! Verifies that the ModelRouter correctly routes chat/think/task messages
-//! to the appropriate LLM provider, error events are emitted when providers fail,
-//! and usage stats are included in the done event when providers report them.
+//! Verifies that classification metadata remains correct for chat/think/task
+//! messages while all requests execute through the Agent port.
 //!
 //! All tests use a wiremock server as the llamafile backend — no live services needed.
 //!
@@ -77,6 +76,7 @@ impl ExtensionManagerPort for StubExtensionManager {
             kind: "builtin".to_string(),
             description: "GIAP builtin tools".to_string(),
             tools: vec!["giap__get_current_weather".to_string()],
+            enabled: true,
         }])
     }
 
@@ -90,6 +90,10 @@ impl ExtensionManagerPort for StubExtensionManager {
 
     async fn list_tools(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec!["giap__get_current_weather".to_string()])
+    }
+
+    async fn set_enabled(&self, _name: &str, _enabled: bool) -> anyhow::Result<()> {
+        Ok(()) // no-op in tests
     }
 }
 
@@ -107,6 +111,25 @@ impl Agent for ToolCallingAgent {
             text: "Task completed from agent".to_string(),
             metadata,
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        request: AgentRequest,
+    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<pond_core::domain::agent::AgentStreamEvent>>> {
+        let stream = async_stream::stream! {
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::ToolCall {
+                id: "test-tool-call-id".to_string(),
+                tool: "giap__get_current_weather".to_string(),
+                input: None,
+            });
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::Text { content: "Task completed from agent".to_string() });
+            yield Ok(pond_core::domain::agent::AgentStreamEvent::Done {
+                session_id: request.session_id,
+                model_role: request.model_role,
+            });
+        };
+        Ok(futures::stream::StreamExt::boxed(stream))
     }
 }
 
@@ -181,6 +204,7 @@ async fn make_app_with_provider(
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
+        event_log_repo: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -303,9 +327,10 @@ async fn task_message_routes_to_task_provider() {
     assert_eq!(done["model_role"].as_str(), Some("task"));
 }
 
-/// When the provider returns a non-200, the SSE stream should include an error event.
+/// Even when the wired provider would return 503, /chat/stream executes via
+/// the Agent port and should still return a normal text response.
 #[tokio::test]
-async fn error_event_emitted_when_provider_returns_500() {
+async fn provider_failure_does_not_break_universal_agent_path() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -326,10 +351,15 @@ async fn error_event_emitted_when_provider_returns_500() {
     let events = collect_sse_events(resp.into_body()).await;
     let error_event = events.iter().find(|e| e.get("error").is_some());
     assert!(
-        error_event.is_some(),
-        "expected an error event when provider returns 503, got events: {:?}",
+        error_event.is_none(),
+        "did not expect an error event when agent path is active, got events: {:?}",
         events
     );
+
+    let text_event = events
+        .iter()
+        .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("text"));
+    assert!(text_event.is_some(), "expected text event, got events: {:?}", events);
 }
 
 /// The done event must always include a non-empty session_id.
@@ -363,10 +393,9 @@ async fn done_event_has_session_id() {
     assert!(!session_id.is_empty(), "done event has empty session_id: {:?}", done);
 }
 
-/// When the provider SSE response includes a `usage` field, the done event must
-/// include `usage.prompt_tokens` and `usage.completion_tokens`.
+/// Agent-path responses currently emit usage fields with zero values.
 #[tokio::test]
-async fn done_event_has_usage_when_provider_includes_it() {
+async fn done_event_has_usage_shape_for_agent_path() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -393,14 +422,14 @@ async fn done_event_has_usage_when_provider_includes_it() {
 
     let prompt = done["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let completion = done["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    assert_eq!(prompt, 12, "expected prompt_tokens=12 in done event: {:?}", done);
-    assert_eq!(completion, 47, "expected completion_tokens=47 in done event: {:?}", done);
+    assert_eq!(prompt, 0, "expected prompt_tokens=0 in done event: {:?}", done);
+    assert_eq!(completion, 0, "expected completion_tokens=0 in done event: {:?}", done);
 }
 
-/// When no provider is configured and a non-task message is sent, the stream
-/// emits an explicit error event.
+/// With universal agent routing, non-task messages still succeed even when
+/// llm_provider is not configured.
 #[tokio::test]
-async fn no_provider_emits_error_event_for_non_task_messages() {
+async fn no_provider_still_returns_agent_response_for_non_task_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -444,6 +473,7 @@ async fn no_provider_emits_error_event_for_non_task_messages() {
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
+        event_log_repo: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -455,13 +485,10 @@ async fn no_provider_emits_error_event_for_non_task_messages() {
 
     let events = collect_sse_events(resp.into_body()).await;
     let error_event = events.iter().find(|e| e.get("error").is_some());
-    assert!(error_event.is_some(), "expected error event: {:?}", events);
-    assert_eq!(
-        error_event
-            .and_then(|e| e.get("error"))
-            .and_then(|e| e.as_str()),
-        Some("no LLM provider configured")
-    );
+    assert!(error_event.is_none(), "did not expect error event: {:?}", events);
+
+    let done = done_event(&events).expect("no done event");
+    assert_eq!(done["model_role"].as_str(), Some("chat"));
 }
 
 /// When task routing is active and Goose extensions are available, task
@@ -511,6 +538,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
+        event_log_repo: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

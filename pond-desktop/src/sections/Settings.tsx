@@ -1,14 +1,15 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Tabs, Switch, Button } from "@heroui/react";
+import { Tabs, Switch, Button, Chip } from "@heroui/react";
+import { Trash2, Plus } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppDispatch, useAppState } from "../state/AppContext";
-import type { Settings as SettingsType } from "../api/types";
+import type { Settings as SettingsType, Extension } from "../api/types";
 import { ModelPickerModal, type ModelRole } from "../components/ModelPickerModal";
 
 // ── Tab definitions ───────────────────────────────────────────
 
-type SettingsTab = "identity" | "voice" | "models" | "prompts" | "location" | "agent" | "data";
+type SettingsTab = "identity" | "voice" | "models" | "prompts" | "location" | "agent" | "data" | "tools";
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: "identity", label: "Identity" },
@@ -18,6 +19,7 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: "location", label: "Location" },
   { id: "agent",    label: "Agent" },
   { id: "data",     label: "Data" },
+  { id: "tools",    label: "Tools" },
 ];
 
 // ── Shared form primitives ────────────────────────────────────
@@ -747,6 +749,7 @@ export function Settings() {
             {tab === "location"  && <LocationTab  s={settings} patch={patch} />}
             {tab === "agent"     && <AgentTab     s={settings} patch={patch} />}
             {tab === "data"      && <DataTab s={settings} patch={patch} serverUrl={state.serverUrl} onServerUrlChange={(v) => dispatch({ type: "SET_SERVER_URL", payload: v })} />}
+            {tab === "tools"     && <ToolsTab />}
           </>
         )}
       </div>
@@ -757,6 +760,112 @@ export function Settings() {
           {saving ? "Saving…" : saved ? "Saved" : "Save Settings"}
         </Button>
       </div>
+    </div>
+  );
+}
+
+// ── Tools Tab ─────────────────────────────────────────────────
+
+function ToolsTab() {
+  const [extensions, setExtensions] = useState<Extension[]>([]);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState<string | null>(null);
+  const [showForm, setShowForm]     = useState(false);
+  const [addName, setAddName]       = useState("");
+  const [addKind, setAddKind]       = useState<"stdio" | "sse">("stdio");
+  const [addCmd, setAddCmd]         = useState("");
+  const [adding, setAdding]         = useState(false);
+
+  function load() {
+    setLoading(true);
+    api.listExtensions()
+      .then((r) => setExtensions(r.extensions))
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function toggle(name: string, enabled: boolean) {
+    try {
+      await api.toggleExtension(name, enabled);
+      setExtensions((prev) => prev.map((e) => e.name === name ? { ...e, enabled } : e));
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function remove(name: string) {
+    try { await api.removeExtension(name); load(); } catch (e) { setError(String(e)); }
+  }
+
+  async function add() {
+    if (!addName.trim() || !addCmd.trim()) return;
+    setAdding(true);
+    try {
+      await api.addExtension({ name: addName.trim(), kind: addKind, command: addCmd.trim() });
+      setAddName(""); setAddCmd(""); setShowForm(false); load();
+    } catch (e) { setError(String(e)); } finally { setAdding(false); }
+  }
+
+  const toolsInpStyle: React.CSSProperties = { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", background: "var(--color-bg)", color: "var(--color-text)", width: "100%" };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+      <div style={{ display: "flex", gap: "var(--space-2)" }}>
+        <Button variant="outline" onPress={() => setShowForm((v) => !v)}>
+          <Plus size={14} /> Add Extension
+        </Button>
+      </div>
+
+      {showForm && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" }}>
+          <input value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="Name (e.g. developer)" aria-label="Extension name" style={toolsInpStyle} />
+          <select value={addKind} onChange={(e) => setAddKind(e.target.value as "stdio" | "sse")} style={{ ...toolsInpStyle }}>
+            <option value="stdio">stdio</option>
+            <option value="sse">SSE</option>
+          </select>
+          <input value={addCmd} onChange={(e) => setAddCmd(e.target.value)} placeholder="Command or URI" aria-label="Extension command or URI" style={toolsInpStyle} />
+          <Button variant="primary" onPress={add} isDisabled={adding || !addName.trim() || !addCmd.trim()}>
+            {adding ? "Adding…" : "Add"}
+          </Button>
+        </div>
+      )}
+
+      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>{error}</p>}
+
+      {loading ? (
+        <p style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 }}>Loading extensions…</p>
+      ) : extensions.length === 0 ? (
+        <p style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 }}>No extensions configured. Add one above to enable tool use.</p>
+      ) : (
+        <ul style={{ listStyle: "none", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
+          {extensions.map((ext) => (
+            <li key={ext.name} style={{ display: "flex", alignItems: "flex-start", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-3) var(--space-4)" }}>
+              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const }}>
+                  <span style={{ fontWeight: 600, fontSize: "var(--text-sm)" }}>{ext.name}</span>
+                  <Chip size="sm" variant="soft">{ext.kind}</Chip>
+                  {!ext.enabled && <Chip size="sm" variant="soft" color="warning">Disabled</Chip>}
+                </div>
+                {ext.description && <p style={{ margin: "2px 0 4px", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" }}>{ext.description}</p>}
+                {ext.tools.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap" as const, gap: "4px", marginTop: "4px" }}>
+                    {ext.tools.slice(0, 8).map((t) => (
+                      <code key={t} style={{ fontSize: "11px", background: "rgba(23,22,22,0.05)", border: "1px solid var(--color-border)", borderRadius: "4px", padding: "1px 5px" }}>
+                        {t.replace(`${ext.name}__`, "")}
+                      </code>
+                    ))}
+                    {ext.tools.length > 8 && <span style={{ fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)" }}>+{ext.tools.length - 8} more</span>}
+                  </div>
+                )}
+              </div>
+              <Button variant="danger-soft" onPress={() => remove(ext.name)} aria-label={`Remove ${ext.name}`}>
+                <Trash2 size={14} />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

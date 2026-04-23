@@ -5,18 +5,35 @@ use goose::agents::extension::Envs;
 use pond_core::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct GiapGooseExtensionManager {
     agent: Arc<GooseAgent>,
     session_id: String,
+    /// Names of extensions that have been disabled by the user.
+    /// Kept in memory; persists until server restart.
+    disabled: Arc<RwLock<HashSet<String>>>,
+    /// Stored configurations for re-enabling extensions.
+    extension_configs: Arc<RwLock<HashMap<String, ExtensionConfig>>>,
 }
 
 impl GiapGooseExtensionManager {
     pub fn new(agent: Arc<GooseAgent>, session_id: String) -> Self {
-        Self { agent, session_id }
+        Self {
+            agent,
+            session_id,
+            disabled: Arc::new(RwLock::new(HashSet::new())),
+            extension_configs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn register_config(&self, name: String, config: ExtensionConfig) {
+        self.extension_configs.write().await.insert(name, config);
     }
 }
+
 
 #[async_trait]
 impl ExtensionManagerPort for GiapGooseExtensionManager {
@@ -43,11 +60,13 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             }
         }
 
+        let disabled = self.disabled.read().await;
         Ok(ext_map
             .into_iter()
             .map(|(name, tools)| ExtensionInfo {
                 kind: "builtin".to_string(),
                 description: String::new(),
+                enabled: !disabled.contains(&name),
                 name,
                 tools,
             })
@@ -103,6 +122,12 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             other => return Err(anyhow!("Unknown extension kind: {}", other)),
         };
 
+        // Store config for possible re-enabling later
+        self.extension_configs
+            .write()
+            .await
+            .insert(request.name.clone(), config.clone());
+
         self.agent
             .add_extension(config, &self.session_id)
             .await
@@ -113,10 +138,13 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             kind: request.kind,
             description: request.description,
             tools: vec![],
+            enabled: true,
         })
     }
 
     async fn remove_extension(&self, name: &str) -> Result<()> {
+        self.extension_configs.write().await.remove(name);
+        self.disabled.write().await.remove(name);
         self.agent
             .remove_extension(name, &self.session_id)
             .await
@@ -126,5 +154,32 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
     async fn list_tools(&self) -> Result<Vec<String>> {
         let tools = self.agent.list_tools(&self.session_id, None).await;
         Ok(tools.iter().map(|t| t.name.as_ref().to_string()).collect())
+    }
+
+    async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        let mut disabled = self.disabled.write().await;
+        if enabled {
+            if disabled.contains(name) {
+                // Re-enable: re-add to Goose agent
+                let configs = self.extension_configs.read().await;
+                if let Some(config) = configs.get(name) {
+                    self.agent
+                        .add_extension(config.clone(), &self.session_id)
+                        .await
+                        .map_err(|e| anyhow!("Failed to re-enable extension: {}", e))?;
+                }
+                disabled.remove(name);
+            }
+        } else {
+            if !disabled.contains(name) {
+                // Disable: remove from Goose agent
+                self.agent
+                    .remove_extension(name, &self.session_id)
+                    .await
+                    .map_err(|e| anyhow!("Failed to disable extension: {}", e))?;
+                disabled.insert(name.to_string());
+            }
+        }
+        Ok(())
     }
 }
