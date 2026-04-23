@@ -2,10 +2,34 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatWidget from '../components/ChatWidget'
-import { mockSpeak } from '../test-setup'
 
 const TOKEN = 'test-token'
 const PREVIEW = 'dev-mock-token'
+
+function mockSseResponse(events: Array<Record<string, unknown>>): Response {
+  const payload = events.map((ev) => `data: ${JSON.stringify(ev)}\n`).join('')
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(payload))
+      controller.close()
+    },
+  })
+  return { ok: true, body } as unknown as Response
+}
+
+function mockChatStreamResponse(sessionId: string, text: string, modelRole = 'chat'): Response {
+  return mockSseResponse([
+    { type: 'text', content: text, token: text },
+    { done: true, session_id: sessionId, model_role: modelRole },
+  ])
+}
+
+function mockTtsResponse(): Response {
+  return {
+    ok: true,
+    blob: () => Promise.resolve(new Blob(['wav'], { type: 'audio/wav' })),
+  } as unknown as Response
+}
 
 beforeEach(() => {
   vi.restoreAllMocks()
@@ -55,10 +79,9 @@ describe('ChatWidget history loading', () => {
 
 describe('ChatWidget sending messages', () => {
   it('appends user and assistant messages on send', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ session_id: 'sess-1', response: 'Hello back!' }),
-    } as Response)
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockChatStreamResponse('sess-1', 'Hello back!'))
+      .mockResolvedValueOnce(mockTtsResponse())
 
     render(<ChatWidget token={TOKEN} />)
     await waitFor(() => expect(screen.queryByText('Loading conversation…')).toBeNull())
@@ -74,10 +97,9 @@ describe('ChatWidget sending messages', () => {
   })
 
   it('persists session id to localStorage after first message', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ session_id: 'new-sess', response: 'Hi!' }),
-    } as Response)
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockChatStreamResponse('new-sess', 'Hi!'))
+      .mockResolvedValueOnce(mockTtsResponse())
 
     render(<ChatWidget token={TOKEN} />)
     await waitFor(() => expect(screen.queryByText('Loading conversation…')).toBeNull())
@@ -97,10 +119,9 @@ describe('ChatWidget sending messages', () => {
 describe('ChatWidget TTS', () => {
   it('speaks assistant response when not muted', async () => {
     localStorage.setItem('pond_tts_muted', 'false')
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ session_id: 's1', response: 'Speaking now.' }),
-    } as Response)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockChatStreamResponse('s1', 'Speaking now.'))
+      .mockResolvedValueOnce(mockTtsResponse())
 
     render(<ChatWidget token={TOKEN} />)
     await waitFor(() => expect(screen.queryByText('Loading conversation…')).toBeNull())
@@ -110,16 +131,16 @@ describe('ChatWidget TTS', () => {
     fireEvent.submit(input.closest('form')!)
 
     await waitFor(() => {
-      expect(mockSpeak).toHaveBeenCalled()
+      expect(screen.getByText('Speaking now.')).toBeTruthy()
     })
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).includes('/api/v1/tts'))).toBe(true)
   })
 
   it('does not speak when muted', async () => {
     localStorage.setItem('pond_tts_muted', 'true')
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ session_id: 's1', response: 'Silent response.' }),
-    } as Response)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockChatStreamResponse('s1', 'Silent response.'))
 
     render(<ChatWidget token={TOKEN} />)
     await waitFor(() => expect(screen.queryByText('Loading conversation…')).toBeNull())
@@ -131,7 +152,8 @@ describe('ChatWidget TTS', () => {
     await waitFor(() => {
       expect(screen.getByText('Silent response.')).toBeTruthy()
     })
-    expect(mockSpeak).not.toHaveBeenCalled()
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(fetchSpy.mock.calls[0]?.[0]).toContain('/api/v1/chat/stream')
   })
 })
 

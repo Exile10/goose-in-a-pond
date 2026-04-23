@@ -22,11 +22,12 @@ use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::ports::scheduler::CreateTaskRequest;
 use pond_core::domain::settings::Settings;
+use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
-use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext, SYSTEM_PROMPT};
+use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext};
 use pond_core::ports::provider::LlmProvider;
 use pond_core::services::chat::ChatService;
 use pond_core::services::model_router::ModelRouter;
@@ -69,8 +70,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/test/speak", post(test_speak))
         // Goose agent status (public — dev diagnostic)
         .route("/dev/goose", get(goose_status))
-        // Qwen TTS status (public — dev diagnostic)
-        .route("/dev/qwen-status", get(qwen_tts_status))
         // Profile create/patch are public so onboarding steps can write before completion
         .route("/profiles", post(create_profile))
         .route("/profiles/{id}", patch(update_profile_prefs));
@@ -359,56 +358,125 @@ struct TtsRequest {
 ///
 /// Priority order:
 /// 1. Piper HTTP server (if running — see `AppState.piper_http_port`)
-/// 2. Qwen TTS HTTP server (if `AppState.qwen_tts_url` is configured)
-/// 3. 503 Service Unavailable — no TTS backend is running
-///
-/// Callers should create an `Audio` object from the returned blob and play it.
-/// This replaces `window.speechSynthesis` on the frontend so that the server's
-/// configured TTS voice is always used.
 async fn tts_synthesise(
     State(state): State<Arc<AppState>>,
     body: Result<Json<TtsRequest>, JsonRejection>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
-    let text = req.text.trim().to_string();
+
+    let text = req.text.trim();
     if text.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "text is required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "'text' must not be empty"})),
+        ));
     }
 
-    // Priority 1: Piper HTTP server
-    if let Some(port) = state.piper_http_port {
-        let url = format!("http://127.0.0.1:{}/tts", port);
-        if let Ok(res) = state.http_client.post(&url).body(text.clone()).send().await {
-            if res.status().is_success() {
-                let bytes = res.bytes().await.unwrap_or_default();
-                return Ok(Response::builder()
-                    .header("Content-Type", "audio/wav")
-                    .header("Content-Length", bytes.len())
-                    .body(Body::from(bytes))
-                    .unwrap());
-            }
+    let Some(port) = state.piper_http_port else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No TTS backend is running"})),
+        ));
+    };
+
+    let piper_url = format!("http://127.0.0.1:{}/tts", port);
+    let resp = state
+        .http_client
+        .post(&piper_url)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(text.to_string())
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("Piper HTTP unavailable: {}", e)})),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": format!(
+                    "Piper HTTP synthesis failed (status {}): {}",
+                    status.as_u16(),
+                    body
+                )
+            })),
+        ));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_string();
+
+    let bytes = resp.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed reading Piper audio response: {}", e)})),
+        )
+    })?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .body(Body::from(bytes.to_vec()))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to build TTS response: {}", e)})),
+            )
+        })
+}
+
+fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String {
+    if extensions.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "## Tool Use Guidance".to_string(),
+        "You may call tools when they are necessary to complete the user request.".to_string(),
+        "- Prefer the smallest number of tool calls that can complete the task.".to_string(),
+        "- If a tool fails, explain what failed and continue with the best possible answer.".to_string(),
+        "".to_string(),
+        "Available tools:".to_string(),
+    ];
+
+    let mut tool_count = 0usize;
+    for ext in extensions {
+        if ext.tools.is_empty() {
+            continue;
+        }
+        tool_count += ext.tools.len();
+
+        if ext.description.trim().is_empty() {
+            lines.push(format!("- {} ({})", ext.name, ext.kind));
+        } else {
+            lines.push(format!("- {} ({}) - {}", ext.name, ext.kind, ext.description.trim()));
+        }
+
+        for tool in &ext.tools {
+            lines.push(format!("  - {}", tool));
         }
     }
 
-    // Priority 2: Qwen TTS HTTP server
-    if let Some(ref qwen_url) = state.qwen_tts_url {
-        let url = format!("{}/v1/audio/speech", qwen_url);
-        let body_json = json!({ "model": "qwen-tts", "input": text, "voice": "default" });
-        if let Ok(res) = state.http_client.post(&url).json(&body_json).send().await {
-            if res.status().is_success() {
-                let bytes = res.bytes().await.unwrap_or_default();
-                return Ok(Response::builder()
-                    .header("Content-Type", "audio/wav")
-                    .header("Content-Length", bytes.len())
-                    .body(Body::from(bytes))
-                    .unwrap());
-            }
-        }
+    if tool_count == 0 {
+        return String::new();
     }
 
-    Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "No TTS backend is running"}))))
+    lines.join("\n")
 }
 
 // ── SSE streaming chat ────────────────────────────────────────────────────────
@@ -443,26 +511,22 @@ async fn chat_stream(
             }
         }
 
-        // Build the system prompt (mirrors the logic in chat())
-        let system_prompt = {
-            let settings = state.settings_repo.get().await.ok();
+        let settings = state.settings_repo.get().await.unwrap_or_default();
 
-            let profile_ctx: Option<ProfileContext> = if let Some(ref s) = settings {
-                if let Some(ref pid) = s.primary_profile_id {
-                    state.profile_repo.get(pid).await.ok().flatten().map(|p| {
-                        let prefs = &p.preferences;
-                        ProfileContext {
-                            preferred_name: prefs.get("preferred_name").cloned(),
-                            birthday: prefs.get("birthday").cloned(),
-                            language: prefs.get("language").cloned(),
-                            atypical_speech: prefs.get("accessibility_atypical_speech")
-                                .map(|v| v == "true")
-                                .unwrap_or(false),
-                        }
-                    })
-                } else {
-                    None
-                }
+        // Build the system prompt
+        let system_prompt = {
+            let profile_ctx: Option<ProfileContext> = if let Some(ref pid) = settings.primary_profile_id {
+                state.profile_repo.get(pid).await.ok().flatten().map(|p| {
+                    let prefs = &p.preferences;
+                    ProfileContext {
+                        preferred_name: prefs.get("preferred_name").cloned(),
+                        birthday: prefs.get("birthday").cloned(),
+                        language: prefs.get("language").cloned(),
+                        atypical_speech: prefs.get("accessibility_atypical_speech")
+                            .map(|v| v == "true")
+                            .unwrap_or(false),
+                    }
+                })
             } else {
                 None
             };
@@ -472,18 +536,18 @@ async fn chat_stream(
                 .as_ref()
                 .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
 
-            match (file_template, settings) {
-                (Some(tmpl), Some(s)) => {
-                    let name     = sanitize_field(&s.assistant_name, 50);
-                    let user     = sanitize_field(&s.user_name, 50);
-                    let persona  = sanitize_field(&s.assistant_personality, 200);
-                    let tz       = sanitize_field(&s.timezone, 50);
-                    let location = if s.weather_location_name.is_empty() {
+            match file_template {
+                Some(tmpl) => {
+                    let name     = sanitize_field(&settings.assistant_name, 50);
+                    let user     = sanitize_field(&settings.user_name, 50);
+                    let persona  = sanitize_field(&settings.assistant_personality, 200);
+                    let tz       = sanitize_field(&settings.timezone, 50);
+                    let location = if settings.weather_location_name.is_empty() {
                         String::new()
                     } else {
-                        format!("\nLocation: {}.", sanitize_field(&s.weather_location_name, 100))
+                        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
                     };
-                    let addendum = sanitize_field(&s.prompt_addendum, 500);
+                    let addendum = sanitize_field(&settings.prompt_addendum, 500);
                     render_template(&tmpl, &[
                         ("assistant_name",  name.as_str()),
                         ("user_name",       user.as_str()),
@@ -493,18 +557,48 @@ async fn chat_stream(
                         ("prompt_addendum", addendum.as_str()),
                     ])
                 }
-                (None, Some(s)) => build_system_prompt_with_profile(&s, profile_ctx.as_ref()),
-                _ => SYSTEM_PROMPT.to_string(),
+                None => build_system_prompt_with_profile(&settings, profile_ctx.as_ref()),
             }
         };
 
-        let system_prompt = match &state.mcp_memory {
+        let mut system_prompt = match &state.mcp_memory {
             Some(m) => {
                 let mem = m.instructions();
                 if mem.is_empty() { system_prompt } else { format!("{}\n\n---\n{}", system_prompt, mem) }
             }
             None => system_prompt,
         };
+
+        if let Some(mgr) = &state.extension_manager {
+            match mgr.list_extensions().await {
+                Ok(extensions) => {
+                    const MAX_TOOL_GUIDANCE_CHARS: usize = 4_000;
+                    const TOOL_GUIDANCE_TRUNCATION_NOTE: &str =
+                        "\n\n[tool guidance truncated; additional tools omitted]";
+
+                    let guidance = render_tool_guidance_from_extensions(&extensions);
+                    if !guidance.is_empty() {
+                        let bounded_guidance = if guidance.len() > MAX_TOOL_GUIDANCE_CHARS {
+                            let reserved = TOOL_GUIDANCE_TRUNCATION_NOTE.len();
+                            let max_content_len = MAX_TOOL_GUIDANCE_CHARS.saturating_sub(reserved);
+                            let mut cut = max_content_len.min(guidance.len());
+                            while cut > 0 && !guidance.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            format!("{}{}", &guidance[..cut], TOOL_GUIDANCE_TRUNCATION_NOTE)
+                        } else {
+                            guidance
+                        };
+
+                        system_prompt.push_str("\n\n");
+                        system_prompt.push_str(&bounded_guidance);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to list extensions for tool guidance: {}", e);
+                }
+            }
+        }
 
         // Classify message for model role
         let model_role = {
@@ -530,11 +624,9 @@ async fn chat_stream(
         }
 
         // Load conversation history and apply context budget
-        let history = match storage.get_recent_messages(&session_id, 100).await {
+        let raw_history = match storage.get_recent_messages(&session_id, 100).await {
             Ok(msgs) => {
-                use pond_core::services::context_budget;
-                let raw: Vec<ChatMessage> = msgs.into_iter().map(|sm| sm.message).collect();
-                context_budget::trim_to_budget(raw)
+                msgs.into_iter().map(|sm| sm.message).collect::<Vec<ChatMessage>>()
             }
             Err(e) => {
                 let data = json!({"error": format!("Failed to load history: {}", e)}).to_string();
@@ -543,22 +635,122 @@ async fn chat_stream(
             }
         };
 
-        // Acquire provider and stream tokens
+        // `llm_max_tokens` caps generation length, not the model's full context window.
+        // Use a conservative context-window budget and reserve the generation cap from it.
+        // A future improvement: read context_length from the model catalog DB.
+        const FALLBACK_CONTEXT_WINDOW_TOKENS: usize = 8_192;
+        let reserved_response_tokens = (settings.llm_max_tokens as usize).max(256);
+        let context_limit_tokens = FALLBACK_CONTEXT_WINDOW_TOKENS
+            .saturating_sub(reserved_response_tokens)
+            .max(256);
+        let mut history = pond_core::services::context_budget::truncate_tool_outputs(raw_history);
+        history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
+
+        // ── On-demand llamafile startup ─────────────────────────────────────
+        // If any role uses llamafile and the process is not responding, emit a
+        // status event and wait up to 90 s before attempting to stream.
+        {
+            let is_llamafile_role = settings.chat_provider == "llamafile"
+                || settings.think_provider.as_deref() == Some("llamafile")
+                || settings.task_provider.as_deref()  == Some("llamafile");
+
+            if is_llamafile_role {
+                if let Some(manager) = &state.llamafile_manager {
+                    if !manager.is_running().await {
+                        let status = json!({"type": "status", "content": "Model starting…"})
+                            .to_string();
+                        yield Ok(Event::default().data(status));
+
+                        let model_hint = if settings.chat_provider == "llamafile" {
+                            Some(settings.chat_model.as_str())
+                        } else {
+                            None
+                        };
+
+                        let (_url, ready) = manager
+                            .ensure_started_and_wait(model_hint, 90)
+                            .await;
+
+                        if !ready {
+                            let data = json!({"error":
+                                "llamafile did not start within 90 s — \
+                                 check that a model file is installed"
+                            }).to_string();
+                            yield Ok(Event::default().data(data));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Acquire provider for compaction and streaming.
         let provider_opt = {
             let guard = state.llm_provider.read().await;
             guard.as_ref().cloned()
         };
 
-        let mut full_text = String::new();
+        // Context compaction runs independently of the memory-injection setting.
+        // `agent_memory_inject` controls memory-fragment prepending only.
+        if let Some(provider) = &provider_opt {
+            let compactor = pond_core::services::context_compactor::ContextCompactor::default();
+            if compactor.needs_compaction(&history) {
+                history = compactor.compact(provider.as_ref(), history).await;
+                history = pond_core::services::context_budget::trim_to_budget_with_limit(history, context_limit_tokens);
+            }
+        }
 
-        if let Some(provider) = provider_opt {
+        let mut full_text = String::new();
+        let mut usage_prompt_tokens: u32 = 0;
+        let mut usage_completion_tokens: u32 = 0;
+        let use_agent = model_role == "task"
+            && settings.agent_goose_mode != "off"
+            && state.extension_manager.is_some();
+
+        if use_agent {
+            use pond_core::domain::agent::AgentRequest;
+            let agent_req = AgentRequest {
+                message: req.message.clone(),
+                session_id: session_id.clone(),
+            };
+
+            match state.agent.chat(agent_req).await {
+                Ok(resp) => {
+                    if let Some(raw_calls) = resp.metadata.get("tool_calls") {
+                        if let Ok(tool_calls) = serde_json::from_str::<Vec<String>>(raw_calls) {
+                            for tool_name in tool_calls {
+                                let data = json!({"type": "tool_call", "tool": tool_name, "result": {}}).to_string();
+                                yield Ok(Event::default().data(data));
+                            }
+                        }
+                    }
+
+                    full_text = resp.text.clone();
+                    let data = json!({"type": "text", "content": resp.text, "token": resp.text}).to_string();
+                    yield Ok(Event::default().data(data));
+                }
+                Err(e) => {
+                    let data = json!({"error": e.to_string()}).to_string();
+                    yield Ok(Event::default().data(data));
+                    return;
+                }
+            }
+        } else if let Some(provider) = provider_opt {
+            use pond_core::ports::provider::StreamToken;
             let mut token_stream = provider.stream_complete(&system_prompt, history);
             while let Some(result) = token_stream.next().await {
                 match result {
-                    Ok(token) => {
+                    Ok(StreamToken::Text(token)) => {
                         full_text.push_str(&token);
-                        let data = json!({"token": token}).to_string();
+                        // Emit both formats: {"type":"text","content":"..."} is the canonical
+                        // format consumed by the Tauri voice pipeline (canvas_feed.rs + audio_cmd.rs);
+                        // {"token":"..."} is kept for backwards-compat with any direct SSE consumers.
+                        let data = json!({"type": "text", "content": token, "token": token}).to_string();
                         yield Ok(Event::default().data(data));
+                    }
+                    Ok(StreamToken::Usage(u)) => {
+                        usage_prompt_tokens = u.prompt_tokens;
+                        usage_completion_tokens = u.completion_tokens;
                     }
                     Err(e) => {
                         let data = json!({"error": e.to_string()}).to_string();
@@ -568,24 +760,9 @@ async fn chat_stream(
                 }
             }
         } else {
-            // Fallback: use MockAgent (echo)
-            use pond_core::domain::agent::AgentRequest;
-            let agent_req = AgentRequest {
-                message: req.message.clone(),
-                session_id: session_id.clone(),
-            };
-            match state.agent.chat(agent_req).await {
-                Ok(resp) => {
-                    full_text = resp.text.clone();
-                    let data = json!({"token": resp.text}).to_string();
-                    yield Ok(Event::default().data(data));
-                }
-                Err(e) => {
-                    let data = json!({"error": e.to_string()}).to_string();
-                    yield Ok(Event::default().data(data));
-                    return;
-                }
-            }
+            let data = json!({"error": "no LLM provider configured"}).to_string();
+            yield Ok(Event::default().data(data));
+            return;
         }
 
         // Persist full assistant response
@@ -598,7 +775,15 @@ async fn chat_stream(
         }
 
         // Done event
-        let data = json!({"done": true, "session_id": session_id, "model_role": model_role}).to_string();
+        let data = json!({
+            "done": true,
+            "session_id": session_id,
+            "model_role": model_role,
+            "usage": {
+                "prompt_tokens": usage_prompt_tokens,
+                "completion_tokens": usage_completion_tokens,
+            }
+        }).to_string();
         yield Ok(Event::default().data(data));
     };
 
@@ -880,7 +1065,7 @@ async fn update_settings(
                     }
                     // Derive category from provider
                     let category = match *provider {
-                        "local"  => "gguf",
+                        "local" | "gguf" => "gguf",
                         "ollama" => "ollama",
                         "asr" | "" if *role == "asr" => "whisper",
                         "tts" | "" if *role == "tts" => "tts_piper",
@@ -893,7 +1078,9 @@ async fn update_settings(
         }
     }
 
-    Ok(Json(json!({ "status": "ok" })))
+    // Return the full merged Settings so the frontend can sync its local state
+    // without a second GET request.
+    Ok(Json(serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" }))))
 }
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
@@ -905,32 +1092,99 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
     use pond_core::ports::provider::LlmProvider as _;
 
     let url = &state.llamafile_url;
+    let data_dir = state.data_dir.clone();
+    let max_tokens   = settings.llm_max_tokens;
+    let temperature  = settings.llm_temperature;
 
-    let build = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+    /// Build one `Arc<dyn LlmProvider>` for a given (provider, model) pair.
+    ///
+    /// `"local"` → `LocalInferenceLlmAdapter` (compiled in with the
+    ///   `local-inference` feature; falls back to llamafile otherwise).
+    /// `"ollama"` → `OllamaProvider`.
+    /// anything else → `LlamafileProvider`.
+    async fn build_one(
+        provider: &str,
+        model: &str,
+        url: &str,
+        _data_dir: Option<std::path::PathBuf>,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Arc<dyn LlmProvider> {
         match provider {
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
+
+            #[cfg(feature = "local-inference")]
+            "local" | "gguf" => {
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+
+                // `new_with_data_dir` handles both raw ".gguf" filenames and
+                // HuggingFace "repo:quant" IDs, registering the model in Goose's
+                // global registry so LocalInferenceProvider can locate the file.
+                let result = match &_data_dir {
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
+                    None      => LocalInferenceLlmAdapter::new(model).await,
+                };
+                match result {
+                    Ok(adapter) => Arc::new(adapter) as Arc<dyn LlmProvider>,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
+                             falling back to llamafile",
+                            model, e
+                        );
+                        Arc::new(LlamafileProvider::new(Some(url))
+                            .with_max_tokens(max_tokens)
+                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                    }
+                }
+            }
+
             _ => Arc::new(
                 LlamafileProvider::new(Some(url))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
         }
-    };
+    }
 
-    let effective_chat_provider = &settings.chat_provider;
-    let effective_chat_model    = &settings.chat_model;
+    let effective_chat_provider = settings.chat_provider.clone();
+    let effective_chat_model    = settings.chat_model.clone();
 
-    let chat  = build(effective_chat_provider, effective_chat_model);
+    let chat = build_one(&effective_chat_provider, &effective_chat_model,
+                         url, data_dir.clone(), max_tokens, temperature).await;
     let think = if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-        build(tp, tm)
+        build_one(tp, tm, url, data_dir.clone(), max_tokens, temperature).await
     } else { chat.clone() };
     let task  = if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-        build(tp, tm)
+        build_one(tp, tm, url, data_dir, max_tokens, temperature).await
     } else { chat.clone() };
+
+    // If any role uses llamafile, ensure the process is running before
+    // the new router goes live (so the first request doesn't time out).
+    let any_llamafile = effective_chat_provider == "llamafile"
+        || settings.think_provider.as_deref() == Some("llamafile")
+        || settings.task_provider.as_deref()  == Some("llamafile");
+
+    if any_llamafile {
+        if let Some(manager) = &state.llamafile_manager {
+            tracing::info!("llamafile provider selected — ensuring server is running");
+            let model_hint = if effective_chat_provider == "llamafile" {
+                Some(effective_chat_model.as_str())
+            } else {
+                None
+            };
+            manager.ensure_started(model_hint).await;
+        } else {
+            tracing::warn!(
+                "llamafile provider selected but no LlamafileManager wired in AppState; \
+                 process will not be auto-started"
+            );
+        }
+    }
 
     let new_router: Arc<dyn LlmProvider> = Arc::new(ModelRouter::new(chat, think, task));
     *state.llm_provider.write().await = Some(new_router);
@@ -1361,6 +1615,17 @@ async fn activate_model(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
 
+    // Persist provider keys using runtime provider names (not category names).
+    // GGUF category maps to the "local" provider in runtime routing.
+    let provider = match cat {
+        ModelCategory::Gguf      => "local",
+        ModelCategory::Llamafile => "llamafile",
+        ModelCategory::Ollama    => "ollama",
+        ModelCategory::Whisper   => "asr",
+        ModelCategory::TtsPiper  => "tts",
+        ModelCategory::TtsHttp   => "tts",
+    };
+
     // Persist assignment
     model_repo.set_assignment(&role, &model_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
@@ -1370,15 +1635,15 @@ async fn activate_model(
     match role.as_str() {
         "chat"  => {
             let _ = settings_repo.set_key("chat_model",    name.clone()).await;
-            let _ = settings_repo.set_key("chat_provider", category.clone()).await;
+            let _ = settings_repo.set_key("chat_provider", provider.to_string()).await;
         }
         "think" => {
             let _ = settings_repo.set_key("think_model",    name.clone()).await;
-            let _ = settings_repo.set_key("think_provider", category.clone()).await;
+            let _ = settings_repo.set_key("think_provider", provider.to_string()).await;
         }
         "task"  => {
             let _ = settings_repo.set_key("task_model",    name.clone()).await;
-            let _ = settings_repo.set_key("task_provider", category.clone()).await;
+            let _ = settings_repo.set_key("task_provider", provider.to_string()).await;
         }
         "asr"   => { let _ = settings_repo.set_key("active_whisper_model", name.clone()).await; }
         "tts"   => { let _ = settings_repo.set_key("active_tts_model",     name.clone()).await; }
@@ -2006,7 +2271,9 @@ async fn transcribe(
         })?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        tracing::warn!("whisper returned {}: {}", status, body);
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": body})),
@@ -2198,31 +2465,11 @@ code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
     <pre id="fallback-out">—</pre>
   </div>
 
-  <!-- TTS -->
-  <div class="card">
+    <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
       <h2>TTS</h2>
-      <button class="secondary" onclick="checkQwenStatus()" style="font-size:0.75rem">↺ Refresh</button>
     </div>
-    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Qwen TTS is primary; Piper is the fallback.</p>
-
-    <!-- Qwen TTS status row -->
-    <table style="width:100%;border-collapse:collapse;margin-bottom:0.75rem;font-size:0.82rem">
-      <tbody>
-        <tr>
-          <td style="padding:4px 8px 4px 0;color:var(--muted);white-space:nowrap">Qwen server</td>
-          <td><span id="qwen-server-badge" class="badge unknown">—</span></td>
-          <td style="padding:4px 0 4px 12px;color:var(--muted);white-space:nowrap">Model</td>
-          <td><span id="qwen-model-badge" class="badge unknown">—</span></td>
-          <td style="padding:4px 0 4px 12px" id="qwen-url-cell"></td>
-        </tr>
-        <tr>
-          <td colspan="5" style="padding:2px 0">
-            <span id="qwen-message" style="color:var(--muted);font-size:0.78rem"></span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Piper TTS is the active backend.</p>
 
     <div style="margin-bottom:0.5rem">
       <textarea id="tts-text">Hello! I am Goose, your local AI assistant.</textarea>
@@ -2566,44 +2813,6 @@ async function testFallback(){
   }catch(e){out.textContent='Error: '+e.message;}
 }
 
-// ── TTS ───────────────────────────────────────────────────────────────────────
-async function checkQwenStatus(){
-  const serverBadge = document.getElementById('qwen-server-badge');
-  const modelBadge  = document.getElementById('qwen-model-badge');
-  const msgEl       = document.getElementById('qwen-message');
-  const urlCell     = document.getElementById('qwen-url-cell');
-  serverBadge.className='badge pending'; serverBadge.textContent='…';
-  modelBadge.className='badge pending';  modelBadge.textContent='…';
-  try{
-    const r = await fetch(`${API}/dev/qwen-status`);
-    const d = await r.json();
-    // Server badge
-    if(!d.configured){
-      serverBadge.className='badge error'; serverBadge.textContent='not configured';
-      modelBadge.className='badge unknown'; modelBadge.textContent='—';
-    } else if(d.server==='up'){
-      serverBadge.className='badge ok'; serverBadge.textContent='up';
-      // Model badge
-      if(d.model==='ready'){
-        modelBadge.className='badge ok'; modelBadge.textContent='ready ✓';
-      } else if(d.model==='loading'){
-        modelBadge.className='badge pending'; modelBadge.textContent='loading…';
-      } else {
-        modelBadge.className='badge error'; modelBadge.textContent='error';
-      }
-    } else {
-      serverBadge.className='badge error'; serverBadge.textContent='down';
-      modelBadge.className='badge unknown'; modelBadge.textContent='—';
-    }
-    msgEl.textContent = d.message||'';
-    urlCell.textContent = d.url||'';
-  }catch(e){
-    serverBadge.className='badge error'; serverBadge.textContent='error';
-    modelBadge.className='badge unknown'; modelBadge.textContent='—';
-    msgEl.textContent = e.message;
-  }
-}
-
 async function testTts(){
   const text=document.getElementById('tts-text').value.trim()||'Hello from Goose!';
   const out=document.getElementById('tts-out');
@@ -2618,8 +2827,6 @@ async function testTts(){
     const d=await r.json();
     d._client_latency_ms=Date.now()-t0;
     out.textContent=JSON.stringify(d,null,2);
-    // Refresh Qwen status after a speak attempt (shows if model became ready)
-    checkQwenStatus();
   }catch(e){out.textContent='Error: '+e.message;}
 }
 
@@ -2914,9 +3121,6 @@ checkServices();
 fetchWeather();
 listSchedules();
 loadGooseStatus();
-checkQwenStatus();
-// Re-poll Qwen status every 15 s while the page is open (model loading can take minutes)
-setInterval(checkQwenStatus, 15000);
 </script>
 </body>
 </html>"#;
@@ -2996,71 +3200,6 @@ async fn test_speak(
             "text": text,
             "message": "No TTS engine configured. Start server with --tts piper after running setup.",
         })),
-    }
-}
-
-/// `GET /api/v1/dev/qwen-status`
-///
-/// Probe the Qwen TTS server and return its current state:
-/// ```json
-/// { "configured": bool, "url": "...", "server": "up"|"down",
-///   "model": "ready"|"loading"|"error", "message": "..." }
-/// ```
-async fn qwen_tts_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let Some(ref url) = state.qwen_tts_url else {
-        return Json(json!({
-            "configured": false,
-            "server": "down",
-            "model": "none",
-            "message": "Qwen TTS not configured (no URL in AppState). \
-                        Start server with default TTS settings to enable it."
-        }));
-    };
-
-    let client = &state.http_client;
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await;
-
-    match resp {
-        Err(e) => Json(json!({
-            "configured": true,
-            "url": url,
-            "server": "down",
-            "model": "none",
-            "message": format!("Server not reachable: {}", e),
-        })),
-        Ok(r) => {
-            let status = r.status().as_u16();
-            let body = r.text().await.unwrap_or_default();
-            if status == 200 {
-                Json(json!({
-                    "configured": true,
-                    "url": url,
-                    "server": "up",
-                    "model": "ready",
-                    "message": "Model loaded and ready.",
-                }))
-            } else if status == 503 {
-                Json(json!({
-                    "configured": true,
-                    "url": url,
-                    "server": "up",
-                    "model": "loading",
-                    "message": body,
-                }))
-            } else {
-                Json(json!({
-                    "configured": true,
-                    "url": url,
-                    "server": "up",
-                    "model": "error",
-                    "message": format!("Unexpected status {}: {}", status, body),
-                }))
-            }
-        }
     }
 }
 

@@ -29,6 +29,7 @@ vi.mock("../api/PondApiClient", () => ({
     }),
     updateSettings: vi.fn().mockResolvedValue({}),
     listModels: vi.fn().mockResolvedValue([]),
+    getActiveRoles: vi.fn().mockResolvedValue({ chat: null, think: null, task: null, asr: null, tts: null }),
   },
 }));
 

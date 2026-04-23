@@ -6,7 +6,7 @@
 //! Typical wiring:
 //! ```ignore
 //! let tts = Arc::new(FallbackVoiceOutput::new(
-//!     Arc::new(QwenTtsOutput::new(None)),   // primary
+//!     Arc::new(PiperOutput::new(primary_bin, primary_model)),
 //!     Arc::new(PiperOutput::new(bin, model)), // fallback
 //! ));
 //! ```

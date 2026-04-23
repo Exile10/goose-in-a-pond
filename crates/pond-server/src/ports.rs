@@ -22,8 +22,6 @@ pub const LLAMAFILE: u16 = 8080;
 /// Piper TTS in-process HTTP bridge (loopback only).
 pub const PIPER_TTS: u16 = 8282;
 
-/// Qwen TTS Python subprocess (loopback only).
-pub const QWEN_TTS: u16 = 8181;
 
 /// How many sequential port numbers to try before giving up.
 pub const MAX_TRIES: u16 = 10;

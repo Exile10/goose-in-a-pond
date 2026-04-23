@@ -15,9 +15,27 @@ pub enum ProviderError {
     ModelNotAvailable(String),
 }
 
-/// A pinned, boxed stream of tokens.  Each item is either a token string or an error.
+/// Token usage reported by the model after a completion.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct UsageStats {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+/// A single item emitted by [`TokenStream`].
+#[derive(Debug, Clone)]
+pub enum StreamToken {
+    /// A text fragment (token) produced by the model.
+    Text(String),
+    /// Final token-usage statistics — emitted once as the **last** stream item
+    /// by providers that support usage tracking (llamafile, Ollama).
+    /// Consumers should skip this when building the response text.
+    Usage(UsageStats),
+}
+
+/// A pinned, boxed stream of [`StreamToken`] items.
 /// Lifetime `'a` is tied to the provider reference so borrowing-based impls work.
-pub type TokenStream<'a> = Pin<Box<dyn Stream<Item = Result<String>> + Send + 'a>>;
+pub type TokenStream<'a> = Pin<Box<dyn Stream<Item = Result<StreamToken>> + Send + 'a>>;
 
 /// Driven Port: LlmProvider
 ///
@@ -38,8 +56,8 @@ pub trait LlmProvider: Send + Sync {
     /// Stream tokens as they are generated.
     ///
     /// The default implementation calls `complete()` and yields the full text as a single
-    /// chunk.  Adapters that support native streaming should override this method to stream
-    /// tokens as they arrive from the backend.
+    /// [`StreamToken::Text`] chunk.  Adapters that support native streaming override this
+    /// to yield tokens as they arrive and optionally append a final [`StreamToken::Usage`].
     fn stream_complete<'a>(
         &'a self,
         system_prompt: &'a str,
@@ -47,7 +65,7 @@ pub trait LlmProvider: Send + Sync {
     ) -> TokenStream<'a> {
         Box::pin(async_stream::stream! {
             match self.complete(system_prompt, messages).await {
-                Ok(msg)  => yield Ok(msg.content.clone()),
+                Ok(msg)  => yield Ok(StreamToken::Text(msg.content.clone())),
                 Err(e)   => yield Err(e),
             }
         })

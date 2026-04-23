@@ -19,7 +19,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,10 @@ struct OllamaMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     message: OllamaMessage,
+    #[serde(default)]
+    prompt_eval_count: u32,
+    #[serde(default)]
+    eval_count: u32,
 }
 
 // ── Pull request ──────────────────────────────────────────────────────────────
@@ -198,6 +202,45 @@ impl OllamaProvider {
 
         Ok(ChatMessage::assistant(parsed.message.content))
     }
+
+    /// Like `send_chat` but also returns token usage stats.
+    async fn send_chat_with_usage(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+    ) -> Result<(ChatMessage, UsageStats)> {
+        let body = ChatRequest {
+            model: &self.model,
+            messages: self.build_messages(system_prompt, messages),
+            stream: false,
+            options: self.build_options(),
+        };
+
+        let resp = self
+            .client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Ollama unreachable — is it running? ({})", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Ollama error {}: {}", status, text));
+        }
+
+        let parsed: ChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("Ollama response parse error: {}", e))?;
+
+        let usage = UsageStats {
+            prompt_tokens: parsed.prompt_eval_count,
+            completion_tokens: parsed.eval_count,
+        };
+        Ok((ChatMessage::assistant(parsed.message.content), usage))
+    }
 }
 
 #[async_trait]
@@ -231,6 +274,40 @@ impl LlmProvider for OllamaProvider {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Override default: call `send_chat_with_usage` so usage stats are emitted.
+    fn stream_complete<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        messages: Vec<ChatMessage>,
+    ) -> TokenStream<'a> {
+        Box::pin(async_stream::stream! {
+            // First attempt
+            let result = match self.send_chat_with_usage(system_prompt, &messages).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("not found") || err_str.contains("no such model") {
+                        // Auto-pull then retry
+                        if let Err(pull_err) = self.pull_model(&self.model).await {
+                            yield Err(pull_err);
+                            return;
+                        }
+                        match self.send_chat_with_usage(system_prompt, &messages).await {
+                            Ok(r) => r,
+                            Err(e2) => { yield Err(e2); return; }
+                        }
+                    } else {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            };
+            let (msg, usage) = result;
+            yield Ok(StreamToken::Text(msg.content));
+            yield Ok(StreamToken::Usage(usage));
+        })
     }
 }
 

@@ -101,7 +101,6 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -110,6 +109,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         prompt_extra_repo: None,
         skill_repo: None,
         recipe_repo: None,
+        llamafile_manager: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -287,7 +287,8 @@ async fn health_endpoint_accessible_without_auth() {
     let resp = app
         .oneshot(
             Request::builder()
-                .get("/api/v1/health")
+                .method("GET")
+                .uri("/api/v1/health")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -111,7 +111,6 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
-        qwen_tts_url: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -120,6 +119,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         prompt_extra_repo: None,
         skill_repo: None,
         recipe_repo: None,
+        llamafile_manager: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

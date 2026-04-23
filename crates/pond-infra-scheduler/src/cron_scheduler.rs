@@ -202,6 +202,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             next_run: None,
             paused: false,
             currently_running: false,
+            payload: Some(record.payload.clone()),
         };
 
         {
@@ -230,6 +231,7 @@ impl SchedulerPort for CronSchedulerAdapter {
                 next_run: None,
                 paused: e.persisted.paused,
                 currently_running: e.currently_running,
+                payload: Some(e.persisted.payload.clone()),
             })
             .collect();
         Ok(tasks)

@@ -1,0 +1,144 @@
+import type { Page } from "@playwright/test";
+
+/** Build a text/event-stream body from JSON event payloads. */
+export function mockSseStream(events: Array<Record<string, unknown>>): string {
+  return `${events.map((ev) => `data: ${JSON.stringify(ev)}`).join("\n\n")}\n\n`;
+}
+
+/**
+ * Intercept all pond-api calls and return sensible mock data.
+ * This prevents tests from requiring a running pond-server.
+ *
+ * Call `await mockAllApiRoutes(page)` in each test's beforeEach.
+ */
+export async function mockAllApiRoutes(page: Page): Promise<void> {
+  // Health
+  await page.route("**/api/v1/health", (route) =>
+    route.fulfill({ json: { status: "ok", version: "test" } }),
+  );
+
+  // Handshake
+  await page.route("**/api/v1/handshake", (route) =>
+    route.fulfill({ json: { token: "e2e-test-token", session_id: "e2e-session" } }),
+  );
+
+  // Onboarding
+  await page.route("**/api/v1/onboard/status", (route) =>
+    route.fulfill({ json: { onboarded: true, current_step: "Completed", steps_completed: 9, total_steps: 9 } }),
+  );
+  await page.route("**/api/v1/onboard/complete", (route) =>
+    route.fulfill({ json: { status: "completed" } }),
+  );
+
+  // Settings
+  await page.route("**/api/v1/settings", (route) => {
+    if (route.request().method() === "PUT") {
+      return route.fulfill({ json: { assistant_name: "Pond", user_name: "Jerry", chat_provider: "llamafile", chat_model: "llama3.2", agent_memory_inject: false, prompt_style: "balanced", llm_temperature: 0.7, llm_max_tokens: 1024 } });
+    }
+    return route.fulfill({ json: { assistant_name: "Pond", user_name: "Jerry", chat_provider: "llamafile", chat_model: "llama3.2", agent_memory_inject: false, prompt_style: "balanced", llm_temperature: 0.7, llm_max_tokens: 1024 } });
+  });
+
+  // Schedules
+  await page.route("**/api/v1/schedules", (route) => {
+    if (route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as Record<string, string>;
+      return route.fulfill({
+        status: 201,
+        json: { id: "new-sched", name: body.name ?? "New Schedule", cron: body.cron ?? "0 0 8 * * *", prompt: body.prompt ?? "", enabled: true },
+      });
+    }
+    return route.fulfill({ json: [] });
+  });
+  await page.route("**/api/v1/schedules/**", (route) =>
+    route.fulfill({ json: { status: "ok" } }),
+  );
+
+  // Sessions
+  await page.route("**/api/v1/sessions", (route) =>
+    route.fulfill({ json: { sessions: [] } }),
+  );
+  await page.route("**/api/v1/sessions/*/messages", (route) =>
+    route.fulfill({ json: { messages: [] } }),
+  );
+
+  // Models
+  await page.route("**/api/v1/models/active-roles", (route) =>
+    route.fulfill({ json: { chat: { provider: "llamafile", model: "llama3.2" }, think: {}, task: {}, asr: {}, tts: {}, router_name: "llamafile" } }),
+  );
+  await page.route("**/api/v1/models/memory-status", (route) =>
+    route.fulfill({ json: { total_mb: 8192, available_for_llm_mb: 4096, loaded_model: null } }),
+  );
+  await page.route("**/api/v1/models/download/progress", (route) =>
+    route.fulfill({ json: { downloads: [] } }),
+  );
+  await page.route("**/api/v1/models", (route) =>
+    route.fulfill({ json: { whisper: [], llamafile: [], tts: [], gguf: [] } }),
+  );
+  await page.route("**/api/v1/models/**", (route) =>
+    route.fulfill({ json: { status: "ok" } }),
+  );
+
+  // Devices
+  await page.route("**/api/v1/devices", (route) =>
+    route.fulfill({ json: { devices: [] } }),
+  );
+
+  // Memories
+  await page.route("**/api/v1/memories", (route) =>
+    route.fulfill({ json: [] }),
+  );
+
+  // Skills
+  await page.route("**/api/v1/skills", (route) =>
+    route.fulfill({ json: [] }),
+  );
+
+  // Prompts
+  await page.route("**/api/v1/prompts", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/v1/prompts/**", (route) =>
+    route.fulfill({ json: { name: "balanced", content: "You are a helpful assistant.", is_system: true } }),
+  );
+
+  // Agent
+  await page.route("**/api/v1/agent/extras", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/v1/agent/tools", (route) =>
+    route.fulfill({ json: [] }),
+  );
+
+  // Recipes
+  await page.route("**/api/v1/recipes", (route) =>
+    route.fulfill({ json: [] }),
+  );
+
+  // Transcribe (for voice pipeline)
+  await page.route("**/api/v1/transcribe", (route) =>
+    route.fulfill({ json: { text: "hello from transcription" } }),
+  );
+
+  // Chat stream
+  await page.route("**/api/v1/chat/stream", (route) =>
+    route.fulfill({
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+      body: [
+        'data: {"type":"text","content":"Hello! I am Pond.","token":"Hello! I am Pond."}',
+        'data: {"done":true,"session_id":"e2e-session","model_role":"chat"}',
+        "",
+      ].join("\n"),
+    }),
+  );
+
+  // TTS
+  await page.route("**/api/v1/tts", (route) =>
+    route.fulfill({ status: 503, json: { error: "TTS not configured in tests" } }),
+  );
+
+  // Profiles
+  await page.route("**/api/v1/profiles", (route) =>
+    route.fulfill({ json: [] }),
+  );
+}

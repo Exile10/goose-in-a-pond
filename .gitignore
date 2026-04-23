@@ -24,4 +24,7 @@ target
 .idea/
 whisper.cpp/
 node_modules/
+.ai/
+.ai/*{txt,md,log}
+**/scratchpad.md
 

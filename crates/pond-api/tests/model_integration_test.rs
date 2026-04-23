@@ -21,6 +21,7 @@ use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::model_repository::ModelRepository;
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::settings::SettingsRepository;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
@@ -66,12 +67,25 @@ impl DeviceRegistry for MockDeviceRegistry {
 
 /// Build a test router with a real SQLite model_repo backed by a tempdir.
 async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, tempfile::TempDir) {
+    let (router, model_repo, _settings_repo, tmp) = make_app_with_settings_repo().await;
+    (router, model_repo, tmp)
+}
+
+async fn make_app_with_settings_repo(
+) -> (
+    axum::Router,
+    Arc<dyn ModelRepository + Send + Sync>,
+    Arc<dyn SettingsRepository + Send + Sync>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let db  = Database::init(tmp.path()).await.unwrap();
 
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     let model_repo: Arc<dyn ModelRepository + Send + Sync> =
         Arc::new(SqliteModelRepository::new(db.system.clone()));
+    let settings_repo: Arc<dyn SettingsRepository + Send + Sync> =
+        Arc::new(MockSettingsRepository::new());
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
@@ -87,7 +101,7 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         llm_provider:        Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url:       "http://127.0.0.1:8080".into(),
         tts:                 None,
-        settings_repo:       Arc::new(MockSettingsRepository::new()),
+        settings_repo:       settings_repo.clone(),
         profile_repo:        Arc::new(MockProfileRepository::new()),
         device_registry:     Arc::new(MockDeviceRegistry),
         memory_repo:         Arc::new(MockMemoryRepository::new()),
@@ -103,7 +117,6 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         mcp_memory:          None,
         extension_manager:   None,
         mcp_server_repo:     None,
-        qwen_tts_url:        None,
         download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port:     None,
         model_catalog_provider: None,
@@ -112,9 +125,15 @@ async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, te
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
 
-    (build_router(state, std::path::PathBuf::from("web/dist")), model_repo, tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        model_repo,
+        settings_repo,
+        tmp,
+    )
 }
 
 fn gguf_record(name: &str) -> ModelRecord {
@@ -276,6 +295,25 @@ async fn activate_model_200_persists_assignment() {
     let assignment = repo.get_assignment("chat").await.unwrap();
     assert!(assignment.is_some(), "assignment should be persisted");
     assert_eq!(assignment.unwrap().model_id, "gguf/llama-3b");
+}
+
+#[tokio::test]
+async fn activate_gguf_model_sets_local_provider_in_settings() {
+    let (app, repo, settings_repo, _tmp) = make_app_with_settings_repo().await;
+
+    repo.upsert(&gguf_record("gemma-2b")).await.unwrap();
+    let req = auth_req(
+        "POST",
+        "/api/v1/models/gguf/gemma-2b/activate",
+        Some(serde_json::json!({ "role": "chat" })),
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let provider = settings_repo.get_key("chat_provider").await.unwrap();
+    let model = settings_repo.get_key("chat_model").await.unwrap();
+    assert_eq!(provider.as_deref(), Some("local"));
+    assert_eq!(model.as_deref(), Some("gemma-2b"));
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ pub enum ModelCategory {
     Whisper,
     /// Piper TTS — ONNX binary + config file, spawned as subprocess.
     TtsPiper,
-    /// HTTP TTS server (OpenAI-compatible /v1/audio/speech, e.g. Qwen TTS).
+    /// HTTP TTS server (OpenAI-compatible /v1/audio/speech).
     TtsHttp,
 }
 
@@ -106,7 +106,7 @@ pub struct ModelRecord {
     pub asr_size: Option<String>,
 
     // ── TTS fields (TtsPiper / TtsHttp) ─────────────────────────────────────
-    /// TTS engine: `"piper"` | `"http"` | `"qwen"`.
+    /// TTS engine: `"piper"` | `"http"`.
     pub tts_engine: Option<String>,
     /// Voice name e.g. `"lessac"`, `"Vivian"`.
     pub tts_voice_name: Option<String>,

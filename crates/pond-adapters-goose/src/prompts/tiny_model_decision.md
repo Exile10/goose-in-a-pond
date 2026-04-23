@@ -26,7 +26,7 @@ Constraints: {{ constraints }}
 → Prefer `tiny` or `base` for fast wake-word loops; `small` or `medium` for full utterance transcription.
 
 **Voice Output (TTS)**
-→ Use Piper for offline, low-latency synthesis. Use Qwen TTS for higher quality when its HTTP server is available.
+→ Use Piper for offline, low-latency synthesis.
 → Pick the smallest voice model that sounds natural for the configured language and voice setting.
 
 **Simple home commands** (device on/off, status queries, single-step actions)

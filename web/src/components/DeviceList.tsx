@@ -66,7 +66,7 @@ export default function DeviceList({ token }: Props) {
     if (isPreviewMode(token)) return
     api.listDevices(token)
       .then(res => {
-        const updated = res.devices.map(d => ({ ...d, type: 'other', active: true }))
+        const updated = res.devices.map(d => ({ ...d, type: d.device_type ?? 'other', active: true }))
         setDevices(updated)
         saveDevices(updated)
       })
@@ -126,9 +126,9 @@ export default function DeviceList({ token }: Props) {
         setDevices(updated)
         saveDevices(updated)
       } else {
-        await api.registerDevice({ name: deviceName.trim(), type: deviceType }, token)
+        await api.registerDevice({ name: deviceName.trim(), device_type: deviceType, capabilities: [] }, token)
         const res = await api.listDevices(token)
-        const updated = res.devices.map(d => ({ ...d, type: 'other', active: true }))
+        const updated = res.devices.map(d => ({ ...d, type: d.device_type ?? 'other', active: true }))
         setDevices(updated)
         saveDevices(updated)
       }

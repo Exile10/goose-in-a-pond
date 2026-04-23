@@ -1,9 +1,10 @@
-/// Audio capture module.
+/// Audio capture + wake-word listener module.
 ///
 /// cpal::Stream is !Send so it cannot be stored in Tauri managed state directly.
 /// Instead we keep only Arc/AtomicBool in managed state and run the cpal stream
 /// on a dedicated OS thread that lives as long as recording is active.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tauri::Emitter;
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -37,6 +38,27 @@ impl AudioState {
 }
 
 impl Default for AudioState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Managed state for the background wake-word listening loop.
+pub struct WakeListenerState {
+    pub is_running: Arc<AtomicBool>,
+    pub stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+}
+
+impl WakeListenerState {
+    pub fn new() -> Self {
+        Self {
+            is_running: Arc::new(AtomicBool::new(false)),
+            stop_tx: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl Default for WakeListenerState {
     fn default() -> Self {
         Self::new()
     }
@@ -222,7 +244,7 @@ fn compute_rms(samples: &[i16]) -> f32 {
     (sum_sq / samples.len() as f64).sqrt() as f32
 }
 
-fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
+pub fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     let ratio = from_rate as f64 / to_rate as f64;
     let out_len = (samples.len() as f64 / ratio) as usize;
     let mut out = Vec::with_capacity(out_len);
@@ -235,6 +257,298 @@ fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         out.push((s0 + (s1 - s0) * frac) as i16);
     }
     out
+}
+
+/// Start a background wake-word listening loop.
+///
+/// Captures audio in 0.8s chunks, applies a silence gate (RMS > 0.01),
+/// sends non-silent chunks to the transcribe endpoint, and emits
+/// `wake-word-detected` on the AppHandle when the configured word is heard.
+pub fn start_wake_listener(
+    state: &WakeListenerState,
+    wake_word: String,
+    base_url: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    // Cancel any existing listener first
+    stop_wake_listener(state);
+
+    state.is_running.store(true, Ordering::SeqCst);
+
+    let is_running = Arc::clone(&state.is_running);
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    *state.stop_tx.lock().unwrap() = Some(stop_tx);
+
+    thread::spawn(move || {
+        let result = wake_listener_thread(app, wake_word, base_url, is_running.clone(), stop_rx);
+        is_running.store(false, Ordering::SeqCst);
+        if let Err(e) = result {
+            tracing::error!("Wake listener thread error: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+/// Stop the background wake-word listening loop.
+pub fn stop_wake_listener(state: &WakeListenerState) {
+    if let Some(tx) = state.stop_tx.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+    state.is_running.store(false, Ordering::SeqCst);
+}
+
+/// The OS thread that drives passive wake-word detection.
+///
+/// Uses a two-stage, ultra-low-power design:
+///
+///   Stage 1 — VAD (Voice Activity Detection)
+///     Drains 30 ms frames from the ring buffer, computes RMS energy, and
+///     runs a tiny state machine (SILENCE → ONSET → SPEECH → SILENCE).
+///     No network, no allocation beyond the frame drain.  CPU ≈ 0%.
+///
+///   Stage 2 — ASR (only on speech end)
+///     When the VAD transitions back to SILENCE after confirmed speech, the
+///     accumulated utterance is resampled to 16 kHz, encoded as WAV, and
+///     sent to the transcribe endpoint exactly once per spoken phrase.
+///     Typical call rate: 2–5 / min vs. the old blind 75 / min.
+fn wake_listener_thread(
+    app: tauri::AppHandle,
+    wake_word: String,
+    base_url: String,
+    is_running: Arc<AtomicBool>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+) -> Result<(), String> {
+    // ── VAD tuning ──────────────────────────────────────────────────────────
+    /// Frame poll interval — matches WebRTC VAD frame size.
+    const FRAME_MS: u64 = 30;
+
+    /// RMS above this → speech onset candidate (two-threshold hysteresis).
+    const SPEECH_RMS: f32 = 0.015;
+
+    /// RMS below this → silence (lower than SPEECH_RMS to prevent flapping).
+    const SILENCE_RMS: f32 = 0.008;
+
+    /// Consecutive above-threshold frames required to confirm speech started.
+    /// 3 × 30 ms = 90 ms — short enough not to miss word beginnings.
+    const ONSET_FRAMES: u32 = 3;
+
+    /// Consecutive below-threshold frames before speech is declared ended.
+    /// 12 × 30 ms = 360 ms tail — natural inter-word pause tolerance.
+    const TAIL_FRAMES: u32 = 12;
+
+    /// Hard cap on accumulated speech (at native rate) before a forced ASR
+    /// check.  Safety valve so the buffer never grows without bound.
+    /// 3 s × max_hardware_rate (96 kHz) ≈ 288 000 samples.
+    const MAX_SPEECH_SAMPLES: usize = 300_000;
+
+    // ── cpal device setup ───────────────────────────────────────────────────
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("No input audio device available")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("Cannot get default input config: {e}"))?;
+
+    let native_rate = config.sample_rate().0;
+    let channels    = config.channels() as usize;
+    let sample_fmt  = config.sample_format();
+
+    // Ring buffer written by the cpal callback, drained by the VAD loop.
+    let ring: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+    let ring_fill   = Arc::clone(&ring);
+
+    let stream_cfg = cpal::StreamConfig {
+        channels:    config.channels(),
+        sample_rate: cpal::SampleRate(native_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    // Build the input stream — converts to mono i16 regardless of hw format.
+    let stream: cpal::Stream = match sample_fmt {
+        cpal::SampleFormat::F32 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels)
+                        .map(|ch| {
+                            let avg = ch.iter().copied().sum::<f32>() / ch.len() as f32;
+                            (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                        })
+                        .collect();
+                    ring_fill.lock().unwrap().extend_from_slice(&mono);
+                },
+                |err| tracing::error!("Wake listener audio error: {err}"),
+                Some(Duration::from_secs(5)),
+            )
+            .map_err(|e| format!("Build stream error: {e}"))?,
+        cpal::SampleFormat::I16 => device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[i16], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels)
+                        .map(|ch| {
+                            let avg = ch
+                                .iter()
+                                .map(|&s| s as i32)
+                                .sum::<i32>()
+                                / ch.len() as i32;
+                            avg as i16
+                        })
+                        .collect();
+                    ring_fill.lock().unwrap().extend_from_slice(&mono);
+                },
+                |err| tracing::error!("Wake listener audio error: {err}"),
+                Some(Duration::from_secs(5)),
+            )
+            .map_err(|e| format!("Build stream error: {e}"))?,
+        _ => return Err(format!("Unsupported sample format: {:?}", sample_fmt)),
+    };
+    stream.play().map_err(|e| format!("Stream play error: {e}"))?;
+
+    // ── HTTP client (re-used across ASR calls) ──────────────────────────────
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    // Normalise the wake word — strip punctuation so it matches whisper output
+    // e.g. "Hey Goose" → "hey goose" (whisper returns "Hey, Goose." which normalises to "hey  goose")
+    let wake_lower: String = wake_word.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect();
+
+    // ── VAD state ───────────────────────────────────────────────────────────
+    let mut onset_frames:   u32      = 0;  // consecutive above-threshold frames
+    let mut tail_frames:    u32      = 0;  // consecutive silence frames while in speech
+    let mut in_speech:      bool     = false;
+    let mut speech_buf:     Vec<i16> = Vec::new();
+
+    // ── Main loop ───────────────────────────────────────────────────────────
+    loop {
+        if stop_rx.try_recv().is_ok() || !is_running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(FRAME_MS));
+
+        // Drain the ring buffer for this 30 ms window.
+        let frame: Vec<i16> = {
+            let mut buf = ring.lock().unwrap();
+            buf.drain(..).collect()
+        };
+        if frame.is_empty() {
+            continue;
+        }
+
+        let rms = compute_rms(&frame);
+
+        // ── Stage 1: VAD state machine (pure math, no network) ──────────────
+        if !in_speech {
+            // SILENCE / ONSET state
+            if rms >= SPEECH_RMS {
+                onset_frames += 1;
+                speech_buf.extend_from_slice(&frame); // keep pre-roll
+                if onset_frames >= ONSET_FRAMES {
+                    // Confirmed speech — transition to SPEECH state
+                    in_speech    = true;
+                    tail_frames  = 0;
+                    tracing::debug!("VAD → SPEECH ({} pre-roll samples)", speech_buf.len());
+                }
+            } else {
+                // Not loud enough — discard pre-roll and reset counter
+                onset_frames = 0;
+                speech_buf.clear();
+            }
+        } else {
+            // SPEECH state — accumulate frame
+            speech_buf.extend_from_slice(&frame);
+
+            if rms < SILENCE_RMS {
+                tail_frames += 1;
+            } else {
+                tail_frames = 0; // speech resumed — reset tail
+            }
+
+            let end_of_speech  = tail_frames >= TAIL_FRAMES;
+            let buffer_maxed   = speech_buf.len() >= MAX_SPEECH_SAMPLES;
+
+            if end_of_speech || buffer_maxed {
+                tracing::debug!(
+                    "VAD → ASR ({} samples, forced={})",
+                    speech_buf.len(),
+                    buffer_maxed,
+                );
+
+                // ── Stage 2: ASR (one call per utterance) ───────────────────
+                let samples_16k = if native_rate != 16000 {
+                    resample_linear(&speech_buf, native_rate, 16000)
+                } else {
+                    speech_buf.clone()
+                };
+
+                'asr: {
+                    let wav = match encode_wav(&samples_16k, 16000) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::warn!("Wake VAD WAV encode failed: {e}");
+                            break 'asr;
+                        }
+                    };
+                    let part = match reqwest::blocking::multipart::Part::bytes(wav)
+                        .file_name("wake.wav")
+                        .mime_str("audio/wav")
+                    {
+                        Ok(p) => p,
+                        Err(_) => break 'asr,
+                    };
+                    let form = reqwest::blocking::multipart::Form::new().part("audio", part);
+                    let res = match client
+                        .post(format!("{}/api/v1/transcribe", base_url))
+                        .multipart(form)
+                        .send()
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!("Wake ASR request failed: {e}");
+                            break 'asr;
+                        }
+                    };
+                    if !res.status().is_success() {
+                        break 'asr;
+                    }
+
+                    #[derive(serde::Deserialize)]
+                    struct Tr { text: String }
+                    if let Ok(t) = res.json::<Tr>() {
+                        // Strip punctuation so "Hey, Goose." matches "hey goose"
+                        let transcript: String = t.text.to_lowercase()
+                            .chars()
+                            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+                            .collect();
+                        tracing::debug!("Wake ASR: {:?}", transcript);
+                        if transcript.contains(&wake_lower) {
+                            tracing::info!("Wake word '{}' detected", wake_word);
+                            let _ = app.emit("wake-word-detected", ());
+                            return Ok(()); // exit thread — recording takes over
+                        }
+                    }
+                }
+
+                // Reset VAD state for next utterance
+                speech_buf.clear();
+                onset_frames = 0;
+                tail_frames  = 0;
+                in_speech    = false;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn encode_wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {

@@ -113,17 +113,9 @@ pub struct Settings {
     #[serde(default = "Settings::default_active_whisper_model")]
     pub active_whisper_model: String,
 
-    /// Active TTS model name from the registry (e.g. "qwen-tts", "piper-lessac")
+    /// Active TTS model name from the registry (e.g. "piper-lessac")
     #[serde(default = "Settings::default_active_tts_model")]
     pub active_tts_model: String,
-
-    /// Base URL of the Qwen TTS HTTP server (OpenAI-compatible /v1/audio/speech)
-    #[serde(default = "Settings::default_tts_http_url")]
-    pub voice_tts_http_url: String,
-
-    /// Voice name sent to the Qwen TTS server (e.g. "Vivian", "Chelsie")
-    #[serde(default = "Settings::default_tts_http_voice")]
-    pub voice_tts_http_voice: String,
 
     // ── Weather ────────────────────────────────────────────────────────────
     /// Whether to fetch live weather and inject it into the LLM system prompt.
@@ -200,8 +192,6 @@ impl Default for Settings {
             active_llm_model:                Self::default_active_llm_model(),
             active_whisper_model:            Self::default_active_whisper_model(),
             active_tts_model:                Self::default_active_tts_model(),
-            voice_tts_http_url:              Self::default_tts_http_url(),
-            voice_tts_http_voice:            Self::default_tts_http_voice(),
             weather_enabled:                 Self::default_weather_enabled(),
             weather_latitude:                Self::default_weather_latitude(),
             weather_longitude:               Self::default_weather_longitude(),
@@ -234,8 +224,6 @@ impl Settings {
     fn default_active_llm_model()           -> String { "".to_string() }
     fn default_active_whisper_model()       -> String { "".to_string() }
     fn default_active_tts_model()           -> String { "".to_string() }
-    fn default_tts_http_url()               -> String { "http://127.0.0.1:8181".to_string() }
-    fn default_tts_http_voice()             -> String { "".to_string() }
     fn default_weather_enabled()             -> bool   { false }
     fn default_weather_latitude()            -> f64    { 0.0 }
     fn default_weather_longitude()           -> f64    { 0.0 }

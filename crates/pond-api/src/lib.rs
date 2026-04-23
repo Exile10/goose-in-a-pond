@@ -39,6 +39,37 @@
 pub mod middleware;
 pub mod routes;
 
+/// Controls the lifecycle of the local llamafile server process.
+///
+/// Injected by `pond-server` so `pond-api` has no process-management logic.
+/// `None` in tests — route handlers check `Option<Arc<dyn LlamafileManager>>`.
+#[async_trait::async_trait]
+pub trait LlamafileManager: Send + Sync {
+    /// Ensure the llamafile server is running, starting it if necessary.
+    ///
+    /// `model_name` hints which model to start; the implementation resolves
+    /// it from the model catalog if `None` or empty.
+    ///
+    /// Returns the base URL (`http://127.0.0.1:<port>`) the server is
+    /// reachable at (even if startup is still in progress).
+    async fn ensure_started(&self, model_name: Option<&str>) -> String;
+
+    /// Returns `true` if the llamafile server is currently answering requests.
+    async fn is_running(&self) -> bool;
+
+    /// Ensure the llamafile server is running AND block until it is ready,
+    /// up to `timeout_secs` seconds.
+    ///
+    /// Returns `(url, true)` when the server becomes ready within the timeout,
+    /// or `(url, false)` if it did not become ready in time.
+    /// `url` is always the base URL (`http://127.0.0.1:<port>`) regardless of outcome.
+    async fn ensure_started_and_wait(
+        &self,
+        model_name: Option<&str>,
+        timeout_secs: u64,
+    ) -> (String, bool);
+}
+
 use axum::{middleware::Next, Router};
 use tower_http::cors::{Any, CorsLayer};
 use pond_core::ports::agent::Agent;
@@ -129,9 +160,7 @@ pub struct AppState {
     /// Persistent storage for configured external MCP server connections.
     /// Loaded at startup to auto-connect saved servers.
     pub mcp_server_repo: Option<Arc<dyn McpServerRepository>>,
-    /// Base URL of the Qwen TTS server (e.g. "http://127.0.0.1:8181").
-    /// `None` when Qwen TTS is not configured.
-    pub qwen_tts_url: Option<String>,
+
     /// Tracks in-progress model downloads so the UI can show progress bars.
     pub download_tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
     /// Port the Piper HTTP TTS server is listening on.
@@ -157,6 +186,10 @@ pub struct AppState {
     /// Agent recipes (Goose Recipe YAML definitions).
     /// `None` in tests that don't exercise recipe endpoints.
     pub recipe_repo: Option<Arc<dyn AgentRecipeRepository + Send + Sync>>,
+    /// Controls the llamafile server lifecycle.
+    /// Set by pond-server when `chat_provider` may be "llamafile".
+    /// `None` in tests and when the llamafile backend is not available.
+    pub llamafile_manager: Option<Arc<dyn LlamafileManager>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

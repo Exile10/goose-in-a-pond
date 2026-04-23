@@ -1,6 +1,7 @@
 import { Button, Card } from "@heroui/react";
 import { Mic, MessageSquare } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
+import { AudioWaves } from "../components/AudioWaves";
 
 export function Dashboard() {
   const state    = useAppState();
@@ -10,7 +11,39 @@ export function Dashboard() {
 
   return (
     <div style={styles.root}>
-      {/* Server status card */}
+
+      {/* ── Voice — primary home action ───────────────────── */}
+      <Card style={styles.voiceCard}>
+        <div style={styles.voiceCardBody}>
+          <div style={styles.voiceCardLeft}>
+            <h3 style={styles.voiceCardTitle}>Voice Mode</h3>
+            <p style={styles.voiceCardSub}>
+              Talk to Pond hands-free. Uses your mic, whisper transcription, and a local TTS voice.
+            </p>
+            <p style={styles.voiceShortcut}>
+              Press <kbd style={styles.kbd}>⌘⇧V</kbd> or <kbd style={styles.kbd}>Ctrl+Shift+V</kbd> from anywhere to activate
+            </p>
+            <Button
+              variant="primary"
+              isDisabled={!state.serverOnline}
+              onPress={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+              style={styles.voiceBtn}
+            >
+              <Mic size={15} /> Open Voice Mode
+            </Button>
+          </div>
+          <div style={styles.voiceWavePreview}>
+            <AudioWaves
+              state={state.voiceState}
+              audioLevel={0}
+              size="sm"
+            />
+            <span style={styles.voiceStateBadge}>{state.voiceState}</span>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── Server status ─────────────────────────────────── */}
       <Card>
         <div style={styles.cardBody}>
           <h3 style={styles.cardTitle}>Server Status</h3>
@@ -31,18 +64,11 @@ export function Dashboard() {
         </div>
       </Card>
 
-      {/* Quick actions */}
+      {/* ── Quick actions ─────────────────────────────────── */}
       <Card>
         <div style={styles.cardBody}>
           <h3 style={styles.cardTitle}>Quick Actions</h3>
           <div style={styles.actionsRow}>
-            <Button
-              variant="outline"
-              isDisabled={!state.serverOnline}
-              onPress={() => dispatch({ type: "SET_MODE", payload: "voice" })}
-            >
-              <Mic size={14} /> Start Voice
-            </Button>
             <Button
               variant="outline"
               isDisabled={!state.serverOnline}
@@ -54,7 +80,7 @@ export function Dashboard() {
         </div>
       </Card>
 
-      {/* Recent activity */}
+      {/* ── Recent activity ───────────────────────────────── */}
       {recentMessages.length > 0 && (
         <Card>
           <div style={styles.cardBody}>
@@ -83,6 +109,66 @@ export function Dashboard() {
 
 const styles: Record<string, React.CSSProperties> = {
   root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
+
+  // Voice card
+  voiceCard: {
+    background: "linear-gradient(135deg, rgba(140,82,255,0.07) 0%, rgba(140,82,255,0.02) 100%)",
+    border: "1px solid rgba(140,82,255,0.20)",
+  },
+  voiceCardBody: {
+    padding: "var(--space-5)",
+    display: "flex",
+    alignItems: "center",
+    gap: "var(--space-5)",
+  },
+  voiceCardLeft: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    gap: "var(--space-2)",
+  },
+  voiceCardTitle: {
+    fontFamily: "var(--font-display)",
+    fontWeight: 700,
+    fontSize: "var(--text-lg)",
+    color: "var(--color-text)",
+    margin: 0,
+  },
+  voiceCardSub: {
+    fontSize: "var(--text-sm)",
+    color: "var(--color-text-secondary)",
+    margin: 0,
+    lineHeight: "1.5",
+  },
+  voiceShortcut: {
+    fontSize: "var(--text-xs)",
+    color: "var(--color-text-tertiary)",
+    margin: 0,
+  },
+  voiceBtn: {
+    marginTop: "var(--space-2)",
+    alignSelf: "flex-start",
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  },
+  voiceWavePreview: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: "6px",
+    width: "120px",
+    flexShrink: 0,
+  },
+  voiceStateBadge: {
+    fontSize: "10px",
+    color: "var(--color-text-tertiary)",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.06em",
+    fontFamily: "var(--font-mono)",
+  },
+
+  // Standard cards
   cardBody: {
     padding: "var(--space-4)",
     display: "flex",
@@ -105,4 +191,14 @@ const styles: Record<string, React.CSSProperties> = {
   activityItem: { display: "flex", gap: "var(--space-2)", alignItems: "baseline" },
   activityRole: { fontSize: "var(--text-xs)", fontWeight: 600, fontFamily: "var(--font-display)", textTransform: "uppercase" as const, flexShrink: 0, letterSpacing: "0.04em" },
   activityText: { fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const },
+  kbd: {
+    display: "inline-block",
+    fontFamily: "var(--font-mono)",
+    fontSize: "9px",
+    background: "rgba(23,22,22,0.07)",
+    border: "1px solid rgba(23,22,22,0.14)",
+    borderRadius: "4px",
+    padding: "0px 4px",
+    color: "var(--color-text-secondary)",
+  },
 };
