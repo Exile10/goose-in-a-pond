@@ -148,6 +148,8 @@ impl LocalInferenceLlmAdapter {
                 match get_registry().lock() {
                     Ok(mut registry) => {
                         if !registry.has_model(&stem) {
+                            let mut settings = ModelSettings::default();
+                            settings.native_tool_calling = true;
                             let entry = LocalModelEntry {
                                 id:           stem.clone(),
                                 repo_id:      format!("local/{}", stem),
@@ -155,11 +157,17 @@ impl LocalInferenceLlmAdapter {
                                 quantization: String::new(),
                                 local_path,
                                 source_url:   String::new(),
-                                settings:     ModelSettings::default(),
+                                settings,
                                 size_bytes:   0,
                             };
                             if let Err(e) = registry.add_model(entry) {
                                 tracing::warn!("Could not register GGUF model '{}': {}", stem, e);
+                            }
+                        } else if let Some(entry) = registry.get_model(&stem) {
+                            let mut s = entry.settings.clone();
+                            if !s.native_tool_calling {
+                                s.native_tool_calling = true;
+                                let _ = registry.update_model_settings(&stem, s);
                             }
                         }
                     }
@@ -195,6 +203,8 @@ impl LocalInferenceLlmAdapter {
             match get_registry().lock() {
                 Ok(mut registry) => {
                     if !registry.has_model(&id) {
+                        let mut settings = ModelSettings::default();
+                        settings.native_tool_calling = true;
                         let entry = LocalModelEntry {
                             id:           id.clone(),
                             repo_id:      repo_id.to_string(),
@@ -202,11 +212,17 @@ impl LocalInferenceLlmAdapter {
                             quantization: quantization.to_string(),
                             local_path,
                             source_url,
-                            settings:     ModelSettings::default(),
+                            settings,
                             size_bytes:   0,
                         };
                         if let Err(e) = registry.add_model(entry) {
                             tracing::warn!("Could not register GGUF model '{}': {}", id, e);
+                        }
+                    } else if let Some(entry) = registry.get_model(&id) {
+                        let mut s = entry.settings.clone();
+                        if !s.native_tool_calling {
+                            s.native_tool_calling = true;
+                            let _ = registry.update_model_settings(&id, s);
                         }
                     }
                 }

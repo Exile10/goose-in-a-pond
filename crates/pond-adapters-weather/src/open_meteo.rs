@@ -94,7 +94,7 @@ impl OpenMeteoWeatherAdapter {
              &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm",
             self.base_url, self.latitude, self.longitude,
         );
-
+       println!("Fetching {}", &url);
         let resp = self
             .client
             .get(&url)
@@ -246,4 +246,34 @@ mod tests {
         let adapter = make_adapter(&server).await;
         assert!(adapter.current().await.is_err());
     }
+}
+
+#[tokio::test]
+
+#[ignore] // 👈 IMPORTANT: prevents running in CI
+
+async fn live_weather_fetch() {
+
+    let adapter = OpenMeteoWeatherAdapter::new(
+
+        -1.286,
+
+        36.817,
+
+        "Nairobi, KE"
+
+    );
+
+    let data = adapter.current().await.expect("failed to fetch live weather");
+
+    println!("{:#?}", data);
+
+    // Soft assertions (don’t be too strict!)
+
+    assert!(data.temperature_c > -50.0 && data.temperature_c < 60.0);
+
+    assert!(data.humidity_pct <= 100);
+
+    assert!(!data.description.is_empty());
+
 }
