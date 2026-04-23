@@ -33,8 +33,13 @@ pub fn spawn_giap_server(reader: DuplexStream, writer: DuplexStream) {
         .clone();
     let server = GiapMcpServer::new(services);
     tokio::spawn(async move {
-        if let Ok(running) = server.serve((reader, writer)).await {
-            let _ = running.waiting().await;
+        match server.serve((reader, writer)).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(e) => {
+                tracing::error!("GIAP MCP server failed to start: {e}");
+            }
         }
     });
 }

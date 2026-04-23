@@ -141,6 +141,7 @@ impl ChatService {
             let request = AgentRequest {
                 message: message.clone(),
                 session_id: self.session_id.clone(),
+                model_role: "task".to_string(),
             };
             self.agent.chat(request).await?.text
         };
@@ -318,12 +319,9 @@ impl ChatService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::message::Role;
     use crate::services::mock_agent::MockAgent;
     use crate::services::mock_provider::MockProvider;
     use crate::services::mock_session::InMemorySessionStorage;
-    use async_trait::async_trait;
-    use std::sync::Mutex;
 
     #[tokio::test]
     async fn chat_once_returns_echo() {

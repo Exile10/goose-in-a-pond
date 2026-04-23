@@ -9,7 +9,13 @@ pub struct ExtensionInfo {
     pub kind: String, // "builtin" | "stdio" | "http"
     pub description: String,
     pub tools: Vec<String>,
+    /// Whether the extension is currently enabled.
+    /// Disabled extensions are not loaded into Goose agent sessions.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
+
+fn default_enabled() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddExtensionRequest {
@@ -33,4 +39,7 @@ pub trait ExtensionManagerPort: Send + Sync {
     async fn add_extension(&self, request: AddExtensionRequest) -> Result<ExtensionInfo>;
     async fn remove_extension(&self, name: &str) -> Result<()>;
     async fn list_tools(&self) -> Result<Vec<String>>;
+    /// Enable or disable an extension by name.
+    /// Disabled extensions are excluded when loading tools for agent sessions.
+    async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()>;
 }

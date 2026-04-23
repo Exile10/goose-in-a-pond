@@ -10,7 +10,8 @@ export type GuiSection =
   | "models"
   | "prompts"
   | "settings"
-  | "agent";
+  | "agent"
+  | "logs";
 
 export const DESKTOP_MODES: DesktopMode[] = ["gui", "voice", "canvas"];
 
@@ -34,6 +35,7 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
       { section: "schedules", label: "Schedules", icon: "clock" },
       { section: "memory",    label: "Memory",    icon: "memory" },
       { section: "skills",    label: "Skills",    icon: "skills" },
+      { section: "logs",      label: "Logs",      icon: "logs" },
     ],
   },
   {

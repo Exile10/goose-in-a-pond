@@ -120,6 +120,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
+        event_log_repo: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

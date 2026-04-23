@@ -73,6 +73,7 @@ pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
 async fn spawn(binary: &Path, port: u16) -> Result<LlamafileProcess> {
     let child = tokio::process::Command::new(binary)
         .arg("--server")
+        .arg("--jinja")
         .args(["--port", &port.to_string()])
         .args(["--host", "127.0.0.1"])
         .arg("--nobrowser")
