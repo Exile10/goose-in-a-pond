@@ -1,4 +1,4 @@
-use crate::domain::agent::{AgentRequest, WorkflowEvent, WorkflowState};
+use crate::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
 use crate::domain::message::ChatMessage;
 use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
@@ -13,9 +13,94 @@ use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::services::context_compactor::ContextCompactor;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
+use futures::StreamExt as _;
 use std::io::{self, Write};
 use std::sync::Arc;
 use uuid::Uuid;
+
+// ── Voice helpers ─────────────────────────────────────────────────────────────
+
+/// Classify a voice message into a model role string.
+///
+/// Voice mode defaults Chat-classified messages to "chat" as well; the role
+/// is metadata for the GooseAdapter's model selection.
+fn resolve_voice_role(message: &str) -> String {
+    use crate::domain::model_role::ModelRole;
+    use crate::services::request_classifier::classify_request;
+    match classify_request(message) {
+        ModelRole::Think => "think".to_string(),
+        ModelRole::Task  => "task".to_string(),
+        ModelRole::Chat  => "chat".to_string(),
+    }
+}
+
+/// Human-readable announcement spoken while an MCP tool is executing.
+fn tool_announcement(tool: &str) -> String {
+    let name = tool.split("__").last().unwrap_or(tool);
+    match name {
+        "get_current_weather" | "get_weather" => "Let me check the weather.".to_string(),
+        "get_devices" | "list_devices"        => "Checking your devices.".to_string(),
+        "set_schedule" | "create_schedule"    => "Setting that up.".to_string(),
+        "save_memory"                         => "Got it, I'll remember that.".to_string(),
+        other => format!("Let me {}.", other.replace('_', " ")),
+    }
+}
+
+/// Split completed sentences out of a text buffer.
+///
+/// Sentence boundaries: `.`, `?`, `!` followed by whitespace or end-of-string,
+/// and bare newlines. Forces a flush at 250 characters to handle code blocks
+/// or long lists without sentence punctuation.
+///
+/// Returns `(sentences_to_speak, remaining_buffer)`.
+fn split_sentences(text: &str) -> (Vec<String>, String) {
+    const MAX_BUF: usize = 250;
+    let mut sentences: Vec<String> = Vec::new();
+    let mut remainder = text.to_string();
+
+    loop {
+        // Force-flush at max buffer: break at last space within the limit
+        if remainder.len() > MAX_BUF {
+            if let Some(split_at) = remainder[..MAX_BUF].rfind(' ') {
+                sentences.push(remainder[..split_at].to_string());
+                remainder = remainder[split_at + 1..].to_string();
+                continue;
+            }
+        }
+
+        let mut found = false;
+        let chars: Vec<(usize, char)> = remainder.char_indices().collect();
+        for (idx, (i, ch)) in chars.iter().enumerate() {
+            if matches!(ch, '.' | '?' | '!') {
+                let next = i + ch.len_utf8();
+                let after = &remainder[next..];
+                if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
+                    sentences.push(remainder[..next].to_string());
+                    remainder = after.trim_start_matches(|c: char| c == ' ' || c == '\n').to_string();
+                    found = true;
+                    break;
+                }
+            } else if *ch == '\n' {
+                // Newline is its own boundary
+                let chunk = remainder[..*i].trim().to_string();
+                if !chunk.is_empty() {
+                    sentences.push(chunk);
+                }
+                let next = i + 1;
+                remainder = remainder[next..].to_string();
+                found = true;
+                let _ = idx; // suppress unused warning
+                break;
+            }
+        }
+
+        if !found {
+            break;
+        }
+    }
+
+    (sentences, remainder)
+}
 
 /// Domain Service: ChatService
 ///
@@ -123,28 +208,15 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        // When a direct LlmProvider is wired (e.g. CLI --provider local/ollama/llamafile),
-        // use it with the full conversation history from session storage.
-        // Otherwise route through the Agent port (GooseAdapter in production), which manages
+        // Always route through the Agent port (GooseAdapter in production), which manages
         // its own history, system prompt, and MCP tools internally.
-        let response_text = if let Some(provider) = &self.provider {
-            let history = self.session_storage
-                .get_messages(&self.session_id)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|sm| sm.message)
-                .collect::<Vec<_>>();
-            let response_msg = provider.complete(&self.system_prompt, history).await?;
-            response_msg.content
-        } else {
-            let request = AgentRequest {
-                message: message.clone(),
-                session_id: self.session_id.clone(),
-                model_role: "task".to_string(),
-            };
-            self.agent.chat(request).await?.text
+        // The optional `self.provider` is kept solely for session title generation.
+        let request = AgentRequest {
+            message: message.clone(),
+            session_id: self.session_id.clone(),
+            model_role: resolve_voice_role(&message),
         };
+        let response_text = self.agent.chat(request).await?.text;
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(response_text.clone());
@@ -234,6 +306,112 @@ impl ChatService {
         }
     }
 
+    /// Streaming chat — routes through the Agent, chunks TTS by sentence.
+    ///
+    /// Differences from `chat_once`:
+    /// - Calls `agent.chat_stream()` so text arrives token-by-token.
+    /// - Speaks each completed sentence immediately (low-latency TTS).
+    /// - Announces MCP tool calls with a short spoken phrase before execution.
+    /// - Speaking happens *inside* this method; callers must NOT call
+    ///   `voice_output.speak()` on the returned text.
+    pub async fn chat_stream_once(&self, message: String) -> Result<String> {
+        // Persist user message
+        let user_msg = ChatMessage::user(message.clone());
+        let session_msg = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            user_msg,
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), session_msg)
+            .await?;
+
+        let request = AgentRequest {
+            message: message.clone(),
+            session_id: self.session_id.clone(),
+            model_role: resolve_voice_role(&message),
+        };
+
+        let mut stream = self.agent.chat_stream(request).await?;
+        let mut full_text = String::new();
+        let mut sentence_buf = String::new();
+        let mut spoken_first = false;
+
+        while let Some(event_result) = stream.next().await {
+            match event_result? {
+                AgentStreamEvent::ToolCall { tool, .. } => {
+                    // Flush any buffered text before announcing the tool
+                    if !sentence_buf.trim().is_empty() {
+                        let chunk = sentence_buf.trim().to_string();
+                        sentence_buf.clear();
+                        if let Err(e) = self.voice_output.speak(&chunk).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                    let announcement = tool_announcement(&tool);
+                    if let Err(e) = self.voice_output.speak(&announcement).await {
+                        tracing::warn!("Tool announcement TTS failed: {}", e);
+                    }
+                }
+                AgentStreamEvent::Text { content } => {
+                    if !spoken_first {
+                        self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
+                        spoken_first = true;
+                    }
+                    full_text.push_str(&content);
+                    sentence_buf.push_str(&content);
+
+                    let (sentences, remainder) = split_sentences(&sentence_buf);
+                    sentence_buf = remainder;
+                    for sentence in sentences {
+                        if let Err(e) = self.voice_output.speak(&sentence).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                }
+                AgentStreamEvent::Done { .. } => {
+                    // Flush any remaining buffer
+                    let remainder = sentence_buf.trim().to_string();
+                    if !remainder.is_empty() {
+                        if let Err(e) = self.voice_output.speak(&remainder).await {
+                            tracing::warn!("TTS flush failed: {}", e);
+                        }
+                    }
+                    sentence_buf.clear();
+                    break;
+                }
+                AgentStreamEvent::Error { content } => {
+                    return Err(anyhow::anyhow!("Agent stream error: {}", content));
+                }
+                AgentStreamEvent::Status { .. } | AgentStreamEvent::ToolResult { .. } => {
+                    // Not spoken — status/tool results are informational only
+                }
+            }
+        }
+
+        // Flush anything left if stream ended without Done
+        let remainder = sentence_buf.trim().to_string();
+        if !remainder.is_empty() {
+            if let Err(e) = self.voice_output.speak(&remainder).await {
+                tracing::warn!("TTS final flush failed: {}", e);
+            }
+        }
+
+        // Persist the assistant response
+        let assistant_msg = ChatMessage::assistant(full_text.clone());
+        let session_msg = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            assistant_msg,
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), session_msg)
+            .await?;
+
+        self.maybe_generate_title(&message, &full_text).await;
+        Ok(full_text)
+    }
+
     /// Run the interactive workflow loop.
     ///
     /// State machine:
@@ -274,19 +452,14 @@ impl ChatService {
 
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
-            // ── Thinking ──
+            // ── Thinking → Speak (streaming) ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
             println!("  🤔 Thinking...");
 
-            match self.chat_once(input).await {
+            match self.chat_stream_once(input).await {
                 Ok(response_text) => {
-                    // ── Speak ──
-                    self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
-                    self.emit_event(WorkflowEvent::AgentOutput(response_text.clone()));
-                    if let Err(e) = self.voice_output.speak(&response_text).await {
-                        tracing::warn!("TTS failed (non-fatal): {}", e);
-                        println!("  🗣  {}", response_text);
-                    }
+                    // Speaking happened inside chat_stream_once; just emit the event.
+                    self.emit_event(WorkflowEvent::AgentOutput(response_text));
                 }
                 Err(e) => {
                     eprintln!("  ❌ Error: {}", e);
