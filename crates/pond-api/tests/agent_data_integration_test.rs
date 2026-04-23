@@ -105,7 +105,6 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory:          None,
         extension_manager:   None,
         mcp_server_repo:     None,
-        qwen_tts_url:        None,
         download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port:     None,
         model_catalog_provider: None,
@@ -114,6 +113,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         prompt_extra_repo:   Some(Arc::new(SqlitePromptExtraRepository::new(pool.clone()))),
         skill_repo:          Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo:         Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
+        llamafile_manager: None,
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
@@ -267,7 +267,6 @@ async fn prompt_template_delete_system_returns_403() {
         mcp_memory:          None,
         extension_manager:   None,
         mcp_server_repo:     None,
-        qwen_tts_url:        None,
         download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port:     None,
         model_catalog_provider: None,
@@ -276,6 +275,7 @@ async fn prompt_template_delete_system_returns_403() {
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -536,7 +536,6 @@ async fn returns_501_when_repos_not_configured() {
         mcp_memory:          None,
         extension_manager:   None,
         mcp_server_repo:     None,
-        qwen_tts_url:        None,
         download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port:     None,
         model_catalog_provider: None,
@@ -545,6 +544,7 @@ async fn returns_501_when_repos_not_configured() {
         prompt_extra_repo:   None,
         skill_repo:          None,
         recipe_repo:         None,
+        llamafile_manager: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

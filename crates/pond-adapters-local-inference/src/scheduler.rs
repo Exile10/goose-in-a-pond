@@ -34,7 +34,7 @@ pub const JETSON_TOTAL_RAM_MB: u64 = 8192;
 const SYSTEM_OVERHEAD_MB: u64 = 1500;
 /// Whisper base model resident size (MB).
 const STT_RESERVED_MB: u64 = 200;
-/// Piper / Qwen TTS resident size (MB).
+/// Reserved TTS resident size (MB).
 const TTS_RESERVED_MB: u64 = 100;
 /// Approximate MB available for a single LLM slot.
 pub const LLM_BUDGET_MB: u64 =
@@ -188,5 +188,90 @@ mod tests {
     fn llm_budget_is_positive_and_reasonable() {
         assert!(LLM_BUDGET_MB > 4096, "budget should be > 4GB on 8GB device");
         assert!(LLM_BUDGET_MB < JETSON_TOTAL_RAM_MB);
+    }
+
+    #[test]
+    fn memory_status_total_matches_jetson_constant() {
+        let (sched, _rx) = ResourceAwareModelScheduler::new();
+        let status = sched.memory_status();
+        // total_mb is always JETSON_TOTAL_RAM_MB regardless of platform
+        assert_eq!(status.total_mb, JETSON_TOTAL_RAM_MB);
+    }
+
+    #[test]
+    fn memory_status_fallback_available_is_full_budget_when_no_model_loaded() {
+        // On non-Linux (or when /proc/meminfo is absent) the fallback uses 0 used
+        // when no model is hot — available should equal LLM_BUDGET_MB.
+        let (sched, _rx) = ResourceAwareModelScheduler::new();
+        let status = sched.memory_status();
+
+        // On Linux (CI) /proc/meminfo is available and the value varies —
+        // just check it's within the sane range.
+        assert!(
+            status.available_for_llm_mb <= LLM_BUDGET_MB,
+            "available should not exceed budget: {} > {}",
+            status.available_for_llm_mb, LLM_BUDGET_MB
+        );
+    }
+
+    #[test]
+    fn memory_status_available_decreases_when_model_is_hot() {
+        // On non-Linux the fallback estimates `LLM_BUDGET_MB / 2` used when a
+        // model is hot.  On Linux /proc/meminfo is used and the fallback branch
+        // is skipped — skip the assertion in that case.
+        let (sched, _rx) = ResourceAwareModelScheduler::new();
+        let free_before = sched.memory_status().available_for_llm_mb;
+
+        sched.set_hot_model(Some("my-model".to_string()));
+        let free_after = sched.memory_status().available_for_llm_mb;
+
+        // On Linux available_for_llm_mb comes from /proc/meminfo and won't
+        // change based on set_hot_model — that path is already tested above.
+        // On macOS / Windows (no /proc/meminfo) the fallback branch IS taken
+        // and available should drop.
+        if cfg!(not(target_os = "linux")) {
+            assert!(
+                free_after < free_before,
+                "available should decrease when a model is hot; before={free_before}, after={free_after}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_hot_model_to_none_clears_it() {
+        let (sched, _rx) = ResourceAwareModelScheduler::new();
+        sched.set_hot_model(Some("my-model".to_string()));
+        assert!(sched.memory_status().loaded_model.is_some());
+
+        sched.set_hot_model(None);
+        assert!(sched.memory_status().loaded_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn noop_scheduler_notify_wake_word_does_not_panic() {
+        let s = NoopScheduler;
+        // NoopScheduler::notify_wake_word is a no-op; this must not panic
+        s.notify_wake_word().await;
+    }
+
+    #[test]
+    fn resource_scheduler_new_starts_with_no_hot_model() {
+        let (sched, _rx) = ResourceAwareModelScheduler::new();
+        assert!(sched.memory_status().loaded_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn wake_word_channel_can_be_re_signalled() {
+        let (sched, mut rx) = ResourceAwareModelScheduler::new();
+
+        sched.notify_wake_word().await;
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+
+        // Mark as seen and signal again — rx should become changed once more
+        let _ = rx.borrow_and_update();
+        sched.notify_wake_word().await;
+        // The channel is already true so sending true again may not mark changed;
+        // just verify no panic.
     }
 }

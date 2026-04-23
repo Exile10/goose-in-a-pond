@@ -25,7 +25,6 @@ mod model_download;
 mod piper_http;
 mod piper_process;
 mod ports;
-mod qwen_tts_process;
 mod reqwest_model_downloader;
 mod startup;
 mod system_deps;
@@ -36,14 +35,13 @@ use clap::{Parser, Subcommand};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
-use pond_adapters_qwen_tts::QwenTtsOutput;
 use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
 use pond_core::ports::wake_word::WakeWordDetector;
 use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::services::instant_activation::InstantActivation;
 use pond_core::services::print_output::PrintOutput;
-use pond_api::AppState;
+use pond_api::{AppState, LlamafileManager};
 use pond_core::ports::agent::Agent;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
@@ -52,7 +50,6 @@ use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
 use pond_core::services::model_router::ModelRouter;
-use pond_core::services::fallback_voice_output::FallbackVoiceOutput;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
@@ -150,7 +147,7 @@ enum Commands {
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: qwen, piper, or none (print only).
+        /// Text-to-speech engine: piper, or none (print only).
         /// Defaults to the active TTS model stored in Settings.
         #[arg(long)]
         tts: Option<String>,
@@ -432,8 +429,6 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("  ✅ Databases ready");
 
     let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
-    let setup_settings = SqliteSettingsRepository::new(db_setup.system.clone())
-        .get().await.unwrap_or_default();
     println!("  📋 Fetching model catalog from upstream sources...");
     seed_model_catalog(&setup_model_repo, &data_dir).await;
 
@@ -501,18 +496,13 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  [4/6] Downloading whisper-server binary...");
     let _ = model_download::download_whisper_binary(&data_dir).await;
 
-    // Step 5: TTS — try Qwen first; if it fails, ensure Piper is fully set up.
-    println!("\n  [5/6] Setting up TTS...");
-    let qwen_ok = qwen_tts_process::setup_install(&data_dir).await;
-
-    // Step 6: Piper TTS binary — voice model is selected via the web Settings page
-    println!("\n  [6/6] Setting up Piper TTS binary{}...",
-        if qwen_ok { " (fallback)" } else { " (primary — Qwen unavailable)" });
+    // Step 5: Piper TTS binary — voice model is selected via the web Settings page
+    println!("\n  [5/6] Setting up Piper TTS...");
     let piper_bin_ok = model_download::download_piper_binary(&data_dir).await.is_ok();
-    if !qwen_ok && !piper_bin_ok {
-        println!("  ⚠  Both Qwen TTS and Piper binary unavailable — voice output will be text-only.");
+    if !piper_bin_ok {
+        println!("  ⚠  Piper binary unavailable — voice output will be text-only.");
         println!("     Install piper manually or retry setup.");
-    } else if piper_bin_ok {
+    } else {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
@@ -532,6 +522,126 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
+}
+
+// ── LlamafileManager implementation ──────────────────────────────────────────
+
+/// Manages the llamafile child process lifecycle.
+///
+/// Implements [`LlamafileManager`] so `pond-api`'s `rebuild_model_router`
+/// can start the process when the user switches to the "llamafile" provider
+/// without `pond-api` having any process-management knowledge.
+struct LlamafileManagerImpl {
+    data_dir:      std::path::PathBuf,
+    model_service: Arc<pond_core::services::model_service::ModelService>,
+    /// Holds the spawned process guard so it stays alive as long as AppState does.
+    guard: Arc<tokio::sync::Mutex<Option<llamafile_process::LlamafileProcess>>>,
+    /// The port the process actually bound to.
+    /// Initialised from the port returned by the startup `try_start` call, or the
+    /// base port as a fallback.  Updated by the background spawn task when
+    /// `ensure_started` starts a new process on a non-base port.
+    actual_port: Arc<std::sync::atomic::AtomicU16>,
+}
+
+#[async_trait::async_trait]
+impl LlamafileManager for LlamafileManagerImpl {
+    async fn ensure_started(&self, model_name: Option<&str>) -> String {
+        let effective = self.effective_port();
+
+        // Fast path: already answering requests
+        if llamafile_process::is_running(effective).await {
+            return llamafile_process::url_for(effective);
+        }
+
+        // Spawn in background so the settings-save HTTP response is not delayed
+        // by the 5–30 s model-loading time.  The process guard is stored inside
+        // `LlamafileManagerImpl` (via the shared `Arc<Mutex<…>>`) so it lives
+        // for the lifetime of AppState.
+        let data_dir       = self.data_dir.clone();
+        let model_service  = self.model_service.clone();
+        let model_hint     = model_name.map(|s| s.to_string());
+        let guard_arc      = Arc::clone(&self.guard);
+        let actual_port_arc = Arc::clone(&self.actual_port);
+
+        tokio::spawn(async move {
+            // Double-check under the lock to avoid a race where two concurrent
+            // requests both reach the is_running() fast-path as false.
+            let mut guard = guard_arc.lock().await;
+            let cur = actual_port_arc.load(std::sync::atomic::Ordering::Acquire);
+            if llamafile_process::is_running(cur).await {
+                return; // someone else already started it
+            }
+            match llamafile_process::try_start(&data_dir, model_service, model_hint.as_deref()).await {
+                Some((proc, port)) => {
+                    actual_port_arc.store(port, std::sync::atomic::Ordering::Release);
+                    tracing::info!("llamafile started on port {}", port);
+                    *guard = Some(proc);
+                }
+                None => {
+                    tracing::warn!("llamafile could not be started (no model found or already running)");
+                }
+            }
+        });
+
+        llamafile_process::url_for(effective)
+    }
+
+    async fn is_running(&self) -> bool {
+        llamafile_process::is_running(self.effective_port()).await
+    }
+
+    async fn ensure_started_and_wait(
+        &self,
+        model_name: Option<&str>,
+        timeout_secs: u64,
+    ) -> (String, bool) {
+        let port = self.effective_port();
+        let url  = llamafile_process::url_for(port);
+
+        // Fast path: already running
+        if llamafile_process::is_running(port).await {
+            return (url, true);
+        }
+
+        // Kick off background startup (reuses existing spawn+lock logic)
+        self.ensure_started(model_name).await;
+
+        // Poll until ready or timeout, re-reading actual_port each iteration
+        // in case a just-started process chose a different port.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(timeout_secs);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let cur_port = self.effective_port();
+            if llamafile_process::is_running(cur_port).await {
+                return (llamafile_process::url_for(cur_port), true);
+            }
+        }
+        (llamafile_process::url_for(self.effective_port()), false)
+    }
+}
+
+impl LlamafileManagerImpl {
+    /// Construct the manager, seeding `actual_port` with the port chosen at
+    /// initial startup (or the base port if the process was not started yet).
+    fn new(
+        data_dir: std::path::PathBuf,
+        model_service: Arc<pond_core::services::model_service::ModelService>,
+        initial_guard: Option<llamafile_process::LlamafileProcess>,
+        initial_port: u16,
+    ) -> Self {
+        Self {
+            data_dir,
+            model_service,
+            guard: Arc::new(tokio::sync::Mutex::new(initial_guard)),
+            actual_port: Arc::new(std::sync::atomic::AtomicU16::new(initial_port)),
+        }
+    }
+
+    /// Return the port the llamafile process is (or should be) listening on.
+    fn effective_port(&self) -> u16 {
+        self.actual_port.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str, native: bool) -> Result<()> {
@@ -608,29 +718,6 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         whisper_process::url_for(whisper_port)
     };
 
-    // TTS — ensure Qwen TTS is installed, start it, then build Qwen (primary) → Piper (fallback)
-    // try_start returns (process, confirmed_running). If it was already running before
-    // we called try_start (returns None), fall back to a live is_running check.
-    let (_qwen_tts_guard, qwen_tts_url, qwen_tts_available) =
-        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
-            Some((proc, port, confirmed)) => {
-                (Some(proc), qwen_tts_process::url_for(port), confirmed)
-            }
-            None => {
-                // Prefer settings URL if the user configured a custom Qwen TTS server.
-                const DEFAULT_QWEN_URL: &str = "http://127.0.0.1:8181";
-                let url = if !settings.voice_tts_http_url.is_empty()
-                    && settings.voice_tts_http_url != DEFAULT_QWEN_URL
-                {
-                    settings.voice_tts_http_url.clone()
-                } else {
-                    qwen_tts_process::url_for(ports::QWEN_TTS)
-                };
-                let running = qwen_tts_process::is_running(&url).await;
-                (None, url, running)
-            }
-        };
-
     // Piper voice path — None when no voice is configured (skips all piper startup).
     // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
     // do not fall back to a hardcoded default.
@@ -704,32 +791,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             }
             _ => None,
         };
-    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = if qwen_tts_available {
-        let qwen_tts = Arc::new(
-            QwenTtsOutput::new(Some(&qwen_tts_url))
-                .with_voice(&settings.voice_tts_http_voice),
-        );
-        Some(match piper_tts {
-            Some(piper) => {
-                println!("  ✅ TTS: qwen-tts (primary) → piper (fallback)");
-                Arc::new(FallbackVoiceOutput::new(qwen_tts, piper))
-                    as Arc<dyn pond_core::ports::voice_output::VoiceOutput>
-            }
-            None => {
-                println!("  ✅ TTS: qwen-tts (primary, no fallback available)");
-                qwen_tts as Arc<dyn pond_core::ports::voice_output::VoiceOutput>
-            }
-        })
-    } else {
-        match piper_tts {
-            Some(piper) => {
-                println!("  ✅ TTS: piper (qwen-tts unavailable)");
-                Some(piper)
-            }
-            None => {
-                println!("  ⚠  TTS: no engine available — responses will be text-only");
-                None
-            }
+    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = match piper_tts {
+        Some(piper) => {
+            println!("  ✅ TTS: piper");
+            Some(piper)
+        }
+        None => {
+            println!("  ⚠  TTS: no engine available — responses will be text-only");
+            None
         }
     };
 
@@ -788,7 +857,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         || settings.task_provider.as_deref()  == Some("llamafile");
 
     let active_llm_name: String = settings.chat_model.clone();
-    let (_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
+    let (initial_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
         match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name)).await {
             Some((proc, port)) => (Some(proc), port),
             None => (None, ports::LLAMAFILE),
@@ -798,6 +867,15 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         (None, ports::LLAMAFILE)
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
+
+    // Build the LlamafileManager — holds the guard so the process stays alive and
+    // can start the process on demand when the user switches to the llamafile provider.
+    let llamafile_manager: Arc<dyn LlamafileManager> = Arc::new(LlamafileManagerImpl::new(
+        data_dir.clone(),
+        model_service.clone(),
+        initial_llamafile_guard,
+        llamafile_port,
+    ));
 
     println!("  ────────────────────────────────────────────────────\n");
 
@@ -834,44 +912,71 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Each role (Chat / Think / Task) may use a different provider + model.
     // Token budget and temperature are baked in at startup.
     //
-    // Helper: build one Arc<dyn LlmProvider> for a given (provider, model) pair.
-    let build_provider = |provider: &str, model: &str| -> Arc<dyn LlmProvider> {
+    // Async helper so we can await LocalInferenceLlmAdapter::new() for the
+    // "local" (in-process GGUF) provider without blocking the Tokio runtime.
+    async fn build_provider(
+        provider: &str,
+        model: &str,
+        llamafile_url: &str,
+        data_dir: Option<&std::path::Path>,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Arc<dyn LlmProvider> {
         match provider {
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
-            "local" => {
-                // Local GGUF inference is managed by GooseAdapter, which hot-swaps providers
-                // from settings on every turn. The server's llm_provider field is only used by
-                // legacy non-Goose API paths. Use llamafile as a stand-in — it won't be called
-                // during normal production operation when GooseAdapter is active.
-                tracing::info!(
-                    "chat_provider=local: GooseAdapter handles GGUF inference; \
-                     server llm_provider defaults to llamafile for non-Goose paths"
-                );
-                Arc::new(
-                    LlamafileProvider::new(Some(&llamafile_url))
-                        .with_max_tokens(settings.llm_max_tokens)
-                        .with_temperature(settings.llm_temperature),
-                ) as Arc<dyn LlmProvider>
+
+            #[cfg(feature = "local-inference")]
+            "local" | "gguf" => {
+                use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                tracing::info!("Building LocalInferenceLlmAdapter for model: {}", model);
+                let result = match data_dir {
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
+                    None      => LocalInferenceLlmAdapter::new(model).await,
+                };
+                match result {
+                    Ok(adapter) => {
+                        tracing::info!("LocalInferenceLlmAdapter ready for '{}'", model);
+                        Arc::new(adapter) as Arc<dyn LlmProvider>
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
+                             falling back to llamafile",
+                            model, e
+                        );
+                        Arc::new(LlamafileProvider::new(Some(llamafile_url))
+                            .with_max_tokens(max_tokens)
+                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                    }
+                }
             }
+
             _ => Arc::new(
                 // Default: llamafile (covers "llamafile" and unknown provider values)
-                LlamafileProvider::new(Some(&llamafile_url))
-                    .with_max_tokens(settings.llm_max_tokens)
-                    .with_temperature(settings.llm_temperature),
+                LlamafileProvider::new(Some(llamafile_url))
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(temperature),
             ) as Arc<dyn LlmProvider>,
         }
-    };
+    }
 
-    let chat_provider_arc = build_provider(&effective_chat_provider, &effective_chat_model);
+    let data_dir_ref = Some(data_dir.as_path());
+    let max_tokens   = settings.llm_max_tokens;
+    let temperature  = settings.llm_temperature;
+
+    let chat_provider_arc = build_provider(
+        &effective_chat_provider, &effective_chat_model,
+        &llamafile_url, data_dir_ref, max_tokens, temperature,
+    ).await;
 
     // Think role: reuse chat Arc if not separately configured.
     let think_provider_arc: Arc<dyn LlmProvider> =
         if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-            build_provider(tp, tm)
+            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
         } else {
             chat_provider_arc.clone()
         };
@@ -879,7 +984,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Task role: reuse chat Arc if not separately configured.
     let task_provider_arc: Arc<dyn LlmProvider> =
         if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-            build_provider(tp, tm)
+            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
         } else {
             chat_provider_arc.clone()
         };
@@ -1071,7 +1176,6 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         mcp_memory,
         extension_manager,
         mcp_server_repo,
-        qwen_tts_url: if qwen_tts_available { Some(qwen_tts_url.clone()) } else { None },
         download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port,
         model_catalog_provider: Some(Arc::new(
@@ -1087,6 +1191,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         prompt_extra_repo: Some(prompt_extra_repo),
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
+        llamafile_manager: Some(llamafile_manager),
     });
 
     // Warn if static assets haven't been built yet
@@ -1361,7 +1466,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
 
     // ── Wire LLM provider (settings drive token budget + temperature) ──
     // Default / fallback is always llamafile — it is auto-started above for any provider
-    // that is not "ollama" or "local".
+    // that is not "ollama" or "local" (GGUF aliases to "local").
     match effective_provider {
         "ollama" => {
             println!(
@@ -1378,7 +1483,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             );
             chat_service = chat_service.with_provider(llm);
         }
-        "local" => {
+        "local" | "gguf" => {
             #[cfg(feature = "local-inference")]
             {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
@@ -1464,48 +1569,8 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     chat_service = chat_service.with_wake_word_detector(detector);
 
-    // Auto-start Qwen TTS server before the match (guard must outlive voice_out).
-    let mut qwen_chat_port = ports::QWEN_TTS;
-    let _qwen_tts_chat_guard = if effective_tts == "qwen" || effective_tts == "qwen-tts" {
-        match qwen_tts_process::try_start(&data_dir, &settings.voice_tts_http_voice).await {
-            Some((proc, port, _confirmed)) => { qwen_chat_port = port; Some(proc) }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let qwen_chat_url = qwen_tts_process::url_for(qwen_chat_port);
-
     // ── Wire TTS output ──
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
-        "qwen" | "qwen-tts" => {
-            let qwen = Arc::new(QwenTtsOutput::new(Some(&qwen_chat_url)));
-
-            // Offer piper as a silent fallback only when already installed on disk.
-            // Never auto-download piper for this path — user must configure piper explicitly.
-            let piper_opt: Option<Arc<dyn VoiceOutput>> = if !settings.voice_tts_voice.is_empty() {
-                let model_path = model_download::tts_models_dir(&data_dir)
-                    .join(&settings.voice_tts_voice);
-                match piper_process::find_binary(&data_dir) {
-                    Some(bin) if model_path.exists() => {
-                        Some(Arc::new(PiperOutput::new(bin, model_path)))
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match piper_opt {
-                Some(piper) => {
-                    println!("  TTS:      qwen-tts (primary) → piper (fallback)");
-                    Arc::new(FallbackVoiceOutput::new(qwen as Arc<dyn VoiceOutput>, piper))
-                }
-                None => {
-                    println!("  TTS:      qwen-tts");
-                    qwen as Arc<dyn VoiceOutput>
-                }
-            }
-        }
         "piper" => {
             // Resolve model path: CLI arg → settings → warn and fall back to text
             let model_path_opt: Option<std::path::PathBuf> = if let Some(p) = tts_model {

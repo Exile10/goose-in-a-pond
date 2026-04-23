@@ -1,4 +1,4 @@
-use crate::audio::{self, AudioState};
+use crate::audio::{self, AudioState, WakeListenerState};
 use crate::canvas_feed::dispatch_sse_event;
 use crate::process::ServerProcess;
 use reqwest::multipart;
@@ -53,7 +53,14 @@ pub async fn stop_recording(
             return Err("No audio captured".to_string());
         }
         let rate = *native_rate.lock().unwrap();
-        audio::encode_wav(&captured, rate)
+        // Normalise to 16 kHz — same as the wake listener — so the
+        // transcribe endpoint always receives a consistent sample rate.
+        let (pcm, wav_rate) = if rate != 16000 {
+            (audio::resample_linear(&captured, rate, 16000), 16000u32)
+        } else {
+            (captured, rate)
+        };
+        audio::encode_wav(&pcm, wav_rate)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -67,6 +74,31 @@ pub async fn abort_recording(
 ) -> Result<(), String> {
     audio::abort_capture(&audio_state);
     let _ = app.emit("recording-aborted", ());
+    Ok(())
+}
+
+/// Start the passive wake-word listening loop.
+///
+/// Captures audio in 0.8s chunks, applies a silence gate, transcribes non-silent
+/// chunks via the pond-server /api/v1/transcribe endpoint, and emits
+/// `wake-word-detected` when `wake_word` is found in the transcript.
+#[tauri::command]
+pub async fn start_wake_listener(
+    app: AppHandle,
+    wake_word: String,
+    wake_state: State<'_, WakeListenerState>,
+    server: State<'_, ServerProcess>,
+) -> Result<(), String> {
+    let base_url = server.get_url();
+    audio::start_wake_listener(&wake_state, wake_word, base_url, app)
+}
+
+/// Stop the passive wake-word listening loop.
+#[tauri::command]
+pub async fn stop_wake_listener(
+    wake_state: State<'_, WakeListenerState>,
+) -> Result<(), String> {
+    audio::stop_wake_listener(&wake_state);
     Ok(())
 }
 
@@ -106,7 +138,7 @@ pub async fn run_voice_pipeline(
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|e| e.to_string())?;
-    let form = multipart::Form::new().part("file", part);
+    let form = multipart::Form::new().part("audio", part);
 
     let mut transcribe_req = client
         .post(format!("{}/api/v1/transcribe", base_url))
@@ -138,7 +170,7 @@ pub async fn run_voice_pipeline(
     let _ = app.emit("transcript", TranscriptResult { text: transcript.clone() });
 
     // ── 2. Chat (streaming SSE) ──────────────────────────────────────────────
-    let effective_session_id = session_id.unwrap_or_else(|| "voice".to_string());
+    let effective_session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let chat_req = serde_json::json!({
         "message": transcript,
         "session_id": effective_session_id
@@ -170,13 +202,17 @@ pub async fn run_voice_pipeline(
         let text = String::from_utf8_lossy(&chunk);
         for line in text.lines() {
             dispatch_sse_event(&app, line);
-            // Collect plain text for TTS
+            // Collect plain text for TTS.
+            // Supports both canonical {"type":"text","content":"..."} and
+            // legacy {"token":"..."} formats for forward/backward compat.
             if let Some(data) = line.strip_prefix("data: ") {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                     if val.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(c) = val.get("content").and_then(|c| c.as_str()) {
                             response_text.push_str(c);
                         }
+                    } else if let Some(tok) = val.get("token").and_then(|t| t.as_str()) {
+                        response_text.push_str(tok);
                     }
                 }
             }

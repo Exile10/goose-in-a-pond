@@ -168,19 +168,13 @@ function VoiceTab({
   applyHotkey: () => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const recDur = s.voice_recording_duration_secs ?? 5;
+  const recDur = s.voice_recording_duration_secs ?? 30;
 
   return (
     <div style={panelStyles.root}>
-      <FormSection title="Voice Activation">
-        <FormRow label="Wake phrase" hint="Say this phrase to activate voice mode">
-          <input
-            style={inp}
-            value={s.voice_wake_word ?? s.wake_word ?? ""}
-            onChange={(e) => patch("voice_wake_word", e.target.value)}
-            placeholder="goose"
-          />
-        </FormRow>
+
+      {/* ── Activation ──────────────────────────────────── */}
+      <FormSection title="Activation">
         <FormRow label="Keyboard shortcut" hint="Press this to activate voice from anywhere">
           <div style={{ display: "flex", gap: "var(--space-2)" }}>
             <input
@@ -192,9 +186,39 @@ function VoiceTab({
             <Button variant="outline" onPress={applyHotkey}>Apply</Button>
           </div>
         </FormRow>
+        <FormRow label="Wake phrase" hint="Say this phrase to activate voice mode">
+          <input
+            style={inp}
+            value={s.voice_wake_word ?? s.wake_word ?? ""}
+            onChange={(e) => patch("voice_wake_word", e.target.value)}
+            placeholder="goose"
+          />
+        </FormRow>
+        {/* Wake word info */}
+        <div style={wakeWordNote}>
+          <span style={wakeWordNoteIcon}>ℹ</span>
+          <span>
+            When set, the app listens passively while Voice mode is open and activates automatically when the phrase is heard. Leave blank to use the keyboard shortcut only.
+          </span>
+        </div>
       </FormSection>
 
-      {/* Advanced toggle */}
+      {/* ── Recording ───────────────────────────────────── */}
+      <FormSection title="Recording">
+        <FormRow label={`Max listen time: ${recDur}s`} hint="Auto-stops recording after this duration">
+          <input
+            type="range"
+            min={5}
+            max={120}
+            step={5}
+            value={recDur}
+            onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))}
+            style={{ width: "100%" }}
+          />
+        </FormRow>
+      </FormSection>
+
+      {/* ── Advanced toggle ──────────────────────────────── */}
       <button
         style={advancedToggleStyle}
         onClick={() => setShowAdvanced((v) => !v)}
@@ -205,21 +229,7 @@ function VoiceTab({
 
       {showAdvanced && (
         <>
-          <FormSection title="Recording">
-            <FormRow label={`Max listen time: ${recDur}s`} hint="Stops recording automatically after this duration">
-              <input
-                type="range"
-                min={2}
-                max={15}
-                step={1}
-                value={recDur}
-                onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))}
-                style={{ width: "100%" }}
-              />
-            </FormRow>
-          </FormSection>
-
-          <FormSection title="Speech Recognition">
+          <FormSection title="Transcription">
             <FormRow label="Server address" hint="Where the speech-to-text server is running">
               <input
                 style={inp}
@@ -238,7 +248,7 @@ function VoiceTab({
             </FormRow>
           </FormSection>
 
-          <FormSection title="Voice Synthesis">
+          <FormSection title="Speech Synthesis">
             <FormRow label="Voice model" hint="Piper voice model file (.onnx)">
               <input
                 style={inp}
@@ -248,12 +258,15 @@ function VoiceTab({
               />
             </FormRow>
             <FormRow label="Voice name">
-              <input
-                style={inp}
-                value={s.voice_tts_voice ?? ""}
-                onChange={(e) => patch("voice_tts_voice", e.target.value)}
-                placeholder="en_US-lessac-medium.onnx"
-              />
+              <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+                <input
+                  style={inp}
+                  value={s.voice_tts_voice ?? ""}
+                  onChange={(e) => patch("voice_tts_voice", e.target.value)}
+                  placeholder="en_US-lessac-medium.onnx"
+                />
+                <Button variant="outline" isDisabled title="Coming soon">Preview</Button>
+              </div>
             </FormRow>
           </FormSection>
         </>
@@ -287,6 +300,27 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
   const [pickerRole, setPickerRole] = useState<ModelRole | null>(null);
   const [thinkSameAsChat, setThinkSameAsChat] = useState(!s.think_provider && !s.think_model);
   const [taskSameAsChat, setTaskSameAsChat]   = useState(!s.task_provider && !s.task_model);
+
+  // Seed model fields from live active roles if settings don't already have them
+  useEffect(() => {
+    api.getActiveRoles().then((roles) => {
+      if (!s.chat_provider && roles.chat) {
+        patch("chat_provider", roles.chat.provider);
+        patch("chat_model", roles.chat.model);
+      }
+      if (!s.think_provider && !s.think_model && roles.think) {
+        setThinkSameAsChat(false);
+        patch("think_provider", roles.think.provider);
+        patch("think_model", roles.think.model);
+      }
+      if (!s.task_provider && !s.task_model && roles.task) {
+        setTaskSameAsChat(false);
+        patch("task_provider", roles.task.provider);
+        patch("task_model", roles.task.model);
+      }
+    }).catch(() => {/* non-fatal */});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const temp = s.llm_temperature ?? 0.7;
   const maxTokenOpts = [128, 256, 512, 1024, 2048, 4096];
@@ -785,6 +819,25 @@ const styles: Record<string, React.CSSProperties> = {
     paddingTop: "var(--space-3)",
     borderTop: "1px solid var(--color-border)",
   },
+};
+
+const wakeWordNote: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: "6px",
+  padding: "8px 10px",
+  background: "rgba(255,149,0,0.08)",
+  border: "1px solid rgba(255,149,0,0.25)",
+  borderRadius: "8px",
+  fontSize: "var(--text-xs)",
+  color: "rgba(23,22,22,0.70)",
+  lineHeight: "1.5",
+};
+
+const wakeWordNoteIcon: React.CSSProperties = {
+  color: "#FF9500",
+  flexShrink: 0,
+  marginTop: "1px",
 };
 
 const advancedToggleStyle: React.CSSProperties = {

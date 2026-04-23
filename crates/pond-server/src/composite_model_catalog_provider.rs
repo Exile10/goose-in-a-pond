@@ -164,32 +164,6 @@ fn piper_record(v: &PiperVoice) -> ModelRecord {
 }
 
 fn piper_tts_models() -> Vec<ModelRecord> {
-    // qwen-tts HTTP endpoint — always "downloaded" (no file needed)
-    let qwen = ModelRecord {
-        id:               ModelRecord::id_for(&ModelCategory::TtsHttp, "qwen-tts"),
-        category:         ModelCategory::TtsHttp,
-        name:             "qwen-tts".to_string(),
-        filename:         None,
-        description:      "Qwen2.5-TTS via local HTTP server (OpenAI-compatible)".to_string(),
-        size_mb:          0,
-        url:              None,
-        hf_id:            None,
-        ram_estimate_mb:  None,
-        recommended_role: Some("tts".to_string()),
-        context_length:   None,
-        quantization:     None,
-        asr_language:     None,
-        asr_size:         None,
-        tts_engine:       Some("http".to_string()),
-        tts_voice_name:   None,
-        config_filename:  None,
-        config_url:       None,
-        tts_url:          Some("http://127.0.0.1:8181".to_string()),
-        sample_rate:      None,
-        downloaded:       true,
-        is_custom:        false,
-    };
-
     let voices = vec![
         PiperVoice { name: "en-lessac-medium",    model_filename: "en_US-lessac-medium.onnx",         config_filename: "en_US-lessac-medium.onnx.json",         hf_path: "en/en_US/lessac/medium",          size_mb: 63,  description: "Piper en_US-lessac medium female (~63 MB) — recommended" },
         PiperVoice { name: "en-lessac-high",      model_filename: "en_US-lessac-high.onnx",           config_filename: "en_US-lessac-high.onnx.json",           hf_path: "en/en_US/lessac/high",            size_mb: 254, description: "Piper en_US-lessac high quality female (~254 MB)" },
@@ -200,10 +174,7 @@ fn piper_tts_models() -> Vec<ModelRecord> {
         PiperVoice { name: "de-thorsten-medium",  model_filename: "de_DE-thorsten-medium.onnx",       config_filename: "de_DE-thorsten-medium.onnx.json",       hf_path: "de/de_DE/thorsten/medium",        size_mb: 63,  description: "Piper de_DE-thorsten medium male (~63 MB)" },
         PiperVoice { name: "sw-biblia-medium",    model_filename: "sw_CD-biblia_takatifu-medium.onnx", config_filename: "sw_CD-biblia_takatifu-medium.onnx.json", hf_path: "sw/sw_CD/biblia_takatifu/medium", size_mb: 63,  description: "Piper sw_CD-biblia_takatifu medium Swahili (~63 MB)" },
     ];
-
-    let mut out = vec![qwen];
-    out.extend(voices.iter().map(piper_record));
-    out
+    voices.iter().map(piper_record).collect()
 }
 
 // ── Llamafile ─────────────────────────────────────────────────────────────────

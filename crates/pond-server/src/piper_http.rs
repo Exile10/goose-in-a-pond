@@ -4,7 +4,7 @@
 //! Endpoint: `POST /tts`  — plain-text body → WAV audio bytes.
 //!
 //! This gives Piper the same "running on port N" lifecycle as
-//! whisper-server and qwen-tts so it can be reported in the startup banner
+//! whisper-server so it can be reported in the startup banner
 //! and reached by any local HTTP client.
 
 use anyhow::{anyhow, Context, Result};

@@ -12,7 +12,7 @@
 //!
 //! let mut ctx: HashMap<&str, &str> = HashMap::new();
 //! ctx.insert("assistant_name", "Goose");
-//! ctx.insert("user_name", "Jerry");
+//! ctx.insert("user_name", "Jack");
 //! ctx.insert("personality", "warm and direct");
 //! ctx.insert("timezone", "Africa/Nairobi");
 //!
@@ -34,6 +34,7 @@
 //! See individual template files in `src/prompts/` for per-template variables.
 
 use goose::prompt_template::render_string;
+use pond_core::ports::extension_manager::ExtensionInfo;
 use serde::Serialize;
 
 // ── Embedded template files ───────────────────────────────────────────────────
@@ -49,6 +50,7 @@ const PLAN:                &str = include_str!("prompts/plan.md");
 const TINY_MODEL_SYSTEM:   &str = include_str!("prompts/tiny_model_system.md");
 const SESSION_NAME:        &str = include_str!("prompts/session_name.md");
 const TINY_MODEL_DECISION: &str = include_str!("prompts/tiny_model_decision.md");
+const TOOL_GUIDANCE:       &str = include_str!("prompts/tool_guidance.md");
 
 /// Registry of GIAP-specific prompt templates.
 ///
@@ -89,6 +91,7 @@ impl GiapPrompts {
             "tiny_model_system.md"   => Some(TINY_MODEL_SYSTEM),
             "session_name.md"        => Some(SESSION_NAME),
             "tiny_model_decision.md" => Some(TINY_MODEL_DECISION),
+            "tool_guidance.md"       => Some(TOOL_GUIDANCE),
             _ => None,
         }
     }
@@ -107,12 +110,53 @@ impl GiapPrompts {
             "tiny_model_system.md",
             "session_name.md",
             "tiny_model_decision.md",
+            "tool_guidance.md",
         ]
     }
 
     /// Returns `true` if `name` is a registered GIAP prompt.
     pub fn is_registered(name: &str) -> bool {
         Self::get(name).is_some()
+    }
+
+    /// Render dynamic tool guidance from the currently loaded extensions.
+    pub fn render_tool_guidance(extensions: &[ExtensionInfo]) -> String {
+        if extensions.is_empty() {
+            return String::new();
+        }
+
+        let mut tools_section: Vec<String> = Vec::new();
+        let mut has_tools = false;
+
+        for ext in extensions {
+            if ext.tools.is_empty() {
+                continue;
+            }
+            has_tools = true;
+            if ext.description.trim().is_empty() {
+                tools_section.push(format!("- {} ({})", ext.name, ext.kind));
+            } else {
+                tools_section.push(format!(
+                    "- {} ({}) - {}",
+                    ext.name,
+                    ext.kind,
+                    ext.description.trim()
+                ));
+            }
+            for tool in &ext.tools {
+                tools_section.push(format!("  - {}", tool));
+            }
+        }
+
+        if !has_tools {
+            return String::new();
+        }
+
+        let ctx = serde_json::json!({
+            "tools_section": tools_section.join("\n")
+        });
+
+        render_string(TOOL_GUIDANCE, &ctx).unwrap_or_else(|_| tools_section.join("\n"))
     }
 }
 
@@ -135,8 +179,9 @@ mod tests {
 
     #[test]
     fn list_returns_all_templates() {
-        assert_eq!(GiapPrompts::list().len(), 11);
+        assert_eq!(GiapPrompts::list().len(), 12);
         assert!(GiapPrompts::list().contains(&"tiny_model_decision.md"));
+        assert!(GiapPrompts::list().contains(&"tool_guidance.md"));
     }
 
     #[test]
@@ -200,5 +245,35 @@ mod tests {
             let result = GiapPrompts::render(name, &ctx);
             assert!(result.is_ok(), "Template '{}' failed to render: {:?}", name, result);
         }
+    }
+
+    #[test]
+    fn render_tool_guidance_lists_extension_tools() {
+        let extensions = vec![ExtensionInfo {
+            name: "weather".to_string(),
+            kind: "builtin".to_string(),
+            description: "Weather integration".to_string(),
+            tools: vec![
+                "giap__get_current_weather".to_string(),
+                "giap__get_forecast".to_string(),
+            ],
+        }];
+
+        let rendered = GiapPrompts::render_tool_guidance(&extensions);
+        assert!(rendered.contains("giap__get_current_weather"));
+        assert!(rendered.contains("Weather integration"));
+    }
+
+    #[test]
+    fn render_tool_guidance_returns_empty_when_no_tools_available() {
+        let extensions = vec![ExtensionInfo {
+            name: "empty".to_string(),
+            kind: "builtin".to_string(),
+            description: "No tools".to_string(),
+            tools: vec![],
+        }];
+
+        let rendered = GiapPrompts::render_tool_guidance(&extensions);
+        assert!(rendered.is_empty());
     }
 }

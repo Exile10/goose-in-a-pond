@@ -108,6 +108,25 @@ describe("reducer — voice state", () => {
     expect(next.voiceError).toBeNull();
   });
 
+  it("SET_VOICE_STATE transitions to 'wait' (passive wake-word listening)", () => {
+    const next = reducer(BASE, { type: "SET_VOICE_STATE", payload: "wait" });
+    expect(next.voiceState).toBe("wait");
+    expect(next.voiceError).toBeNull();
+  });
+
+  it("full wait → recording → thinking → speaking → idle cycle via reducer", () => {
+    let s = reducer(BASE, { type: "SET_VOICE_STATE", payload: "wait" });
+    expect(s.voiceState).toBe("wait");
+    s = reducer(s, { type: "SET_VOICE_STATE", payload: "recording" });
+    expect(s.voiceState).toBe("recording");
+    s = reducer(s, { type: "SET_VOICE_STATE", payload: "thinking" });
+    expect(s.voiceState).toBe("thinking");
+    s = reducer(s, { type: "SET_VOICE_STATE", payload: "speaking" });
+    expect(s.voiceState).toBe("speaking");
+    s = reducer(s, { type: "SET_VOICE_STATE", payload: "idle" });
+    expect(s.voiceState).toBe("idle");
+  });
+
   it("SET_VOICE_ERROR sets voiceError", () => {
     const next = reducer(BASE, { type: "SET_VOICE_ERROR", payload: "mic unavailable" });
     expect(next.voiceError).toBe("mic unavailable");

@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 pond-core = { workspace = true }
 anyhow = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

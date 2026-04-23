@@ -28,7 +28,7 @@ tauri-plugin-shell = "2"
 cpal = "0.15"
 
 # HTTP client for talking to pond-server
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream", "blocking"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,6 +39,9 @@ serde_json = "1"
 
 # Audio playback for TTS output
 rodio = { version = "0.17", default-features = false, features = ["wav", "mp3"] }
+
+# UUID generation (for session IDs)
+uuid = { version = "1", features = ["v4"] }
 
 # Logging
 tracing = "0.1"

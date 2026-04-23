@@ -98,9 +98,9 @@ impl ChatService {
 
     /// Enable LLM-based context compaction.
     ///
-    /// When set, `chat_once` will summarise the oldest 75% of history whenever
-    /// the conversation exceeds 80% of the context limit, instead of simply
-    /// dropping old messages via `trim_to_budget`.
+    /// When set, `chat_once` will summarise older history while preserving the
+    /// most recent turns whenever the conversation exceeds 80% of the context
+    /// limit, instead of simply dropping old messages via `trim_to_budget`.
     pub fn with_context_compactor(mut self, compactor: ContextCompactor) -> Self {
         self.compactor = Some(compactor);
         self

@@ -2,6 +2,46 @@ import { useState, useRef } from 'react'
 
 type TestStatus = 'idle' | 'recording' | 'transcribing' | 'done' | 'error'
 
+/**
+ * Decodes any browser-recorded audio blob (webm, mp4, ogg) and re-encodes
+ * it as a 16kHz mono 16-bit PCM WAV that whisper.cpp accepts.
+ */
+async function encodeWav(audioBlob: Blob): Promise<Blob> {
+  const arrayBuffer = await audioBlob.arrayBuffer()
+  const audioCtx = new AudioContext({ sampleRate: 16000 })
+  const decoded = await audioCtx.decodeAudioData(arrayBuffer)
+  await audioCtx.close()
+
+  const numSamples = decoded.length
+  const channelData = decoded.getChannelData(0)
+
+  // Mix stereo down to mono if needed
+  if (decoded.numberOfChannels > 1) {
+    const ch1 = decoded.getChannelData(1)
+    for (let i = 0; i < numSamples; i++) {
+      channelData[i] = (channelData[i] + ch1[i]) / 2
+    }
+  }
+
+  // Build WAV file: 44-byte header + 16-bit PCM samples
+  const dataLen = numSamples * 2
+  const buf = new ArrayBuffer(44 + dataLen)
+  const view = new DataView(buf)
+  const writeStr = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i))
+  }
+  writeStr(0, 'RIFF'); view.setUint32(4, 36 + dataLen, true); writeStr(8, 'WAVE')
+  writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true); view.setUint32(24, 16000, true); view.setUint32(28, 32000, true)
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true)
+  writeStr(36, 'data'); view.setUint32(40, dataLen, true)
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, channelData[i]))
+    view.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true)
+  }
+  return new Blob([buf], { type: 'audio/wav' })
+}
+
 export default function WakeWordTest() {
   const [status, setStatus] = useState<TestStatus>('idle')
   const [transcript, setTranscript] = useState('')
@@ -47,9 +87,12 @@ export default function WakeWordTest() {
       setStatus('transcribing')
 
       try {
-        const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
+        // Convert compressed browser audio (webm/mp4) to 16kHz mono WAV —
+        // whisper.cpp only accepts WAV and rejects compressed formats
+        const rawBlob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
+        const wavBlob = await encodeWav(rawBlob)
         const form = new FormData()
-        form.append('audio', blob, 'audio.webm')
+        form.append('audio', wavBlob, 'audio.wav')
 
         const res = await fetch('/api/v1/transcribe', { method: 'POST', body: form })
 

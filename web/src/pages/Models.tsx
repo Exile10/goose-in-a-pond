@@ -467,7 +467,7 @@ function RolePanel({
     think: 'Deep reasoning, analysis, explanations',
     task:  'Actions, scheduling, device control',
     asr:   'Speech-to-text (Whisper)',
-    tts:   'Text-to-speech (Piper / Qwen)',
+    tts:   'Text-to-speech (Piper)',
   }
 
   const ALL_ROLE_ICONS: Record<string, string> = {
@@ -502,7 +502,7 @@ function RolePanel({
           const isSet = !!(provider || model)
           const isUpdated = justUpdated === role
           return (
-            <div key={role} style={{
+            <div key={role} className="db-role-row" style={{
               display: 'flex', alignItems: 'center', gap: '0.75rem',
               padding: '0.6rem 0.75rem', borderRadius: '8px',
               border: `1px solid ${isSet ? 'rgba(169,111,245,0.25)' : 'rgba(128,128,128,0.12)'}`,
@@ -547,7 +547,7 @@ function RolePanel({
           const isSet = !!name
           const isUpdated = justUpdated === role
           return (
-            <div key={role} style={{
+            <div key={role} className="db-role-row" style={{
               display: 'flex', alignItems: 'center', gap: '0.75rem',
               padding: '0.6rem 0.75rem', borderRadius: '8px',
               border: `1px solid ${isSet ? 'rgba(74,222,128,0.2)' : 'rgba(128,128,128,0.12)'}`,
@@ -928,7 +928,7 @@ export default function Models({ token }: Props) {
           onRefresh={load}
         />
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.75rem', gap: '0.5rem', alignItems: 'center' }}>
+        <div className="db-models-toolbar" style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.75rem', gap: '0.5rem', alignItems: 'center' }}>
           {refreshMsg && <span style={{ fontSize: '0.8rem', opacity: 0.7 }}>{refreshMsg}</span>}
           <button
             className="db-btn-sm"

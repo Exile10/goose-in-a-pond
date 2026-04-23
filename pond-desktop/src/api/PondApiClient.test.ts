@@ -277,3 +277,210 @@ describe("chatStream()", () => {
     expect(events.filter((e) => e.type === "text")).toHaveLength(1);
   });
 });
+
+// ── Schedule actions ──────────────────────────────────────────────────────────
+
+describe("pauseSchedule()", () => {
+  it("POSTs to /schedules/:id/pause", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await client().pauseSchedule("sched-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/schedules/sched-1/pause",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+describe("resumeSchedule()", () => {
+  it("POSTs to /schedules/:id/resume", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await client().resumeSchedule("sched-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/schedules/sched-1/resume",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+describe("runScheduleNow()", () => {
+  it("POSTs to /schedules/:id/run-now", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await client().runScheduleNow("sched-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/schedules/sched-1/run-now",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+// ── GGUF model search & download ──────────────────────────────────────────────
+
+describe("searchGgufModels()", () => {
+  it("GETs /models/search/gguf?q=<query>", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [] }));
+    await client().searchGgufModels("gemma");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/search/gguf?q=gemma",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("encodes special characters in query", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [] }));
+    await client().searchGgufModels("gemma 4b");
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("q=gemma%204b");
+  });
+
+  it("returns model list", async () => {
+    const models = [{ id: "unsloth/gemma-4-E2B-it-GGUF", downloads: 5000, likes: 12, tags: ["gguf"], url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF" }];
+    fetchMock.mockResolvedValueOnce(okJson({ models }));
+    const res = await client().searchGgufModels("gemma");
+    expect(res.models).toHaveLength(1);
+    expect(res.models[0].id).toBe("unsloth/gemma-4-E2B-it-GGUF");
+  });
+});
+
+describe("listHfModelFiles()", () => {
+  it("GETs /models/search/gguf/files?repo=<repo>", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ files: [] }));
+    await client().listHfModelFiles("unsloth/gemma-4-E2B-it-GGUF");
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/models/search/gguf/files");
+    expect(url).toContain("repo=");
+  });
+
+  it("returns file list", async () => {
+    const files = [{ filename: "model.Q4_K_M.gguf", size_mb: 1400, url: "https://huggingface.co/..." }];
+    fetchMock.mockResolvedValueOnce(okJson({ files }));
+    const res = await client().listHfModelFiles("unsloth/gemma-4-E2B-it-GGUF");
+    expect(res.files).toHaveLength(1);
+    expect(res.files[0].filename).toBe("model.Q4_K_M.gguf");
+  });
+});
+
+describe("downloadModelFromUrl()", () => {
+  it("POSTs to /models/download/url with correct body", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ status: "download_started" }));
+    const res = await client().downloadModelFromUrl("https://hf.co/file.gguf", "gguf", "file.gguf");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/download/url",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ url: "https://hf.co/file.gguf", category: "gguf", filename: "file.gguf" }),
+      }),
+    );
+    expect(res.status).toBe("download_started");
+  });
+});
+
+describe("getDownloadProgress()", () => {
+  it("GETs /models/download/progress", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ downloads: [] }));
+    const res = await client().getDownloadProgress();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/download/progress",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(res.downloads).toEqual([]);
+  });
+
+  it("returns in-progress downloads", async () => {
+    const downloads = [{ filename: "model.gguf", category: "gguf", progress_pct: 42, status: "downloading" }];
+    fetchMock.mockResolvedValueOnce(okJson({ downloads }));
+    const res = await client().getDownloadProgress();
+    expect(res.downloads[0].progress_pct).toBe(42);
+  });
+});
+
+// ── deleteModel ───────────────────────────────────────────────────────────────
+
+describe("deleteModel()", () => {
+  it("DELETEs /models/{category}/{name}", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await client().deleteModel("gguf", "gemma-2b");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/gguf/gemma-2b",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("throws ApiError 409 when model is active", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(409, "model is active in role chat"));
+    await expect(client().deleteModel("gguf", "active-model")).rejects.toSatisfy(
+      (e: unknown) => e instanceof ApiError && (e as ApiError).status === 409,
+    );
+  });
+});
+
+// ── listOllamaModels ──────────────────────────────────────────────────────────
+
+describe("listOllamaModels()", () => {
+  it("GETs /models/ollama", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [] }));
+    const res = await client().listOllamaModels();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/ollama",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(res.models).toEqual([]);
+  });
+
+  it("returns models with name field", async () => {
+    const models = [{ name: "llama3.2:3b", size: 2_000_000_000 }];
+    fetchMock.mockResolvedValueOnce(okJson({ models }));
+    const res = await client().listOllamaModels();
+    expect(res.models[0].name).toBe("llama3.2:3b");
+  });
+
+  it("returns error string when Ollama not running", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [], error: "Ollama not running or not installed" }));
+    const res = await client().listOllamaModels();
+    expect(res.error).toContain("Ollama");
+  });
+});
+
+// ── pullOllamaModel ───────────────────────────────────────────────────────────
+
+describe("pullOllamaModel()", () => {
+  it("POSTs to /models/ollama/pull with model name in body", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ status: "pulling" }));
+    const res = await client().pullOllamaModel("llama3.2:3b");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/ollama/pull",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ model: "llama3.2:3b" }),
+      }),
+    );
+    expect(res.status).toBe("pulling");
+  });
+});
+
+// ── searchLlamafileModels ─────────────────────────────────────────────────────
+
+describe("searchLlamafileModels()", () => {
+  it("GETs /models/search/llamafile without query", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [] }));
+    await client().searchLlamafileModels();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/search/llamafile",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("appends ?q= when query provided", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ models: [] }));
+    await client().searchLlamafileModels("gemma");
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("?q=gemma");
+  });
+
+  it("returns release list", async () => {
+    const models = [{ name: "gemma-2b-it.llamafile", size_mb: 1400, download_url: "https://github.com/...", tag: "0.9.1" }];
+    fetchMock.mockResolvedValueOnce(okJson({ models }));
+    const res = await client().searchLlamafileModels("gemma");
+    expect(res.models[0].name).toBe("gemma-2b-it.llamafile");
+    expect(res.models[0].tag).toBe("0.9.1");
+  });
+});
