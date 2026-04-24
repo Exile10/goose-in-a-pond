@@ -92,6 +92,15 @@ pub struct Settings {
     #[serde(default = "Settings::default_wake_word")]
     pub voice_wake_word: String,
 
+    /// Whisper transcription variants collected during wake-word calibration.
+    ///
+    /// Empty → detector falls back to raw normalized `voice_wake_word` as the sole pattern.
+    /// Non-empty → detector matches against any variant in this list (OR logic), enabling
+    /// robust detection across Whisper's inconsistent output ("hey goose" / "hey, goose" /
+    /// "a goose" etc.).
+    #[serde(default)]
+    pub voice_wake_word_transcriptions: Vec<String>,
+
     /// Piper TTS voice model filename (e.g. "en_US-lessac-medium.onnx")
     #[serde(default = "Settings::default_tts_voice")]
     pub voice_tts_voice: String,
@@ -186,6 +195,7 @@ impl Default for Settings {
             llm_temperature:                 Self::default_temperature(),
             llm_provider:                    Self::default_llm_provider(),
             voice_wake_word:                 Self::default_wake_word(),
+            voice_wake_word_transcriptions:  Vec::new(),
             voice_tts_voice:                 Self::default_tts_voice(),
             voice_recording_duration_secs:   Self::default_recording_duration(),
             voice_whisper_url:               Self::default_whisper_url(),

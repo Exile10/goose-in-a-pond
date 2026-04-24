@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use pond_core::domain::settings::Settings;
 use pond_core::ports::settings::SettingsRepository;
 use sqlx::{Pool, Sqlite};
+use serde_json;
 
 pub struct SqliteSettingsRepository {
     pool: Pool<Sqlite>,
@@ -67,6 +68,9 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("llm_temperature",                 settings.llm_temperature.to_string());
         upsert!("llm_provider",                    &settings.llm_provider);
         upsert!("voice_wake_word",                 &settings.voice_wake_word);
+        upsert!("voice_wake_word_transcriptions",
+            serde_json::to_string(&settings.voice_wake_word_transcriptions)
+                .unwrap_or_else(|_| "[]".to_string()));
         upsert!("voice_tts_voice",                 &settings.voice_tts_voice);
         upsert!("voice_recording_duration_secs",   settings.voice_recording_duration_secs.to_string());
         upsert!("voice_whisper_url",               &settings.voice_whisper_url);
@@ -145,6 +149,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         "llm_provider"                    => s.llm_provider = value.to_string(),
         "voice_wake_word"                 => s.voice_wake_word = value.to_string(),
+        "voice_wake_word_transcriptions"  => {
+            if let Ok(v) = serde_json::from_str::<Vec<String>>(value) {
+                s.voice_wake_word_transcriptions = v;
+            }
+        }
         "voice_tts_voice"                 => s.voice_tts_voice = value.to_string(),
         "voice_recording_duration_secs"   => {
             if let Ok(v) = value.parse() { s.voice_recording_duration_secs = v; }

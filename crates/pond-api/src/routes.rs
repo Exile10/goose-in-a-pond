@@ -63,6 +63,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/settings", put(update_settings))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
+        // Wake-word phrase calibration (public — used during onboarding WakeWord step)
+        .route("/voice/calibrate", post(calibrate_wake_word))
+        .route("/voice/calibrate", delete(reset_wake_word_calibration))
         .route("/system/info", get(system_info))
         // Service connectivity test (public — diagnostic tool)
         .route("/test", get(test_services))
@@ -2262,6 +2265,142 @@ async fn transcribe(
 
     let text = json["text"].as_str().unwrap_or("").trim().to_string();
     Ok(Json(json!({"text": text})))
+}
+
+// ── Wake-word calibration ─────────────────────────────────────────────────────
+
+/// `POST /api/v1/voice/calibrate`
+///
+/// Accepts a WAV recording of the user saying their wake word/phrase, transcribes
+/// it via whisper.cpp, and stores the result as a calibration variant in settings.
+///
+/// Call this 5 times (one per recording sample) during the onboarding WakeWord step.
+/// The endpoint accumulates unique normalized variants and returns progress after each call.
+///
+/// **Request** — multipart/form-data with an `audio` field (WAV bytes, 16-bit mono 16 kHz).
+///
+/// **Response**
+/// ```json
+/// {
+///   "transcript":    "hey goose",
+///   "all_variants":  ["hey goose", "hey, goose", "a goose"],
+///   "sample_count":  3,
+///   "target_count":  5,
+///   "complete":      false
+/// }
+/// ```
+async fn calibrate_wake_word(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const TARGET_SAMPLES: usize = 5;
+
+    // ── Read audio field ─────────────────────────────────────────────────────
+    let mut audio_bytes: Option<Vec<u8>> = None;
+    let mut filename = "audio.wav".to_string();
+    let mut content_type = "audio/wav".to_string();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("multipart error: {e}")})))
+    })? {
+        if field.name() == Some("audio") {
+            filename = field.file_name().unwrap_or("audio.wav").to_string();
+            content_type = field.content_type().unwrap_or("audio/wav").to_string();
+            let bytes = field.bytes().await.map_err(|e| {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": format!("read error: {e}")})))
+            })?;
+            audio_bytes = Some(bytes.to_vec());
+        }
+    }
+
+    let bytes = audio_bytes.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'audio' field in multipart body"})))
+    })?;
+
+    // ── Transcribe via whisper.cpp ───────────────────────────────────────────
+    let whisper_url = format!("{}/inference", state.whisper_url);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename)
+        .mime_str(&content_type)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("MIME error: {e}")}))))?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "json");
+
+    let resp = state.http_client.post(&whisper_url).multipart(form).send().await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("whisper server unreachable: {e}")})))
+    })?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": body}))));
+    }
+
+    let whisper_json: Value = resp.json().await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("whisper parse error: {e}")})))
+    })?;
+
+    let raw_transcript = whisper_json["text"].as_str().unwrap_or("").trim().to_string();
+    if raw_transcript.is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "no speech detected in recording"}))));
+    }
+
+    // Normalize: strip punctuation, collapse whitespace, lowercase — same as detector.
+    let normalized: String = raw_transcript
+        .chars()
+        .map(|c| if c.is_alphabetic() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    // ── Load settings, append variant, save ─────────────────────────────────
+    let mut settings = state.settings_repo.get().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings load failed: {e}")})))
+    })?;
+
+    // Append only if this normalized variant is not already present.
+    if !settings.voice_wake_word_transcriptions.contains(&normalized) {
+        settings.voice_wake_word_transcriptions.push(normalized.clone());
+    }
+
+    let all_variants = settings.voice_wake_word_transcriptions.clone();
+    let sample_count = all_variants.len();
+    let complete     = sample_count >= TARGET_SAMPLES;
+
+    state.settings_repo.update(&settings).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings save failed: {e}")})))
+    })?;
+
+    Ok(Json(json!({
+        "transcript":   raw_transcript,
+        "normalized":   normalized,
+        "all_variants": all_variants,
+        "sample_count": sample_count,
+        "target_count": TARGET_SAMPLES,
+        "complete":     complete,
+    })))
+}
+
+/// `DELETE /api/v1/voice/calibrate`
+///
+/// Clears all collected wake-word transcription variants, resetting calibration.
+/// Safe to call at any point — the detector falls back to the raw normalized wake word.
+async fn reset_wake_word_calibration(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut settings = state.settings_repo.get().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings load failed: {e}")})))
+    })?;
+
+    settings.voice_wake_word_transcriptions.clear();
+
+    state.settings_repo.update(&settings).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings save failed: {e}")})))
+    })?;
+
+    Ok(Json(json!({"cleared": true, "message": "Wake-word calibration data cleared"})))
 }
 
 // ── Service connectivity test ─────────────────────────────────────────────────
