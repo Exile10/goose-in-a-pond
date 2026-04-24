@@ -1730,19 +1730,37 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     if no_wake_word || input != "whisper" {
         chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
-        let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
+        let trigger        = wake_word.unwrap_or(settings.voice_wake_word.as_str());
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
+        // Tiered model: use a separate (fast, tiny) whisper server for KWS when configured.
+        let kws_url = settings.voice_kws_whisper_url
+            .as_deref()
+            .unwrap_or(&whisper_url);
+
         if transcriptions.is_empty() {
             println!("  Wake word: \"{}\" (no calibration — using raw phrase)", trigger);
         } else {
             println!("  Wake word: \"{}\" ({} calibrated variants)", trigger, transcriptions.len());
         }
-        println!("  Detector: sliding-window via whisper @ {}", whisper_url);
-        // Use the streaming detector — it returns captured command audio on activation
-        // so the user can speak "Hey Goose, <command>" in one breath.
+        println!("  KWS whisper:   {}", kws_url);
+        println!("  ASR whisper:   {}", whisper_url);
+        println!("  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
+            settings.voice_kws_energy_threshold,
+            settings.voice_kws_cooldown_ms,
+            settings.voice_kws_post_trigger_silence_ms);
+
+        use pond_adapters_whisper::KeywordDetectorConfig;
+        let kws_config = KeywordDetectorConfig {
+            energy_threshold:        settings.voice_kws_energy_threshold,
+            post_trigger_silence_ms: settings.voice_kws_post_trigger_silence_ms,
+            cooldown_ms:             settings.voice_kws_cooldown_ms,
+            ..KeywordDetectorConfig::default()
+        };
+
         let detector = Arc::new(
-            WhisperKeywordDetector::new(Some(&whisper_url), trigger)
+            WhisperKeywordDetector::new(Some(kws_url), trigger)
                 .with_transcriptions(transcriptions)
+                .with_config(kws_config)
         );
         chat_service = chat_service.with_wake_word_detector(detector);
     };

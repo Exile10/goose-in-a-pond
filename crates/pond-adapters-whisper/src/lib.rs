@@ -307,9 +307,9 @@ pub struct KeywordDetectorConfig {
     /// How far to advance the window on each detection cycle (milliseconds).
     /// Default: 500 ms — 3 overlapping checks per window, ~1–1.5 s latency.
     pub slide_ms: u64,
-    /// Extra audio to capture after detection fires (milliseconds).
-    /// This becomes the command audio returned to the caller (one-breath path).
-    /// Default: 4000 ms — long enough for typical spoken commands.
+    /// Maximum audio to capture after detection fires (milliseconds).
+    /// Acts as a hard ceiling — VAD silence detection exits earlier when enabled.
+    /// Default: 4000 ms.
     pub post_trigger_ms: u64,
     /// Enable two-threshold hysteresis.
     /// When a ≤3-token transcript contains the trigger, re-check once with a
@@ -319,16 +319,33 @@ pub struct KeywordDetectorConfig {
     /// Slide advance used during the hysteresis re-check (milliseconds).
     /// Default: 200 ms.
     pub hysteresis_slide_ms: u64,
+    /// Minimum RMS energy required to send a window to whisper.
+    /// Windows below this level are skipped entirely — eliminates ~90% of
+    /// whisper calls during silence and prevents ambient-noise false positives.
+    /// Default: 0.01 (~−40 dBFS). Set to 0.0 to disable the gate.
+    pub energy_threshold: f32,
+    /// How long (ms) of consecutive silence terminates the post-trigger capture.
+    /// The ring buffer is snapshotted as soon as this silence duration elapses,
+    /// instead of always waiting the full `post_trigger_ms`.
+    /// Default: 400 ms. Set to 0 to disable (always wait full `post_trigger_ms`).
+    pub post_trigger_silence_ms: u64,
+    /// How long (ms) to sleep before re-arming detection after each activation.
+    /// Prevents re-triggering on TTS echo or residual room noise.
+    /// Default: 2000 ms. Set to 0 to disable.
+    pub cooldown_ms: u64,
 }
 
 impl Default for KeywordDetectorConfig {
     fn default() -> Self {
         Self {
-            window_ms:          1500,
-            slide_ms:           500,
-            post_trigger_ms:    4000,
-            hysteresis_enabled: true,
-            hysteresis_slide_ms: 200,
+            window_ms:               1500,
+            slide_ms:                500,
+            post_trigger_ms:         4000,
+            hysteresis_enabled:      true,
+            hysteresis_slide_ms:     200,
+            energy_threshold:        0.01,
+            post_trigger_silence_ms: 400,
+            cooldown_ms:             2000,
         }
     }
 }
@@ -420,6 +437,15 @@ fn token_count(s: &str) -> usize {
     s.split_whitespace().count()
 }
 
+/// Root-mean-square energy of a mono f32 sample slice.
+/// Returns 0.0 for an empty slice.
+fn rms_energy(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
 #[async_trait]
 impl StreamingWakeWordDetector for WhisperKeywordDetector {
     async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
@@ -501,6 +527,12 @@ fn detection_loop(
     };
     stream.play().map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
 
+    // ── Cooldown — wait before re-arming (prevents TTS echo re-trigger) ───────
+    if config.cooldown_ms > 0 {
+        tracing::debug!("KWS: cooldown {}ms before arming", config.cooldown_ms);
+        std::thread::sleep(std::time::Duration::from_millis(config.cooldown_ms));
+    }
+
     // ── Detection loop ────────────────────────────────────────────────────────
     let window_samples    = (config.window_ms * sample_rate as u64 / 1000) as usize;
     let mut slide_ms      = config.slide_ms;
@@ -522,6 +554,15 @@ fn detection_loop(
 
         if snapshot.len() < window_samples / 2 {
             continue; // buffer not yet full enough — keep waiting
+        }
+
+        // ── Energy gate — skip silent windows before hitting whisper ──────────
+        if config.energy_threshold > 0.0 {
+            let rms = rms_energy(&snapshot);
+            if rms < config.energy_threshold {
+                tracing::trace!("KWS: silent window skipped (rms={:.4})", rms);
+                continue;
+            }
         }
 
         // Transcribe the window.
@@ -551,9 +592,42 @@ fn detection_loop(
             tracing::info!("Wake word confirmed: \"{}\" (matched triggers: {:?})", transcript, triggers);
             println!("  🟢 Wake word detected!");
 
-            std::thread::sleep(std::time::Duration::from_millis(config.post_trigger_ms));
+            // VAD-gated post-trigger: poll every 50 ms and exit as soon as the
+            // microphone goes silent for `post_trigger_silence_ms` consecutive ms.
+            // Falls back to waiting the full `post_trigger_ms` if VAD is disabled
+            // or the user keeps speaking past the ceiling.
+            let poll_ms = 50u64;
+            let mut elapsed_ms = 0u64;
+            let mut silent_for_ms = 0u64;
 
-            let post_samples = (config.post_trigger_ms * sample_rate as u64 / 1000) as usize;
+            while elapsed_ms < config.post_trigger_ms {
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+                elapsed_ms += poll_ms;
+
+                if config.post_trigger_silence_ms > 0 && config.energy_threshold > 0.0 {
+                    let recent_rms = {
+                        let r = ring.lock().unwrap();
+                        let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
+                        let start = r.len().saturating_sub(recent_samples);
+                        let chunk: Vec<f32> = r.range(start..).copied().collect();
+                        rms_energy(&chunk)
+                    };
+                    if recent_rms < config.energy_threshold {
+                        silent_for_ms += poll_ms;
+                        if silent_for_ms >= config.post_trigger_silence_ms {
+                            tracing::debug!(
+                                "KWS: VAD silence after {}ms — snapping command audio early",
+                                elapsed_ms
+                            );
+                            break;
+                        }
+                    } else {
+                        silent_for_ms = 0; // voice still present — reset counter
+                    }
+                }
+            }
+
+            let post_samples = (elapsed_ms * sample_rate as u64 / 1000) as usize;
             let command_audio: Vec<f32> = {
                 let r = ring.lock().unwrap();
                 let start = r.len().saturating_sub(post_samples);
