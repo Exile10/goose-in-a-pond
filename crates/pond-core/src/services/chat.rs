@@ -1,4 +1,4 @@
-use crate::domain::agent::{AgentRequest, WorkflowEvent, WorkflowState};
+use crate::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
 use crate::domain::message::ChatMessage;
 use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
@@ -13,9 +13,358 @@ use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::services::context_compactor::ContextCompactor;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
+use futures::StreamExt as _;
 use std::io::{self, Write};
 use std::sync::Arc;
 use uuid::Uuid;
+
+// ── Voice helpers ─────────────────────────────────────────────────────────────
+
+/// Classify a voice message into a model role string.
+///
+/// Voice mode defaults Chat-classified messages to "chat" as well; the role
+/// is metadata for the GooseAdapter's model selection.
+fn resolve_voice_role(message: &str) -> String {
+    use crate::domain::model_role::ModelRole;
+    use crate::services::request_classifier::classify_request;
+    match classify_request(message) {
+        ModelRole::Think => "think".to_string(),
+        ModelRole::Task  => "task".to_string(),
+        ModelRole::Chat  => "chat".to_string(),
+    }
+}
+
+/// Human-readable announcement spoken while an MCP tool is executing.
+fn tool_announcement(tool: &str) -> String {
+    let name = tool.split("__").last().unwrap_or(tool);
+    match name {
+        "get_current_weather" | "get_weather" => "Let me check the weather.".to_string(),
+        "get_devices" | "list_devices"        => "Checking your devices.".to_string(),
+        "set_schedule" | "create_schedule"    => "Setting that up.".to_string(),
+        "save_memory"                         => "Got it, I'll remember that.".to_string(),
+        other => format!("Let me {}.", other.replace('_', " ")),
+    }
+}
+
+/// Split completed sentences out of a text buffer.
+///
+/// Sentence boundaries: `.`, `?`, `!` followed by whitespace or end-of-string,
+/// and bare newlines. Forces a flush at 250 characters to handle code blocks
+/// or long lists without sentence punctuation.
+///
+/// Returns `(sentences_to_speak, remaining_buffer)`.
+fn split_sentences(text: &str) -> (Vec<String>, String) {
+    const MAX_BUF: usize = 250;
+    let mut sentences: Vec<String> = Vec::new();
+    let mut remainder = text.to_string();
+
+    loop {
+        // Force-flush at max buffer: break at last space within the limit
+        if remainder.len() > MAX_BUF {
+            if let Some(split_at) = remainder[..MAX_BUF].rfind(' ') {
+                sentences.push(remainder[..split_at].to_string());
+                remainder = remainder[split_at + 1..].to_string();
+                continue;
+            }
+        }
+
+        let mut found = false;
+        let chars: Vec<(usize, char)> = remainder.char_indices().collect();
+        for (idx, (i, ch)) in chars.iter().enumerate() {
+            if matches!(ch, '.' | '?' | '!') {
+                let next = i + ch.len_utf8();
+                let after = &remainder[next..];
+                if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
+                    sentences.push(remainder[..next].to_string());
+                    remainder = after.trim_start_matches(|c: char| c == ' ' || c == '\n').to_string();
+                    found = true;
+                    break;
+                }
+            } else if *ch == '\n' {
+                // Newline is its own boundary
+                let chunk = remainder[..*i].trim().to_string();
+                if !chunk.is_empty() {
+                    sentences.push(chunk);
+                }
+                let next = i + 1;
+                remainder = remainder[next..].to_string();
+                found = true;
+                let _ = idx; // suppress unused warning
+                break;
+            }
+        }
+
+        if !found {
+            break;
+        }
+    }
+
+    (sentences, remainder)
+}
+
+/// Convert a markdown string to plain text suitable for TTS.
+///
+/// Handles:
+/// - Code fences (``` / ~~~) — block skipped entirely
+/// - Inline code (`…`) — backticks removed, content kept
+/// - Bold / italic (`**`, `__`, `*`, `_`) — markers removed
+/// - Headers (`#`, `##`, …) — `#` stripped, text kept
+/// - Blockquotes (`> `) — `>` stripped, text kept
+/// - Unordered lists (`- `, `* `, `+ `) — marker stripped, text kept
+/// - Ordered lists (`1. `, `2. `, …) — marker stripped, text kept
+/// - Horizontal rules (`---`, `***`, `___`) — line dropped
+/// - Links (`[text](url)`) — url dropped, text kept
+/// - Images (`![alt](url)`) — dropped entirely
+/// - Strikethrough (`~~…~~`) — markers removed
+fn strip_markdown_for_speech(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code_fence = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Code fence toggle — skip body of code blocks
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+
+        // Horizontal rules: --- *** ___ (3+ of the same char, nothing else)
+        if is_hr(trimmed) {
+            continue;
+        }
+
+        // Strip structural prefix then inline markers
+        let content = strip_line_prefix(trimmed);
+        let content = strip_inline_md(content);
+        let content = content.trim().to_string();
+        if !content.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&content);
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn is_hr(s: &str) -> bool {
+    if s.len() < 3 {
+        return false;
+    }
+    let first = s.chars().next().unwrap_or(' ');
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    s.chars().all(|c| c == first || c == ' ')
+}
+
+/// Strip leading structural markdown from a line (header `#`, blockquote `>`, list marker).
+fn strip_line_prefix(line: &str) -> &str {
+    // Headers: ### text → text
+    if line.starts_with('#') {
+        return line.trim_start_matches('#').trim_start();
+    }
+    // Blockquotes: > text
+    if let Some(rest) = line.strip_prefix("> ").or_else(|| line.strip_prefix('>')) {
+        return rest.trim_start();
+    }
+    // Unordered lists: - / * / +
+    if let Some(rest) = line.strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return rest;
+    }
+    // Ordered lists: 1. 2. 10. etc.
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && bytes.get(i) == Some(&b'.') && bytes.get(i + 1) == Some(&b' ') {
+        return &line[i + 2..];
+    }
+    line
+}
+
+/// Strip inline markdown markers from a string, handling bold, italic, code, links, images.
+fn strip_inline_md(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Images: ![alt](url) → dropped
+        if chars[i] == '!' && chars.get(i + 1) == Some(&'[') {
+            if let Some((end, _)) = find_link(&chars, i + 1) {
+                i = end;
+                continue;
+            }
+        }
+
+        // Links: [text](url) → text
+        if chars[i] == '[' {
+            if let Some((end, text)) = find_link(&chars, i) {
+                out.push_str(&text);
+                i = end;
+                continue;
+            }
+        }
+
+        // Strikethrough: ~~text~~
+        if chars.get(i..i + 2) == Some(&['~', '~']) {
+            if let Some(close) = find_marker_close(&chars, i + 2, &['~', '~']) {
+                out.push_str(&chars[i + 2..close].iter().collect::<String>());
+                i = close + 2;
+                continue;
+            }
+        }
+
+        // Bold: **text** or __text__
+        if chars.get(i..i + 2) == Some(&['*', '*'])
+            || chars.get(i..i + 2) == Some(&['_', '_'])
+        {
+            let marker = [chars[i], chars[i + 1]];
+            if let Some(close) = find_marker_close(&chars, i + 2, &marker) {
+                out.push_str(&chars[i + 2..close].iter().collect::<String>());
+                i = close + 2;
+                continue;
+            }
+        }
+
+        // Italic: *text* or _text_
+        if chars[i] == '*' || chars[i] == '_' {
+            let marker = [chars[i]];
+            if let Some(close) = find_marker_close(&chars, i + 1, &marker) {
+                out.push_str(&chars[i + 1..close].iter().collect::<String>());
+                i = close + 1;
+                continue;
+            }
+        }
+
+        // Inline code: `text`
+        if chars[i] == '`' {
+            if let Some(close) = find_marker_close(&chars, i + 1, &['`']) {
+                out.push_str(&chars[i + 1..close].iter().collect::<String>());
+                i = close + 1;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Find a `[text](url)` link starting at `start` (which points to `[`).
+/// Returns `(end_index, link_text)` where `end_index` is one past the closing `)`.
+fn find_link(chars: &[char], start: usize) -> Option<(usize, String)> {
+    if chars.get(start) != Some(&'[') {
+        return None;
+    }
+    // Find closing ]
+    let mut depth = 0usize;
+    let mut j = start;
+    while j < chars.len() {
+        match chars[j] {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    if j >= chars.len() {
+        return None;
+    }
+    let text_end = j; // index of `]`
+    // Must be followed by `(`
+    if chars.get(j + 1) != Some(&'(') {
+        return None;
+    }
+    // Find closing )
+    let mut k = j + 2;
+    let mut depth2 = 1usize;
+    while k < chars.len() && depth2 > 0 {
+        match chars[k] {
+            '(' => depth2 += 1,
+            ')' => depth2 -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    if depth2 != 0 {
+        return None;
+    }
+    let link_text: String = chars[start + 1..text_end].iter().collect();
+    Some((k, link_text))
+}
+
+/// Find the closing occurrence of `marker` in `chars` starting at `start`.
+/// Returns the index where the marker begins (not one-past-end).
+fn find_marker_close(chars: &[char], start: usize, marker: &[char]) -> Option<usize> {
+    let mlen = marker.len();
+    let limit = chars.len().saturating_sub(mlen - 1);
+    for i in start..limit {
+        if &chars[i..i + mlen] == marker {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Strip `<think>…</think>` reasoning blocks from a streaming text chunk.
+///
+/// Models like Qwen3/QwQ/DeepSeek-R1 emit reasoning inside `<think>` tags before
+/// their actual answer.  TTS should skip that content; only the visible answer
+/// should be spoken.
+///
+/// `in_block` is the carry-over state from the previous chunk (we may be in the
+/// middle of a block that started in an earlier event).
+///
+/// Returns `(visible_text, updated_in_block)`.
+fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
+    let mut visible = String::with_capacity(chunk.len());
+    let mut rest = chunk;
+
+    loop {
+        if in_block {
+            // Inside a think block — look for the closing tag.
+            if let Some(end) = rest.find("</think>") {
+                rest = &rest[end + "</think>".len()..];
+                in_block = false;
+            } else {
+                // Entire remaining chunk is still inside the block — skip it all.
+                break;
+            }
+        } else {
+            // Outside a think block — look for the opening tag.
+            if let Some(start) = rest.find("<think>") {
+                visible.push_str(&rest[..start]);
+                rest = &rest[start + "<think>".len()..];
+                in_block = true;
+            } else {
+                // No more think blocks — everything remaining is visible.
+                visible.push_str(rest);
+                break;
+            }
+        }
+    }
+
+    (visible, in_block)
+}
 
 /// Domain Service: ChatService
 ///
@@ -123,28 +472,15 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        // When a direct LlmProvider is wired (e.g. CLI --provider local/ollama/llamafile),
-        // use it with the full conversation history from session storage.
-        // Otherwise route through the Agent port (GooseAdapter in production), which manages
+        // Always route through the Agent port (GooseAdapter in production), which manages
         // its own history, system prompt, and MCP tools internally.
-        let response_text = if let Some(provider) = &self.provider {
-            let history = self.session_storage
-                .get_messages(&self.session_id)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|sm| sm.message)
-                .collect::<Vec<_>>();
-            let response_msg = provider.complete(&self.system_prompt, history).await?;
-            response_msg.content
-        } else {
-            let request = AgentRequest {
-                message: message.clone(),
-                session_id: self.session_id.clone(),
-                model_role: "task".to_string(),
-            };
-            self.agent.chat(request).await?.text
+        // The optional `self.provider` is kept solely for session title generation.
+        let request = AgentRequest {
+            message: message.clone(),
+            session_id: self.session_id.clone(),
+            model_role: resolve_voice_role(&message),
         };
+        let response_text = self.agent.chat(request).await?.text;
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(response_text.clone());
@@ -234,6 +570,131 @@ impl ChatService {
         }
     }
 
+    /// Streaming chat — routes through the Agent, chunks TTS by sentence.
+    ///
+    /// Differences from `chat_once`:
+    /// - Calls `agent.chat_stream()` so text arrives token-by-token.
+    /// - Speaks each completed sentence immediately (low-latency TTS).
+    /// - Announces MCP tool calls with a short spoken phrase before execution.
+    /// - Speaking happens *inside* this method; callers must NOT call
+    ///   `voice_output.speak()` on the returned text.
+    pub async fn chat_stream_once(&self, message: String) -> Result<String> {
+        // Persist user message
+        let user_msg = ChatMessage::user(message.clone());
+        let session_msg = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            user_msg,
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), session_msg)
+            .await?;
+
+        let request = AgentRequest {
+            message: message.clone(),
+            session_id: self.session_id.clone(),
+            model_role: resolve_voice_role(&message),
+        };
+
+        let mut stream = self.agent.chat_stream(request).await?;
+        let mut full_text = String::new();
+        let mut sentence_buf = String::new();
+        let mut spoken_first = false;
+        let mut in_think_block = false;
+
+        while let Some(event_result) = stream.next().await {
+            match event_result? {
+                AgentStreamEvent::ToolCall { tool, .. } => {
+                    // Flush any buffered text before announcing the tool
+                    if !sentence_buf.trim().is_empty() {
+                        let chunk = sentence_buf.trim().to_string();
+                        sentence_buf.clear();
+                        if let Err(e) = self.voice_output.speak(&chunk).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                    let announcement = tool_announcement(&tool);
+                    if let Err(e) = self.voice_output.speak(&announcement).await {
+                        tracing::warn!("Tool announcement TTS failed: {}", e);
+                    }
+                }
+                AgentStreamEvent::Text { content } => {
+                    // Strip <think>…</think> reasoning blocks — not meant for TTS or transcript.
+                    let (visible, new_in_think) = filter_thinking(&content, in_think_block);
+                    in_think_block = new_in_think;
+                    let content = visible;
+                    if content.is_empty() {
+                        continue;
+                    }
+
+                    if !spoken_first {
+                        self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
+                        spoken_first = true;
+                    }
+                    full_text.push_str(&content);
+                    sentence_buf.push_str(&content);
+
+                    let (sentences, remainder) = split_sentences(&sentence_buf);
+                    sentence_buf = remainder;
+                    for sentence in sentences {
+                        let spoken = strip_markdown_for_speech(&sentence);
+                        if spoken.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = self.voice_output.speak(&spoken).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                }
+                AgentStreamEvent::Done { .. } => {
+                    // Flush any remaining buffer
+                    let remainder = sentence_buf.trim().to_string();
+                    if !remainder.is_empty() {
+                        let spoken = strip_markdown_for_speech(&remainder);
+                        if !spoken.is_empty() {
+                            if let Err(e) = self.voice_output.speak(&spoken).await {
+                                tracing::warn!("TTS flush failed: {}", e);
+                            }
+                        }
+                    }
+                    sentence_buf.clear();
+                    break;
+                }
+                AgentStreamEvent::Error { content } => {
+                    return Err(anyhow::anyhow!("Agent stream error: {}", content));
+                }
+                AgentStreamEvent::Status { .. } | AgentStreamEvent::ToolResult { .. } => {
+                    // Not spoken — status/tool results are informational only
+                }
+            }
+        }
+
+        // Flush anything left if stream ended without Done
+        let remainder = sentence_buf.trim().to_string();
+        if !remainder.is_empty() {
+            let spoken = strip_markdown_for_speech(&remainder);
+            if !spoken.is_empty() {
+                if let Err(e) = self.voice_output.speak(&spoken).await {
+                    tracing::warn!("TTS final flush failed: {}", e);
+                }
+            }
+        }
+
+        // Persist the assistant response
+        let assistant_msg = ChatMessage::assistant(full_text.clone());
+        let session_msg = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            assistant_msg,
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), session_msg)
+            .await?;
+
+        self.maybe_generate_title(&message, &full_text).await;
+        Ok(full_text)
+    }
+
     /// Run the interactive workflow loop.
     ///
     /// State machine:
@@ -274,19 +735,14 @@ impl ChatService {
 
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
-            // ── Thinking ──
+            // ── Thinking → Speak (streaming) ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
             println!("  🤔 Thinking...");
 
-            match self.chat_once(input).await {
+            match self.chat_stream_once(input).await {
                 Ok(response_text) => {
-                    // ── Speak ──
-                    self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
-                    self.emit_event(WorkflowEvent::AgentOutput(response_text.clone()));
-                    if let Err(e) = self.voice_output.speak(&response_text).await {
-                        tracing::warn!("TTS failed (non-fatal): {}", e);
-                        println!("  🗣  {}", response_text);
-                    }
+                    // Speaking happened inside chat_stream_once; just emit the event.
+                    self.emit_event(WorkflowEvent::AgentOutput(response_text));
                 }
                 Err(e) => {
                     eprintln!("  ❌ Error: {}", e);
@@ -440,6 +896,106 @@ mod tests {
 
         let _service = ChatService::new(agent, session_id, storage)
             .with_voice_input(Arc::new(StdinInput::new()));
+    }
+
+    #[test]
+    fn markdown_bold_stripped() {
+        assert_eq!(strip_markdown_for_speech("The **quick** fox"), "The quick fox");
+    }
+
+    #[test]
+    fn markdown_italic_stripped() {
+        assert_eq!(strip_markdown_for_speech("The _quick_ fox"), "The quick fox");
+        assert_eq!(strip_markdown_for_speech("The *quick* fox"), "The quick fox");
+    }
+
+    #[test]
+    fn markdown_header_stripped() {
+        assert_eq!(strip_markdown_for_speech("## Hello"), "Hello");
+        assert_eq!(strip_markdown_for_speech("# Title\nBody text"), "Title Body text");
+    }
+
+    #[test]
+    fn markdown_inline_code_stripped() {
+        assert_eq!(strip_markdown_for_speech("Run `cargo build`"), "Run cargo build");
+    }
+
+    #[test]
+    fn markdown_code_block_skipped() {
+        let md = "Here is code:\n```\nfn main() {}\n```\nDone.";
+        assert_eq!(strip_markdown_for_speech(md), "Here is code: Done.");
+    }
+
+    #[test]
+    fn markdown_link_keeps_text() {
+        assert_eq!(
+            strip_markdown_for_speech("See [the docs](https://example.com)"),
+            "See the docs"
+        );
+    }
+
+    #[test]
+    fn markdown_image_dropped() {
+        assert_eq!(strip_markdown_for_speech("![logo](logo.png) text"), "text");
+    }
+
+    #[test]
+    fn markdown_list_items_stripped() {
+        let md = "- item one\n- item two";
+        assert_eq!(strip_markdown_for_speech(md), "item one item two");
+    }
+
+    #[test]
+    fn markdown_hr_dropped() {
+        assert_eq!(strip_markdown_for_speech("before\n---\nafter"), "before after");
+    }
+
+    #[test]
+    fn markdown_blockquote_stripped() {
+        assert_eq!(strip_markdown_for_speech("> quoted text"), "quoted text");
+    }
+
+    #[test]
+    fn filter_thinking_strips_complete_block() {
+        let (text, in_block) = filter_thinking("<think>reasoning here</think>actual answer", false);
+        assert_eq!(text, "actual answer");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn filter_thinking_no_block_passthrough() {
+        let (text, in_block) = filter_thinking("just normal text", false);
+        assert_eq!(text, "just normal text");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn filter_thinking_split_across_chunks() {
+        // First chunk opens the block but doesn't close it
+        let (text1, in_block) = filter_thinking("prefix<think>start of reasoning", false);
+        assert_eq!(text1, "prefix");
+        assert!(in_block);
+
+        // Second chunk closes it and continues with real content
+        let (text2, in_block2) = filter_thinking("end of reasoning</think>real answer", in_block);
+        assert_eq!(text2, "real answer");
+        assert!(!in_block2);
+    }
+
+    #[test]
+    fn filter_thinking_chunk_entirely_inside_block() {
+        let (text, in_block) = filter_thinking("more reasoning tokens", true);
+        assert_eq!(text, "");
+        assert!(in_block);
+    }
+
+    #[test]
+    fn filter_thinking_multiple_blocks() {
+        let (text, in_block) = filter_thinking(
+            "<think>a</think>first<think>b</think>second", false
+        );
+        assert_eq!(text, "firstsecond");
+        assert!(!in_block);
     }
 
     #[tokio::test]

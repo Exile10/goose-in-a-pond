@@ -299,6 +299,8 @@ pub struct WhisperKeywordDetector {
     whisper: WhisperInput,
     /// The trigger phrase to listen for (case-insensitive substring match).
     trigger: String,
+    /// Pre-built prompt shown in the Wait state UI.
+    prompt: String,
 }
 
 impl WhisperKeywordDetector {
@@ -306,11 +308,29 @@ impl WhisperKeywordDetector {
     /// Uses `server_url` for whisper (defaults to `DEFAULT_HOST`).
     /// Records 2-second clips by default.
     pub fn new(server_url: Option<&str>, trigger: impl Into<String>) -> Self {
+        let raw = trigger.into();
+        let prompt = format!("Say \"{}\" to activate...", raw);
         Self {
             whisper: WhisperInput::new(server_url).with_duration(2),
-            trigger: trigger.into().to_lowercase(),
+            trigger: normalize_transcript(&raw),
+            prompt,
         }
     }
+}
+
+/// Strip punctuation and normalise whitespace for wake-word comparison.
+///
+/// Whisper adds commas and periods to transcripts (e.g. "Hey, goose.") which
+/// breaks a naive `contains()` against "hey goose".  Keeping only alphabetic
+/// chars and collapsing whitespace makes the match robust.
+fn normalize_transcript(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphabetic() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 #[async_trait]
@@ -318,13 +338,18 @@ impl WakeWordDetector for WhisperKeywordDetector {
     async fn wait_for_activation(&self) -> Result<()> {
         loop {
             match self.whisper.listen().await {
-                Ok(Some(text)) if text.to_lowercase().contains(&self.trigger) => {
-                    tracing::info!("Wake word detected: \"{}\"", text.trim());
-                    return Ok(());
+                Ok(Some(text)) => {
+                    let normalized = normalize_transcript(&text);
+                    if normalized.contains(&self.trigger) {
+                        tracing::info!("Wake word detected: \"{}\"", text.trim());
+                        return Ok(());
+                    }
+                    // Heard something, but trigger not in transcript — show what was heard
+                    tracing::info!("Heard: \"{}\" (trigger: \"{}\")", text.trim(), self.trigger);
+                    println!("  👂 Heard: \"{}\" (waiting for \"{}\")", text.trim(), self.trigger);
                 }
-                Ok(_) => {
-                    // Nothing heard or trigger not in transcript — keep polling
-                    tracing::debug!("No wake word, polling again...");
+                Ok(None) => {
+                    tracing::debug!("No speech detected, polling again...");
                 }
                 Err(e) => {
                     // Log but keep polling — a single failed clip is not fatal
@@ -335,7 +360,7 @@ impl WakeWordDetector for WhisperKeywordDetector {
     }
 
     fn activation_prompt(&self) -> &str {
-        "Say \"Goose\" to activate..."
+        &self.prompt
     }
 }
 

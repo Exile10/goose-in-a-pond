@@ -59,6 +59,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 hostname = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

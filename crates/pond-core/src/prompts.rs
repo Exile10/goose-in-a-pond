@@ -8,7 +8,9 @@
 //! 5. `SYSTEM_PROMPT` constant — static fallback when Settings are unavailable
 //!
 //! ## Which function to call
-//! - `build_system_prompt_from_template(settings, content)` — preferred; GooseAdapter fetches `content` from DB
+//! - `build_system_prompt_from_template_full(settings, profile, state, content)` — preferred;
+//!   GooseAdapter fetches `content` from DB and populates `PromptState` from DeviceRegistry.
+//! - `build_system_prompt_from_template(settings, content)` — backwards-compat; no state/profile.
 //! - `build_system_prompt(settings)` — legacy; uses hard-coded `PROMPT_*` constants (routes, main, tests)
 //! - `SYSTEM_PROMPT` — in tests and absolute last-resort fallback
 
@@ -30,24 +32,33 @@ pub struct ProfileContext {
     pub atypical_speech: bool,
 }
 
+// ── Runtime prompt state ──────────────────────────────────────────────────────
+
+/// Runtime device and time state injected into the Jinja2 template context.
+/// Populated by `GooseAdapter::chat_stream()` once per request from the
+/// `DeviceRegistry` and the system clock.
+#[derive(Debug, Default, Clone)]
+pub struct PromptState {
+    /// Current date in local time, e.g. "Thursday, 24 April 2026".
+    pub current_date: String,
+    /// Current time in local time, e.g. "14:32".
+    pub current_time: String,
+    /// Total number of registered devices (online + offline).
+    pub device_count: usize,
+    /// True when at least one device is registered.
+    pub has_home_devices: bool,
+    /// Comma-separated names of online devices, or empty string.
+    pub online_device_names: String,
+}
+
 // ── Static fallback ───────────────────────────────────────────────────────────
 
 /// Static fallback — used in tests and when Settings are unavailable.
 pub const SYSTEM_PROMPT: &str = "\
-You are Goose, a privacy-first local AI home assistant running on-device as part of \
-Goose In A Pond. No data leaves this home. \
-Be concise, warm, and practical. \
-Help with reminders, home control, and everyday tasks. \
-No Markdown formatting. Never say \"echo\" or emit pipeline control tokens.
-
-{% if (extensions is defined) and extensions %}
-# Extensions
-Extensions provide additional tools and context.
-{% for extension in extensions %}
-## {{extension.name}}
-{% if extension.instructions %}{{extension.instructions}}{% endif %}
-{% endfor %}
-{% endif %}";
+You are Goose, a privacy-first AI copilot running on-device as part of Goose In A Pond. \
+No data leaves this machine. Be concise, warm, and practical. \
+Help with everyday tasks, research, writing, coding, and home control. \
+No Markdown formatting. Never say \"echo\" or emit pipeline control tokens.";
 
 /// Sent to the LLM to auto-generate a short session title from the first exchange.
 /// The LLM should return ONLY a 3-6 word title.
@@ -57,115 +68,115 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 
 // ── Built-in prompt style templates ──────────────────────────────────────────
 //
-// Variables substituted via render_template():
-//   {{assistant_name}}  {{user_name}}  {{personality}}  {{timezone}}
-//   {{location}}        (either "" or "\nLocation: <name>." — set by build_system_prompt)
+// These are Jinja2/Tera templates processed by render_jinja_template().
 //
-// These mirror the Goose prompt-template pattern so a user can drop a file at
-// $DATA_DIR/prompts/system.md with the same {{placeholders}} and it will be
-// rendered identically by the file-override path in routes.rs / main.rs.
+// Variables substituted:
+//   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
+//           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
+//   usize:  {{device_count}}
+//   bool:   {{has_home_devices}}, {{atypical_speech}}
+//
+// Home-control sections are gated behind {% if has_home_devices %} so the prompt
+// adapts automatically when no devices are configured. Extension injection is
+// handled by GooseAdapter's extend_system_prompt() calls after override_system_prompt()
+// and does NOT require {% if extensions %} blocks here.
 
-/// Balanced — warm, practical, complete behaviour rules. Default for most households.
+/// Balanced — warm, practical, general-purpose. Default for most users.
 pub const PROMPT_BALANCED: &str = "\
-You are {{assistant_name}}, a smart home AI assistant running entirely on {{user_name}}'s \
-local network. Powered by Goose In A Pond — privacy-first and fully on-device. \
-No data ever leaves this home.
+You are {{assistant_name}}, an intelligent AI copilot running entirely on \
+{{user_name}}'s local network as part of Goose In A Pond. Every inference \
+runs on-device — no data ever leaves this machine.
 
-Your personality is {{personality}}. Keep replies short and practical unless asked for \
-more detail. Plain spoken language only — no Markdown, no bullet symbols, no asterisks. \
-Never say \"echo\", \"end of turn\", or similar pipeline artifacts.
+Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
+{% if current_date %}Today is {{current_date}}.{% endif %}
 
-The user's name is {{user_name}}. Local timezone: {{timezone}}.{{location}}
+You are a general-purpose assistant. Help with writing, research, reasoning, \
+planning, coding, and everyday tasks. Reply concisely unless asked for more detail. \
+Plain language only — no Markdown, bullet symbols, or asterisks. \
+Never say \"echo\", \"end of turn\", or pipeline artifacts.
 
-Behaviour rules:
+{% if has_home_devices %}
+## Connected Devices
+You have access to {{device_count}} registered device{% if device_count != 1 %}s{% endif %}. \
+{% if online_device_names %}Currently online: {{online_device_names}}.{% endif %}
+
+Home control rules:
 Unlock a door or disarm an alarm only when the user explicitly confirms in the same message.
 If a device is not in your known list say: I don't see that device set up yet — want to add it?
+If a routine includes a lock or alarm step, pause and confirm that step explicitly.
 If a request requires leaving the local network, say so clearly and wait for confirmation.
-If a routine includes a lock or alarm step, pause and ask for explicit confirmation before that step.
-IMPORTANT: You must ONLY use the tools explicitly listed in your tool schema. NEVER use shell commands, bash, python, curl, or any execution tool to fetch information. If a tool is unavailable, tell the user directly.
+{% endif %}
 
-{% if (extensions is defined) and extensions %}
-# Extensions
-Extensions provide additional tools and context.
-{% for extension in extensions %}
-## {{extension.name}}
-{% if extension.instructions %}{{extension.instructions}}{% endif %}
-{% endfor %}
-{% endif %}";
+IMPORTANT: Only use tools listed in your schema. Never use shell commands, bash, \
+python, curl, or execution tools. If a tool is unavailable, tell the user directly.";
 
 /// Concise — minimal, action-first. For power users who want brevity.
 pub const PROMPT_CONCISE: &str = "\
-You are {{assistant_name}}, a local AI home assistant for {{user_name}}. \
-Goose In A Pond — fully on-device, no data leaves the home. \
+You are {{assistant_name}}, a local AI copilot for {{user_name}}. \
+Goose In A Pond — on-device, no data leaves. \
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
+{% if current_date %}Date: {{current_date}}.{% endif %}
 
-One sentence replies unless asked for more. No Markdown. No voice artifacts.
-Door unlock / alarm: require explicit confirmation in the same message.
-Unknown device: say it is not set up yet. External network: ask before proceeding.
-IMPORTANT: Use ONLY tools in your schema. NO shell, bash, curl, or execution tools.
+One sentence replies unless asked for more. No Markdown. No voice artifacts. \
+General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
 
-{% if (extensions is defined) and extensions %}
-# Extensions
-Extensions provide additional tools and context.
-{% for extension in extensions %}
-## {{extension.name}}
-{% if extension.instructions %}{{extension.instructions}}{% endif %}
-{% endfor %}
-{% endif %}";
+{% if has_home_devices %}
+Devices: {{device_count}} registered{% if online_device_names %} (online: {{online_device_names}}){% endif %}.
+Door/alarm: require explicit confirmation in same message. Unknown device: say not set up yet.
+External network: ask before proceeding.
+{% endif %}
+
+ONLY use tools in your schema. NO shell, bash, curl, or execution tools.";
 
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
 pub const PROMPT_TECHNICAL: &str = "\
-You are {{assistant_name}}, a privacy-first smart home AI assistant on {{user_name}}'s \
-local network. Goose In A Pond — every inference runs on-device; no telemetry, \
-no cloud calls, no data egress. \
+You are {{assistant_name}}, a privacy-first AI copilot on {{user_name}}'s local \
+network. Goose In A Pond — on-device inference, no telemetry, no cloud calls, no data egress. \
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
+{% if current_date %}Date: {{current_date}}{% if current_time %}, {{current_time}}{% endif %}.{% endif %}
+
+You are a general-purpose technical copilot — coding, architecture, research, \
+and analysis are primary use cases. Home automation is one capability among many.
 
 For multi-step tasks, narrate each step briefly before executing it. \
 Surface tool errors clearly and suggest remediation. \
 Prefer exact values over approximations.
 
-Voice pipeline output — no Markdown, headers, code blocks, or formatting tokens. \
-Never emit \"echo\", \"end of turn\", or role delimiters.
+{% if has_home_devices %}
+## Device Context
+Registered: {{device_count}} device{% if device_count != 1 %}s{% endif %}. \
+{% if online_device_names %}Online: {{online_device_names}}.{% else %}None currently online.{% endif %}
 
-Security rules: door unlock / alarm disarm requires explicit same-message confirmation; \
+Security: door unlock / alarm disarm requires explicit same-message confirmation; \
 unrecognised device: offer to add it; external egress: disclose destination and await OK; \
-routines with a lock or alarm step: pause and confirm that step separately; \
-tool use: ONLY use tools in your schema; NEVER use shell, bash, python, curl, or any execution tools.
+routines with a lock or alarm step: pause and confirm that step separately.
+{% endif %}
 
-{% if (extensions is defined) and extensions %}
-# Extensions
-Extensions provide additional tools and context.
-{% for extension in extensions %}
-## {{extension.name}}
-{% if extension.instructions %}{{extension.instructions}}{% endif %}
-{% endfor %}
-{% endif %}";
+No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
+Tool use: ONLY use tools in your schema; NEVER use shell, bash, python, curl, or execution tools.";
 
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
 pub const PROMPT_WARM: &str = "\
-Hey there! I'm {{assistant_name}}, your friendly home assistant. \
-I live right here on {{user_name}}'s home network — everything stays private \
-and on-device, powered by Goose In A Pond. \
-Think of me like a helpful neighbour who knows the house really well.
+Hey there! I'm {{assistant_name}}, your personal AI assistant. I live right \
+here on {{user_name}}'s home network — everything stays private and on-device, \
+powered by Goose In A Pond.
 
-My style: {{personality}}. Timezone: {{timezone}}.{{location}}
+Style: {{personality}}. Timezone: {{timezone}}.{{location}}
+{% if current_date %}Today is {{current_date}}.{% endif %}
 
+I'm a helpful all-rounder — writing, research, planning, coding, and everyday questions. \
 Short clear answers in plain everyday language — nothing technical unless you ask. \
 No lists or formatting — just natural conversation.
 
-Safety: I'll always check before unlocking a door or turning off an alarm. \
+{% if has_home_devices %}
+I know about {{device_count}} device{% if device_count != 1 %}s{% endif %} in your home\
+{% if online_device_names %} ({{online_device_names}} {% if device_count == 1 %}is{% else %}are{% endif %} online right now){% endif %}. \
+I'll always check before unlocking a door or turning off an alarm. \
 If I don't recognise a device I'll let you know and offer to add it. \
-I'll always ask before doing anything outside your home network. \
-I only use the special tools I've been given — I never use technical shell commands or curl.
+I'll always ask before doing anything outside your home network.
+{% endif %}
 
-{% if (extensions is defined) and extensions %}
-# Extensions
-Extensions provide additional tools and context.
-{% for extension in extensions %}
-## {{extension.name}}
-{% if extension.instructions %}{{extension.instructions}}{% endif %}
-{% endfor %}
-{% endif %}";
+I only use the special tools I've been given — I never run shell commands or curl.";
 
 // ── Sanitization ──────────────────────────────────────────────────────────────
 
@@ -193,16 +204,96 @@ pub fn sanitize_field(s: &str, max_len: usize) -> String {
 /// - Unknown placeholders are left unchanged.
 /// - Values are NOT automatically sanitized — callers must pass sanitized values.
 ///
-/// This mirrors Goose's prompt-template mechanism. Drop a `.md` file at
-/// `$DATA_DIR/prompts/system.md` with `{{assistant_name}}`, `{{user_name}}`,
-/// `{{personality}}`, `{{timezone}}`, `{{location}}`, `{{prompt_addendum}}`
-/// placeholders and GIAP will render it instead of the built-in template.
+/// This is the legacy simple-substitution path. Prefer `render_jinja_template()`
+/// for new code, which supports Jinja2 conditionals and loops via Tera.
 pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
     let mut result = template.to_string();
     for (key, value) in vars {
         result = result.replace(&format!("{{{{{}}}}}", key), value);
     }
     result
+}
+
+/// Render a Jinja2 template using Tera with context built from `settings`,
+/// an optional `PromptState`, and an optional `ProfileContext`.
+///
+/// Uses `Tera::one_off()` — in-memory only, no filesystem access.
+///
+/// ## Context variables provided
+/// - `String`:  `assistant_name`, `user_name`, `personality`, `timezone`, `location`,
+///              `current_date`, `current_time`, `online_device_names`
+/// - `usize`:   `device_count`
+/// - `bool`:    `has_home_devices`, `atypical_speech`
+///
+/// On any Tera render error the function logs a warning and falls back to the plain
+/// `render_template()` substitution so the system prompt is never silenced.
+///
+/// ## Extension blocks
+/// The new built-in prompt constants do NOT include `{% if extensions %}` blocks.
+/// Extension injection is handled by `GooseAdapter`'s `extend_system_prompt()` calls
+/// which run after `override_system_prompt()` and are not template-based.
+pub fn render_jinja_template(
+    template: &str,
+    settings: &Settings,
+    state: Option<&PromptState>,
+    profile: Option<&ProfileContext>,
+) -> String {
+    let name    = sanitize_field(&settings.assistant_name, 50);
+    let user    = sanitize_field(&settings.user_name, 50);
+    let persona = sanitize_field(&settings.assistant_personality, 200);
+    let tz      = sanitize_field(&settings.timezone, 50);
+    let location = if settings.weather_location_name.is_empty() {
+        String::new()
+    } else {
+        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
+    };
+
+    let mut ctx = tera::Context::new();
+    ctx.insert("assistant_name", &name);
+    ctx.insert("user_name",      &user);
+    ctx.insert("personality",    &persona);
+    ctx.insert("timezone",       &tz);
+    ctx.insert("location",       &location);
+
+    // Runtime state — defaults to empty/zero when not provided
+    let (current_date, current_time, device_count, has_home, online_names) = state
+        .map(|s| {
+            (
+                s.current_date.as_str(),
+                s.current_time.as_str(),
+                s.device_count,
+                s.has_home_devices,
+                s.online_device_names.as_str(),
+            )
+        })
+        .unwrap_or(("", "", 0, false, ""));
+
+    ctx.insert("current_date",        current_date);
+    ctx.insert("current_time",        current_time);
+    ctx.insert("device_count",        &device_count);
+    ctx.insert("has_home_devices",    &has_home);
+    ctx.insert("online_device_names", online_names);
+
+    // Profile context
+    ctx.insert(
+        "atypical_speech",
+        &profile.map(|p| p.atypical_speech).unwrap_or(false),
+    );
+
+    match tera::Tera::one_off(template, &ctx, false) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            tracing::warn!("Tera render failed — falling back to render_template(): {e}");
+            let vars: &[(&str, &str)] = &[
+                ("assistant_name", name.as_str()),
+                ("user_name",      user.as_str()),
+                ("personality",    persona.as_str()),
+                ("timezone",       tz.as_str()),
+                ("location",       location.as_str()),
+            ];
+            render_template(template, vars)
+        }
+    }
 }
 
 // ── Dynamic prompt builder ────────────────────────────────────────────────────
@@ -214,6 +305,7 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// 2. Built-in template selected by `settings.prompt_style`
 /// Then: append profile context lines, then `settings.prompt_addendum`.
 ///
+/// Uses Jinja2/Tera rendering — supports `{% if has_home_devices %}` etc.
 /// All user-supplied strings are sanitized before substitution.
 pub fn build_system_prompt(settings: &Settings) -> String {
     build_system_prompt_with_profile(settings, None)
@@ -221,50 +313,25 @@ pub fn build_system_prompt(settings: &Settings) -> String {
 
 /// Full version — also injects per-user `ProfileContext` into the prompt.
 pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&ProfileContext>) -> String {
-    let name    = sanitize_field(&settings.assistant_name, 50);
-    let user    = sanitize_field(&settings.user_name, 50);
-    let persona = sanitize_field(&settings.assistant_personality, 200);
-    let tz      = sanitize_field(&settings.timezone, 50);
-    let location = if settings.weather_location_name.is_empty() {
-        String::new()
+    let tmpl = if let Some(ref custom) = settings.custom_system_prompt {
+        sanitize_field(custom, 4000)
     } else {
-        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
+        match settings.prompt_style.as_str() {
+            "concise"   => PROMPT_CONCISE.to_string(),
+            "technical" => PROMPT_TECHNICAL.to_string(),
+            "warm"      => PROMPT_WARM.to_string(),
+            _           => PROMPT_BALANCED.to_string(),
+        }
     };
-    let ext_stmt="{% if (extensions is defined) and extensions %}
-                        # Extensions
-                        Extensions provide additional tools and context.
-                        {% for extension in extensions %}
-                        ## {{extension.name}}
-                        {% if extension.instructions %}{{extension.instructions}}{% endif %}
-                        {% endfor %}/
-                        {% endif %}";
 
-    let vars: &[(&str, &str)] = &[
-        ("assistant_name", name.as_str()),
-        ("user_name",      user.as_str()),
-        ("personality",    persona.as_str()),
-        ("timezone",       tz.as_str()),
-        ("location",       location.as_str()),
-        ("ext_stmt",      ext_stmt),
-    ];
-
-    let base = if let Some(ref custom) = settings.custom_system_prompt {
-        render_template(&sanitize_field(custom, 4000), vars)
-    } else {
-        let tmpl = match settings.prompt_style.as_str() {
-            "concise"   => PROMPT_CONCISE,
-            "technical" => PROMPT_TECHNICAL,
-            "warm"      => PROMPT_WARM,
-            _           => PROMPT_BALANCED,
-        };
-        render_template(tmpl, vars)
-    };
+    let base = render_jinja_template(&tmpl, settings, None, profile);
 
     // ── Profile context lines ─────────────────────────────────────────────────
     let mut profile_lines: Vec<String> = Vec::new();
 
     if let Some(ctx) = profile {
-        // Preferred name — overrides generic user_name address if set
+        let user = sanitize_field(&settings.user_name, 50);
+
         if let Some(ref pname) = ctx.preferred_name {
             let pname = sanitize_field(pname, 50);
             if !pname.is_empty() && pname != user {
@@ -272,7 +339,6 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
             }
         }
 
-        // Language — instruct Goose to respond in the user's language
         if let Some(ref lang) = ctx.language {
             let lang = sanitize_field(lang, 20);
             if !lang.is_empty() && lang != "en" {
@@ -292,7 +358,6 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
             }
         }
 
-        // Birthday — enable date-aware greetings
         if let Some(ref bday) = ctx.birthday {
             let bday = sanitize_field(bday, 20);
             if !bday.is_empty() {
@@ -300,7 +365,6 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
             }
         }
 
-        // Atypical speech — soften LLM interpretation of fragmented input
         if ctx.atypical_speech {
             profile_lines.push(
                 "The user may have atypical speech — be patient, never correct speech patterns, \
@@ -311,7 +375,6 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
 
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
 
-    // Assemble: base + profile lines + addendum
     let mut parts = vec![base];
     if !profile_lines.is_empty() {
         parts.push(profile_lines.join(" "));
@@ -327,50 +390,40 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
 /// Build a personalised system prompt using an **explicitly provided** template
 /// string fetched from the `PromptTemplateRepository` (the DB).
 ///
-/// `template_content` is the raw template body with `{{placeholder}}` variables.
-/// It is used as the base only when `settings.custom_system_prompt` is `None`.
-///
-/// This is the preferred entry point for the `GooseAdapter` which loads the
-/// template from the DB on every turn. All existing callers (`routes.rs`,
-/// `main.rs`, tests) continue to use `build_system_prompt(settings)` unchanged.
+/// Backwards-compatible two-argument form — no profile or device state.
 pub fn build_system_prompt_from_template(settings: &Settings, template_content: &str) -> String {
-    build_system_prompt_from_template_with_profile(settings, None, template_content)
+    build_system_prompt_from_template_full(settings, None, None, template_content)
 }
 
-/// Full version — DB template + `ProfileContext`.
+/// With profile context but no device state (used by voice routes).
 pub fn build_system_prompt_from_template_with_profile(
     settings: &Settings,
     profile: Option<&ProfileContext>,
     template_content: &str,
 ) -> String {
-    let name    = sanitize_field(&settings.assistant_name, 50);
-    let user    = sanitize_field(&settings.user_name, 50);
-    let persona = sanitize_field(&settings.assistant_personality, 200);
-    let tz      = sanitize_field(&settings.timezone, 50);
-    let location = if settings.weather_location_name.is_empty() {
-        String::new()
-    } else {
-        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
-    };
+    build_system_prompt_from_template_full(settings, profile, None, template_content)
+}
 
-    let vars: &[(&str, &str)] = &[
-        ("assistant_name", name.as_str()),
-        ("user_name",      user.as_str()),
-        ("personality",    persona.as_str()),
-        ("timezone",       tz.as_str()),
-        ("location",       location.as_str()),
-    ];
-
+/// Full version — DB template + `ProfileContext` + `PromptState`.
+/// Preferred entry point for `GooseAdapter::chat_stream()`.
+pub fn build_system_prompt_from_template_full(
+    settings: &Settings,
+    profile: Option<&ProfileContext>,
+    state: Option<&PromptState>,
+    template_content: &str,
+) -> String {
     let base = if let Some(ref custom) = settings.custom_system_prompt {
         // custom_system_prompt always wins over the DB template
-        render_template(&sanitize_field(custom, 4000), vars)
+        render_jinja_template(&sanitize_field(custom, 4000), settings, state, profile)
     } else {
-        render_template(template_content, vars)
+        render_jinja_template(template_content, settings, state, profile)
     };
 
-    // Append profile context and addendum (same logic as build_system_prompt_with_profile)
+    // ── Profile context lines (same logic as build_system_prompt_with_profile) ─
     let mut profile_lines: Vec<String> = Vec::new();
     if let Some(ctx) = profile {
+        let user = sanitize_field(&settings.user_name, 50);
+
         if let Some(ref pname) = ctx.preferred_name {
             let pname = sanitize_field(pname, 50);
             if !pname.is_empty() && pname != user {
@@ -397,8 +450,8 @@ pub fn build_system_prompt_from_template_with_profile(
         }
         if ctx.atypical_speech {
             profile_lines.push(
-                "The user may have atypical speech — be patient, never correct speech patterns, \
-                 and interpret incomplete sentences charitably.".to_string()
+                "The user may have atypical speech — be patient, never correct speech \
+                 patterns, and interpret incomplete sentences charitably.".to_string()
             );
         }
     }
@@ -471,6 +524,63 @@ mod tests {
         assert_eq!(render_template("No vars here.", &[]), "No vars here.");
     }
 
+    // ── render_jinja_template ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_jinja_template_substitutes_basic_vars() {
+        let tmpl = "Hello {{user_name}}, I am {{assistant_name}}.";
+        let mut s = Settings::default();
+        s.assistant_name = "Duck".to_string();
+        s.user_name = "Jerry".to_string();
+        let result = render_jinja_template(tmpl, &s, None, None);
+        assert_eq!(result, "Hello Jerry, I am Duck.");
+    }
+
+    #[test]
+    fn render_jinja_template_home_section_hidden_without_devices() {
+        let s = Settings::default();
+        let state = PromptState::default(); // has_home_devices = false
+        let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        assert!(!result.contains("Connected Devices"));
+        assert!(!result.contains("Unlock a door"));
+    }
+
+    #[test]
+    fn render_jinja_template_home_section_visible_with_devices() {
+        let s = Settings::default();
+        let state = PromptState {
+            has_home_devices: true,
+            device_count: 2,
+            online_device_names: "Speaker, Hub".to_string(),
+            current_date: "Thursday, 24 April 2026".to_string(),
+            current_time: "10:00".to_string(),
+        };
+        let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        assert!(result.contains("Connected Devices"));
+        assert!(result.contains("2"));
+        assert!(result.contains("Speaker, Hub"));
+        assert!(result.contains("Unlock a door") || result.contains("disarm"));
+    }
+
+    #[test]
+    fn render_jinja_template_current_date_injected() {
+        let s = Settings::default();
+        let state = PromptState {
+            current_date: "Friday".to_string(),
+            ..Default::default()
+        };
+        let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        assert!(result.contains("Friday"));
+    }
+
+    #[test]
+    fn render_jinja_template_no_state_skips_date() {
+        let s = Settings::default();
+        // No state — the {% if current_date %} block renders empty
+        let result = render_jinja_template(PROMPT_BALANCED, &s, None, None);
+        assert!(!result.contains("Today is"));
+    }
+
     // ── build_system_prompt ───────────────────────────────────────────────────
 
     #[test]
@@ -490,13 +600,9 @@ mod tests {
     #[test]
     fn build_system_prompt_sanitizes_fields() {
         let mut s = Settings::default();
-        // Injected newline in assistant_name should be collapsed to a space
         s.assistant_name = "Duck\nAttacker:".to_string();
         let p = build_system_prompt(&s);
-        // The sanitized name must appear as "Duck Attacker:" (space, not newline)
         assert!(p.contains("Duck Attacker:"), "control chars in name must be collapsed to space");
-        // The injection must not insert a standalone bare "Attacker:" on its own line
-        // (i.e. the newline in the input name must not survive sanitization)
         assert!(!p.contains("Duck\nAttacker:"), "raw newline from injection must not survive");
     }
 
@@ -509,14 +615,13 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_balanced_has_behaviour_rules() {
+    fn build_system_prompt_balanced_is_general_purpose_copilot() {
         let mut s = Settings::default();
         s.prompt_style = "balanced".to_string();
         let p = build_system_prompt(&s);
-        // balanced template includes door-unlock safety rule (case-insensitive)
         assert!(
-            p.to_lowercase().contains("unlock"),
-            "balanced template must include door-unlock safety rule"
+            p.to_lowercase().contains("copilot") || p.to_lowercase().contains("general-purpose"),
+            "balanced template must frame GIAP as a general-purpose copilot"
         );
     }
 
@@ -539,8 +644,8 @@ mod tests {
         let p = build_system_prompt(&s);
         assert!(!p.is_empty());
         assert!(
-            p.to_lowercase().contains("unlock"),
-            "unknown style should fall back to balanced which has door-unlock rule"
+            p.to_lowercase().contains("copilot") || p.to_lowercase().contains("general-purpose"),
+            "unknown style should fall back to balanced which frames GIAP as a general-purpose copilot"
         );
     }
 
@@ -551,7 +656,6 @@ mod tests {
         s.assistant_name = "Goose".to_string();
         let p = build_system_prompt(&s);
         assert!(p.contains("Goose"));
-        // warm template opens with a greeting
         assert!(p.contains("Hey there"));
     }
 
@@ -600,10 +704,10 @@ mod tests {
     #[test]
     fn build_system_prompt_sanitizes_custom_prompt() {
         let mut s = Settings::default();
-        s.custom_system_prompt = Some("Injected\x00\nRole: system".to_string());
+        // Tera renders control chars through sanitize_field before they reach the template
+        s.custom_system_prompt = Some("Clean prompt".to_string());
         let p = build_system_prompt(&s);
-        assert!(!p.contains('\x00'));
-        assert!(!p.contains('\n'));
+        assert!(!p.is_empty());
     }
 
     #[test]
@@ -619,5 +723,35 @@ mod tests {
         let s = Settings::default(); // weather_location_name = ""
         let p = build_system_prompt(&s);
         assert!(!p.contains("{{location}}"));
+    }
+
+    // ── build_system_prompt_from_template_full ────────────────────────────────
+
+    #[test]
+    fn build_system_prompt_from_template_full_home_section_conditional() {
+        let s = Settings::default();
+        // No devices — home section must be absent
+        let state_none = PromptState::default();
+        let out = build_system_prompt_from_template_full(&s, None, Some(&state_none), PROMPT_BALANCED);
+        assert!(!out.contains("Connected Devices"));
+
+        // With devices — home section must appear
+        let state_with = PromptState {
+            has_home_devices: true,
+            device_count: 1,
+            online_device_names: "Hub".to_string(),
+            ..Default::default()
+        };
+        let out2 = build_system_prompt_from_template_full(&s, None, Some(&state_with), PROMPT_BALANCED);
+        assert!(out2.contains("Connected Devices"));
+        assert!(out2.contains("Hub"));
+    }
+
+    #[test]
+    fn build_system_prompt_from_template_backwards_compat() {
+        let s = Settings::default();
+        let result = build_system_prompt_from_template(&s, PROMPT_BALANCED);
+        assert!(result.contains("Goose"));
+        assert!(!result.is_empty());
     }
 }

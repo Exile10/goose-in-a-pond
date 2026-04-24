@@ -7,12 +7,13 @@ use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
 use pond_core::ports::agent::{Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent};
+use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
-use pond_core::prompts::build_system_prompt_from_template;
+use pond_core::prompts::{build_system_prompt_from_template_full, PromptState};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -23,21 +24,13 @@ use crate::extension_manager::GiapGooseExtensionManager;
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
 const FALLBACK_PROMPT: &str =
-    "You are {{assistant_name}}, a privacy-first local AI home assistant. \
-     No data leaves this home. Be concise, warm, and practical. \
+    "You are {{assistant_name}}, a privacy-first local AI copilot. \
+     No data leaves this device. Be concise and practical. \
+     Help with everyday tasks, research, writing, coding, and home control. \
      No Markdown. Never emit pipeline control tokens. \
-     IMPORTANT: You must ONLY use the tools explicitly listed in your tool schema. \
-     NEVER use shell commands, bash, python, curl, or any execution tool to fetch information. \
-     If a service or tool is unavailable or not configured, tell the user directly and stop.
-
-        {% if (extensions is defined) and extensions %}
-        # Extensions
-        Extensions provide additional tools and context.
-        {% for extension in extensions %}
-        ## {{extension.name}}
-        {% if extension.instructions %}{{extension.instructions}}{% endif %}
-        {% endfor %}
-        {% endif %}";
+     IMPORTANT: Only use tools listed in your schema. \
+     Never use shell, bash, python, curl, or any execution tool. \
+     If a service is unavailable, tell the user directly.";
 
 
 /// Adapter: GooseAdapter
@@ -60,6 +53,8 @@ pub struct GooseAdapter {
     extras_repo: Arc<dyn PromptExtraRepository>,
     skill_repo: Arc<dyn UserSkillRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
+    /// Device registry — queried per turn to populate PromptState for Jinja2 rendering.
+    device_repo: Arc<dyn DeviceRegistry>,
     llamafile_url: String,
     /// GIAP data directory — used to resolve GGUF model paths under
     /// `$data_dir/models/gguf/` for the in-process LocalInferenceProvider.
@@ -82,6 +77,7 @@ impl GooseAdapter {
         extras_repo: Arc<dyn PromptExtraRepository>,
         skill_repo: Arc<dyn UserSkillRepository>,
         memory_repo: Arc<dyn MemoryRepository>,
+        device_repo: Arc<dyn DeviceRegistry>,
         llamafile_url: String,
         data_dir: Option<PathBuf>,
     ) -> Result<Self> {
@@ -112,6 +108,7 @@ impl GooseAdapter {
             extras_repo,
             skill_repo,
             memory_repo,
+            device_repo,
             llamafile_url,
             data_dir,
             extension_manager,
@@ -124,11 +121,12 @@ impl GooseAdapter {
     /// Convenience factory for non-server use (tests, CLI one-shots).
     /// Uses mock repos and connects to llamafile at `host`.
     pub async fn with_llamafile(host: Option<&str>) -> Result<Self> {
-        use pond_core::services::mock_settings::MockSettingsRepository;
-        use pond_core::services::mock_prompt_template::MockPromptTemplateRepository;
-        use pond_core::services::mock_prompt_extra::MockPromptExtraRepository;
-        use pond_core::services::mock_skill::MockSkillRepository;
+        use pond_core::services::mock_device_registry::MockDeviceRegistry;
         use pond_core::services::mock_memory::MockMemoryRepository;
+        use pond_core::services::mock_prompt_extra::MockPromptExtraRepository;
+        use pond_core::services::mock_prompt_template::MockPromptTemplateRepository;
+        use pond_core::services::mock_settings::MockSettingsRepository;
+        use pond_core::services::mock_skill::MockSkillRepository;
 
         let url = host.unwrap_or("http://127.0.0.1:8080").to_string();
         Self::new(
@@ -137,6 +135,7 @@ impl GooseAdapter {
             Arc::new(MockPromptExtraRepository::default()),
             Arc::new(MockSkillRepository::default()),
             Arc::new(MockMemoryRepository::default()),
+            Arc::new(MockDeviceRegistry),
             url,
             None,
         ).await
@@ -375,7 +374,38 @@ impl GooseAdapter {
             .flatten()
             .map(|t| t.content)
             .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
-        let system_prompt = build_system_prompt_from_template(&settings, &template_content);
+
+        // Populate runtime state for Jinja2 rendering (device list + current date/time).
+        // Failure to read devices is non-fatal — renders with empty home-control section.
+        let prompt_state = {
+            use chrono::Local;
+            let now = Local::now();
+            let current_date = now.format("%A, %-d %B %Y").to_string();
+            let current_time = now.format("%H:%M").to_string();
+            let devices = self.device_repo.list_devices().await.unwrap_or_default();
+            let device_count = devices.len();
+            let has_home_devices = device_count > 0;
+            let online_device_names = devices
+                .iter()
+                .filter(|d| d.is_online)
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            PromptState {
+                current_date,
+                current_time,
+                device_count,
+                has_home_devices,
+                online_device_names,
+            }
+        };
+
+        let system_prompt = build_system_prompt_from_template_full(
+            &settings,
+            None,
+            Some(&prompt_state),
+            &template_content,
+        );
         self.agent.override_system_prompt(system_prompt).await;
 
         // ── 2. System prompt extras ───────────────────────────────────────────
