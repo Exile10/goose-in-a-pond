@@ -700,10 +700,29 @@
 .db-chat-agent-status.online  { color: #15803d; }
 .db-chat-agent-status.offline { color: var(--text-faint); }
 
-/* Light mode: only the mute/unmute button gets white text — other buttons keep their own colours */
-:root[data-theme="light"] .db-chat-mute-btn { color: #ffffff; }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]):not([data-theme="light"]) .db-chat-mute-btn { color: #ffffff; }
+/* Mute button base: pin a chip background + dark icon in BOTH modes so the
+   `currentColor` SVG stroke stays legible.  The previous rule used white
+   text against the 25%-alpha glass surface, which on a light page rendered
+   the icon almost invisibly. */
+.db-chat-mute-btn {
+  background: var(--chip-bg);
+  color: var(--text-primary);
+  border-color: rgba(120, 120, 140, 0.30);
+}
+.db-chat-mute-btn:hover:not(:disabled) {
+  background: var(--chip-hover-bg);
+  border-color: rgba(120, 120, 140, 0.55);
+}
+
+/* When muted, switch to a warm-amber affordance so the active state is
+   obvious without depending on icon shape alone. */
+.db-chat-mute-btn.is-muted {
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+.db-chat-mute-btn.is-muted:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.26);
 }
 
 /* Mute button — speaking state: purple accent, sound bars replace icon */
@@ -782,6 +801,29 @@
 .db-chat-control-btn.clear:hover:not(:disabled) {
   background: var(--chip-hover-bg);
   border-color: #b386ff;
+}
+
+/* Mute toggle (chat composer toolbar). The base class has no colour, so the
+   icon was inheriting the page text colour against a transparent background —
+   in light mode that ended up nearly invisible.  Pin it to chip styling so
+   it sits next to Stop/Clear with the same surface, and switch to a warm
+   amber tint when muted to make the active state obvious. */
+.db-chat-control-btn.mute {
+  background: var(--chip-bg);
+  color: var(--text-primary);
+  border-color: rgba(120, 120, 140, 0.30);
+}
+.db-chat-control-btn.mute:hover:not(:disabled) {
+  background: var(--chip-hover-bg);
+  border-color: rgba(120, 120, 140, 0.55);
+}
+.db-chat-control-btn.mute.is-muted {
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+.db-chat-control-btn.mute.is-muted:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.26);
 }
 
 /* ── Suggestion chips ─────────────────────────────────────────────────────── */
@@ -1766,70 +1808,8 @@
   50%       { transform: scaleY(1);   opacity: 1; }
 }
 
-/* Mute toggle */
-/* Mute button — theme-aware solid pill, icon always high-contrast.
-   The SVG's `stroke="currentColor"` attribute is overridden via CSS so
-   neither `color: <system default>` nor the global `button` rule can
-   make the icon invisible. */
-.voice-orb-mute-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
-  color: #111827;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
-}
-.voice-orb-mute-btn svg { stroke: #111827 !important; fill: none !important; }
-.voice-orb-mute-btn:hover {
-  background: #f3f4f6;
-  border-color: #9ca3af;
-}
-:root[data-theme="dark"] .voice-orb-mute-btn,
-:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn {
-  background: #1f2937;
-  border-color: #4b5563;
-  color: #f9fafb;
-}
-:root[data-theme="dark"] .voice-orb-mute-btn svg,
-:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn svg {
-  stroke: #f9fafb !important;
-}
-:root[data-theme="dark"] .voice-orb-mute-btn:hover,
-:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn:hover {
-  background: #374151;
-  border-color: #6b7280;
-}
-/* In system mode we only darken when the OS is actually dark. */
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .voice-orb-mute-btn {
-    background: #ffffff;
-    border-color: #d1d5db;
-    color: #111827;
-  }
-  :root:not([data-theme="dark"]) .voice-orb-mute-btn svg {
-    stroke: #111827 !important;
-  }
-}
-.voice-orb-mute-btn.muted,
-:root[data-theme="dark"] .voice-orb-mute-btn.muted,
-:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn.muted {
-  color: #ffffff;
-  background: #dc2626;
-  border-color: #b91c1c;
-}
-.voice-orb-mute-btn.muted svg,
-:root[data-theme="dark"] .voice-orb-mute-btn.muted svg,
-:root:not([data-theme="light"]):not([data-theme="dark"]) .voice-orb-mute-btn.muted svg {
-  stroke: #ffffff !important;
-}
-.voice-orb-mute-btn.muted:hover { background: #b91c1c; }
+/* The floating mute button (.voice-orb-mute-btn) was removed — mute now
+   lives in the chat composer toolbar.  Class kept out of the bundle. */
 
 /* Transcript / response overlay */
 .voice-orb-overlay {
