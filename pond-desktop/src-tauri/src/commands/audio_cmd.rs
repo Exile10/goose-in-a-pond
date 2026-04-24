@@ -10,6 +10,35 @@ pub struct TranscriptResult {
     pub text: String,
 }
 
+/// Quips spoken by Goose while it processes your request.
+/// Short phrases — aim for ≤ 2 seconds of synthesised audio each.
+const QUIPS: &[&str] = &[
+    "On it.",
+    "Let me think.",
+    "Ruffling through possibilities.",
+    "Consulting the pond elders.",
+    "Wading into the knowledge pool.",
+    "Hatching a response.",
+    "Migrating toward an answer.",
+    "Paddling upstream.",
+    "Preening my thoughts.",
+    "Assembling ideas, feather by feather.",
+    "Surveying the flock.",
+    "Squinting at the data.",
+    "Flocking toward clarity.",
+    "Skimming the surface.",
+];
+
+/// Pick a quip using sub-millisecond time as a cheap source of variety.
+fn pick_quip() -> &'static str {
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % QUIPS.len();
+    QUIPS[idx]
+}
+
 /// Begin capturing audio from the microphone.
 /// Emits `audio-level` events (f32 0..1) for the VoiceOrb animation.
 #[tauri::command]
@@ -105,6 +134,9 @@ pub async fn stop_wake_listener(
 /// Full voice pipeline:
 /// (caller passes WAV bytes from stop_recording) → transcribe → chat stream → speak
 ///
+/// A short quip is synthesised in the background immediately so the silence
+/// between the user speaking and Goose responding is filled with audio.
+///
 /// `auth_token` — the pond session token from localStorage; empty string for unauthenticated
 ///   loopback connections (pond-server accepts any well-formed Bearer on loopback).
 ///
@@ -132,6 +164,21 @@ pub async fn run_voice_pipeline(
     } else {
         Some(format!("Bearer {}", auth_token))
     };
+
+    // ── 0. Start quip synthesis + playback immediately ──────────────────────
+    // The quip is fetched AND played inside a spawned task so it runs
+    // concurrently with transcription + LLM inference.  The user hears audio
+    // during the silence between speaking and the model's first token — not
+    // after the model finishes.
+    let quip_text   = pick_quip();
+    let quip_client = client.clone();
+    let quip_url    = base_url.clone();
+    let quip_handle = tokio::spawn(async move {
+        match fetch_tts_bytes(&quip_client, &quip_url, quip_text).await {
+            Ok(bytes) => { let _ = play_wav_bytes(bytes).await; }
+            Err(e)    => { tracing::debug!("Quip TTS skipped: {e}"); }
+        }
+    });
 
     // ── 1. Transcribe ────────────────────────────────────────────────────────
     let part = multipart::Part::bytes(wav_bytes)
@@ -169,7 +216,7 @@ pub async fn run_voice_pipeline(
 
     let _ = app.emit("transcript", TranscriptResult { text: transcript.clone() });
 
-    // ── 2. Chat (streaming SSE) ──────────────────────────────────────────────
+    // ── 2. Chat (streaming SSE) — runs while quip is already playing ─────────
     let effective_session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let chat_req = serde_json::json!({
         "message": transcript,
@@ -193,7 +240,6 @@ pub async fn run_voice_pipeline(
         })?;
 
     let mut response_text = String::new();
-
     while let Some(chunk) = chat_res
         .chunk()
         .await
@@ -219,41 +265,52 @@ pub async fn run_voice_pipeline(
         }
     }
 
-    // ── 3. TTS playback ──────────────────────────────────────────────────────
+    // ── 3. TTS playback: wait for quip → then play response ──────────────────
+    // quip_handle may still be playing (or already finished).  Awaiting it
+    // ensures we don't cut the quip short before starting the response audio.
+    let _ = app.emit("tts-start", ());
+    quip_handle.await.ok();
+
     if !response_text.is_empty() {
-        let _ = app.emit("tts-start", ());
-        let tts_result = play_tts(&client, &base_url, &response_text).await;
-        let _ = app.emit("tts-end", ());
-        if let Err(e) = tts_result {
+        if let Err(e) = play_tts(&client, &base_url, &response_text).await {
             tracing::warn!("TTS playback failed (non-fatal): {e}");
         }
     }
 
+    let _ = app.emit("tts-end", ());
+
     Ok(())
 }
 
-async fn play_tts(client: &reqwest::Client, base_url: &str, text: &str) -> Result<(), String> {
-    // 30-second timeout on the HTTP request to the TTS endpoint
+/// Fetch synthesised WAV bytes for `text` from the pond-server TTS endpoint.
+/// Does NOT play audio — just returns the bytes.
+async fn fetch_tts_bytes(
+    client: &reqwest::Client,
+    base_url: &str,
+    text: &str,
+) -> Result<Vec<u8>, String> {
     let res = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(15),
         client
             .post(format!("{}/api/v1/tts", base_url))
             .json(&serde_json::json!({ "text": text }))
             .send(),
     )
     .await
-    .map_err(|_| "TTS HTTP request timed out after 30s".to_string())?
+    .map_err(|_| "TTS fetch timed out".to_string())?
     .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
         return Err(format!("TTS server error: {}", res.status()));
     }
 
-    let bytes = res.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+}
 
-    // 60-second timeout on rodio playback (guards against stuck audio sinks)
+/// Play WAV bytes through the system audio output via rodio.
+async fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), String> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
             use rodio::{Decoder, OutputStream, Sink};
             let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
@@ -266,6 +323,18 @@ async fn play_tts(client: &reqwest::Client, base_url: &str, text: &str) -> Resul
         }),
     )
     .await
-    .map_err(|_| "TTS playback timed out after 60s".to_string())?
+    .map_err(|_| "Audio playback timed out".to_string())?
     .map_err(|e| e.to_string())?
+}
+
+/// Synthesise `text` and play it — convenience wrapper for the main response.
+async fn play_tts(client: &reqwest::Client, base_url: &str, text: &str) -> Result<(), String> {
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fetch_tts_bytes(client, base_url, text),
+    )
+    .await
+    .map_err(|_| "TTS HTTP request timed out after 30s".to_string())??;
+
+    play_wav_bytes(bytes).await
 }
