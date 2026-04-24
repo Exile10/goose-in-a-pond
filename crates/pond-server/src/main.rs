@@ -75,6 +75,7 @@ use std::sync::Arc;
 use pond_core::services::onboarding::OnboardingService;
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_infra::onboarding::SqlxOnboardingRepository;
+use futures::StreamExt as _;
 use std::io::{self, Write};
 use std::collections::HashMap;
 use std::net::UdpSocket;
@@ -229,13 +230,25 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum AgentAction {
-    /// Send a message through the Goose agent and print the response
+    /// Send a message through the Goose agent and stream the response
     Chat {
         /// The message to send to the agent
         message: String,
         /// Session ID for conversation continuity across calls
         #[arg(long, default_value = "cli-agent")]
         session: String,
+        /// Model role: auto (classify from message), chat, think, task
+        #[arg(long, default_value = "auto")]
+        role: String,
+    },
+    /// Interactive multi-turn conversation REPL
+    Repl {
+        /// Session ID — persists history across the REPL session
+        #[arg(long, default_value = "cli-repl")]
+        session: String,
+        /// Model role: auto (classify each message), chat, think, task
+        #[arg(long, default_value = "auto")]
+        role: String,
     },
     /// List MCP tool extensions currently known to the agent
     Tools,
@@ -436,7 +449,8 @@ async fn run_setup(model: &str) -> Result<()> {
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
         use pond_core::domain::prompt_template::PromptTemplate;
-        use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
 
         let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
@@ -943,6 +957,33 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
         Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+
+    // Reseed built-in prompt templates with latest Jinja2 general-purpose content.
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = prompt_template_repo.upsert(&t).await {
+                tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
+            }
+        }
+        tracing::info!("Built-in prompt templates reseeded (Jinja2 general-purpose copilot)");
+    }
 
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model    = settings.chat_model.clone();
@@ -1452,10 +1493,105 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
     let session_id = "default-session".to_string();
-    // MockAgent is the fallback for ChatService when no LLM provider is wired.
-    // In practice the with_provider() builder always overrides it below,
-    // but ChatService::new() requires an agent at construction time.
-    let agent = Arc::new(MockAgent::new());
+
+    // ── Build repos for GooseAdapter (before db.system is consumed) ───────────────
+    let settings_repo_arc: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
+        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+        Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
+        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+    let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
+        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
+        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let device_registry_arc: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
+        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+
+    // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
+    // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
+    // User-created templates (is_system = false) are never touched.
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = template_repo.upsert(&t).await {
+                tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
+            }
+        }
+        tracing::info!("Built-in prompt templates reseeded (Jinja2 general-purpose copilot)");
+    }
+
+    // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
+    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
+        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+    {
+        let loc = if settings.weather_location_name.is_empty() {
+            format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+        } else {
+            settings.weather_location_name.clone()
+        };
+        Some(Arc::new(OpenMeteoWeatherAdapter::new(
+            settings.weather_latitude,
+            settings.weather_longitude,
+            loc,
+        )))
+    } else {
+        None
+    };
+
+    // ── Build the GooseAdapter (MCP tools + model routing) ───────────────────────
+    // When goose-agent is compiled in, GooseAdapter is used for all inference —
+    // it selects provider/model internally via the settings DB.  CLI --provider
+    // and --model flags are persisted to the DB first so GooseAdapter picks them up.
+    //
+    // Without the feature we fall back to MockAgent and wire a direct LlmProvider
+    // via with_provider() later (identical to the old behaviour).
+    #[cfg(feature = "goose-agent")]
+    let agent: Arc<dyn Agent> = {
+        // Persist CLI overrides so GooseAdapter reads the right provider + model.
+        if provider.is_some() || model.is_some() {
+            let mut s = settings.clone();
+            s.chat_provider = effective_provider.to_string();
+            s.chat_model    = effective_model.to_string();
+            settings_repo_arc.update(&s).await.ok();
+        }
+        let (a, _ext_mgr) = build_goose_backend(
+            "goose",
+            &llamafile_url,
+            &data_dir,
+            weather,
+            device_registry_arc,
+            None, // scheduler not used in voice mode
+            settings_repo_arc,
+            memory_repo,
+            skill_repo,
+            recipe_repo,
+            template_repo,
+            extras_repo,
+        ).await;
+        a
+    };
+
+    #[cfg(not(feature = "goose-agent"))]
+    let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
 
     // Resolve the system prompt using the already-loaded settings:
     // 1. File at $DATA_DIR/prompts/system.md (deployment override, rendered with all vars)
@@ -1511,9 +1647,10 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
         .with_system_prompt(system_prompt);
 
-    // ── Wire LLM provider (settings drive token budget + temperature) ──
-    // Default / fallback is always llamafile — it is auto-started above for any provider
-    // that is not "ollama" or "local" (GGUF aliases to "local").
+    // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
+    // When GooseAdapter is active it selects the provider internally via the DB.
+    // This block runs only in builds without the goose-agent feature.
+    #[cfg(not(feature = "goose-agent"))]
     match effective_provider {
         "ollama" => {
             println!(
@@ -1534,12 +1671,6 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             #[cfg(feature = "local-inference")]
             {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-                // Resolve catalog name → HF model ID ("owner/repo:quantization").
-                // effective_model is a catalog name like "gemma-4-E4B-it-Q4_K_S".
-                // new_with_data_dir registers the local GGUF path in Goose's model
-                // registry so LocalInferenceProvider can find the already-downloaded file.
-                // hf_id is already stored as "owner/repo:quantization" (e.g.
-                // "google/gemma-4-E4B-it-GGUF:Q4_K_S") — use it directly.
                 let hf_model_id = chat_model_repo
                     .get_by_id(&format!("gguf/{}", effective_model))
                     .await
@@ -1639,8 +1770,18 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
                             Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
                         }
                     }
-                    if !model_path.exists() {
-                        println!("  📥 TTS model not found — downloading configured voice...");
+                    // Piper requires both the .onnx weights AND the .onnx.json config.
+                    // Check both — the JSON is often missing even when the onnx was
+                    // downloaded in an earlier version that didn't fetch the config.
+                    let config_path = std::path::PathBuf::from(
+                        format!("{}.json", model_path.display())
+                    );
+                    if !model_path.exists() || !config_path.exists() {
+                        if model_path.exists() {
+                            println!("  📥 TTS model config (.json) missing — downloading...");
+                        } else {
+                            println!("  📥 TTS model not found — downloading configured voice...");
+                        }
                         // Look up in DB by filename to get the correct download URL.
                         let voice_filename = settings.voice_tts_voice.as_str();
                         let registry_entry = SqliteModelRepository::new(db_system.clone())
@@ -2358,7 +2499,7 @@ async fn build_goose_backend(
     // Register the GIAP MCP server into Goose's builtin extension registry.
     let handles = Arc::new(GiapServiceHandles {
         weather,
-        device_registry,
+        device_registry: device_registry.clone(),
         scheduler,
         settings_repo: settings_repo.clone(),
         memory_repo: memory_repo.clone(),
@@ -2377,6 +2518,7 @@ async fn build_goose_backend(
         extras_repo,
         skill_repo,
         memory_repo,
+        device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
     ).await {
@@ -2657,10 +2799,79 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
 // ── Agent CLI ─────────────────────────────────────────────────────────────────
 
-/// One-shot Goose agent chat from the CLI.
+/// Resolve the model role string from a `--role` flag value and the message text.
+fn resolve_role(role_arg: &str, message: &str) -> String {
+    use pond_core::services::request_classifier::classify_request;
+    match role_arg {
+        "auto" => match classify_request(message) {
+            pond_core::domain::model_role::ModelRole::Think => "think".to_string(),
+            pond_core::domain::model_role::ModelRole::Task  => "task".to_string(),
+            pond_core::domain::model_role::ModelRole::Chat  => "chat".to_string(),
+        },
+        other => other.to_string(),
+    }
+}
+
+/// Stream a single agent request to stdout, printing tool calls to stderr.
+///
+/// Text tokens are printed as they arrive. Tool calls and results are shown
+/// on stderr so they don't pollute piped output. Returns when the stream ends.
+async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domain::agent::AgentRequest) -> Result<()> {
+    use pond_core::domain::agent::AgentStreamEvent;
+
+    let mut stream = agent.chat_stream(request).await?;
+    let mut printed_newline = false;
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            AgentStreamEvent::Status { content } => {
+                eprint!("\r\x1b[K  {content}");
+                let _ = io::stderr().flush();
+            }
+            AgentStreamEvent::ToolCall { tool, input, .. } => {
+                // Clear the status line, then show the tool call
+                let args = input
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .filter(|s| s != "{}" && s != "null")
+                    .unwrap_or_default();
+                eprint!("\r\x1b[K");
+                if args.is_empty() {
+                    eprintln!("  ⚙  {tool}");
+                } else {
+                    eprintln!("  ⚙  {tool}  {args}");
+                }
+            }
+            AgentStreamEvent::ToolResult { content, .. } => {
+                // Show first line of result so the user sees what came back
+                let preview = content.lines().next().unwrap_or("(no output)");
+                eprintln!("     ↳ {preview}");
+            }
+            AgentStreamEvent::Text { content } => {
+                eprint!("\r\x1b[K"); // clear any trailing status message
+                print!("{content}");
+                let _ = io::stdout().flush();
+                printed_newline = content.ends_with('\n');
+            }
+            AgentStreamEvent::Done { .. } => {
+                if !printed_newline {
+                    println!();
+                }
+                break;
+            }
+            AgentStreamEvent::Error { content } => {
+                eprintln!("\n  error: {content}");
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-shot or interactive Goose agent chat from the CLI.
 ///
 /// Builds the full GooseAdapter + GIAP MCP backend (same as `run_server`),
-/// sends a single message, prints the text response, then exits.
+/// streams the response to stdout, then exits (or loops in REPL mode).
 async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -2705,12 +2916,12 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     };
 
     match action {
-        AgentAction::Chat { message, session } => {
+        AgentAction::Chat { message, session, role } => {
             use pond_core::domain::agent::AgentRequest;
 
-            println!("Agent: {} | Provider: {} | Model: {}",
-                settings.assistant_name, settings.chat_provider, settings.chat_model);
-            println!("Sending: {message}\n");
+            let model_role = resolve_role(&role, &message);
+            eprintln!("  {} | provider: {}  model: {}  role: {}",
+                settings.assistant_name, settings.chat_provider, settings.chat_model, model_role);
 
             let (agent, _ext_mgr) = build_goose_backend(
                 "goose",
@@ -2730,20 +2941,63 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             let request = AgentRequest {
                 message,
                 session_id: session,
-                model_role: "task".to_string(),
+                model_role,
             };
-            match agent.chat(request).await {
-                Ok(response) => {
-                    println!("{}", response.text);
-                    if let Some(calls) = response.metadata.get("tool_calls") {
-                        if !calls.is_empty() {
-                            eprintln!("\n[tool calls: {}]", calls);
-                        }
-                    }
+            stream_agent_response(&agent, request).await?;
+        }
+
+        AgentAction::Repl { session, role } => {
+            use pond_core::domain::agent::AgentRequest;
+            use tokio::io::AsyncBufReadExt as _;
+
+            let (agent, _ext_mgr) = build_goose_backend(
+                "goose",
+                &llamafile_url,
+                &data_dir,
+                weather,
+                device_registry,
+                None,
+                settings_repo,
+                memory_repo,
+                skill_repo,
+                recipe_repo,
+                template_repo,
+                extras_repo,
+            ).await;
+
+            eprintln!("  {} — session: {}  (Ctrl+C or 'exit' to quit)",
+                settings.assistant_name, session);
+
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            let mut lines = stdin.lines();
+
+            loop {
+                eprint!("\nYou: ");
+                let _ = io::stderr().flush();
+
+                let line = match lines.next_line().await {
+                    Ok(Some(l)) => l,
+                    _ => break,
+                };
+                let message = line.trim().to_string();
+                if message.is_empty() {
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("Agent error: {e}");
-                    std::process::exit(1);
+                if message == "exit" || message == "quit" {
+                    break;
+                }
+
+                let model_role = resolve_role(&role, &message);
+                eprint!("\nPond [{model_role}]: ");
+                let _ = io::stderr().flush();
+
+                let request = AgentRequest {
+                    message,
+                    session_id: session.clone(),
+                    model_role,
+                };
+                if let Err(e) = stream_agent_response(&agent, request).await {
+                    eprintln!("\n  error: {e}");
                 }
             }
         }
