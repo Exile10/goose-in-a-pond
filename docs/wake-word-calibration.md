@@ -306,3 +306,44 @@ The calibration system is intentionally thin:
   to duplicate variants (they're de-duplicated before saving).
 - **Backward compatible** — `voice_wake_word_transcriptions` defaults to `[]`; existing installs
   with no calibration data continue to work exactly as before.
+
+---
+
+## Detector Tuning Reference
+
+All settings below are persisted in `pond_system.db` and writable via `PUT /api/v1/settings`.
+
+| Setting | Default | Range | Description |
+|---|---|---|---|
+| `voice_wake_word` | `"goose"` | any string | The activation phrase |
+| `voice_kws_whisper_url` | `null` (= `voice_whisper_url`) | URL | Separate fast-model whisper for KWS |
+| `voice_kws_energy_threshold` | `0.01` | `0.0–1.0` | Min RMS to call whisper. `0.0` = disabled |
+| `voice_kws_post_trigger_silence_ms` | `400` | `0–4000` | Silence to end capture early. `0` = disabled |
+| `voice_kws_cooldown_ms` | `2000` | `0–10000` | Sleep before re-arming after activation |
+| `voice_recording_duration_secs` | `3` | `1–30` | Hard ceiling for fresh command recording |
+
+### Calibrating `voice_kws_energy_threshold`
+
+Run with `RUST_LOG=trace` and stay quiet — the trace log shows the RMS of each skipped window:
+
+```
+TRACE pond_adapters_whisper: KWS: silent window skipped (rms=0.0082)
+```
+
+Set the threshold ~20% above the highest idle RMS you observe. In a noisy open-plan office you
+may need `0.025`; in a quiet room `0.008` is fine.
+
+### Tuning `voice_kws_post_trigger_silence_ms`
+
+Lower values exit the capture window sooner but risk clipping the end of long commands. Increase
+if you notice commands being cut off mid-sentence. Disable (`0`) if commands are consistently
+long or your room has significant reverb.
+
+### Tuning `voice_kws_cooldown_ms`
+
+Set to at least the length of your longest TTS response plus ~500 ms for room settling. The
+startup print in `pond-server chat` shows the active value:
+
+```
+  Energy gate:   0.010 RMS  |  cooldown: 2000ms  |  VAD silence: 400ms
+```
