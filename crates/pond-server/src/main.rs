@@ -449,7 +449,8 @@ async fn run_setup(model: &str) -> Result<()> {
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
         use pond_core::domain::prompt_template::PromptTemplate;
-        use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
 
         let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
@@ -918,6 +919,33 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
         Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+
+    // Reseed built-in prompt templates with latest Jinja2 general-purpose content.
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = prompt_template_repo.upsert(&t).await {
+                tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
+            }
+        }
+        tracing::info!("Built-in prompt templates reseeded (Jinja2 general-purpose copilot)");
+    }
 
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model    = settings.chat_model.clone();
@@ -1441,6 +1469,35 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
     let device_registry_arc: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+
+    // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
+    // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
+    // User-created templates (is_system = false) are never touched.
+    {
+        use pond_core::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::ports::prompt_template::PromptTemplateRepository;
+        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        let built_ins = [
+            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
+            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
+            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
+            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+        ];
+        for (name, content, description) in built_ins {
+            let t = PromptTemplate {
+                name:        name.to_string(),
+                content:     content.to_string(),
+                description: description.to_string(),
+                is_system:   true,
+                updated_at:  String::new(),
+            };
+            if let Err(e) = template_repo.upsert(&t).await {
+                tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
+            }
+        }
+        tracing::info!("Built-in prompt templates reseeded (Jinja2 general-purpose copilot)");
+    }
 
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
@@ -2125,7 +2182,7 @@ async fn build_goose_backend(
     // Register the GIAP MCP server into Goose's builtin extension registry.
     let handles = Arc::new(GiapServiceHandles {
         weather,
-        device_registry,
+        device_registry: device_registry.clone(),
         scheduler,
         settings_repo: settings_repo.clone(),
         memory_repo: memory_repo.clone(),
@@ -2144,6 +2201,7 @@ async fn build_goose_backend(
         extras_repo,
         skill_repo,
         memory_repo,
+        device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
     ).await {

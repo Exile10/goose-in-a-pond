@@ -7,6 +7,7 @@ pub mod context_compactor;
 pub mod fallback_provider;
 pub mod fallback_voice_output;
 pub mod mock_agent;
+pub mod mock_device_registry;
 pub mod mock_memory;
 pub mod mock_model_catalog_provider;
 pub mod mock_model_downloader;

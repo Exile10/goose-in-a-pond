@@ -6,6 +6,7 @@ import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ContextCard } from "../components/ContextCard";
+import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import type { ChatEvent } from "../api/types";
 
 interface Message {
@@ -249,10 +250,7 @@ export function Chat() {
               ...(msg.error ? styles.bubbleError : {}),
             }}>
               {msg.text || (msg.streaming ? (
-                <span style={styles.thinkingContainer}>
-                  {msg.status && <span style={styles.statusText}>{msg.status}</span>}
-                  <span style={styles.thinkingDots}>●●●</span>
-                </span>
+                <ThinkingPlaceholder status={msg.status} />
               ) : "")}
             </p>
 
@@ -383,20 +381,6 @@ const styles: Record<string, React.CSSProperties> = {
   bubbleError: {
     borderColor: "var(--color-destructive)",
     color: "var(--color-destructive)",
-  },
-  thinkingContainer: {
-    display: "flex",
-    alignItems: "center",
-    gap: "var(--space-2)",
-  },
-  statusText: {
-    fontSize: "var(--text-sm)",
-    color: "var(--color-text-secondary)",
-    fontStyle: "italic",
-  },
-  thinkingDots: {
-    color: "var(--color-text-tertiary)",
-    animation: "pulse 1.4s ease infinite",
   },
   cardList: {
     display: "flex",

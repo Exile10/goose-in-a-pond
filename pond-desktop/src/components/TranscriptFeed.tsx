@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Chip } from "@heroui/react";
 import type { ContextCard, TranscriptMessage } from "../state/reducer";
 import { ContextCard as ContextCardView } from "./ContextCard";
+import { ThinkingPlaceholder } from "./ThinkingPlaceholder";
 
 interface Props {
   messages: TranscriptMessage[];
@@ -73,7 +74,7 @@ export function TranscriptFeed({
                 </Chip>
               )}
               <p style={{ ...styles.text, fontSize: compact ? "12px" : "13px" }}>
-                {msg.text || (msg.role === "agent" ? <span style={styles.thinking}>●●●</span> : "")}
+                {msg.text || (msg.role === "agent" ? <ThinkingPlaceholder compact /> : "")}
               </p>
             </div>
 
@@ -134,10 +135,6 @@ const styles: Record<string, React.CSSProperties> = {
     background: "rgba(23,22,22,0.05)",
     wordBreak: "break-word",
     userSelect: "text",
-  },
-  thinking: {
-    color: "rgba(23,22,22,0.30)",
-    animation: "pulse 1.4s ease infinite",
   },
   cardsRow: {
     display: "flex",
