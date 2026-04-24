@@ -188,6 +188,10 @@ export default function ChatWidget({ token }: Props) {
     const next = !muted
     setMuted(next)
     localStorage.setItem('pond_tts_muted', String(next))
+    // `storage` events do not fire in the originating tab, so dispatch a
+    // custom event for in-tab listeners (notably VoiceOrb, which gates
+    // its TTS playback on this same key).
+    window.dispatchEvent(new Event('pond-tts-muted-changed'))
   }
 
   function toggleListening() {
@@ -342,7 +346,7 @@ export default function ChatWidget({ token }: Props) {
         <div className="db-chat-control-btns">
           {/* Mute/unmute TTS */}
           <button
-            className="db-chat-control-btn"
+            className={`db-chat-control-btn mute${muted ? ' is-muted' : ''}`}
             onClick={toggleMute}
             title={muted ? 'Unmute voice' : 'Mute voice'}
           >

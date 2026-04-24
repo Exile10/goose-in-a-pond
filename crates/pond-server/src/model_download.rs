@@ -1012,6 +1012,189 @@ pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Resul
     Ok(())
 }
 
+// ── Face recognition models (SCRFD detector + ArcFace R50 embedding + Silent-Face PAD) ──
+
+/// On-disk directory where face models live: `<data_dir>/models/face/`.
+pub fn face_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join("face")
+}
+
+/// Returns the canonical (default) paths for the three face-recognition models.
+///
+/// `(embedding, detector, antispoof)` — matching what `build_face_recognition`
+/// in main.rs looks up.  Operators can override each with the matching
+/// `POND_FACE_*_PATH` env var.
+pub fn face_model_paths(data_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let dir = face_models_dir(data_dir);
+    (
+        dir.join("w600k_r50.onnx"),
+        dir.join("scrfd.onnx"),
+        dir.join("antispoof.onnx"),
+    )
+}
+
+/// `buffalo_l.zip` from InsightFace ships both the SCRFD 10G detector
+/// (`det_10g.onnx`) and the ArcFace R50 embedder (`w600k_r50.onnx`) in a
+/// single ~281 MB archive — downloading once gets us both files.
+const BUFFALO_L_ZIP_URL: &str =
+    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip";
+const BUFFALO_L_APPROX_MB: u64 = 281;
+
+/// Silent-Face MiniFASNetV2 anti-spoof model — 3-class export
+/// `[fake_2D, fake_3D, live]` at 80×80 BGR input.  We try a couple of
+/// community mirrors; if all fail we just skip and leave the heuristic
+/// gate in place (face recognition still works, only PAD is degraded).
+const ANTISPOOF_MIRRORS: &[&str] = &[
+    "https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
+    "https://huggingface.co/datasets/giap-mirror/silent-face-anti-spoofing/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
+];
+const ANTISPOOF_APPROX_MB: u64 = 2;
+
+/// Download face recognition models into `<data_dir>/models/face/`.
+///
+/// - `w600k_r50.onnx` (ArcFace R50, 174 MB embedding head)
+/// - `scrfd.onnx`     (SCRFD 10G detector with 5-point landmarks, 17 MB)
+///   — both extracted from a single buffalo_l.zip download.
+/// - `antispoof.onnx` (Silent-Face MiniFASNetV2, ~2 MB) — best-effort.
+///
+/// Models that already exist are skipped.  Failure to fetch the anti-spoof
+/// mirror is non-fatal — the heuristic PAD plus burst-liveness gates still
+/// catch most photo attacks.
+pub async fn download_face_models(data_dir: &Path) -> Result<()> {
+    let (embed, detect, antispoof) = face_model_paths(data_dir);
+    let dir = face_models_dir(data_dir);
+    tokio::fs::create_dir_all(&dir).await?;
+
+    // ── Embedder + detector (single zip) ────────────────────────────────────
+    if !embed.exists() || !detect.exists() {
+        println!("  📥 Face models not found — downloading buffalo_l (ArcFace R50 + SCRFD 10G)...");
+        match fetch_buffalo_l_zip(&dir, &embed, &detect).await {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  ⚠  Face model download failed: {} — face recognition will be disabled", e);
+                // Don't bail — antispoof is still worth attempting.
+            }
+        }
+    } else {
+        println!("  ✅ Face embedder + detector already present");
+    }
+
+    // ── Anti-spoof (separate small file, multiple mirrors) ──────────────────
+    if !antispoof.exists() {
+        println!("  📥 Anti-spoof model not found — trying community mirrors...");
+        let mut got = false;
+        for url in ANTISPOOF_MIRRORS {
+            match download_file(url, &antispoof, ANTISPOOF_APPROX_MB).await {
+                Ok(_) => {
+                    got = true;
+                    break;
+                }
+                Err(e) => {
+                    println!("  ⚠  Mirror {} failed: {}", url, e);
+                }
+            }
+        }
+        if !got {
+            println!(
+                "  ⚠  Anti-spoof model unavailable — heuristic PAD + burst liveness gates \
+                 will still run, but the strongest photo-attack defence is missing.\n     \
+                 Place the file manually at: {}",
+                antispoof.display()
+            );
+        }
+    } else {
+        println!("  ✅ Anti-spoof model already present");
+    }
+
+    Ok(())
+}
+
+/// Stream `buffalo_l.zip`, extracting only `det_10g.onnx` → `scrfd.onnx`
+/// and `w600k_r50.onnx` → `w600k_r50.onnx` into `out_dir`.
+async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Path) -> Result<()> {
+    println!("  ⬇  buffalo_l.zip (~{} MB) — contains both ArcFace R50 + SCRFD 10G",
+        BUFFALO_L_APPROX_MB);
+
+    let client = reqwest::Client::builder().build()?;
+    let resp = client.get(BUFFALO_L_ZIP_URL).send().await
+        .context("Failed to fetch buffalo_l.zip")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("Server returned {} for buffalo_l.zip", resp.status()));
+    }
+
+    let total = resp.content_length().unwrap_or(BUFFALO_L_APPROX_MB * 1_048_576);
+    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut downloaded: u64 = 0;
+    let mut resp = resp;
+
+    while let Some(chunk) = resp.chunk().await.context("Download interrupted")? {
+        buf.extend_from_slice(&chunk);
+        downloaded += chunk.len() as u64;
+        let pct = (downloaded * 100) / total.max(1);
+        print!("\r  ⬇  {} / {} MB  ({}%)",
+            downloaded / 1_048_576, total / 1_048_576, pct);
+        std::io::stdout().flush().ok();
+    }
+    println!();
+
+    let embed_dest = embed_dest.to_path_buf();
+    let detect_dest = detect_dest.to_path_buf();
+    let out_dir = out_dir.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let cursor = std::io::Cursor::new(buf);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .context("Failed to open buffalo_l zip archive")?;
+
+        let mut embed_found = false;
+        let mut detect_found = false;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let raw_name = entry.name().to_string();
+            let file_name = std::path::Path::new(&raw_name)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let target = match file_name.as_str() {
+                "w600k_r50.onnx" => { embed_found = true; embed_dest.clone() }
+                "det_10g.onnx"   => { detect_found = true; detect_dest.clone() }
+                _ => continue,
+            };
+
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = target.with_extension("part");
+            {
+                let mut out_file = std::fs::File::create(&tmp)
+                    .with_context(|| format!("Cannot write {}", tmp.display()))?;
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+                out_file.write_all(&content)?;
+            }
+            std::fs::rename(&tmp, &target)?;
+            println!("  ✅ Extracted {} → {}", file_name, target.display());
+        }
+
+        let _ = &out_dir;
+
+        if !embed_found {
+            return Err(anyhow!("buffalo_l.zip did not contain w600k_r50.onnx"));
+        }
+        if !detect_found {
+            return Err(anyhow!("buffalo_l.zip did not contain det_10g.onnx"));
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("buffalo_l zip extraction task panicked")??;
+
+    Ok(())
+}
+
 /// Run a `tokio::process::Command`, streaming its output, and return an error on non-zero exit.
 async fn run_cmd(cmd: &mut tokio::process::Command, label: &str) -> Result<()> {
     let status = cmd
