@@ -36,7 +36,6 @@ use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
 use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
-use pond_core::ports::wake_word::WakeWordDetector;
 use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::services::instant_activation::InstantActivation;
@@ -203,6 +202,33 @@ enum Commands {
     Memories {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+
+    /// Calibrate the wake-word detector by recording samples of your activation phrase.
+    ///
+    /// Records several short clips of you saying your wake-word phrase and stores
+    /// Whisper's transcriptions as calibration variants. The detector will then match
+    /// against any of those variants, making it robust to Whisper's inconsistent output.
+    ///
+    /// Example:
+    ///   pond-server calibrate
+    ///   pond-server calibrate --phrase "hey pond" --samples 3
+    Calibrate {
+        /// The wake-word phrase to calibrate (defaults to voice_wake_word from settings)
+        #[arg(long)]
+        phrase: Option<String>,
+
+        /// Number of recording samples to collect (default: 5)
+        #[arg(long, default_value = "5")]
+        samples: usize,
+
+        /// Whisper server URL (defaults to voice_whisper_url from settings)
+        #[arg(long)]
+        whisper_url: Option<String>,
+
+        /// Clear any existing calibration data before starting
+        #[arg(long)]
+        reset: bool,
     },
 }
 
@@ -389,6 +415,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Memories { action }) => {
             run_memories_cmd(action).await
+        }
+        Some(Commands::Calibrate { phrase, samples, whisper_url, reset }) => {
+            run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await
         }
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
@@ -1698,14 +1727,25 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     chat_service = chat_service.with_voice_input(voice);
 
     // ── Wire wake word detector ──
-    let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
-        Arc::new(InstantActivation)
+    if no_wake_word || input != "whisper" {
+        chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
         let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
-        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, whisper_url);
-        Arc::new(WhisperKeywordDetector::new(Some(&whisper_url), trigger))
+        let transcriptions = settings.voice_wake_word_transcriptions.clone();
+        if transcriptions.is_empty() {
+            println!("  Wake word: \"{}\" (no calibration — using raw phrase)", trigger);
+        } else {
+            println!("  Wake word: \"{}\" ({} calibrated variants)", trigger, transcriptions.len());
+        }
+        println!("  Detector: sliding-window via whisper @ {}", whisper_url);
+        // Use the streaming detector — it returns captured command audio on activation
+        // so the user can speak "Hey Goose, <command>" in one breath.
+        let detector = Arc::new(
+            WhisperKeywordDetector::new(Some(&whisper_url), trigger)
+                .with_transcriptions(transcriptions)
+        );
+        chat_service = chat_service.with_wake_word_detector(detector);
     };
-    chat_service = chat_service.with_wake_word_detector(detector);
 
     // ── Wire TTS output ──
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
@@ -1883,6 +1923,135 @@ async fn run_status() -> Result<()> {
     } else {
         println!("  (not found — run `pond-server setup` first)");
     }
+
+    Ok(())
+}
+
+/// `pond-server calibrate` — record N samples of the wake-word phrase and store
+/// Whisper's transcriptions as calibration variants in settings.
+async fn run_calibrate(
+    phrase_arg: Option<&str>,
+    target_samples: usize,
+    whisper_url_arg: Option<&str>,
+    reset: bool,
+) -> Result<()> {
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+    let mut settings = settings_repo.get().await?;
+
+    // Resolve phrase and whisper URL from args → settings → defaults.
+    let phrase = phrase_arg
+        .unwrap_or(settings.voice_wake_word.as_str())
+        .to_string();
+    let whisper_url = whisper_url_arg
+        .unwrap_or(settings.voice_whisper_url.as_str())
+        .to_string();
+
+    println!();
+    println!("  ╔═══════════════════════════════════════════════╗");
+    println!("  ║   🎤  Wake-Word Calibration                   ║");
+    println!("  ╚═══════════════════════════════════════════════╝");
+    println!("  Phrase:       \"{}\"", phrase);
+    println!("  Whisper URL:  {}", whisper_url);
+    println!("  Samples:      {}", target_samples);
+    println!();
+
+    if reset {
+        settings.voice_wake_word_transcriptions.clear();
+        settings_repo.update(&settings).await?;
+        println!("  ✓  Previous calibration data cleared.");
+        println!();
+    } else if !settings.voice_wake_word_transcriptions.is_empty() {
+        println!("  Existing variants ({}):", settings.voice_wake_word_transcriptions.len());
+        for v in &settings.voice_wake_word_transcriptions {
+            println!("    • {}", v);
+        }
+        println!("  (add --reset to discard these and start fresh)");
+        println!();
+    }
+
+    // Save the phrase to settings in case it was provided via --phrase.
+    if phrase_arg.is_some() {
+        settings.voice_wake_word = phrase.clone();
+    }
+
+    let whisper = WhisperInput::new(Some(&whisper_url));
+    let mut collected = 0usize;
+    let mut attempt  = 0usize;
+
+    while collected < target_samples {
+        attempt += 1;
+        println!("  ── Sample {} / {} ─────────────────────────────────", collected + 1, target_samples);
+        println!("  Press Enter, then say \"{}\"...", phrase);
+        {
+            // Wait for Enter
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
+        }
+
+        print!("  🎤 Recording...");
+        io::stdout().flush()?;
+
+        let text = match whisper.listen().await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                println!(" (no speech detected — try again)");
+                continue;
+            }
+            Err(e) => {
+                println!(" (error: {} — is whisper running at {}?)", e, whisper_url);
+                if attempt >= target_samples * 3 {
+                    anyhow::bail!("Too many failed attempts — aborting calibration.");
+                }
+                continue;
+            }
+        };
+
+        // Normalize: strip punctuation, collapse whitespace, lowercase.
+        let normalized: String = text
+            .chars()
+            .map(|c| if c.is_alphabetic() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        println!(" heard: \"{}\"", text);
+
+        if normalized.is_empty() {
+            println!("  (normalized to empty — skipping)");
+            continue;
+        }
+
+        if settings.voice_wake_word_transcriptions.contains(&normalized) {
+            println!("  (already stored as a variant — skipping duplicate)");
+            // Still count toward progress so the loop terminates.
+            collected += 1;
+            continue;
+        }
+
+        settings.voice_wake_word_transcriptions.push(normalized.clone());
+        settings_repo.update(&settings).await?;
+        collected += 1;
+
+        println!("  ✓  Stored: \"{}\"  ({}/{})", normalized, collected, target_samples);
+        println!();
+    }
+
+    println!("  ╔═══════════════════════════════════════════════╗");
+    println!("  ║   ✅  Calibration Complete!                   ║");
+    println!("  ╚═══════════════════════════════════════════════╝");
+    println!("  Phrase:    \"{}\"", settings.voice_wake_word);
+    println!("  Variants ({}):", settings.voice_wake_word_transcriptions.len());
+    for v in &settings.voice_wake_word_transcriptions {
+        println!("    • {}", v);
+    }
+    println!();
+    println!("  The wake-word detector will now match any of these variants.");
+    println!("  Run `pond-server chat --input whisper` to test it.");
+    println!();
 
     Ok(())
 }
