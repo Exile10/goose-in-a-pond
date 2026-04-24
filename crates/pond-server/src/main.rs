@@ -507,6 +507,15 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
+    // Step 7 (face-onnx feature only): face recognition models
+    #[cfg(feature = "face-onnx")]
+    {
+        println!("\n  [7/7] Setting up face recognition models...");
+        if let Err(e) = model_download::download_face_models(&data_dir).await {
+            println!("  ⚠  Face model setup failed: {} — face recognition will be disabled until you add the files manually", e);
+        }
+    }
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
@@ -907,6 +916,22 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Built only when the --features face-onnx build flag is enabled AND an
     // ONNX embedding model is present on disk.  Missing model file → None
     // (server starts normally; /api/v1/faces/* return 503).
+    //
+    // First call the auto-downloader so a fresh `cargo run` brings the
+    // models down on its own, exactly the way whisper / piper do.  We
+    // do this only when the face feature is compiled in, and we let
+    // failures fall through — `build_face_recognition` will simply
+    // return `None` when the files are absent.
+    #[cfg(feature = "face-onnx")]
+    {
+        if let Err(e) = model_download::download_face_models(&data_dir).await {
+            tracing::warn!("face model auto-download failed: {e:#}");
+        }
+        // Re-apply defaults: the antispoof file may have just appeared on
+        // disk for the first time, in which case the earlier env-default
+        // pass was a no-op.  Idempotent — only sets unset vars.
+        apply_face_recognition_defaults();
+    }
     let face_recognition: Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> =
         build_face_recognition(&data_dir, db.system.clone());
 
@@ -1850,9 +1875,42 @@ fn build_face_recognition(
     use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
     use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
 
-    let model_path = std::env::var("POND_FACE_MODEL_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| data_dir.join("models/face/arcface.onnx"));
+    // Default model lookup tries the well-calibrated buffalo_l export first,
+    // then falls back to legacy `arcface.onnx` for users who haven't migrated
+    // yet.  Operators can pin a specific path via `POND_FACE_MODEL_PATH`.
+    let model_path = match std::env::var("POND_FACE_MODEL_PATH") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let preferred = data_dir.join("models/face/w600k_r50.onnx");
+            if preferred.exists() {
+                preferred
+            } else {
+                data_dir.join("models/face/arcface.onnx")
+            }
+        }
+    };
+
+    // Default the anti-spoof path so users get the Silent-Face PAD gate
+    // for free once the model file is present, with no env-var setup.
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
+        let antispoof_default = data_dir.join("models/face/antispoof.onnx");
+        if antispoof_default.exists() {
+            // SAFETY: single-threaded init phase before any task scheduling.
+            unsafe {
+                std::env::set_var(
+                    "POND_FACE_ANTISPOOF_PATH",
+                    antispoof_default.as_os_str(),
+                );
+            }
+        }
+    }
+    // Same idea for the live-class index — the Silent-Face MiniFASNetV2
+    // export at the install URL we ship has [fake_2D, fake_3D, live] order
+    // (live is index 2), but the in-tree default is `auto` which assumes
+    // index 0.  Pin the default to 2 so the model works out-of-the-box.
+    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2"); }
+    }
 
     if !model_path.exists() {
         tracing::info!(
