@@ -3935,6 +3935,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "globwalk"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bf760ebf69878d9fd8f110c89703d90ce35095324d1f1edcb595c63945ee757"
+dependencies = [
+ "bitflags 2.11.0",
+ "ignore",
+ "walkdir",
+]
+
+[[package]]
 name = "goose"
 version = "0.1.0"
 dependencies = [
@@ -6813,6 +6824,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tera",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -9601,6 +9613,22 @@ dependencies = [
  "timezone_provider",
  "tinystr",
  "writeable",
+]
+
+[[package]]
+name = "tera"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8004bca281f2d32df3bacd59bc67b312cb4c70cea46cbd79dbe8ac5ed206722"
+dependencies = [
+ "globwalk",
+ "lazy_static",
+ "pest",
+ "pest_derive",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]
