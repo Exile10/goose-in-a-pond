@@ -27,7 +27,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pond_core::ports::voice_input::VoiceInput;
-use pond_core::ports::wake_word::WakeWordDetector;
+use pond_core::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Default whisper.cpp server URL.
@@ -42,6 +43,9 @@ pub struct WhisperInput {
     transcription_url: String,
     /// How long to record before sending for transcription (seconds).
     duration_secs: u32,
+    /// Pre-captured WAV bytes from the wake-word detector (one-breath path).
+    /// When `Some`, `listen()` transcribes these bytes instead of recording fresh.
+    captured: Mutex<Option<Vec<u8>>>,
 }
 
 impl WhisperInput {
@@ -53,6 +57,7 @@ impl WhisperInput {
             client: reqwest::Client::new(),
             transcription_url: format!("{}/inference", base),
             duration_secs: 5,
+            captured: Mutex::new(None),
         }
     }
 
@@ -66,9 +71,14 @@ impl WhisperInput {
 #[async_trait]
 impl VoiceInput for WhisperInput {
     async fn listen(&self) -> Result<Option<String>> {
-        let duration = self.duration_secs;
+        // One-breath path: transcribe pre-captured audio from the wake-word detector.
+        let captured = self.captured.lock().unwrap().take();
+        if let Some(wav) = captured {
+            return self.transcribe_wav(wav).await;
+        }
 
-        // Audio capture is blocking — run it in a dedicated thread.
+        // Normal path: record a fresh clip from the microphone.
+        let duration = self.duration_secs;
         let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             println!("  🎤 Recording for {} seconds...", duration);
             let (samples, sample_rate) = record_mono_f32(duration)?;
@@ -86,6 +96,11 @@ impl VoiceInput for WhisperInput {
 
     fn prompt(&self) -> &str {
         "🎤 "
+    }
+
+    /// Store WAV bytes for `listen()` to transcribe instead of recording fresh.
+    fn prime_with_captured(&self, wav: Vec<u8>) {
+        *self.captured.lock().unwrap() = Some(wav);
     }
 }
 
@@ -283,38 +298,105 @@ fn encode_wav_mono_16k(samples: &[f32]) -> Vec<u8> {
 
 // ── WhisperKeywordDetector ────────────────────────────────────────────────────
 
-/// WakeWordDetector that polls the microphone until the trigger phrase is heard.
+/// Configuration for the sliding-window wake-word detector.
+#[derive(Clone)]
+pub struct KeywordDetectorConfig {
+    /// Width of the audio window fed to whisper on each cycle (milliseconds).
+    /// Default: 1500 ms — wide enough for "Hey Goose" at normal speech rate.
+    pub window_ms: u64,
+    /// How far to advance the window on each detection cycle (milliseconds).
+    /// Default: 500 ms — 3 overlapping checks per window, ~1–1.5 s latency.
+    pub slide_ms: u64,
+    /// Extra audio to capture after detection fires (milliseconds).
+    /// This becomes the command audio returned to the caller (one-breath path).
+    /// Default: 4000 ms — long enough for typical spoken commands.
+    pub post_trigger_ms: u64,
+    /// Enable two-threshold hysteresis.
+    /// When a ≤3-token transcript contains the trigger, re-check once with a
+    /// shorter slide before firing — reduces false positives from noise bursts.
+    /// Default: true.
+    pub hysteresis_enabled: bool,
+    /// Slide advance used during the hysteresis re-check (milliseconds).
+    /// Default: 200 ms.
+    pub hysteresis_slide_ms: u64,
+}
+
+impl Default for KeywordDetectorConfig {
+    fn default() -> Self {
+        Self {
+            window_ms:          1500,
+            slide_ms:           500,
+            post_trigger_ms:    4000,
+            hysteresis_enabled: true,
+            hysteresis_slide_ms: 200,
+        }
+    }
+}
+
+/// WakeWordDetector that uses a continuous audio ring buffer and a sliding
+/// detection window to reduce latency and support the one-breath command flow.
 ///
-/// Records short clips (default 2 s), transcribes each via whisper.cpp, and
-/// returns `Ok(())` as soon as the transcript contains the trigger word/phrase
-/// (case-insensitive).
+/// Siri-inspired improvements over the old sequential 2 s-clip poller:
+/// - **Rolling ring buffer** — `cpal` streams continuously; no gaps between clips.
+/// - **Overlapping windows** — default 1500 ms window slides every 500 ms,
+///   giving ~1–1.5 s detection latency vs ~2.5 s before.
+/// - **Two-threshold hysteresis** — a ≤3-token match triggers a 200 ms re-check
+///   before firing, reducing false positives without meaningful latency cost.
+/// - **One-breath audio hand-off** — on confirmed detection, 4 s of trailing
+///   audio is captured and returned so `VoiceInput::listen()` can transcribe
+///   the command without a separate recording window.
 ///
-/// This is a polyfill for real-time KWS.  It has ~2 s latency per poll cycle
-/// and requires the whisper server to be running.  On Jetson with the `tiny`
-/// model, one cycle takes roughly 2 s record + 0.5 s inference = 2.5 s.
-///
-/// A dedicated native KWS library (Porcupine, Vosk KWS) will replace this
-/// when always-on wake-word detection is required.
+/// Implements `StreamingWakeWordDetector`; the blanket impl provides
+/// `WakeWordDetector` automatically.
 pub struct WhisperKeywordDetector {
-    whisper: WhisperInput,
-    /// The trigger phrase to listen for (case-insensitive substring match).
-    trigger: String,
-    /// Pre-built prompt shown in the Wait state UI.
+    server_url: String,
+    /// All normalized trigger variants. A transcript matching *any* of these fires detection.
+    triggers: Vec<String>,
     prompt: String,
+    config: KeywordDetectorConfig,
 }
 
 impl WhisperKeywordDetector {
     /// Create a detector listening for `trigger` (e.g. `"goose"`).
     /// Uses `server_url` for whisper (defaults to `DEFAULT_HOST`).
-    /// Records 2-second clips by default.
     pub fn new(server_url: Option<&str>, trigger: impl Into<String>) -> Self {
         let raw = trigger.into();
         let prompt = format!("Say \"{}\" to activate...", raw);
         Self {
-            whisper: WhisperInput::new(server_url).with_duration(2),
-            trigger: normalize_transcript(&raw),
+            server_url: server_url.unwrap_or(DEFAULT_HOST).to_string(),
+            triggers: vec![normalize_transcript(&raw)],
             prompt,
+            config: KeywordDetectorConfig::default(),
         }
+    }
+
+    /// Load calibrated transcription variants collected during onboarding.
+    ///
+    /// When `variants` is non-empty, the detector matches against any of them
+    /// (OR logic), making detection robust to Whisper's inconsistent output
+    /// (e.g. "hey goose" / "hey, goose" / "a goose").
+    ///
+    /// When `variants` is empty the detector keeps the single normalized trigger
+    /// set by `new()`.
+    pub fn with_transcriptions(mut self, variants: Vec<String>) -> Self {
+        if !variants.is_empty() {
+            self.triggers = variants
+                .iter()
+                .map(|v| normalize_transcript(v))
+                .filter(|v| !v.is_empty())
+                .collect();
+            // Fallback: if all variants normalized to empty, keep the existing trigger.
+            if self.triggers.is_empty() {
+                self.triggers = vec![normalize_transcript(&self.prompt)];
+            }
+        }
+        self
+    }
+
+    /// Override detection parameters.
+    pub fn with_config(mut self, config: KeywordDetectorConfig) -> Self {
+        self.config = config;
+        self
     }
 }
 
@@ -333,35 +415,195 @@ fn normalize_transcript(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Count whitespace-separated tokens in a normalized transcript.
+fn token_count(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
 #[async_trait]
-impl WakeWordDetector for WhisperKeywordDetector {
-    async fn wait_for_activation(&self) -> Result<()> {
-        loop {
-            match self.whisper.listen().await {
-                Ok(Some(text)) => {
-                    let normalized = normalize_transcript(&text);
-                    if normalized.contains(&self.trigger) {
-                        tracing::info!("Wake word detected: \"{}\"", text.trim());
-                        return Ok(());
-                    }
-                    // Heard something, but trigger not in transcript — show what was heard
-                    tracing::info!("Heard: \"{}\" (trigger: \"{}\")", text.trim(), self.trigger);
-                    println!("  👂 Heard: \"{}\" (waiting for \"{}\")", text.trim(), self.trigger);
-                }
-                Ok(None) => {
-                    tracing::debug!("No speech detected, polling again...");
-                }
-                Err(e) => {
-                    // Log but keep polling — a single failed clip is not fatal
-                    tracing::warn!("Wake word poll error (retrying): {}", e);
-                }
-            }
-        }
+impl StreamingWakeWordDetector for WhisperKeywordDetector {
+    async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+        let server_url  = self.server_url.clone();
+        let triggers    = self.triggers.clone();
+        let config      = self.config.clone();
+
+        tokio::task::spawn_blocking(move || {
+            detection_loop(server_url, triggers, config)
+        })
+        .await
+        .map_err(|e| anyhow!("detection thread panicked: {}", e))?
     }
 
     fn activation_prompt(&self) -> &str {
         &self.prompt
     }
+}
+
+/// Blocking detection loop — runs inside `tokio::task::spawn_blocking`.
+///
+/// Opens a continuous cpal input stream into a ring buffer, then slides a
+/// detection window over it, sending each window to whisper.cpp for
+/// transcription.  Returns when the trigger phrase is confirmed.
+fn detection_loop(
+    server_url: String,
+    triggers: Vec<String>,
+    config: KeywordDetectorConfig,
+) -> Result<WakeWordActivation> {
+    // ── Open continuous audio stream ─────────────────────────────────────────
+    let host   = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("No audio input device found"))?;
+    let stream_config = device
+        .default_input_config()
+        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
+
+    let sample_rate = stream_config.sample_rate().0;
+    let channels    = stream_config.channels() as usize;
+
+    // Ring buffer holds (window_ms + post_trigger_ms) worth of samples.
+    let max_samples = ((config.window_ms + config.post_trigger_ms)
+        * sample_rate as u64 / 1000) as usize;
+    let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(max_samples)));
+    let ring_writer = ring.clone();
+
+    let stream = match stream_config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &stream_config.into(),
+            move |data: &[f32], _| {
+                let mut r = ring_writer.lock().unwrap();
+                for chunk in data.chunks(channels) {
+                    let mono = chunk.iter().copied().sum::<f32>() / channels as f32;
+                    r.push_back(mono);
+                }
+                while r.len() > max_samples { r.pop_front(); }
+            },
+            |e| tracing::warn!("audio stream error: {}", e),
+            None,
+        )?,
+        cpal::SampleFormat::I16 => {
+            let ring_writer2 = ring.clone();
+            device.build_input_stream(
+                &stream_config.into(),
+                move |data: &[i16], _| {
+                    let mut r = ring_writer2.lock().unwrap();
+                    for chunk in data.chunks(channels) {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
+                        r.push_back(sum / channels as f32);
+                    }
+                    while r.len() > max_samples { r.pop_front(); }
+                },
+                |e| tracing::warn!("audio stream error: {}", e),
+                None,
+            )?
+        }
+        fmt => return Err(anyhow!("Unsupported audio format: {:?}", fmt)),
+    };
+    stream.play().map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+
+    // ── Detection loop ────────────────────────────────────────────────────────
+    let window_samples    = (config.window_ms * sample_rate as u64 / 1000) as usize;
+    let mut slide_ms      = config.slide_ms;
+    let mut hysteresis    = false;
+
+    let blocking_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(slide_ms));
+
+        // Snapshot the latest window_ms samples from the ring buffer.
+        let snapshot: Vec<f32> = {
+            let r = ring.lock().unwrap();
+            let start = r.len().saturating_sub(window_samples);
+            r.range(start..).copied().collect()
+        };
+
+        if snapshot.len() < window_samples / 2 {
+            continue; // buffer not yet full enough — keep waiting
+        }
+
+        // Transcribe the window.
+        let resampled = resample_to_16k(&snapshot, sample_rate);
+        let wav       = encode_wav_mono_16k(&resampled);
+
+        let transcript = match transcribe_blocking(&blocking_client, &server_url, wav) {
+            Ok(Some(t)) => normalize_transcript(&t),
+            Ok(None)    => { tracing::debug!("No speech in window"); continue; }
+            Err(e)      => { tracing::warn!("Whisper error (retrying): {}", e); continue; }
+        };
+
+        let matched = triggers.iter().any(|t| transcript.contains(t.as_str()));
+        tracing::debug!("KWS window: \"{}\" (triggers: {:?}, matched: {})", transcript, triggers, matched);
+
+        if matched {
+            // ── Hysteresis check ──────────────────────────────────────────────
+            if config.hysteresis_enabled && !hysteresis && token_count(&transcript) <= 3 {
+                // Short noisy transcript — could be a false positive. Re-check once.
+                tracing::debug!("Hysteresis: entering re-check mode");
+                hysteresis = true;
+                slide_ms   = config.hysteresis_slide_ms;
+                continue;
+            }
+
+            // ── Confirmed — capture trailing command audio ────────────────────
+            tracing::info!("Wake word confirmed: \"{}\" (matched triggers: {:?})", transcript, triggers);
+            println!("  🟢 Wake word detected!");
+
+            std::thread::sleep(std::time::Duration::from_millis(config.post_trigger_ms));
+
+            let post_samples = (config.post_trigger_ms * sample_rate as u64 / 1000) as usize;
+            let command_audio: Vec<f32> = {
+                let r = ring.lock().unwrap();
+                let start = r.len().saturating_sub(post_samples);
+                r.range(start..).copied().collect()
+            };
+
+            drop(stream); // stop recording
+
+            let cmd_resampled = resample_to_16k(&command_audio, sample_rate);
+            let cmd_wav       = encode_wav_mono_16k(&cmd_resampled);
+
+            return Ok(WakeWordActivation { captured_audio: Some(cmd_wav) });
+        }
+
+        // No trigger found.
+        if hysteresis {
+            tracing::debug!("Hysteresis: re-check clean, returning to normal slide");
+            hysteresis = false;
+            slide_ms   = config.slide_ms;
+        }
+    }
+}
+
+/// POST WAV bytes to whisper.cpp using a blocking HTTP client.
+fn transcribe_blocking(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    wav: Vec<u8>,
+) -> Result<Option<String>> {
+    let part = reqwest::blocking::multipart::Part::bytes(wav)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| anyhow!("MIME: {}", e))?;
+    let form = reqwest::blocking::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "json");
+
+    let resp = client
+        .post(format!("{}/inference", server_url))
+        .multipart(form)
+        .send()
+        .map_err(|e| anyhow!("whisper request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("whisper error {}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp.json().map_err(|e| anyhow!("parse error: {}", e))?;
+    let text = json["text"].as_str().unwrap_or("").trim().to_string();
+    Ok(if text.is_empty() { None } else { Some(text) })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
