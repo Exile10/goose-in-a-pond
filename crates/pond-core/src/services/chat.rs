@@ -6,7 +6,7 @@ use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
 use crate::ports::voice_input::VoiceInput;
 use crate::ports::voice_output::VoiceOutput;
-use crate::ports::wake_word::WakeWordDetector;
+use crate::ports::wake_word::StreamingWakeWordDetector;
 use crate::services::instant_activation::InstantActivation;
 use crate::services::print_output::PrintOutput;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
@@ -44,6 +44,31 @@ fn tool_announcement(tool: &str) -> String {
         "save_memory"                         => "Got it, I'll remember that.".to_string(),
         other => format!("Let me {}.", other.replace('_', " ")),
     }
+}
+
+/// Short phrases spoken while the LLM is thinking (fills the audio silence).
+const THINKING_QUIPS: &[&str] = &[
+    // "On it.",
+    "Let me think.",
+    "Ruffling through possibilities.",
+    "One moment.",
+    "Consulting the pond elders.",
+    "Processing.",
+    "Wading in.",
+    "Let me check.",
+    // "Good question.",
+    "Thinking that through.",
+    "Allow me a moment.",
+    "Right, let me look at that.",
+];
+
+fn pick_quip() -> &'static str {
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % THINKING_QUIPS.len();
+    THINKING_QUIPS[idx]
 }
 
 /// Split completed sentences out of a text buffer.
@@ -149,7 +174,7 @@ fn strip_markdown_for_speech(text: &str) -> String {
         }
     }
 
-    out.trim().to_string()
+    normalize_for_speech(out.trim())
 }
 
 fn is_hr(s: &str) -> bool {
@@ -325,6 +350,214 @@ fn find_marker_close(chars: &[char], start: usize, marker: &[char]) -> Option<us
     None
 }
 
+/// Convert symbols and abbreviations to their spoken equivalents so that
+/// TTS engines (Piper, etc.) pronounce them correctly.
+///
+/// Handles:
+/// - Temperature  `28°C` → "28 degrees Celsius", `28°F` → "28 degrees Fahrenheit",
+///                `28°`  → "28 degrees"
+/// - Percent      `50%`  → "50 percent"
+/// - Currency     `$50`  → "50 dollars", `£50` → "50 pounds", `€50` → "50 euros"
+/// - Time         `3:45pm` → "3 45 PM", `15:30` → "15 30", `9am` → "9 AM"
+/// - Ampersand    `&`    → "and"
+/// - At-sign      `@`    → "at"
+fn normalize_for_speech(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len + len / 4);
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        // ── Time: 3:45pm / 15:30 / 9am ────────────────────────────────────────
+        // Only attempt when the digit is not part of a larger number sequence.
+        if ch.is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
+            if let Some((spoken, advance)) = try_read_time(&chars, i) {
+                out.push_str(&spoken);
+                i += advance;
+                continue;
+            }
+        }
+
+        // ── Degree symbol ──────────────────────────────────────────────────────
+        if ch == '°' {
+            match chars.get(i + 1) {
+                Some('C') | Some('c') => { out.push_str(" degrees Celsius");    i += 2; continue; }
+                Some('F') | Some('f') => { out.push_str(" degrees Fahrenheit"); i += 2; continue; }
+                Some('K') | Some('k') => { out.push_str(" kelvin");             i += 2; continue; }
+                _                     => { out.push_str(" degrees");            i += 1; continue; }
+            }
+        }
+
+        // ── Percent ────────────────────────────────────────────────────────────
+        if ch == '%' {
+            out.push_str(" percent");
+            i += 1;
+            continue;
+        }
+
+        // ── Currency symbols ───────────────────────────────────────────────────
+        if matches!(ch, '$' | '£' | '€') {
+            let (num_str, advance) = read_number(&chars, i + 1);
+            if advance > 0 {
+                let unit = match ch {
+                    '$' => "dollar",
+                    '£' => "pound",
+                    _   => "euro",
+                };
+                let plural = if num_str.trim_end_matches('s') != "1" { "s" } else { "" };
+                out.push_str(&num_str);
+                out.push(' ');
+                out.push_str(unit);
+                out.push_str(plural);
+                i += 1 + advance;
+                continue;
+            }
+        }
+
+        // ── Ampersand ──────────────────────────────────────────────────────────
+        if ch == '&' {
+            // Only expand when surrounded by whitespace or at the boundary —
+            // avoids mangling HTML entities that survived markdown stripping.
+            let prev_space = i == 0 || chars[i - 1].is_whitespace();
+            let next_space = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
+            if prev_space || next_space {
+                out.push_str("and");
+                i += 1;
+                continue;
+            }
+        }
+
+        // ── At-sign ────────────────────────────────────────────────────────────
+        if ch == '@' {
+            let prev_space = i == 0 || chars[i - 1].is_whitespace();
+            let next_space = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
+            if prev_space || next_space {
+                out.push_str("at");
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    out
+}
+
+/// Scan a number (digits, optional single `.` for decimals) starting at `start`.
+/// Returns `(number_string, chars_consumed)`.  Returns `("", 0)` if no digit found.
+fn read_number(chars: &[char], start: usize) -> (String, usize) {
+    let mut j = start;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    // Optional decimal part
+    if chars.get(j) == Some(&'.') && chars.get(j + 1).map_or(false, |c| c.is_ascii_digit()) {
+        j += 1; // consume '.'
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+    }
+    if j == start {
+        return (String::new(), 0);
+    }
+    let s: String = chars[start..j].iter().collect();
+    (s, j - start)
+}
+
+/// Try to parse a time expression at position `start` in `chars`.
+///
+/// Recognises:
+/// - `H:MM am/pm`  e.g. `3:45pm`  → "3 45 PM"
+/// - `HH:MM`       e.g. `15:30`   → "15 30"
+/// - `H am/pm`     e.g. `9am`     → "9 AM"
+///
+/// Returns `Some((spoken, chars_consumed))` on success, `None` otherwise.
+fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let len = chars.len();
+    let mut j = start;
+
+    // ── Hours: 1-2 digits, value 0-23 ────────────────────────────────────────
+    let h_start = j;
+    while j < len && chars[j].is_ascii_digit() && j - h_start < 2 {
+        j += 1;
+    }
+    if j == h_start { return None; }
+    let hour: u32 = chars[h_start..j].iter().collect::<String>().parse().ok()?;
+    if hour > 23 { return None; }
+    let hour_str: String = chars[h_start..j].iter().collect();
+
+    // ── Optional :MM ─────────────────────────────────────────────────────────
+    let mut minute_str: Option<String> = None;
+    if chars.get(j) == Some(&':') {
+        let d1 = chars.get(j + 1)?;
+        let d2 = chars.get(j + 2)?;
+        if d1.is_ascii_digit() && d2.is_ascii_digit() {
+            let min: u32 = format!("{}{}", d1, d2).parse().ok()?;
+            if min > 59 { return None; }
+            minute_str = Some(format!("{}{}", d1, d2));
+            j += 3; // consume :MM
+        } else {
+            return None;
+        }
+    }
+
+    // ── Optional whitespace before am/pm ─────────────────────────────────────
+    let ws_j = j;
+    while j < len && chars[j] == ' ' {
+        j += 1;
+    }
+
+    // ── Optional am/pm ───────────────────────────────────────────────────────
+    let ampm = if j + 1 < len {
+        let a = chars[j].to_ascii_lowercase();
+        let b = chars[j + 1].to_ascii_lowercase();
+        if (a == 'a' || a == 'p') && b == 'm' {
+            // Must NOT be followed by another letter (avoids "amplitude" → "AM plitude")
+            if chars.get(j + 2).map_or(true, |c| !c.is_alphabetic()) {
+                j += 2;
+                Some(if a == 'a' { "AM" } else { "PM" })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Require at least one of: `:MM` or `am/pm`.
+    // A bare `3` with nothing after is not a time.
+    if minute_str.is_none() && ampm.is_none() {
+        return None;
+    }
+
+    // If we consumed whitespace but found no am/pm, roll it back.
+    if ampm.is_none() {
+        j = ws_j;
+    }
+
+    // ── Build spoken form ─────────────────────────────────────────────────────
+    let mut spoken = hour_str;
+    if let Some(ref m) = minute_str {
+        // Skip "00" minutes when am/pm is present: "3:00 PM" → "3 PM"
+        if m != "00" || ampm.is_none() {
+            spoken.push(' ');
+            spoken.push_str(m);
+        }
+    }
+    if let Some(ap) = ampm {
+        spoken.push(' ');
+        spoken.push_str(ap);
+    }
+
+    Some((spoken, j - start))
+}
+
 /// Strip `<think>…</think>` reasoning blocks from a streaming text chunk.
 ///
 /// Models like Qwen3/QwQ/DeepSeek-R1 emit reasoning inside `<think>` tags before
@@ -381,7 +614,11 @@ pub struct ChatService {
     provider: Option<Arc<dyn LlmProvider>>,
     voice_input: Arc<dyn VoiceInput>,
     voice_output: Arc<dyn VoiceOutput>,
-    wake_word_detector: Arc<dyn WakeWordDetector>,
+    /// Wake-word detector.  Defaults to `InstantActivation` (keyboard / stdin mode).
+    /// All detectors implement `StreamingWakeWordDetector`; `run_loop` always calls
+    /// `wait_for_activation_with_audio()` so captured command audio is available for
+    /// the one-breath flow when the detector supports it.
+    wake_word_detector: Arc<dyn StreamingWakeWordDetector>,
     session_id: String,
     session_storage: Arc<dyn SessionStorage>,
     /// System prompt sent to the LLM on every completion call.
@@ -430,8 +667,12 @@ impl ChatService {
         self
     }
 
-    /// Override the wake-word detector.  Defaults to `InstantActivation` (no wait).
-    pub fn with_wake_word_detector(mut self, detector: Arc<dyn WakeWordDetector>) -> Self {
+    /// Set the wake-word detector.  Defaults to `InstantActivation` (no wait).
+    ///
+    /// All detectors implement `StreamingWakeWordDetector`.  `run_loop` always calls
+    /// `wait_for_activation_with_audio()`, so detectors that capture command audio
+    /// (e.g. `WhisperKeywordDetector`) enable the one-breath flow automatically.
+    pub fn with_wake_word_detector(mut self, detector: Arc<dyn StreamingWakeWordDetector>) -> Self {
         self.wake_word_detector = detector;
         self
     }
@@ -596,6 +837,24 @@ impl ChatService {
             model_role: resolve_voice_role(&message),
         };
 
+        // Speak a quip immediately while the LLM warms up.  The handle is
+        // drained (once) before the first real speak() call so the quip never
+        // overlaps with the response audio.
+        let quip_voice = self.voice_output.clone();
+        let quip_text  = pick_quip();
+        let mut quip_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
+            let _ = quip_voice.speak(quip_text).await;
+        }));
+
+        // Helper: await the quip task exactly once (no-op on subsequent calls).
+        macro_rules! drain_quip {
+            () => {
+                if let Some(h) = quip_handle.take() {
+                    let _ = h.await;
+                }
+            };
+        }
+
         let mut stream = self.agent.chat_stream(request).await?;
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
@@ -609,11 +868,13 @@ impl ChatService {
                     if !sentence_buf.trim().is_empty() {
                         let chunk = sentence_buf.trim().to_string();
                         sentence_buf.clear();
+                        drain_quip!();
                         if let Err(e) = self.voice_output.speak(&chunk).await {
                             tracing::warn!("TTS failed: {}", e);
                         }
                     }
                     let announcement = tool_announcement(&tool);
+                    drain_quip!();
                     if let Err(e) = self.voice_output.speak(&announcement).await {
                         tracing::warn!("Tool announcement TTS failed: {}", e);
                     }
@@ -641,6 +902,7 @@ impl ChatService {
                         if spoken.is_empty() {
                             continue;
                         }
+                        drain_quip!();
                         if let Err(e) = self.voice_output.speak(&spoken).await {
                             tracing::warn!("TTS failed: {}", e);
                         }
@@ -652,6 +914,7 @@ impl ChatService {
                     if !remainder.is_empty() {
                         let spoken = strip_markdown_for_speech(&remainder);
                         if !spoken.is_empty() {
+                            drain_quip!();
                             if let Err(e) = self.voice_output.speak(&spoken).await {
                                 tracing::warn!("TTS flush failed: {}", e);
                             }
@@ -674,11 +937,16 @@ impl ChatService {
         if !remainder.is_empty() {
             let spoken = strip_markdown_for_speech(&remainder);
             if !spoken.is_empty() {
+                drain_quip!();
                 if let Err(e) = self.voice_output.speak(&spoken).await {
                     tracing::warn!("TTS final flush failed: {}", e);
                 }
             }
         }
+
+        // If the model produced no speakable text at all, ensure the quip task
+        // is still joined (avoids a detached task leaking into the next turn).
+        drain_quip!();
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(full_text.clone());
@@ -705,17 +973,25 @@ impl ChatService {
         loop {
             // ── Wait ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
-            println!(
-                "\n  🟢 {} (type \"exit\" to quit)",
-                self.wake_word_detector.activation_prompt()
-            );
+            println!("\n  🟢 {} (type \"exit\" to quit)", self.wake_word_detector.activation_prompt());
             io::stdout().flush()?;
-            self.wake_word_detector.wait_for_activation().await?;
+
+            // All detectors implement StreamingWakeWordDetector.  Detectors that
+            // capture audio after the wake word (e.g. WhisperKeywordDetector) return
+            // Some(wav) here, enabling the one-breath flow.  InstantActivation returns
+            // None and the Listen state records a fresh clip as normal.
+            let activation = self.wake_word_detector.wait_for_activation_with_audio().await?;
 
             // ── Listen ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
             print!("  {}", self.voice_input.prompt());
             io::stdout().flush()?;
+
+            // Prime the voice input with the already-captured command audio when
+            // the detector handed it off (one-breath flow).
+            if let Some(wav) = activation.captured_audio {
+                self.voice_input.prime_with_captured(wav);
+            }
 
             let input = match self.voice_input.listen().await? {
                 None => {
@@ -996,6 +1272,104 @@ mod tests {
         );
         assert_eq!(text, "firstsecond");
         assert!(!in_block);
+    }
+
+    // ── normalize_for_speech tests ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_temperature_celsius() {
+        assert_eq!(normalize_for_speech("It is 28°C today"), "It is 28 degrees Celsius today");
+    }
+
+    #[test]
+    fn normalize_temperature_fahrenheit() {
+        assert_eq!(normalize_for_speech("It is 82°F"), "It is 82 degrees Fahrenheit");
+    }
+
+    #[test]
+    fn normalize_temperature_bare_degree() {
+        assert_eq!(normalize_for_speech("Angle of 45°"), "Angle of 45 degrees");
+    }
+
+    #[test]
+    fn normalize_percent() {
+        assert_eq!(normalize_for_speech("Humidity is 72%"), "Humidity is 72 percent");
+    }
+
+    #[test]
+    fn normalize_dollars() {
+        assert_eq!(normalize_for_speech("That costs $50"), "That costs 50 dollars");
+    }
+
+    #[test]
+    fn normalize_dollars_singular() {
+        assert_eq!(normalize_for_speech("Just $1"), "Just 1 dollar");
+    }
+
+    #[test]
+    fn normalize_dollars_decimal() {
+        assert_eq!(normalize_for_speech("Price: $9.99"), "Price: 9.99 dollars");
+    }
+
+    #[test]
+    fn normalize_pounds() {
+        assert_eq!(normalize_for_speech("Costs £30"), "Costs 30 pounds");
+    }
+
+    #[test]
+    fn normalize_euros() {
+        assert_eq!(normalize_for_speech("Costs €20"), "Costs 20 euros");
+    }
+
+    #[test]
+    fn normalize_ampersand_standalone() {
+        assert_eq!(normalize_for_speech("fish & chips"), "fish and chips");
+    }
+
+    #[test]
+    fn normalize_at_standalone() {
+        assert_eq!(normalize_for_speech("meet @ 3pm"), "meet at 3 PM");
+    }
+
+    #[test]
+    fn normalize_time_hhmm_ampm() {
+        assert_eq!(normalize_for_speech("at 3:45pm"), "at 3 45 PM");
+    }
+
+    #[test]
+    fn normalize_time_hhmm_ampm_uppercase() {
+        assert_eq!(normalize_for_speech("at 3:45PM"), "at 3 45 PM");
+    }
+
+    #[test]
+    fn normalize_time_24h() {
+        assert_eq!(normalize_for_speech("at 15:30"), "at 15 30");
+    }
+
+    #[test]
+    fn normalize_time_bare_ampm() {
+        assert_eq!(normalize_for_speech("at 9am"), "at 9 AM");
+    }
+
+    #[test]
+    fn normalize_time_zero_minutes_dropped() {
+        // 3:00 PM → "3 PM" (the :00 is silent when am/pm present)
+        assert_eq!(normalize_for_speech("at 3:00pm"), "at 3 PM");
+    }
+
+    #[test]
+    fn normalize_time_not_a_time_bare_number() {
+        // A lone digit with nothing after it must NOT be consumed as a time
+        assert_eq!(normalize_for_speech("I have 3 cats"), "I have 3 cats");
+    }
+
+    #[test]
+    fn normalize_combined_with_markdown_strip() {
+        // strip_markdown_for_speech runs normalize_for_speech at the end
+        assert_eq!(
+            strip_markdown_for_speech("Temperature: **28°C** and humidity **72%**"),
+            "Temperature: 28 degrees Celsius and humidity 72 percent"
+        );
     }
 
     #[tokio::test]
