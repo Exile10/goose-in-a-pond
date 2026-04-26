@@ -700,36 +700,77 @@
 .db-chat-agent-status.online  { color: #15803d; }
 .db-chat-agent-status.offline { color: var(--text-faint); }
 
-/* Mute button base: pin a chip background + dark icon in BOTH modes so the
-   `currentColor` SVG stroke stays legible.  The previous rule used white
-   text against the 25%-alpha glass surface, which on a light page rendered
-   the icon almost invisibly. */
-.db-chat-mute-btn {
-  background: var(--chip-bg);
-  color: var(--text-primary);
-  border-color: rgba(120, 120, 140, 0.30);
+/* Mute button base.
+ *
+ * Two prior fixes failed: setting a translucent chip background relied on
+ * what was layered behind it, which in some light-mode contexts left the
+ * icon "completely black" against a near-black composited surface. We now
+ * pin both surface AND foreground per theme with high specificity so no
+ * inherited `color` or upstream `button { background: #1a1a1a }` rule wins.
+ * The selector `.db-chat-controls .db-chat-mute-btn` outweighs both the
+ * default-button rule and any single-class override anywhere in the file. */
+.db-chat-controls .db-chat-mute-btn {
+  background: #f5f3ff;
+  color: #1f2937;
+  border-color: #d8d4ec;
 }
-.db-chat-mute-btn:hover:not(:disabled) {
-  background: var(--chip-hover-bg);
-  border-color: rgba(120, 120, 140, 0.55);
+.db-chat-controls .db-chat-mute-btn:hover:not(:disabled) {
+  background: #ece8fa;
+  border-color: #b8b1d9;
+}
+.db-chat-controls .db-chat-mute-btn.is-muted {
+  background: #fff7ed;
+  color: #b45309;
+  border-color: #fdba74;
+}
+.db-chat-controls .db-chat-mute-btn.is-muted:hover:not(:disabled) {
+  background: #ffedd5;
+  border-color: #fb923c;
+}
+.db-chat-controls .db-chat-mute-btn.speaking {
+  background: #f3eaff;
+  color: #6d28d9;
+  border-color: #c4b5fd;
 }
 
-/* When muted, switch to a warm-amber affordance so the active state is
-   obvious without depending on icon shape alone. */
-.db-chat-mute-btn.is-muted {
-  background: rgba(245, 158, 11, 0.16);
-  color: #b45309;
+/* Dark theme — flip surface to a low-opacity panel that reads as a chip
+ * over the dark glass background, with light text so currentColor stays
+ * legible. Both the explicit override and the system-dark fallback. */
+:root[data-theme="dark"] .db-chat-controls .db-chat-mute-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f3f4f6;
+  border-color: rgba(255, 255, 255, 0.18);
+}
+:root[data-theme="dark"] .db-chat-controls .db-chat-mute-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.30);
+}
+:root[data-theme="dark"] .db-chat-controls .db-chat-mute-btn.is-muted {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
   border-color: rgba(245, 158, 11, 0.45);
 }
-.db-chat-mute-btn.is-muted:hover:not(:disabled) {
-  background: rgba(245, 158, 11, 0.26);
+:root[data-theme="dark"] .db-chat-controls .db-chat-mute-btn.speaking {
+  background: rgba(169, 111, 245, 0.22);
+  color: #c4b5fd;
+  border-color: rgba(169, 111, 245, 0.5);
 }
-
-/* Mute button — speaking state: purple accent, sound bars replace icon */
-.db-chat-mute-btn.speaking {
-  color: #a96ff5;
-  background: rgba(169, 111, 245, 0.12);
-  border-color: rgba(169, 111, 245, 0.35);
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .db-chat-controls .db-chat-mute-btn {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f3f4f6;
+    border-color: rgba(255, 255, 255, 0.18);
+  }
+  :root:not([data-theme="light"]) .db-chat-controls .db-chat-mute-btn.is-muted {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fbbf24;
+    border-color: rgba(245, 158, 11, 0.45);
+  }
+  :root:not([data-theme="light"]) .db-chat-controls .db-chat-mute-btn.speaking {
+    background: rgba(169, 111, 245, 0.22);
+    color: #c4b5fd;
+    border-color: rgba(169, 111, 245, 0.5);
+  }
 }
 
 .db-chat-agent-dot {
@@ -803,28 +844,9 @@
   border-color: #b386ff;
 }
 
-/* Mute toggle (chat composer toolbar). The base class has no colour, so the
-   icon was inheriting the page text colour against a transparent background —
-   in light mode that ended up nearly invisible.  Pin it to chip styling so
-   it sits next to Stop/Clear with the same surface, and switch to a warm
-   amber tint when muted to make the active state obvious. */
-.db-chat-control-btn.mute {
-  background: var(--chip-bg);
-  color: var(--text-primary);
-  border-color: rgba(120, 120, 140, 0.30);
-}
-.db-chat-control-btn.mute:hover:not(:disabled) {
-  background: var(--chip-hover-bg);
-  border-color: rgba(120, 120, 140, 0.55);
-}
-.db-chat-control-btn.mute.is-muted {
-  background: rgba(245, 158, 11, 0.16);
-  color: #b45309;
-  border-color: rgba(245, 158, 11, 0.45);
-}
-.db-chat-control-btn.mute.is-muted:hover:not(:disabled) {
-  background: rgba(245, 158, 11, 0.26);
-}
+/* (Older `.db-chat-control-btn.mute` rules removed — the component renders
+ * `.db-chat-mute-btn`, never `.mute`, so those rules were dead code that
+ * masked which selector was actually winning.) */
 
 /* ── Suggestion chips ─────────────────────────────────────────────────────── */
 

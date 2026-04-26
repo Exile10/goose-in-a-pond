@@ -38,6 +38,7 @@
 
 pub mod middleware;
 pub mod routes;
+pub mod thought_filter;
 
 /// Controls the lifecycle of the local llamafile server process.
 ///

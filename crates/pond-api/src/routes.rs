@@ -151,6 +151,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/faces/debug/pairwise", get(face_pairwise_debug))
         .route("/faces/debug/eval", get(face_eval_debug))
+        .route("/faces/models", get(list_face_models_handler))
         .route("/users/{profile_id}/biometrics", delete(delete_user_biometrics))
         // Wake-on-face: bind an identified profile to an active chat session
         .route("/sessions/{session_id}/identify-user", post(identify_session_user_handler))
@@ -710,6 +711,12 @@ async fn chat_stream(
         };
 
         let mut full_text = String::new();
+        // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
+        // preambles out of the per-token stream. Llamafile + Ollama provide
+        // native streaming, so the per-`complete()` strip in the local-inference
+        // adapter does not run on this path — without this filter the user sees
+        // the model's internal monologue.
+        let mut thought = crate::thought_filter::ThoughtFilter::new();
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -722,29 +729,55 @@ async fn chat_stream(
         while let Some(event_result) = agent_stream.next().await {
             match event_result {
                 Ok(event) => {
-                    let data = match event {
+                    let maybe_data = match event {
                         AgentStreamEvent::Status { content } => {
-                            json!({"type": "status", "content": content}).to_string()
+                            Some(json!({"type": "status", "content": content}).to_string())
                         }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
-                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                            Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                         }
                         AgentStreamEvent::ToolResult { tool, id, content } => {
-                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                            Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
                         }
                         AgentStreamEvent::Text { content } => {
-                            full_text.push_str(&content);
-                            json!({"type": "text", "content": content, "token": content}).to_string()
+                            let visible = thought.push(&content);
+                            if visible.is_empty() {
+                                None
+                            } else {
+                                full_text.push_str(&visible);
+                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
+                            }
                         }
                         AgentStreamEvent::Done { .. } => {
                             // Handled at the end of the loop
                             continue;
                         }
                         AgentStreamEvent::Error { content } => {
-                            json!({"error": content}).to_string()
+                            Some(json!({"error": content}).to_string())
                         }
                     };
-                    yield Ok(Event::default().data(data));
+                    if let Some(data) = maybe_data {
+                        yield Ok(Event::default().data(data));
+                    }
+                    // After every push the filter may have captured a complete
+                    // tool-call envelope (`<|tool_call> ... <tool_call|>`).
+                    // Surface those as a visible note so the user understands
+                    // why the action they asked for produced nothing — the
+                    // model emitted Harmony text markup instead of using the
+                    // structured tool-call protocol Goose actually invokes.
+                    for body in thought.take_tool_calls() {
+                        let notice = match crate::thought_filter::parse_tool_envelope(&body) {
+                            Some((name, args)) => format!(
+                                "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
+                            ),
+                            None => format!(
+                                "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
+                            ),
+                        };
+                        full_text.push_str(&notice);
+                        let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
+                        yield Ok(Event::default().data(data));
+                    }
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
@@ -753,6 +786,15 @@ async fn chat_stream(
                     return;
                 }
             }
+        }
+
+        // Flush any tail buffered by the thought filter (e.g. text after the
+        // last `<channel|>` that had not yet exceeded the safe-emit threshold).
+        let tail = thought.flush();
+        if !tail.is_empty() {
+            full_text.push_str(&tail);
+            let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
+            yield Ok(Event::default().data(data));
         }
 
         // Persist full assistant response
@@ -3534,30 +3576,55 @@ async fn agent_chat_stream(
             }
         };
 
+        // See chat_stream above for rationale — same Harmony preamble filter.
+        let mut thought = crate::thought_filter::ThoughtFilter::new();
+
         while let Some(event_result) = agent_stream.next().await {
             match event_result {
                 Ok(event) => {
-                    let data = match event {
+                    let maybe_data = match event {
                         AgentStreamEvent::Status { content } => {
-                            json!({"type": "status", "content": content}).to_string()
+                            Some(json!({"type": "status", "content": content}).to_string())
                         }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
-                            json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string()
+                            Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                         }
                         AgentStreamEvent::ToolResult { tool, id, content } => {
-                            json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
+                            Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
                         }
                         AgentStreamEvent::Text { content } => {
-                            json!({"type": "text", "content": content, "token": content}).to_string()
+                            let visible = thought.push(&content);
+                            if visible.is_empty() {
+                                None
+                            } else {
+                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
+                            }
                         }
                         AgentStreamEvent::Done { .. } => {
-                            json!({"done": true, "session_id": session_id.clone()}).to_string()
+                            Some(json!({"done": true, "session_id": session_id.clone()}).to_string())
                         }
                         AgentStreamEvent::Error { content } => {
-                            json!({"error": content}).to_string()
+                            Some(json!({"error": content}).to_string())
                         }
                     };
-                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                    if let Some(data) = maybe_data {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                    }
+                    // See chat_stream for rationale — surface Harmony-format
+                    // tool-call leaks so the user knows the model attempted
+                    // something rather than silently dropping it.
+                    for body in thought.take_tool_calls() {
+                        let notice = match crate::thought_filter::parse_tool_envelope(&body) {
+                            Some((name, args)) => format!(
+                                "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
+                            ),
+                            None => format!(
+                                "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
+                            ),
+                        };
+                        let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                    }
                 }
                 Err(e) => {
                     let data = json!({"error": e.to_string()}).to_string();
@@ -3565,6 +3632,12 @@ async fn agent_chat_stream(
                     return;
                 }
             }
+        }
+
+        let tail = thought.flush();
+        if !tail.is_empty() {
+            let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
+            yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
         }
     };
 
@@ -4390,6 +4463,56 @@ async fn list_face_enrollments(
     })))
 }
 
+/// GET /api/v1/faces/models — report status of the three face models on disk.
+///
+/// Returns availability + size for each of: ArcFace R50 embedder
+/// (`w600k_r50.onnx`), SCRFD 10G detector (`scrfd.onnx`), Silent-Face PAD
+/// (`antispoof.onnx`).  Drives the Face Recognition card on the web/desktop
+/// Models pages.  Returns `feature_enabled: false` when pond-server was
+/// built without the `face-onnx` feature so the UI can render a "rebuild
+/// with --features face-onnx" hint.
+async fn list_face_models_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let feature_enabled = state.face_recognition.is_some();
+    let dir = state
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("models").join("face"));
+
+    fn describe(dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str) -> Value {
+        let path = dir.as_ref().map(|d| d.join(name));
+        let (downloaded, size_mb) = match &path {
+            Some(p) => match std::fs::metadata(p) {
+                Ok(md) => (true, Some(md.len() / 1_048_576)),
+                Err(_) => (false, None),
+            },
+            None => (false, None),
+        };
+        json!({
+            "name": name,
+            "label": label,
+            "role": role,
+            "expected_mb": expected_mb,
+            "size_mb": size_mb,
+            "downloaded": downloaded,
+            "path": path.as_ref().map(|p| p.display().to_string()),
+        })
+    }
+
+    let entries = vec![
+        describe(&dir, "w600k_r50.onnx", "ArcFace R50",        174, "embedding"),
+        describe(&dir, "scrfd.onnx",     "SCRFD 10G",           17, "detector"),
+        describe(&dir, "antispoof.onnx", "Silent-Face PAD",      2, "antispoof"),
+    ];
+
+    Json(json!({
+        "feature_enabled": feature_enabled,
+        "models_dir": dir.as_ref().map(|d| d.display().to_string()),
+        "models": entries,
+    }))
+}
+
 /// GET /api/v1/faces/debug/pairwise — diagnostic: cross-sample cosine matrix.
 ///
 /// Surfaces the full pairwise-cosine list plus a verdict:
@@ -5094,36 +5217,78 @@ fn compute_liveness_report(
         0.0
     };
 
+    // (5) Face-size variation across the burst.  A live face moves slightly
+    // closer to / further from the camera as the user breathes and shifts
+    // their head, producing inter-eye distance variation of ~1.5–6 % across
+    // 5 frames.  A photo held on a phone screen at arm's length stays at a
+    // near-constant size (< 0.8 % variation).  This is the new signal that
+    // catches the case the user reported: their own photo on a phone, with
+    // slight hand jitter passing the existing motion floor but staying
+    // dimensionally rigid.
+    let face_size_spread = if landmarks.len() >= 2 {
+        let dists: Vec<f32> = landmarks.iter().map(|lm| {
+            let dx = lm.right_eye.0 - lm.left_eye.0;
+            let dy = lm.right_eye.1 - lm.left_eye.1;
+            (dx * dx + dy * dy).sqrt()
+        }).collect();
+        let mean = dists.iter().sum::<f32>() / dists.len() as f32;
+        if mean > 1e-3 {
+            let min = dists.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = dists.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            (max - min) / mean
+        } else { 0.0 }
+    } else { 0.0 };
+
     // Gates.
     //
     // Tunable via env so field-tuning doesn't require a rebuild:
-    //   POND_FACE_LIVENESS_DIFF_MOTION_MIN   (default 0.35 px)
-    //   POND_FACE_LIVENESS_MOTION_MIN        (default 0.5 px)
-    //   POND_FACE_LIVENESS_EYE_SPREAD_MIN    (default 0.002)
+    //   POND_FACE_LIVENESS_DIFF_MOTION_MIN   (default 0.60 px — was 0.35,
+    //                                         raised because phone-screen
+    //                                         photos with hand jitter can
+    //                                         leak ~0.3 px non-rigid noise)
+    //   POND_FACE_LIVENESS_MOTION_MIN        (default 0.5  px)
+    //   POND_FACE_LIVENESS_EYE_SPREAD_MIN    (default 0.003 — was 0.002)
+    //   POND_FACE_LIVENESS_SIZE_SPREAD_MIN   (default 0.012 — new: 1.2 % min
+    //                                         inter-eye distance variation)
+    //   POND_FACE_LIVENESS_INTER_COS_MAX     (default 0.9994 — new: phone-
+    //                                         screen replays have ≥ 0.9995
+    //                                         cosine because the same pixels
+    //                                         are re-imaged each frame)
     let diff_floor = std::env::var("POND_FACE_LIVENESS_DIFF_MOTION_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.35);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.60);
     let motion_floor = std::env::var("POND_FACE_LIVENESS_MOTION_MIN")
         .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.5);
     let eye_floor = std::env::var("POND_FACE_LIVENESS_EYE_SPREAD_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.002);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.003);
+    let size_floor = std::env::var("POND_FACE_LIVENESS_SIZE_SPREAD_MIN")
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.012);
+    let cos_ceiling = std::env::var("POND_FACE_LIVENESS_INTER_COS_MAX")
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.9994);
 
     let barely_moving     = landmark_motion < motion_floor && landmarks.len() >= 3;
     let flat_eye_ratio    = eye_ratio_spread < eye_floor;
     let rigid_motion      = differential_motion < diff_floor && landmarks.len() >= 3;
+    let dimensionally_rigid = face_size_spread < size_floor && landmarks.len() >= 3;
+    let frozen_embedding  = mean_inter_cos > cos_ceiling && embeddings.len() >= 3;
 
-    // Hard reject on *either*:
-    //   (a) almost no motion of any kind (still photo), OR
-    //   (b) lots of motion but all rigid with flat eyes (waved photo — this
-    //       is the attack that fooled the earlier build).
-    let hard_reject = (barely_moving && flat_eye_ratio)
-        || (rigid_motion && flat_eye_ratio);
+    // Hard reject on **any two** photo-like signals.  Previously we required
+    // (flat_eye_ratio) to be one of them, which let a phone-screen photo with
+    // slight zoom artefacts pass when its eye ratio happened to vary > 0.002.
+    // The new "any two of five" rule is strictly stricter: a live face
+    // typically fails ONE gate (e.g. brief still moment between blinks); a
+    // photo fails THREE or more (eyes flat, size flat, rigid motion, frozen
+    // embedding all at once).
+    let photo_like = [
+        barely_moving,
+        flat_eye_ratio,
+        rigid_motion,
+        dimensionally_rigid,
+        frozen_embedding,
+    ].iter().filter(|x| **x).count();
+    let hard_reject = photo_like >= 2;
 
-    // Soft suspicious: any single axis looking photo-like tightens downstream
-    // consensus (80 % vote + confidence ≥ threshold + 0.05).
-    let suspicious = !hard_reject
-        && (landmark_motion < 1.0
-            || eye_ratio_spread < 0.005
-            || differential_motion < diff_floor * 1.5);
+    // Soft suspicious tightens consensus on a single failed axis.
+    let suspicious = !hard_reject && photo_like >= 1;
 
     LivenessReport {
         hard_reject,

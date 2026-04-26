@@ -136,11 +136,29 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode }[] = [
 function App() {
     const [page, setPage] = useState<Page>("chat");
 
+    // Cross-component navigation hook used by deep-link buttons elsewhere
+    // in the app (e.g. the "Open Face Enrollment →" link in the Models page).
+    // Detail must be one of the Page string literals.
+    useEffect(() => {
+        const handler = (e: Event) => {
+            const detail = (e as CustomEvent<string>).detail;
+            if (typeof detail === "string") {
+                setPage(detail as Page);
+            }
+        };
+        window.addEventListener("pond-nav", handler as EventListener);
+        return () => window.removeEventListener("pond-nav", handler as EventListener);
+    }, []);
+
     // Resolved theme drives the logo swap — we watch both the explicit
     // `pond_theme` setting and (when set to `system`) the OS preference,
     // so a user toggling dark mode in macOS System Settings immediately
     // gets the matching logo asset.
-    const [resolvedTheme, setResolvedTheme] = useState<"light" | "dark">(() => {
+    // The resolved theme value itself isn't read in JSX (logo swap is now
+    // pure-CSS via `.db-logo-light` / `.db-logo-dark`), but we still need the
+    // setter so the effect below can re-fire on theme changes. Prefix with
+    // `_` to silence the noUnusedLocals tsc check that breaks `npm run build`.
+    const [_resolvedTheme, setResolvedTheme] = useState<"light" | "dark">(() => {
         const saved = localStorage.getItem("pond_theme") ?? "system";
         if (saved === "dark") return "dark";
         if (saved === "light") return "light";

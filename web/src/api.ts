@@ -812,6 +812,25 @@ export const api = {
     return res.json()
   },
 
+  /** Status of the three on-disk face models — used by Models pages to render
+   *  a parity card for ArcFace + SCRFD + Silent-Face PAD. Returns
+   *  `feature_enabled: false` when pond-server was built without
+   *  `--features face-onnx`. */
+  listFaceModels: (token: string) =>
+    getReq<{
+      feature_enabled: boolean
+      models_dir: string | null
+      models: Array<{
+        name: string
+        label: string
+        role: 'embedding' | 'detector' | 'antispoof'
+        expected_mb: number
+        size_mb: number | null
+        downloaded: boolean
+        path: string | null
+      }>
+    }>(`/faces/models`, token),
+
   /** List all face enrollments for a profile (metadata only — embeddings stay server-side). */
   listFaceEnrollments: (profileId: string, token: string) =>
     getReq<{ profile_id: string; enrollments: { id: string; profile_id: string; model_dims: number; created_at: string }[]; count: number }>(

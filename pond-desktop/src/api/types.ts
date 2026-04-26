@@ -150,7 +150,7 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "tool_call" | "done" | "error" | "status";
+export type ChatEventType = "text" | "tool_call" | "tool_result" | "done" | "error" | "status";
 
 export interface ChatEvent {
   type: ChatEventType;
@@ -281,6 +281,27 @@ export interface LogEntry {
   source: string;
   message: string;
   metadata?: string;  // JSON string
+}
+
+// ── Face Recognition models (auto-managed status) ──────────────
+//
+// Mirrors the JSON returned by GET /api/v1/faces/models. The desktop
+// Models section renders this read-only — pond-server downloads the
+// three files automatically on first boot when built with `face-onnx`.
+export interface FaceModelEntry {
+  name: string;        // file basename, e.g. "w600k_r50.onnx"
+  label: string;       // human-readable, e.g. "ArcFace R50"
+  role: "embedding" | "detector" | "antispoof";
+  expected_mb: number;
+  size_mb: number | null;   // null when missing on disk
+  downloaded: boolean;
+  path: string | null;
+}
+
+export interface FaceModelsResponse {
+  feature_enabled: boolean;  // false when pond-server lacks --features face-onnx
+  models_dir: string | null;
+  models: FaceModelEntry[];
 }
 
 // ── API Error ─────────────────────────────────────────────────

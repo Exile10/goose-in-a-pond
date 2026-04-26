@@ -214,7 +214,12 @@ impl Settings {
     fn default_assistant_personality()      -> String { "friendly and concise".to_string() }
     fn default_user_name()                  -> String { "Friend".to_string() }
     fn default_timezone()                   -> String { "UTC".to_string() }
-    fn default_max_tokens()                 -> u32    { 1024 }
+    // 4096 covers most practical assistant replies.  The previous 1024 cap
+    // truncated long answers mid-sentence — especially for Harmony-channel
+    // models (Gemma 4 / gpt-oss) whose internal `<|channel>thought ...
+    // <channel|>` reasoning preamble already eats hundreds of tokens before
+    // the visible reply even starts, so 1024 left only ~500 for the answer.
+    fn default_max_tokens()                 -> u32    { 4096 }
     fn default_temperature()                -> f32    { 0.7 }
     fn default_llm_provider()               -> String { "".to_string() }
     fn default_wake_word()                  -> String { "goose".to_string() }
@@ -245,7 +250,7 @@ mod tests {
     fn default_settings_have_expected_values() {
         let s = Settings::default();
         assert_eq!(s.assistant_name, "Goose");
-        assert_eq!(s.llm_max_tokens, 1024);
+        assert_eq!(s.llm_max_tokens, 4096);
         assert_eq!(s.llm_temperature, 0.7);
         assert_eq!(s.voice_wake_word, "goose");
         assert_eq!(s.retention_event_log_days, 30);
@@ -296,7 +301,7 @@ mod tests {
         let json = r#"{"assistant_name": "Pond"}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.assistant_name, "Pond");
-        assert_eq!(s.llm_max_tokens, 1024); // default
+        assert_eq!(s.llm_max_tokens, 4096); // bumped from 1024 to fit Harmony preambles + long replies
         assert_eq!(s.timezone, "UTC");       // default
     }
 }

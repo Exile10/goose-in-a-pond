@@ -165,6 +165,73 @@ const MAX_MEAN_BRIGHTNESS: f32 = 0.95;
 /// obvious blur, low enough to admit imperfect focus from cheap webcams.
 const MIN_LAPLACIAN_VAR_X1000: f32 = 4.0;
 
+/// Mean-luminance threshold below which the low-light auto-exposure pass
+/// fires.  0.30 catches noticeably dim indoor lighting (no overhead light,
+/// only ambient evening light) without touching a normally-lit headshot
+/// (which sits comfortably in 0.40–0.65).
+const LOW_LIGHT_TRIGGER: f32 = 0.30;
+
+fn auto_exposure_enabled() -> bool {
+    !std::env::var("POND_FACE_AUTO_EXPOSURE")
+        .map(|v| v.to_ascii_lowercase() == "off")
+        .unwrap_or(false)
+}
+
+/// Mean luminance of an RGB image, in [0, 1].  Rec.709 weights.
+fn mean_luminance(img: &RgbImage) -> f32 {
+    let n = (img.width() as u64) * (img.height() as u64);
+    if n == 0 { return 0.0; }
+    let mut acc: f64 = 0.0;
+    for p in img.pixels() {
+        let y = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+        acc += y as f64;
+    }
+    ((acc / n as f64) / 255.0) as f32
+}
+
+/// Per-channel 2-98 percentile histogram stretch.  Cheap (~0.2 ms on
+/// 112×112) and dependency-free.  Mutates the image in place: each pixel
+/// channel is linearly mapped from `[p2, p98]` → `[0, 255]`, with values
+/// outside the range clamped.  Channels are processed independently so a
+/// global colour cast doesn't survive — which is what we want for face
+/// recognition where chroma carries no useful identity signal.
+fn stretch_histogram_2_98(img: &mut RgbImage) {
+    let n = (img.width() * img.height()) as usize;
+    if n == 0 { return; }
+    let mut hists: [[u32; 256]; 3] = [[0; 256], [0; 256], [0; 256]];
+    for p in img.pixels() {
+        for c in 0..3 {
+            hists[c][p[c] as usize] += 1;
+        }
+    }
+    let lo_count = (n as f32 * 0.02) as u32;
+    let hi_count = (n as f32 * 0.98) as u32;
+    let mut lo = [0u8; 3];
+    let mut hi = [255u8; 3];
+    for c in 0..3 {
+        let mut acc: u32 = 0;
+        for v in 0..256 {
+            acc += hists[c][v];
+            if acc >= lo_count { lo[c] = v as u8; break; }
+        }
+        let mut acc: u32 = 0;
+        for v in 0..256 {
+            acc += hists[c][v];
+            if acc >= hi_count { hi[c] = v as u8; break; }
+        }
+        // Avoid div-by-zero on degenerate channels (uniform colour).
+        if hi[c] <= lo[c] { hi[c] = lo[c].saturating_add(1); }
+    }
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            let v = p[c] as f32;
+            let span = (hi[c] as f32 - lo[c] as f32).max(1.0);
+            let mapped = ((v - lo[c] as f32) / span) * 255.0;
+            p[c] = mapped.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 pub struct OnnxFaceEmbeddingExtractor {
     // `Session::run` takes `&mut self`; we guard with a std::sync::Mutex
     // because the entire inference call already runs inside `spawn_blocking`.
@@ -249,7 +316,7 @@ fn preprocess(
     // Landmarks path: similarity-warp the whole image into the canonical
     // 112×112 template.  This is the ArcFace-trained alignment and is
     // dramatically more identity-preserving than a naive crop.
-    let resized = if let Some(lms) = landmarks {
+    let mut resized = if let Some(lms) = landmarks {
         let warped = align_to_canonical_112(&img, &lms, size);
         warped.to_rgb8()
     } else {
@@ -261,6 +328,28 @@ fn preprocess(
             .resize_exact(size, size, FilterType::Triangle)
             .to_rgb8()
     };
+
+    // Low-light auto-correct.  Cheap per-channel histogram stretch (map the
+    // 2nd-98th percentile range to [0,255]) applied only when the mean
+    // luminance of the aligned crop falls below `LOW_LIGHT_TRIGGER`.  This
+    // recovers a usable dynamic range from underexposed webcam frames so:
+    //   * the brightness gate further down does not false-reject the user;
+    //   * the Laplacian-variance blur gate sees real edges instead of
+    //     uniform noise floor;
+    //   * the embedder receives an input distribution closer to its
+    //     training data, which improves match confidence under poor light.
+    // Disable with `POND_FACE_AUTO_EXPOSURE=off` if it ever harms a setup.
+    if auto_exposure_enabled() {
+        let mean_pre = mean_luminance(&resized);
+        if mean_pre < LOW_LIGHT_TRIGGER {
+            let before = mean_pre;
+            stretch_histogram_2_98(&mut resized);
+            info!(
+                before, after = mean_luminance(&resized),
+                "preprocess: applied low-light auto-exposure to dim crop",
+            );
+        }
+    }
 
     let h = size as usize;
     let w = size as usize;
@@ -475,12 +564,17 @@ fn antispoof_threshold(is_onnx: bool) -> f32 {
         return v;
     }
     // Defaults differ by path:
-    //   * Silent-Face ONNX returns a calibrated [0, 1] probability, so the
-    //     natural spoof regime starts at ≥ 0.50.
+    //   * Silent-Face ONNX returns a calibrated [0, 1] probability.  We
+    //     pulled the ONNX threshold down from 0.50 → 0.40: phone-screen
+    //     replays of the user's own photo were producing spoof scores in
+    //     the 0.42–0.48 range and slipping past the 0.50 floor.  0.40 is
+    //     still well above the live regime (0.05–0.20) so false-reject
+    //     rate stays acceptable, while catching the screen-photo attack
+    //     the user reported.
     //   * The heuristic score uses ad-hoc saturation / highlight / skew
     //     features, and the empirical split to avoid false-rejecting real
     //     users under LED ring lights sits closer to 0.65.
-    if is_onnx { 0.50 } else { 0.65 }
+    if is_onnx { 0.40 } else { 0.65 }
 }
 
 /// Compute the variance of a 3×3 Laplacian kernel applied to the BT.601
@@ -596,6 +690,40 @@ mod tests {
         assert_eq!(EmbeddingModel::ArcFace512.dims(), 512);
         assert_eq!(EmbeddingModel::MobileFaceNet128.dims(), 128);
         assert_eq!(EmbeddingModel::ArcFace512.input_size(), 112);
+    }
+
+    #[test]
+    fn histogram_stretch_brightens_dim_image() {
+        // 32×32 image with all values in [10, 30] — heavily underexposed.
+        let mut img = RgbImage::from_fn(32, 32, |x, y| {
+            let v = ((x + y) % 21 + 10) as u8;   // 10..=30
+            image::Rgb([v, v, v])
+        });
+        let mean_before = mean_luminance(&img);
+        stretch_histogram_2_98(&mut img);
+        let mean_after = mean_luminance(&img);
+        assert!(
+            mean_after > mean_before * 2.0,
+            "expected histogram stretch to roughly double mean luminance; got {mean_before} -> {mean_after}",
+        );
+        // Stretched output should reach toward saturation on the brightest
+        // pixels (close to 255 / ~1.0 luminance).
+        assert!(mean_after > 0.4, "stretched mean too dark: {mean_after}");
+    }
+
+    #[test]
+    fn histogram_stretch_idempotent_on_full_range_image() {
+        // Image already spans 0..=255 — stretch should leave the bulk of
+        // pixels roughly where they were.
+        let mut img = RgbImage::from_fn(32, 32, |x, _| {
+            let v = ((x * 8) % 256) as u8;
+            image::Rgb([v, v, v])
+        });
+        let mean_before = mean_luminance(&img);
+        stretch_histogram_2_98(&mut img);
+        let mean_after = mean_luminance(&img);
+        let drift = (mean_after - mean_before).abs();
+        assert!(drift < 0.1, "well-exposed image should not drift much: {mean_before} -> {mean_after}");
     }
 
     #[test]

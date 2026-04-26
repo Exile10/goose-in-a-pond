@@ -7,7 +7,7 @@ import {
   Home, MessageSquare, Monitor, Clock, BrainCircuit, Zap,
   Cpu, FileText, Settings, User,
   ChevronRight, ChevronLeft,
-  Mic, Layers,
+  Mic, Layers, ScanFace,
 } from "lucide-react";
 
 // ── Icon map ─────────────────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   model: Cpu,
   prompt: FileText,
   settings: Settings,
+  face: ScanFace,
   agent: User,
 };
 

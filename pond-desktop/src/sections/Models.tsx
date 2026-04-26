@@ -3,21 +3,23 @@ import { Button } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
+  ScanFace,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, HfModel, HfModelFile, DownloadEntry,
-  OllamaModel, LlamafileRelease,
+  OllamaModel, LlamafileRelease, FaceModelsResponse,
 } from "../api/types";
 import { ApiError } from "../api/types";
 
 // ── Design constants ──────────────────────────────────────────
 
 const CAT_COLOR = {
-  llm: "var(--color-accent)",
-  asr: "#e5a000",
-  tts: "#e04343",
+  llm:  "var(--color-accent)",
+  asr:  "#e5a000",
+  tts:  "#e04343",
+  face: "#3b82f6",
 } as const;
 
 const ROLE_COLOR: Record<string, string> = {
@@ -860,13 +862,111 @@ const llmSt: Record<string, React.CSSProperties> = {
 
 // ── Category Tabs ─────────────────────────────────────────────
 
-type Category = "llm" | "asr" | "tts";
+type Category = "llm" | "asr" | "tts" | "face";
 
 const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; color: string }> = [
-  { key: "llm", label: "LLM", icon: <Brain size={14} />, color: CAT_COLOR.llm },
-  { key: "asr", label: "ASR", icon: <Mic size={14} />, color: CAT_COLOR.asr },
-  { key: "tts", label: "TTS", icon: <Volume2 size={14} />, color: CAT_COLOR.tts },
+  { key: "llm",  label: "LLM",  icon: <Brain size={14} />,     color: CAT_COLOR.llm  },
+  { key: "asr",  label: "ASR",  icon: <Mic size={14} />,       color: CAT_COLOR.asr  },
+  { key: "tts",  label: "TTS",  icon: <Volume2 size={14} />,   color: CAT_COLOR.tts  },
+  { key: "face", label: "Face", icon: <ScanFace size={14} />,  color: CAT_COLOR.face },
 ];
+
+// ── Face Recognition Panel ───────────────────────────────────
+//
+// Read-only status for the three face models (ArcFace R50 + SCRFD 10G +
+// Silent-Face PAD). pond-server downloads them automatically on first
+// boot when built with `--features face-onnx`, so there is no per-model
+// "Download" button — operators just watch progress here. When the
+// feature is disabled the card surfaces the rebuild instruction.
+function FacePanel() {
+  const [data, setData]       = useState<FaceModelsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    setLoading(true); setError(null);
+    try { setData(await api.listFaceModels()); }
+    catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const installed = data?.models.filter(m => m.downloaded).length ?? 0;
+  const total     = data?.models.length ?? 0;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+      <div style={rootSt.sectionHeader}>
+        <ScanFace size={14} style={{ color: CAT_COLOR.face }} />
+        <span style={{ ...rootSt.sectionTitle, color: CAT_COLOR.face }}>Face Recognition</span>
+        {data && (
+          <span style={mlSt.badge}>
+            {data.feature_enabled ? `${installed}/${total} ready` : "feature disabled"}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        <Button variant="ghost" size="sm" onPress={reload} isDisabled={loading}>
+          <RefreshCw size={12} /> Refresh
+        </Button>
+      </div>
+
+      {loading && <p style={hint}>Loading…</p>}
+      {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
+
+      {data && !data.feature_enabled && (
+        <p style={hint}>
+          Face recognition is disabled in this build. Rebuild pond-server with
+          {" "}<code style={inlineCode}>--features face-onnx</code>{" "}
+          to enable per-user identification.
+        </p>
+      )}
+
+      {data && data.models.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
+          {data.models.map(m => (
+            <div
+              key={m.name}
+              style={{
+                ...mlSt.row,
+                borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent",
+              }}
+            >
+              <div style={mlSt.left}>
+                <div style={mlSt.nameRow}>
+                  <span style={mlSt.name}>{m.label}</span>
+                  <span style={mlSt.badge}>{m.role}</span>
+                  {m.downloaded ? (
+                    <span style={{ ...mlSt.badge, color: "var(--color-success)" }}>
+                      {m.size_mb != null ? `${m.size_mb} MB` : "ready"}
+                    </span>
+                  ) : (
+                    <span style={{ ...mlSt.badge, color: "#e5a000" }}>
+                      missing · ~{m.expected_mb} MB
+                    </span>
+                  )}
+                </div>
+                <span style={mlSt.sub}>{m.name}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {data?.models_dir && (
+        <p style={{ ...hint, fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", opacity: 0.6 }}>
+          {data.models_dir}
+        </p>
+      )}
+
+      <p style={hint}>
+        Models auto-download on first server boot. The buffalo_l zip ships ArcFace R50 +
+        SCRFD 10G in a single ~281 MB archive; Silent-Face PAD is ~2 MB. Once installed,
+        use the <strong>Face Enrollment</strong> page (web UI) to register household members.
+      </p>
+    </div>
+  );
+}
 
 // ── Memory Status Bar ─────────────────────────────────────────
 
@@ -1074,6 +1174,8 @@ export function Models() {
           <p style={hint}>Whisper models power voice-to-text transcription. Place <code style={inlineCode}>.bin</code> files in <code style={inlineCode}>models/whisper/</code> and click Scan in the LLM tab.</p>
         </div>
       )}
+
+      {category === "face" && <FacePanel />}
 
       {category === "tts" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
