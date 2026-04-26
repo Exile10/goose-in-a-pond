@@ -403,6 +403,7 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
                 if (v) { patch("think_provider", null); patch("think_model", null); }
               }}
             >
+              <Switch.Control><Switch.Thumb /></Switch.Control>
               Same as Conversation
             </Switch>
             {!thinkSameAsChat && (
@@ -424,6 +425,7 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
                 if (v) { patch("task_provider", null); patch("task_model", null); }
               }}
             >
+              <Switch.Control><Switch.Thumb /></Switch.Control>
               Same as Conversation
             </Switch>
             {!taskSameAsChat && (
@@ -548,7 +550,9 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
               setCustomEnabled(v);
               if (!v) patch("custom_system_prompt", null);
             }}
-          />
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
         </FormRow>
         <FormRow label="System prompt" hint="Replaces the built-in system prompt entirely">
           <div style={{ position: "relative" }}>
@@ -579,6 +583,7 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             isSelected={enabled}
             onChange={(v) => patch("weather_enabled", v)}
           >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
             Enable weather
           </Switch>
         </FormRow>
@@ -681,6 +686,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             isSelected={memInject}
             onChange={(v) => patch("agent_memory_inject", v)}
           >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
             Use conversation memory
           </Switch>
         </FormRow>
@@ -962,7 +968,7 @@ function ToolsTab() {
         <div className="ext-list">
           {extensions.map((ext) => (
             <div key={ext.name} className="ext-row">
-              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`} />
+              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const }}>
                   <span className="ext-row__name">{ext.name}</span>
