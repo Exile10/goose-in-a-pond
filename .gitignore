@@ -38,4 +38,5 @@ llama.log
 
 # Local editor / agent session state
 .claude/
+.vscode/
 
