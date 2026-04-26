@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button, Tabs, Card, CardContent, Chip, ProgressBar } from "@heroui/react";
 import {
-  Brain, Mic, Volume2, RefreshCw, Download, CheckCircle,
+  Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
+  ScanFace, Loader2,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, HfModel, HfModelFile, DownloadEntry,
-  OllamaModel, LlamafileRelease,
+  OllamaModel, LlamafileRelease, FaceModelsResponse,
 } from "../api/types";
 import { ApiError } from "../api/types";
 // ── Design constants ──────────────────────────────────────────
@@ -119,58 +120,52 @@ function ActiveRolesBanner({
 
 // ── Download Progress ─────────────────────────────────────────
 
+/** Format bytes as human-readable size. */
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 function DownloadProgress({ downloads, onScanModels }: { downloads: DownloadEntry[]; onScanModels: () => void }) {
   if (downloads.length === 0) return null;
   const allDone = downloads.every((d) => d.status === "done" || d.status === "error");
   return (
-    <div style={dlSt.root}>
-      <div style={dlSt.header}>
-        <span style={dlSt.title}>Downloads</span>
+    <div className="dl-progress">
+      <div className="dl-progress__header">
+        <span className="dl-progress__title">Downloads</span>
         {allDone && (
           <Button variant="outline" size="sm" onPress={onScanModels}>
             <RefreshCw size={12} /> Scan & index
           </Button>
         )}
       </div>
-      {downloads.map((d) => (
-        <div key={d.filename} style={dlSt.item}>
-          <div style={dlSt.itemHeader}>
-            <code style={dlSt.filename}>{d.filename}</code>
-            <span style={{
-              ...dlSt.status,
-              color: d.status === "error" ? "var(--color-destructive)" : d.status === "done" ? "var(--color-success)" : "var(--color-text-secondary)",
-            }}>
-              {d.status === "done" ? "Complete" : d.status === "error" ? (d.error ?? "Error") : `${d.progress_pct ?? 0}%`}
-            </span>
+      {downloads.map((d) => {
+        const pct = d.total_bytes ? Math.round((d.downloaded_bytes / d.total_bytes) * 100) : 0;
+        const sizeLabel = d.total_bytes
+          ? `${fmtBytes(d.downloaded_bytes)} / ${fmtBytes(d.total_bytes)}`
+          : fmtBytes(d.downloaded_bytes);
+        return (
+          <div key={d.filename} className="dl-progress__item">
+            <div className="dl-progress__item-header">
+              <code className="dl-progress__filename">{d.filename}</code>
+              <span className={`dl-progress__status dl-progress__status--${d.status}`}>
+                {d.status === "done" ? "Complete" : d.status === "error" ? (d.error ?? "Error") : `${pct}% — ${sizeLabel}`}
+              </span>
+            </div>
+            <div className="dl-progress__track">
+              <div
+                className={`dl-progress__fill dl-progress__fill--${d.status}`}
+                style={{ width: d.status === "done" ? "100%" : `${pct}%` }}
+              />
+            </div>
           </div>
-          <div style={dlSt.track}>
-            <div style={{
-              ...dlSt.fill,
-              width: `${d.progress_pct ?? 0}%`,
-              background: d.status === "error" ? "var(--color-destructive)" : d.status === "done" ? "var(--color-success)" : "var(--color-accent)",
-            }} />
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
-
-const dlSt: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex", flexDirection: "column", gap: "var(--space-2)",
-    background: "var(--color-bg)", border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-md)", padding: "var(--space-3) var(--space-4)",
-  },
-  header: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "2px" },
-  title: { fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--color-text-secondary)", textTransform: "uppercase" as const, letterSpacing: "0.06em" },
-  item: { display: "flex", flexDirection: "column" as const, gap: "4px" },
-  itemHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--space-2)" },
-  filename: { fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--color-text)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const },
-  status: { fontSize: "var(--text-xs)", flexShrink: 0, fontFamily: "var(--font-mono)" },
-  track: { height: "4px", background: "rgba(23,22,22,0.08)", borderRadius: "2px", overflow: "hidden" },
-  fill: { height: "100%", borderRadius: "2px", transition: "width 0.4s ease" },
-};
 
 // ── Shared ModelList ──────────────────────────────────────────
 
@@ -778,7 +773,7 @@ const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; c
   { key: "llm", label: "LLM", icon: <Brain size={14} />, color: CAT_COLOR.llm },
   { key: "asr", label: "ASR", icon: <Mic size={14} />, color: CAT_COLOR.asr },
   { key: "tts", label: "TTS", icon: <Volume2 size={14} />, color: CAT_COLOR.tts },
-  { key: "face", label: "Face", icon: <span style={{ fontSize: 14 }}>&#128100;</span>, color: "#3b82f6" },
+  { key: "face", label: "Face", icon: <ScanFace size={14} />, color: "#3b82f6" },
 ];
 
 // ── Memory Status Bar ─────────────────────────────────────────
@@ -787,17 +782,26 @@ function MemoryStatusBar({ status }: { status: ModelMemoryStatus | null }) {
   if (!status) return null;
   const { total_mb, available_for_llm_mb, loaded_model } = status;
   if (total_mb <= 0) return null;
+  const usedMb = total_mb - available_for_llm_mb;
+  const usedPct = Math.round((usedMb / total_mb) * 100);
+  const totalGb = (total_mb / 1024).toFixed(1);
+  const availGb = (available_for_llm_mb / 1024).toFixed(1);
   return (
-    <div className="seg-banner seg-banner--info">
-      <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "var(--text-xs)", letterSpacing: "0.06em" }}>
-        System Memory
-      </span>
-      <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)" }}>
-        {total_mb.toLocaleString()} MB total · {available_for_llm_mb.toLocaleString()} MB available
-      </span>
-      {loaded_model && (
-        <Chip size="sm" color="accent" variant="soft">Hot: {loaded_model}</Chip>
-      )}
+    <div className="sys-stats">
+      <div className="sys-stats__row">
+        <span className="sys-stats__label">Memory</span>
+        <span className="sys-stats__value">{availGb} GB free / {totalGb} GB</span>
+        {loaded_model && <Chip size="sm" variant="soft">{loaded_model}</Chip>}
+      </div>
+      <div className="dl-progress__track" style={{ height: 8 }}>
+        <div
+          className="dl-progress__fill"
+          style={{
+            width: `${usedPct}%`,
+            background: usedPct > 85 ? "var(--color-destructive)" : usedPct > 60 ? "#f59e0b" : "var(--color-success)",
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -1033,18 +1037,74 @@ export function Models() {
         </div>
       )}
 
-      {category === "face" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner" style={{ borderColor: "#3b82f6", background: "rgba(59,130,246,0.06)" }}>
-            <span style={{ fontSize: 14 }}>&#128100;</span>
-            <span>Face Recognition</span>
+      {category === "face" && <FacePanel />}
+    </div>
+  );
+}
+
+// ── Face Recognition Panel ───────────────────────────────────
+
+function FacePanel() {
+  const [data, setData] = useState<FaceModelsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.listFaceModels()
+      .then(setData)
+      .catch(() => setData(null))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 16, color: "var(--grey-500)" }}>
+        <Loader2 size={16} className="spin" /> Loading face models...
+      </div>
+    );
+  }
+
+  if (!data || !data.feature_enabled) {
+    return (
+      <div className="seg-banner seg-banner--warn">
+        <ScanFace size={14} />
+        <span>Face recognition is not enabled. Build the server with <code>--features face-onnx</code> to activate.</span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner" style={{ borderColor: "#3b82f6", background: "rgba(59,130,246,0.06)" }}>
+        <ScanFace size={14} />
+        <span>Face Recognition Models</span>
+      </div>
+      {data.models.map((m) => (
+        <div
+          key={m.name}
+          className={`giap-model-row ${m.downloaded ? "is-active" : ""}`}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+            {m.downloaded
+              ? <CheckCircle size={14} style={{ color: "var(--color-success)", flexShrink: 0 }} />
+              : <XCircle size={14} style={{ color: "var(--color-destructive)", flexShrink: 0 }} />}
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: "var(--text-sm)" }}>{m.label || m.name}</div>
+              {m.path && (
+                <code style={{ fontSize: 10, color: "var(--grey-500)", display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {m.path}
+                </code>
+              )}
+            </div>
           </div>
-          <p className="muted-foot">
-            Face recognition models (ArcFace R50, SCRFD 10G, Silent-Face PAD) are downloaded
-            automatically on first boot when the server is built with <code>--features face-onnx</code>.
-            Check the Faces section in the sidebar to enrol and identify faces.
-          </p>
+          <Chip size="sm" variant={m.downloaded ? "success" : "outline"}>
+            {m.downloaded ? "Ready" : "Missing"}
+          </Chip>
         </div>
+      ))}
+      {data.models_dir && (
+        <p className="muted-foot">
+          Models directory: <code>{data.models_dir}</code>
+        </p>
       )}
     </div>
   );
