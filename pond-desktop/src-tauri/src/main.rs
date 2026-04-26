@@ -8,6 +8,7 @@ mod hotkey;
 mod notifications;
 mod process;
 mod tray;
+mod tts_text;
 
 use audio::{AudioState, WakeListenerState};
 use commands::{audio_cmd, desktop_cmd, server_cmd, window_cmd};
@@ -122,6 +123,8 @@ fn main() {
             audio_cmd::start_recording,
             audio_cmd::stop_recording,
             audio_cmd::abort_recording,
+            audio_cmd::record_with_vad,
+            audio_cmd::play_ping,
             audio_cmd::run_voice_pipeline,
             audio_cmd::start_wake_listener,
             audio_cmd::stop_wake_listener,

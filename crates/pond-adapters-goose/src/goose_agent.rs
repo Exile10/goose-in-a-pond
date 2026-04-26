@@ -21,6 +21,47 @@ use std::sync::{Arc, Mutex};
 
 use crate::extension_manager::GiapGooseExtensionManager;
 
+/// Strip thinking-token preambles from model output.
+///
+/// Handles:
+/// - Gemma 4: `<|channel>thought … <channel|>ACTUAL REPLY`
+/// - Qwen3 / DeepSeek-R1 / QwQ: `<think>…</think>ACTUAL REPLY`
+fn strip_thinking_tokens(text: &str) -> String {
+    // Gemma 4 format — everything after last <channel|>
+    const CHANNEL_CLOSE: &str = "<channel|>";
+    if let Some(pos) = text.rfind(CHANNEL_CLOSE) {
+        let cleaned = text[pos + CHANNEL_CLOSE.len()..].trim();
+        if !cleaned.is_empty() {
+            return cleaned.to_string();
+        }
+    }
+
+    // <think>…</think> format — strip all blocks
+    if text.contains("<think>") {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            if let Some(start) = rest.find("<think>") {
+                out.push_str(&rest[..start]);
+                if let Some(end) = rest[start..].find("</think>") {
+                    rest = &rest[start + end + "</think>".len()..];
+                } else {
+                    break; // unclosed — discard tail
+                }
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    text.to_string()
+}
+
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
 const FALLBACK_PROMPT: &str =
@@ -67,6 +108,9 @@ pub struct GooseAdapter {
     loaded_extensions: Mutex<HashSet<String>>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
+    /// When true, prompt templates include voice-mode instructions (keep responses
+    /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
+    voice_mode: std::sync::atomic::AtomicBool,
 }
 
 impl GooseAdapter {
@@ -115,7 +159,14 @@ impl GooseAdapter {
             last_provider_key: Mutex::new(String::new()),
             loaded_extensions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
+            voice_mode: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Enable voice mode — prompt templates will include instructions for
+    /// short, conversational, TTS-friendly responses.
+    pub fn set_voice_mode(&self, enabled: bool) {
+        self.voice_mode.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Convenience factory for non-server use (tests, CLI one-shots).
@@ -397,6 +448,7 @@ impl GooseAdapter {
                 device_count,
                 has_home_devices,
                 online_device_names,
+                voice_mode: self.voice_mode.load(std::sync::atomic::Ordering::Relaxed),
             }
         };
 
@@ -568,10 +620,15 @@ impl GooseAdapter {
                                     _ => {}
                                 }
                             }
-                            // Emit text
-                            let text = msg.as_concat_text();
-                            if !text.is_empty() {
-                                yield Ok(AgentStreamEvent::Text { content: text });
+                            // Emit text — strip <think> blocks and Gemma 4 channel tags
+                            // before yielding so all consumers (CLI, HTTP SSE, voice TTS)
+                            // receive clean text without internal reasoning.
+                            let raw_text = msg.as_concat_text();
+                            if !raw_text.is_empty() {
+                                let text = strip_thinking_tokens(&raw_text);
+                                if !text.is_empty() {
+                                    yield Ok(AgentStreamEvent::Text { content: text });
+                                }
                             }
                         }
                         goose::agents::AgentEvent::HistoryReplaced(_) => {

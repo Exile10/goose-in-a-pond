@@ -1,117 +1,185 @@
 import { useState, useEffect } from "react";
-import { Button, Switch, TextArea } from "@heroui/react";
-import { Trash2, Plus } from "lucide-react";
+import { Card, CardContent, Button, Input, TextArea, Switch } from "@heroui/react";
+import { Plus, Trash2, Zap, Check } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { UserSkill } from "../api/types";
 
 export function Skills() {
-  const [skills, setSkills] = useState<UserSkill[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [name, setName]     = useState("");
-  const [content, setContent] = useState("");
+  const [skills, setSkills]     = useState<UserSkill[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [name, setName]         = useState("");
+  const [content, setContent]   = useState("");
   const [showForm, setShowForm] = useState(false);
-  const [error, setError]   = useState<string | null>(null);
+  const [error, setError]       = useState<string | null>(null);
 
   function load() {
     setLoading(true);
-    api.listSkills(true).then(setSkills).catch((e) => setError(String(e))).finally(() => setLoading(false));
+    api
+      .listSkills(true)
+      .then(setSkills)
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   async function add() {
     if (!name.trim() || !content.trim()) return;
     try {
       await api.addSkill(name.trim(), content.trim());
-      setName(""); setContent(""); setShowForm(false); load();
-    } catch (e) { setError(String(e)); }
+      setName("");
+      setContent("");
+      setShowForm(false);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function toggle(id: string, currentActive: boolean) {
-    try { await api.toggleSkill(id, currentActive); load(); } catch (e) { setError(String(e)); }
+    try {
+      await api.toggleSkill(id, currentActive);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function remove(id: string) {
-    try { await api.removeSkill(id); load(); } catch (e) { setError(String(e)); }
+    try {
+      await api.removeSkill(id);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   return (
-    <div style={styles.root}>
-      {/* Add form toggle */}
-      <div>
-        <Button
-          variant="outline"
-          onPress={() => setShowForm((v) => !v)}
-        >
-          <Plus size={14} /> Add Skill
-        </Button>
-      </div>
-
-      {showForm && (
-        <div style={styles.addCard}>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Skill name"
-            aria-label="Skill name"
-            style={inputStyle}
-          />
-          <TextArea
-            value={content}
-            onChange={(e) => setContent(e.target.value)}
-            placeholder="Skill instructions…"
-            aria-label="Skill instructions"
-            rows={3}
-          />
+    <div className="screen">
+      {/* ── Page header ─────────────────────────────────────── */}
+      <div className="page-header">
+        <h1 className="page-header__title">Skills</h1>
+        <div className="page-header__action">
           <Button
-            variant="primary"
-            onPress={add}
-            isDisabled={!name.trim() || !content.trim()}
+            size="sm"
+            variant={showForm ? "bordered" : "solid"}
+            color="secondary"
+            onPress={() => setShowForm((v) => !v)}
+            startContent={showForm ? undefined : <Plus size={14} />}
           >
-            Save
+            {showForm ? "Cancel" : "Add Skill"}
           </Button>
         </div>
+      </div>
+
+      {/* ── Add form ────────────────────────────────────────── */}
+      {showForm && (
+        <Card shadow="none" className="giap-card">
+          <CardContent>
+            <div className="skills-form">
+              <Input
+                size="sm"
+                radius="md"
+                variant="bordered"
+                label="Name"
+                placeholder="Skill name"
+                aria-label="Skill name"
+                value={name}
+                onValueChange={setName}
+              />
+              <TextArea
+                size="sm"
+                radius="md"
+                variant="bordered"
+                label="Instructions"
+                placeholder="Skill instructions..."
+                aria-label="Skill instructions"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                minRows={3}
+              />
+              <div className="skills-form__actions">
+                <Button
+                  size="sm"
+                  variant="light"
+                  onPress={() => {
+                    setShowForm(false);
+                    setName("");
+                    setContent("");
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  color="secondary"
+                  onPress={add}
+                  isDisabled={!name.trim() || !content.trim()}
+                  startContent={<Check size={14} />}
+                >
+                  Save
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
-      {error && <p style={styles.error}>{error}</p>}
-      {loading ? <p style={styles.hint}>Loading…</p> : skills.length === 0 ? <p style={styles.hint}>No skills yet.</p> : (
-        <ul style={styles.list}>
-          {skills.map((s) => (
-            <li key={s.id} style={styles.item}>
-              <Switch
-                isSelected={s.active}
-                onChange={() => toggle(s.id, s.active)}
-                size="sm"
-                aria-label={`Enable ${s.name}`}
-              />
-              <div style={{ flex: 1 }}>
-                <p style={styles.skillName}>{s.name}</p>
-                <p style={styles.skillContent}>{s.content.length > 80 ? s.content.slice(0, 80) + "…" : s.content}</p>
+      {/* ── Error ───────────────────────────────────────────── */}
+      {error && (
+        <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>
+          {error}
+        </p>
+      )}
+
+      {/* ── Skills list ─────────────────────────────────────── */}
+      {loading ? (
+        <p className="muted-12">Loading...</p>
+      ) : skills.length === 0 ? (
+        <div className="empty-state">
+          <Zap size={32} />
+          <span>No skills yet. Add one to get started.</span>
+        </div>
+      ) : (
+        <Card shadow="none" className="giap-card">
+          <CardContent className="card-body--list">
+            {skills.map((s) => (
+              <div key={s.id} className="skill-row">
+                <div className="skill-row__icon">
+                  <Zap size={16} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="skill-row__name">{s.name}</div>
+                  <div className="skill-row__instr">
+                    {s.content.length > 80
+                      ? s.content.slice(0, 80) + "..."
+                      : s.content}
+                  </div>
+                </div>
+                <Switch
+                  size="sm"
+                  color="secondary"
+                  isSelected={s.active}
+                  onValueChange={() => toggle(s.id, s.active)}
+                  aria-label={`Enable ${s.name}`}
+                />
+                <Button
+                  size="sm"
+                  variant="light"
+                  color="danger"
+                  isIconOnly
+                  onPress={() => remove(s.id)}
+                  aria-label={`Delete ${s.name}`}
+                >
+                  <Trash2 size={14} />
+                </Button>
               </div>
-              <Button
-                variant="danger-soft"
-                onPress={() => remove(s.id)}
-                aria-label={`Delete ${s.name}`}
-              >
-                <Trash2 size={14} />
-              </Button>
-            </li>
-          ))}
-        </ul>
+            ))}
+          </CardContent>
+        </Card>
       )}
     </div>
   );
 }
-
-const inputStyle: React.CSSProperties = { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", background: "var(--color-bg)", color: "var(--color-text)", width: "100%" };
-
-const styles: Record<string, React.CSSProperties> = {
-  root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
-  addCard: { display: "flex", flexDirection: "column", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
-  error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
-  hint: { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 },
-  list: { listStyle: "none", display: "flex", flexDirection: "column", gap: "4px" },
-  item: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", minHeight: "48px" },
-  skillName: { margin: 0, fontSize: "var(--text-base)", fontWeight: 600, color: "var(--color-text)" },
-  skillContent: { margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-secondary)" },
-};

@@ -36,7 +36,6 @@ use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
 use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
-use pond_core::ports::wake_word::WakeWordDetector;
 use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::services::instant_activation::InstantActivation;
@@ -203,6 +202,33 @@ enum Commands {
     Memories {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+
+    /// Calibrate the wake-word detector by recording samples of your activation phrase.
+    ///
+    /// Records several short clips of you saying your wake-word phrase and stores
+    /// Whisper's transcriptions as calibration variants. The detector will then match
+    /// against any of those variants, making it robust to Whisper's inconsistent output.
+    ///
+    /// Example:
+    ///   pond-server calibrate
+    ///   pond-server calibrate --phrase "hey pond" --samples 3
+    Calibrate {
+        /// The wake-word phrase to calibrate (defaults to voice_wake_word from settings)
+        #[arg(long)]
+        phrase: Option<String>,
+
+        /// Number of recording samples to collect (default: 5)
+        #[arg(long, default_value = "5")]
+        samples: usize,
+
+        /// Whisper server URL (defaults to voice_whisper_url from settings)
+        #[arg(long)]
+        whisper_url: Option<String>,
+
+        /// Clear any existing calibration data before starting
+        #[arg(long)]
+        reset: bool,
     },
 }
 
@@ -389,6 +415,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Memories { action }) => {
             run_memories_cmd(action).await
+        }
+        Some(Commands::Calibrate { phrase, samples, whisper_url, reset }) => {
+            run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await
         }
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
@@ -1162,6 +1191,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         recipe_repo.clone(),
         prompt_template_repo.clone(),
         prompt_extra_repo.clone(),
+        false, // voice_mode — server mode, not voice
     ).await;
 
     #[cfg(not(feature = "goose-agent"))]
@@ -1586,6 +1616,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             recipe_repo,
             template_repo,
             extras_repo,
+            input == "whisper", // voice_mode
         ).await;
         a
     };
@@ -1738,14 +1769,43 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     chat_service = chat_service.with_voice_input(voice);
 
     // ── Wire wake word detector ──
-    let detector: Arc<dyn WakeWordDetector> = if no_wake_word || input != "whisper" {
-        Arc::new(InstantActivation)
+    if no_wake_word || input != "whisper" {
+        chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
-        let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
-        println!("  Wake word: \"{}\" (via whisper @ {})", trigger, whisper_url);
-        Arc::new(WhisperKeywordDetector::new(Some(&whisper_url), trigger))
+        let trigger        = wake_word.unwrap_or(settings.voice_wake_word.as_str());
+        let transcriptions = settings.voice_wake_word_transcriptions.clone();
+        // Tiered model: use a separate (fast, tiny) whisper server for KWS when configured.
+        let kws_url = settings.voice_kws_whisper_url
+            .as_deref()
+            .unwrap_or(&whisper_url);
+
+        if transcriptions.is_empty() {
+            println!("  Wake word: \"{}\" (no calibration — using raw phrase)", trigger);
+        } else {
+            println!("  Wake word: \"{}\" ({} calibrated variants)", trigger, transcriptions.len());
+        }
+        println!("  KWS whisper:   {}", kws_url);
+        println!("  ASR whisper:   {}", whisper_url);
+        println!("  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
+            settings.voice_kws_energy_threshold,
+            settings.voice_kws_cooldown_ms,
+            settings.voice_kws_post_trigger_silence_ms);
+
+        use pond_adapters_whisper::KeywordDetectorConfig;
+        let kws_config = KeywordDetectorConfig {
+            energy_threshold:        settings.voice_kws_energy_threshold,
+            post_trigger_silence_ms: settings.voice_kws_post_trigger_silence_ms,
+            cooldown_ms:             settings.voice_kws_cooldown_ms,
+            ..KeywordDetectorConfig::default()
+        };
+
+        let detector = Arc::new(
+            WhisperKeywordDetector::new(Some(kws_url), trigger)
+                .with_transcriptions(transcriptions)
+                .with_config(kws_config)
+        );
+        chat_service = chat_service.with_wake_word_detector(detector);
     };
-    chat_service = chat_service.with_wake_word_detector(detector);
 
     // ── Wire TTS output ──
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
@@ -1994,6 +2054,135 @@ fn apply_face_recognition_defaults() {
             unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
         }
     }
+}
+
+/// `pond-server calibrate` — record N samples of the wake-word phrase and store
+/// Whisper's transcriptions as calibration variants in settings.
+async fn run_calibrate(
+    phrase_arg: Option<&str>,
+    target_samples: usize,
+    whisper_url_arg: Option<&str>,
+    reset: bool,
+) -> Result<()> {
+    let data_dir = default_data_dir();
+    let db = Database::init(&data_dir).await?;
+    let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+    let mut settings = settings_repo.get().await?;
+
+    // Resolve phrase and whisper URL from args → settings → defaults.
+    let phrase = phrase_arg
+        .unwrap_or(settings.voice_wake_word.as_str())
+        .to_string();
+    let whisper_url = whisper_url_arg
+        .unwrap_or(settings.voice_whisper_url.as_str())
+        .to_string();
+
+    println!();
+    println!("  ╔═══════════════════════════════════════════════╗");
+    println!("  ║   🎤  Wake-Word Calibration                   ║");
+    println!("  ╚═══════════════════════════════════════════════╝");
+    println!("  Phrase:       \"{}\"", phrase);
+    println!("  Whisper URL:  {}", whisper_url);
+    println!("  Samples:      {}", target_samples);
+    println!();
+
+    if reset {
+        settings.voice_wake_word_transcriptions.clear();
+        settings_repo.update(&settings).await?;
+        println!("  ✓  Previous calibration data cleared.");
+        println!();
+    } else if !settings.voice_wake_word_transcriptions.is_empty() {
+        println!("  Existing variants ({}):", settings.voice_wake_word_transcriptions.len());
+        for v in &settings.voice_wake_word_transcriptions {
+            println!("    • {}", v);
+        }
+        println!("  (add --reset to discard these and start fresh)");
+        println!();
+    }
+
+    // Save the phrase to settings in case it was provided via --phrase.
+    if phrase_arg.is_some() {
+        settings.voice_wake_word = phrase.clone();
+    }
+
+    let whisper = WhisperInput::new(Some(&whisper_url));
+    let mut collected = 0usize;
+    let mut attempt  = 0usize;
+
+    while collected < target_samples {
+        attempt += 1;
+        println!("  ── Sample {} / {} ─────────────────────────────────", collected + 1, target_samples);
+        println!("  Press Enter, then say \"{}\"...", phrase);
+        {
+            // Wait for Enter
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
+        }
+
+        print!("  🎤 Recording...");
+        io::stdout().flush()?;
+
+        let text = match whisper.listen().await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                println!(" (no speech detected — try again)");
+                continue;
+            }
+            Err(e) => {
+                println!(" (error: {} — is whisper running at {}?)", e, whisper_url);
+                if attempt >= target_samples * 3 {
+                    anyhow::bail!("Too many failed attempts — aborting calibration.");
+                }
+                continue;
+            }
+        };
+
+        // Normalize: strip punctuation, collapse whitespace, lowercase.
+        let normalized: String = text
+            .chars()
+            .map(|c| if c.is_alphabetic() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        println!(" heard: \"{}\"", text);
+
+        if normalized.is_empty() {
+            println!("  (normalized to empty — skipping)");
+            continue;
+        }
+
+        if settings.voice_wake_word_transcriptions.contains(&normalized) {
+            println!("  (already stored as a variant — skipping duplicate)");
+            // Still count toward progress so the loop terminates.
+            collected += 1;
+            continue;
+        }
+
+        settings.voice_wake_word_transcriptions.push(normalized.clone());
+        settings_repo.update(&settings).await?;
+        collected += 1;
+
+        println!("  ✓  Stored: \"{}\"  ({}/{})", normalized, collected, target_samples);
+        println!();
+    }
+
+    println!("  ╔═══════════════════════════════════════════════╗");
+    println!("  ║   ✅  Calibration Complete!                   ║");
+    println!("  ╚═══════════════════════════════════════════════╝");
+    println!("  Phrase:    \"{}\"", settings.voice_wake_word);
+    println!("  Variants ({}):", settings.voice_wake_word_transcriptions.len());
+    for v in &settings.voice_wake_word_transcriptions {
+        println!("    • {}", v);
+    }
+    println!();
+    println!("  The wake-word detector will now match any of these variants.");
+    println!("  Run `pond-server chat --input whisper` to test it.");
+    println!();
+
+    Ok(())
 }
 
 fn default_data_dir() -> std::path::PathBuf {
@@ -2528,6 +2717,7 @@ async fn build_goose_backend(
     recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
     template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync>,
     extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
+    voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
@@ -2566,6 +2756,9 @@ async fn build_goose_backend(
         Some(data_dir.to_path_buf()),
     ).await {
         Ok(adapter) => {
+            if voice_mode {
+                adapter.set_voice_mode(true);
+            }
             let ext_mgr: Arc<dyn ExtensionManagerPort> =
                 adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
@@ -2979,6 +3172,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             let request = AgentRequest {
@@ -3006,6 +3200,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             eprintln!("  {} — session: {}  (Ctrl+C or 'exit' to quit)",
@@ -3059,6 +3254,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             match ext_mgr {

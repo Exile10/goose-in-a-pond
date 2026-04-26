@@ -92,6 +92,41 @@ pub struct Settings {
     #[serde(default = "Settings::default_wake_word")]
     pub voice_wake_word: String,
 
+    /// Separate whisper server URL for keyword-spotting (wake-word detection only).
+    /// When set, `WhisperKeywordDetector` sends sliding windows here while
+    /// `WhisperInput` uses `voice_whisper_url` for accurate command transcription.
+    /// Recommended: point this at a `tiny`-model server (39 MB, ~0.3s inference)
+    /// for fast detection while keeping `base`/`small` for ASR accuracy.
+    /// Defaults to `voice_whisper_url` when `None`.
+    #[serde(default)]
+    pub voice_kws_whisper_url: Option<String>,
+
+    /// Minimum RMS energy for the wake-word detector to call whisper.
+    /// Windows quieter than this are skipped, eliminating ~90% of whisper calls
+    /// during silence. Default: 0.01 (~−40 dBFS). Set to 0.0 to disable.
+    #[serde(default = "Settings::default_kws_energy_threshold")]
+    pub voice_kws_energy_threshold: f32,
+
+    /// Milliseconds of consecutive silence that terminates post-trigger audio capture.
+    /// Enables early exit from the fixed `post_trigger_ms` wait when the user has
+    /// finished speaking. Default: 400 ms. Set to 0 to always wait the full window.
+    #[serde(default = "Settings::default_kws_post_trigger_silence_ms")]
+    pub voice_kws_post_trigger_silence_ms: u64,
+
+    /// Milliseconds to sleep before re-arming detection after each activation.
+    /// Prevents re-triggering on TTS echo or room noise. Default: 2000 ms.
+    #[serde(default = "Settings::default_kws_cooldown_ms")]
+    pub voice_kws_cooldown_ms: u64,
+
+    /// Whisper transcription variants collected during wake-word calibration.
+    ///
+    /// Empty → detector falls back to raw normalized `voice_wake_word` as the sole pattern.
+    /// Non-empty → detector matches against any variant in this list (OR logic), enabling
+    /// robust detection across Whisper's inconsistent output ("hey goose" / "hey, goose" /
+    /// "a goose" etc.).
+    #[serde(default)]
+    pub voice_wake_word_transcriptions: Vec<String>,
+
     /// Piper TTS voice model filename (e.g. "en_US-lessac-medium.onnx")
     #[serde(default = "Settings::default_tts_voice")]
     pub voice_tts_voice: String,
@@ -185,8 +220,13 @@ impl Default for Settings {
             llm_max_tokens:                  Self::default_max_tokens(),
             llm_temperature:                 Self::default_temperature(),
             llm_provider:                    Self::default_llm_provider(),
-            voice_wake_word:                 Self::default_wake_word(),
-            voice_tts_voice:                 Self::default_tts_voice(),
+            voice_wake_word:                      Self::default_wake_word(),
+            voice_kws_whisper_url:                None,
+            voice_kws_energy_threshold:           Self::default_kws_energy_threshold(),
+            voice_kws_post_trigger_silence_ms:    Self::default_kws_post_trigger_silence_ms(),
+            voice_kws_cooldown_ms:                Self::default_kws_cooldown_ms(),
+            voice_wake_word_transcriptions:       Vec::new(),
+            voice_tts_voice:                      Self::default_tts_voice(),
             voice_recording_duration_secs:   Self::default_recording_duration(),
             voice_whisper_url:               Self::default_whisper_url(),
             active_llm_model:                Self::default_active_llm_model(),
@@ -223,8 +263,11 @@ impl Settings {
     fn default_temperature()                -> f32    { 0.7 }
     fn default_llm_provider()               -> String { "".to_string() }
     fn default_wake_word()                  -> String { "goose".to_string() }
+    fn default_kws_energy_threshold()       -> f32    { 0.01 }
+    fn default_kws_post_trigger_silence_ms() -> u64   { 400 }
+    fn default_kws_cooldown_ms()            -> u64    { 2000 }
     fn default_tts_voice()                  -> String { "".to_string() }
-    fn default_recording_duration()         -> u32    { 5 }
+    fn default_recording_duration()         -> u32    { 3 }
     fn default_whisper_url()                -> String { "http://127.0.0.1:9000".to_string() }
     fn default_active_llm_model()           -> String { "".to_string() }
     fn default_active_whisper_model()       -> String { "".to_string() }

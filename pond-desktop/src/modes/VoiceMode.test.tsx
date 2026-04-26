@@ -165,6 +165,7 @@ describe("VoiceMode — wait (wake word configured)", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("start_wake_listener", {
         wakeWord: "goose",
+        variants: null,
       });
     });
   });
@@ -200,6 +201,7 @@ describe("VoiceMode — wake-word-detected triggers recording", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("start_wake_listener", {
         wakeWord: "goose",
+        variants: null,
       });
     });
 
@@ -215,11 +217,13 @@ describe("VoiceMode — wake-word-detected triggers recording", () => {
 
     // The mic must be released before new recording opens
     expect(mockInvoke).toHaveBeenCalledWith("stop_wake_listener");
-    // Recording must start immediately after
-    expect(mockInvoke).toHaveBeenCalledWith("start_recording");
+    // VAD recording must start immediately after (or one-breath pipeline)
+    const usesVad = mockInvoke.mock.calls.some((c: unknown[]) => c[0] === "record_with_vad");
+    const usesPipeline = mockInvoke.mock.calls.some((c: unknown[]) => c[0] === "run_voice_pipeline");
+    expect(usesVad || usesPipeline).toBe(true);
   });
 
-  it("order: stop_wake_listener fires before start_recording", async () => {
+  it("order: stop_wake_listener fires before record_with_vad", async () => {
     renderVoiceMode({ voiceState: "wait" });
 
     await waitFor(() => {
@@ -237,10 +241,12 @@ describe("VoiceMode — wake-word-detected triggers recording", () => {
     });
 
     const stopIdx  = callOrder.indexOf("stop_wake_listener");
-    const startIdx = callOrder.indexOf("start_recording");
+    const startIdx = callOrder.indexOf("record_with_vad");
     expect(stopIdx).toBeGreaterThanOrEqual(0);
-    expect(startIdx).toBeGreaterThanOrEqual(0);
-    expect(stopIdx).toBeLessThan(startIdx);
+    // record_with_vad or run_voice_pipeline (one-breath) should follow
+    const recordIdx = startIdx >= 0 ? startIdx : callOrder.indexOf("run_voice_pipeline");
+    expect(recordIdx).toBeGreaterThanOrEqual(0);
+    expect(stopIdx).toBeLessThan(recordIdx);
   });
 });
 
@@ -330,6 +336,7 @@ describe("VoiceMode — unmount cleanup", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("start_wake_listener", {
         wakeWord: "goose",
+        variants: null,
       });
     });
 

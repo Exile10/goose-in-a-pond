@@ -259,6 +259,159 @@ pub fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16
     out
 }
 
+/// VAD-aware recording — mirrors the CLI's `record_mono_f32_vad`.
+///
+/// Instead of the start/stop/countdown approach, this:
+///   1. Opens the mic and waits up to `max_wait_secs` for speech onset
+///   2. Once speech is detected (RMS > onset threshold), records everything
+///   3. Stops when the user pauses for `silence_ms` consecutive milliseconds
+///   4. Hard cap at `max_record_secs` total recording time
+///
+/// Emits `audio-level` events for waveform animation.
+/// Returns 16 kHz mono WAV bytes, or empty Vec if no speech detected.
+pub fn record_with_vad(
+    app: &tauri::AppHandle,
+    max_wait_secs: u32,
+    max_record_secs: u32,
+    silence_ms: u64,
+) -> Result<Vec<u8>, String> {
+    const SPEECH_RMS: f32  = 0.018; // onset threshold
+    const SILENCE_RMS: f32 = 0.008; // end-of-speech threshold (hysteresis)
+    const POLL_MS: u64     = 30;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("No input audio device available")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("Cannot get default input config: {e}"))?;
+
+    let native_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+    let sample_format = config.sample_format();
+
+    let stream_config = StreamConfig {
+        channels: config.channels(),
+        sample_rate: SampleRate(native_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let samples: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples_writer = Arc::clone(&samples);
+    let app_emitter = app.clone();
+
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _| {
+                let mono: Vec<i16> = data
+                    .chunks(channels)
+                    .map(|ch| {
+                        let avg = ch.iter().copied().sum::<f32>() / ch.len() as f32;
+                        (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                    })
+                    .collect();
+                let rms = compute_rms(&mono);
+                let _ = app_emitter.emit("audio-level", rms);
+                samples_writer.lock().unwrap().extend_from_slice(&mono);
+            },
+            |e| tracing::error!("Audio stream error: {e}"),
+            None,
+        ).map_err(|e| format!("Build stream error: {e}"))?,
+        SampleFormat::I16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[i16], _| {
+                let mono: Vec<i16> = data
+                    .chunks(channels)
+                    .map(|ch| {
+                        let avg = ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
+                        avg as i16
+                    })
+                    .collect();
+                let rms = compute_rms(&mono);
+                let _ = app_emitter.emit("audio-level", rms);
+                samples_writer.lock().unwrap().extend_from_slice(&mono);
+            },
+            |e| tracing::error!("Audio stream error: {e}"),
+            None,
+        ).map_err(|e| format!("Build stream error: {e}"))?,
+        _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
+    };
+
+    stream.play().map_err(|e| format!("Stream play error: {e}"))?;
+
+    // ── Phase 1: wait for speech onset ──────────────────────────────────────
+    let max_wait_ms = max_wait_secs as u64 * 1000;
+    let mut waited_ms: u64 = 0;
+    let mut speech_detected = false;
+
+    while waited_ms < max_wait_ms {
+        thread::sleep(Duration::from_millis(POLL_MS));
+        waited_ms += POLL_MS;
+
+        let rms = {
+            let buf = samples.lock().unwrap();
+            let recent = (native_rate as u64 * POLL_MS / 1000) as usize;
+            let start = buf.len().saturating_sub(recent);
+            compute_rms(&buf[start..])
+        };
+
+        if rms >= SPEECH_RMS {
+            speech_detected = true;
+            break;
+        }
+    }
+
+    if !speech_detected {
+        drop(stream);
+        return Ok(Vec::new()); // no speech → empty
+    }
+
+    // ── Phase 2: record until end-of-speech ─────────────────────────────────
+    let max_record_ms = max_record_secs as u64 * 1000;
+    let mut recorded_ms: u64 = 0;
+    let mut silent_for: u64 = 0;
+
+    while recorded_ms < max_record_ms {
+        thread::sleep(Duration::from_millis(POLL_MS));
+        recorded_ms += POLL_MS;
+
+        let rms = {
+            let buf = samples.lock().unwrap();
+            let recent = (native_rate as u64 * POLL_MS / 1000) as usize;
+            let start = buf.len().saturating_sub(recent);
+            compute_rms(&buf[start..])
+        };
+
+        if rms < SILENCE_RMS {
+            silent_for += POLL_MS;
+            if silent_for >= silence_ms {
+                tracing::debug!("VAD: end-of-speech after {}ms silence ({}ms recorded)", silent_for, recorded_ms);
+                break;
+            }
+        } else {
+            silent_for = 0;
+        }
+    }
+
+    drop(stream);
+
+    let recorded = samples.lock().unwrap().clone();
+    if recorded.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Resample to 16 kHz
+    let pcm_16k = if native_rate != 16000 {
+        resample_linear(&recorded, native_rate, 16000)
+    } else {
+        recorded
+    };
+
+    encode_wav(&pcm_16k, 16000)
+}
+
 /// Start a background wake-word listening loop.
 ///
 /// Captures audio in 0.8s chunks, applies a silence gate (RMS > 0.01),
@@ -267,6 +420,7 @@ pub fn resample_linear(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16
 pub fn start_wake_listener(
     state: &WakeListenerState,
     wake_word: String,
+    variants: Vec<String>,
     base_url: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -280,7 +434,7 @@ pub fn start_wake_listener(
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
 
     thread::spawn(move || {
-        let result = wake_listener_thread(app, wake_word, base_url, is_running.clone(), stop_rx);
+        let result = wake_listener_thread(app, wake_word, variants, base_url, is_running.clone(), stop_rx);
         is_running.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             tracing::error!("Wake listener thread error: {e}");
@@ -315,6 +469,7 @@ pub fn stop_wake_listener(state: &WakeListenerState) {
 fn wake_listener_thread(
     app: tauri::AppHandle,
     wake_word: String,
+    variants: Vec<String>,
     base_url: String,
     is_running: Arc<AtomicBool>,
     stop_rx: std::sync::mpsc::Receiver<()>,
@@ -415,12 +570,30 @@ fn wake_listener_thread(
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    // Normalise the wake word — strip punctuation so it matches whisper output
-    // e.g. "Hey Goose" → "hey goose" (whisper returns "Hey, Goose." which normalises to "hey  goose")
-    let wake_lower: String = wake_word.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
-        .collect();
+    // Build the set of trigger phrases to match against.
+    // If calibrated variants exist, use them (they're already Whisper transcriptions).
+    // Otherwise fall back to the raw wake word. All are normalized identically.
+    let normalize = |s: &str| -> String {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let triggers: Vec<String> = if variants.is_empty() {
+        vec![normalize(&wake_word)]
+    } else {
+        variants.iter().map(|v| normalize(v)).collect()
+    };
+    tracing::info!(
+        "Wake listener armed — triggers: {:?} (from {} calibrated variant{})",
+        triggers,
+        if variants.is_empty() { 0 } else { variants.len() },
+        if variants.len() == 1 { "" } else { "s" },
+    );
 
     // ── VAD state ───────────────────────────────────────────────────────────
     let mut onset_frames:   u32      = 0;  // consecutive above-threshold frames
@@ -525,16 +698,99 @@ fn wake_listener_thread(
                     #[derive(serde::Deserialize)]
                     struct Tr { text: String }
                     if let Ok(t) = res.json::<Tr>() {
-                        // Strip punctuation so "Hey, Goose." matches "hey goose"
-                        let transcript: String = t.text.to_lowercase()
+                        // Strip Whisper artifacts before matching
+                        let cleaned = crate::tts_text::strip_whisper_artifacts(&t.text);
+                        if cleaned.is_empty() {
+                            tracing::debug!("Wake ASR: artifact-only transcript stripped: {:?}", t.text);
+                            break 'asr;
+                        }
+                        // Normalize transcript identically to the trigger phrases
+                        let transcript: String = cleaned.to_lowercase()
                             .chars()
                             .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
-                            .collect();
-                        tracing::debug!("Wake ASR: {:?}", transcript);
-                        if transcript.contains(&wake_lower) {
-                            tracing::info!("Wake word '{}' detected", wake_word);
-                            let _ = app.emit("wake-word-detected", ());
-                            return Ok(()); // exit thread — recording takes over
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        // OR-match against all trigger phrases (calibrated variants or raw wake word)
+                        let matched = triggers.iter().any(|t| transcript.contains(t.as_str()));
+                        tracing::debug!("Wake ASR: {:?} (matched: {})", transcript, matched);
+                        if matched {
+                            tracing::info!("Wake word '{}' detected — capturing command audio", wake_word);
+
+                            // ── One-breath flow ─────────────────────────────────
+                            // speech_buf already contains the FULL utterance that
+                            // was just transcribed (wake word + any command in the
+                            // same breath, e.g. "hey goose what's the weather").
+                            //
+                            // Additionally, capture any continuation speech: the
+                            // user might pause briefly between wake word and
+                            // command ("hey goose" [brief pause] "what time is it").
+                            // The ring buffer accumulates audio during the ASR call
+                            // and afterwards; drain it for continuation.
+                            const POST_TRIGGER_MS: u64       = 3000;
+                            const POST_TRIGGER_SILENCE: u64  = 800;
+                            const POLL_MS: u64               = 30;
+
+                            let mut continuation: Vec<i16> = Vec::new();
+                            let mut elapsed: u64 = 0;
+                            let mut silent_for: u64 = 0;
+                            let mut heard_speech = false;
+
+                            while elapsed < POST_TRIGGER_MS {
+                                thread::sleep(Duration::from_millis(POLL_MS));
+                                elapsed += POLL_MS;
+
+                                let frame: Vec<i16> = {
+                                    let mut buf = ring.lock().unwrap();
+                                    buf.drain(..).collect()
+                                };
+                                if frame.is_empty() {
+                                    silent_for += POLL_MS;
+                                } else {
+                                    let rms = compute_rms(&frame);
+                                    if rms >= SILENCE_RMS {
+                                        heard_speech = true;
+                                        silent_for = 0;
+                                        continuation.extend_from_slice(&frame);
+                                    } else {
+                                        silent_for += POLL_MS;
+                                        // Keep trailing audio if user was speaking
+                                        if heard_speech {
+                                            continuation.extend_from_slice(&frame);
+                                        }
+                                    }
+                                }
+
+                                if silent_for >= POST_TRIGGER_SILENCE {
+                                    break;
+                                }
+                            }
+
+                            // Combine: speech_buf (wake word + any initial
+                            // command from the same breath) + continuation
+                            // (speech after a brief pause).
+                            let mut full_audio = speech_buf.clone();
+                            full_audio.extend_from_slice(&continuation);
+
+                            let pcm_16k = if native_rate != 16000 {
+                                resample_linear(&full_audio, native_rate, 16000)
+                            } else {
+                                full_audio
+                            };
+                            let command_wav = encode_wav(&pcm_16k, 16000)
+                                .unwrap_or_default();
+
+                            let duration_ms = pcm_16k.len() as u64 * 1000 / 16000;
+                            tracing::info!(
+                                "One-breath: {}ms audio ({}ms original + {}ms continuation)",
+                                duration_ms,
+                                speech_buf.len() as u64 * 1000 / native_rate as u64,
+                                continuation.len() as u64 * 1000 / native_rate as u64,
+                            );
+
+                            let _ = app.emit("wake-word-detected", command_wav);
+                            return Ok(());
                         }
                     }
                 }

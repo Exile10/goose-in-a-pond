@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 
 import "./styles/design-tokens.css";
 import "./styles/base.css";
+import "./styles/sections.css";
 
 import { StartupScreen } from "./components/StartupScreen";
 import { AppContextProvider } from "./state/AppContext";

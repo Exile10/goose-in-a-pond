@@ -23,6 +23,7 @@ export interface Settings {
   // Voice pipeline
   voice_wake_word?: string;
   wake_word?: string;      // legacy alias
+  voice_wake_word_transcriptions?: string[];
   voice_recording_duration_secs?: number;
   voice_whisper_url?: string;
   active_whisper_model?: string;
@@ -172,6 +173,16 @@ export interface ChatEvent {
 // ── Transcription ─────────────────────────────────────────────
 export interface TranscribeResponse {
   text: string;
+}
+
+// ── Wake-word Calibration ────────────────────────────────────
+export interface CalibrateResponse {
+  transcript:    string;
+  normalized:    string;
+  all_variants:  string[];
+  sample_count:  number;
+  target_count:  number;
+  complete:      boolean;
 }
 
 // ── Auth / Handshake ──────────────────────────────────────────

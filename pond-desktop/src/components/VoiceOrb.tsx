@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { VoiceState } from "../state/reducer";
+import { ORB_STATE_COLORS } from "../lib/colors";
 
 export type OrbSize = "sm" | "md" | "lg";
 
@@ -15,15 +16,6 @@ const SIZE_PX: Record<OrbSize, number> = {
   lg: 120,
 };
 
-const STATE_COLORS: Record<VoiceState, string> = {
-  idle:      "#8E8E93",
-  wait:      "#8C4BFF",  // dim Jarida Purple — alert but calm
-  recording: "#8C4BFF",  // Jarida Purple
-  thinking:  "#FF9500",  // warm amber
-  speaking:  "#34C759",  // green
-  error:     "#FF3B30",
-};
-
 const STATE_LABELS: Record<VoiceState, string> = {
   idle:      "Ready",
   wait:      "Waiting…",
@@ -35,7 +27,7 @@ const STATE_LABELS: Record<VoiceState, string> = {
 
 export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
   const px = SIZE_PX[size];
-  const color = STATE_COLORS[state];
+  const color = ORB_STATE_COLORS[state];
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const phaseRef = useRef(0);

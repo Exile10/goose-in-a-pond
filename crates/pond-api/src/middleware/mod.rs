@@ -118,6 +118,7 @@ fn is_public_route(path: &str) -> bool {
             | "/onboard/complete"
             | "/onboard/status"
             | "/transcribe"
+            | "/voice/calibrate"   // POST/DELETE — used during onboarding WakeWord step
             | "/system/info"
             | "/test"
             | "/test/speak"
