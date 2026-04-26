@@ -1,7 +1,10 @@
+import { useEffect, useState } from "react";
 import { Button, Card } from "@heroui/react";
 import { Mic, MessageSquare } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { AudioWaves } from "../components/AudioWaves";
+import { api } from "../api/PondApiClient";
+import type { SessionSummary } from "../api/types";
 
 function abbreviateModel(name: string): string {
   // "org/model-name" → "model-name"; truncate to 32 chars
@@ -27,6 +30,50 @@ export function Dashboard() {
   const dispatch = useAppDispatch();
 
   const recentMessages = state.transcript.slice(-5).reverse();
+
+  // Recent text-chat sessions. The voice transcript above only captures
+  // wake-word / mic conversations; the typed Chat section persists into
+  // the backend's session store. We pull the 5 most recent and render
+  // them as clickable items that take the user straight to chat.
+  const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
+  useEffect(() => {
+    // Wait for both the connection AND the handshake-issued bearer token —
+    // listSessions is gated by the auth middleware, so calling it before
+    // the token is set just produces a silent 401 and an empty Recents card.
+    if (!state.serverOnline || !state.sessionToken) return;
+    let cancelled = false;
+    api.listSessions()
+      .then((sessions) => {
+        if (cancelled) return;
+        const sorted = [...sessions]
+          .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+          .slice(0, 5);
+        setRecentSessions(sorted);
+      })
+      .catch((err) => {
+        // Non-fatal — Recent card just stays hidden.
+        console.warn("Dashboard: listSessions failed:", err);
+      });
+    return () => { cancelled = true; };
+  }, [state.serverOnline, state.sessionToken]);
+
+  function openSession(id: string) {
+    dispatch({ type: "SET_SESSION_ID", payload: id });
+    dispatch({ type: "SET_SECTION", payload: "chat" });
+  }
+
+  function relativeTime(iso: string): string {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return "";
+    const diff = Date.now() - then;
+    const min = Math.round(diff / 60_000);
+    if (min < 1)  return "just now";
+    if (min < 60) return `${min} min ago`;
+    const h = Math.round(min / 60);
+    if (h < 24) return `${h} h ago`;
+    const d = Math.round(h / 24);
+    return `${d} day${d === 1 ? "" : "s"} ago`;
+  }
 
   return (
     <div style={styles.root}>
@@ -119,26 +166,68 @@ export function Dashboard() {
         </div>
       </Card>
 
-      {/* ── Recent activity ───────────────────────────────── */}
-      {recentMessages.length > 0 && (
+      {/* ── Recent activity ─────────────────────────────────
+       * Always rendered when the server is online: shows recent typed-chat
+       * sessions (clickable, jump back into the conversation) and any
+       * voice transcript lines from the current session. Replaces the old
+       * "only show when voice transcript is non-empty" behaviour, which
+       * left the dashboard with no Recent card on a fresh launch. */}
+      {state.serverOnline && (recentSessions.length > 0 || recentMessages.length > 0) && (
         <Card>
           <div style={styles.cardBody}>
             <h3 style={styles.cardTitle}>Recent</h3>
-            <ul style={styles.activityList}>
-              {recentMessages.map((msg) => (
-                <li key={msg.id} style={styles.activityItem}>
-                  <span style={{
-                    ...styles.activityRole,
-                    color: msg.role === "agent" ? "var(--color-accent)" : "var(--color-text-secondary)",
-                  }}>
-                    {msg.role === "user" ? "You" : "Pond"}
-                  </span>
-                  <span style={styles.activityText}>
-                    {msg.text.length > 80 ? msg.text.slice(0, 80) + "…" : msg.text}
-                  </span>
-                </li>
-              ))}
-            </ul>
+
+            {recentSessions.length > 0 && (
+              <ul style={styles.activityList}>
+                {recentSessions.map((s) => {
+                  const title =
+                    s.title?.trim() ||
+                    `Conversation from ${new Date(s.created_at).toLocaleString(undefined, {
+                      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                    })}`;
+                  return (
+                    <li
+                      key={s.id}
+                      style={{ ...styles.activityItem, cursor: "pointer" }}
+                      onClick={() => openSession(s.id)}
+                      role="button"
+                      aria-label={`Open ${title}`}
+                    >
+                      <MessageSquare size={12} style={{ color: "var(--color-accent)", flexShrink: 0 }} />
+                      <span style={{ ...styles.activityText, flex: 1, minWidth: 0 }}>
+                        {title.length > 60 ? title.slice(0, 60) + "…" : title}
+                      </span>
+                      <span style={{ fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", flexShrink: 0 }}>
+                        {relativeTime(s.updated_at)}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {recentMessages.length > 0 && (
+              <>
+                {recentSessions.length > 0 && (
+                  <div style={{ height: 1, background: "var(--color-border)", margin: "8px 0" }} />
+                )}
+                <ul style={styles.activityList}>
+                  {recentMessages.map((msg) => (
+                    <li key={msg.id} style={styles.activityItem}>
+                      <span style={{
+                        ...styles.activityRole,
+                        color: msg.role === "agent" ? "var(--color-accent)" : "var(--color-text-secondary)",
+                      }}>
+                        {msg.role === "user" ? "You" : "Pond"}
+                      </span>
+                      <span style={styles.activityText}>
+                        {msg.text.length > 80 ? msg.text.slice(0, 80) + "…" : msg.text}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
           </div>
         </Card>
       )}

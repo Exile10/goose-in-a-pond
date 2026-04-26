@@ -3,11 +3,32 @@ import { Button } from "@heroui/react";
 import { ArrowUp } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
-import { nextCardId } from "../state/reducer";
-import type { ContextCard as ContextCardType } from "../state/reducer";
-import { ContextCard } from "../components/ContextCard";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import type { ChatEvent } from "../api/types";
+
+// Map raw tool names (e.g. "giap__get_current_weather") to a one-line,
+// user-friendly status the chat bubble shows while the tool is running.
+// Falls back to a humanised version of the bare tool name so unknown tools
+// still render something readable instead of "giap__do_thing_v2".
+function friendlyToolStatus(rawName: string): string {
+    const bare = rawName.includes("__") ? rawName.split("__").pop()! : rawName;
+    const map: Record<string, string> = {
+        get_current_weather:      "Checking the weather…",
+        list_registered_devices:  "Looking up your devices…",
+        recall_memories:          "Recalling what I know…",
+        save_memory:              "Saving that for later…",
+        list_schedules:           "Looking up your schedules…",
+        get_recipe:               "Finding that recipe…",
+        get_user_profile:         "Looking up your profile…",
+        list_skills:              "Checking my skills…",
+    };
+    if (map[bare]) return map[bare];
+    // Generic fallback: turn snake_case into "Title Case" preceded by "Working on".
+    const pretty = bare
+        .replace(/_/g, " ")
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+    return `Working on: ${pretty}…`;
+}
 
 interface Message {
   id: number;
@@ -15,7 +36,7 @@ interface Message {
   text: string;
   streaming?: boolean;
   status?: string;       // current activity description (e.g. "Thinking...", "Using tool...")
-  cards?: ContextCardType[];  // inline tool call results attached to this message
+  // (cards removed — see tool_call handler below)
   modelRole?: string;         // which role answered (chat/think/task)
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
   error?: boolean;            // true when this bubble represents an error
@@ -33,9 +54,30 @@ export function Chat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
 
-  // Keep sessionIdRef in sync with state
+  // Keep sessionIdRef in sync with state. When the session id changes
+  // *externally* (e.g. the user clicked a Recent item on the Dashboard),
+  // fetch that session's messages and replace the bubble list. The
+  // mount-time loader below covers the "open Chat for the first time"
+  // case; this effect covers every subsequent navigate-to-this-chat.
   useEffect(() => {
-    sessionIdRef.current = state.sessionId ?? undefined;
+    const newId = state.sessionId ?? undefined;
+    if (newId === sessionIdRef.current) return;
+    const wasExternal = !!newId;
+    sessionIdRef.current = newId;
+    if (!wasExternal) return;
+    api.getSessionMessages(newId!)
+      .then((msgs) => {
+        setMessages(
+          (msgs ?? []).map((m) => ({
+            id: ++msgId,
+            role: m.role === "user" ? "user" : "agent",
+            text: m.content,
+          })),
+        );
+      })
+      .catch((err) => {
+        console.warn("Could not load session history (non-fatal):", err);
+      });
   }, [state.sessionId]);
 
   // Load most recent session on mount (once server is online)
@@ -113,34 +155,28 @@ export function Chat() {
           });
 
         } else if (ev.type === "tool_call" && ev.tool) {
-          const card: ContextCardType = {
-            id: nextCardId(),
-            tool: ev.tool,
-            data: (ev.result as Record<string, unknown>) ?? {},
-            timestamp_ms: Date.now(),
-          };
-          dispatch({ type: "PUSH_CONTEXT_CARD", payload: card }); // keep for voice compat
+          // Surface the tool invocation as a discreet inline status only.
+          // We deliberately do NOT push the ContextCard into global state
+          // either — anything that reads `state.contextCards` (the voice
+          // overlay, the transcript feed) would otherwise re-render the
+          // raw "Get Weather / Get User Profile" chip the user explicitly
+          // asked us to remove. The reply text still streams through as a
+          // `text` event, so the user sees the answer.
+          const friendly = friendlyToolStatus(ev.tool);
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { 
-              ...last, 
-              cards: [...(last.cards ?? []), card],
-              status: `Using tool: ${ev.tool}`
-            }];
+            return [...prev.slice(0, -1), { ...last, status: friendly }];
           });
 
-        } else if (ev.type === "tool_result" && ev.id) {
+        } else if (ev.type === "tool_result") {
+          // Tool finished — clear the inline status. Result text arrives
+          // separately as `text` events from the model's follow-up reply,
+          // so we don't need to render the raw payload here either.
           setMessages((prev) => {
             const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent" || !last.cards) return prev;
-            // Update the data for the specific card
-            const newCards = last.cards.map(c => 
-              // We don't have tool_call_id on ContextCardType yet, but we can match by tool name if it was the last one
-              // or better: let's just update the last one for now or add id to card
-              c.tool === ev.tool ? { ...c, data: { result: ev.content } } : c
-            );
-            return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
+            if (!last || last.role !== "agent") return prev;
+            return [...prev.slice(0, -1), { ...last, status: undefined }];
           });
 
         } else if (ev.type === "error" || ev.error) {
@@ -254,14 +290,12 @@ export function Chat() {
               ) : "")}
             </p>
 
-            {/* Inline tool call result cards */}
-            {msg.role === "agent" && (msg.cards?.length ?? 0) > 0 && (
-              <div style={styles.cardList}>
-                {msg.cards!.map((card) => (
-                  <ContextCard key={card.id} card={card} />
-                ))}
-              </div>
-            )}
+            {/* Inline tool-call ContextCards intentionally NOT rendered in
+             * the chat thread. They were leaking the agent's plumbing
+             * (raw "Get Recipe" / "Get Weather" chips with `{}` JSON
+             * underneath) every time the model invoked a tool. The
+             * canvas overlay still receives the same cards via the
+             * PUSH_CONTEXT_CARD action above, so voice mode is unaffected. */}
 
             {/* Model role badge + token count */}
             {msg.role === "agent" && msg.modelRole && !msg.streaming && (

@@ -963,17 +963,55 @@ fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
 // ── Generic file download helper ──────────────────────────────────────────────
 
 /// Download `url` to `dest`, showing a live progress line.  Skips if `dest` exists.
+/// Read a Hugging Face access token from one of the conventional env vars.
+/// Used to download gated models (Gemma, Llama-Guard, etc.) without manual
+/// curl invocations. Returns `None` when neither var is set, in which case
+/// callers fall back to anonymous access (which works fine for public repos).
+fn hugging_face_token() -> Option<String> {
+    for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"] {
+        if let Ok(v) = std::env::var(var) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
     println!("  ⬇  {} (~{} MB)", dest.file_name().unwrap_or_default().to_string_lossy(), approx_size_mb);
 
     let client = reqwest::Client::builder().build()?;
-    let resp = client
-        .get(url)
+    // Hugging Face gates models behind both repo-level licenses (e.g. Gemma)
+    // AND auth tokens. Forward `HF_TOKEN` (or the standard `HUGGING_FACE_HUB_TOKEN`)
+    // when present so gated downloads succeed without hand-fetching the file.
+    let mut req = client.get(url);
+    if url.contains("huggingface.co") {
+        if let Some(tok) = hugging_face_token() {
+            req = req.bearer_auth(tok);
+        }
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("Failed to fetch {url}"))?;
 
     if !resp.status().is_success() {
+        // Surface the most common error (gated repo + missing token) in plain
+        // English so operators see a clear next step instead of "Server returned 401".
+        if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
+            return Err(anyhow!(
+                "{} {} for {url} — this looks like a gated Hugging Face repo. \
+                 Accept the model licence on the model's HF page, generate a \
+                 read-only token at https://huggingface.co/settings/tokens, then \
+                 export HF_TOKEN=<token> before re-running the server. \
+                 Alternatively, download the GGUF manually and place it at the \
+                 expected path so auto-download is skipped.",
+                resp.status().as_u16(),
+                resp.status().canonical_reason().unwrap_or(""),
+            ));
+        }
         return Err(anyhow!("Server returned {} for {url}", resp.status()));
     }
 

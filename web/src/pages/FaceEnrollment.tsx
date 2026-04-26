@@ -63,7 +63,7 @@ export default function FaceEnrollment({ token }: Props) {
           setSelectedProfile(res.profiles[0].id)
         }
       })
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load profiles.'))
+      .catch(() => setError("We couldn't load your household profiles right now. Try again in a moment."))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token])
 
@@ -139,19 +139,26 @@ export default function FaceEnrollment({ token }: Props) {
   async function handleEnroll() {
     setError(null); setBanner(null)
     if (!selectedProfile) {
-      setError('Pick a profile before enrolling.')
+      setError("Choose who you're enrolling first, then capture a sample.")
       return
     }
     const blob = await captureFrame()
     if (!blob) {
-      setError('Could not capture a frame — is the camera running?')
+      setError("The camera isn't sending video yet. Give it a moment, then try again.")
       return
     }
     setBusy('enrolling')
     try {
-      const stored = await api.registerFace(selectedProfile, blob, token)
-      setBanner(`Enrolled a new sample for this profile (id ${stored.id.slice(0, 8)}…).`)
-      await refreshEnrollments(selectedProfile)
+      await api.registerFace(selectedProfile, blob, token)
+      const fresh = await api.listFaceEnrollments(selectedProfile, token)
+      const n = fresh.enrollments.length
+      if (n >= 3) {
+        setBanner(`Sample ${n} saved — ${profileName(selectedProfile)} is ready to be recognised. ✅`)
+      } else {
+        setBanner(`Sample ${n} of 3 saved — capture ${3 - n} more from a slightly different angle for best accuracy.`)
+      }
+      setEnrollments(fresh.enrollments)
+      setAvailability('available')
     } catch (err) {
       handleBackendError(err)
     } finally {
@@ -173,7 +180,7 @@ export default function FaceEnrollment({ token }: Props) {
         if (i > 0) await new Promise(r => setTimeout(r, 400))
         const blob = await captureFrame()
         if (!blob) {
-          setError('Could not capture a frame — is the camera running?')
+          setError("The camera isn't sending video yet. Give it a moment, then try again.")
           return
         }
         frames.push(blob)
@@ -181,8 +188,16 @@ export default function FaceEnrollment({ token }: Props) {
       const result = await api.identifyFaceBurst(frames, token)
       if (result.reason === 'liveness_failed') {
         setError(
-          'Liveness check failed — this looked like a still image (no head motion across frames). ' +
-          'Hold the camera steady on a live face and try again.',
+          "We couldn't confirm a real, live face in front of the camera. " +
+          "If you're using a real face, look at the camera and blink or move slightly, then try again. " +
+          "Photos and phone screens won't work — that's by design, to keep your account safe."
+        )
+      } else if (result.identified && result.profile_id) {
+        setBanner(`Welcome back, ${profileName(result.profile_id)}! 👋`)
+      } else if (!result.identified) {
+        setBanner(
+          "Hi there — we don't recognise this face yet. " +
+          "If you're a household member, capture a few enrolment samples first."
         )
       }
       setLastResult({
@@ -205,7 +220,12 @@ export default function FaceEnrollment({ token }: Props) {
     setBusy('deleting')
     try {
       const res = await api.deleteUserBiometrics(selectedProfile, token)
-      setBanner(`Deleted ${res.face_embeddings_deleted} face embedding(s) for this profile.`)
+      const n = res.face_embeddings_deleted
+      setBanner(
+        n === 0
+          ? `${profileName(selectedProfile)} had nothing on file — you're all clear.`
+          : `Removed ${n} face sample${n === 1 ? '' : 's'} for ${profileName(selectedProfile)}.`
+      )
       await refreshEnrollments(selectedProfile)
     } catch (err) {
       handleBackendError(err)
@@ -218,9 +238,14 @@ export default function FaceEnrollment({ token }: Props) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.includes('503') || msg.toLowerCase().includes('not configured')) {
       setAvailability('unavailable')
-      setError('Face recognition is not configured on this server. Rebuild pond-server with `--features face-onnx` and an ArcFace model.')
+      setError("Face recognition isn't enabled on this server yet. Ask your installer to rebuild it with face support turned on.")
+    } else if (msg.includes('401')) {
+      setError('Your session expired. Refresh the page to sign back in.')
+    } else if (/HTTP 5\d\d|fetch/i.test(msg)) {
+      setError('Something went wrong on the server. Please try again in a few seconds.')
     } else {
-      setError(msg)
+      setError("That didn't work — please try again. If it keeps happening, refresh the page.")
+      console.warn('[FaceEnrollment] action failed:', msg)
     }
   }
 
@@ -248,8 +273,8 @@ export default function FaceEnrollment({ token }: Props) {
       <div className="db-page-content">
         {availability === 'unavailable' && (
           <div style={bannerStyle('#fef3c7', '#92400e')}>
-            <strong>Face recognition unavailable.</strong> Rebuild pond-server with
-            {' '}<code>--features face-onnx</code>{' '} and install an ONNX model to use this page.
+            <strong>Face recognition isn't turned on yet.</strong>{' '}
+            Ask whoever set up Goose for you to rebuild the server with face support enabled, then come back to this page.
           </div>
         )}
 
@@ -326,16 +351,26 @@ export default function FaceEnrollment({ token }: Props) {
 
             {lastResult && (
               <div style={{ marginTop: 16, padding: 12, background: 'var(--surface-muted)', color: 'var(--text-primary)', borderRadius: 8 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Last identification</div>
                 {lastResult.identified ? (
-                  <div>
-                    <div>Match: <strong>{profileName(lastResult.profile_id ?? '')}</strong></div>
-                    <div>Confidence: <strong>{pct(lastResult.confidence)}</strong> (threshold {pct(lastResult.threshold)})</div>
-                  </div>
+                  <>
+                    <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
+                      Recognised as {profileName(lastResult.profile_id ?? '')}
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      Confidence {pct(lastResult.confidence)} · this looks like a strong match.
+                    </div>
+                  </>
                 ) : (
-                  <div>
-                    No confident match. Best score: {pct(lastResult.confidence)} (threshold {pct(lastResult.threshold)})
-                  </div>
+                  <>
+                    <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
+                      No matching profile found
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      {lastResult.confidence != null && lastResult.confidence > 0
+                        ? "We weren't confident enough to make a match. Try a brighter spot, or enrol another sample under similar lighting."
+                        : "We couldn't find a face in the camera view. Make sure your face is centred in the dashed square and try again."}
+                    </div>
+                  </>
                 )}
               </div>
             )}
