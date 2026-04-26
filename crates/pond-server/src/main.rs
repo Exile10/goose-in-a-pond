@@ -1153,6 +1153,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         recipe_repo.clone(),
         prompt_template_repo.clone(),
         prompt_extra_repo.clone(),
+        false, // voice_mode — server mode, not voice
     ).await;
 
     #[cfg(not(feature = "goose-agent"))]
@@ -1575,6 +1576,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             recipe_repo,
             template_repo,
             extras_repo,
+            input == "whisper", // voice_mode
         ).await;
         a
     };
@@ -2355,6 +2357,7 @@ async fn build_goose_backend(
     recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
     template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync>,
     extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
+    voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
@@ -2393,6 +2396,9 @@ async fn build_goose_backend(
         Some(data_dir.to_path_buf()),
     ).await {
         Ok(adapter) => {
+            if voice_mode {
+                adapter.set_voice_mode(true);
+            }
             let ext_mgr: Arc<dyn ExtensionManagerPort> =
                 adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
@@ -2806,6 +2812,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             let request = AgentRequest {
@@ -2833,6 +2840,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             eprintln!("  {} — session: {}  (Ctrl+C or 'exit' to quit)",
@@ -2886,6 +2894,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                false,
             ).await;
 
             match ext_mgr {

@@ -49,6 +49,10 @@ pub struct PromptState {
     pub has_home_devices: bool,
     /// Comma-separated names of online devices, or empty string.
     pub online_device_names: String,
+    /// True when the user is interacting via voice (microphone + TTS).
+    /// When set, prompts instruct the LLM to keep responses short, spoken-friendly,
+    /// and free of visual formatting.
+    pub voice_mode: bool,
 }
 
 // ── Static fallback ───────────────────────────────────────────────────────────
@@ -108,7 +112,20 @@ If a request requires leaving the local network, say so clearly and wait for con
 {% endif %}
 
 IMPORTANT: Only use tools listed in your schema. Never use shell commands, bash, \
-python, curl, or execution tools. If a tool is unavailable, tell the user directly.";
+python, curl, or execution tools. If a tool is unavailable, tell the user directly.
+{% if voice_mode %}
+
+## Voice Mode
+The user is talking to you through a microphone. Your response will be read aloud by a \
+text-to-speech engine. Rules for voice interaction:
+- Keep responses short and conversational — 1 to 3 sentences for simple questions.
+- Never use Markdown, bullet points, numbered lists, code blocks, or any visual formatting.
+- Spell out abbreviations and symbols (say \"degrees Celsius\" not \"°C\").
+- Use natural spoken phrasing — contractions, simple words, short sentences.
+- For longer answers, break into digestible spoken chunks. Pause between ideas.
+- If the user's speech was unclear, ask them to repeat rather than guessing.
+- Never read URLs, file paths, or long technical strings aloud — summarise instead.
+{% endif %}";
 
 /// Concise — minimal, action-first. For power users who want brevity.
 pub const PROMPT_CONCISE: &str = "\
@@ -126,7 +143,11 @@ Door/alarm: require explicit confirmation in same message. Unknown device: say n
 External network: ask before proceeding.
 {% endif %}
 
-ONLY use tools in your schema. NO shell, bash, curl, or execution tools.";
+ONLY use tools in your schema. NO shell, bash, curl, or execution tools.
+{% if voice_mode %}
+Voice mode active — responses read aloud via TTS. Keep answers short, conversational, \
+no formatting. Spell out symbols. Ask to repeat if unclear.
+{% endif %}";
 
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
 pub const PROMPT_TECHNICAL: &str = "\
@@ -153,7 +174,13 @@ routines with a lock or alarm step: pause and confirm that step separately.
 {% endif %}
 
 No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
-Tool use: ONLY use tools in your schema; NEVER use shell, bash, python, curl, or execution tools.";
+Tool use: ONLY use tools in your schema; NEVER use shell, bash, python, curl, or execution tools.
+{% if voice_mode %}
+
+Voice mode active — user is speaking via microphone, responses are read aloud. \
+Keep responses concise and spoken-friendly. No visual formatting. \
+Spell out symbols and abbreviations. Summarise URLs and paths instead of reading them.
+{% endif %}";
 
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
 pub const PROMPT_WARM: &str = "\
@@ -176,7 +203,13 @@ If I don't recognise a device I'll let you know and offer to add it. \
 I'll always ask before doing anything outside your home network.
 {% endif %}
 
-I only use the special tools I've been given — I never run shell commands or curl.";
+I only use the special tools I've been given — I never run shell commands or curl.
+{% if voice_mode %}
+
+You're in voice mode right now — I'm listening through the microphone and speaking my \
+answers out loud. I'll keep things short and chatty, no fancy formatting. If I didn't \
+catch something clearly, I'll ask you to say it again.
+{% endif %}";
 
 // ── Sanitization ──────────────────────────────────────────────────────────────
 
@@ -273,6 +306,7 @@ pub fn render_jinja_template(
     ctx.insert("device_count",        &device_count);
     ctx.insert("has_home_devices",    &has_home);
     ctx.insert("online_device_names", online_names);
+    ctx.insert("voice_mode",          &state.map(|s| s.voice_mode).unwrap_or(false));
 
     // Profile context
     ctx.insert(
@@ -554,6 +588,7 @@ mod tests {
             online_device_names: "Speaker, Hub".to_string(),
             current_date: "Thursday, 24 April 2026".to_string(),
             current_time: "10:00".to_string(),
+            ..Default::default()
         };
         let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
         assert!(result.contains("Connected Devices"));

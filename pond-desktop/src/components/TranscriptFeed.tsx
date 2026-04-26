@@ -107,8 +107,8 @@ const styles: Record<string, React.CSSProperties> = {
   },
   empty: {
     textAlign: "center",
-    fontSize: "12px",
-    color: "rgba(23,22,22,0.38)",
+    fontSize: "var(--text-sm)",
+    color: "var(--color-text-tertiary)",
     margin: "12px 0",
   },
   message: {
@@ -128,11 +128,11 @@ const styles: Record<string, React.CSSProperties> = {
   text: {
     margin: 0,
     lineHeight: "1.5",
-    color: "#171616",
+    color: "var(--color-text)",
     maxWidth: "88%",
     padding: "6px 10px",
-    borderRadius: "10px",
-    background: "rgba(23,22,22,0.05)",
+    borderRadius: "var(--radius-lg)",
+    background: "var(--color-border)",
     wordBreak: "break-word",
     userSelect: "text",
   },
@@ -145,6 +145,6 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: "4px",
   },
   cardWrapper: {
-    maxWidth: "340px",
+    maxWidth: "min(340px, 90%)",
   },
 };

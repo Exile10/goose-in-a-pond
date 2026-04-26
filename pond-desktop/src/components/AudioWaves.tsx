@@ -1,15 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { VoiceState } from "../state/reducer";
-
-// ── Palette ────────────────────────────────────────────────────
-const COLORS: Record<VoiceState, string> = {
-  idle:      "#8E8E93",
-  wait:      "#8C4BFF",
-  recording: "#8C4BFF",
-  thinking:  "#FF9500",
-  speaking:  "#34C759",
-  error:     "#FF3B30",
-};
+import { ORB_STATE_COLORS } from "../lib/colors";
 
 // ── Config ─────────────────────────────────────────────────────
 const CONFIG = {
@@ -87,7 +78,7 @@ export function AudioWaves({ state, audioLevel, size = "lg", style }: AudioWaves
 
       ctx.clearRect(0, 0, W, H);
 
-      const color = COLORS[state];
+      const color = ORB_STATE_COLORS[state];
       ctx.fillStyle = color;
 
       const phase = phaseRef.current;

@@ -40,6 +40,8 @@ pub struct PiperOutput {
     /// Optional path to the espeak-ng-data directory.
     /// When set, `--espeak_data <path>` is passed to piper.
     espeak_data: Option<PathBuf>,
+    /// Thinking tone stop flag — shared with the background tone thread.
+    thinking_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PiperOutput {
@@ -53,6 +55,7 @@ impl PiperOutput {
             model,
             sample_rate: 22_050,
             espeak_data: None,
+            thinking_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -91,6 +94,55 @@ impl PiperOutput {
 
 #[async_trait]
 impl VoiceOutput for PiperOutput {
+    fn start_thinking_tone(&self) {
+        use std::sync::atomic::Ordering;
+        // If already playing, don't spawn a second thread
+        if self.thinking_active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let flag = self.thinking_active.clone();
+        std::thread::spawn(move || {
+            use rodio::{OutputStream, Sink};
+
+            let Ok((_stream, handle)) = OutputStream::try_default() else {
+                flag.store(false, Ordering::SeqCst);
+                return;
+            };
+            let Ok(sink) = Sink::try_new(&handle) else {
+                flag.store(false, Ordering::SeqCst);
+                return;
+            };
+            sink.set_volume(0.08);
+
+            let rate = 22050u32;
+            let pulse_samples = rate as usize; // 1-second pulse
+            let pulse: Vec<f32> = (0..pulse_samples)
+                .map(|i| {
+                    let t = i as f32 / rate as f32;
+                    let envelope = (std::f32::consts::PI * t).sin();
+                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * envelope * 0.5
+                })
+                .collect();
+
+            while flag.load(Ordering::Relaxed) {
+                let buf = rodio::buffer::SamplesBuffer::new(1, rate, pulse.clone());
+                sink.append(buf);
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if !flag.load(Ordering::Relaxed) {
+                        sink.stop();
+                        return;
+                    }
+                }
+            }
+            sink.stop();
+        });
+    }
+
+    fn stop_thinking_tone(&self) {
+        self.thinking_active.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn speak(&self, text: &str) -> Result<()> {
         let bin = self.piper_bin.clone();
         let model = self.model.clone();

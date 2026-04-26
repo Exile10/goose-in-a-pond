@@ -46,9 +46,10 @@ fn tool_announcement(tool: &str) -> String {
     }
 }
 
-/// Short phrases spoken while the LLM is thinking (fills the audio silence).
+// Quips replaced by thinking tone (VoiceOutput::start_thinking_tone).
+// Kept for potential future use (e.g. text-only fallback).
+#[allow(dead_code)]
 const THINKING_QUIPS: &[&str] = &[
-    // "On it.",
     "Let me think.",
     "Ruffling through possibilities.",
     "One moment.",
@@ -56,12 +57,12 @@ const THINKING_QUIPS: &[&str] = &[
     "Processing.",
     "Wading in.",
     "Let me check.",
-    // "Good question.",
     "Thinking that through.",
     "Allow me a moment.",
     "Right, let me look at that.",
 ];
 
+#[allow(dead_code)]
 fn pick_quip() -> &'static str {
     let idx = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -350,17 +351,121 @@ fn find_marker_close(chars: &[char], start: usize, marker: &[char]) -> Option<us
     None
 }
 
+// ── Lookup tables for TTS normalization ──────────────────────────────────────
+
+/// Unit suffixes matched after a number. Sorted longest-first for greedy matching.
+const UNIT_SUFFIXES: &[(&str, &str)] = &[
+    // ── Compound / slash units ──
+    ("km/h",  " kilometers per hour"),
+    ("mi/h",  " miles per hour"),
+    ("KB/s",  " kilobytes per second"),
+    ("MB/s",  " megabytes per second"),
+    ("m/s",   " meters per second"),
+    ("ft/s",  " feet per second"),
+    ("fl oz", " fluid ounces"),
+    // ── Data (IEC binary) ──
+    ("KiB", " kibibytes"), ("MiB", " mebibytes"), ("GiB", " gibibytes"), ("TiB", " tebibytes"),
+    // ── Data speed ──
+    ("kbps", " kilobits per second"), ("Mbps", " megabits per second"), ("Gbps", " gigabits per second"),
+    // ── Energy (long) ──
+    ("kWh", " kilowatt hours"), ("kcal", " kilocalories"), ("BTU", " B T U"),
+    // ── Frequency ──
+    ("THz", " terahertz"), ("GHz", " gigahertz"), ("MHz", " megahertz"), ("kHz", " kilohertz"),
+    // ── Power ──
+    ("GW", " gigawatts"), ("MW", " megawatts"), ("kW", " kilowatts"), ("mW", " milliwatts"),
+    // ── Voltage ──
+    ("kV", " kilovolts"), ("mV", " millivolts"),
+    // ── Current ──
+    ("mA", " milliamps"), ("μA", " microamps"),
+    // ── Resistance ──
+    ("MΩ", " megaohms"), ("kΩ", " kilohms"),
+    // ── Pressure ──
+    ("MPa", " megapascals"), ("kPa", " kilopascals"),
+    ("mmHg", " millimeters of mercury"),
+    ("atm", " atmospheres"), ("bar", " bar"), ("psi", " P S I"),
+    // ── Energy ──
+    ("MJ", " megajoules"), ("kJ", " kilojoules"),
+    ("cal", " calories"), ("eV", " electron volts"), ("Wh", " watt hours"),
+    // ── Sound ──
+    ("dBA", " D B A"), ("dB", " decibels"),
+    // ── Duration ──
+    ("hrs", " hours"), ("sec", " seconds"), ("min", " minutes"),
+    ("ms", " milliseconds"), ("ns", " nanoseconds"), ("μs", " microseconds"),
+    ("hr", " hours"),
+    // ── Data storage ──
+    ("KB", " kilobytes"), ("MB", " megabytes"), ("GB", " gigabytes"),
+    ("TB", " terabytes"), ("PB", " petabytes"), ("EB", " exabytes"),
+    // ── Speed ──
+    ("mph", " miles per hour"), ("bps", " bits per second"),
+    // ── Area (with superscript) ──
+    ("km²", " square kilometers"), ("cm²", " square centimeters"),
+    ("m²", " square meters"), ("ft²", " square feet"), ("in²", " square inches"),
+    ("cm³", " cubic centimeters"), ("m³", " cubic meters"),
+    ("ha", " hectares"),
+    // ── Length ──
+    ("km", " kilometers"), ("cm", " centimeters"), ("mm", " millimeters"),
+    ("nm", " nanometers"), ("μm", " micrometers"),
+    ("mi", " miles"), ("ft", " feet"), ("yd", " yards"),
+    // ── Weight ──
+    ("kg", " kilograms"), ("mg", " milligrams"), ("μg", " micrograms"),
+    ("lbs", " pounds"), ("lb", " pounds"), ("oz", " ounces"), ("st", " stone"),
+    // ── Volume ──
+    ("mL", " milliliters"), ("dL", " deciliters"), ("kL", " kiloliters"),
+    ("gal", " gallons"), ("qt", " quarts"), ("pt", " pints"),
+    // ── Single-char units (last — shortest match) ──
+    ("Hz", " hertz"), ("Pa", " pascals"),
+    ("W", " watts"), ("V", " volts"), ("A", " amps"),
+    ("J", " joules"), ("Ω", " ohms"), ("L", " liters"),
+    ("m", " meters"), ("g", " grams"),
+];
+
+/// Currency symbols: (char, singular, plural).
+const CURRENCY_SYMBOLS: &[(char, &str, &str)] = &[
+    ('$', "dollar",   "dollars"),
+    ('£', "pound",    "pounds"),
+    ('€', "euro",     "euros"),
+    ('¥', "yen",      "yen"),
+    ('₹', "rupee",    "rupees"),
+    ('₽', "ruble",    "rubles"),
+    ('₩', "won",      "won"),
+    ('₪', "shekel",   "shekels"),
+    ('₦', "naira",    "naira"),
+    ('₱', "peso",     "pesos"),
+    ('₺', "lira",     "lira"),
+    ('₴', "hryvnia",  "hryvnias"),
+    ('₵', "cedi",     "cedis"),
+    ('₡', "colon",    "colones"),
+    ('₫', "dong",     "dong"),
+    ('₭', "kip",      "kip"),
+    ('₮', "tugrik",   "tugriks"),
+    ('₧', "peseta",   "pesetas"),
+    ('₣', "franc",    "francs"),
+];
+
+/// Standalone single-character symbols.
+const STANDALONE_SYMBOLS: &[(char, &str)] = &[
+    // Math
+    ('±', "plus or minus "), ('×', " times "), ('÷', " divided by "),
+    ('∞', "infinity"), ('≈', "approximately "), ('≤', "less than or equal to "),
+    ('≥', "greater than or equal to "), ('≠', "not equal to "),
+    ('√', "square root of "), ('π', "pi"),
+    ('²', " squared"), ('³', " cubed"),
+    // Fractions
+    ('½', "one half"), ('⅓', "one third"), ('⅔', "two thirds"),
+    ('¼', "one quarter"), ('¾', "three quarters"),
+    ('⅕', "one fifth"), ('⅖', "two fifths"), ('⅗', "three fifths"), ('⅘', "four fifths"),
+    ('⅙', "one sixth"), ('⅚', "five sixths"),
+    ('⅛', "one eighth"), ('⅜', "three eighths"), ('⅝', "five eighths"), ('⅞', "seven eighths"),
+    // Legal / typographic
+    ('©', "copyright"), ('®', "registered"), ('™', "trademark"),
+    ('§', "section"), ('¶', "paragraph"),
+    ('†', ""), ('‡', ""),
+    ('•', ", "),
+    ('—', ", "),
+];
+
 /// Convert symbols and abbreviations to their spoken equivalents so that
 /// TTS engines (Piper, etc.) pronounce them correctly.
-///
-/// Handles:
-/// - Temperature  `28°C` → "28 degrees Celsius", `28°F` → "28 degrees Fahrenheit",
-///                `28°`  → "28 degrees"
-/// - Percent      `50%`  → "50 percent"
-/// - Currency     `$50`  → "50 dollars", `£50` → "50 pounds", `€50` → "50 euros"
-/// - Time         `3:45pm` → "3 45 PM", `15:30` → "15 30", `9am` → "9 AM"
-/// - Ampersand    `&`    → "and"
-/// - At-sign      `@`    → "at"
 fn normalize_for_speech(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -371,9 +476,17 @@ fn normalize_for_speech(text: &str) -> String {
         let ch = chars[i];
 
         // ── Time: 3:45pm / 15:30 / 9am ────────────────────────────────────────
-        // Only attempt when the digit is not part of a larger number sequence.
         if ch.is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
             if let Some((spoken, advance)) = try_read_time(&chars, i) {
+                out.push_str(&spoken);
+                i += advance;
+                continue;
+            }
+        }
+
+        // ── Unit suffix after number: 5kg → "5 kilograms" ─────────────────────
+        if i > 0 && chars[i - 1].is_ascii_digit() && !ch.is_ascii_digit() {
+            if let Some((spoken, advance)) = try_read_unit_suffix(&chars, i) {
                 out.push_str(&spoken);
                 i += advance;
                 continue;
@@ -397,20 +510,59 @@ fn normalize_for_speech(text: &str) -> String {
             continue;
         }
 
-        // ── Currency symbols ───────────────────────────────────────────────────
-        if matches!(ch, '$' | '£' | '€') {
+        // ── Abbreviations: e.g. → "for example", Dr. → "doctor" ──────────────
+        if ch.is_alphabetic() {
+            if let Some((expansion, advance)) = try_read_abbreviation(&chars, i) {
+                out.push_str(&expansion);
+                i += advance;
+                continue;
+            }
+        }
+
+        // ── Period / dot — context-dependent ────────────────────────────────────
+        if ch == '.' {
+            // Between digits: "3.14" → "3 point 14"
+            // BUT keep as decimal when followed by a unit suffix (3.5GHz → "3.5 gigahertz")
+            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_digit = chars.get(i + 1).map_or(false, |c| c.is_ascii_digit());
+            if prev_digit && next_digit {
+                // Peek ahead: find the end of the digit run after the dot
+                let mut j = i + 1;
+                while j < len && chars[j].is_ascii_digit() { j += 1; }
+                // If a unit suffix follows the digits, keep the dot as-is (decimal)
+                let has_unit = try_read_unit_suffix(&chars, j).is_some();
+                if has_unit {
+                    out.push(ch);
+                    i += 1;
+                    continue;
+                }
+                out.push_str(" point ");
+                i += 1;
+                continue;
+            }
+            // Between letters (domain-like): "google.com" → "google dot com"
+            let prev_alpha = i > 0 && chars[i - 1].is_alphabetic();
+            let next_alpha = chars.get(i + 1).map_or(false, |c| c.is_alphabetic());
+            if prev_alpha && next_alpha {
+                out.push_str(" dot ");
+                i += 1;
+                continue;
+            }
+            // Sentence-ending / other punctuation: pass through for TTS
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // ── Currency symbols (table-driven) ────────────────────────────────────
+        if let Some(&(_, singular, plural)) = CURRENCY_SYMBOLS.iter().find(|&&(c, _, _)| c == ch) {
             let (num_str, advance) = read_number(&chars, i + 1);
             if advance > 0 {
-                let unit = match ch {
-                    '$' => "dollar",
-                    '£' => "pound",
-                    _   => "euro",
-                };
-                let plural = if num_str.trim_end_matches('s') != "1" { "s" } else { "" };
+                let is_one = num_str == "1" || num_str == "1.0" || num_str == "1.00";
+                let unit = if is_one { singular } else { plural };
                 out.push_str(&num_str);
                 out.push(' ');
                 out.push_str(unit);
-                out.push_str(plural);
                 i += 1 + advance;
                 continue;
             }
@@ -418,8 +570,6 @@ fn normalize_for_speech(text: &str) -> String {
 
         // ── Ampersand ──────────────────────────────────────────────────────────
         if ch == '&' {
-            // Only expand when surrounded by whitespace or at the boundary —
-            // avoids mangling HTML entities that survived markdown stripping.
             let prev_space = i == 0 || chars[i - 1].is_whitespace();
             let next_space = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
             if prev_space || next_space {
@@ -440,11 +590,137 @@ fn normalize_for_speech(text: &str) -> String {
             }
         }
 
+        // ── Number sign: #5 → "number 5" ──────────────────────────────────────
+        if ch == '#' && chars.get(i + 1).map_or(false, |c| c.is_ascii_digit()) {
+            out.push_str("number ");
+            i += 1;
+            continue;
+        }
+
+        // ── En dash: 3–5 → "3 to 5", otherwise a pause ───────────────────────
+        if ch == '–' {
+            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_digit = chars.get(i + 1).map_or(false, |c| c.is_ascii_digit());
+            if prev_digit && next_digit {
+                out.push_str(" to ");
+            } else {
+                out.push_str(", ");
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── Standalone symbol table ────────────────────────────────────────────
+        if let Some(&(_, spoken)) = STANDALONE_SYMBOLS.iter().find(|&&(c, _)| c == ch) {
+            out.push_str(spoken);
+            i += 1;
+            continue;
+        }
+
         out.push(ch);
         i += 1;
     }
 
-    out
+    // Collapse runs of whitespace from symbol substitutions.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Try to match a unit suffix at position `i` (immediately after a number ended).
+/// Allows one optional space between number and unit: "5kg" and "5 kg" both match.
+/// Rejects if the char after the suffix is alphabetic (prevents "5mining" → "5 minutes").
+/// Common abbreviations with periods — matched case-insensitively.
+/// (abbreviation_lowercase, expansion, char_length_including_dots)
+const ABBREVIATIONS: &[(&str, &str)] = &[
+    ("e.g.",  "for example"),
+    ("i.e.",  "that is"),
+    ("etc.",  "etcetera"),
+    ("vs.",   "versus"),
+    ("approx.", "approximately"),
+    ("dept.", "department"),
+    ("govt.", "government"),
+    ("assn.", "association"),
+    ("inc.",  "incorporated"),
+    ("corp.", "corporation"),
+    ("ltd.",  "limited"),
+    ("prof.", "professor"),
+    ("dr.",   "doctor"),
+    ("mr.",   "mister"),
+    ("mrs.",  "missus"),
+    ("ms.",   "miss"),
+    ("jr.",   "junior"),
+    ("sr.",   "senior"),
+    ("st.",   "saint"),
+    ("ave.",  "avenue"),
+    ("blvd.", "boulevard"),
+    ("ft.",   "fort"),
+    ("mt.",   "mount"),
+    ("no.",   "number"),
+    ("vol.",  "volume"),
+    ("ch.",   "chapter"),
+    ("pg.",   "page"),
+    ("fig.",  "figure"),
+    ("approx.", "approximately"),
+    ("max.",  "maximum"),
+    ("min.",  "minimum"),
+    ("temp.", "temperature"),
+    ("est.",  "established"),
+    ("jan.",  "January"), ("feb.", "February"), ("mar.", "March"),
+    ("apr.",  "April"), ("jun.", "June"), ("jul.", "July"),
+    ("aug.",  "August"), ("sep.", "September"), ("oct.", "October"),
+    ("nov.",  "November"), ("dec.", "December"),
+];
+
+/// Try to match a common abbreviation starting at position `i`.
+/// `i` must be at a word boundary (start-of-string or after whitespace/punctuation).
+/// Returns `(expansion, total_chars_consumed)`.
+fn try_read_abbreviation(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let len = chars.len();
+    // Must be at a word boundary
+    let at_boundary = i == 0
+        || chars[i - 1].is_whitespace()
+        || matches!(chars[i - 1], '(' | ',' | '"' | '\'' | '[');
+    if !at_boundary { return None; }
+
+    // Build a lowercase window from position i (up to 10 chars)
+    let window_end = (i + 10).min(len);
+    let window: String = chars[i..window_end]
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    for &(abbrev, expansion) in ABBREVIATIONS {
+        if window.starts_with(abbrev) {
+            let consumed = abbrev.chars().count();
+            return Some((expansion.to_string(), consumed));
+        }
+    }
+    None
+}
+
+fn try_read_unit_suffix(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let len = chars.len();
+    let (unit_start, space_consumed) = if i < len && chars[i] == ' ' {
+        (i + 1, 1usize)
+    } else {
+        (i, 0usize)
+    };
+    if unit_start >= len { return None; }
+
+    for &(suffix, spoken) in UNIT_SUFFIXES {
+        let suffix_chars: Vec<char> = suffix.chars().collect();
+        let slen = suffix_chars.len();
+        if unit_start + slen > len { continue; }
+
+        let matches = suffix_chars.iter().enumerate().all(|(j, &sc)| chars[unit_start + j] == sc);
+        if !matches { continue; }
+
+        // Alphabetic continuation guard
+        let after = unit_start + slen;
+        if after < len && chars[after].is_alphabetic() { continue; }
+
+        return Some((spoken.to_string(), space_consumed + slen));
+    }
+    None
 }
 
 /// Scan a number (digits, optional single `.` for decimals) starting at `start`.
@@ -568,7 +844,7 @@ fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
 /// middle of a block that started in an earlier event).
 ///
 /// Returns `(visible_text, updated_in_block)`.
-fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
+pub fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
     let mut visible = String::with_capacity(chunk.len());
     let mut rest = chunk;
 
@@ -837,20 +1113,16 @@ impl ChatService {
             model_role: resolve_voice_role(&message),
         };
 
-        // Speak a quip immediately while the LLM warms up.  The handle is
-        // drained (once) before the first real speak() call so the quip never
-        // overlaps with the response audio.
-        let quip_voice = self.voice_output.clone();
-        let quip_text  = pick_quip();
-        let mut quip_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
-            let _ = quip_voice.speak(quip_text).await;
-        }));
+        // Start a soft ambient thinking tone while the LLM infers.
+        // Stopped as soon as the first speakable content arrives.
+        self.voice_output.start_thinking_tone();
+        let mut tone_stopped = false;
 
-        // Helper: await the quip task exactly once (no-op on subsequent calls).
-        macro_rules! drain_quip {
+        macro_rules! stop_tone {
             () => {
-                if let Some(h) = quip_handle.take() {
-                    let _ = h.await;
+                if !tone_stopped {
+                    self.voice_output.stop_thinking_tone();
+                    tone_stopped = true;
                 }
             };
         }
@@ -868,13 +1140,13 @@ impl ChatService {
                     if !sentence_buf.trim().is_empty() {
                         let chunk = sentence_buf.trim().to_string();
                         sentence_buf.clear();
-                        drain_quip!();
+                        stop_tone!();
                         if let Err(e) = self.voice_output.speak(&chunk).await {
                             tracing::warn!("TTS failed: {}", e);
                         }
                     }
                     let announcement = tool_announcement(&tool);
-                    drain_quip!();
+                    stop_tone!();
                     if let Err(e) = self.voice_output.speak(&announcement).await {
                         tracing::warn!("Tool announcement TTS failed: {}", e);
                     }
@@ -902,7 +1174,7 @@ impl ChatService {
                         if spoken.is_empty() {
                             continue;
                         }
-                        drain_quip!();
+                        stop_tone!();
                         if let Err(e) = self.voice_output.speak(&spoken).await {
                             tracing::warn!("TTS failed: {}", e);
                         }
@@ -914,7 +1186,7 @@ impl ChatService {
                     if !remainder.is_empty() {
                         let spoken = strip_markdown_for_speech(&remainder);
                         if !spoken.is_empty() {
-                            drain_quip!();
+                            stop_tone!();
                             if let Err(e) = self.voice_output.speak(&spoken).await {
                                 tracing::warn!("TTS flush failed: {}", e);
                             }
@@ -937,16 +1209,15 @@ impl ChatService {
         if !remainder.is_empty() {
             let spoken = strip_markdown_for_speech(&remainder);
             if !spoken.is_empty() {
-                drain_quip!();
+                stop_tone!();
                 if let Err(e) = self.voice_output.speak(&spoken).await {
                     tracing::warn!("TTS final flush failed: {}", e);
                 }
             }
         }
 
-        // If the model produced no speakable text at all, ensure the quip task
-        // is still joined (avoids a detached task leaking into the next turn).
-        drain_quip!();
+        // Ensure the thinking tone is stopped even if no speakable text was produced.
+        stop_tone!();
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(full_text.clone());
@@ -970,58 +1241,109 @@ impl ChatService {
     ///
     /// Input is obtained via the `VoiceInput` port (stdin by default).
     pub async fn run_loop(&self) -> Result<()> {
+        // First interaction always requires the wake word.
+        // After that, conversational turn-taking: Goose listens for the user's
+        // next turn directly after speaking, no wake word needed.
+        // If the user doesn't speak (empty transcription), fall back to wake word.
+        let mut first_turn = true;
+
         loop {
-            // ── Wait ──
-            self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
-            println!("\n  🟢 {} (type \"exit\" to quit)", self.wake_word_detector.activation_prompt());
-            io::stdout().flush()?;
+            let input = if first_turn {
+                // ── Wait for wake word ──
+                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
+                println!("\n  🟢 {} (type \"exit\" to quit)", self.wake_word_detector.activation_prompt());
+                io::stdout().flush()?;
 
-            // All detectors implement StreamingWakeWordDetector.  Detectors that
-            // capture audio after the wake word (e.g. WhisperKeywordDetector) return
-            // Some(wav) here, enabling the one-breath flow.  InstantActivation returns
-            // None and the Listen state records a fresh clip as normal.
-            let activation = self.wake_word_detector.wait_for_activation_with_audio().await?;
+                let activation = self.wake_word_detector.wait_for_activation_with_audio().await?;
 
-            // ── Listen ──
-            self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
-            print!("  {}", self.voice_input.prompt());
-            io::stdout().flush()?;
+                // ── Listen (one-breath or fresh recording) ──
+                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                print!("  {}", self.voice_input.prompt());
+                io::stdout().flush()?;
 
-            // Prime the voice input with the already-captured command audio when
-            // the detector handed it off (one-breath flow).
-            if let Some(wav) = activation.captured_audio {
-                self.voice_input.prime_with_captured(wav);
-            }
+                if let Some(wav) = activation.captured_audio {
+                    self.voice_input.prime_with_captured(wav);
+                }
 
-            let input = match self.voice_input.listen().await? {
-                None => {
+                self.voice_input.listen().await?
+            } else {
+                // ── Conversational turn — listen without wake word ──
+                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                println!("\n  🎧 Listening for your reply...");
+                io::stdout().flush()?;
+
+                self.voice_input.listen().await?
+            };
+
+            let input = match input {
+                None if first_turn => {
+                    // Stdin EOF — exit the loop
                     self.emit_event(WorkflowEvent::Exit);
                     println!("\n  ⏹ End of input.");
                     break;
                 }
-                Some(text) if text.is_empty() => continue,
+                None => {
+                    // Conversational mode, no speech — reset to wake word
+                    println!("  💤 No speech detected, returning to wake word mode.");
+                    first_turn = true;
+                    continue;
+                }
+                Some(text) if text.is_empty() => {
+                    // Empty transcription — fall back to wake word mode
+                    if !first_turn {
+                        println!("  💤 No speech detected, returning to wake word mode.");
+                    }
+                    first_turn = true;
+                    continue;
+                }
                 Some(text) => text,
             };
 
-            if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+            // ── Dismissal / sleep commands → speak farewell, return to wake word ──
+            let lower = input.trim().to_lowercase();
+            let lower = lower.trim_end_matches(|c: char| c == '.' || c == '!');
+            if matches!(
+                lower,
+                "bye" | "goodbye" | "good bye" | "dismissed" | "go to sleep"
+                    | "that's all" | "thats all" | "never mind" | "nevermind"
+                    | "stop" | "stop listening"
+            ) {
+                let farewell = "Until next time. Just say my name when you need me.";
+                println!("  🫡 {}", farewell);
+                if let Err(e) = self.voice_output.speak(farewell).await {
+                    tracing::warn!("TTS farewell failed: {}", e);
+                }
+                first_turn = true;
+                continue;
+            }
+
+            // ── Hard exit (terminates the voice loop entirely) ──
+            if matches!(lower, "exit" | "quit") {
+                let farewell = "Goodbye! I'll be here whenever you need me.";
+                println!("  👋 {}", farewell);
+                if let Err(e) = self.voice_output.speak(farewell).await {
+                    tracing::warn!("TTS farewell failed: {}", e);
+                }
                 self.emit_event(WorkflowEvent::Exit);
-                println!("  👋 Goodbye!");
                 break;
             }
+
+            // Conversation is active — subsequent turns skip the wake word
+            first_turn = false;
 
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
             // ── Thinking → Speak (streaming) ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
-            println!("  🤔 Thinking...");
 
             match self.chat_stream_once(input).await {
                 Ok(response_text) => {
-                    // Speaking happened inside chat_stream_once; just emit the event.
                     self.emit_event(WorkflowEvent::AgentOutput(response_text));
                 }
                 Err(e) => {
                     eprintln!("  ❌ Error: {}", e);
+                    // On error, fall back to wake word mode
+                    first_turn = true;
                 }
             }
         }
@@ -1370,6 +1692,141 @@ mod tests {
             strip_markdown_for_speech("Temperature: **28°C** and humidity **72%**"),
             "Temperature: 28 degrees Celsius and humidity 72 percent"
         );
+    }
+
+    // ── Unit suffix tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_unit_kg() {
+        assert_eq!(normalize_for_speech("5kg"), "5 kilograms");
+    }
+    #[test]
+    fn normalize_unit_kg_space() {
+        assert_eq!(normalize_for_speech("5 kg"), "5 kilograms");
+    }
+    #[test]
+    fn normalize_unit_no_false_positive() {
+        assert_eq!(normalize_for_speech("asking"), "asking");
+    }
+    #[test]
+    fn normalize_unit_km_per_h() {
+        assert_eq!(normalize_for_speech("100km/h"), "100 kilometers per hour");
+    }
+    #[test]
+    fn normalize_unit_ghz() {
+        assert_eq!(normalize_for_speech("3.5GHz"), "3.5 gigahertz");
+    }
+    #[test]
+    fn normalize_unit_kwh() {
+        assert_eq!(normalize_for_speech("2kWh"), "2 kilowatt hours");
+    }
+    #[test]
+    fn normalize_unit_no_false_positive_mining() {
+        assert_eq!(normalize_for_speech("5mining"), "5mining");
+    }
+    #[test]
+    fn normalize_unit_mb() {
+        assert_eq!(normalize_for_speech("10MB"), "10 megabytes");
+    }
+    #[test]
+    fn normalize_unit_sq_meters() {
+        assert_eq!(normalize_for_speech("5m²"), "5 square meters");
+    }
+    #[test]
+    fn normalize_unit_db() {
+        assert_eq!(normalize_for_speech("80dB"), "80 decibels");
+    }
+    #[test]
+    fn normalize_unit_mph() {
+        assert_eq!(normalize_for_speech("60mph"), "60 miles per hour");
+    }
+
+    // ── Expanded currency tests ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_yen() {
+        assert_eq!(normalize_for_speech("¥500"), "500 yen");
+    }
+    #[test]
+    fn normalize_rupee_singular() {
+        assert_eq!(normalize_for_speech("₹1"), "1 rupee");
+    }
+    #[test]
+    fn normalize_rupee_plural() {
+        assert_eq!(normalize_for_speech("₹100"), "100 rupees");
+    }
+
+    // ── Standalone symbol tests ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_plus_minus() {
+        assert_eq!(normalize_for_speech("±5"), "plus or minus 5");
+    }
+    #[test]
+    fn normalize_pi() {
+        assert_eq!(normalize_for_speech("π"), "pi");
+    }
+    #[test]
+    fn normalize_fraction_half() {
+        assert_eq!(normalize_for_speech("½"), "one half");
+    }
+    #[test]
+    fn normalize_en_dash_range() {
+        assert_eq!(normalize_for_speech("3–5"), "3 to 5");
+    }
+    #[test]
+    fn normalize_copyright() {
+        assert_eq!(normalize_for_speech("©"), "copyright");
+    }
+    #[test]
+    fn normalize_squared() {
+        assert_eq!(normalize_for_speech("5²"), "5 squared");
+    }
+    #[test]
+    fn normalize_number_sign() {
+        assert_eq!(normalize_for_speech("#5"), "number 5");
+    }
+
+    // ── Period / dot tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_dot_between_digits() {
+        assert_eq!(normalize_for_speech("3.14"), "3 point 14");
+    }
+    #[test]
+    fn normalize_dot_domain() {
+        assert_eq!(normalize_for_speech("google.com"), "google dot com");
+    }
+    #[test]
+    fn normalize_dot_sentence_end() {
+        assert_eq!(normalize_for_speech("Hello."), "Hello.");
+    }
+    #[test]
+    fn normalize_dot_ip_address() {
+        assert_eq!(normalize_for_speech("192.168.1.1"), "192 point 168 point 1 point 1");
+    }
+    #[test]
+    fn normalize_dot_version() {
+        assert_eq!(normalize_for_speech("v3.2"), "v3 point 2");
+    }
+
+    // ── Abbreviation tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_abbrev_eg() {
+        assert_eq!(normalize_for_speech("e.g. cats"), "for example cats");
+    }
+    #[test]
+    fn normalize_abbrev_ie() {
+        assert_eq!(normalize_for_speech("i.e. dogs"), "that is dogs");
+    }
+    #[test]
+    fn normalize_abbrev_etc() {
+        assert_eq!(normalize_for_speech("cats, etc."), "cats, etcetera");
+    }
+    #[test]
+    fn normalize_abbrev_dr() {
+        assert_eq!(normalize_for_speech("Dr. Smith"), "doctor Smith");
     }
 
     #[tokio::test]

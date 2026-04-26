@@ -695,6 +695,7 @@ async fn chat_stream(
         };
 
         let mut full_text = String::new();
+        let mut in_think_block = false; // filter <think> blocks before SSE
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -718,8 +719,14 @@ async fn chat_stream(
                             json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
                         }
                         AgentStreamEvent::Text { content } => {
-                            full_text.push_str(&content);
-                            json!({"type": "text", "content": content, "token": content}).to_string()
+                            // Filter <think>…</think> blocks before sending to clients.
+                            let (visible, new_state) = pond_core::services::chat::filter_thinking(&content, in_think_block);
+                            in_think_block = new_state;
+                            if visible.is_empty() {
+                                continue;
+                            }
+                            full_text.push_str(&visible);
+                            json!({"type": "text", "content": visible}).to_string()
                         }
                         AgentStreamEvent::Done { .. } => {
                             // Handled at the end of the loop
@@ -3517,6 +3524,7 @@ async fn agent_chat_stream(
             model_role: "task".to_string(),
         };
 
+        let mut in_think_block = false; // filter <think> blocks
         let mut agent_stream = match agent.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => {
@@ -3540,7 +3548,12 @@ async fn agent_chat_stream(
                             json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string()
                         }
                         AgentStreamEvent::Text { content } => {
-                            json!({"type": "text", "content": content, "token": content}).to_string()
+                            let (visible, new_state) = pond_core::services::chat::filter_thinking(&content, in_think_block);
+                            in_think_block = new_state;
+                            if visible.is_empty() {
+                                continue;
+                            }
+                            json!({"type": "text", "content": visible}).to_string()
                         }
                         AgentStreamEvent::Done { .. } => {
                             json!({"done": true, "session_id": session_id.clone()}).to_string()

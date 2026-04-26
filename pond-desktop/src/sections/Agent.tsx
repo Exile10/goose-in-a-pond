@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef } from "react";
-import { Tabs, Button, Chip, TextArea } from "@heroui/react";
-import { Trash2, Plus, Send, Wrench } from "lucide-react";
+import {
+  Tabs,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+} from "@heroui/react";
+import { Trash2, Plus, Send, Wrench, Terminal, FileText, ChefHat } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { AgentTool, AgentRecipe, PromptExtra, ChatEvent } from "../api/types";
 
@@ -10,36 +16,37 @@ export function Agent() {
   const [tab, setTab] = useState<Tab>("chat");
 
   return (
-    <div style={styles.root}>
+    <div className="screen">
+      {/* Page header */}
+      <div className="page-header">
+        <h1 className="page-header__title">Agent</h1>
+      </div>
+
       <Tabs
         selectedKey={tab}
         onSelectionChange={(k) => setTab(k as Tab)}
       >
         <Tabs.ListContainer>
-          <Tabs.List aria-label="Agent sections">
-            <Tabs.Tab id="chat">
-              <Tabs.Indicator />
-              Chat
-            </Tabs.Tab>
-            <Tabs.Tab id="tools">
-              <Tabs.Indicator />
-              MCP Tools
-            </Tabs.Tab>
-            <Tabs.Tab id="extras">
-              <Tabs.Indicator />
-              Prompt Extras
-            </Tabs.Tab>
-            <Tabs.Tab id="recipes">
-              <Tabs.Indicator />
-              Recipes
-            </Tabs.Tab>
+          <Tabs.List aria-label="Agent sections" className="agent-tabs">
+            {[
+              { id: "chat", label: "Chat" },
+              { id: "tools", label: "MCP Tools" },
+              { id: "extras", label: "Prompt Extras" },
+              { id: "recipes", label: "Recipes" },
+            ].map((t) => (
+              <Tabs.Tab key={t.id} id={t.id} onClick={() => setTab(t.id as Tab)} className="agent-tab">
+                <Tabs.Indicator />
+                {t.label}
+              </Tabs.Tab>
+            ))}
           </Tabs.List>
         </Tabs.ListContainer>
-        <Tabs.Panel id="chat"><AgentChatPanel /></Tabs.Panel>
-        <Tabs.Panel id="tools"><ToolsPanel /></Tabs.Panel>
-        <Tabs.Panel id="extras"><ExtrasPanel /></Tabs.Panel>
-        <Tabs.Panel id="recipes"><RecipesPanel /></Tabs.Panel>
       </Tabs>
+
+      {tab === "chat"    && <AgentChatPanel />}
+      {tab === "tools"   && <ToolsPanel />}
+      {tab === "extras"  && <ExtrasPanel />}
+      {tab === "recipes" && <RecipesPanel />}
     </div>
   );
 }
@@ -103,67 +110,80 @@ function AgentChatPanel() {
   }
 
   return (
-    <div style={styles.chatRoot}>
-      <div style={styles.chatMessages}>
-        {messages.length === 0 && (
-          <p style={hint}>Send a message. The agent can use MCP tools to take real actions.</p>
-        )}
-        {messages.map((msg, i) => {
-          if (msg.kind === "user") return (
-            <div key={i} style={styles.chatUserBubble}>{msg.text}</div>
-          );
-          if (msg.kind === "assistant") return (
-            <div key={i} style={styles.chatAssistantBubble}><pre style={styles.chatPre}>{msg.text}</pre></div>
-          );
-          if (msg.kind === "tool_call") return (
-            <div key={i} style={styles.chatToolCard}>
-              <Wrench size={12} style={{ flexShrink: 0, opacity: 0.7 }} />
-              <code style={{ fontSize: "var(--text-xs)" }}>{msg.tool}</code>
+    <Card shadow="none" className="giap-card agent-chat-card">
+      <CardContent style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", minHeight: "420px" }}>
+        {/* Messages */}
+        <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 4 }}>
+          {messages.length === 0 && (
+            <div className="empty-state">
+              <Send size={28} />
+              <p>Send a message. The agent can use MCP tools to take real actions.</p>
             </div>
-          );
-          if (msg.kind === "status") return (
-            <div key={i} style={styles.chatStatus}>{msg.text}</div>
-          );
-          if (msg.kind === "error") return (
-            <div key={i} style={{ ...styles.chatStatus, color: "var(--color-destructive)" }}>{msg.text}</div>
-          );
-          return null;
-        })}
-        {busy && <div style={styles.chatStatus}>Agent working…</div>}
-        <div ref={bottomRef} />
-      </div>
-      <div style={styles.chatInputRow}>
-        <input
-          style={{ ...inputStyle, flex: 1 }}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-          placeholder="Ask the agent…"
-          disabled={busy}
-          aria-label="Agent message"
-        />
-        <Button variant="primary" onPress={send} isDisabled={busy || !input.trim()}>
-          <Send size={14} />
-        </Button>
-      </div>
-    </div>
+          )}
+          {messages.map((msg, i) => {
+            if (msg.kind === "user") return (
+              <div key={i} style={bubbleStyles.user}>{msg.text}</div>
+            );
+            if (msg.kind === "assistant") return (
+              <div key={i} style={bubbleStyles.assistant}><pre style={bubbleStyles.pre}>{msg.text}</pre></div>
+            );
+            if (msg.kind === "tool_call") return (
+              <div key={i} className="tool-call">
+                <Wrench size={12} />
+                <code>{msg.tool}</code>
+              </div>
+            );
+            if (msg.kind === "status") return (
+              <div key={i} style={bubbleStyles.status}>{msg.text}</div>
+            );
+            if (msg.kind === "error") return (
+              <div key={i} style={{ ...bubbleStyles.status, color: "var(--color-destructive)" }}>{msg.text}</div>
+            );
+            return null;
+          })}
+          {busy && <div style={bubbleStyles.status}>Agent working...</div>}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Composer */}
+        <div className="agent-chat-card__composer">
+          <input
+            style={{ ...composerInput, flex: 1 }}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            placeholder="Ask the agent..."
+            disabled={busy}
+            aria-label="Agent message"
+          />
+          <Button variant="primary" onPress={send} isDisabled={busy || !input.trim()}>
+            <Send size={14} />
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
 // ── MCP Tools ────────────────────────────────────────────────
 
 function ToolsPanel() {
-  const [tools, setTools]   = useState<AgentTool[]>([]);
+  const [tools, setTools]     = useState<AgentTool[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError]   = useState<string | null>(null);
+  const [error, setError]     = useState<string | null>(null);
 
   useEffect(() => {
     api.listTools().then(setTools).catch((e) => setError(String(e))).finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <p style={hint}>Loading tools…</p>;
-  if (error)   return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
-  if (!tools.length) return <p style={hint}>No MCP tools loaded. Start pond-server with an extension enabled.</p>;
+  if (loading) return <p className="muted-12">Loading tools...</p>;
+  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
+  if (!tools.length) return (
+    <div className="empty-state">
+      <Wrench size={28} />
+      <p>No MCP tools loaded. Start pond-server with an extension enabled.</p>
+    </div>
+  );
 
   // Group tools by extension
   const byExtension: Record<string, AgentTool[]> = {};
@@ -172,22 +192,32 @@ function ToolsPanel() {
   }
 
   return (
-    <div style={styles.panelRoot}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
       {Object.entries(byExtension).map(([ext, extTools]) => (
-        <div key={ext} style={styles.group}>
-          <div style={styles.groupHeader}>
-            <Chip variant="primary" size="sm">{ext}</Chip>
-            <span style={styles.toolCount}>{extTools.length} tool{extTools.length !== 1 ? "s" : ""}</span>
-          </div>
-          <ul style={styles.toolList}>
-            {extTools.map((t) => (
-              <li key={t.name} style={styles.toolItem}>
-                <code style={styles.toolName}>{t.name.replace(`${ext}__`, "")}</code>
-                {t.description && <p style={styles.toolDesc}>{t.description}</p>}
-              </li>
-            ))}
-          </ul>
-        </div>
+        <Card key={ext} shadow="none" className="giap-card">
+          <CardContent className="card-body--flush">
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderBottom: "1px solid var(--grey-200)", background: "var(--grey-50)" }}>
+              <Chip variant="primary" size="sm">{ext}</Chip>
+              <span className="muted-12" style={{ marginLeft: "auto" }}>
+                {extTools.length} tool{extTools.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+            <div>
+              {extTools.map((t) => (
+                <div key={t.name} className="tool-row">
+                  <span className="tool-row__icon"><Terminal size={14} /></span>
+                  <span className="tool-row__name">{t.name.replace(`${ext}__`, "")}</span>
+                  {t.description && (
+                    <Chip size="sm" variant="soft" style={{ marginLeft: 6 }}>
+                      {t.description.length > 50 ? t.description.slice(0, 47) + "..." : t.description}
+                    </Chip>
+                  )}
+                  <span className="tool-row__spacer" />
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
       ))}
     </div>
   );
@@ -196,13 +226,12 @@ function ToolsPanel() {
 // ── Prompt Extras ────────────────────────────────────────────
 
 function ExtrasPanel() {
-  const [extras, setExtras]   = useState<PromptExtra[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [key, setKey]         = useState("");
-  const [content, setContent] = useState("");
-  const [saving, setSaving]   = useState(false);
-  const [showForm, setShowForm] = useState(false);
-  const [error, setError]     = useState<string | null>(null);
+  const [extras, setExtras]     = useState<PromptExtra[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [key, setKey]           = useState("");
+  const [content, setContent]   = useState("");
+  const [saving, setSaving]     = useState(false);
+  const [error, setError]       = useState<string | null>(null);
 
   function load() {
     setLoading(true);
@@ -216,7 +245,7 @@ function ExtrasPanel() {
     setSaving(true);
     try {
       await api.addExtra(key.trim(), content.trim());
-      setKey(""); setContent(""); setShowForm(false); load();
+      setKey(""); setContent(""); load();
     } catch (e) { setError(String(e)); } finally { setSaving(false); }
   }
 
@@ -225,68 +254,63 @@ function ExtrasPanel() {
   }
 
   return (
-    <div style={styles.panelRoot}>
-      <div>
-        <Button
-          variant="outline"
-          onPress={() => setShowForm((v) => !v)}
-        >
-          <Plus size={14} /> Add Extra
-        </Button>
-      </div>
-
-      {showForm && (
-        <div style={styles.addCard}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
+      {/* Add form */}
+      <div className="extras-add">
+        <div>
           <input
+            style={composerInput}
             value={key}
             onChange={(e) => setKey(e.target.value)}
             placeholder="Key (e.g. context_note)"
             aria-label="Extra key"
-            style={inputStyle}
           />
-          <TextArea
-            value={content}
-            onChange={(e) => setContent(e.target.value)}
-            placeholder="Content injected into system prompt…"
-            aria-label="Extra content"
-            rows={3}
-          />
-          <Button
-            variant="primary"
-            onPress={add}
-            isDisabled={saving || !key.trim() || !content.trim()}
-          >
-            {saving ? "Saving…" : "Save"}
-          </Button>
         </div>
-      )}
+        <Button variant="primary" onPress={add} isDisabled={saving || !key.trim() || !content.trim()}>
+          <Plus size={14} />
+          Add
+        </Button>
+      </div>
+      <textarea
+        style={{ ...composerInput, height: "64px", resize: "vertical" as const, padding: "8px 12px" }}
+        value={content}
+        onChange={(e) => setContent(e.target.value)}
+        placeholder="Content injected into system prompt..."
+        aria-label="Extra content"
+      />
 
-      {error && <p style={styles.error}>{error}</p>}
-      {loading ? <p style={hint}>Loading…</p> : extras.length === 0 ? (
-        <p style={hint}>No prompt extras. Extras are injected into every agent system prompt.</p>
+      {error && <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>}
+
+      {loading ? (
+        <p className="muted-12">Loading...</p>
+      ) : extras.length === 0 ? (
+        <div className="empty-state--inline">
+          <FileText size={18} />
+          <span>No prompt extras. Extras are injected into every agent system prompt.</span>
+        </div>
       ) : (
-        <ul style={styles.extraList}>
-          {extras.map((ex) => (
-            <li key={ex.key} style={styles.extraItem}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={styles.extraHeader}>
-                  <code style={styles.extraKey}>{ex.key}</code>
-                  {!ex.enabled && <Chip size="sm" variant="soft">Disabled</Chip>}
-                </div>
-                <p style={styles.extraContent}>
-                  {ex.content.length > 120 ? ex.content.slice(0, 120) + "…" : ex.content}
-                </p>
+        <Card shadow="none" className="giap-card">
+          <CardContent className="card-body--flush">
+            {extras.map((ex) => (
+              <div key={ex.key} className="extra-row">
+                <code style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-base)", color: "var(--color-accent)", fontWeight: 600 }}>
+                  {ex.key}
+                </code>
+                {!ex.enabled && <Chip size="sm" variant="soft" color="warning">Disabled</Chip>}
+                <span style={{ flex: 1, fontSize: "var(--text-sm)", color: "var(--grey-600)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>
+                  {ex.content.length > 80 ? ex.content.slice(0, 77) + "..." : ex.content}
+                </span>
+                <Button
+                  variant="danger-soft"
+                  onPress={() => remove(ex.key)}
+                  aria-label="Delete extra"
+                >
+                  <Trash2 size={14} />
+                </Button>
               </div>
-              <Button
-                variant="danger-soft"
-                onPress={() => remove(ex.key)}
-                aria-label="Delete extra"
-              >
-                <Trash2 size={14} />
-              </Button>
-            </li>
-          ))}
-        </ul>
+            ))}
+          </CardContent>
+        </Card>
       )}
     </div>
   );
@@ -309,97 +333,129 @@ function RecipesPanel() {
 
   const current = recipes.find((r) => r.name === selected);
 
-  if (loading) return <p style={hint}>Loading recipes…</p>;
-  if (error)   return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
+  if (loading) return <p className="muted-12">Loading recipes...</p>;
+  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
   if (!recipes.length) return (
-    <p style={hint}>
-      No recipes found. Import one with{" "}
-      <code style={inlineCode}>pond-server recipes import &lt;name&gt; &lt;file.yaml&gt;</code>.
-    </p>
+    <Card shadow="none" className="giap-card">
+      <CardContent>
+        <div className="empty-state">
+          <ChefHat size={28} />
+          <p>No recipes found.</p>
+          <p className="muted-12">
+            Import one with{" "}
+            <Chip size="sm" variant="soft">
+              <code style={{ fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+                pond-server recipes import &lt;name&gt; &lt;file.yaml&gt;
+              </code>
+            </Chip>
+          </p>
+        </div>
+      </CardContent>
+    </Card>
   );
 
   return (
-    <div style={styles.panelRoot}>
-      <div style={styles.recipeLayout}>
-        <ul style={styles.recipeList}>
+    <div style={{ display: "flex", gap: 12, paddingTop: 8, minHeight: 320 }}>
+      {/* Recipe list */}
+      <Card shadow="none" className="giap-card" style={{ width: 200, flexShrink: 0 }}>
+        <CardContent className="card-body--list" style={{ padding: 4 }}>
           {recipes.map((r) => (
-            <li
+            <button
               key={r.name}
-              style={{ ...styles.recipeItem, ...(selected === r.name ? styles.recipeItemActive : {}) }}
+              className={`prompt-tab${selected === r.name ? " is-active" : ""}`}
               onClick={() => setSelected(r.name)}
+              style={{ width: "100%", textAlign: "left" }}
             >
-              <span style={styles.recipeName}>{r.name}</span>
-              {r.description && <span style={styles.recipeDesc}>{r.description}</span>}
-            </li>
+              <div className="prompt-tab__title">
+                <span>{r.name}</span>
+                {r.description && <span className="prompt-tab__desc">{r.description}</span>}
+              </div>
+            </button>
           ))}
-        </ul>
-        <div style={styles.recipeContent}>
+        </CardContent>
+      </Card>
+
+      {/* Recipe detail */}
+      <Card shadow="none" className="giap-card" style={{ flex: 1, minWidth: 0 }}>
+        <CardContent style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {current ? (
             <>
-              <div style={styles.recipeContentHeader}>
-                <span style={styles.recipeName}>{current.name}</span>
-                {current.description && <p style={styles.recipeFullDesc}>{current.description}</p>}
+              <div>
+                <span style={{ fontWeight: 600, fontSize: "var(--text-base)" }}>{current.name}</span>
+                {current.description && (
+                  <p style={{ margin: "4px 0 0", fontSize: "var(--text-sm)", color: "var(--grey-600)" }}>{current.description}</p>
+                )}
               </div>
-              <pre style={styles.yaml}>{current.yaml}</pre>
+              <pre style={{
+                flex: 1,
+                margin: 0,
+                padding: "var(--space-4)",
+                background: "var(--grey-50)",
+                border: "1px solid var(--grey-200)",
+                borderRadius: "var(--radius-card)",
+                fontFamily: "var(--font-mono)",
+                fontSize: "var(--text-xs)",
+                color: "var(--fg)",
+                lineHeight: "1.6",
+                overflow: "auto",
+                whiteSpace: "pre" as const,
+              }}>{current.yaml}</pre>
             </>
           ) : (
-            <p style={hint}>Select a recipe to view its YAML.</p>
+            <p className="muted-12">Select a recipe to view its YAML.</p>
           )}
-        </div>
-      </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
-// ── Styles ───────────────────────────────────────────────────
+// ── Shared input style ─────────────────────────────────────────
 
-const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
-const inputStyle: React.CSSProperties = { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", background: "var(--color-bg)", color: "var(--color-text)", width: "100%" };
-const inlineCode: React.CSSProperties = { fontFamily: "var(--font-mono)", fontSize: "0.85em", background: "rgba(23,22,22,0.06)", padding: "1px 5px", borderRadius: "4px" };
+const composerInput: React.CSSProperties = {
+  height: "36px",
+  border: "1px solid var(--grey-200)",
+  borderRadius: "var(--radius-card)",
+  padding: "0 12px",
+  fontSize: "var(--text-base)",
+  fontFamily: "var(--font-body)",
+  background: "#fff",
+  color: "var(--fg)",
+  width: "100%",
+};
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
+// ── Chat bubble styles ─────────────────────────────────────────
 
-  // Agent chat
-  chatRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)", paddingTop: "var(--space-3)", height: "480px" },
-  chatMessages: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "var(--space-2)", paddingRight: "var(--space-1)" },
-  chatInputRow: { display: "flex", gap: "var(--space-2)", alignItems: "center" },
-  chatUserBubble: { alignSelf: "flex-end", background: "var(--color-accent)", color: "#fff", borderRadius: "var(--radius-md) var(--radius-md) 2px var(--radius-md)", padding: "var(--space-2) var(--space-3)", fontSize: "var(--text-sm)", maxWidth: "80%", whiteSpace: "pre-wrap" as const },
-  chatAssistantBubble: { alignSelf: "flex-start", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "2px var(--radius-md) var(--radius-md) var(--radius-md)", padding: "var(--space-2) var(--space-3)", fontSize: "var(--text-sm)", maxWidth: "90%" },
-  chatPre: { margin: 0, fontFamily: "inherit", whiteSpace: "pre-wrap" as const, lineHeight: "1.55" },
-  chatToolCard: { display: "flex", alignItems: "center", gap: "var(--space-2)", alignSelf: "flex-start", background: "rgba(23,22,22,0.04)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-sm)", padding: "2px var(--space-2)", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" },
-  chatStatus: { alignSelf: "flex-start", fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", fontStyle: "italic" },
-
-  // Panel
-  panelRoot: { display: "flex", flexDirection: "column", gap: "var(--space-3)", paddingTop: "var(--space-3)" },
-
-  // Tools
-  group: { background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", overflow: "hidden" },
-  groupHeader: { display: "flex", alignItems: "center", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", borderBottom: "1px solid var(--color-border)", background: "rgba(23,22,22,0.02)" },
-  toolCount: { fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", marginLeft: "auto" },
-  toolList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "0" },
-  toolItem: { padding: "var(--space-3) var(--space-4)", borderBottom: "1px solid var(--color-border)", display: "flex", flexDirection: "column", gap: "2px" },
-  toolName: { fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: "var(--color-text)", fontWeight: 500 },
-  toolDesc: { margin: 0, fontSize: "var(--text-xs)", color: "var(--color-text-secondary)", lineHeight: "1.5" },
-
-  // Extras
-  addCard: { display: "flex", flexDirection: "column", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" },
-  error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
-  extraList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "4px" },
-  extraItem: { display: "flex", alignItems: "flex-start", gap: "var(--space-3)", padding: "var(--space-3) var(--space-4)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)" },
-  extraHeader: { display: "flex", alignItems: "center", gap: "var(--space-2)", marginBottom: "2px" },
-  extraKey: { fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: "var(--color-accent)", fontWeight: 600 },
-  extraContent: { margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", lineHeight: "1.5" },
-
-  // Recipes
-  recipeLayout: { display: "flex", gap: "var(--space-3)", minHeight: "320px" },
-  recipeList: { listStyle: "none", display: "flex", flexDirection: "column", gap: "2px", width: "180px", flexShrink: 0 },
-  recipeItem: { padding: "var(--space-2) var(--space-3)", borderRadius: "var(--radius-md)", cursor: "pointer", display: "flex", flexDirection: "column", gap: "2px", border: "1px solid transparent" },
-  recipeItemActive: { background: "var(--color-accent-soft)", borderColor: "var(--color-accent-soft)" },
-  recipeName: { fontWeight: 600, fontSize: "var(--text-sm)", color: "var(--color-text)" },
-  recipeDesc: { fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const },
-  recipeContent: { flex: 1, display: "flex", flexDirection: "column", gap: "var(--space-2)", minWidth: 0 },
-  recipeContentHeader: { display: "flex", flexDirection: "column", gap: "2px" },
-  recipeFullDesc: { margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-secondary)" },
-  yaml: { flex: 1, margin: 0, padding: "var(--space-4)", background: "rgba(23,22,22,0.03)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--color-text)", lineHeight: "1.6", overflow: "auto", whiteSpace: "pre" as const },
+const bubbleStyles: Record<string, React.CSSProperties> = {
+  user: {
+    alignSelf: "flex-end",
+    background: "var(--color-accent)",
+    color: "#fff",
+    borderRadius: "var(--radius-card) var(--radius-card) 2px var(--radius-card)",
+    padding: "8px 12px",
+    fontSize: "var(--text-sm)",
+    maxWidth: "80%",
+    whiteSpace: "pre-wrap",
+  },
+  assistant: {
+    alignSelf: "flex-start",
+    background: "#fff",
+    border: "1px solid var(--grey-200)",
+    borderRadius: "2px var(--radius-card) var(--radius-card) var(--radius-card)",
+    padding: "8px 12px",
+    fontSize: "var(--text-sm)",
+    maxWidth: "90%",
+  },
+  pre: {
+    margin: 0,
+    fontFamily: "inherit",
+    whiteSpace: "pre-wrap",
+    lineHeight: "1.55",
+  },
+  status: {
+    alignSelf: "flex-start",
+    fontSize: "var(--text-xs)",
+    color: "var(--grey-500)",
+    fontStyle: "italic",
+  },
 };
