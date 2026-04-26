@@ -19,8 +19,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Mic,
-  Layers,
   ScanFace,
+  Layers,
 } from "lucide-react";
 
 // ── Icon map — standard lucide icons matching each section's intent ──────────
@@ -37,6 +37,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   prompt:   PenLine,
   settings: Settings,
   face:     ScanFace,
+  canvas:   Layers,
   agent:    Bot,
 };
 
