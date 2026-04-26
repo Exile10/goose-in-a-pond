@@ -240,8 +240,9 @@ export interface HfModelFile {
 export interface DownloadEntry {
   filename: string;
   category: string;
-  progress_pct: number;
-  status: string;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  status: "downloading" | "done" | "error";
   error?: string;
 }
 
