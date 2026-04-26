@@ -462,3 +462,22 @@ input[type="range"]::-moz-range-track {
   margin-top: 2px;
   line-height: 1.4;
 }
+
+/* ── Skeleton shimmer animation ─────────────────────────────── */
+@keyframes shimmer {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.45; }
+  100% { opacity: 1; }
+}
+
+/* ── Model rows — native browser virtualization ─────────────── */
+.model-row {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 72px;
+}
+
+/* ── Responsive table wrapper ───────────────────────────────── */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}

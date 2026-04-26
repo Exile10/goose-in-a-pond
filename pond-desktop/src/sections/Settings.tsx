@@ -1,11 +1,21 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Tabs, Switch, Button, Chip } from "@heroui/react";
+import {
+  Tabs,
+  Switch,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  RadioGroup,
+  Radio,
+} from "@heroui/react";
 import { Trash2, Plus } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppDispatch, useAppState } from "../state/AppContext";
 import type { Settings as SettingsType, Extension } from "../api/types";
 import { ModelPickerModal, type ModelRole } from "../components/ModelPickerModal";
+const WakeWordCalibration = lazy(() => import("../components/WakeWordCalibration").then(m => ({ default: m.WakeWordCalibration })));
 
 // ── Tab definitions ───────────────────────────────────────────
 
@@ -24,62 +34,25 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
 
 // ── Shared form primitives ────────────────────────────────────
 
-function FormSection({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section style={sectionStyles.root}>
-      <h4 style={sectionStyles.title}>{title}</h4>
-      <div style={sectionStyles.body}>{children}</div>
-    </section>
+    <Card shadow="none" className="giap-card">
+      <CardContent>
+        <h4 className="section__title">{title}</h4>
+        <div className="section__rows">{children}</div>
+      </CardContent>
+    </Card>
   );
 }
 
 function FormRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div style={rowStyles.root}>
-      <div style={rowStyles.labelCol}>
-        <span style={rowStyles.label}>{label}</span>
-        {hint && <span style={rowStyles.hint}>{hint}</span>}
+    <div className="settings-row">
+      <div className="settings-row__label">
+        <div className="settings-row__name">{label}</div>
+        {hint && <div className="settings-row__hint">{hint}</div>}
       </div>
-      <div style={rowStyles.control}>{children}</div>
-    </div>
-  );
-}
-
-interface RadioOption<T extends string> {
-  value: T;
-  label: string;
-  desc?: string;
-}
-
-interface RadioGroupProps<T extends string> {
-  options: RadioOption<T>[];
-  value: T | undefined;
-  onChange: (v: T) => void;
-  name: string;
-}
-
-function RadioGroup<T extends string>({ options, value, onChange, name }: RadioGroupProps<T>) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
-      {options.map((opt) => (
-        <label
-          key={opt.value}
-          className={`radio-option${value === opt.value ? " selected" : ""}`}
-          onClick={() => onChange(opt.value)}
-        >
-          <input
-            type="radio"
-            name={name}
-            value={opt.value}
-            checked={value === opt.value}
-            onChange={() => onChange(opt.value)}
-          />
-          <div>
-            <div className="radio-label">{opt.label}</div>
-            {opt.desc && <div className="radio-desc">{opt.desc}</div>}
-          </div>
-        </label>
-      ))}
+      <div>{children}</div>
     </div>
   );
 }
@@ -111,11 +84,11 @@ const TIMEZONES = [
 
 function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="Personal">
+    <div className="settings-body">
+      <Section title="Personal">
         <FormRow label="Your name" hint="How Goose addresses you">
           <input
-            style={inp}
+            style={nativeInput}
             value={s.user_name ?? ""}
             onChange={(e) => patch("user_name", e.target.value)}
             placeholder="Friend"
@@ -123,7 +96,7 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
         </FormRow>
         <FormRow label="Assistant name" hint="What you call your assistant">
           <input
-            style={inp}
+            style={nativeInput}
             value={s.assistant_name ?? ""}
             onChange={(e) => patch("assistant_name", e.target.value)}
             placeholder="Goose"
@@ -131,7 +104,7 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
         </FormRow>
         <FormRow label="Timezone">
           <select
-            style={inp}
+            style={selectFallback}
             value={s.timezone ?? "UTC"}
             onChange={(e) => patch("timezone", e.target.value)}
           >
@@ -140,18 +113,18 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             ))}
           </select>
         </FormRow>
-      </FormSection>
+      </Section>
 
-      <FormSection title="Personality">
+      <Section title="Personality">
         <FormRow label="Personality" hint="Describe how your assistant should behave">
           <textarea
-            style={{ ...inp, height: "80px", resize: "vertical" }}
+            style={{ ...nativeInput, height: "80px", resize: "vertical" as const }}
             value={s.assistant_personality ?? s.personality ?? ""}
             onChange={(e) => patch("assistant_personality", e.target.value)}
             placeholder="Friendly, concise, and helpful"
           />
         </FormRow>
-      </FormSection>
+      </Section>
     </div>
   );
 }
@@ -162,25 +135,53 @@ function VoiceTab({
   hotkey,
   setHotkey,
   applyHotkey,
+  refreshSettings,
 }: {
   s: Partial<SettingsType>;
   patch: (k: keyof SettingsType, v: unknown) => void;
   hotkey: string;
   setHotkey: (v: string) => void;
   applyHotkey: () => void;
+  refreshSettings: () => Promise<void>;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [calibrating, setCalibrating] = useState(false);
   const recDur = s.voice_recording_duration_secs ?? 30;
 
-  return (
-    <div style={panelStyles.root}>
+  const wakePhrase = (s.voice_wake_word ?? s.wake_word ?? "").trim();
+  const transcriptions = s.voice_wake_word_transcriptions ?? [];
+  const isCalibrated = transcriptions.length > 0;
 
-      {/* ── Activation ──────────────────────────────────── */}
-      <FormSection title="Activation">
+  async function startCalibration() {
+    if (wakePhrase) {
+      try {
+        await api.updateSettings({ voice_wake_word: wakePhrase });
+        await api.resetWakeWordCalibration();
+      } catch { /* ignore -- calibration component handles errors */ }
+    }
+    setCalibrating(true);
+  }
+
+  async function handleCalibrationComplete() {
+    setCalibrating(false);
+    await refreshSettings();
+  }
+
+  async function clearCalibration() {
+    try {
+      await api.resetWakeWordCalibration();
+      patch("voice_wake_word_transcriptions", []);
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="settings-body">
+      {/* Activation */}
+      <Section title="Activation">
         <FormRow label="Keyboard shortcut" hint="Press this to activate voice from anywhere">
-          <div style={{ display: "flex", gap: "var(--space-2)" }}>
+          <div className="shortcut-row">
             <input
-              style={inp}
+              style={{ ...nativeInput, flex: 1 }}
               value={hotkey}
               onChange={(e) => setHotkey(e.target.value)}
               placeholder="CmdOrCtrl+Shift+V"
@@ -190,23 +191,65 @@ function VoiceTab({
         </FormRow>
         <FormRow label="Wake phrase" hint="Say this phrase to activate voice mode">
           <input
-            style={inp}
+            style={nativeInput}
             value={s.voice_wake_word ?? s.wake_word ?? ""}
             onChange={(e) => patch("voice_wake_word", e.target.value)}
             placeholder="goose"
+            disabled={calibrating}
           />
         </FormRow>
-        {/* Wake word info */}
-        <div style={wakeWordNote}>
-          <span style={wakeWordNoteIcon}>ℹ</span>
-          <span>
-            When set, the app listens passively while Voice mode is open and activates automatically when the phrase is heard. Leave blank to use the keyboard shortcut only.
-          </span>
-        </div>
-      </FormSection>
 
-      {/* ── Recording ───────────────────────────────────── */}
-      <FormSection title="Recording">
+        {/* Calibration status */}
+        {!calibrating && wakePhrase && (
+          <div style={calibrationRow}>
+            <span
+              style={{
+                ...calibrationDot,
+                background: isCalibrated ? "var(--color-success)" : "var(--color-warning)",
+              }}
+            />
+            <span style={calibrationLabel}>
+              {isCalibrated
+                ? `Calibrated (${transcriptions.length} variant${transcriptions.length !== 1 ? "s" : ""})`
+                : "Not calibrated"}
+            </span>
+            <div style={{ marginLeft: "auto", display: "flex", gap: "var(--space-2)" }}>
+              {isCalibrated && (
+                <Button variant="outline" size="sm" onPress={clearCalibration}>Clear</Button>
+              )}
+              <Button variant="outline" size="sm" onPress={startCalibration}>
+                {isCalibrated ? "Re-calibrate" : "Calibrate"}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Inline calibration component */}
+        {calibrating && wakePhrase && (
+          <Suspense fallback={<p className="muted-12">Loading calibration...</p>}>
+            <WakeWordCalibration
+              phrase={wakePhrase}
+              onComplete={handleCalibrationComplete}
+              onCancel={() => setCalibrating(false)}
+            />
+          </Suspense>
+        )}
+
+        {/* Wake word info */}
+        {!calibrating && (
+          <div style={wakeWordNote}>
+            <span style={wakeWordNoteIcon}>i</span>
+            <span>
+              {wakePhrase
+                ? "Calibrating improves detection accuracy by learning how Whisper transcribes your voice. Record 3-5 samples for best results."
+                : "When set, the app listens passively while Voice mode is open and activates automatically when the phrase is heard. Leave blank to use the keyboard shortcut only."}
+            </span>
+          </div>
+        )}
+      </Section>
+
+      {/* Recording */}
+      <Section title="Recording">
         <FormRow label={`Max listen time: ${recDur}s`} hint="Auto-stops recording after this duration">
           <input
             type="range"
@@ -218,23 +261,23 @@ function VoiceTab({
             style={{ width: "100%" }}
           />
         </FormRow>
-      </FormSection>
+      </Section>
 
-      {/* ── Advanced toggle ──────────────────────────────── */}
+      {/* Advanced toggle */}
       <button
         style={advancedToggleStyle}
         onClick={() => setShowAdvanced((v) => !v)}
         aria-expanded={showAdvanced}
       >
-        {showAdvanced ? "▾" : "▸"} Advanced voice settings
+        {showAdvanced ? "\u25BE" : "\u25B8"} Advanced voice settings
       </button>
 
       {showAdvanced && (
         <>
-          <FormSection title="Transcription">
+          <Section title="Transcription">
             <FormRow label="Server address" hint="Where the speech-to-text server is running">
               <input
-                style={inp}
+                style={nativeInput}
                 value={s.voice_whisper_url ?? ""}
                 onChange={(e) => patch("voice_whisper_url", e.target.value)}
                 placeholder="http://127.0.0.1:9000"
@@ -242,18 +285,18 @@ function VoiceTab({
             </FormRow>
             <FormRow label="Model file" hint="Speech recognition model (e.g. ggml-base.bin)">
               <input
-                style={inp}
+                style={nativeInput}
                 value={s.active_whisper_model ?? ""}
                 onChange={(e) => patch("active_whisper_model", e.target.value)}
                 placeholder="ggml-base.bin"
               />
             </FormRow>
-          </FormSection>
+          </Section>
 
-          <FormSection title="Speech Synthesis">
+          <Section title="Speech Synthesis">
             <FormRow label="Voice model" hint="Piper voice model file (.onnx)">
               <input
-                style={inp}
+                style={nativeInput}
                 value={s.active_tts_model ?? ""}
                 onChange={(e) => patch("active_tts_model", e.target.value)}
                 placeholder="en_US-lessac-medium.onnx"
@@ -262,7 +305,7 @@ function VoiceTab({
             <FormRow label="Voice name">
               <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
                 <input
-                  style={inp}
+                  style={{ ...nativeInput, flex: 1 }}
                   value={s.voice_tts_voice ?? ""}
                   onChange={(e) => patch("voice_tts_voice", e.target.value)}
                   placeholder="en_US-lessac-medium.onnx"
@@ -270,14 +313,14 @@ function VoiceTab({
                 <Button variant="outline" isDisabled title="Coming soon">Preview</Button>
               </div>
             </FormRow>
-          </FormSection>
+          </Section>
         </>
       )}
     </div>
   );
 }
 
-// Helper that shows the current model assignment and a "Change…" button
+// Helper that shows the current model assignment and a "Change{"\u2026"}" button
 function ModelRoleRow({
   provider,
   model,
@@ -289,11 +332,18 @@ function ModelRoleRow({
 }) {
   const label = provider && model ? `${provider} / ${model}` : "Not set";
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", width: "100%" }}>
-      <span style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)", color: provider ? "var(--color-text)" : "var(--color-text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+    <div className="model-picker">
+      <span className="model-picker__current" style={{
+        fontFamily: "var(--font-mono)",
+        fontSize: "var(--text-sm)",
+        color: provider ? "var(--fg)" : "var(--grey-500)",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}>
         {label}
       </span>
-      <Button variant="outline" onPress={onPick}>Change…</Button>
+      <Button variant="outline" onPress={onPick}>Change{"\u2026"}</Button>
     </div>
   );
 }
@@ -334,8 +384,8 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
   }
 
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="AI Models">
+    <div className="settings-body">
+      <Section title="AI Models">
         <FormRow label="Conversation" hint="Used for everyday chat and questions">
           <ModelRoleRow
             provider={s.chat_provider}
@@ -346,17 +396,15 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
 
         <FormRow label="Reasoning" hint="Used for complex, multi-step thinking">
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
-              <Switch
-                isSelected={thinkSameAsChat}
-                onChange={(v) => {
-                  setThinkSameAsChat(v);
-                  if (v) { patch("think_provider", null); patch("think_model", null); }
-                }}
-              >
-                Same as Conversation
-              </Switch>
-            </div>
+            <Switch
+              isSelected={thinkSameAsChat}
+              onChange={(v) => {
+                setThinkSameAsChat(v);
+                if (v) { patch("think_provider", null); patch("think_model", null); }
+              }}
+            >
+              Same as Conversation
+            </Switch>
             {!thinkSameAsChat && (
               <ModelRoleRow
                 provider={s.think_provider}
@@ -369,17 +417,15 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
 
         <FormRow label="Tools & Tasks" hint="Used when running actions or automations">
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
-              <Switch
-                isSelected={taskSameAsChat}
-                onChange={(v) => {
-                  setTaskSameAsChat(v);
-                  if (v) { patch("task_provider", null); patch("task_model", null); }
-                }}
-              >
-                Same as Conversation
-              </Switch>
-            </div>
+            <Switch
+              isSelected={taskSameAsChat}
+              onChange={(v) => {
+                setTaskSameAsChat(v);
+                if (v) { patch("task_provider", null); patch("task_model", null); }
+              }}
+            >
+              Same as Conversation
+            </Switch>
             {!taskSameAsChat && (
               <ModelRoleRow
                 provider={s.task_provider}
@@ -389,9 +435,9 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             )}
           </div>
         </FormRow>
-      </FormSection>
+      </Section>
 
-      <FormSection title="Response Quality">
+      <Section title="Response Quality">
         <FormRow label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
           <input
             type="range"
@@ -404,11 +450,15 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
           />
         </FormRow>
         <FormRow label="Response length" hint="Maximum length of each response">
-          <select style={inp} value={s.llm_max_tokens ?? 1024} onChange={(e) => patch("llm_max_tokens", Number(e.target.value))}>
+          <select
+            style={selectFallback}
+            value={s.llm_max_tokens ?? 1024}
+            onChange={(e) => patch("llm_max_tokens", Number(e.target.value))}
+          >
             {maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
           </select>
         </FormRow>
-      </FormSection>
+      </Section>
 
       {pickerRole && (
         <ModelPickerModal
@@ -424,46 +474,73 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
 }
 
 function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
-  const [customEnabled, setCustomEnabled] = useState(
-    !!s.custom_system_prompt
-  );
+  const [customEnabled, setCustomEnabled] = useState(!!s.custom_system_prompt);
   const addendum = s.prompt_addendum ?? "";
   const customPrompt = s.custom_system_prompt ?? "";
 
-  const styleOpts = [
-    { value: "balanced" as const, label: "Balanced", desc: "Natural conversation, medium length responses" },
-    { value: "concise" as const, label: "Concise", desc: "Short, direct answers. Minimal explanation" },
-    { value: "technical" as const, label: "Technical", desc: "Precise, detailed. Favors accuracy over brevity" },
-    { value: "warm" as const, label: "Warm", desc: "Friendly, encouraging tone. Conversational style" },
-  ];
-
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="Prompt Style">
+    <div className="settings-body">
+      <Section title="Prompt Style">
         <RadioGroup
-          name="prompt_style"
-          options={styleOpts}
-          value={(s.prompt_style ?? "balanced") as "balanced" | "concise" | "technical" | "warm"}
+          aria-label="Prompt style"
+          value={s.prompt_style ?? "balanced"}
           onChange={(v) => patch("prompt_style", v)}
-        />
-      </FormSection>
+        >
+          <Radio value="balanced">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Balanced</div>
+                <div className="settings-row__hint">Natural conversation, medium length responses</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="concise">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Concise</div>
+                <div className="settings-row__hint">Short, direct answers. Minimal explanation</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="technical">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Technical</div>
+                <div className="settings-row__hint">Precise, detailed. Favors accuracy over brevity</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="warm">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Warm</div>
+                <div className="settings-row__hint">Friendly, encouraging tone. Conversational style</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+        </RadioGroup>
+      </Section>
 
-      <FormSection title="Prompt Addendum">
+      <Section title="Prompt Addendum">
         <FormRow label="Additional context" hint="Appended to every system prompt">
           <div style={{ position: "relative" }}>
             <textarea
-              style={{ ...inp, height: "80px", resize: "vertical", width: "100%" }}
+              style={{ ...nativeInput, height: "80px", resize: "vertical" as const, width: "100%" }}
               value={addendum}
               maxLength={500}
               onChange={(e) => patch("prompt_addendum", e.target.value)}
-              placeholder="Extra instructions appended to every request…"
+              placeholder="Extra instructions appended to every request..."
             />
             <span style={charCounter}>{addendum.length}/500</span>
           </div>
         </FormRow>
-      </FormSection>
+      </Section>
 
-      <FormSection title="Custom System Prompt">
+      <Section title="Custom System Prompt">
         <FormRow label="Enable custom prompt">
           <Switch
             isSelected={customEnabled}
@@ -476,17 +553,17 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
         <FormRow label="System prompt" hint="Replaces the built-in system prompt entirely">
           <div style={{ position: "relative" }}>
             <textarea
-              style={{ ...inp, height: "140px", resize: "vertical", width: "100%", opacity: customEnabled ? 1 : 0.45 }}
+              style={{ ...nativeInput, height: "140px", resize: "vertical" as const, width: "100%", opacity: customEnabled ? 1 : 0.45 }}
               disabled={!customEnabled}
               value={customPrompt}
               maxLength={4000}
               onChange={(e) => patch("custom_system_prompt", e.target.value)}
-              placeholder="You are a helpful AI assistant…"
+              placeholder="You are a helpful AI assistant..."
             />
             {customEnabled && <span style={charCounter}>{customPrompt.length}/4000</span>}
           </div>
         </FormRow>
-      </FormSection>
+      </Section>
     </div>
   );
 }
@@ -495,8 +572,8 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
   const enabled = s.weather_enabled ?? false;
 
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="Weather">
+    <div className="settings-body">
+      <Section title="Weather">
         <FormRow label="Enable weather" hint="Allow the assistant to fetch current weather data">
           <Switch
             isSelected={enabled}
@@ -507,7 +584,7 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
         </FormRow>
         <FormRow label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
           <input
-            style={{ ...inp, opacity: enabled ? 1 : 0.45 }}
+            style={{ ...nativeInput, opacity: enabled ? 1 : 0.45 }}
             disabled={!enabled}
             value={s.weather_location_name ?? ""}
             onChange={(e) => patch("weather_location_name", e.target.value)}
@@ -517,8 +594,9 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
         <FormRow label="Latitude">
           <input
             type="number"
+            role="spinbutton"
             step={0.0001}
-            style={{ ...inp, opacity: enabled ? 1 : 0.45 }}
+            style={{ ...nativeInput, opacity: enabled ? 1 : 0.45 }}
             disabled={!enabled}
             value={s.weather_latitude ?? ""}
             onChange={(e) => patch("weather_latitude", Number(e.target.value))}
@@ -528,15 +606,16 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
         <FormRow label="Longitude">
           <input
             type="number"
+            role="spinbutton"
             step={0.0001}
-            style={{ ...inp, opacity: enabled ? 1 : 0.45 }}
+            style={{ ...nativeInput, opacity: enabled ? 1 : 0.45 }}
             disabled={!enabled}
             value={s.weather_longitude ?? ""}
             onChange={(e) => patch("weather_longitude", Number(e.target.value))}
             placeholder="36.8219"
           />
         </FormRow>
-      </FormSection>
+      </Section>
     </div>
   );
 }
@@ -544,37 +623,59 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
 function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
   const memInject = s.agent_memory_inject ?? false;
 
-  const modeOpts = [
-    { value: "auto" as const, label: "Smart (recommended)", desc: "Pond decides when to look things up or take actions" },
-    { value: "chat" as const, label: "Chat only", desc: "Conversation only — Pond won't use any tools" },
-    { value: "smart" as const, label: "Proactive", desc: "Pond actively uses tools to give more detailed answers" },
-  ];
-
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="How thorough should Pond be?">
+    <div className="settings-body">
+      <Section title="How thorough should Pond be?">
         <RadioGroup
-          name="agent_goose_mode"
-          options={modeOpts}
-          value={(s.agent_goose_mode ?? "auto") as "auto" | "chat" | "smart"}
+          aria-label="Agent mode"
+          value={s.agent_goose_mode ?? "auto"}
           onChange={(v) => patch("agent_goose_mode", v)}
-        />
-      </FormSection>
+        >
+          <Radio value="auto">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Smart (recommended)</div>
+                <div className="settings-row__hint">Pond decides when to look things up or take actions</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="chat">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Chat only</div>
+                <div className="settings-row__hint">Conversation only -- Pond won't use any tools</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="smart">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Proactive</div>
+                <div className="settings-row__hint">Pond actively uses tools to give more detailed answers</div>
+              </div>
+            </Radio.Content>
+          </Radio>
+        </RadioGroup>
+      </Section>
 
-      <FormSection title="Behaviour">
-        <FormRow label="How thorough" hint="How many steps Pond will take to answer a question (1–50)">
+      <Section title="Behaviour">
+        <FormRow label="How thorough" hint="How many steps Pond will take to answer a question (1-50)">
           <input
             type="number"
-            style={inp}
+            role="spinbutton"
+            style={nativeInput}
             min={1}
             max={50}
             value={s.agent_max_turns ?? 20}
             onChange={(e) => patch("agent_max_turns", Number(e.target.value))}
           />
         </FormRow>
-      </FormSection>
+      </Section>
 
-      <FormSection title="Memory">
+      <Section title="Memory">
         <FormRow label="Remember context" hint="Pond recalls facts from past conversations to give better answers">
           <Switch
             isSelected={memInject}
@@ -583,10 +684,11 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             Use conversation memory
           </Switch>
         </FormRow>
-        <FormRow label="How much to recall" hint="Number of past memories to include (1–20)">
+        <FormRow label="How much to recall" hint="Number of past memories to include (1-20)">
           <input
             type="number"
-            style={{ ...inp, opacity: memInject ? 1 : 0.45 }}
+            role="spinbutton"
+            style={{ ...nativeInput, opacity: memInject ? 1 : 0.45 }}
             disabled={!memInject}
             min={1}
             max={20}
@@ -594,7 +696,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             onChange={(e) => patch("agent_memory_limit", Number(e.target.value))}
           />
         </FormRow>
-      </FormSection>
+      </Section>
     </div>
   );
 }
@@ -611,61 +713,62 @@ function DataTab({
   onServerUrlChange: (v: string) => void;
 }) {
   return (
-    <div style={panelStyles.root}>
-      <FormSection title="Data Retention">
+    <div className="settings-body">
+      <Section title="Data Retention">
         <FormRow label="Event logs" hint="How many days to keep event log entries">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
-              style={{ ...inp, width: "80px" }}
+              role="spinbutton"
+              style={{ ...nativeInput, width: "80px" }}
               min={1}
               max={365}
               value={s.retention_event_log_days ?? 30}
               onChange={(e) => patch("retention_event_log_days", Number(e.target.value))}
             />
-            <span style={unitLabel}>days</span>
+            <span className="muted-12">days</span>
           </div>
         </FormRow>
         <FormRow label="Sensor readings" hint="How many days to keep sensor data">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
-              style={{ ...inp, width: "80px" }}
+              role="spinbutton"
+              style={{ ...nativeInput, width: "80px" }}
               min={1}
               max={365}
               value={s.retention_sensor_days ?? 7}
               onChange={(e) => patch("retention_sensor_days", Number(e.target.value))}
             />
-            <span style={unitLabel}>days</span>
+            <span className="muted-12">days</span>
           </div>
         </FormRow>
         <FormRow label="Session messages" hint="Maximum messages to keep per session">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
-              style={{ ...inp, width: "100px" }}
+              role="spinbutton"
+              style={{ ...nativeInput, width: "100px" }}
               min={10}
               max={10000}
               value={s.retention_session_messages_keep ?? 500}
               onChange={(e) => patch("retention_session_messages_keep", Number(e.target.value))}
             />
-            <span style={unitLabel}>messages</span>
+            <span className="muted-12">messages</span>
           </div>
         </FormRow>
-      </FormSection>
+      </Section>
 
-      <hr style={{ border: "none", borderTop: "1px solid var(--color-border)", margin: "var(--space-2) 0" }} />
-
-      <FormSection title="Desktop">
+      <Section title="Desktop">
         <FormRow label="Server URL" hint="pond-server base URL">
           <input
-            style={inp}
+            style={nativeInput}
             value={serverUrl}
             onChange={(e) => onServerUrlChange(e.target.value)}
             placeholder="http://127.0.0.1:4000"
           />
         </FormRow>
-      </FormSection>
+      </Section>
     </div>
   );
 }
@@ -675,7 +778,7 @@ function DataTab({
 export function Settings() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
-  const [tab, setTab]         = useState<SettingsTab>("identity");
+  const [tab, setTab]           = useState<SettingsTab>("identity");
   const [settings, setSettings] = useState<Partial<SettingsType>>({});
   const [loading, setLoading]   = useState(true);
   const [saving, setSaving]     = useState(false);
@@ -715,14 +818,24 @@ export function Settings() {
   }
 
   return (
-    <div style={styles.root}>
-      {/* HeroUI Tab bar */}
+    <div className="screen" style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+      {/* Page header */}
+      <div className="page-header">
+        <h2 className="page-header__title">Settings</h2>
+        <div className="page-header__action">
+          <Button variant="primary" onPress={save} isDisabled={saving || loading}>
+            {saving ? "Saving..." : saved ? "Saved" : "Save Settings"}
+          </Button>
+        </div>
+      </div>
+
+      {/* Tab bar */}
       <Tabs
         selectedKey={tab}
         onSelectionChange={(k) => setTab(k as SettingsTab)}
       >
         <Tabs.ListContainer>
-          <Tabs.List aria-label="Settings sections">
+          <Tabs.List aria-label="Settings sections" className="settings-tabs">
             {TABS.map((t) => (
               <Tabs.Tab key={t.id} id={t.id} onClick={() => setTab(t.id)}>
                 <Tabs.Indicator />
@@ -734,16 +847,16 @@ export function Settings() {
       </Tabs>
 
       {/* Error banner */}
-      {error && <p style={styles.error}>{error}</p>}
+      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0, flexShrink: 0 }}>{error}</p>}
 
-      {/* Panel area — conditionally rendered for test compatibility */}
-      <div style={styles.panel}>
+      {/* Panel area */}
+      <div style={{ flex: 1, overflowY: "auto", marginTop: 4 }}>
         {loading ? (
-          <p style={styles.hint}>Loading settings…</p>
+          <p className="muted-12">Loading settings...</p>
         ) : (
           <>
             {tab === "identity"  && <IdentityTab  s={settings} patch={patch} />}
-            {tab === "voice"     && <VoiceTab s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} />}
+            {tab === "voice"     && <VoiceTab s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} refreshSettings={async () => { try { const u = await api.getSettings(); setSettings(u); } catch { /* ignore */ } }} />}
             {tab === "models"    && <ModelsTab    s={settings} patch={patch} />}
             {tab === "prompts"   && <PromptsTab   s={settings} patch={patch} />}
             {tab === "location"  && <LocationTab  s={settings} patch={patch} />}
@@ -752,13 +865,6 @@ export function Settings() {
             {tab === "tools"     && <ToolsTab />}
           </>
         )}
-      </div>
-
-      {/* Save bar */}
-      <div style={styles.saveBar}>
-        <Button variant="primary" onPress={save} isDisabled={saving || loading}>
-          {saving ? "Saving…" : saved ? "Saved" : "Save Settings"}
-        </Button>
       </div>
     </div>
   );
@@ -806,10 +912,8 @@ function ToolsTab() {
     } catch (e) { setError(String(e)); } finally { setAdding(false); }
   }
 
-  const toolsInpStyle: React.CSSProperties = { height: "36px", border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)", padding: "0 var(--space-3)", fontSize: "var(--text-base)", background: "var(--color-bg)", color: "var(--color-text)", width: "100%" };
-
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+    <div className="settings-body">
       <div style={{ display: "flex", gap: "var(--space-2)" }}>
         <Button variant="outline" onPress={() => setShowForm((v) => !v)}>
           <Plus size={14} /> Add Extension
@@ -817,54 +921,72 @@ function ToolsTab() {
       </div>
 
       {showForm && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-4)" }}>
-          <input value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="Name (e.g. developer)" aria-label="Extension name" style={toolsInpStyle} />
-          <select value={addKind} onChange={(e) => setAddKind(e.target.value as "stdio" | "sse")} style={{ ...toolsInpStyle }}>
-            <option value="stdio">stdio</option>
-            <option value="sse">SSE</option>
-          </select>
-          <input value={addCmd} onChange={(e) => setAddCmd(e.target.value)} placeholder="Command or URI" aria-label="Extension command or URI" style={toolsInpStyle} />
-          <Button variant="primary" onPress={add} isDisabled={adding || !addName.trim() || !addCmd.trim()}>
-            {adding ? "Adding…" : "Add"}
-          </Button>
-        </div>
+        <Card shadow="none" className="giap-card">
+          <CardContent style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+            <input
+              style={nativeInput}
+              value={addName}
+              onChange={(e) => setAddName(e.target.value)}
+              placeholder="Name (e.g. developer)"
+              aria-label="Extension name"
+            />
+            <select
+              style={selectFallback}
+              value={addKind}
+              onChange={(e) => setAddKind(e.target.value as "stdio" | "sse")}
+            >
+              <option value="stdio">stdio</option>
+              <option value="sse">SSE</option>
+            </select>
+            <input
+              style={nativeInput}
+              value={addCmd}
+              onChange={(e) => setAddCmd(e.target.value)}
+              placeholder="Command or URI"
+              aria-label="Extension command or URI"
+            />
+            <Button variant="primary" onPress={add} isDisabled={adding || !addName.trim() || !addCmd.trim()}>
+              {adding ? "Adding..." : "Add"}
+            </Button>
+          </CardContent>
+        </Card>
       )}
 
       {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>{error}</p>}
 
       {loading ? (
-        <p style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 }}>Loading extensions…</p>
+        <p className="muted-12">Loading extensions...</p>
       ) : extensions.length === 0 ? (
-        <p style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 }}>No extensions configured. Add one above to enable tool use.</p>
+        <p className="muted-12">No extensions configured. Add one above to enable tool use.</p>
       ) : (
-        <ul style={{ listStyle: "none", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
+        <div className="ext-list">
           {extensions.map((ext) => (
-            <li key={ext.name} style={{ display: "flex", alignItems: "flex-start", gap: "var(--space-3)", background: "var(--color-bg)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)", padding: "var(--space-3) var(--space-4)" }}>
+            <div key={ext.name} className="ext-row">
               <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const }}>
-                  <span style={{ fontWeight: 600, fontSize: "var(--text-sm)" }}>{ext.name}</span>
+                  <span className="ext-row__name">{ext.name}</span>
                   <Chip size="sm" variant="soft">{ext.kind}</Chip>
                   {!ext.enabled && <Chip size="sm" variant="soft" color="warning">Disabled</Chip>}
                 </div>
-                {ext.description && <p style={{ margin: "2px 0 4px", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" }}>{ext.description}</p>}
+                {ext.description && <p style={{ margin: "2px 0 4px", fontSize: "var(--text-xs)", color: "var(--grey-500)" }}>{ext.description}</p>}
                 {ext.tools.length > 0 && (
                   <div style={{ display: "flex", flexWrap: "wrap" as const, gap: "4px", marginTop: "4px" }}>
                     {ext.tools.slice(0, 8).map((t) => (
-                      <code key={t} style={{ fontSize: "11px", background: "rgba(23,22,22,0.05)", border: "1px solid var(--color-border)", borderRadius: "4px", padding: "1px 5px" }}>
+                      <code key={t} style={{ fontSize: "11px", background: "var(--grey-50)", border: "1px solid var(--grey-200)", borderRadius: "4px", padding: "1px 5px", fontFamily: "var(--font-mono)" }}>
                         {t.replace(`${ext.name}__`, "")}
                       </code>
                     ))}
-                    {ext.tools.length > 8 && <span style={{ fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)" }}>+{ext.tools.length - 8} more</span>}
+                    {ext.tools.length > 8 && <span className="muted-12">+{ext.tools.length - 8} more</span>}
                   </div>
                 )}
               </div>
               <Button variant="danger-soft" onPress={() => remove(ext.name)} aria-label={`Remove ${ext.name}`}>
                 <Trash2 size={14} />
               </Button>
-            </li>
+            </div>
           ))}
-        </ul>
+        </div>
       )}
     </div>
   );
@@ -872,17 +994,27 @@ function ToolsTab() {
 
 // ── Styles ────────────────────────────────────────────────────
 
-const inp: React.CSSProperties = {
+/**
+ * Native <input> and <select> styling for cases where HeroUI components
+ * don't fit (e.g. type="number" needing role="spinbutton" for tests,
+ * <select> with <option> children).
+ */
+const nativeInput: React.CSSProperties = {
   height: "36px",
-  border: "1px solid var(--color-border-strong)",
-  borderRadius: "var(--radius-md)",
+  border: "1px solid var(--grey-200)",
+  borderRadius: "var(--radius-card)",
   padding: "0 var(--space-3)",
   fontSize: "var(--text-base)",
   fontFamily: "var(--font-body)",
-  background: "var(--color-bg)",
-  color: "var(--color-text)",
+  background: "#fff",
+  color: "var(--fg)",
   width: "100%",
   userSelect: "text",
+};
+
+const selectFallback: React.CSSProperties = {
+  ...nativeInput,
+  cursor: "pointer",
 };
 
 const charCounter: React.CSSProperties = {
@@ -890,44 +1022,8 @@ const charCounter: React.CSSProperties = {
   bottom: "6px",
   right: "8px",
   fontSize: "var(--text-xs)",
-  color: "var(--color-text-tertiary)",
+  color: "var(--grey-500)",
   pointerEvents: "none",
-};
-
-const unitLabel: React.CSSProperties = {
-  fontSize: "var(--text-base)",
-  color: "var(--color-text-secondary)",
-  whiteSpace: "nowrap",
-};
-
-const styles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    height: "100%",
-    gap: "var(--space-4)",
-    maxWidth: "var(--content-max-width)",
-  },
-  error: {
-    color: "var(--color-destructive)",
-    fontSize: "var(--text-sm)",
-    margin: 0,
-    flexShrink: 0,
-  },
-  panel: {
-    flex: 1,
-    overflowY: "auto",
-  },
-  hint: {
-    color: "var(--color-text-tertiary)",
-    fontSize: "var(--text-sm)",
-    margin: 0,
-  },
-  saveBar: {
-    flexShrink: 0,
-    paddingTop: "var(--space-3)",
-    borderTop: "1px solid var(--color-border)",
-  },
 };
 
 const wakeWordNote: React.CSSProperties = {
@@ -939,7 +1035,7 @@ const wakeWordNote: React.CSSProperties = {
   border: "1px solid rgba(255,149,0,0.25)",
   borderRadius: "8px",
   fontSize: "var(--text-xs)",
-  color: "rgba(23,22,22,0.70)",
+  color: "var(--grey-600)",
   lineHeight: "1.5",
 };
 
@@ -947,6 +1043,28 @@ const wakeWordNoteIcon: React.CSSProperties = {
   color: "#FF9500",
   flexShrink: 0,
   marginTop: "1px",
+  fontWeight: 700,
+  fontStyle: "italic",
+};
+
+const calibrationRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "var(--space-2)",
+  padding: "6px 0",
+};
+
+const calibrationDot: React.CSSProperties = {
+  width: "8px",
+  height: "8px",
+  borderRadius: "50%",
+  flexShrink: 0,
+};
+
+const calibrationLabel: React.CSSProperties = {
+  fontSize: "var(--text-sm)",
+  fontFamily: "var(--font-body)",
+  color: "var(--grey-600)",
 };
 
 const advancedToggleStyle: React.CSSProperties = {
@@ -954,71 +1072,11 @@ const advancedToggleStyle: React.CSSProperties = {
   border: "none",
   cursor: "pointer",
   fontSize: "var(--text-sm)",
-  color: "var(--color-text-secondary)",
+  color: "var(--grey-600)",
   padding: "0",
   textAlign: "left",
   fontFamily: "var(--font-body)",
   display: "flex",
   alignItems: "center",
   gap: "var(--space-1)",
-};
-
-const panelStyles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "var(--space-5)",
-  },
-};
-
-const sectionStyles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "var(--space-3)",
-  },
-  title: {
-    fontFamily: "var(--font-display)",
-    fontWeight: 700,
-    fontSize: "var(--text-base)",
-    color: "var(--color-text)",
-    margin: 0,
-    paddingBottom: "var(--space-2)",
-    borderBottom: "1px solid var(--color-border)",
-  },
-  body: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "var(--space-3)",
-  },
-};
-
-const rowStyles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: "var(--space-4)",
-  },
-  labelCol: {
-    width: "160px",
-    flexShrink: 0,
-    paddingTop: "8px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "2px",
-  },
-  label: {
-    fontSize: "var(--text-base)",
-    color: "var(--color-text)",
-    fontWeight: 500,
-  },
-  hint: {
-    fontSize: "var(--text-xs)",
-    color: "var(--color-text-tertiary)",
-    lineHeight: "1.4",
-  },
-  control: {
-    flex: 1,
-    minWidth: 0,
-  },
 };

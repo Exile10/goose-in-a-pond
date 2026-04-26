@@ -459,6 +459,69 @@ describe("pullOllamaModel()", () => {
 
 // ── searchLlamafileModels ─────────────────────────────────────────────────────
 
+// ── wake-word calibration ────────────────────────────────────────��───────────
+
+describe("calibrateWakeWord()", () => {
+  it("POSTs multipart form to /voice/calibrate", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({
+      transcript: "hey goose",
+      normalized: "hey goose",
+      all_variants: ["hey goose"],
+      sample_count: 1,
+      target_count: 5,
+      complete: false,
+    }));
+    const wav = new Uint8Array([0, 1, 2, 3]).buffer;
+    const res = await client().calibrateWakeWord(wav);
+    expect(res.sample_count).toBe(1);
+    expect(res.all_variants).toEqual(["hey goose"]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/voice/calibrate",
+      expect.objectContaining({ method: "POST" }),
+    );
+    // Verify body is FormData (not JSON)
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.body).toBeInstanceOf(FormData);
+  });
+
+  it("throws ApiError on 422 (no speech detected)", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(422, "No speech detected"));
+    const wav = new Uint8Array([0]).buffer;
+    await expect(client().calibrateWakeWord(wav)).rejects.toSatisfy(
+      (e: unknown) => e instanceof ApiError && (e as ApiError).status === 422,
+    );
+  });
+
+  it("attaches Bearer token when set", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({
+      transcript: "goose",
+      normalized: "goose",
+      all_variants: ["goose"],
+      sample_count: 1,
+      target_count: 5,
+      complete: false,
+    }));
+    const c = client();
+    c.setToken("tok-123");
+    await c.calibrateWakeWord(new Uint8Array([0]).buffer);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer tok-123");
+  });
+});
+
+describe("resetWakeWordCalibration()", () => {
+  it("DELETEs /voice/calibrate", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ cleared: true }));
+    await client().resetWakeWordCalibration();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/voice/calibrate",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+});
+
+// ── searchLlamafileModels ─────────────────────────────────────────────────────
+
 describe("searchLlamafileModels()", () => {
   it("GETs /models/search/llamafile without query", async () => {
     fetchMock.mockResolvedValueOnce(okJson({ models: [] }));

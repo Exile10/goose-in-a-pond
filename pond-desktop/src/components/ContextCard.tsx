@@ -21,18 +21,19 @@ export function ContextCard({ card }: Props) {
   );
 }
 
-function ToolContent({ toolName, data }: { toolName: string; data: Record<string, unknown> }) {
-  if (toolName === "get_current_weather") return <WeatherContent data={data} />;
-  if (toolName === "list_registered_devices") return <DevicesContent data={data} />;
-  if (toolName === "recall_memories" || toolName === "save_memory") return <MemoryContent data={data} />;
-  if (toolName === "list_schedules") return <SchedulesContent data={data} />;
-  return <GenericContent data={data} />;
+function ToolContent({ toolName, data }: { toolName: string; data: Record<string, unknown> | null }) {
+  const safe = data ?? {};
+  if (toolName === "get_current_weather") return <WeatherContent data={safe} />;
+  if (toolName === "list_registered_devices") return <DevicesContent data={safe} />;
+  if (toolName === "recall_memories" || toolName === "save_memory") return <MemoryContent data={safe} />;
+  if (toolName === "list_schedules") return <SchedulesContent data={safe} />;
+  return <GenericContent data={safe} />;
 }
 
 function WeatherContent({ data }: { data: Record<string, unknown> }) {
-  const temp = data.temperature ?? data.temp;
-  const desc = data.description ?? data.condition ?? data.weather;
-  const location = data.location ?? data.city;
+  const temp = data?.temperature ?? data?.temp;
+  const desc = data?.description ?? data?.condition ?? data?.weather;
+  const location = data?.location ?? data?.city;
   return (
     <div style={styles.weatherRow}>
       <span style={styles.weatherTemp}>{temp !== undefined ? `${temp}°` : "—"}</span>
@@ -45,7 +46,7 @@ function WeatherContent({ data }: { data: Record<string, unknown> }) {
 }
 
 function DevicesContent({ data }: { data: Record<string, unknown> }) {
-  const devices = Array.isArray(data.devices) ? data.devices : Array.isArray(data) ? data : [];
+  const devices = Array.isArray(data?.devices) ? data.devices : Array.isArray(data) ? data : [];
   if (devices.length === 0) return <p style={styles.hint}>No devices found.</p>;
   return (
     <ul style={styles.list}>
@@ -53,7 +54,7 @@ function DevicesContent({ data }: { data: Record<string, unknown> }) {
         const dev = d as Record<string, unknown>;
         return (
           <li key={i} style={styles.listItem}>
-            <span style={{ ...styles.dot, background: dev.is_online ? "#34C759" : "#8E8E93" }} />
+            <span style={{ ...styles.dot, background: dev.is_online ? "var(--color-success)" : "var(--color-neutral)" }} />
             <span style={styles.value}>{String(dev.name ?? "Device")}</span>
             {dev.room != null && <span style={styles.hint}>{String(dev.room)}</span>}
           </li>
@@ -64,7 +65,7 @@ function DevicesContent({ data }: { data: Record<string, unknown> }) {
 }
 
 function MemoryContent({ data }: { data: Record<string, unknown> }) {
-  const content = data.content ?? data.text ?? data.memory;
+  const content = data?.content ?? data?.text ?? data?.memory;
   return content ? (
     <p style={{ ...styles.value, userSelect: "text" as const }}>{String(content)}</p>
   ) : (
@@ -73,7 +74,7 @@ function MemoryContent({ data }: { data: Record<string, unknown> }) {
 }
 
 function SchedulesContent({ data }: { data: Record<string, unknown> }) {
-  const schedules = Array.isArray(data.schedules) ? data.schedules : [];
+  const schedules = Array.isArray(data?.schedules) ? data.schedules : [];
   if (schedules.length === 0) return <p style={styles.hint}>No schedules.</p>;
   return (
     <ul style={styles.list}>
@@ -93,7 +94,7 @@ function SchedulesContent({ data }: { data: Record<string, unknown> }) {
 function GenericContent({ data }: { data: Record<string, unknown> }) {
   const text = typeof data === "string"
     ? data
-    : JSON.stringify(data, null, 2);
+    : JSON.stringify(data ?? {}, null, 2);
   return (
     <pre style={styles.pre}>{text}</pre>
   );
@@ -107,22 +108,22 @@ function formatToolName(name: string): string {
 
 const styles: Record<string, React.CSSProperties> = {
   card: {
-    background: "#FFFFFF",
-    border: "1px solid rgba(23,22,22,0.10)",
-    borderRadius: "10px",
+    background: "var(--color-bg)",
+    border: "1px solid var(--color-border)",
+    borderRadius: "var(--radius-lg)",
     overflow: "hidden",
-    fontSize: "12px",
+    fontSize: "var(--text-sm)",
   },
   header: {
     padding: "6px 10px",
-    background: "rgba(140,82,255,0.06)",
-    borderBottom: "1px solid rgba(23,22,22,0.07)",
+    background: "var(--color-accent-subtle)",
+    borderBottom: "1px solid var(--color-border)",
   },
   toolName: {
-    fontFamily: '"Quicksand", sans-serif',
+    fontFamily: "var(--font-display)",
     fontWeight: 600,
-    fontSize: "10px",
-    color: "#8C52FF",
+    fontSize: "var(--text-xs)",
+    color: "var(--color-accent)",
     textTransform: "uppercase",
     letterSpacing: "0.05em",
   },
@@ -135,10 +136,10 @@ const styles: Record<string, React.CSSProperties> = {
     gap: "10px",
   },
   weatherTemp: {
-    fontFamily: '"Quicksand", sans-serif',
+    fontFamily: "var(--font-display)",
     fontWeight: 700,
-    fontSize: "22px",
-    color: "#171616",
+    fontSize: "var(--text-xl)",
+    color: "var(--color-text)",
     lineHeight: "1",
   },
   list: {
@@ -162,19 +163,19 @@ const styles: Record<string, React.CSSProperties> = {
   },
   value: {
     margin: 0,
-    color: "#171616",
-    fontSize: "12px",
+    color: "var(--color-text)",
+    fontSize: "var(--text-sm)",
   },
   hint: {
     margin: 0,
-    color: "rgba(23,22,22,0.45)",
-    fontSize: "11px",
+    color: "var(--color-text-tertiary)",
+    fontSize: "var(--text-xs)",
   },
   pre: {
     margin: 0,
-    fontSize: "10px",
-    fontFamily: '"JetBrains Mono", Menlo, monospace',
-    color: "rgba(23,22,22,0.65)",
+    fontSize: "var(--text-xs)",
+    fontFamily: "var(--font-mono)",
+    color: "var(--color-text-secondary)",
     whiteSpace: "pre-wrap",
     wordBreak: "break-all",
     userSelect: "text",
