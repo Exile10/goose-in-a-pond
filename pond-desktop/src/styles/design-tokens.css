@@ -94,13 +94,57 @@
 
   /* ── Voice Orb States ───────────────────────────────────── */
   --orb-idle:      #8E8E93;
-  --orb-listening: #8C52FF;   /* Jarida Purple — listening */
+  --orb-listening: #8C4BFF;   /* Jarida Purple — listening */
   --orb-thinking:  #FF9500;   /* warm amber — thinking */
   --orb-speaking:  #34C759;   /* green — speaking */
   --orb-error:     #FF3B30;   /* red — error */
 
+  /* Voice pipeline state CSS vars (DOM elements only; canvas must use hex) */
+  --color-state-idle:      var(--color-neutral);
+  --color-state-wait:      var(--color-accent);
+  --color-state-recording: var(--color-accent);
+  --color-state-thinking:  var(--color-warning);
+  --color-state-speaking:  var(--color-success);
+  --color-state-error:     var(--color-destructive);
+
+  /* ── LLM Role Colors ────────────────────────────────────── */
+  --color-role-chat:       #8C4BFF;
+  --color-role-think:      #FF9500;
+  --color-role-task:       #30a46c;
+  --color-role-asr:        #007AFF;
+  --color-role-tts:        #e5a000;
+
+  --color-role-chat-soft:  rgba(140, 75, 255, 0.10);
+  --color-role-think-soft: rgba(255, 149, 0, 0.12);
+  --color-role-task-soft:  rgba(48, 164, 108, 0.12);
+  --color-role-asr-soft:   rgba(0, 122, 255, 0.10);
+  --color-role-tts-soft:   rgba(229, 160, 0, 0.12);
+
+  /* ── Grey / Neutral Scale (zinc) ─────────────────────────── */
+  --grey-50:  #FAFAFA;
+  --grey-100: #F4F4F5;
+  --grey-200: #E4E4E7;
+  --grey-300: #D4D4D8;
+  --grey-400: #A1A1AA;
+  --grey-500: #71717A;
+  --grey-600: #52525B;
+  --grey-700: #3F3F46;
+
+  /* ── Aliases (used by sections.css BEM classes) ─────────── */
+  --fg:           var(--color-text);
+  --font-heading: var(--font-display);
+  --success:      var(--color-success);
+  --warning:      var(--color-warning);
+  --danger:       var(--color-destructive);
+  --bg-brand:     var(--color-accent);
+  --bg-brand-soft: #F4ECFF;
+  --fg-brand:     var(--purple-700);
+  --fg-on-brand:  var(--color-text-on-accent);
+  --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
+  --radius-card:  14px;
+
   /* ── Layout ─────────────────────────────────────────────── */
-  --sidebar-width:           220px;
+  --sidebar-width:           232px;
   --sidebar-width-collapsed:  52px;
   --sidebar-transition: width 200ms ease, min-width 200ms ease;
   --toolbar-height:    48px;

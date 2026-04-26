@@ -290,20 +290,47 @@ impl LocalInferenceLlmAdapter {
 
 /// Strip thinking-token preambles emitted by reasoning-capable models.
 ///
-/// Gemma 4 actual format: `<|channel>thought … <channel|>ACTUAL REPLY`
-/// The opening tag is `<|channel>thought` and the *closing* tag is the
-/// reversed form `<channel|>`.  Everything after the last `<channel|>` is
-/// the real response; everything before it is internal reasoning that should
-/// not be shown to users.
+/// Handles two formats:
 ///
-/// If the pattern is not present the original text is returned unchanged.
+/// 1. **Gemma 4**: `<|channel>thought … <channel|>ACTUAL REPLY`
+///    Everything after the last `<channel|>` is the real response.
+///
+/// 2. **Qwen3 / DeepSeek-R1 / QwQ**: `<think>…</think>ACTUAL REPLY`
+///    Everything inside `<think>…</think>` tags is stripped.
+///
+/// If neither pattern is present the original text is returned unchanged.
 fn strip_thinking_tokens(text: &str) -> String {
-    const CLOSE_TAG: &str = "<channel|>";
-    if let Some(pos) = text.rfind(CLOSE_TAG) {
-        text[pos + CLOSE_TAG.len()..].trim().to_string()
-    } else {
-        text.to_string()
+    // Gemma 4 format
+    const CHANNEL_CLOSE: &str = "<channel|>";
+    if let Some(pos) = text.rfind(CHANNEL_CLOSE) {
+        return text[pos + CHANNEL_CLOSE.len()..].trim().to_string();
     }
+
+    // <think>…</think> format — strip all blocks
+    if text.contains("<think>") {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            if let Some(start) = rest.find("<think>") {
+                out.push_str(&rest[..start]);
+                if let Some(end) = rest[start..].find("</think>") {
+                    rest = &rest[start + end + "</think>".len()..];
+                } else {
+                    // Unclosed <think> — discard the rest
+                    break;
+                }
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        }
+        let trimmed = out.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+
+    text.to_string()
 }
 
 #[async_trait]

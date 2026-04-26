@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 /// A tool-call result emitted to the canvas for rendering a ContextCard.
@@ -21,6 +22,26 @@ pub struct ResponseToken {
 pub struct SessionCreated {
     pub session_id: String,
     pub model_role: String,
+}
+
+/// Persistent state for cross-chunk `<think>` block filtering.
+/// Reset to `false` at the start of each new chat stream.
+static IN_THINK_BLOCK: Mutex<bool> = Mutex::new(false);
+
+/// Reset the thinking block state — call at the start of each new stream.
+pub fn reset_think_filter() {
+    *IN_THINK_BLOCK.lock().unwrap() = false;
+}
+
+/// Filter `<think>…</think>` blocks from a streaming text chunk.
+/// Uses the shared `IN_THINK_BLOCK` state so blocks that span multiple
+/// SSE events are handled correctly.  Single lock acquisition to avoid
+/// TOCTOU race between reading and writing the state.
+fn filter_thinking(text: &str) -> String {
+    let mut guard = IN_THINK_BLOCK.lock().unwrap();
+    let (visible, new_state) = crate::tts_text::filter_thinking(text, *guard);
+    *guard = new_state;
+    visible
 }
 
 /// Parse a single SSE line from the chat/stream endpoint and emit the
@@ -53,6 +74,7 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
 
     // Handle done event — emitted by backend at end of stream with session_id.
     if value.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+        reset_think_filter();
         let session_id = value
             .get("session_id")
             .and_then(|s| s.as_str())
@@ -86,13 +108,16 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
     match value.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
-                let _ = app.emit(
-                    "response-token",
-                    ResponseToken {
-                        token: content.to_string(),
-                        done: false,
-                    },
-                );
+                let visible = filter_thinking(content);
+                if !visible.is_empty() {
+                    let _ = app.emit(
+                        "response-token",
+                        ResponseToken {
+                            token: visible,
+                            done: false,
+                        },
+                    );
+                }
             }
         }
         Some("tool_call") => {
@@ -102,9 +127,40 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
                 .unwrap_or("unknown")
                 .to_string();
             let data = value
-                .get("result")
+                .get("input")
                 .cloned()
-                .unwrap_or(serde_json::Value::Null);
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let _ = app.emit(
+                "tool-result",
+                ToolResult {
+                    tool,
+                    data,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                },
+            );
+        }
+        Some("tool_result") => {
+            let tool = value
+                .get("tool")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            // tool_result has the actual output in "content"
+            let content = value
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            let data = if content.is_empty() {
+                serde_json::json!({})
+            } else {
+                // Try parsing as JSON; fall back to wrapping as {"result": "..."}
+                serde_json::from_str::<serde_json::Value>(content)
+                    .unwrap_or_else(|_| serde_json::json!({"result": content}))
+            };
 
             let _ = app.emit(
                 "tool-result",
@@ -121,13 +177,16 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
         _ => {
             // Legacy/compat: handle {"token": "..."} format emitted by older backends.
             if let Some(token) = value.get("token").and_then(|t| t.as_str()) {
-                let _ = app.emit(
-                    "response-token",
-                    ResponseToken {
-                        token: token.to_string(),
-                        done: false,
-                    },
-                );
+                let visible = filter_thinking(token);
+                if !visible.is_empty() {
+                    let _ = app.emit(
+                        "response-token",
+                        ResponseToken {
+                            token: visible,
+                            done: false,
+                        },
+                    );
+                }
             }
         }
     }

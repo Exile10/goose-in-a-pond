@@ -3,7 +3,6 @@ import React, {
   useContext,
   useReducer,
   useEffect,
-  useRef,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -24,9 +23,6 @@ const DispatchCtx = createContext<React.Dispatch<AppAction> | null>(null);
 
 export function AppContextProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, buildInitialState);
-
-  // Track whether a partial agent message has been started in the transcript
-  const agentMessageStarted = useRef(false);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];
@@ -81,17 +77,10 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "VOICE_ACTIVATE" });
     }).then((u) => unlisten.push(u));
 
-    // Recording lifecycle
-    listen("recording-started", () => {
-      agentMessageStarted.current = false;
-      dispatch({ type: "SET_VOICE_STATE", payload: "recording" });
-    }).then((u) => unlisten.push(u));
-
-    // recording-aborted: VoiceMode handles the state transition itself
-    // (it knows whether to return to "wait" or "idle"), so no dispatch here.
-    listen("recording-aborted", () => {
-      agentMessageStarted.current = false;
-    }).then((u) => unlisten.push(u));
+    // Recording lifecycle — voice state is now managed explicitly by
+    // VoiceMode/CanvasOverlay so calibration recordings don't corrupt it.
+    // recording-started: no-op (callers set their own state)
+    // recording-aborted: VoiceMode handles state transition itself
 
     // Transcript (user text after ASR)
     // Rust emits TranscriptResult { text: String } → payload is { text: "..." }
@@ -112,7 +101,6 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
         timestamp: Date.now(),
       };
       dispatch({ type: "APPEND_TRANSCRIPT", payload: agentMsg });
-      agentMessageStarted.current = true;
     }).then((u) => unlisten.push(u));
 
     // Streaming response tokens

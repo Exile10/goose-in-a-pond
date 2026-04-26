@@ -27,8 +27,38 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pond_core::ports::voice_input::VoiceInput;
-use pond_core::ports::wake_word::WakeWordDetector;
+use pond_core::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+/// Play a short two-tone confirmation ping (C6→E6, ~220ms).
+/// Called when the wake word is detected so the user gets immediate audio feedback.
+fn play_wake_ping() {
+    std::thread::spawn(|| {
+        use rodio::{OutputStream, Sink};
+        let Ok((_stream, handle)) = OutputStream::try_default() else { return };
+        let Ok(sink) = Sink::try_new(&handle) else { return };
+        sink.set_volume(0.35);
+
+        let rate = 44100u32;
+        let tone = |freq: f32, ms: u64| -> Vec<f32> {
+            let n = (rate as u64 * ms / 1000) as usize;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / rate as f32;
+                    let env = 1.0 - (i as f32 / n as f32); // fade-out
+                    (2.0 * std::f32::consts::PI * freq * t).sin() * env * 0.6
+                })
+                .collect()
+        };
+        // C6 (1047 Hz) then E6 (1319 Hz) — quick ascending chime
+        let mut samples = tone(1047.0, 100);
+        samples.extend(tone(1319.0, 120));
+        let buf = rodio::buffer::SamplesBuffer::new(1, rate, samples);
+        sink.append(buf);
+        sink.sleep_until_end();
+    });
+}
 
 /// Default whisper.cpp server URL.
 pub const DEFAULT_HOST: &str = "http://127.0.0.1:9000";
@@ -40,8 +70,13 @@ pub const DEFAULT_HOST: &str = "http://127.0.0.1:9000";
 pub struct WhisperInput {
     client: reqwest::Client,
     transcription_url: String,
-    /// How long to record before sending for transcription (seconds).
+    /// Hard cap on recording time (seconds). VAD usually stops earlier.
     duration_secs: u32,
+    /// How long (ms) of silence after speech to declare end-of-utterance.
+    silence_ms: u64,
+    /// Pre-captured WAV bytes from the wake-word detector (one-breath path).
+    /// When `Some`, `listen()` transcribes these bytes instead of recording fresh.
+    captured: Mutex<Option<Vec<u8>>>,
 }
 
 impl WhisperInput {
@@ -52,13 +87,21 @@ impl WhisperInput {
         Self {
             client: reqwest::Client::new(),
             transcription_url: format!("{}/inference", base),
-            duration_secs: 5,
+            duration_secs: 30,
+            silence_ms: 800,
+            captured: Mutex::new(None),
         }
     }
 
-    /// Override the recording duration (default: 5 seconds).
+    /// Override the maximum recording duration (default: 30 seconds).
     pub fn with_duration(mut self, secs: u32) -> Self {
         self.duration_secs = secs;
+        self
+    }
+
+    /// Override the end-of-speech silence threshold (default: 1200 ms).
+    pub fn with_silence_ms(mut self, ms: u64) -> Self {
+        self.silence_ms = ms;
         self
     }
 }
@@ -66,26 +109,79 @@ impl WhisperInput {
 #[async_trait]
 impl VoiceInput for WhisperInput {
     async fn listen(&self) -> Result<Option<String>> {
-        let duration = self.duration_secs;
+        let captured = self.captured.lock().unwrap().take();
+        let max_record = self.duration_secs;
+        let silence_ms = self.silence_ms;
 
-        // Audio capture is blocking — run it in a dedicated thread.
-        let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            println!("  🎤 Recording for {} seconds...", duration);
-            let (samples, sample_rate) = record_mono_f32(duration)?;
-            if samples.is_empty() {
-                return Err(anyhow!("No audio captured"));
+        if let Some(wav) = captured {
+            // One-breath path: we have pre-captured audio from the wake listener,
+            // but the user may still be speaking.  Decode what we have, continue
+            // recording from the mic until silence, combine, then transcribe.
+            let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                println!("  🎤 Listening...");
+
+                // Decode the pre-captured 16kHz WAV.
+                let (captured_samples, captured_rate) = decode_wav_mono_f32(&wav)?;
+
+                // Continue recording — no onset wait, just listen until silence.
+                let (fresh_samples, fresh_rate) = record_mono_f32_until_silence(
+                    max_record, silence_ms,
+                )?;
+
+                // Resample fresh recording to match captured rate (16 kHz).
+                let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
+
+                // Combine: captured audio first, then continuation.
+                let mut combined = captured_samples;
+                // Skip the leading silence from the fresh recording — the mic
+                // needs ~200ms to spin up before producing real audio.
+                let skip = (captured_rate as usize) / 5; // ~200ms at 16kHz
+                if fresh_16k.len() > skip {
+                    combined.extend_from_slice(&fresh_16k[skip..]);
+                }
+
+                if combined.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(encode_wav_mono_16k(&combined)))
+            })
+            .await??;
+
+            match wav_bytes {
+                Some(wav) => self.transcribe_wav(wav).await,
+                None => Ok(Some(String::new())),
             }
-            // Resample to 16 kHz (whisper's expected rate) then encode WAV.
-            let samples_16k = resample_to_16k(&samples, sample_rate);
-            Ok(encode_wav_mono_16k(&samples_16k))
-        })
-        .await??;
+        } else {
+            // Normal path: VAD-aware recording — waits for speech, stops on silence.
+            let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                println!("  🎤 Listening...");
+                let (samples, sample_rate) = record_mono_f32_vad(
+                    10,           // max 10s waiting for speech to start
+                    max_record,   // hard cap on total recording
+                    silence_ms,   // end-of-speech silence threshold
+                )?;
+                if samples.is_empty() {
+                    return Ok(None);
+                }
+                let samples_16k = resample_to_16k(&samples, sample_rate);
+                Ok(Some(encode_wav_mono_16k(&samples_16k)))
+            })
+            .await??;
 
-        self.transcribe_wav(wav_bytes).await
+            match wav_bytes {
+                Some(wav) => self.transcribe_wav(wav).await,
+                None => Ok(Some(String::new())),
+            }
+        }
     }
 
     fn prompt(&self) -> &str {
         "🎤 "
+    }
+
+    /// Store WAV bytes for `listen()` to transcribe instead of recording fresh.
+    fn prime_with_captured(&self, wav: Vec<u8>) {
+        *self.captured.lock().unwrap() = Some(wav);
     }
 }
 
@@ -122,17 +218,114 @@ impl WhisperInput {
             .await
             .map_err(|e| anyhow!("whisper response parse error: {}", e))?;
 
-        let text = json["text"].as_str().unwrap_or("").trim().to_string();
+        let raw = json["text"].as_str().unwrap_or("").trim().to_string();
+
+        // Strip Whisper artifacts — bracketed tags like [BLANK_AUDIO], [MUSIC],
+        // [NOISE], [LAUGHTER], etc.  These are not speech.
+        let text = strip_whisper_artifacts(&raw);
 
         Ok(if text.is_empty() { None } else { Some(text) })
     }
 }
 
+/// Remove Whisper non-speech tags (`[BLANK_AUDIO]`, `[MUSIC]`, `[NOISE]`, …)
+/// and return the remaining text trimmed.  If nothing real remains, returns "".
+fn strip_whisper_artifacts(text: &str) -> String {
+    // Strip all [BRACKETED_TAGS] — Whisper uses these for non-speech events.
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        if let Some(close) = rest[open..].find(']') {
+            rest = &rest[open + close + 1..];
+        } else {
+            rest = &rest[open..];
+            break;
+        }
+    }
+    out.push_str(rest);
+
+    // Strip (PARENTHESIZED TAGS) — e.g. (inaudible), (music), (laughing)
+    let mut cleaned = String::with_capacity(out.len());
+    let mut prest = out.as_str();
+    while let Some(open) = prest.find('(') {
+        cleaned.push_str(&prest[..open]);
+        if let Some(close) = prest[open..].find(')') {
+            prest = &prest[open + close + 1..];
+        } else {
+            prest = &prest[open..];
+            break;
+        }
+    }
+    cleaned.push_str(prest);
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    // Reject common Whisper hallucinations on silence / noise.
+    let lower = cleaned.to_lowercase();
+    const EXACT_HALLUCINATIONS: &[&str] = &[
+        ".", "..", "...", ",", "!", "?",
+        "thank you", "thanks for watching", "thanks for listening",
+        "thanks", "you", "bye", "bye bye", "okay",
+        "the end", "subtitles by", "subtitle",
+        "so", "um", "uh", "hmm", "huh", "ah", "oh",
+        "i'm sorry", "i don't know",
+        "please subscribe", "like and subscribe",
+    ];
+    if EXACT_HALLUCINATIONS.iter().any(|h| lower == *h) {
+        return String::new();
+    }
+
+    // Reject very short transcripts (1-2 chars) — almost always noise artifacts.
+    if cleaned.len() <= 2 {
+        return String::new();
+    }
+
+    // Reject if the transcript is just the same word/syllable repeated.
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.len() >= 2 && words.iter().all(|w| *w == words[0]) {
+        return String::new();
+    }
+
+    cleaned.to_string()
+}
+
+// ── WAV decoding ─────────────────────────────────────────────────────────────
+
+/// Decode a 16-bit mono PCM WAV (as produced by `encode_wav_mono_16k`) back to
+/// f32 samples.  Returns `(samples, sample_rate)`.
+fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
+    if wav.len() < 44 {
+        return Err(anyhow!("WAV too short ({} bytes)", wav.len()));
+    }
+    // Read sample rate from the fmt chunk (bytes 24..28).
+    let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+    // Data payload starts at byte 44.
+    let pcm = &wav[44..];
+    let samples: Vec<f32> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32_767.0)
+        .collect();
+    Ok((samples, sample_rate))
+}
+
 // ── Audio capture ─────────────────────────────────────────────────────────────
 
-/// Record `duration_secs` seconds of audio from the default input device.
-/// Returns interleaved-to-mono f32 PCM samples and the device's sample rate.
-fn record_mono_f32(duration_secs: u32) -> Result<(Vec<f32>, u32)> {
+/// Record from the microphone until the speaker stops talking.
+///
+/// Unlike `record_mono_f32_vad`, this skips the "wait for speech onset" phase
+/// — it assumes the speaker is already talking (or about to be).  Used after
+/// wake word detection to continue capturing the user's command.
+///
+/// Stops when `silence_ms` consecutive milliseconds of silence are detected,
+/// or after `max_record_secs` total recording time.
+fn record_mono_f32_until_silence(max_record_secs: u32, silence_ms: u64) -> Result<(Vec<f32>, u32)> {
+    const SILENCE_RMS: f32 = 0.008;
+    const POLL_MS: u64     = 30;
+
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -152,7 +345,129 @@ fn record_mono_f32(duration_secs: u32) -> Result<(Vec<f32>, u32)> {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Downmix multi-channel to mono by averaging
+                let mono: Vec<f32> = data
+                    .chunks(channels)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                    .collect();
+                samples_writer.lock().unwrap().extend_from_slice(&mono);
+            },
+            |e| eprintln!("  ⚠ Audio stream error: {}", e),
+            None,
+        )?,
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config.into(),
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                let mono: Vec<f32> = data
+                    .chunks(channels)
+                    .map(|frame| {
+                        let sum: f32 = frame
+                            .iter()
+                            .map(|&s| s as f32 / i16::MAX as f32)
+                            .sum();
+                        sum / channels as f32
+                    })
+                    .collect();
+                samples_writer.lock().unwrap().extend_from_slice(&mono);
+            },
+            |e| eprintln!("  ⚠ Audio stream error: {}", e),
+            None,
+        )?,
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config.into(),
+            move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                let mono: Vec<f32> = data
+                    .chunks(channels)
+                    .map(|frame| {
+                        let sum: f32 = frame
+                            .iter()
+                            .map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0)
+                            .sum();
+                        sum / channels as f32
+                    })
+                    .collect();
+                samples_writer.lock().unwrap().extend_from_slice(&mono);
+            },
+            |e| eprintln!("  ⚠ Audio stream error: {}", e),
+            None,
+        )?,
+        fmt => return Err(anyhow!("Unsupported audio sample format: {:?}", fmt)),
+    };
+
+    stream.play().map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+
+    // Record until silence or hard cap — no onset wait.
+    let max_ms = max_record_secs as u64 * 1000;
+    let mut elapsed_ms: u64 = 0;
+    let mut silent_for: u64 = 0;
+
+    while elapsed_ms < max_ms {
+        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        elapsed_ms += POLL_MS;
+
+        let rms = {
+            let buf = samples.lock().unwrap();
+            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+            let start = buf.len().saturating_sub(recent);
+            rms_energy(&buf[start..])
+        };
+
+        if rms < SILENCE_RMS {
+            silent_for += POLL_MS;
+            if silent_for >= silence_ms {
+                tracing::debug!(
+                    "Continue-record: end-of-speech after {}ms silence ({}ms total)",
+                    silent_for, elapsed_ms
+                );
+                break;
+            }
+        } else {
+            silent_for = 0;
+        }
+    }
+
+    drop(stream);
+    let recorded = match Arc::try_unwrap(samples) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+
+    Ok((recorded, sample_rate))
+}
+
+/// VAD-aware audio recording from the default input device.
+///
+/// Instead of recording a fixed duration, this uses voice activity detection:
+///   1. Waits up to `max_wait_secs` for the user to start speaking
+///   2. Once speech is detected (RMS > onset threshold), records everything
+///   3. Stops when the user pauses for `silence_ms` consecutive milliseconds
+///   4. Hard cap at `max_record_secs` total recording time
+///
+/// Returns mono f32 PCM samples and the device's sample rate.
+/// Returns `Ok((empty, rate))` if no speech was detected within the wait period.
+fn record_mono_f32_vad(max_wait_secs: u32, max_record_secs: u32, silence_ms: u64) -> Result<(Vec<f32>, u32)> {
+    const SPEECH_RMS: f32  = 0.018;  // onset threshold — raised to reject ambient noise
+    const SILENCE_RMS: f32 = 0.008;  // end-of-speech threshold (hysteresis)
+    const POLL_MS: u64     = 30;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("No audio input device found"))?;
+
+    let config = device
+        .default_input_config()
+        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
+
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+
+    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples_writer = Arc::clone(&samples);
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let mono: Vec<f32> = data
                     .chunks(channels)
                     .map(|frame| frame.iter().sum::<f32>() / channels as f32)
@@ -208,10 +523,66 @@ fn record_mono_f32(duration_secs: u32) -> Result<(Vec<f32>, u32)> {
     stream
         .play()
         .map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
-    std::thread::sleep(std::time::Duration::from_secs(duration_secs as u64));
-    drop(stream); // stops recording
 
-    // Recover the Vec — safe because the stream callback is stopped after drop
+    // ── Phase 1: wait for speech onset ──────────────────────────────────────
+    let max_wait_ms = max_wait_secs as u64 * 1000;
+    let mut waited_ms: u64 = 0;
+    let mut speech_detected = false;
+
+    while waited_ms < max_wait_ms {
+        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        waited_ms += POLL_MS;
+
+        let rms = {
+            let buf = samples.lock().unwrap();
+            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+            let start = buf.len().saturating_sub(recent);
+            rms_energy(&buf[start..])
+        };
+
+        if rms >= SPEECH_RMS {
+            speech_detected = true;
+            break;
+        }
+    }
+
+    if !speech_detected {
+        drop(stream);
+        let recorded = match Arc::try_unwrap(samples) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+        return Ok((recorded, sample_rate)); // empty or just noise
+    }
+
+    // ── Phase 2: record until end-of-speech ─────────────────────────────────
+    let max_record_ms = max_record_secs as u64 * 1000;
+    let mut recorded_ms: u64 = 0;
+    let mut silent_for: u64 = 0;
+
+    while recorded_ms < max_record_ms {
+        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        recorded_ms += POLL_MS;
+
+        let rms = {
+            let buf = samples.lock().unwrap();
+            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+            let start = buf.len().saturating_sub(recent);
+            rms_energy(&buf[start..])
+        };
+
+        if rms < SILENCE_RMS {
+            silent_for += POLL_MS;
+            if silent_for >= silence_ms {
+                tracing::debug!("VAD: end-of-speech after {}ms silence ({}ms total)", silent_for, recorded_ms);
+                break;
+            }
+        } else {
+            silent_for = 0;
+        }
+    }
+
+    drop(stream);
     let recorded = match Arc::try_unwrap(samples) {
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
@@ -283,38 +654,122 @@ fn encode_wav_mono_16k(samples: &[f32]) -> Vec<u8> {
 
 // ── WhisperKeywordDetector ────────────────────────────────────────────────────
 
-/// WakeWordDetector that polls the microphone until the trigger phrase is heard.
+/// Configuration for the sliding-window wake-word detector.
+#[derive(Clone)]
+pub struct KeywordDetectorConfig {
+    /// Width of the audio window fed to whisper on each cycle (milliseconds).
+    /// Default: 2500 ms — wide enough for multi-word wake phrases and natural speech.
+    pub window_ms: u64,
+    /// How far to advance the window on each detection cycle (milliseconds).
+    /// Default: 400 ms — ~6 overlapping checks per window, responsive detection.
+    pub slide_ms: u64,
+    /// Maximum audio to capture after detection fires (milliseconds).
+    /// Acts as a hard ceiling — VAD silence detection exits earlier when enabled.
+    /// Default: 5000 ms.
+    pub post_trigger_ms: u64,
+    /// Enable two-threshold hysteresis.
+    /// When a ≤3-token transcript contains the trigger, re-check once with a
+    /// shorter slide before firing — reduces false positives from noise bursts.
+    /// Default: true.
+    pub hysteresis_enabled: bool,
+    /// Slide advance used during the hysteresis re-check (milliseconds).
+    /// Default: 200 ms.
+    pub hysteresis_slide_ms: u64,
+    /// Minimum RMS energy required to send a window to whisper.
+    /// Windows below this level are skipped entirely — eliminates ~90% of
+    /// whisper calls during silence and prevents ambient-noise false positives.
+    /// Default: 0.01 (~−40 dBFS). Set to 0.0 to disable the gate.
+    pub energy_threshold: f32,
+    /// How long (ms) of consecutive silence terminates the post-trigger capture.
+    /// The ring buffer is snapshotted as soon as this silence duration elapses,
+    /// instead of always waiting the full `post_trigger_ms`.
+    /// Default: 600 ms. Set to 0 to disable (always wait full `post_trigger_ms`).
+    pub post_trigger_silence_ms: u64,
+    /// How long (ms) to sleep before re-arming detection after each activation.
+    /// Prevents re-triggering on TTS echo or residual room noise.
+    /// Default: 2000 ms. Set to 0 to disable.
+    pub cooldown_ms: u64,
+}
+
+impl Default for KeywordDetectorConfig {
+    fn default() -> Self {
+        Self {
+            window_ms:               2500,
+            slide_ms:                400,
+            post_trigger_ms:         5000,
+            hysteresis_enabled:      true,
+            hysteresis_slide_ms:     200,
+            energy_threshold:        0.015,
+            post_trigger_silence_ms: 600,
+            cooldown_ms:             2000,
+        }
+    }
+}
+
+/// WakeWordDetector that uses a continuous audio ring buffer and a sliding
+/// detection window to reduce latency and support the one-breath command flow.
 ///
-/// Records short clips (default 2 s), transcribes each via whisper.cpp, and
-/// returns `Ok(())` as soon as the transcript contains the trigger word/phrase
-/// (case-insensitive).
+/// Siri-inspired improvements over the old sequential 2 s-clip poller:
+/// - **Rolling ring buffer** — `cpal` streams continuously; no gaps between clips.
+/// - **Overlapping windows** — default 1500 ms window slides every 500 ms,
+///   giving ~1–1.5 s detection latency vs ~2.5 s before.
+/// - **Two-threshold hysteresis** — a ≤3-token match triggers a 200 ms re-check
+///   before firing, reducing false positives without meaningful latency cost.
+/// - **One-breath audio hand-off** — on confirmed detection, 4 s of trailing
+///   audio is captured and returned so `VoiceInput::listen()` can transcribe
+///   the command without a separate recording window.
 ///
-/// This is a polyfill for real-time KWS.  It has ~2 s latency per poll cycle
-/// and requires the whisper server to be running.  On Jetson with the `tiny`
-/// model, one cycle takes roughly 2 s record + 0.5 s inference = 2.5 s.
-///
-/// A dedicated native KWS library (Porcupine, Vosk KWS) will replace this
-/// when always-on wake-word detection is required.
+/// Implements `StreamingWakeWordDetector`; the blanket impl provides
+/// `WakeWordDetector` automatically.
 pub struct WhisperKeywordDetector {
-    whisper: WhisperInput,
-    /// The trigger phrase to listen for (case-insensitive substring match).
-    trigger: String,
-    /// Pre-built prompt shown in the Wait state UI.
+    server_url: String,
+    /// All normalized trigger variants. A transcript matching *any* of these fires detection.
+    triggers: Vec<String>,
     prompt: String,
+    config: KeywordDetectorConfig,
 }
 
 impl WhisperKeywordDetector {
     /// Create a detector listening for `trigger` (e.g. `"goose"`).
     /// Uses `server_url` for whisper (defaults to `DEFAULT_HOST`).
-    /// Records 2-second clips by default.
     pub fn new(server_url: Option<&str>, trigger: impl Into<String>) -> Self {
         let raw = trigger.into();
         let prompt = format!("Say \"{}\" to activate...", raw);
         Self {
-            whisper: WhisperInput::new(server_url).with_duration(2),
-            trigger: normalize_transcript(&raw),
+            server_url: server_url.unwrap_or(DEFAULT_HOST).to_string(),
+            triggers: vec![normalize_transcript(&raw)],
             prompt,
+            config: KeywordDetectorConfig::default(),
         }
+    }
+
+    /// Load calibrated transcription variants collected during onboarding.
+    ///
+    /// When `variants` is non-empty, the detector matches against any of them
+    /// (OR logic), making detection robust to Whisper's inconsistent output
+    /// (e.g. "hey goose" / "hey, goose" / "a goose").
+    ///
+    /// When `variants` is empty the detector keeps the single normalized trigger
+    /// set by `new()`.
+    pub fn with_transcriptions(mut self, variants: Vec<String>) -> Self {
+        if !variants.is_empty() {
+            self.triggers = variants
+                .iter()
+                .map(|v| normalize_transcript(v))
+                .filter(|v| !v.is_empty())
+                .collect();
+            // Fallback: if all variants normalized to empty, keep the existing trigger.
+            if self.triggers.is_empty() {
+                self.triggers = vec![normalize_transcript(&self.prompt)];
+            }
+        }
+        self
+    }
+
+    /// Override detection parameters.
+    pub fn with_config(mut self, config: KeywordDetectorConfig) -> Self {
+        self.config = config;
+        self
     }
 }
 
@@ -333,35 +788,262 @@ fn normalize_transcript(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Count whitespace-separated tokens in a normalized transcript.
+fn token_count(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
+/// Root-mean-square energy of a mono f32 sample slice.
+/// Returns 0.0 for an empty slice.
+fn rms_energy(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
 #[async_trait]
-impl WakeWordDetector for WhisperKeywordDetector {
-    async fn wait_for_activation(&self) -> Result<()> {
-        loop {
-            match self.whisper.listen().await {
-                Ok(Some(text)) => {
-                    let normalized = normalize_transcript(&text);
-                    if normalized.contains(&self.trigger) {
-                        tracing::info!("Wake word detected: \"{}\"", text.trim());
-                        return Ok(());
-                    }
-                    // Heard something, but trigger not in transcript — show what was heard
-                    tracing::info!("Heard: \"{}\" (trigger: \"{}\")", text.trim(), self.trigger);
-                    println!("  👂 Heard: \"{}\" (waiting for \"{}\")", text.trim(), self.trigger);
-                }
-                Ok(None) => {
-                    tracing::debug!("No speech detected, polling again...");
-                }
-                Err(e) => {
-                    // Log but keep polling — a single failed clip is not fatal
-                    tracing::warn!("Wake word poll error (retrying): {}", e);
-                }
-            }
-        }
+impl StreamingWakeWordDetector for WhisperKeywordDetector {
+    async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+        let server_url  = self.server_url.clone();
+        let triggers    = self.triggers.clone();
+        let config      = self.config.clone();
+
+        tokio::task::spawn_blocking(move || {
+            detection_loop(server_url, triggers, config)
+        })
+        .await
+        .map_err(|e| anyhow!("detection thread panicked: {}", e))?
     }
 
     fn activation_prompt(&self) -> &str {
         &self.prompt
     }
+}
+
+/// Blocking detection loop — runs inside `tokio::task::spawn_blocking`.
+///
+/// Opens a continuous cpal input stream into a ring buffer, then slides a
+/// detection window over it, sending each window to whisper.cpp for
+/// transcription.  Returns when the trigger phrase is confirmed.
+fn detection_loop(
+    server_url: String,
+    triggers: Vec<String>,
+    config: KeywordDetectorConfig,
+) -> Result<WakeWordActivation> {
+    // ── Open continuous audio stream ─────────────────────────────────────────
+    let host   = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("No audio input device found"))?;
+    let stream_config = device
+        .default_input_config()
+        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
+
+    let sample_rate = stream_config.sample_rate().0;
+    let channels    = stream_config.channels() as usize;
+
+    // Ring buffer holds (window_ms + post_trigger_ms) worth of samples.
+    let max_samples = ((config.window_ms + config.post_trigger_ms)
+        * sample_rate as u64 / 1000) as usize;
+    let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(max_samples)));
+    let ring_writer = ring.clone();
+
+    let stream = match stream_config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &stream_config.into(),
+            move |data: &[f32], _| {
+                let mut r = ring_writer.lock().unwrap();
+                for chunk in data.chunks(channels) {
+                    let mono = chunk.iter().copied().sum::<f32>() / channels as f32;
+                    r.push_back(mono);
+                }
+                while r.len() > max_samples { r.pop_front(); }
+            },
+            |e| tracing::warn!("audio stream error: {}", e),
+            None,
+        )?,
+        cpal::SampleFormat::I16 => {
+            let ring_writer2 = ring.clone();
+            device.build_input_stream(
+                &stream_config.into(),
+                move |data: &[i16], _| {
+                    let mut r = ring_writer2.lock().unwrap();
+                    for chunk in data.chunks(channels) {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
+                        r.push_back(sum / channels as f32);
+                    }
+                    while r.len() > max_samples { r.pop_front(); }
+                },
+                |e| tracing::warn!("audio stream error: {}", e),
+                None,
+            )?
+        }
+        fmt => return Err(anyhow!("Unsupported audio format: {:?}", fmt)),
+    };
+    stream.play().map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+
+    // ── Cooldown — wait before re-arming (prevents TTS echo re-trigger) ───────
+    if config.cooldown_ms > 0 {
+        tracing::debug!("KWS: cooldown {}ms before arming", config.cooldown_ms);
+        std::thread::sleep(std::time::Duration::from_millis(config.cooldown_ms));
+    }
+
+    // ── Detection loop ────────────────────────────────────────────────────────
+    let window_samples    = (config.window_ms * sample_rate as u64 / 1000) as usize;
+    let mut slide_ms      = config.slide_ms;
+    let mut hysteresis    = false;
+
+    let blocking_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(slide_ms));
+
+        // Snapshot the latest window_ms samples from the ring buffer.
+        let snapshot: Vec<f32> = {
+            let r = ring.lock().unwrap();
+            let start = r.len().saturating_sub(window_samples);
+            r.range(start..).copied().collect()
+        };
+
+        if snapshot.len() < window_samples / 2 {
+            continue; // buffer not yet full enough — keep waiting
+        }
+
+        // ── Energy gate — skip silent windows before hitting whisper ──────────
+        if config.energy_threshold > 0.0 {
+            let rms = rms_energy(&snapshot);
+            if rms < config.energy_threshold {
+                tracing::trace!("KWS: silent window skipped (rms={:.4})", rms);
+                continue;
+            }
+        }
+
+        // Transcribe the window.
+        let resampled = resample_to_16k(&snapshot, sample_rate);
+        let wav       = encode_wav_mono_16k(&resampled);
+
+        let transcript = match transcribe_blocking(&blocking_client, &server_url, wav) {
+            Ok(Some(t)) => {
+                // Strip artifacts first so [BLANK_AUDIO] etc. don't pollute matching.
+                let cleaned = strip_whisper_artifacts(&t);
+                if cleaned.is_empty() {
+                    tracing::debug!("KWS: artifact-only transcript stripped: {:?}", t);
+                    continue;
+                }
+                normalize_transcript(&cleaned)
+            }
+            Ok(None)    => { tracing::debug!("No speech in window"); continue; }
+            Err(e)      => { tracing::warn!("Whisper error (retrying): {}", e); continue; }
+        };
+
+        let matched = triggers.iter().any(|t| transcript.contains(t.as_str()));
+        tracing::debug!("KWS window: \"{}\" (triggers: {:?}, matched: {})", transcript, triggers, matched);
+
+        if matched {
+            // ── Hysteresis check ──────────────────────────────────────────────
+            if config.hysteresis_enabled && !hysteresis && token_count(&transcript) <= 3 {
+                // Short noisy transcript — could be a false positive. Re-check once.
+                tracing::debug!("Hysteresis: entering re-check mode");
+                hysteresis = true;
+                slide_ms   = config.hysteresis_slide_ms;
+                continue;
+            }
+
+            // ── Confirmed — capture trailing command audio ────────────────────
+            tracing::info!("Wake word confirmed: \"{}\" (matched triggers: {:?})", transcript, triggers);
+            println!("  🟢 Wake word detected!");
+            play_wake_ping();
+
+            // VAD-gated post-trigger: poll every 50 ms and exit as soon as the
+            // microphone goes silent for `post_trigger_silence_ms` consecutive ms.
+            // Falls back to waiting the full `post_trigger_ms` if VAD is disabled
+            // or the user keeps speaking past the ceiling.
+            let poll_ms = 50u64;
+            let mut elapsed_ms = 0u64;
+            let mut silent_for_ms = 0u64;
+
+            while elapsed_ms < config.post_trigger_ms {
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+                elapsed_ms += poll_ms;
+
+                if config.post_trigger_silence_ms > 0 && config.energy_threshold > 0.0 {
+                    let recent_rms = {
+                        let r = ring.lock().unwrap();
+                        let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
+                        let start = r.len().saturating_sub(recent_samples);
+                        let chunk: Vec<f32> = r.range(start..).copied().collect();
+                        rms_energy(&chunk)
+                    };
+                    if recent_rms < config.energy_threshold {
+                        silent_for_ms += poll_ms;
+                        if silent_for_ms >= config.post_trigger_silence_ms {
+                            tracing::debug!(
+                                "KWS: VAD silence after {}ms — snapping command audio early",
+                                elapsed_ms
+                            );
+                            break;
+                        }
+                    } else {
+                        silent_for_ms = 0; // voice still present — reset counter
+                    }
+                }
+            }
+
+            let post_samples = (elapsed_ms * sample_rate as u64 / 1000) as usize;
+            let command_audio: Vec<f32> = {
+                let r = ring.lock().unwrap();
+                let start = r.len().saturating_sub(post_samples);
+                r.range(start..).copied().collect()
+            };
+
+            drop(stream); // stop recording
+
+            let cmd_resampled = resample_to_16k(&command_audio, sample_rate);
+            let cmd_wav       = encode_wav_mono_16k(&cmd_resampled);
+
+            return Ok(WakeWordActivation { captured_audio: Some(cmd_wav) });
+        }
+
+        // No trigger found.
+        if hysteresis {
+            tracing::debug!("Hysteresis: re-check clean, returning to normal slide");
+            hysteresis = false;
+            slide_ms   = config.slide_ms;
+        }
+    }
+}
+
+/// POST WAV bytes to whisper.cpp using a blocking HTTP client.
+fn transcribe_blocking(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    wav: Vec<u8>,
+) -> Result<Option<String>> {
+    let part = reqwest::blocking::multipart::Part::bytes(wav)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| anyhow!("MIME: {}", e))?;
+    let form = reqwest::blocking::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "json");
+
+    let resp = client
+        .post(format!("{}/inference", server_url))
+        .multipart(form)
+        .send()
+        .map_err(|e| anyhow!("whisper request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("whisper error {}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp.json().map_err(|e| anyhow!("parse error: {}", e))?;
+    let raw = json["text"].as_str().unwrap_or("").trim().to_string();
+    let text = strip_whisper_artifacts(&raw);
+    Ok(if text.is_empty() { None } else { Some(text) })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

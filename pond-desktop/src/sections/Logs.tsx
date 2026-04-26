@@ -1,16 +1,18 @@
 import { useState, useEffect, useCallback } from "react";
-import { Button } from "@heroui/react";
-import { RefreshCw, Download } from "lucide-react";
+import { Button, Card, CardContent, Chip, Input, Switch, Tabs } from "@heroui/react";
+import { RefreshCw, Download, Search } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { LogEntry } from "../api/types";
 
 type LevelFilter = "ALL" | "INFO" | "WARN" | "ERROR";
 
 export function Logs() {
-  const [entries, setEntries]   = useState<LogEntry[]>([]);
-  const [level, setLevel]       = useState<LevelFilter>("ALL");
-  const [loading, setLoading]   = useState(true);
-  const [error, setError]       = useState<string | null>(null);
+  const [entries, setEntries]       = useState<LogEntry[]>([]);
+  const [level, setLevel]           = useState<LevelFilter>("ALL");
+  const [search, setSearch]         = useState("");
+  const [autoscroll, setAutoscroll] = useState(true);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -37,67 +39,115 @@ export function Logs() {
     a.click();
   }
 
+  const filtered = entries.filter((e) => {
+    if (search && !(e.message + e.source).toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  function levelColor(l: string): "danger" | "warning" | "default" {
+    switch (l.toUpperCase()) {
+      case "ERROR": return "danger";
+      case "WARN":  return "warning";
+      default:      return "default";
+    }
+  }
+
   return (
-    <div style={styles.root}>
-      {/* Filter bar */}
-      <div style={styles.filterBar}>
-        <div style={styles.filterGroup}>
-          {(["ALL", "INFO", "WARN", "ERROR"] as LevelFilter[]).map((l) => (
-            <button
-              key={l}
-              style={{ ...styles.filterBtn, ...(level === l ? styles.filterBtnActive : {}) }}
-              onClick={() => setLevel(l)}
-            >
-              {l}
-            </button>
-          ))}
-        </div>
-        <div style={styles.filterActions}>
-          <Button variant="outline" onPress={load} isDisabled={loading}>
-            <RefreshCw size={13} />
+    <div className="screen screen--logs">
+      <div className="page-header">
+        <h1 className="page-header__title">Logs</h1>
+      </div>
+
+      {/* Toolbar */}
+      <div className="logs-toolbar">
+        <Tabs
+          selectedKey={level}
+          onSelectionChange={(k) => setLevel(String(k) as LevelFilter)}
+        >
+          <Tabs.ListContainer>
+            <Tabs.List aria-label="Log level filter">
+              {(["ALL", "INFO", "WARN", "ERROR"] as const).map((l) => (
+                <Tabs.Tab key={l} id={l} onClick={() => setLevel(l)}>
+                  <Tabs.Indicator />
+                  {l === "ALL" ? "All" : l.charAt(0) + l.slice(1).toLowerCase()}
+                </Tabs.Tab>
+              ))}
+            </Tabs.List>
+          </Tabs.ListContainer>
+        </Tabs>
+
+        <div className="logs-toolbar__right">
+          <Input
+            size="sm"
+            radius="md"
+            variant="bordered"
+            placeholder="Search messages…"
+            value={search}
+            onValueChange={setSearch}
+            startContent={<Search size={14} />}
+            className="logs-toolbar__search"
+          />
+          <Switch
+            size="sm"
+            color="secondary"
+            isSelected={autoscroll}
+            onValueChange={setAutoscroll}
+          >
+            <span className="muted-12">Autoscroll</span>
+          </Switch>
+          <Button size="sm" variant="light" onPress={load} isDisabled={loading} startContent={<RefreshCw size={14} />}>
             Refresh
           </Button>
-          <Button variant="outline" onPress={downloadCsv}>
-            <Download size={13} />
+          <Button size="sm" variant="bordered" radius="md" onPress={downloadCsv} startContent={<Download size={14} />}>
             Download CSV
           </Button>
         </div>
       </div>
 
-      {error && <p style={styles.error}>{error}</p>}
+      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>{error}</p>}
 
-      {/* Table */}
-      <div style={styles.tableWrap}>
-        <table style={styles.table}>
-          <thead>
-            <tr>
-              <th style={{ ...styles.th, width: "160px" }}>Timestamp</th>
-              <th style={{ ...styles.th, width: "72px" }}>Level</th>
-              <th style={{ ...styles.th, width: "120px" }}>Source</th>
-              <th style={styles.th}>Message</th>
-            </tr>
-          </thead>
-          <tbody>
+      {/* Log table */}
+      <Card shadow="none" className="giap-card logs-table">
+        <CardContent className="card-body--flush">
+          <div className="logs-table__head">
+            <div>Timestamp</div>
+            <div>Level</div>
+            <div>Source</div>
+            <div>Message</div>
+          </div>
+          <div>
             {loading && entries.length === 0 && (
-              <tr><td colSpan={4} style={styles.empty}>Loading logs…</td></tr>
+              <div className="empty-state empty-state--inline">
+                <span>Loading logs\u2026</span>
+              </div>
             )}
-            {!loading && entries.length === 0 && (
-              <tr><td colSpan={4} style={styles.empty}>No log entries found.</td></tr>
+            {!loading && filtered.length === 0 && (
+              <div className="empty-state empty-state--inline">
+                <span>No log entries {search ? "match" : "found"}.</span>
+              </div>
             )}
-            {entries.map((e) => (
-              <tr key={e.id} style={styles.tr}>
-                <td style={styles.td}><span style={styles.ts}>{formatTs(e.timestamp)}</span></td>
-                <td style={styles.td}><span style={{ ...styles.levelBadge, ...levelStyle(e.level) }}>{e.level}</span></td>
-                <td style={styles.td}><span style={styles.source}>{e.source}</span></td>
-                <td style={styles.td}>
-                  <span style={styles.msg}>{e.message}</span>
-                  {e.metadata && <code style={styles.meta}>{truncate(e.metadata, 120)}</code>}
-                </td>
-              </tr>
+            {filtered.map((e) => (
+              <div className="logs-table__row" key={e.id}>
+                <div className="logs-table__ts"><code>{formatTs(e.timestamp)}</code></div>
+                <div>
+                  <Chip size="sm" variant="flat" color={levelColor(e.level)}>
+                    {e.level}
+                  </Chip>
+                </div>
+                <div className="logs-table__src"><code>{e.source}</code></div>
+                <div className="logs-table__msg">
+                  {e.message}
+                  {e.metadata && (
+                    <code style={{ display: "block", marginTop: 2, fontSize: "10px", color: "var(--grey-500)", wordBreak: "break-all" }}>
+                      {truncate(e.metadata, 120)}
+                    </code>
+                  )}
+                </div>
+              </div>
             ))}
-          </tbody>
-        </table>
-      </div>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -107,50 +157,12 @@ export function Logs() {
 function formatTs(ts: string): string {
   try {
     const d = new Date(ts);
-    return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch {
     return ts;
   }
 }
 
 function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
+  return s.length > n ? s.slice(0, n) + "\u2026" : s;
 }
-
-function levelStyle(level: string): React.CSSProperties {
-  switch (level.toUpperCase()) {
-    case "ERROR": return { background: "rgba(220,38,38,0.10)", color: "rgb(185,28,28)", borderColor: "rgba(220,38,38,0.25)" };
-    case "WARN":  return { background: "rgba(245,158,11,0.10)", color: "rgb(180,108,0)", borderColor: "rgba(245,158,11,0.25)" };
-    default:      return { background: "rgba(23,22,22,0.05)", color: "var(--color-text-secondary)", borderColor: "var(--color-border)" };
-  }
-}
-
-// ── Styles ────────────────────────────────────────────────────
-
-const styles: Record<string, React.CSSProperties> = {
-  root: { display: "flex", flexDirection: "column", gap: "var(--space-3)", maxWidth: "100%" },
-  filterBar: { display: "flex", alignItems: "center", gap: "var(--space-3)", flexWrap: "wrap" as const },
-  filterGroup: { display: "flex", gap: "4px" },
-  filterBtn: {
-    height: "30px", padding: "0 var(--space-3)", borderRadius: "var(--radius-sm)",
-    border: "1px solid var(--color-border)", background: "var(--color-bg)",
-    cursor: "pointer", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)",
-    fontFamily: "var(--font-mono)", fontWeight: 500,
-  },
-  filterBtnActive: {
-    background: "var(--color-accent)", color: "#fff", borderColor: "var(--color-accent)",
-  },
-  filterActions: { display: "flex", gap: "var(--space-2)", marginLeft: "auto" },
-  error: { color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 },
-  tableWrap: { overflowX: "auto", border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)" },
-  table: { width: "100%", borderCollapse: "collapse" as const, fontSize: "var(--text-xs)" },
-  th: { padding: "var(--space-2) var(--space-3)", textAlign: "left" as const, background: "rgba(23,22,22,0.03)", borderBottom: "1px solid var(--color-border)", fontWeight: 600, color: "var(--color-text-secondary)", fontSize: "11px", letterSpacing: "0.04em", textTransform: "uppercase" as const },
-  tr: { borderBottom: "1px solid var(--color-border)" },
-  td: { padding: "var(--space-2) var(--space-3)", verticalAlign: "top" as const },
-  empty: { padding: "var(--space-5)", textAlign: "center" as const, color: "var(--color-text-tertiary)" },
-  ts: { fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--color-text-secondary)", whiteSpace: "nowrap" as const },
-  levelBadge: { display: "inline-block", padding: "1px 6px", borderRadius: "4px", border: "1px solid", fontFamily: "var(--font-mono)", fontSize: "10px", fontWeight: 700, letterSpacing: "0.05em" },
-  source: { fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--color-text)" },
-  msg: { color: "var(--color-text)", lineHeight: "1.5" },
-  meta: { display: "block", marginTop: "2px", fontFamily: "var(--font-mono)", fontSize: "10px", color: "var(--color-text-tertiary)", wordBreak: "break-all" as const },
-};
