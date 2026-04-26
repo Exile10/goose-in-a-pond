@@ -26,8 +26,11 @@ vi.mock("../api/PondApiClient", () => ({
       retention_event_log_days: 30,
       retention_sensor_days: 7,
       retention_session_messages_keep: 100,
+      voice_wake_word: "goose",
+      voice_wake_word_transcriptions: [],
     }),
     updateSettings: vi.fn().mockResolvedValue({}),
+    resetWakeWordCalibration: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),
     getActiveRoles: vi.fn().mockResolvedValue({ chat: null, think: null, task: null, asr: null, tts: null }),
   },
@@ -88,6 +91,16 @@ describe("Settings", () => {
       if (!screen.queryByPlaceholderText("goose")) throw new Error("not rendered");
     });
     expect(screen.getByPlaceholderText("goose")).toBeTruthy();
+  });
+
+  it("Voice tab shows 'Not calibrated' and Calibrate button when transcriptions empty", async () => {
+    await renderSettings();
+    clickTab("Voice");
+    await waitFor(() => {
+      if (!screen.queryByText("Not calibrated")) throw new Error("not rendered");
+    });
+    expect(screen.getByText("Not calibrated")).toBeTruthy();
+    expect(screen.getByText("Calibrate")).toBeTruthy();
   });
 
   it("Models tab shows model role rows with Change buttons", async () => {

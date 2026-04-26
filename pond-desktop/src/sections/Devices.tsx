@@ -1,7 +1,24 @@
 import { useState, useEffect } from "react";
-import { Table } from "@heroui/react";
+import { Card, CardContent, Button, Chip } from "@heroui/react";
+import { Monitor, Cpu, Activity, Power, Settings } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
+
+function deviceIcon(kind: string | undefined): React.ReactNode {
+  switch (kind) {
+    case "host":   return <Cpu size={18} />;
+    case "sensor": return <Activity size={18} />;
+    default:       return <Monitor size={18} />;
+  }
+}
+
+function iconClass(kind: string | undefined): string {
+  switch (kind) {
+    case "host":   return "device-card__icon device-card__icon--host";
+    case "sensor": return "device-card__icon device-card__icon--sensor";
+    default:       return "device-card__icon device-card__icon--edge";
+  }
+}
 
 export function Devices() {
   const [devices, setDevices] = useState<Device[]>([]);
@@ -15,50 +32,64 @@ export function Devices() {
       .finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <p style={hint}>Loading devices…</p>;
-  if (error)   return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
-  if (!devices.length) return <p style={hint}>No devices registered yet.</p>;
-
   return (
-    <div style={{ maxWidth: "var(--content-max-width)" }}>
-      <Table>
-        <Table.ScrollContainer>
-          <Table.Content aria-label="Devices">
-            <Table.Header>
-              <Table.Column>Name</Table.Column>
-              <Table.Column>Room</Table.Column>
-              <Table.Column>Status</Table.Column>
-              <Table.Column>Last seen</Table.Column>
-            </Table.Header>
-            <Table.Body>
-              {devices.map((d) => (
-                <Table.Row key={d.id}>
-                  <Table.Cell>{d.name}</Table.Cell>
-                  <Table.Cell>
-                    <span style={{ color: "var(--color-text-secondary)" }}>{d.room ?? "—"}</span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                      <span style={{
-                        width: "7px", height: "7px", borderRadius: "50%", flexShrink: 0,
-                        background: d.is_online ? "var(--color-success)" : "var(--color-neutral)",
-                      }} />
-                      {d.is_online ? "Online" : "Offline"}
-                    </span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span style={{ color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)", fontSize: "var(--text-sm)" }}>
-                      {d.last_seen ? new Date(d.last_seen).toLocaleString() : "—"}
-                    </span>
-                  </Table.Cell>
-                </Table.Row>
-              ))}
-            </Table.Body>
-          </Table.Content>
-        </Table.ScrollContainer>
-      </Table>
+    <div className="screen">
+      <div className="page-header">
+        <h1 className="page-header__title">Devices</h1>
+      </div>
+
+      {loading && <p className="muted-12">Loading devices\u2026</p>}
+      {error && <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>}
+
+      {!loading && !error && devices.length === 0 && (
+        <div className="empty-state">
+          <Monitor size={32} />
+          <span>No devices registered yet.</span>
+        </div>
+      )}
+
+      {devices.length > 0 && (
+        <div className="devices-grid">
+          {devices.map((d) => (
+            <Card
+              key={d.id}
+              shadow="none"
+              className={`giap-card ${!d.is_online ? "device-card--offline" : ""}`}
+            >
+              <CardContent>
+                <div className="device-card__head">
+                  <div className={iconClass(d.device_type)}>
+                    {deviceIcon(d.device_type)}
+                  </div>
+                  <Chip
+                    size="sm"
+                    variant="flat"
+                    color={d.is_online ? "success" : "default"}
+                  >
+                    <span className={`giap-status-dot giap-status-dot--${d.is_online ? "online" : "offline"}`} />
+                    {d.is_online ? "Online" : "Offline"}
+                  </Chip>
+                </div>
+
+                <div className="device-card__name">{d.name}</div>
+
+                {d.room && (
+                  <code style={{ fontSize: 11, color: "var(--grey-500)", display: "block", marginBottom: 6 }}>
+                    {d.room}
+                  </code>
+                )}
+
+                <div className="device-card__meta">
+                  <Chip size="sm" variant="flat" color="default">{d.device_type ?? "edge"}</Chip>
+                  <span className="muted-12">
+                    {d.last_seen ? new Date(d.last_seen).toLocaleString() : "\u2014"}
+                  </span>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
-
-const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };

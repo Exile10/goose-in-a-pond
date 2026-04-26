@@ -3,6 +3,7 @@ import {
   type AddExtensionRequest,
   type AgentRecipe,
   type AgentTool,
+  type CalibrateResponse,
   type ChatEvent,
   type Device,
   type DownloadEntry,
@@ -540,6 +541,36 @@ export class PondApiClient {
     }
 
     return res.json() as Promise<TranscribeResponse>;
+  }
+
+  // ── Wake-word calibration ────────────────────────────────────
+
+  /** Submit one WAV recording as a calibration sample. */
+  async calibrateWakeWord(wav: ArrayBuffer): Promise<CalibrateResponse> {
+    const headers: Record<string, string> = {};
+    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
+
+    const form = new FormData();
+    form.append("audio", new Blob([wav], { type: "audio/wav" }), "sample.wav");
+
+    const res = await fetch(`${this.base}/api/v1/voice/calibrate`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      throw new ApiError(res.status, msg);
+    }
+
+    return res.json() as Promise<CalibrateResponse>;
+  }
+
+  /** Clear all calibration data. Detector reverts to raw wake-word phrase. */
+  async resetWakeWordCalibration(): Promise<void> {
+    await this.del("/api/v1/voice/calibrate");
   }
 }
 

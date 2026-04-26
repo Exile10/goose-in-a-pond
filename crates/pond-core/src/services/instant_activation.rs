@@ -1,10 +1,13 @@
-//! InstantActivation — no-op WakeWordDetector for keyboard / stdin mode.
+//! InstantActivation — StreamingWakeWordDetector for keyboard / stdin mode.
 //!
-//! Returns immediately from `wait_for_activation()` so the workflow loop
+//! Returns immediately from `wait_for_activation_with_audio()` so the workflow loop
 //! transitions straight from Wait to Listen without pausing.
 //! Used as the default in `ChatService` and in all tests.
+//!
+//! Implements `StreamingWakeWordDetector`; the blanket impl provides `WakeWordDetector`
+//! automatically.
 
-use crate::ports::wake_word::WakeWordDetector;
+use crate::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -15,9 +18,9 @@ use async_trait::async_trait;
 pub struct InstantActivation;
 
 #[async_trait]
-impl WakeWordDetector for InstantActivation {
-    async fn wait_for_activation(&self) -> Result<()> {
-        Ok(())
+impl StreamingWakeWordDetector for InstantActivation {
+    async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+        Ok(WakeWordActivation { captured_audio: None })
     }
 
     fn activation_prompt(&self) -> &str {
@@ -28,16 +31,29 @@ impl WakeWordDetector for InstantActivation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::wake_word::WakeWordDetector;
 
     #[tokio::test]
     async fn instant_activation_returns_ok_immediately() {
         let detector = InstantActivation;
-        assert!(detector.wait_for_activation().await.is_ok());
+        let activation = detector.wait_for_activation_with_audio().await.unwrap();
+        assert!(activation.captured_audio.is_none());
     }
 
     #[tokio::test]
     async fn instant_activation_prompt_is_non_empty() {
         let detector = InstantActivation;
-        assert!(!detector.activation_prompt().is_empty());
+        // Explicitly call through StreamingWakeWordDetector to avoid ambiguity
+        // with the deprecated WakeWordDetector blanket impl.
+        assert!(!StreamingWakeWordDetector::activation_prompt(&detector).is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn instant_activation_satisfies_wake_word_detector_via_blanket() {
+        // The blanket impl provides WakeWordDetector automatically.
+        let detector = InstantActivation;
+        let det: &dyn WakeWordDetector = &detector;
+        assert!(det.wait_for_activation().await.is_ok());
     }
 }

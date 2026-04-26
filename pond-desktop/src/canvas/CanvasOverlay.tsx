@@ -97,10 +97,8 @@ export function CanvasOverlay() {
       if (isRecordingRef.current) stopAndSend();
     }).then((u) => unlisten.push(u));
 
-    listen("recording-started", () => {
-      isRecordingRef.current = true;
-      setOrbState("recording");
-    }).then((u) => unlisten.push(u));
+    // recording-started: no longer used — startRecording() sets state
+    // directly, so calibration recordings don't cross-contaminate.
 
     listen("recording-aborted", () => {
       isRecordingRef.current = false;
@@ -117,10 +115,10 @@ export function CanvasOverlay() {
       }
     }).then((u) => unlisten.push(u));
 
-    listen<string>("transcript", (e) => {
+    listen<{ text: string }>("transcript", (e) => {
       setTranscript((prev) => [
         ...prev,
-        { id: nextTranscriptId(), role: "user" as const, text: e.payload, timestamp: Date.now() },
+        { id: nextTranscriptId(), role: "user" as const, text: e.payload.text, timestamp: Date.now() },
       ]);
       setOrbState("thinking");
     }).then((u) => unlisten.push(u));
@@ -160,6 +158,7 @@ export function CanvasOverlay() {
 
   const stateLabels: Record<VoiceState, string> = {
     idle:      "Idle — say something",
+    wait:      "Waiting for wake word…",
     recording: "Listening…",
     thinking:  "Thinking…",
     speaking:  "Speaking…",
