@@ -38,6 +38,7 @@
 
 pub mod middleware;
 pub mod routes;
+pub mod thought_filter;
 
 /// Controls the lifecycle of the local llamafile server process.
 ///
@@ -80,6 +81,7 @@ use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::camera_storage::CameraStorage;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::ports::face_recognition::FaceRecognition;
 use pond_core::ports::mcp_memory::McpMemoryPort;
 use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
 use pond_core::ports::model_repository::ModelRepository;
@@ -194,6 +196,19 @@ pub struct AppState {
     /// Used by the `/api/v1/logs` endpoint.
     /// `None` in tests.
     pub event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>>,
+    /// Biometric face recognition service (register + identify household
+    /// members from camera frames).  `None` when no ONNX embedding model
+    /// is configured — all face endpoints then return 503.
+    pub face_recognition: Option<Arc<dyn FaceRecognition>>,
+    /// Wake-on-face session bindings: `session_id -> profile_id`.
+    ///
+    /// Populated by `POST /api/v1/sessions/:id/identify-user` when a camera
+    /// frame recognises a known face.  The prompt builder can then pull the
+    /// profile's name into the system prompt so the agent greets the right
+    /// household member by name.  Entries are transient (cleared on server
+    /// restart); re-identification is cheap enough to redo each session.
+    pub session_user_bindings:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.
@@ -246,6 +261,7 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
     Router::new()
         // Dev test page — no auth required, returns HTML
         .route("/dev/test", axum::routing::get(routes::dev_test_page))
+        .route("/dev/face", axum::routing::get(routes::dev_face_page))
         .nest("/api/v1", routes::api_routes(state.clone()))
         .fallback_service(routes::web_routes(static_dir))
         // Log every request/response at DEBUG level.

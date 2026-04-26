@@ -5,21 +5,22 @@ import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import logoSrc from "../assets/logo.png";
 import {
-  LayoutDashboard,    // Dashboard — grid overview
-  MessageCircle,      // Chat — speech bubble
-  Monitor,            // Devices — screen
-  CalendarClock,      // Schedules — calendar + time
-  Brain,              // Memory — brain
-  Sparkles,           // Skills — sparkles
-  ScrollText,         // Logs — scrollable text
-  Box,                // Models — 3D box / model
-  PenLine,            // Prompts — editing pen
-  Settings,           // Settings — gear
-  Bot,                // Agent — robot
+  LayoutDashboard,
+  MessageCircle,
+  Monitor,
+  CalendarClock,
+  Brain,
+  Sparkles,
+  ScrollText,
+  Box,
+  PenLine,
+  Settings,
+  Bot,
   ChevronLeft,
   ChevronRight,
   Mic,
   Layers,
+  ScanFace,
 } from "lucide-react";
 
 // ── Icon map — standard lucide icons matching each section's intent ──────────
@@ -35,6 +36,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   model:    Box,
   prompt:   PenLine,
   settings: Settings,
+  face:     ScanFace,
   agent:    Bot,
 };
 
