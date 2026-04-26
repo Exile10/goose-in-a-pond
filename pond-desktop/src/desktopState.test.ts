@@ -36,11 +36,13 @@ describe("desktopState", () => {
     expect(normalizeGuiSection(undefined)).toBe("dashboard");
   });
 
-  it("DESKTOP_SECTIONS is a flat ordered list of all 11 sidebar items", () => {
-    expect(DESKTOP_SECTIONS).toHaveLength(11);
+  it("DESKTOP_SECTIONS is a flat ordered list of all 12 sidebar items", () => {
+    // 12 = the original 11 (dashboard, chat, devices, schedules, memory, skills,
+    // models, prompts, settings, agent, logs) plus the new `faces` entry that
+    // sits in the CONFIGURE group between Prompts and Settings.
+    expect(DESKTOP_SECTIONS).toHaveLength(12);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
-    // Verify all expected sections are present
     const sectionKeys = DESKTOP_SECTIONS.map((s) => s.section);
     expect(sectionKeys).toContain("devices");
     expect(sectionKeys).toContain("schedules");
@@ -48,6 +50,7 @@ describe("desktopState", () => {
     expect(sectionKeys).toContain("skills");
     expect(sectionKeys).toContain("models");
     expect(sectionKeys).toContain("prompts");
+    expect(sectionKeys).toContain("faces");
     expect(sectionKeys).toContain("settings");
     expect(sectionKeys).toContain("agent");
     expect(sectionKeys).toContain("logs");

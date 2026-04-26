@@ -1,121 +1,142 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Button, Tabs, Card, CardContent, Chip, ProgressBar } from "@heroui/react";
+import { Button } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
+  ScanFace,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, HfModel, HfModelFile, DownloadEntry,
-  OllamaModel, LlamafileRelease,
+  OllamaModel, LlamafileRelease, FaceModelsResponse,
 } from "../api/types";
 import { ApiError } from "../api/types";
+
 // ── Design constants ──────────────────────────────────────────
 
 const CAT_COLOR = {
-  llm: "var(--color-role-chat)",
-  asr: "var(--color-role-asr)",
-  tts: "var(--color-role-tts)",
+  llm:  "var(--color-accent)",
+  asr:  "#e5a000",
+  tts:  "#e04343",
+  face: "#3b82f6",
 } as const;
+
+const ROLE_COLOR: Record<string, string> = {
+  chat:  "var(--color-accent)",
+  think: "#8c52ff",
+  task:  "#30a46c",
+  asr:   "#e5a000",
+  tts:   "#e04343",
+};
 
 // ── Active Roles Banner ───────────────────────────────────────
 
-/** Maps role keys to role-chip CSS modifier classes */
-const ROLE_CHIP_VARIANT: Record<string, string> = {
-  chat: "secondary", think: "warning", task: "success", asr: "primary", tts: "danger",
-};
-
 function ActiveRolesBanner({
   roles,
-  memoryStatus,
   onRefresh,
   loading,
   onNavigate,
 }: {
   roles: ModelActiveRoles | null;
-  memoryStatus: ModelMemoryStatus | null;
   onRefresh: () => void;
   loading: boolean;
   onNavigate?: (category: "llm" | "asr" | "tts") => void;
 }) {
   const ROLE_DEFS = [
-    { key: "chat"  as const, label: "Chat",  icon: <MessageSquare size={10} />, category: "llm" as const },
-    { key: "think" as const, label: "Think", icon: <Brain size={10} />,         category: "llm" as const },
-    { key: "task"  as const, label: "Task",  icon: <Wrench size={10} />,        category: "llm" as const },
-    { key: "asr"   as const, label: "ASR",   icon: <Mic size={10} />,           category: "asr" as const },
-    { key: "tts"   as const, label: "TTS",   icon: <Volume2 size={10} />,       category: "tts" as const },
+    { key: "chat"  as const, label: "Chat",  color: ROLE_COLOR.chat,  icon: <MessageSquare size={10} />, category: "llm" as const },
+    { key: "think" as const, label: "Think", color: ROLE_COLOR.think, icon: <Brain size={10} />,         category: "llm" as const },
+    { key: "task"  as const, label: "Task",  color: ROLE_COLOR.task,  icon: <Wrench size={10} />,        category: "llm" as const },
+    { key: "asr"   as const, label: "ASR",   color: ROLE_COLOR.asr,   icon: <Mic size={10} />,           category: "asr" as const },
+    { key: "tts"   as const, label: "TTS",   color: ROLE_COLOR.tts,   icon: <Volume2 size={10} />,       category: "tts" as const },
   ];
 
-  const memPct = memoryStatus && memoryStatus.total_mb > 0
-    ? Math.round(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100)
-    : null;
-
   return (
-    <Card className="giap-card">
-      <CardContent style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
-        <div className="card-header" style={{ padding: 0 }}>
-          <span className="card__label">Active Model Roles</span>
-          <div className="card-header__right">
-            {memoryStatus && memoryStatus.total_mb > 0 && (
-              <div style={{ width: 160, display: "flex", flexDirection: "column", gap: 4 }}>
-                <div className="mem-progress__label">
-                  <span>Memory</span>
-                  <span className="mem-progress__num">
-                    {memoryStatus.available_for_llm_mb.toLocaleString()} / {memoryStatus.total_mb.toLocaleString()} MB
-                  </span>
-                </div>
-                <ProgressBar
-                  size="sm"
-                  value={memPct ?? 0}
-                  color={memPct != null && memPct > 85 ? "warning" : "accent"}
-                  aria-label="Memory usage"
-                >
-                  <ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track>
-                </ProgressBar>
+    <div style={bannerSt.root}>
+      <div style={bannerSt.header}>
+        <span style={bannerSt.title}>Active Model Roles</span>
+        <button style={bannerSt.refreshBtn} onClick={onRefresh} disabled={loading} aria-label="Refresh roles">
+          <RefreshCw size={13} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
+        </button>
+      </div>
+      <div style={bannerSt.pills}>
+        {ROLE_DEFS.map(({ key, label, color, icon, category }) => {
+          const a = roles?.[key];
+          const isSet = !!(a?.provider && a?.model);
+          return (
+            <div
+              key={key}
+              style={{ ...bannerSt.pill, borderLeftColor: color, cursor: !isSet && onNavigate ? "pointer" : "default" }}
+              onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
+              title={!isSet ? `Click to set ${label} model` : undefined}
+            >
+              <div style={{ ...bannerSt.roleLabel, color }}>
+                {icon}
+                <span>{label}</span>
               </div>
-            )}
-            <Button size="sm" variant="ghost" isIconOnly onPress={onRefresh} isDisabled={loading} aria-label="Refresh roles">
-              <RefreshCw size={13} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
-            </Button>
-          </div>
-        </div>
-
-        <div className="role-grid">
-          {ROLE_DEFS.map(({ key, label, icon, category }) => {
-            const a = roles?.[key];
-            const isSet = !!(a?.provider && a?.model);
-            const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
-            return (
-              <div
-                key={key}
-                className={`role-chip role-chip--${variant}`}
-                onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
-                style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
-                title={!isSet ? `Click to set ${label} model` : undefined}
-              >
-                <div className="role-chip__bar" />
-                <div className="role-chip__body">
-                  <div className="role-chip__head">
-                    {icon}
-                    <span className="role-chip__role">{label}</span>
-                  </div>
-                  <span style={{
-                    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                    color: isSet ? "var(--fg)" : "var(--grey-500)", fontStyle: isSet ? "normal" : "italic",
-                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
-                  }}>
-                    {isSet ? `${a!.provider} / ${a!.model}` : "Not set"}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </CardContent>
-    </Card>
+              <span style={isSet ? bannerSt.modelName : bannerSt.notSet}>
+                {isSet ? `${a!.provider} / ${a!.model}` : "Not set"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
+
+const bannerSt: Record<string, React.CSSProperties> = {
+  root: {
+    background: "var(--color-bg)",
+    border: "1px solid var(--color-border)",
+    borderRadius: "var(--radius-lg)",
+    padding: "var(--space-4)",
+    display: "flex",
+    flexDirection: "column",
+    gap: "var(--space-3)",
+  },
+  header: { display: "flex", alignItems: "center", justifyContent: "space-between" },
+  title: {
+    fontFamily: "var(--font-display)",
+    fontWeight: 700,
+    fontSize: "var(--text-sm)",
+    color: "var(--color-text)",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.06em",
+  },
+  refreshBtn: {
+    background: "none", border: "none", cursor: "pointer",
+    padding: "var(--space-1)", color: "var(--color-text-tertiary)",
+    display: "flex", alignItems: "center",
+  },
+  pills: { display: "flex", flexWrap: "wrap" as const, gap: "var(--space-2)" },
+  pill: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: "3px",
+    background: "rgba(23,22,22,0.02)",
+    border: "1px solid var(--color-border)",
+    borderLeft: "4px solid",
+    padding: "var(--space-2) var(--space-3)",
+    minWidth: "130px",
+    transition: "border-color var(--transition-fast)",
+  },
+  roleLabel: {
+    display: "flex", alignItems: "center", gap: "4px",
+    fontSize: "9px", fontWeight: 700,
+    textTransform: "uppercase" as const, letterSpacing: "0.08em",
+    fontFamily: "var(--font-display)",
+  },
+  modelName: {
+    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+    color: "var(--color-text)", fontWeight: 500,
+    whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis", maxWidth: "200px",
+  },
+  notSet: {
+    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+    color: "var(--color-text-tertiary)", fontStyle: "italic",
+  },
+};
 
 // ── Download Progress ─────────────────────────────────────────
 
@@ -216,61 +237,63 @@ function ModelList({
   }
 
   return (
-    <div className="models-list">
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
       {models.map((m) => {
         const activeFor = activeRolesFor(m);
         const isAnyActive = activeFor.length > 0;
+        const accentColor = activeFor.length > 0 ? ROLE_COLOR[activeFor[0]] : "transparent";
 
         return (
           <div
             key={m.id}
-            className={`giap-model-row${isAnyActive ? " is-active" : ""}`}
+            style={{
+              ...mlSt.row,
+              borderLeftColor: isAnyActive ? accentColor : "transparent",
+            }}
           >
-            <div>
-              <div className="giap-model-row__title-row">
-                <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+            <div style={mlSt.left}>
+              <div style={mlSt.nameRow}>
+                <span style={mlSt.name}>{m.display_name ?? m.name}</span>
                 {m.ram_estimate_mb && (
-                  <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB</Chip>
+                  <span style={mlSt.badge}>{m.ram_estimate_mb} MB</span>
                 )}
                 {m.recommended_role && (
-                  <Chip size="sm" variant="soft">{m.recommended_role}</Chip>
+                  <span style={mlSt.badge}>{m.recommended_role}</span>
                 )}
-                {activeFor.map((r) => (
-                  <Chip key={r} size="sm" color="accent" variant="soft">{ROLE_LABELS[r]}</Chip>
-                ))}
               </div>
-              <div className="giap-model-row__file"><code>{m.provider} / {m.name}</code></div>
+              <span style={mlSt.sub}>{m.provider} / {m.name}</span>
             </div>
-            <div className="giap-model-row__actions">
-              <div className="role-select">
-                {availableRoles.map((role) => {
-                  const active = isRoleActive(m, role);
-                  return (
-                    <Button
-                      key={role}
-                      size="sm"
-                      variant={active ? "secondary" : "outline"}
-                      onPress={() => onActivate(m.provider, m.name, role)}
-                      isDisabled={!state.serverOnline}
-                      aria-label={`Set ${m.name} as ${role} model`}
-                    >
-                      {active && <CheckCircle size={11} />}
-                      {ROLE_LABELS[role]}
-                    </Button>
-                  );
-                })}
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                isIconOnly
-                className="giap-model-row__trash"
-                onPress={() => onDelete(m.provider, m.name)}
-                isDisabled={!state.serverOnline}
+            <div style={mlSt.actions}>
+              {availableRoles.map((role) => {
+                const active = isRoleActive(m, role);
+                return (
+                  <button
+                    key={role}
+                    style={{
+                      ...mlSt.roleBtn,
+                      background: active ? ROLE_COLOR[role] : "transparent",
+                      color: active ? "#fff" : "var(--color-text-secondary)",
+                      borderColor: active ? ROLE_COLOR[role] : "var(--color-border-strong)",
+                    }}
+                    onClick={() => onActivate(m.provider, m.name, role)}
+                    disabled={!state.serverOnline}
+                    aria-label={`Set ${m.name} as ${role} model`}
+                    title={`Set as ${ROLE_LABELS[role]}`}
+                  >
+                    {active && <CheckCircle size={11} />}
+                    {ROLE_LABELS[role]}
+                  </button>
+                );
+              })}
+              <button
+                style={mlSt.deleteBtn}
+                onClick={() => onDelete(m.provider, m.name)}
+                disabled={!state.serverOnline}
                 aria-label={`Delete ${m.name}`}
+                title="Delete from disk"
               >
                 <Trash2 size={12} />
-              </Button>
+              </button>
             </div>
           </div>
         );
@@ -278,6 +301,48 @@ function ModelList({
     </div>
   );
 }
+
+const mlSt: Record<string, React.CSSProperties> = {
+  row: {
+    display: "flex", alignItems: "center", gap: "var(--space-3)",
+    padding: "var(--space-3) var(--space-4)",
+    background: "var(--color-bg)",
+    border: "1px solid var(--color-border)",
+    borderLeft: "4px solid",
+    transition: "border-color var(--transition-fast), box-shadow var(--transition-fast)",
+  },
+  left: { flex: 1, display: "flex", flexDirection: "column" as const, gap: "2px", minWidth: 0 },
+  nameRow: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const },
+  name: {
+    fontWeight: 600, fontSize: "var(--text-sm)", color: "var(--color-text)",
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+  },
+  sub: {
+    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+    color: "var(--color-text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+  },
+  badge: {
+    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+    color: "var(--color-text-tertiary)", background: "rgba(23,22,22,0.05)",
+    padding: "1px 6px", borderRadius: "var(--radius-xs)", flexShrink: 0,
+  },
+  actions: { display: "flex", alignItems: "center", gap: "var(--space-1)", flexShrink: 0 },
+  roleBtn: {
+    display: "inline-flex", alignItems: "center", gap: "4px",
+    height: "28px", padding: "0 10px",
+    border: "1px solid", borderRadius: "var(--radius-md)",
+    fontSize: "var(--text-xs)", fontWeight: 600, fontFamily: "var(--font-body)",
+    cursor: "pointer", transition: "all var(--transition-fast)",
+    whiteSpace: "nowrap" as const,
+  },
+  deleteBtn: {
+    display: "inline-flex", alignItems: "center", justifyContent: "center",
+    height: "28px", width: "28px",
+    border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)",
+    background: "transparent", color: "var(--color-destructive)",
+    cursor: "pointer", transition: "all var(--transition-fast)", flexShrink: 0,
+  },
+};
 
 // ── Browse HuggingFace Accordion ──────────────────────────────
 
@@ -324,8 +389,8 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
   }
 
   return (
-    <div className="github-accordion">
-      <button className="acc-title" style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open && results.length === 0) search(); }}>
+    <div style={accordionSt.root}>
+      <button style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open && results.length === 0) search(); }}>
         <span style={accordionSt.headerLabel}><Download size={13} /> Browse HuggingFace</span>
         {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
       </button>
@@ -334,7 +399,7 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
         <div style={accordionSt.body}>
           <div style={accordionSt.searchRow}>
             <div style={{ position: "relative", flex: 1 }}>
-              <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-500)", pointerEvents: "none" }} />
+              <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--color-text-tertiary)", pointerEvents: "none" }} />
               <input
                 style={accordionSt.searchInput}
                 value={query}
@@ -344,7 +409,7 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
                 aria-label="Search HuggingFace GGUF models"
               />
             </div>
-            <Button variant="secondary" size="sm" onPress={search} isDisabled={searching || !state.serverOnline}>
+            <Button variant="primary" size="sm" onPress={search} isDisabled={searching || !state.serverOnline}>
               {searching ? "…" : "Search"}
             </Button>
           </div>
@@ -353,7 +418,7 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
           {dlMsg && <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>{dlMsg}</p>}
 
           {!searching && results.length === 0 && !searchError && (
-            <p className="gh-empty"><Search size={14} /> No results. Search for &quot;gemma&quot;, &quot;llama&quot;, or &quot;mistral&quot;.</p>
+            <p style={hint}>No results. Search for "gemma", "llama", or "mistral".</p>
           )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
@@ -366,25 +431,25 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <a href={model.url} target="_blank" rel="noopener noreferrer" style={accordionSt.repoId}>{model.id}</a>
                       <div style={{ display: "flex", flexWrap: "wrap" as const, gap: "4px", marginTop: "2px" }}>
-                        <Chip size="sm" variant="soft">↓ {model.downloads?.toLocaleString() ?? "?"}</Chip>
-                        <Chip size="sm" variant="soft">♥ {model.likes ?? "?"}</Chip>
-                        {model.tags?.slice(0, 2).map((tag) => <Chip key={tag} size="sm" variant="soft">{tag}</Chip>)}
+                        <span style={mlSt.badge}>↓ {model.downloads?.toLocaleString() ?? "?"}</span>
+                        <span style={mlSt.badge}>♥ {model.likes ?? "?"}</span>
+                        {model.tags?.slice(0, 2).map((tag) => <span key={tag} style={mlSt.badge}>{tag}</span>)}
                       </div>
                     </div>
                     <Button variant="outline" size="sm" onPress={() => browseFiles(model.id)} isDisabled={!state.serverOnline}>
-                      {loadingFiles === model.id ? "…" : isExpanded ? "Hide" : "Files"}
+                      {loadingFiles === model.id ? "…" : isExpanded ? "▲ Hide" : "▼ Files"}
                     </Button>
                   </div>
                   {isExpanded && (
                     <div style={accordionSt.fileList}>
                       {loadingFiles === model.id && <p style={{ ...hint, padding: "var(--space-2) var(--space-3)" }}>Loading files…</p>}
-                      {!loadingFiles && files.length === 0 && <p className="gh-empty" style={{ padding: "var(--space-2) var(--space-3)" }}>No .gguf files in this repo.</p>}
+                      {!loadingFiles && files.length === 0 && <p style={{ ...hint, padding: "var(--space-2) var(--space-3)" }}>No .gguf files in this repo.</p>}
                       {files.map((file) => (
                         <div key={file.filename} style={accordionSt.fileRow}>
-                          <code className="giap-model-row__name">{file.filename}</code>
-                          {file.size_mb != null && <Chip size="sm" variant="soft">{file.size_mb.toLocaleString()} MB</Chip>}
+                          <code style={mlSt.name}>{file.filename}</code>
+                          {file.size_mb != null && <span style={mlSt.badge}>{file.size_mb.toLocaleString()} MB</span>}
                           <Button
-                            variant="secondary" size="sm"
+                            variant="primary" size="sm"
                             onPress={() => startDownload(file)}
                             isDisabled={downloadingFile === file.filename || !state.serverOnline}
                           >
@@ -438,8 +503,8 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
   }
 
   return (
-    <div className="github-accordion">
-      <button className="acc-title" style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open) load(); }}>
+    <div style={accordionSt.root}>
+      <button style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open) load(); }}>
         <span style={accordionSt.headerLabel}><Download size={13} /> Browse GitHub Releases</span>
         {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
       </button>
@@ -448,19 +513,19 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
           {loading && <p style={hint}>Fetching releases…</p>}
           {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
           {dlMsg && <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>{dlMsg}</p>}
-          {!loading && releases.length === 0 && !error && <p className="gh-empty"><Download size={14} /> No llamafile releases found.</p>}
+          {!loading && releases.length === 0 && !error && <p style={hint}>No llamafile releases found.</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
             {releases.map((rel) => (
               <div key={rel.name} style={accordionSt.fileRow}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <code className="giap-model-row__name">{rel.name}</code>
+                  <code style={mlSt.name}>{rel.name}</code>
                   <div style={{ display: "flex", gap: "4px", marginTop: "2px" }}>
-                    <Chip size="sm" variant="soft">{rel.tag}</Chip>
-                    {rel.size_mb != null && <Chip size="sm" variant="soft">{rel.size_mb.toLocaleString()} MB</Chip>}
+                    <span style={mlSt.badge}>{rel.tag}</span>
+                    {rel.size_mb != null && <span style={mlSt.badge}>{rel.size_mb.toLocaleString()} MB</span>}
                   </div>
                 </div>
                 <Button
-                  variant="secondary" size="sm"
+                  variant="primary" size="sm"
                   onPress={() => startDownload(rel)}
                   isDisabled={downloadingFile === rel.name || !state.serverOnline}
                 >
@@ -598,31 +663,35 @@ function OllamaPanel({
   ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
       {/* Status bar */}
-      <div className={`seg-banner ${isRunning ? "seg-banner--info" : "seg-banner--warn"}`}>
-        <span className={`giap-status-dot ${ollamaLoading ? "" : isRunning ? "giap-status-dot--online" : "giap-status-dot--offline"}`} />
-        <span style={{ flex: 1 }}>
-          {ollamaLoading ? "Checking Ollama…" : isRunning ? `Ollama running — ${ollamaModels.length} model${ollamaModels.length !== 1 ? "s" : ""}` : "Ollama not running"}
-        </span>
-        {!isRunning && !ollamaLoading && (
-          <Button variant="outline" size="sm" onPress={() => {
-            setPullMsg("Run `ollama serve` in a terminal to start Ollama, then refresh.");
-          }}>
-            <Play size={12} /> How to start
+      <div style={ollamaSt.statusBar}>
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+          <span style={{ ...ollamaSt.dot, background: ollamaLoading ? "#aaa" : isRunning ? "var(--color-success)" : "#e5a000" }} />
+          <span style={ollamaSt.statusText}>
+            {ollamaLoading ? "Checking Ollama…" : isRunning ? `Ollama running — ${ollamaModels.length} model${ollamaModels.length !== 1 ? "s" : ""}` : "Ollama not running"}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: "var(--space-2)" }}>
+          {!isRunning && !ollamaLoading && (
+            <Button variant="outline" size="sm" onPress={() => {
+              setPullMsg("Run `ollama serve` in a terminal to start Ollama, then refresh.");
+            }}>
+              <Play size={12} /> How to start
+            </Button>
+          )}
+          <Button variant="ghost" size="sm" onPress={loadOllamaModels} isDisabled={ollamaLoading}>
+            <RefreshCw size={12} />
           </Button>
-        )}
-        <Button variant="ghost" size="sm" isIconOnly onPress={loadOllamaModels} isDisabled={ollamaLoading}>
-          <RefreshCw size={12} />
-        </Button>
+        </div>
       </div>
 
       {pullMsg && <p style={{ ...hint, color: pullMsg.startsWith("Error") ? "var(--color-destructive)" : pullMsg.startsWith("Run") ? "var(--color-text-secondary)" : "var(--color-success)" }}>{pullMsg}</p>}
 
       {/* Pull row */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div style={ollamaSt.pullRow}>
         <input
-          style={pullInputSt}
+          style={ollamaSt.pullInput}
           value={pullInput}
           onChange={(e) => setPullInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handlePull()}
@@ -631,7 +700,7 @@ function OllamaPanel({
           disabled={!state.serverOnline || !isRunning}
         />
         <Button
-          variant="secondary" size="sm"
+          variant="primary" size="sm"
           onPress={handlePull}
           isDisabled={!pullInput.trim() || pulling || !state.serverOnline || !isRunning}
         >
@@ -654,11 +723,22 @@ function OllamaPanel({
   );
 }
 
-const pullInputSt: React.CSSProperties = {
-  flex: 1, height: "34px", padding: "0 12px",
-  border: "1px solid var(--grey-200)", borderRadius: "8px",
-  fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-  background: "#fff", color: "var(--fg)", outline: "none",
+const ollamaSt: Record<string, React.CSSProperties> = {
+  statusBar: {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    padding: "var(--space-3) var(--space-4)",
+    background: "rgba(23,22,22,0.02)", border: "1px solid var(--color-border)",
+    borderRadius: "var(--radius-md)",
+  },
+  dot: { width: "8px", height: "8px", borderRadius: "50%", flexShrink: 0 },
+  statusText: { fontSize: "var(--text-sm)", color: "var(--color-text-secondary)", fontWeight: 500 },
+  pullRow: { display: "flex", gap: "var(--space-2)", alignItems: "center" },
+  pullInput: {
+    flex: 1, height: "34px", padding: "0 var(--space-3)",
+    border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)",
+    fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
+    background: "var(--color-bg)", color: "var(--color-text)", outline: "none",
+  },
 };
 
 // ── LLM Tab ───────────────────────────────────────────────────
@@ -696,27 +776,28 @@ function LlmTab({
   const ollamaRegistryModels = models.filter((m) => m.provider === "ollama");
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* Provider sub-tabs */}
-      <div className="seg-toolbar">
-        <Tabs
-          selectedKey={provider}
-          onSelectionChange={(k) => setProvider(String(k) as LlmProvider)}
-        >
-          <Tabs.ListContainer>
-            <Tabs.List aria-label="LLM providers">
-              {PROVIDERS.map(({ key, label }) => (
-                <Tabs.Tab key={key} id={key} onClick={() => setProvider(key as LlmProvider)}>
-                  <Tabs.Indicator />
-                  {label}
-                </Tabs.Tab>
-              ))}
-            </Tabs.List>
-          </Tabs.ListContainer>
-        </Tabs>
-        <div className="seg-toolbar__count">
-          <span>{ggufModels.length + llamafileModels.length + ollamaRegistryModels.length} models</span>
-        </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)" }}>
+      {/* Provider pills */}
+      <div style={llmSt.pills}>
+        {PROVIDERS.map(({ key, label }) => (
+          <button
+            key={key}
+            style={{
+              ...llmSt.pill,
+              background: provider === key ? "rgba(140,82,255,0.1)" : "transparent",
+              borderColor: provider === key ? "var(--color-accent)" : "var(--color-border)",
+              color: provider === key ? "var(--color-accent)" : "var(--color-text-secondary)",
+              fontWeight: provider === key ? 700 : 500,
+            }}
+            onClick={() => setProvider(key)}
+          >
+            {label}
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        <Button variant="ghost" size="sm" onPress={onScanModels} aria-label="Scan for models">
+          <RefreshCw size={12} /> Scan
+        </Button>
       </div>
 
       {/* GGUF panel */}
@@ -768,34 +849,159 @@ function LlmTab({
   );
 }
 
-// llmSt removed — provider pills now use HeroUI Tabs + seg-toolbar CSS classes
+const llmSt: Record<string, React.CSSProperties> = {
+  pills: { display: "flex", alignItems: "center", gap: "var(--space-2)" },
+  pill: {
+    height: "30px", padding: "0 var(--space-3)",
+    border: "1px solid", borderRadius: "var(--radius-md)",
+    fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
+    cursor: "pointer", transition: "all var(--transition-fast)",
+    whiteSpace: "nowrap" as const,
+  },
+};
 
 // ── Category Tabs ─────────────────────────────────────────────
 
-type Category = "llm" | "asr" | "tts";
+type Category = "llm" | "asr" | "tts" | "face";
 
 const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; color: string }> = [
-  { key: "llm", label: "LLM", icon: <Brain size={14} />, color: CAT_COLOR.llm },
-  { key: "asr", label: "ASR", icon: <Mic size={14} />, color: CAT_COLOR.asr },
-  { key: "tts", label: "TTS", icon: <Volume2 size={14} />, color: CAT_COLOR.tts },
+  { key: "llm",  label: "LLM",  icon: <Brain size={14} />,     color: CAT_COLOR.llm  },
+  { key: "asr",  label: "ASR",  icon: <Mic size={14} />,       color: CAT_COLOR.asr  },
+  { key: "tts",  label: "TTS",  icon: <Volume2 size={14} />,   color: CAT_COLOR.tts  },
+  { key: "face", label: "Face", icon: <ScanFace size={14} />,  color: CAT_COLOR.face },
 ];
+
+// ── Face Recognition Panel ───────────────────────────────────
+//
+// Read-only status for the three face models (ArcFace R50 + SCRFD 10G +
+// Silent-Face PAD). pond-server downloads them automatically on first
+// boot when built with `--features face-onnx`, so there is no per-model
+// "Download" button — operators just watch progress here. When the
+// feature is disabled the card surfaces the rebuild instruction.
+function FacePanel() {
+  const [data, setData]       = useState<FaceModelsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    setLoading(true); setError(null);
+    try { setData(await api.listFaceModels()); }
+    catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const installed = data?.models.filter(m => m.downloaded).length ?? 0;
+  const total     = data?.models.length ?? 0;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+      <div style={rootSt.sectionHeader}>
+        <ScanFace size={14} style={{ color: CAT_COLOR.face }} />
+        <span style={{ ...rootSt.sectionTitle, color: CAT_COLOR.face }}>Face Recognition</span>
+        {data && (
+          <span style={mlSt.badge}>
+            {data.feature_enabled ? `${installed}/${total} ready` : "feature disabled"}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        <Button variant="ghost" size="sm" onPress={reload} isDisabled={loading}>
+          <RefreshCw size={12} /> Refresh
+        </Button>
+      </div>
+
+      {loading && <p style={hint}>Loading…</p>}
+      {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
+
+      {data && !data.feature_enabled && (
+        <p style={hint}>
+          Face recognition is disabled in this build. Rebuild pond-server with
+          {" "}<code style={inlineCode}>--features face-onnx</code>{" "}
+          to enable per-user identification.
+        </p>
+      )}
+
+      {data && data.models.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
+          {data.models.map(m => (
+            <div
+              key={m.name}
+              style={{
+                ...mlSt.row,
+                borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent",
+              }}
+            >
+              <div style={mlSt.left}>
+                <div style={mlSt.nameRow}>
+                  <span style={mlSt.name}>{m.label}</span>
+                  <span style={mlSt.badge}>{m.role}</span>
+                  {m.downloaded ? (
+                    <span style={{ ...mlSt.badge, color: "var(--color-success)" }}>
+                      {m.size_mb != null ? `${m.size_mb} MB` : "ready"}
+                    </span>
+                  ) : (
+                    <span style={{ ...mlSt.badge, color: "#e5a000" }}>
+                      missing · ~{m.expected_mb} MB
+                    </span>
+                  )}
+                </div>
+                <span style={mlSt.sub}>{m.name}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {data?.models_dir && (
+        <p style={{ ...hint, fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", opacity: 0.6 }}>
+          {data.models_dir}
+        </p>
+      )}
+
+      <p style={hint}>
+        Models auto-download on first server boot. The buffalo_l zip ships ArcFace R50 +
+        SCRFD 10G in a single ~281 MB archive; Silent-Face PAD is ~2 MB. Once installed,
+        use the <strong>Face Enrollment</strong> page (web UI) to register household members.
+      </p>
+    </div>
+  );
+}
 
 // ── Memory Status Bar ─────────────────────────────────────────
 
 function MemoryStatusBar({ status }: { status: ModelMemoryStatus | null }) {
   if (!status) return null;
   const { total_mb, available_for_llm_mb, loaded_model } = status;
-  if (total_mb <= 0) return null;
   return (
-    <div className="seg-banner seg-banner--info">
-      <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "var(--text-xs)", letterSpacing: "0.06em" }}>
+    <div style={{
+      background: "var(--color-bg)",
+      border: "1px solid var(--color-border)",
+      borderRadius: "var(--radius-lg)",
+      padding: "var(--space-3) var(--space-4)",
+      display: "flex",
+      alignItems: "center",
+      gap: "var(--space-4)",
+      flexWrap: "wrap" as const,
+    }}>
+      <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "var(--text-xs)", color: "var(--color-text-secondary)", textTransform: "uppercase" as const, letterSpacing: "0.06em" }}>
         System Memory
       </span>
-      <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)" }}>
-        {total_mb.toLocaleString()} MB total · {available_for_llm_mb.toLocaleString()} MB available
-      </span>
-      {loaded_model && (
-        <Chip size="sm" color="accent" variant="soft">Hot: {loaded_model}</Chip>
+      {total_mb > 0 ? (
+        <>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--color-text)" }}>
+            {total_mb.toLocaleString()} MB total · {available_for_llm_mb.toLocaleString()} MB available
+          </span>
+          {loaded_model && (
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--color-accent)" }}>
+              Hot: {loaded_model}
+            </span>
+          )}
+        </>
+      ) : (
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", fontStyle: "italic" }}>
+          Managed externally
+        </span>
       )}
     </div>
   );
@@ -813,7 +1019,7 @@ export function Models() {
   const [downloads, setDownloads] = useState<DownloadEntry[]>([]);
   const [actionMsg, setActionMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadRoles = useCallback(async () => {
     setRolesLoading(true);
@@ -834,34 +1040,23 @@ export function Models() {
     catch { /* non-fatal */ }
   }, []);
 
-  // Exponential-backoff download poll: starts at 2s, doubles each unchanged tick, caps at 15s.
   const startDownloadPoll = useCallback(() => {
     if (pollRef.current) return;
-    let delay = 2000;
-
-    async function tick() {
+    pollRef.current = setInterval(async () => {
+      await loadDownloads();
       const { downloads: dl } = await api.getDownloadProgress().catch(() => ({ downloads: [] as DownloadEntry[] }));
-      setDownloads(dl ?? []);
-
-      const allDone = dl.every((d) => d.status === "done" || d.status === "error" || d.status === "completed");
-      if (allDone) {
+      if (dl.every((d) => d.status === "done" || d.status === "error") && pollRef.current) {
+        clearInterval(pollRef.current);
         pollRef.current = null;
         loadModels();
-        return;
       }
-
-      // Double the delay each tick (unchanged progress = slow download), cap at 15s
-      delay = Math.min(delay * 2, 15_000);
-      pollRef.current = setTimeout(tick, delay);
-    }
-
-    pollRef.current = setTimeout(tick, delay);
+    }, 3000);
   }, [loadDownloads, loadModels]);
 
   useEffect(() => {
     loadRoles(); loadModels(); loadDownloads();
     api.getMemoryStatus().then(setMemoryStatus).catch(() => {/* non-fatal */});
-    return () => { if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; } };
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -904,28 +1099,18 @@ export function Models() {
   const asrModels = models.filter((m) => m.provider === "whisper");
   const ttsModels = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
 
-  const llmCount = models.filter((m) => m.provider !== "whisper" && m.provider !== "tts" && m.provider !== "tts_piper" && m.provider !== "tts_http").length;
-
   return (
-    <div className="screen">
-      {/* Page header */}
-      <div className="page-header">
-        <h1 className="page-header__title">Models</h1>
-        <div className="page-header__action">
-          <Button size="sm" variant="outline" onPress={handleScan}>
-            <RefreshCw size={14} /> Scan
-          </Button>
-        </div>
-      </div>
-
-      {/* Active Roles Banner (with memory progress) */}
+    <div style={rootSt.root}>
+      {/* Active Roles Banner */}
       <ActiveRolesBanner
         roles={activeRoles}
-        memoryStatus={memoryStatus}
         onRefresh={loadRoles}
         loading={rolesLoading}
         onNavigate={(cat) => setCategory(cat)}
       />
+
+      {/* Memory Status */}
+      <MemoryStatusBar status={memoryStatus} />
 
       {/* Download Progress */}
       <DownloadProgress downloads={downloads} onScanModels={handleScan} />
@@ -937,45 +1122,23 @@ export function Models() {
         </p>
       )}
 
-      {/* Category tabs toolbar */}
-      <div className="models-toolbar">
-        <Tabs
-          selectedKey={category}
-          onSelectionChange={(k) => setCategory(String(k) as Category)}
-        >
-          <Tabs.ListContainer>
-            <Tabs.List aria-label="Model categories" className="models-toolbar__tabs">
-              {CATEGORIES.map(({ key, label, icon }) => (
-                <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
-                  <Tabs.Indicator />
-                  <div className="tab-title">
-                    {icon}
-                    <span>{label}</span>
-                    <span className="tab-title__count">
-                      {key === "llm" ? llmCount : key === "asr" ? asrModels.length : ttsModels.length}
-                    </span>
-                  </div>
-                </Tabs.Tab>
-              ))}
-            </Tabs.List>
-          </Tabs.ListContainer>
-        </Tabs>
-        <div className="models-toolbar__right">
-          <div className="models-toolbar__search" style={{ position: "relative" }}>
-            <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-500)", pointerEvents: "none" }} />
-            <input
-              style={{
-                width: "100%", height: "32px", paddingLeft: "32px", paddingRight: "12px",
-                border: "1px solid var(--grey-200)", borderRadius: "8px",
-                fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-                background: "#fff", color: "var(--fg)", outline: "none",
-                boxSizing: "border-box" as const,
-              }}
-              placeholder="Search models…"
-              aria-label="Search models"
-            />
-          </div>
-        </div>
+      {/* Category tabs */}
+      <div style={rootSt.catTabs}>
+        {CATEGORIES.map(({ key, label, icon, color }) => (
+          <button
+            key={key}
+            style={{
+              ...rootSt.catTab,
+              borderBottomColor: category === key ? color : "transparent",
+              color: category === key ? color : "var(--color-text-secondary)",
+              fontWeight: category === key ? 700 : 500,
+            }}
+            onClick={() => setCategory(key)}
+          >
+            <span style={{ color: category === key ? color : "var(--color-text-tertiary)" }}>{icon}</span>
+            {label}
+          </button>
+        ))}
       </div>
 
       {/* Tab content */}
@@ -993,10 +1156,10 @@ export function Models() {
       )}
 
       {category === "asr" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--info">
-            <Mic size={14} />
-            <span>Automatic Speech Recognition</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+          <div style={rootSt.sectionHeader}>
+            <Mic size={14} style={{ color: CAT_COLOR.asr }} />
+            <span style={{ ...rootSt.sectionTitle, color: CAT_COLOR.asr }}>Automatic Speech Recognition</span>
           </div>
           <ModelList
             models={asrModels}
@@ -1008,15 +1171,17 @@ export function Models() {
             onDelete={handleDelete}
             emptyMessage="No Whisper models found. Run a model scan or download from HuggingFace."
           />
-          <p className="muted-foot">Whisper models power voice-to-text transcription. Place <code>.bin</code> files in <code>models/whisper/</code> and click Scan.</p>
+          <p style={hint}>Whisper models power voice-to-text transcription. Place <code style={inlineCode}>.bin</code> files in <code style={inlineCode}>models/whisper/</code> and click Scan in the LLM tab.</p>
         </div>
       )}
 
+      {category === "face" && <FacePanel />}
+
       {category === "tts" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--warn">
-            <Volume2 size={14} />
-            <span>Text-to-Speech</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+          <div style={rootSt.sectionHeader}>
+            <Volume2 size={14} style={{ color: CAT_COLOR.tts }} />
+            <span style={{ ...rootSt.sectionTitle, color: CAT_COLOR.tts }}>Text-to-Speech</span>
           </div>
           <ModelList
             models={ttsModels}
@@ -1028,7 +1193,7 @@ export function Models() {
             onDelete={handleDelete}
             emptyMessage="No TTS models found. Place Piper .onnx files in models/tts/ and scan."
           />
-          <p className="muted-foot">TTS models power the voice output. Piper voices use <code>.onnx</code> + <code>.json</code> pairs in <code>models/tts/</code>.</p>
+          <p style={hint}>TTS models power the voice output. Piper voices use <code style={inlineCode}>.onnx</code> + <code style={inlineCode}>.json</code> pairs in <code style={inlineCode}>models/tts/</code>.</p>
         </div>
       )}
     </div>
@@ -1036,3 +1201,26 @@ export function Models() {
 }
 
 const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
+const inlineCode: React.CSSProperties = { fontFamily: "var(--font-mono)", fontSize: "0.85em", background: "rgba(23,22,22,0.06)", padding: "1px 5px", borderRadius: "4px" };
+
+const rootSt: Record<string, React.CSSProperties> = {
+  root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
+  catTabs: {
+    display: "flex", gap: 0,
+    borderBottom: "2px solid var(--color-border)",
+  },
+  catTab: {
+    display: "inline-flex", alignItems: "center", gap: "var(--space-2)",
+    height: "40px", padding: "0 var(--space-4)",
+    border: "none", borderBottom: "3px solid",
+    background: "transparent", cursor: "pointer",
+    fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
+    transition: "all var(--transition-fast)",
+    marginBottom: "-2px",
+  },
+  sectionHeader: { display: "flex", alignItems: "center", gap: "var(--space-2)" },
+  sectionTitle: {
+    fontFamily: "var(--font-display)", fontWeight: 700,
+    fontSize: "var(--text-sm)", textTransform: "uppercase" as const, letterSpacing: "0.06em",
+  },
+};
