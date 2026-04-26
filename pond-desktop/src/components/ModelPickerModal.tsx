@@ -42,6 +42,15 @@ export function ModelPickerModal({
       .finally(() => setLoading(false));
   }, []);
 
+  // Close on ESC key
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [onClose]);
+
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
     if (!q) return models;
@@ -289,7 +298,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "var(--text-xs)",
     fontFamily: "var(--font-mono)",
     color: "var(--color-text-tertiary)",
-    background: "rgba(23,22,22,0.05)",
+    background: "var(--color-border)",
     padding: "2px 6px",
     borderRadius: "var(--radius-xs)",
     whiteSpace: "nowrap",

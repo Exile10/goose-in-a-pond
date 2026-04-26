@@ -9,15 +9,7 @@ import { TranscriptFeed } from "../components/TranscriptFeed";
 import { resolveVoiceDecision } from "../voiceSummon";
 import { api } from "../api/PondApiClient";
 
-// ── State colours ────────────────────────────────────────────
-const STATE_COLORS: Record<string, string> = {
-  idle:      "#8E8E93",
-  wait:      "#8C4BFF",  // dim brand purple — passive wake-word watch
-  recording: "#8C4BFF",
-  thinking:  "#FF9500",
-  speaking:  "#34C759",
-  error:     "#FF3B30",
-};
+import { ORB_STATE_COLORS as STATE_COLORS } from "../lib/colors";
 
 const STATE_LABELS: Record<string, string> = {
   idle:      "Ready",
@@ -70,6 +62,8 @@ export function VoiceMode() {
   const [audioLevel, setAudioLevel] = useState(0);
   const audioLevelRef = useRef(0);
   const voiceHandledRef = useRef(0);
+  const voiceStateRef = useRef(state.voiceState);
+  voiceStateRef.current = state.voiceState; // always points at latest render
   const prevVoiceStateRef = useRef(state.voiceState);
 
   // Live refs to the latest startRecording / stopAndSend so that the
@@ -80,6 +74,8 @@ export function VoiceMode() {
   const startRecordingRef = useRef<() => Promise<void>>(async () => {});
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const stopAndSendRef = useRef<() => Promise<void>>(async () => {});
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleWakeAudioRef = useRef<(wavBytes: number[]) => Promise<void>>(async () => {});
 
   // Always keep refs pointing at the current render's versions.
   // (Must be assigned in the render body, before any effects run.)
@@ -93,6 +89,18 @@ export function VoiceMode() {
   const [secsLeft, setSecsLeft] = useState(0);
   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Silence detection — auto-stop recording after sustained silence
+  const SILENCE_THRESHOLD = 0.015;
+  const SILENCE_TIMEOUT_MS = 1500;
+  const silenceStartRef = useRef<number | null>(null);
+  const hasSpeechRef = useRef(false);
+
+  // Conversational turn-taking — after Goose speaks, auto-listen for
+  // the user's next turn without requiring the wake word again.
+  // If no speech within NO_SPEECH_TIMEOUT_MS, return to passive wake listening.
+  const NO_SPEECH_TIMEOUT_MS = 8000;
+  const noSpeechTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Hide canvas overlay
   useEffect(() => {
@@ -110,39 +118,117 @@ export function VoiceMode() {
       .catch(() => undefined);
   }, []);
 
-  // Track audio levels (Tauri only — listen() crashes in browser env)
+  // Track audio levels + silence detection (Tauri only)
   useEffect(() => {
     const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     if (!isTauri) return;
     let unlisten: (() => void) | null = null;
     listen<number>("audio-level", (e) => {
-      audioLevelRef.current = e.payload;
-      setAudioLevel(e.payload);
+      const level = e.payload;
+      audioLevelRef.current = level;
+      setAudioLevel(level);
+
+      // Silence detection: auto-stop recording after SILENCE_TIMEOUT_MS
+      // of continuous silence, but only after speech has been detected.
+      // Use voiceStateRef (not state.voiceState) to avoid stale closure —
+      // this effect runs once at mount with [] deps.
+      if (voiceStateRef.current !== "recording") {
+        silenceStartRef.current = null;
+        hasSpeechRef.current = false;
+        return;
+      }
+      if (level > SILENCE_THRESHOLD) {
+        if (!hasSpeechRef.current) {
+          // First speech detected — cancel the no-speech timeout
+          hasSpeechRef.current = true;
+          if (noSpeechTimerRef.current) {
+            clearTimeout(noSpeechTimerRef.current);
+            noSpeechTimerRef.current = null;
+          }
+        }
+        silenceStartRef.current = null;
+      } else if (hasSpeechRef.current) {
+        // Below threshold — start or check silence timer
+        if (silenceStartRef.current === null) {
+          silenceStartRef.current = Date.now();
+        } else if (Date.now() - silenceStartRef.current >= SILENCE_TIMEOUT_MS) {
+          silenceStartRef.current = null;
+          stopAndSendRef.current();
+        }
+      }
     }).then((u) => { unlisten = u; });
     return () => { unlisten?.(); };
   }, []);
+
+  // ── Dismissal handler ──────────────────────────────────────────
+  // When the Rust pipeline detects "bye", "dismissed", etc. it speaks a
+  // farewell and emits `voice-dismissed`.  Reset to wake word mode here.
+  useEffect(() => {
+    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!isTauri) return;
+    let unlisten: (() => void) | null = null;
+    listen<boolean>("voice-dismissed", async (e) => {
+      const isExit = e.payload; // true = hard exit, false = soft dismissal
+      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+      if (isExit) return; // hard exit — stay idle
+
+      // Soft dismissal — return to passive wake word listening
+      try {
+        const s = await api.getSettings();
+        const raw = s as Record<string, unknown>;
+        const ww = raw.voice_wake_word ?? raw.wake_word;
+        if (ww && typeof ww === "string" && ww.trim()) {
+          const variants = Array.isArray(raw.voice_wake_word_transcriptions)
+            ? (raw.voice_wake_word_transcriptions as string[]).filter((v: unknown) => typeof v === "string" && (v as string).trim())
+            : [];
+          await invoke("start_wake_listener", {
+            wakeWord: ww.trim(),
+            variants: variants.length > 0 ? variants : null,
+          });
+          dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+        }
+      } catch { /* ignore */ }
+    }).then((u) => { unlisten = u; });
+    return () => { unlisten?.(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Wake word listener ───────────────────────────────────────
   // On mount: load wake word setting and start passive listening loop if configured.
   useEffect(() => {
     let wakeUnlisten: (() => void) | null = null;
+    let unmounted = false; // guard against leaked async listeners
     const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
     api.getSettings()
       .then(async (s) => {
-        const wakeWord = (s as Record<string, unknown>).voice_wake_word;
-        if (!wakeWord || typeof wakeWord !== "string" || !wakeWord.trim()) return;
+        if (unmounted) return; // component already gone — bail
+
+        const raw = s as Record<string, unknown>;
+        const wakeWord = raw.voice_wake_word ?? raw.wake_word;
+        if (!wakeWord || typeof wakeWord !== "string" || !wakeWord.trim()) {
+          // No wake word configured — auto-start recording immediately
+          // (matches CLI's InstantActivation: no wake word = listen right away)
+          startRecordingRef.current();
+          return;
+        }
 
         setWakeWord(wakeWord.trim());
 
-        // Enter wait state and start the passive listener
+        // Calibrated variants — if present, the wake listener uses OR-matching
+        // against all variants instead of just the raw phrase.
+        const variants = Array.isArray(raw.voice_wake_word_transcriptions)
+          ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
+          : [];
+
         dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
         if (isTauri) {
           try {
-            await invoke("start_wake_listener", { wakeWord: wakeWord.trim() });
+            await invoke("start_wake_listener", {
+              wakeWord: wakeWord.trim(),
+              variants: variants.length > 0 ? variants : null,
+            });
           } catch (e) {
-            // Most likely cause: microphone permission denied on macOS.
-            // Show the error so the user knows why it's silent.
+            if (unmounted) return;
             const msg = String(e);
             const isMicDenied =
               msg.toLowerCase().includes("permission") ||
@@ -157,20 +243,45 @@ export function VoiceMode() {
                 : `Wake listener failed: ${msg}`,
             });
             dispatch({ type: "SET_VOICE_STATE", payload: "error" });
-            return; // don't register the listener if the backend failed
+            return;
           }
 
-          // Listen for wake word detection → hand off to record.
-          wakeUnlisten = await listen("wake-word-detected", () => {
+          // One-breath flow: the Rust wake listener captures audio (wake word +
+          // any following command) and passes WAV bytes in the event payload.
+          const unsub = await listen<number[]>("wake-word-detected", (e) => {
+            // Guard: if component unmounted while listen() was resolving,
+            // the listener leaked — clean it up and do nothing.
+            if (unmounted) {
+              unsub();
+              return;
+            }
+
             invoke("stop_wake_listener").catch(() => undefined);
-            startRecordingRef.current();
+            // Audible confirmation so the user knows they were heard
+            invoke("play_ping").catch(() => undefined);
+
+            const wavBytes = e.payload;
+            if (wavBytes && Array.isArray(wavBytes) && wavBytes.length > 100) {
+              // One-breath: audio already captured — send to pipeline
+              handleWakeAudioRef.current(wavBytes);
+            } else {
+              // No captured audio — start fresh recording
+              startRecordingRef.current();
+            }
           });
+
+          // If cleanup ran while listen() was pending, immediately unsubscribe
+          if (unmounted) {
+            unsub();
+          } else {
+            wakeUnlisten = unsub;
+          }
         }
       })
       .catch(() => undefined);
 
     return () => {
-      // Teardown: stop passive listener and return to idle
+      unmounted = true;
       wakeUnlisten?.();
       if (isTauri) {
         invoke("stop_wake_listener").catch(() => undefined);
@@ -179,34 +290,92 @@ export function VoiceMode() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Speak → Wait loop closure ────────────────────────────────
-  // After the pipeline finishes (speaking/error → idle), restart the passive
-  // wake listener so the cycle completes: wait → listen → think → speak → wait
+  // ── Conversational turn-taking ────────────────────────────────
+  // After Goose speaks, automatically start recording for the user's next
+  // turn — no wake word needed within an active conversation.
+  //
+  // If the user doesn't speak within NO_SPEECH_TIMEOUT_MS, the conversation
+  // ends and we return to passive wake-word listening.
+  //
+  // State machine:
+  //   wait → wake word → think → speak → [auto-listen] → think → speak → ...
+  //                                          ↓ (no speech 8s)
+  //                                         wait
   useEffect(() => {
     const prev = prevVoiceStateRef.current;
     prevVoiceStateRef.current = state.voiceState;
 
-    if (state.voiceState === "idle" && (prev === "speaking" || prev === "error")) {
-      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      api.getSettings()
-        .then(async (s) => {
-          const ww = (s as Record<string, unknown>).voice_wake_word;
-          if (!ww || typeof ww !== "string" || !ww.trim()) return;
-          setWakeWord(ww.trim());
-          dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+    if (state.voiceState === "idle" && prev === "speaking") {
+      // Goose just finished speaking — start listening for user's next turn.
+      startRecordingRef.current();
+
+      // Set a no-speech timeout: if the user doesn't start talking within
+      // 8 seconds, end the conversation and return to passive wake listening.
+      noSpeechTimerRef.current = setTimeout(() => {
+        if (!hasSpeechRef.current) {
+          // User didn't respond — conversation over. Abort recording and
+          // return to "wait" (if wake word configured) or "idle".
+          // Use invoke directly since abortRecording captures stale state.
+          invoke("abort_recording").catch(() => undefined);
+          const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
           if (isTauri) {
-            await invoke("start_wake_listener", { wakeWord: ww.trim() }).catch(() => undefined);
+            api.getSettings()
+              .then(async (s) => {
+                const raw = s as Record<string, unknown>;
+                const ww = raw.voice_wake_word ?? raw.wake_word;
+                if (ww && typeof ww === "string" && ww.trim()) {
+                  const variants = Array.isArray(raw.voice_wake_word_transcriptions)
+                    ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
+                    : [];
+                  await invoke("start_wake_listener", {
+                    wakeWord: ww.trim(),
+                    variants: variants.length > 0 ? variants : null,
+                  }).catch(() => undefined);
+                  dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+                } else {
+                  dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+                }
+              })
+              .catch(() => dispatch({ type: "SET_VOICE_STATE", payload: "idle" }));
+          } else {
+            dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
           }
-        })
-        .catch(() => undefined);
+        }
+      }, NO_SPEECH_TIMEOUT_MS);
+    }
+
+    // On error, go back to passive wake listening immediately
+    if (state.voiceState === "idle" && prev === "error") {
+      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      if (isTauri) {
+        api.getSettings()
+          .then(async (s) => {
+            const raw = s as Record<string, unknown>;
+            const ww = raw.voice_wake_word ?? raw.wake_word;
+            if (!ww || typeof ww !== "string" || !ww.trim()) return;
+            setWakeWord(ww.trim());
+            const variants = Array.isArray(raw.voice_wake_word_transcriptions)
+              ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
+              : [];
+            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+            await invoke("start_wake_listener", {
+              wakeWord: ww.trim(),
+              variants: variants.length > 0 ? variants : null,
+            }).catch(() => undefined);
+          })
+          .catch(() => undefined);
+      }
     }
   }, [state.voiceState]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Clear countdown timers
+  // Clear countdown timers + silence detection + no-speech timer
   const clearTimers = useCallback(() => {
     if (stopTimerRef.current) { clearTimeout(stopTimerRef.current); stopTimerRef.current = null; }
     if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
+    if (noSpeechTimerRef.current) { clearTimeout(noSpeechTimerRef.current); noSpeechTimerRef.current = null; }
     setSecsLeft(0);
+    silenceStartRef.current = null;
+    hasSpeechRef.current = false;
   }, []);
 
   // Start countdown visuals + auto-stop
@@ -230,6 +399,13 @@ export function VoiceMode() {
     if (state.voiceState !== "recording") clearTimers();
   }, [state.voiceState, clearTimers]);
 
+  // Clear countdown timers on unmount so they don't fire after component is gone
+  useEffect(() => {
+    return () => clearTimers();
+  // clearTimers is stable (useCallback with no deps) — safe to omit from deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Respond to global voice activation hotkey
   useEffect(() => {
     if (state.voiceRequestId === voiceHandledRef.current) return;
@@ -246,23 +422,35 @@ export function VoiceMode() {
   }, [state.voiceRequestId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function startRecording() {
+    // VAD-aware recording — matches the CLI's technique.
+    // Opens the mic, waits for speech, records until silence, then sends.
+    // No countdown timer needed — VAD handles end-of-speech automatically.
+    dispatch({ type: "SET_VOICE_STATE", payload: "recording" });
     try {
-      await invoke("start_recording");
-      // Use a ref-wrapped callback so stopAndSend is always the latest version
-      // even when called from the countdown timer set up here.
-      startCountdown(maxSecs, () => stopAndSendRef.current());
+      const wavBytes = await invoke<number[]>("record_with_vad");
+      if (!wavBytes || wavBytes.length === 0) {
+        // No speech detected — fall back to wake word or idle
+        dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+        return;
+      }
+      dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
+      const authToken = state.sessionToken ?? "";
+      const sessionId = state.sessionId ?? undefined;
+      await invoke("run_voice_pipeline", { wavBytes, authToken, sessionId });
     } catch (e) {
-      console.error("start_recording failed:", e);
+      console.error("VAD recording failed:", e);
+      dispatch({ type: "SET_VOICE_ERROR", payload: String(e) });
+      dispatch({ type: "SET_VOICE_STATE", payload: "error" });
     }
   }
 
   async function stopAndSend() {
+    // Legacy stop — used by manual "Send" button and hotkey.
+    // Falls back to old start/stop if someone presses the button.
     clearTimers();
     try {
       dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
       const wavBytes = await invoke<number[]>("stop_recording");
-      // Read directly from state — this function is always the latest render's
-      // version (kept alive via stopAndSendRef), so state is never stale here.
       const authToken = state.sessionToken ?? "";
       const sessionId = state.sessionId ?? undefined;
       await invoke("run_voice_pipeline", { wavBytes, authToken, sessionId });
@@ -273,10 +461,26 @@ export function VoiceMode() {
     }
   }
 
+  // One-breath flow: handle pre-captured WAV audio from wake word detection.
+  // Skips the recording phase and sends directly to the voice pipeline.
+  async function handleWakeAudio(wavBytes: number[]) {
+    dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
+    try {
+      const authToken = state.sessionToken ?? "";
+      const sessionId = state.sessionId ?? undefined;
+      await invoke("run_voice_pipeline", { wavBytes, authToken, sessionId });
+    } catch (e) {
+      console.error("one-breath pipeline failed:", e);
+      dispatch({ type: "SET_VOICE_ERROR", payload: String(e) });
+      dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+    }
+  }
+
   // Sync live refs — runs on every render so the wake listener always calls
   // the most up-to-date versions of these functions.
   startRecordingRef.current = startRecording;
   stopAndSendRef.current = stopAndSend;
+  handleWakeAudioRef.current = handleWakeAudio;
 
   async function abortRecording() {
     clearTimers();

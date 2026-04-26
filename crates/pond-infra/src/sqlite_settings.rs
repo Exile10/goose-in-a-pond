@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use pond_core::domain::settings::Settings;
 use pond_core::ports::settings::SettingsRepository;
 use sqlx::{Pool, Sqlite};
+use serde_json;
 
 pub struct SqliteSettingsRepository {
     pool: Pool<Sqlite>,
@@ -66,7 +67,15 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("llm_max_tokens",                  settings.llm_max_tokens.to_string());
         upsert!("llm_temperature",                 settings.llm_temperature.to_string());
         upsert!("llm_provider",                    &settings.llm_provider);
-        upsert!("voice_wake_word",                 &settings.voice_wake_word);
+        upsert!("voice_wake_word",                      &settings.voice_wake_word);
+        upsert!("voice_kws_whisper_url",
+            settings.voice_kws_whisper_url.as_deref().unwrap_or(""));
+        upsert!("voice_kws_energy_threshold",           settings.voice_kws_energy_threshold.to_string());
+        upsert!("voice_kws_post_trigger_silence_ms",    settings.voice_kws_post_trigger_silence_ms.to_string());
+        upsert!("voice_kws_cooldown_ms",                settings.voice_kws_cooldown_ms.to_string());
+        upsert!("voice_wake_word_transcriptions",
+            serde_json::to_string(&settings.voice_wake_word_transcriptions)
+                .unwrap_or_else(|_| "[]".to_string()));
         upsert!("voice_tts_voice",                 &settings.voice_tts_voice);
         upsert!("voice_recording_duration_secs",   settings.voice_recording_duration_secs.to_string());
         upsert!("voice_whisper_url",               &settings.voice_whisper_url);
@@ -145,6 +154,23 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         "llm_provider"                    => s.llm_provider = value.to_string(),
         "voice_wake_word"                 => s.voice_wake_word = value.to_string(),
+        "voice_kws_whisper_url"           => {
+            s.voice_kws_whisper_url = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "voice_kws_energy_threshold"      => {
+            if let Ok(v) = value.parse() { s.voice_kws_energy_threshold = v; }
+        }
+        "voice_kws_post_trigger_silence_ms" => {
+            if let Ok(v) = value.parse() { s.voice_kws_post_trigger_silence_ms = v; }
+        }
+        "voice_kws_cooldown_ms"           => {
+            if let Ok(v) = value.parse() { s.voice_kws_cooldown_ms = v; }
+        }
+        "voice_wake_word_transcriptions"  => {
+            if let Ok(v) = serde_json::from_str::<Vec<String>>(value) {
+                s.voice_wake_word_transcriptions = v;
+            }
+        }
         "voice_tts_voice"                 => s.voice_tts_voice = value.to_string(),
         "voice_recording_duration_secs"   => {
             if let Ok(v) = value.parse() { s.voice_recording_duration_secs = v; }

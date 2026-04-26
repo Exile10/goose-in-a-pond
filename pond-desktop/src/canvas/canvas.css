@@ -160,3 +160,10 @@ html, body, #root {
 .canvas-card-in {
   animation: fadeIn 0.2s ease;
 }
+
+/* ── Voice orb pulse rings ───────────────────────────────── */
+
+@keyframes voicePulse {
+  0%   { transform: scale(0.9); opacity: 0.8; }
+  100% { transform: scale(1.7); opacity: 0; }
+}

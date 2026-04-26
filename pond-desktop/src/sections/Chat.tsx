@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Button } from "@heroui/react";
-import { ArrowUp } from "lucide-react";
+import { Button, Chip } from "@heroui/react";
+import { ArrowUp, Cpu, Mic, Paperclip, Zap } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import type { ChatEvent } from "../api/types";
+import { filterThinking } from "../lib/thinkFilter";
 
 // Map raw tool names (e.g. "giap__get_current_weather") to a one-line,
 // user-friendly status the chat bubble shows while the tool is running.
@@ -50,9 +51,11 @@ export function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [loadingSession, setLoadingSession] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
+  const inThinkBlockRef = useRef(false);
 
   // Keep sessionIdRef in sync with state. When the session id changes
   // *externally* (e.g. the user clicked a Recent item on the Dashboard),
@@ -83,6 +86,7 @@ export function Chat() {
   // Load most recent session on mount (once server is online)
   useEffect(() => {
     if (!state.serverOnline || messages.length > 0) return;
+    setLoadingSession(true);
     api.listSessions()
       .then((sessions) => {
         if (sessions.length === 0) return;
@@ -103,7 +107,8 @@ export function Chat() {
       })
       .catch((err) => {
         console.warn("Could not load session history (non-fatal):", err);
-      });
+      })
+      .finally(() => setLoadingSession(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.serverOnline]);
 
@@ -130,6 +135,7 @@ export function Chat() {
     }
     setBusy(true);
 
+    inThinkBlockRef.current = false; // reset for new stream
     const userMsg: Message = { id: ++msgId, role: "user", text };
     const agentMsg: Message = { id: ++msgId, role: "agent", text: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, agentMsg]);
@@ -140,12 +146,16 @@ export function Chat() {
         const ev = event as ChatEvent;
 
         if (ev.type === "text" && (ev.content ?? ev.token)) {
-          const tok = ev.content ?? ev.token ?? "";
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, text: last.text + tok, status: undefined }];
-          });
+          const raw = ev.content ?? ev.token ?? "";
+          const [visible, newInBlock] = filterThinking(raw, inThinkBlockRef.current);
+          inThinkBlockRef.current = newInBlock;
+          if (visible) {
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== "agent") return prev;
+              return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
+            });
+          }
 
         } else if (ev.type === "status" && ev.content) {
           setMessages((prev) => {
@@ -244,173 +254,157 @@ export function Chat() {
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   }
 
+  const modelLabel = state.lastResponseMeta?.modelName ?? "local model";
+
   return (
-    <div style={styles.root}>
-      {/* Header */}
-      <div style={styles.header}>
-        <span style={styles.headerTitle}>Chat</span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onPress={newConversation}
-          aria-label="New conversation"
-        >
-          New chat
-        </Button>
+    <div className="screen screen--chat">
+      {/* Chat Toolbar */}
+      <div className="chat-toolbar">
+        <div className="chat-toolbar__left">
+          <h1 className="page-header__title chat-toolbar__title">Chat</h1>
+          <Chip size="sm" variant="soft">
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Cpu size={12} /> {modelLabel}
+            </span>
+          </Chip>
+        </div>
+        <div className="chat-toolbar__right">
+          <Button
+            size="sm"
+            variant="ghost"
+            onPress={newConversation}
+            aria-label="New conversation"
+          >
+            New chat
+          </Button>
+          <Button size="sm" variant="outline">
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Zap size={14} /> Tools
+            </span>
+          </Button>
+        </div>
       </div>
 
       {/* Messages */}
-      <div style={styles.messages} role="log" aria-live="polite">
-        {messages.length === 0 && (
-          <div style={styles.empty}>
-            <p style={styles.emptyTitle}>Start a conversation</p>
-            <p style={styles.emptyHint}>Ask Pond anything. Type a message or use voice mode.</p>
-          </div>
-        )}
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            style={{
-              ...styles.bubble,
-              ...(msg.role === "user" ? styles.userBubble : styles.agentBubble),
-            }}
-          >
-            <span style={{
-              ...styles.roleLabel,
-              color: msg.role === "agent" ? "var(--color-accent)" : "var(--color-text-secondary)",
-            }}>
-              {msg.role === "user" ? "You" : "Pond"}
-            </span>
-            <p style={{
-              ...styles.bubbleText,
-              ...(msg.error ? styles.bubbleError : {}),
-            }}>
-              {msg.text || (msg.streaming ? (
-                <ThinkingPlaceholder status={msg.status} />
-              ) : "")}
-            </p>
+      <div className="chat-body" role="log" aria-live="polite">
+        <div className="chat-thread">
+          {loadingSession && (
+            <div style={styles.skeleton} aria-busy="true" aria-label="Loading conversation">
+              {[88, 64, 72].map((w, i) => (
+                <div key={i} style={{ ...styles.skeletonRow, alignSelf: i % 2 === 0 ? "flex-start" : "flex-end" }}>
+                  <div style={{ ...styles.skeletonLine, width: `${w}%`, height: "14px", marginBottom: "6px" }} />
+                  <div style={{ ...styles.skeletonLine, width: `${Math.round(w * 0.65)}%`, height: "14px" }} />
+                </div>
+              ))}
+            </div>
+          )}
+          {!loadingSession && messages.length === 0 && (
+            <div className="empty-state">
+              <p style={styles.emptyTitle}>Start a conversation</p>
+              <p style={styles.emptyHint}>Ask Pond anything. Type a message or use voice mode.</p>
+            </div>
+          )}
+          {messages.map((msg) => (
+            <div
+              key={msg.id}
+              className={`bubble ${msg.role === "user" ? "bubble--user" : "bubble--assistant"}`}
+            >
+              <div className="bubble__author">
+                {msg.role === "user" ? "You" : "Pond"}
+              </div>
+              <div
+                className="bubble__body"
+                style={{
+                  userSelect: "text",
+                  wordBreak: "break-word",
+                  ...(msg.error ? styles.bubbleError : {}),
+                }}
+              >
+                {msg.text || (msg.streaming ? (
+                  msg.status
+                    ? <ThinkingPlaceholder status={msg.status} />
+                    : <span className="stream-dots"><span /><span /><span /></span>
+                ) : "")}
+              </div>
 
-            {/* Inline tool-call ContextCards intentionally NOT rendered in
-             * the chat thread. They were leaking the agent's plumbing
-             * (raw "Get Recipe" / "Get Weather" chips with `{}` JSON
-             * underneath) every time the model invoked a tool. The
-             * canvas overlay still receives the same cards via the
-             * PUSH_CONTEXT_CARD action above, so voice mode is unaffected. */}
+              {/* Inline tool-call ContextCards intentionally NOT rendered in
+               * the chat thread. They were leaking the agent's plumbing
+               * (raw "Get Recipe" / "Get Weather" chips with `{}` JSON
+               * underneath) every time the model invoked a tool. The
+               * canvas overlay still receives cards via PUSH_CONTEXT_CARD
+               * for voice mode, so that flow is unaffected. */}
 
-            {/* Model role badge + token count */}
-            {msg.role === "agent" && msg.modelRole && !msg.streaming && (
-              <span style={styles.modelRoleBadge}>
-                {msg.modelRole}
-                {msg.tokenUsage && msg.tokenUsage.completion_tokens > 0 && (
-                  <> · {msg.tokenUsage.completion_tokens} tokens</>
-                )}
-              </span>
-            )}
-          </div>
-        ))}
-        <div ref={bottomRef} />
+              {/* Model role badge + token count */}
+              {msg.role === "agent" && msg.modelRole && !msg.streaming && (
+                <span style={styles.modelRoleBadge}>
+                  {msg.modelRole}
+                  {msg.tokenUsage && msg.tokenUsage.completion_tokens > 0 && (
+                    <> · {msg.tokenUsage.completion_tokens} tokens</>
+                  )}
+                </span>
+              )}
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
       </div>
 
       {/* Composer */}
-      <div style={styles.composer}>
-        <textarea
-          ref={textareaRef}
-          style={styles.textarea}
-          value={input}
-          onChange={onInput}
-          onKeyDown={onKeyDown}
-          placeholder="Message Pond… (⌘↵ to send)"
-          disabled={!state.serverOnline || busy}
-          aria-label="Message input"
-        />
-        <Button
-          variant="primary"
-          isDisabled={!input.trim() || !state.serverOnline || busy}
-          onPress={sendMessage}
-          aria-label="Send message"
-        >
-          <ArrowUp size={16} />
-        </Button>
+      <div className="chat-composer">
+        <div className="chat-composer__inner">
+          <textarea
+            ref={textareaRef}
+            className="chat-composer__field"
+            style={styles.textarea}
+            value={input}
+            onChange={onInput}
+            onKeyDown={onKeyDown}
+            placeholder="Message Pond..."
+            disabled={!state.serverOnline || busy}
+            aria-label="Message input"
+          />
+          <div className="chat-composer__actions">
+            <Button isIconOnly size="sm" variant="ghost">
+              <Paperclip size={16} />
+            </Button>
+            <Button isIconOnly size="sm" variant="ghost">
+              <Mic size={16} />
+            </Button>
+            <Button
+              isIconOnly
+              size="sm"
+              variant="secondary"
+              isDisabled={!input.trim() || !state.serverOnline || busy}
+              onPress={sendMessage}
+              aria-label="Send message"
+            >
+              <ArrowUp size={16} />
+            </Button>
+          </div>
+        </div>
+        <div className="chat-composer__hint">
+          <span>Ctrl/Cmd + Enter to send</span>
+          <span>&middot;</span>
+          <span>Up arrow to edit last message</span>
+        </div>
       </div>
     </div>
   );
 }
 
+/* Residual inline styles for elements not fully covered by CSS classes */
 const styles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    height: "calc(100vh - var(--toolbar-height) - var(--space-6) * 2)",
-    gap: "var(--space-4)",
-    maxWidth: "var(--content-max-width)",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    flexShrink: 0,
-  },
-  headerTitle: {
-    fontFamily: "var(--font-display)",
-    fontWeight: 700,
-    fontSize: "var(--text-sm)",
-    color: "var(--color-text-secondary)",
-  },
-  messages: {
-    flex: 1,
-    overflowY: "auto",
-    display: "flex",
-    flexDirection: "column",
-    gap: "var(--space-4)",
-  },
-  empty: {
-    flex: 1,
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: "var(--space-2)",
-    padding: "var(--space-12) 0",
-    textAlign: "center",
-  },
   emptyTitle: {
-    fontFamily: "var(--font-display)",
+    fontFamily: "var(--font-heading)",
     fontWeight: 700,
     fontSize: "var(--text-lg)",
-    color: "var(--color-text)",
+    color: "var(--fg)",
     margin: 0,
   },
   emptyHint: {
     fontSize: "var(--text-sm)",
-    color: "var(--color-text-tertiary)",
+    color: "var(--grey-500)",
     margin: 0,
-  },
-  bubble: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "4px",
-    maxWidth: "80%",
-  },
-  userBubble: { alignSelf: "flex-end", alignItems: "flex-end" },
-  agentBubble: { alignSelf: "flex-start", alignItems: "flex-start" },
-  roleLabel: {
-    fontSize: "var(--text-xs)",
-    fontWeight: 600,
-    fontFamily: "var(--font-display)",
-    textTransform: "uppercase" as const,
-    letterSpacing: "0.04em",
-  },
-  bubbleText: {
-    margin: 0,
-    fontSize: "var(--text-base)",
-    lineHeight: "var(--leading-base)",
-    color: "var(--color-text)",
-    background: "var(--color-bg)",
-    border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-lg)",
-    padding: "var(--space-3) var(--space-4)",
-    userSelect: "text",
-    wordBreak: "break-word",
   },
   bubbleError: {
     borderColor: "var(--color-destructive)",
@@ -419,25 +413,15 @@ const styles: Record<string, React.CSSProperties> = {
   cardList: {
     display: "flex",
     flexDirection: "column",
-    gap: "var(--space-2)",
+    gap: "8px",
     maxWidth: "360px",
     width: "100%",
   },
   modelRoleBadge: {
     fontSize: "10px",
-    color: "var(--color-text-tertiary)",
+    color: "var(--grey-500)",
     fontFamily: "var(--font-mono)",
     paddingTop: "2px",
-  },
-  composer: {
-    display: "flex",
-    gap: "var(--space-2)",
-    alignItems: "flex-end",
-    background: "var(--color-bg)",
-    border: "1px solid var(--color-border-strong)",
-    borderRadius: "var(--radius-lg)",
-    padding: "var(--space-2)",
-    flexShrink: 0,
   },
   textarea: {
     flex: 1,
@@ -446,13 +430,30 @@ const styles: Record<string, React.CSSProperties> = {
     resize: "none",
     fontSize: "var(--text-base)",
     fontFamily: "var(--font-body)",
-    color: "var(--color-text)",
-    lineHeight: "var(--leading-base)",
+    color: "var(--fg)",
+    lineHeight: 1.55,
     outline: "none",
-    padding: "var(--space-2) var(--space-3)",
+    padding: "8px 12px",
     minHeight: "36px",
     maxHeight: "120px",
     overflowY: "auto",
     userSelect: "text",
+  },
+  skeleton: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "20px",
+    padding: "16px 0",
+  },
+  skeletonRow: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+    maxWidth: "70%",
+  },
+  skeletonLine: {
+    borderRadius: "var(--radius-md)",
+    background: "var(--grey-200)",
+    animation: "shimmer 1.4s ease-in-out infinite",
   },
 };

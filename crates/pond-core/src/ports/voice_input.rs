@@ -26,4 +26,13 @@ pub trait VoiceInput: Send + Sync {
     fn prompt(&self) -> &str {
         "> "
     }
+
+    /// Pre-load captured audio that `listen()` should transcribe instead of
+    /// recording a fresh microphone clip.
+    ///
+    /// Call this before `listen()` when the wake-word detector has already
+    /// recorded the user's command in the same breath as the wake word.
+    /// The default implementation is a no-op — implementors that support
+    /// audio hand-off (e.g. `WhisperInput`) override this method.
+    fn prime_with_captured(&self, _wav: Vec<u8>) {}
 }

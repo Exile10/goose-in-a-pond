@@ -6776,6 +6776,7 @@ dependencies = [
  "cpal",
  "pond-core",
  "reqwest 0.13.2",
+ "rodio",
  "serde",
  "serde_json",
  "tokio",
