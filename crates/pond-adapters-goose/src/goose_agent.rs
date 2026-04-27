@@ -417,23 +417,36 @@ impl GooseAdapter {
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
 
-        // ── 1. System prompt ──────────────────────────────────────────────────
-        let template_content = self.template_repo
-            .get(&settings.prompt_style)
-            .await
+        // ── 1-4. System prompt, extras, skills, memory — fetched in parallel ─
+        let memory_limit = if settings.agent_memory_inject {
+            Some(settings.agent_memory_limit as usize)
+        } else {
+            None
+        };
+
+        let (template_result, devices_result, extras_result, skills_result, memories_result) = tokio::join!(
+            self.template_repo.get(&settings.prompt_style),
+            self.device_repo.list_devices(),
+            self.extras_repo.list_active(),
+            self.skill_repo.list_active(),
+            async {
+                match memory_limit {
+                    Some(limit) => self.memory_repo.search_recent(None, limit).await,
+                    None => Ok(vec![]),
+                }
+            },
+        );
+
+        let template_content = template_result
             .ok()
             .flatten()
             .map(|t| t.content)
             .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
 
-        // Populate runtime state for Jinja2 rendering (device list + current date/time).
-        // Failure to read devices is non-fatal — renders with empty home-control section.
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
-            let current_date = now.format("%A, %-d %B %Y").to_string();
-            let current_time = now.format("%H:%M").to_string();
-            let devices = self.device_repo.list_devices().await.unwrap_or_default();
+            let devices = devices_result.unwrap_or_default();
             let device_count = devices.len();
             let has_home_devices = device_count > 0;
             let online_device_names = devices
@@ -443,8 +456,8 @@ impl GooseAdapter {
                 .collect::<Vec<_>>()
                 .join(", ");
             PromptState {
-                current_date,
-                current_time,
+                current_date: now.format("%A, %-d %B %Y").to_string(),
+                current_time: now.format("%H:%M").to_string(),
                 device_count,
                 has_home_devices,
                 online_device_names,
@@ -460,15 +473,13 @@ impl GooseAdapter {
         );
         self.agent.override_system_prompt(system_prompt).await;
 
-        // ── 2. System prompt extras ───────────────────────────────────────────
-        if let Ok(extras) = self.extras_repo.list_active().await {
+        if let Ok(extras) = extras_result {
             for extra in extras {
                 self.agent.extend_system_prompt(extra.key, extra.instruction).await;
             }
         }
 
-        // ── 3. Active user skills ─────────────────────────────────────────────
-        if let Ok(skills) = self.skill_repo.list_active().await {
+        if let Ok(skills) = skills_result {
             for skill in skills {
                 self.agent
                     .extend_system_prompt(format!("skill:{}", skill.name), skill.content)
@@ -476,23 +487,19 @@ impl GooseAdapter {
             }
         }
 
-        // ── 4. Memory injection ───────────────────────────────────────────────
-        if settings.agent_memory_inject {
-            let limit = settings.agent_memory_limit as usize;
-            if let Ok(memories) = self.memory_repo.search_recent(None, limit).await {
-                if !memories.is_empty() {
-                    let block = memories
-                        .iter()
-                        .map(|m| format!("- {}", m.content))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    self.agent
-                        .extend_system_prompt(
-                            "memories".to_string(),
-                            format!("Relevant memories:\n{block}"),
-                        )
-                        .await;
-                }
+        if let Ok(memories) = memories_result {
+            if !memories.is_empty() {
+                let block = memories
+                    .iter()
+                    .map(|m| format!("- {}", m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.agent
+                    .extend_system_prompt(
+                        "memories".to_string(),
+                        format!("Relevant memories:\n{block}"),
+                    )
+                    .await;
             }
         }
 
@@ -537,6 +544,10 @@ impl GooseAdapter {
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
+        // Stash the user message so MCP tools can use it as fallback when the
+        // model calls a tool with empty parameters (common with small local models).
+        pond_mcp_server::set_last_user_message(&request.message).await;
+
         let user_msg = Message::user().with_text(&request.message);
         let session_cfg = goose::agents::types::SessionConfig {
             id: goose_sid.clone(),
