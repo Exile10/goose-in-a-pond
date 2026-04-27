@@ -361,7 +361,7 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
     let base = render_jinja_template(&tmpl, settings, None, profile);
 
     // ── Profile context lines ─────────────────────────────────────────────────
-    let mut profile_lines: Vec<String> = Vec::new();
+    let mut profile_lines: Vec<String> = Vec::with_capacity(8);
 
     if let Some(ctx) = profile {
         let user = sanitize_field(&settings.user_name, 50);
@@ -454,7 +454,7 @@ pub fn build_system_prompt_from_template_full(
     };
 
     // ── Profile context lines (same logic as build_system_prompt_with_profile) ─
-    let mut profile_lines: Vec<String> = Vec::new();
+    let mut profile_lines: Vec<String> = Vec::with_capacity(8);
     if let Some(ctx) = profile {
         let user = sanitize_field(&settings.user_name, 50);
 

@@ -372,8 +372,22 @@ enum MemoryAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // On Jetson Orin Nano (6 cores), cap at 4 to leave headroom for OS + audio.
+    // On dev machines, use all cores.
+    let workers = if num_cpus <= 6 { num_cpus.min(4) } else { num_cpus };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -1310,6 +1324,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         event_log_repo: event_log_repo,
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
 
     // Warn if static assets haven't been built yet
@@ -2662,6 +2677,8 @@ async fn build_goose_backend(
         memory_repo: memory_repo.clone(),
         skill_repo: skill_repo.clone(),
         recipe_repo: recipe_repo.clone(),
+        http_client: reqwest::Client::new(),
+        last_user_message: tokio::sync::RwLock::new(String::new()),
     });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");

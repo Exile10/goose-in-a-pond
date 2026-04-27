@@ -205,6 +205,9 @@ async fn make_app_with_provider(
         recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
+        face_recognition: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -474,6 +477,9 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
+        face_recognition: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -539,6 +545,9 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
+        face_recognition: None,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

@@ -123,6 +123,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

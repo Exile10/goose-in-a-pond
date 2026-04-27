@@ -81,7 +81,7 @@ fn pick_quip() -> &'static str {
 /// Returns `(sentences_to_speak, remaining_buffer)`.
 fn split_sentences(text: &str) -> (Vec<String>, String) {
     const MAX_BUF: usize = 250;
-    let mut sentences: Vec<String> = Vec::new();
+    let mut sentences: Vec<String> = Vec::with_capacity(8);
     let mut remainder = text.to_string();
 
     loop {
@@ -1043,8 +1043,9 @@ impl ChatService {
             }
         }
 
-        // Check if this is the first exchange (exactly 2 messages: user + assistant)
-        if let Ok(msgs) = self.session_storage.get_messages(&self.session_id).await {
+        // Check if this is the first exchange (exactly 2 messages: user + assistant).
+        // Fetch only 3 to avoid loading the entire history just for a count check.
+        if let Ok(msgs) = self.session_storage.get_messages_paginated(&self.session_id, 3, 0).await {
             if msgs.len() != 2 {
                 return;
             }

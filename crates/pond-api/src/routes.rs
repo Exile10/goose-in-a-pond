@@ -522,11 +522,15 @@ async fn chat_stream(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     use futures::StreamExt;
     use pond_core::ports::agent::AgentStreamEvent;
+    let permit = state.sse_semaphore.clone().try_acquire_owned().map_err(|_| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"})))
+    })?;
     let Json(req) = body.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
     })?;
 
     let stream = async_stream::stream! {
+        let _permit = permit;
         let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let storage = &state.session_storage;
 
@@ -559,10 +563,10 @@ async fn chat_stream(
                 None
             };
 
-            let file_template = state
-                .prompt_template_dir
-                .as_ref()
-                .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
+            let file_template = match state.prompt_template_dir.as_ref() {
+                Some(dir) => tokio::fs::read_to_string(dir.join("system.md")).await.ok(),
+                None => None,
+            };
 
             match file_template {
                 Some(tmpl) => {
@@ -894,19 +898,35 @@ async fn rename_session(
     })))
 }
 
-/// Get all messages for a session.
+/// Get messages for a session (paginated).
 ///
-/// GET /api/v1/sessions/:session_id/messages
+/// GET /api/v1/sessions/:session_id/messages?limit=100&offset=0
+///
+/// Query params (optional):
+/// - `limit`:  max messages to return (default 100, capped at 500)
+/// - `offset`: skip this many oldest messages (default 0)
+///
+/// When called without params, returns the 100 most recent messages — enough
+/// for the UI to render a session without loading the full history into RAM.
 async fn get_session_messages(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     use pond_core::domain::message::Role;
     use pond_core::ports::session_storage::SessionStorageError;
 
+    let limit: usize = params.get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(500);
+    let offset: usize = params.get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let messages = state
         .session_storage
-        .get_messages(&session_id)
+        .get_messages_paginated(&session_id, limit, offset)
         .await
         .map_err(|e| {
             let status = match &e {
@@ -1331,62 +1351,67 @@ async fn scan_filesystem_extras(
         .filter_map(|m| m.filename.clone())
         .collect();
 
-    let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&'static str]|
-        -> Vec<ModelRecord>
-    {
-        let mut found = vec![];
-        let Ok(rd) = std::fs::read_dir(&dir) else { return found };
-        for entry in rd.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
-            if known_filenames.contains(&fname) { continue; }
-            let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
-            let name = fname
-                .trim_end_matches(".gguf")
-                .trim_end_matches(".llamafile")
-                .trim_end_matches(".onnx")
-                .trim_end_matches(".bin")
-                .to_string();
-            found.push(ModelRecord {
-                id:              ModelRecord::id_for(&category, &name),
-                category:        category.clone(),
-                name,
-                filename:        Some(fname),
-                description:     "(detected on disk)".to_string(),
-                size_mb,
-                url:             None,
-                hf_id:           None,
-                ram_estimate_mb: None,
-                recommended_role: None,
-                context_length:  None,
-                quantization:    None,
-                asr_language:    None,
-                asr_size:        None,
-                tts_engine:      None,
-                tts_voice_name:  None,
-                config_filename: None,
-                config_url:      None,
-                tts_url:         None,
-                sample_rate:     None,
-                downloaded:      true,
-                is_custom:       true,
-            });
-        }
-        found
-    };
+    let data_dir_owned = data_dir.to_path_buf();
+    let known = known_filenames;
+    let extras_from_disk = tokio::task::spawn_blocking(move || {
+        let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]|
+            -> Vec<ModelRecord>
+        {
+            let mut found = vec![];
+            let Ok(rd) = std::fs::read_dir(&dir) else { return found };
+            for entry in rd.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
+                if known.contains(&fname) { continue; }
+                let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+                let name = fname
+                    .trim_end_matches(".gguf")
+                    .trim_end_matches(".llamafile")
+                    .trim_end_matches(".onnx")
+                    .trim_end_matches(".bin")
+                    .to_string();
+                found.push(ModelRecord {
+                    id:              ModelRecord::id_for(&category, &name),
+                    category:        category.clone(),
+                    name,
+                    filename:        Some(fname),
+                    description:     "(detected on disk)".to_string(),
+                    size_mb,
+                    url:             None,
+                    hf_id:           None,
+                    ram_estimate_mb: None,
+                    recommended_role: None,
+                    context_length:  None,
+                    quantization:    None,
+                    asr_language:    None,
+                    asr_size:        None,
+                    tts_engine:      None,
+                    tts_voice_name:  None,
+                    config_filename: None,
+                    config_url:      None,
+                    tts_url:         None,
+                    sample_rate:     None,
+                    downloaded:      true,
+                    is_custom:       true,
+                });
+            }
+            found
+        };
 
-    let mut extras = vec![];
-    extras.extend(scan_dir(data_dir.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
-    extras.extend(scan_dir(data_dir.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
-    extras.extend(scan_dir(data_dir.join("models"),               ModelCategory::Whisper,   &[".bin"]));
-    extras.extend(scan_dir(data_dir.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+        let mut extras = vec![];
+        extras.extend(scan_dir(data_dir_owned.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
+        extras.extend(scan_dir(data_dir_owned.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
+        extras.extend(scan_dir(data_dir_owned.join("models"),               ModelCategory::Whisper,   &[".bin"]));
+        extras.extend(scan_dir(data_dir_owned.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+        extras
+    }).await.unwrap_or_default();
 
     // Persist newly discovered models to the catalog
-    for m in &extras {
+    for m in &extras_from_disk {
         let _ = model_repo.upsert(m).await;
     }
 
-    extras
+    extras_from_disk
 }
 
 /// GET /api/v1/models — returns all catalog models with downloaded/active flags.
@@ -1488,10 +1513,20 @@ async fn refresh_model_registry(
 }
 
 /// GET /api/v1/models/download/progress — return all active/recent downloads.
+///
+/// Also evicts entries that finished more than 5 minutes ago to prevent
+/// unbounded growth of the in-memory tracker over long server uptimes.
 async fn get_download_progress(
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
-    let tracker = state.download_tracker.read().await;
+    let mut tracker = state.download_tracker.write().await;
+    let now = std::time::Instant::now();
+    tracker.retain(|_, e| {
+        match e.finished_at {
+            Some(t) => now.duration_since(t) < std::time::Duration::from_secs(300),
+            None => true, // still in progress — keep
+        }
+    });
     let entries: Vec<&DownloadEntry> = tracker.values().collect();
     Json(json!({"downloads": entries}))
 }
@@ -1537,11 +1572,12 @@ async fn download_model(
     };
 
     let tracker     = Arc::clone(&state.download_tracker);
+    let dl_client   = state.http_client.clone();
     let dl_filename = filename.clone();
     let dl_category = category.clone();
 
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, async move {
+        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, dl_client, async move {
             let _ = model_repo.set_downloaded(&model_id, true).await;
         }).await;
     });
@@ -1591,7 +1627,7 @@ async fn delete_model(
             ModelCategory::Ollama    => data_dir.join("models").join(filename),
         };
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
+            tokio::fs::remove_file(&path).await.map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete file: {e}")})))
             })?;
         }
@@ -1694,12 +1730,13 @@ async fn activate_model(
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
 /// Returns `{"models": [...]}` or `{"models": [], "error": "..."}` if Ollama is unreachable.
-async fn list_ollama_models() -> Json<Value> {
-    let client = reqwest::Client::builder()
+async fn list_ollama_models(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let client = &state.http_client;
+    match client.get("http://localhost:11434/api/tags")
         .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-    match client.get("http://localhost:11434/api/tags").send().await {
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({"models": []}));
             Json(body)
@@ -1734,6 +1771,7 @@ async fn pull_ollama_model(
 
 /// GET /api/v1/models/search/gguf?q=<query> — proxy HuggingFace API for GGUF models.
 async fn search_gguf_models(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
@@ -1741,12 +1779,11 @@ async fn search_gguf_models(
         "https://huggingface.co/api/models?filter=gguf&search={}&limit=20&sort=downloads&direction=-1",
         urlencoding::encode(q)
     );
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(&url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let models: Vec<Value> = resp.json().await.unwrap_or_default();
             // Return a simplified shape: id, downloads, likes, tags
@@ -1766,16 +1803,16 @@ async fn search_gguf_models(
 
 /// GET /api/v1/models/search/llamafile?q=<query> — list llamafile releases from GitHub.
 async fn search_llamafile_models(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let q = params.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let releases: Vec<Value> = resp.json().await.unwrap_or_default();
             let mut assets: Vec<Value> = Vec::new();
@@ -1809,6 +1846,7 @@ async fn search_llamafile_models(
 
 /// GET /api/v1/models/search/gguf/files?repo=<owner/name> — list .gguf files inside a HF repo.
 async fn list_hf_model_files(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let repo = match params.get("repo") {
@@ -1818,12 +1856,11 @@ async fn list_hf_model_files(
     // Do NOT percent-encode the repo — HF expects the literal owner/name path segment
     // (urlencoding::encode would turn '/' into '%2F' which returns 400)
     let url = format!("https://huggingface.co/api/models/{}", repo);
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(&url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
             let files: Vec<Value> = meta["siblings"]
@@ -1891,8 +1928,9 @@ async fn download_model_from_url(
     let resp_filename = filename.clone();
     let resp_category = category.clone();
 
+    let dl_client = state.http_client.clone();
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, filename, category, tracker, async {}).await;
+        spawn_tracked_download(url, dest, filename, category, tracker, dl_client, async {}).await;
     });
 
     (StatusCode::ACCEPTED, Json(json!({"status": "downloading", "filename": resp_filename, "category": resp_category})))
@@ -1907,6 +1945,7 @@ async fn spawn_tracked_download<F>(
     filename: String,
     category: String,
     tracker:  Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    client:   reqwest::Client,
     on_done:  F,
 ) where F: std::future::Future<Output = ()> + Send {
     use tokio::io::AsyncWriteExt;
@@ -1920,17 +1959,13 @@ async fn spawn_tracked_download<F>(
             downloaded_bytes: 0,
             total_bytes:      None,
             status:           "downloading".to_string(),
+            finished_at:      None,
         });
     }
 
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(7200))
-        .build()
-        .unwrap_or_default();
 
     tracing::info!("Downloading {} from {}", filename, url);
 
@@ -1973,6 +2008,7 @@ async fn spawn_tracked_download<F>(
                 let mut t = tracker.write().await;
                 if let Some(e) = t.get_mut(&filename) {
                     e.status = "done".to_string();
+                    e.finished_at = Some(std::time::Instant::now());
                 }
             }
             on_done.await;
@@ -1982,6 +2018,7 @@ async fn spawn_tracked_download<F>(
             let mut t = tracker.write().await;
             if let Some(e) = t.get_mut(&filename) {
                 e.status = "error".to_string();
+                e.finished_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -3681,6 +3718,13 @@ async fn agent_chat_stream(
     use pond_core::ports::agent::AgentStreamEvent;
     use futures::stream::StreamExt;
 
+    let permit = match state.sse_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"}))).into_response();
+        }
+    };
+
     let body = match body {
         Ok(b) => b.0,
         Err(e) => {
@@ -3697,6 +3741,7 @@ async fn agent_chat_stream(
     let agent = state.agent.clone();
 
     let stream = async_stream::stream! {
+        let _permit = permit;
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -4617,31 +4662,34 @@ async fn list_face_models_handler(
         .as_ref()
         .map(|d| d.join("models").join("face"));
 
-    fn describe(dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str) -> Value {
-        let path = dir.as_ref().map(|d| d.join(name));
-        let (downloaded, size_mb) = match &path {
-            Some(p) => match std::fs::metadata(p) {
-                Ok(md) => (true, Some(md.len() / 1_048_576)),
-                Err(_) => (false, None),
-            },
-            None => (false, None),
+    let dir_clone = dir.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let describe = |dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str| -> Value {
+            let path = dir.as_ref().map(|d| d.join(name));
+            let (downloaded, size_mb) = match &path {
+                Some(p) => match std::fs::metadata(p) {
+                    Ok(md) => (true, Some(md.len() / 1_048_576)),
+                    Err(_) => (false, None),
+                },
+                None => (false, None),
+            };
+            json!({
+                "name": name,
+                "label": label,
+                "role": role,
+                "expected_mb": expected_mb,
+                "size_mb": size_mb,
+                "downloaded": downloaded,
+                "path": path.as_ref().map(|p| p.display().to_string()),
+            })
         };
-        json!({
-            "name": name,
-            "label": label,
-            "role": role,
-            "expected_mb": expected_mb,
-            "size_mb": size_mb,
-            "downloaded": downloaded,
-            "path": path.as_ref().map(|p| p.display().to_string()),
-        })
-    }
 
-    let entries = vec![
-        describe(&dir, "w600k_r50.onnx", "ArcFace R50",        174, "embedding"),
-        describe(&dir, "scrfd.onnx",     "SCRFD 10G",           17, "detector"),
-        describe(&dir, "antispoof.onnx", "Silent-Face PAD",      2, "antispoof"),
-    ];
+        vec![
+            describe(&dir_clone, "w600k_r50.onnx", "ArcFace R50",        174, "embedding"),
+            describe(&dir_clone, "scrfd.onnx",     "SCRFD 10G",           17, "detector"),
+            describe(&dir_clone, "antispoof.onnx", "Silent-Face PAD",      2, "antispoof"),
+        ]
+    }).await.unwrap_or_default();
 
     Json(json!({
         "feature_enabled": feature_enabled,

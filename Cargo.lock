@@ -6880,12 +6880,14 @@ dependencies = [
  "once_cell",
  "pond-adapters-weather",
  "pond-core",
+ "reqwest 0.13.2",
  "rmcp",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "urlencoding",
  "uuid",
 ]
 
