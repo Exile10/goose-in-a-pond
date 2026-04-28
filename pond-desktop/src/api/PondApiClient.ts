@@ -219,6 +219,10 @@ export class PondApiClient {
     });
   }
 
+  getModelCapabilities(): Promise<import("./types").ModelCapabilities> {
+    return this.get("/api/v1/models/capabilities");
+  }
+
   getMemoryStatus(): Promise<ModelMemoryStatus> {
     return this.get("/api/v1/models/memory-status");
   }

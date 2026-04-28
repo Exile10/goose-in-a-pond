@@ -396,10 +396,26 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
               <option key={name} value={name}>{name}</option>
             ))}
           </select>
+          {(!s.tool_model || s.tool_model === s.chat_model) && (
+            <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", marginTop: 4, display: "block" }}>
+              Same model as main LLM — zero swap overhead
+            </span>
+          )}
         </FormRow>
       </Section>
 
       <Section title="Response Quality">
+        <FormRow label="Thinking Mode" hint="Enable internal reasoning for better analysis, planning, and complex answers">
+          <select
+            style={selectFallback}
+            value={s.thinking_mode ?? "auto"}
+            onChange={(e) => patch("thinking_mode", e.target.value)}
+          >
+            <option value="auto">Auto (enable for capable models)</option>
+            <option value="on">Always On</option>
+            <option value="off">Off</option>
+          </select>
+        </FormRow>
         <FormRow label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
           <input
             type="range"

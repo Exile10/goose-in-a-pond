@@ -34,6 +34,8 @@ export interface Settings {
   chat_provider?: string;
   chat_model?: string;
   tool_model?: string | null;
+  thinking_mode?: string;
+  show_thinking?: boolean;
   llm_provider?: string;
   llm_temperature?: number;
   llm_max_tokens?: number;
@@ -120,6 +122,14 @@ export interface ModelMemoryStatus {
   loaded_model: string | null;
 }
 
+export interface ModelCapabilities {
+  thinking: boolean;
+  vision: boolean;
+  audio_input: boolean;
+  context_window_tokens: number;
+  structured_output: boolean;
+}
+
 // ── Prompt Templates ──────────────────────────────────────────
 export interface PromptTemplate {
   name: string;
@@ -148,7 +158,7 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "tool_call" | "tool_result" | "done" | "error" | "status";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status";
 
 export interface ChatEvent {
   type: ChatEventType;

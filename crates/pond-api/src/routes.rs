@@ -88,6 +88,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
+        .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/memory-status", get(get_memory_status))
         .route("/models/active-roles", get(get_active_roles))
         .route("/models/registry/refresh", post(refresh_model_registry))
@@ -304,6 +305,9 @@ async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 struct ChatRequest {
     session_id: Option<String>,
     message: String,
+    /// Optional image attachments for multimodal models (base64-encoded).
+    #[serde(default)]
+    images: Vec<pond_core::domain::message::ImageAttachment>,
 }
 
 /// Send a message and get a response.
@@ -707,12 +711,18 @@ async fn chat_stream(
             message: agent_message,
             session_id: session_id.clone(),
             model_role: model_role.to_string(),
+            images: req.images.clone(),
         };
 
         let mut full_text = String::new();
         // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
         // preambles and `<think>…</think>` blocks out of the per-token stream.
-        let mut thought = crate::thought_filter::ThoughtFilter::new();
+        // When show_thinking is enabled, capture thinking blocks as SSE events.
+        let mut thought = if settings.show_thinking {
+            crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
+        } else {
+            crate::thought_filter::ThoughtFilter::new()
+        };
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -728,6 +738,9 @@ async fn chat_stream(
                     let maybe_data = match event {
                         AgentStreamEvent::Status { content } => {
                             Some(json!({"type": "status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::Thinking { content } => {
+                            Some(json!({"type": "thinking", "content": content}).to_string())
                         }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
                             Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
@@ -753,6 +766,11 @@ async fn chat_stream(
                         }
                     };
                     if let Some(data) = maybe_data {
+                        yield Ok(Event::default().data(data));
+                    }
+                    // Emit captured thinking blocks as SSE events (when show_thinking is on)
+                    for thinking_content in thought.take_thinking() {
+                        let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok(Event::default().data(data));
                     }
                     // After every push the filter may have captured a complete
@@ -1221,6 +1239,14 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
 }
 
 // ── Model registry handlers ───────────────────────────────────────────────────
+
+/// GET /api/v1/models/capabilities — returns the active model's runtime capabilities.
+async fn get_model_capabilities(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let caps = state.agent.capabilities();
+    Json(serde_json::to_value(caps).unwrap_or_default())
+}
 
 /// GET /api/v1/models/active-roles — returns the provider+model currently wired for each role.
 ///
@@ -3704,6 +3730,7 @@ async fn agent_chat_stream(
             message,
             session_id: session_id.clone(),
             model_role: "task".to_string(),
+            images: Vec::new(),
         };
 
         let mut in_think_block = false; // filter <think> blocks
@@ -3725,6 +3752,9 @@ async fn agent_chat_stream(
                     let maybe_data = match event {
                         AgentStreamEvent::Status { content } => {
                             Some(json!({"type": "status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::Thinking { content } => {
+                            Some(json!({"type": "thinking", "content": content}).to_string())
                         }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
                             Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
@@ -3748,6 +3778,11 @@ async fn agent_chat_stream(
                         }
                     };
                     if let Some(data) = maybe_data {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                    }
+                    // Emit thinking blocks captured by the filter
+                    for thinking_content in thought.take_thinking() {
+                        let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // See chat_stream for rationale — surface Harmony-format

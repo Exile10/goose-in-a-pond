@@ -6,6 +6,9 @@ pub struct AgentRequest {
     pub message: String,
     pub session_id: String,
     pub model_role: String, // "chat" | "think" | "task"
+    /// Optional image attachments for multimodal models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::domain::message::ImageAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +21,11 @@ pub struct AgentResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentStreamEvent {
     Status {
+        content: String,
+    },
+    /// Internal reasoning / chain-of-thought from models that support thinking
+    /// (Gemma 4, Qwen3, DeepSeek-R1). Only emitted when `show_thinking` is enabled.
+    Thinking {
         content: String,
     },
     ToolCall {

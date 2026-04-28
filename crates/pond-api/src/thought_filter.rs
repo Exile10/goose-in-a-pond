@@ -59,6 +59,11 @@ pub struct ThoughtFilter {
     inside_open_tag: Option<&'static str>,
     /// Tool-call envelope bodies completed since the last `take_tool_calls`.
     captured_tool_calls: Vec<String>,
+    /// When true, thinking/reasoning blocks are captured (not just discarded)
+    /// so they can be forwarded as SSE thinking events.
+    capture_thinking: bool,
+    /// Thinking blocks captured since the last `take_thinking`.
+    captured_thinking: Vec<String>,
 }
 
 impl Default for ThoughtFilter {
@@ -69,6 +74,8 @@ impl Default for ThoughtFilter {
             block_body: String::new(),
             inside_open_tag: None,
             captured_tool_calls: Vec::new(),
+            capture_thinking: false,
+            captured_thinking: Vec::new(),
         }
     }
 }
@@ -76,6 +83,12 @@ impl Default for ThoughtFilter {
 impl ThoughtFilter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a filter that captures thinking blocks for forwarding as events.
+    pub fn with_thinking_capture(mut self) -> Self {
+        self.capture_thinking = true;
+        self
     }
 
     /// Feed a chunk; returns the (possibly empty) substring that should be
@@ -114,15 +127,24 @@ impl ThoughtFilter {
                 State::InsideBlock(close) => {
                     let close_tag = *close;
                     if let Some(i) = self.buf.find(close_tag) {
-                        // Capture the body of a tool_call envelope so the
-                        // SSE handler can surface it; channel/thought block
-                        // bodies are still discarded.
+                        // Capture the body of paired-tag envelopes:
+                        // - tool_call: always captured for UI surfacing
+                        // - channel/thought: captured only when capture_thinking is on
                         self.block_body.push_str(&self.buf[..i]);
                         if matches!(self.inside_open_tag, Some("<|tool_call>")) {
                             let body = std::mem::take(&mut self.block_body);
                             let trimmed = body.trim();
                             if !trimmed.is_empty() {
                                 self.captured_tool_calls.push(trimmed.to_string());
+                            }
+                        } else if self.capture_thinking {
+                            // Thinking block — capture for SSE thinking events
+                            let body = std::mem::take(&mut self.block_body);
+                            let trimmed = body.trim()
+                                .strip_prefix("thought").unwrap_or(body.trim())
+                                .trim();
+                            if !trimmed.is_empty() {
+                                self.captured_thinking.push(trimmed.to_string());
                             }
                         } else {
                             self.block_body.clear();
@@ -162,6 +184,13 @@ impl ThoughtFilter {
     /// the tool name and JSON arguments.
     pub fn take_tool_calls(&mut self) -> Vec<String> {
         std::mem::take(&mut self.captured_tool_calls)
+    }
+
+    /// Drain any thinking/reasoning blocks captured since the last call.
+    /// Only populated when `with_thinking_capture()` was called. Returns
+    /// the reasoning text with the "thought" prefix stripped.
+    pub fn take_thinking(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.captured_thinking)
     }
 }
 

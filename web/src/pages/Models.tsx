@@ -27,6 +27,30 @@ function formatSize(mb: number): string {
   return `${mb} MB`
 }
 
+/** Infer capabilities from a model name and render compact badges. */
+function WebCapabilityBadges({ name }: { name: string }) {
+  const n = name.toLowerCase()
+  const badges: string[] = []
+  if (/gemma[-_]?4|qwen3|qwq|deepseek[-_]?r1/.test(n)) badges.push('Thinking')
+  if (/gemma[-_]?4|llava|bakllava|moondream/.test(n)) badges.push('Vision')
+  if (/gemma[-_]?4/.test(n) && /e[24]b/i.test(n)) badges.push('Audio')
+  if (/gemma[-_]?4/.test(n)) badges.push('128k ctx')
+  else if (/qwen/.test(n) || /mistral/.test(n)) badges.push('32k ctx')
+
+  if (badges.length === 0) return null
+  return (
+    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', marginTop: '0.25rem' }}>
+      {badges.map(b => (
+        <span key={b} style={{
+          fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem',
+          borderRadius: '10px', background: 'rgba(99,179,237,0.12)',
+          color: 'rgba(99,179,237,0.9)', border: '1px solid rgba(99,179,237,0.2)',
+        }}>{b}</span>
+      ))}
+    </div>
+  )
+}
+
 // Map a ModelStatusEntry to the provider string GIAP uses in settings
 function providerForEntry(entry: ModelStatusEntry): string {
   if (entry.category === 'llamafile') return 'llamafile'
@@ -521,10 +545,12 @@ function RolePanel({
   const llmRoles: Array<'chat' | 'think' | 'task'> = ['chat', 'think', 'task']
   const [activeRoles, setActiveRoles] = useState<ActiveRolesResponse | null>(null)
   const [justUpdated, setJustUpdated] = useState<string | null>(null)
+  const [caps, setCaps] = useState<{ thinking: boolean; vision: boolean; audio_input: boolean; context_window_tokens: number; structured_output: boolean } | null>(null)
 
   const reload = () => {
     if (!token || token === 'dev-mock-token') return
     api.getActiveRoles(token).then(setActiveRoles).catch(() => {})
+    api.getModelCapabilities(token).then(setCaps).catch(() => {})
   }
 
   useEffect(reload, [token, settings]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -680,6 +706,22 @@ function RolePanel({
 
       <MemoryBar status={memory} />
 
+      {/* Active model capabilities */}
+      {caps && (caps.thinking || caps.vision || caps.audio_input || caps.context_window_tokens > 4096) && (
+        <div style={{
+          display: 'flex', gap: '0.35rem', flexWrap: 'wrap', alignItems: 'center',
+          marginTop: '0.6rem', padding: '0.5rem 0.6rem',
+          borderRadius: '6px', background: 'rgba(99,179,237,0.06)', border: '1px solid rgba(99,179,237,0.15)',
+        }}>
+          <span style={{ fontSize: '0.7rem', opacity: 0.55, marginRight: '0.25rem' }}>Active model features:</span>
+          {caps.thinking && <span style={{ fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem', borderRadius: '10px', background: 'rgba(99,179,237,0.15)', color: 'rgba(99,179,237,0.9)' }}>Thinking</span>}
+          {caps.vision && <span style={{ fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem', borderRadius: '10px', background: 'rgba(99,179,237,0.15)', color: 'rgba(99,179,237,0.9)' }}>Vision</span>}
+          {caps.audio_input && <span style={{ fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem', borderRadius: '10px', background: 'rgba(99,179,237,0.15)', color: 'rgba(99,179,237,0.9)' }}>Audio</span>}
+          {caps.structured_output && <span style={{ fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem', borderRadius: '10px', background: 'rgba(99,179,237,0.15)', color: 'rgba(99,179,237,0.9)' }}>Structured Output</span>}
+          {caps.context_window_tokens > 4096 && <span style={{ fontSize: '0.62rem', fontWeight: 600, padding: '0.08rem 0.4rem', borderRadius: '10px', background: 'rgba(99,179,237,0.15)', color: 'rgba(99,179,237,0.9)' }}>{Math.round(caps.context_window_tokens / 1000)}k context</span>}
+        </div>
+      )}
+
       <p style={{ fontSize: '0.72rem', opacity: 0.4, marginTop: '0.6rem' }}>
         Assign models using the {ROLE_ICONS['chat']}{ROLE_ICONS['think']}{ROLE_ICONS['task']} buttons on installed model cards below. Changes take effect immediately — no restart needed.
       </p>
@@ -741,6 +783,7 @@ function ModelCard({
             </span>
           )}
         </div>
+        <WebCapabilityBadges name={entry.name} />
       </div>
       <div className="db-model-card-actions">
         {/* Status indicator */}
