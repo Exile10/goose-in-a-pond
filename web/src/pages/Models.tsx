@@ -39,8 +39,7 @@ function roleForEntry(entry: ModelStatusEntry, settings: Settings | null, ollama
   const provider = ollamaName ? 'ollama' : providerForEntry(entry)
   const name = ollamaName ?? entry.name
   if (settings.chat_provider === provider && settings.chat_model === name) return 'chat'
-  if (settings.think_provider === provider && settings.think_model === name) return 'think'
-  if (settings.task_provider === provider && settings.task_model === name) return 'task'
+  if (settings.tool_model === name) return 'tool'
   return null
 }
 

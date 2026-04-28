@@ -100,6 +100,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

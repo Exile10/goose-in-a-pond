@@ -182,10 +182,7 @@ export interface Settings {
   // Model role assignments
   chat_provider:  string
   chat_model:     string
-  think_provider: string | null
-  think_model:    string | null
-  task_provider:  string | null
-  task_model:     string | null
+  tool_model:     string | null
 }
 
 // ── Agent data types ──────────────────────────────────────────────────────────

@@ -265,8 +265,10 @@ impl GooseAdapter {
         {
             let last = self.last_provider_key.lock().unwrap();
             if *last == key {
+                println!("[model-switch] provider already current: {}", key);
                 return Ok(());
             }
+            println!("[model-switch] provider change detected: {:?} -> {}", *last, key);
         }
 
         let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
@@ -284,12 +286,15 @@ impl GooseAdapter {
                     Self::register_gguf_model(&model_name, dd);
                 }
                 let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
+                println!("[model-switch] building LocalInferenceProvider for '{}'...", model_name);
                 match goose::providers::local_inference::LocalInferenceProvider::from_env(cfg, vec![]).await {
                     Ok(p) => {
+                        println!("[model-switch] LocalInferenceProvider ready for '{}'", model_name);
                         tracing::info!("Built LocalInferenceProvider for model '{}'", model_name);
                         Some(Arc::new(p))
                     }
                     Err(e) => {
+                        println!("[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}", model_name);
                         tracing::warn!("Failed to build local inference provider for '{}': {e}", model_name);
                         None
                     }
@@ -305,9 +310,14 @@ impl GooseAdapter {
                     settings.chat_model.clone()
                 };
                 let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
+                println!("[model-switch] building llamafile OllamaProvider for '{}'...", model_name);
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
-                    Ok(p) => Some(Arc::new(p)),
+                    Ok(p) => {
+                        println!("[model-switch] llamafile provider ready for '{}'", model_name);
+                        Some(Arc::new(p))
+                    }
                     Err(e) => {
+                        println!("[model-switch] FAILED to build llamafile provider for '{}': {e}", model_name);
                         tracing::warn!("Failed to build llamafile provider: {e}");
                         None
                     }
@@ -320,25 +330,37 @@ impl GooseAdapter {
                 } else {
                     settings.chat_model.clone()
                 };
+                println!("[model-switch] building Ollama provider for '{}'...", model_name);
                 let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
-                    Ok(p) => Some(Arc::new(p)),
+                    Ok(p) => {
+                        println!("[model-switch] Ollama provider ready for '{}'", model_name);
+                        Some(Arc::new(p))
+                    }
                     Err(e) => {
+                        println!("[model-switch] FAILED to build Ollama provider for '{}': {e}", model_name);
                         tracing::warn!("Failed to build ollama provider: {e}");
                         None
                     }
                 }
             }
-            _ => None, // unknown provider — keep whatever Goose currently has
+            _ => {
+                println!("[model-switch] unknown provider '{}', keeping current", settings.chat_provider);
+                None
+            }
         };
 
         if let Some(p) = provider {
+            println!("[model-switch] swapping Goose provider to {}:{} for session {}", settings.chat_provider, settings.chat_model, session_id);
             tracing::info!(
                 "Switching Goose provider to {}:{} for session {}",
                 settings.chat_provider, settings.chat_model, session_id
             );
             self.agent.update_provider(p, session_id).await?;
-            *self.last_provider_key.lock().unwrap() = key;
+            *self.last_provider_key.lock().unwrap() = key.clone();
+            println!("[model-switch] swap complete, key={}", key);
+        } else {
+            println!("[model-switch] no provider built for {}:{}", settings.chat_provider, settings.chat_model);
         }
         Ok(())
     }
@@ -455,6 +477,12 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Build tool descriptions for the prompt template
+            let available_tools: Vec<String> = pond_core::prompts::giap_tool_definitions()
+                .iter()
+                .map(|(name, desc)| format!("{} — {}", name, desc))
+                .collect();
+
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
                 current_time: now.format("%H:%M").to_string(),
@@ -462,6 +490,7 @@ impl GooseAdapter {
                 has_home_devices,
                 online_device_names,
                 voice_mode: self.voice_mode.load(std::sync::atomic::Ordering::Relaxed),
+                available_tools,
             }
         };
 
@@ -508,32 +537,21 @@ impl GooseAdapter {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");
         }
 
-        // ── 6. Auto-load "giap" builtin extension ─────────────────────────────
-        let needs_extension_load = {
-            let loaded = self.loaded_extensions.lock().unwrap();
-            !loaded.contains(&goose_sid)
-        };
-        if needs_extension_load {
-            if let Err(e) = self.add_builtin_extension("giap", &goose_sid).await {
-                tracing::error!(
-                    session = %goose_sid,
-                    error = %e,
-                    "Failed to load GIAP builtin extension — agent will have no tools"
-                );
-            }
-
-            // Remove all Goose platform/builtin extensions that may have bled in
-            // from ~/.config/goose/config.yaml or prior sessions.  GIAP only exposes
-            // the "giap" MCP extension; everything else is noise or a security risk.
-            for ext in &[
-                "developer", "computercontroller", "extensionmanager",
-                "todo", "apps", "analyze", "summon", "summarize",
-                "orchestrator", "tom",
-            ] {
-                self.agent.remove_extension(ext, &goose_sid).await.ok();
-            }
-
-            self.loaded_extensions.lock().unwrap().insert(goose_sid.clone());
+        // ── 6. Tool-free mode ─────────────────────────────────────────────────
+        // GIAP tools (Wikipedia, weather, etc.) are handled by the Tool Agent
+        // pre-processor in routes.rs BEFORE the main LLM runs. The Goose agent
+        // operates with ZERO tools — no MCP extensions loaded, no tool schemas
+        // in the prompt, no tool-call formatting required from the model.
+        // This eliminates tool-call argument failures and model-swap overhead.
+        //
+        // Remove any extensions that may have bled in from prior sessions or
+        // Goose's default config.
+        for ext in &[
+            "giap", "developer", "computercontroller", "extensionmanager",
+            "todo", "apps", "analyze", "summon", "summarize",
+            "orchestrator", "tom",
+        ] {
+            self.agent.remove_extension(ext, &goose_sid).await.ok();
         }
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────

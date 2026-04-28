@@ -213,6 +213,9 @@ pub struct AppState {
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Tool Agent — classifies messages, executes tools (Wikipedia, weather,
+    /// memory), and returns augmented context before the main LLM runs.
+    pub tool_agent: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

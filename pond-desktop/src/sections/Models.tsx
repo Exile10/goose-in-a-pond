@@ -3,7 +3,7 @@ import { Button, Tabs, Card, CardContent, Chip, ProgressBar } from "@heroui/reac
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
-  ScanFace, Loader2,
+  ScanFace, Loader2, Puzzle,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
@@ -24,7 +24,7 @@ const CAT_COLOR = {
 
 /** Maps role keys to role-chip CSS modifier classes */
 const ROLE_CHIP_VARIANT: Record<string, string> = {
-  chat: "secondary", think: "warning", task: "success", asr: "primary", tts: "danger",
+  chat: "secondary", tool: "success", asr: "primary", tts: "danger",
 };
 
 function ActiveRolesBanner({
@@ -40,13 +40,12 @@ function ActiveRolesBanner({
   loading: boolean;
   onNavigate?: (category: "llm" | "asr" | "tts") => void;
 }) {
-  const ROLE_DEFS = [
-    { key: "chat"  as const, label: "Chat",  icon: <MessageSquare size={10} />, category: "llm" as const },
-    { key: "think" as const, label: "Think", icon: <Brain size={10} />,         category: "llm" as const },
-    { key: "task"  as const, label: "Task",  icon: <Wrench size={10} />,        category: "llm" as const },
-    { key: "asr"   as const, label: "ASR",   icon: <Mic size={10} />,           category: "asr" as const },
-    { key: "tts"   as const, label: "TTS",   icon: <Volume2 size={10} />,       category: "tts" as const },
+  const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" }> = [
+    { key: "chat", label: "Main LLM", icon: <MessageSquare size={10} />, category: "llm" },
+    { key: "asr",  label: "ASR",      icon: <Mic size={10} />,           category: "asr" },
+    { key: "tts",  label: "TTS",      icon: <Volume2 size={10} />,       category: "tts" },
   ];
+  const toolModel = roles?.tool?.model;
 
   const memPct = memoryStatus && memoryStatus.total_mb > 0
     ? Math.round(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100)
@@ -112,6 +111,28 @@ function ActiveRolesBanner({
               </div>
             );
           })}
+          {/* Tool Caller chip */}
+          <div
+            className="role-chip role-chip--success"
+            onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
+            style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
+            title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
+          >
+            <div className="role-chip__bar" />
+            <div className="role-chip__body">
+              <div className="role-chip__head">
+                <Puzzle size={10} />
+                <span className="role-chip__role">Tool Caller</span>
+              </div>
+              <span style={{
+                fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+                color: toolModel ? "var(--fg)" : "var(--grey-500)", fontStyle: toolModel ? "normal" : "italic",
+                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
+              }}>
+                {toolModel ?? "Not set"}
+              </span>
+            </div>
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -169,10 +190,10 @@ function DownloadProgress({ downloads, onScanModels }: { downloads: DownloadEntr
 
 // ── Shared ModelList ──────────────────────────────────────────
 
-type RoleKey = "chat" | "think" | "task" | "asr" | "tts";
+type RoleKey = "chat" | "tool" | "asr" | "tts";
 
 const ROLE_LABELS: Record<RoleKey, string> = {
-  chat: "Chat", think: "Think", task: "Task", asr: "ASR", tts: "TTS",
+  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS",
 };
 
 function ModelList({
@@ -201,6 +222,9 @@ function ModelList({
   if (models.length === 0) return <p style={hint}>{emptyMessage}</p>;
 
   function isRoleActive(m: ModelEntry, role: RoleKey) {
+    if (role === "tool") {
+      return activeRoles?.tool?.model === m.name;
+    }
     const a = activeRoles?.[role];
     if (!a) return false;
     return a.provider === m.provider && a.model === m.name;
@@ -640,7 +664,7 @@ function OllamaPanel({
         loading={modelsLoading && ollamaLoading}
         error={modelsError}
         activeRoles={activeRoles}
-        availableRoles={["chat", "think", "task"]}
+        availableRoles={["chat"]}
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
@@ -722,7 +746,7 @@ function LlmTab({
             loading={modelsLoading}
             error={modelsError}
             activeRoles={activeRoles}
-            availableRoles={["chat", "think", "task"]}
+            availableRoles={["chat", "tool"]}
             onActivate={onActivate}
             onDelete={onDelete}
             emptyMessage="No GGUF models found. Download one below."
@@ -739,7 +763,7 @@ function LlmTab({
             loading={modelsLoading}
             error={modelsError}
             activeRoles={activeRoles}
-            availableRoles={["chat", "think", "task"]}
+            availableRoles={["chat"]}
             onActivate={onActivate}
             onDelete={onDelete}
             emptyMessage="No Llamafile models found. Download one below."
@@ -877,8 +901,14 @@ export function Models() {
 
   async function handleActivate(provider: string, name: string, role: string) {
     try {
-      await api.activateModel(provider, name, role);
-      flash(`${name} set as ${role} model.`);
+      if (role === "tool") {
+        // Tool caller is a settings field, not a model-role assignment
+        await api.updateSettings({ tool_model: name });
+        flash(`${name} set as Tool Caller.`);
+      } else {
+        await api.activateModel(provider, name, role);
+        flash(`${name} set as ${ROLE_LABELS[role as RoleKey] ?? role} model.`);
+      }
       await loadRoles();
     } catch (e) { flash(String(e), false); }
   }

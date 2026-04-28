@@ -241,8 +241,7 @@ export class PondApiClient {
       }
       return {
         chat:  normalize(raw.chat),
-        think: normalize(raw.think),
-        task:  normalize(raw.task),
+        tool:  raw.tool ?? null,
         asr:   normalize(raw.asr),
         tts:   normalize(raw.tts),
       } as ModelActiveRoles;

@@ -27,6 +27,8 @@ pub mod sensor_storage;
 pub mod session_storage;
 pub mod settings;
 pub mod skill;
+pub mod tool_agent;
+pub mod tool_caller;
 pub mod onboarding;
 pub mod voice_input;
 pub mod voice_output;

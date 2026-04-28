@@ -4,6 +4,7 @@ use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
+use crate::ports::tool_agent::ToolAgent;
 use crate::ports::voice_input::VoiceInput;
 use crate::ports::voice_output::VoiceOutput;
 use crate::ports::wake_word::StreamingWakeWordDetector;
@@ -903,6 +904,9 @@ pub struct ChatService {
     /// Optional LLM-based context compactor.  When set, triggers at 80% of
     /// the context budget instead of falling straight to trim_to_budget.
     compactor: Option<ContextCompactor>,
+    /// Optional Tool Agent — classifies messages and pre-fetches tool data
+    /// (Wikipedia, weather, memory) before the main LLM runs.
+    tool_agent: Option<Arc<dyn ToolAgent>>,
 }
 
 impl ChatService {
@@ -921,7 +925,19 @@ impl ChatService {
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
             compactor: None,
+            tool_agent: None,
         }
+    }
+
+    /// Attach a Tool Agent for pre-inference tool classification and execution.
+    pub fn with_tool_agent(mut self, agent: Arc<dyn ToolAgent>) -> Self {
+        self.tool_agent = Some(agent);
+        self
+    }
+
+    /// Access the LLM provider (if set) for constructing tool agents etc.
+    pub fn provider_ref(&self) -> &Option<Arc<dyn LlmProvider>> {
+        &self.provider
     }
 
     /// Attach a real LLM provider. When set, `chat_once` calls the provider
@@ -1108,10 +1124,30 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
+        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
+        let agent_message = if let Some(ref tool_agent) = self.tool_agent {
+            match tool_agent.process(&message).await {
+                Ok(Some(augmented)) => {
+                    println!("[voice-tool-agent] tool result injected ({} chars)", augmented.len());
+                    augmented
+                }
+                Ok(None) => {
+                    println!("[voice-tool-agent] no tool needed");
+                    message.clone()
+                }
+                Err(e) => {
+                    println!("[voice-tool-agent] error: {e}, using original message");
+                    message.clone()
+                }
+            }
+        } else {
+            message.clone()
+        };
+
         let request = AgentRequest {
-            message: message.clone(),
+            message: agent_message,
             session_id: self.session_id.clone(),
-            model_role: resolve_voice_role(&message),
+            model_role: "chat".to_string(),
         };
 
         // Start a soft ambient thinking tone while the LLM infers.

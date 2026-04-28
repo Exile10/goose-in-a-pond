@@ -28,7 +28,9 @@
 //! ```
 
 pub mod scheduler;
+pub mod tool_caller;
 pub use scheduler::{NoopScheduler, ResourceAwareModelScheduler, LLM_BUDGET_MB, JETSON_TOTAL_RAM_MB};
+pub use tool_caller::ToolCallerEngine;
 
 use anyhow::Result;
 use async_trait::async_trait;
