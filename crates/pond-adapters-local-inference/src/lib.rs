@@ -337,6 +337,11 @@ fn strip_thinking_tokens(text: &str) -> String {
 
 #[async_trait]
 impl LlmProvider for LocalInferenceLlmAdapter {
+    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
+        let name = self.inner.model_name();
+        pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
+    }
+
     async fn complete(
         &self,
         system: &str,

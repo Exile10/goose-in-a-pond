@@ -111,6 +111,8 @@ pub struct GooseAdapter {
     /// When true, prompt templates include voice-mode instructions (keep responses
     /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
     voice_mode: std::sync::atomic::AtomicBool,
+    /// Runtime capabilities of the currently loaded model.
+    model_capabilities: Mutex<pond_core::domain::model_capabilities::ModelCapabilities>,
 }
 
 impl GooseAdapter {
@@ -160,6 +162,7 @@ impl GooseAdapter {
             loaded_extensions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
             voice_mode: std::sync::atomic::AtomicBool::new(false),
+            model_capabilities: Mutex::new(pond_core::domain::model_capabilities::ModelCapabilities::default()),
         })
     }
 
@@ -358,6 +361,13 @@ impl GooseAdapter {
             );
             self.agent.update_provider(p, session_id).await?;
             *self.last_provider_key.lock().unwrap() = key.clone();
+
+            // Update model capabilities from the new model name
+            let caps = pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&settings.chat_model);
+            println!("[model-switch] capabilities: thinking={}, vision={}, context={}k",
+                caps.thinking, caps.vision, caps.context_window_tokens / 1000);
+            *self.model_capabilities.lock().unwrap() = caps;
+
             println!("[model-switch] swap complete, key={}", key);
         } else {
             println!("[model-switch] no provider built for {}:{}", settings.chat_provider, settings.chat_model);
@@ -483,6 +493,14 @@ impl GooseAdapter {
                 .map(|(name, desc)| format!("{} — {}", name, desc))
                 .collect();
 
+            // Resolve thinking mode from settings + capabilities
+            let caps = self.model_capabilities.lock().unwrap().clone();
+            let thinking_enabled = match settings.thinking_mode.as_str() {
+                "on"  => true,
+                "off" => false,
+                _     => caps.thinking, // "auto" — enable when model supports it
+            };
+
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
                 current_time: now.format("%H:%M").to_string(),
@@ -491,6 +509,7 @@ impl GooseAdapter {
                 online_device_names,
                 voice_mode: self.voice_mode.load(std::sync::atomic::Ordering::Relaxed),
                 available_tools,
+                thinking_enabled,
             }
         };
 
@@ -680,6 +699,10 @@ impl GooseAdapter {
 
 #[async_trait]
 impl AgentPort for GooseAdapter {
+    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
+        self.model_capabilities.lock().unwrap().clone()
+    }
+
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
         let mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>> =
             self.chat_stream(request).await?;

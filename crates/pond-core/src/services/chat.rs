@@ -1012,6 +1012,7 @@ impl ChatService {
             message: message.clone(),
             session_id: self.session_id.clone(),
             model_role: resolve_voice_role(&message),
+            images: Vec::new(),
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1148,6 +1149,7 @@ impl ChatService {
             message: agent_message,
             session_id: self.session_id.clone(),
             model_role: "chat".to_string(),
+            images: Vec::new(),
         };
 
         // Start a soft ambient thinking tone while the LLM infers.
@@ -1235,8 +1237,8 @@ impl ChatService {
                 AgentStreamEvent::Error { content } => {
                     return Err(anyhow::anyhow!("Agent stream error: {}", content));
                 }
-                AgentStreamEvent::Status { .. } | AgentStreamEvent::ToolResult { .. } => {
-                    // Not spoken — status/tool results are informational only
+                AgentStreamEvent::Status { .. } | AgentStreamEvent::ToolResult { .. } | AgentStreamEvent::Thinking { .. } => {
+                    // Not spoken — status/tool results/thinking are informational only
                 }
             }
         }

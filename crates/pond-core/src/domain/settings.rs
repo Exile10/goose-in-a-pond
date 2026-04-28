@@ -173,6 +173,25 @@ pub struct Settings {
     #[serde(default = "Settings::default_session_messages_keep")]
     pub retention_session_messages_keep: u32,
 
+    // ── Thinking / Reasoning ────────────────────────────────────────────────────
+    /// Thinking/reasoning mode: "auto" | "on" | "off"
+    /// "auto" (default): enable for models that support it (Gemma 4, Qwen3, etc.)
+    /// "on": always attempt to enable thinking
+    /// "off": never use thinking mode
+    #[serde(default = "Settings::default_thinking_mode")]
+    pub thinking_mode: String,
+
+    /// When true, thinking/reasoning blocks are forwarded to the UI as events
+    /// instead of being silently stripped. Off by default.
+    #[serde(default)]
+    pub show_thinking: bool,
+
+    /// Override the model's reported context window (tokens).
+    /// 0 (default) = use the model's own value.
+    /// Non-zero = cap at this value (useful for memory-constrained deployments).
+    #[serde(default)]
+    pub context_window_override: u32,
+
     // ── Agent behaviour ────────────────────────────────────────────────────────
     /// GooseMode for the agent loop: "auto" | "chat" | "smart"
     #[serde(default = "Settings::default_agent_goose_mode")]
@@ -227,6 +246,9 @@ impl Default for Settings {
             retention_event_log_days:        Self::default_event_log_days(),
             retention_sensor_days:           Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
+            thinking_mode:                   Self::default_thinking_mode(),
+            show_thinking:                   false,
+            context_window_override:         0,
             agent_goose_mode:                Self::default_agent_goose_mode(),
             agent_max_turns:                 Self::default_agent_max_turns(),
             agent_memory_inject:             Self::default_agent_memory_inject(),
@@ -267,6 +289,7 @@ impl Settings {
     fn default_event_log_days()              -> u32    { 30 }
     fn default_sensor_days()                -> u32    { 7 }
     fn default_session_messages_keep()      -> u32    { 500 }
+    fn default_thinking_mode()              -> String { "auto".to_string() }
     fn default_agent_goose_mode()           -> String { "auto".to_string() }
     fn default_agent_max_turns()            -> u32    { 20 }
     fn default_agent_memory_inject()        -> bool   { false }

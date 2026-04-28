@@ -328,6 +328,17 @@ export default function Settings({ token }: Props) {
             />
           </div>
 
+          {/* Thinking mode */}
+          <div className="db-settings-field" style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem' }}>
+            <label className="db-settings-label">Thinking Mode</label>
+            <p className="db-settings-hint" style={{ margin: '0 0 0.5rem' }}>Enable internal reasoning for better analysis, planning, and complex answers.</p>
+            <select className="db-settings-input" defaultValue="auto">
+              <option value="auto">Auto (enable for capable models)</option>
+              <option value="on">Always On</option>
+              <option value="off">Off</option>
+            </select>
+          </div>
+
           {/* Shared generation params */}
           <div className="db-settings-field" style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem' }}>
             <label className="db-settings-label" htmlFor="llmMaxTokens">

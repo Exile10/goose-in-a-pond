@@ -8,10 +8,54 @@ import {
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type {
-  ModelEntry, ModelActiveRoles, ModelMemoryStatus, HfModel, HfModelFile, DownloadEntry,
+  ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
+  HfModel, HfModelFile, DownloadEntry,
   OllamaModel, LlamafileRelease, FaceModelsResponse,
 } from "../api/types";
 import { ApiError } from "../api/types";
+
+// ── Capability detection from model name (frontend heuristic) ──
+
+/** Infer capabilities from a model name string (mirrors backend ModelCapabilities::from_model_name). */
+function inferCapabilities(name: string): Partial<ModelCapabilities> {
+  const n = name.toLowerCase();
+  const caps: Partial<ModelCapabilities> = {};
+
+  // Thinking
+  if (/gemma[-_]?4|qwen3|qwq|deepseek[-_]?r1/.test(n)) caps.thinking = true;
+  // Vision
+  if (/gemma[-_]?4|llava|bakllava|moondream/.test(n)) caps.vision = true;
+  // Audio
+  if (/gemma[-_]?4/.test(n) && /e[24]b/i.test(n)) caps.audio_input = true;
+  // Context window
+  if (/gemma[-_]?4/.test(n)) caps.context_window_tokens = 128_000;
+  else if (/llama[-_]?3/.test(n)) caps.context_window_tokens = 8_192;
+  else if (/qwen/.test(n)) caps.context_window_tokens = 32_768;
+  else if (/mistral/.test(n)) caps.context_window_tokens = 32_768;
+
+  return caps;
+}
+
+/** Compact capability badge list for a model name. */
+function CapabilityBadges({ name }: { name: string }) {
+  const caps = inferCapabilities(name);
+  const badges: Array<{ label: string; title: string }> = [];
+  if (caps.thinking) badges.push({ label: "Thinking", title: "Supports internal chain-of-thought reasoning" });
+  if (caps.vision) badges.push({ label: "Vision", title: "Accepts image input (multimodal)" });
+  if (caps.audio_input) badges.push({ label: "Audio", title: "Accepts raw audio input" });
+  if (caps.context_window_tokens && caps.context_window_tokens > 8192)
+    badges.push({ label: `${Math.round(caps.context_window_tokens / 1000)}k ctx`, title: `${caps.context_window_tokens.toLocaleString()} token context window` });
+
+  if (badges.length === 0) return null;
+  return (
+    <>
+      {badges.map(b => (
+        <Chip key={b.label} size="sm" variant="soft" color="default" title={b.title}>{b.label}</Chip>
+      ))}
+    </>
+  );
+}
+
 // ── Design constants ──────────────────────────────────────────
 
 const CAT_COLOR = {
@@ -30,12 +74,14 @@ const ROLE_CHIP_VARIANT: Record<string, string> = {
 function ActiveRolesBanner({
   roles,
   memoryStatus,
+  capabilities,
   onRefresh,
   loading,
   onNavigate,
 }: {
   roles: ModelActiveRoles | null;
   memoryStatus: ModelMemoryStatus | null;
+  capabilities: ModelCapabilities | null;
   onRefresh: () => void;
   loading: boolean;
   onNavigate?: (category: "llm" | "asr" | "tts") => void;
@@ -134,6 +180,27 @@ function ActiveRolesBanner({
             </div>
           </div>
         </div>
+
+        {/* Active model capabilities */}
+        {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
+          <div style={{
+            display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center",
+            padding: "6px 0 0", borderTop: "1px solid var(--grey-200)",
+          }}>
+            <span style={{ fontSize: "var(--text-xs)", color: "var(--grey-500)", marginRight: 4 }}>
+              Model features:
+            </span>
+            {capabilities.thinking && <Chip size="sm" variant="soft" color="accent">Thinking</Chip>}
+            {capabilities.vision && <Chip size="sm" variant="soft" color="accent">Vision</Chip>}
+            {capabilities.audio_input && <Chip size="sm" variant="soft" color="accent">Audio</Chip>}
+            {capabilities.structured_output && <Chip size="sm" variant="soft" color="accent">Structured Output</Chip>}
+            {capabilities.context_window_tokens > 4096 && (
+              <Chip size="sm" variant="soft" color="accent">
+                {Math.round(capabilities.context_window_tokens / 1000)}k context
+              </Chip>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -257,6 +324,7 @@ function ModelList({
                 {activeFor.map((r) => (
                   <Chip key={r} size="sm" color="accent" variant="soft">{ROLE_LABELS[r]}</Chip>
                 ))}
+                <CapabilityBadges name={m.name} />
               </div>
               <div className="giap-model-row__file"><code>{m.provider} / {m.name}</code></div>
             </div>
@@ -842,6 +910,7 @@ export function Models() {
   const [downloads, setDownloads] = useState<DownloadEntry[]>([]);
   const [actionMsg, setActionMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
+  const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadRoles = useCallback(async () => {
@@ -890,6 +959,7 @@ export function Models() {
   useEffect(() => {
     loadRoles(); loadModels(); loadDownloads();
     api.getMemoryStatus().then(setMemoryStatus).catch(() => {/* non-fatal */});
+    api.getModelCapabilities().then(setCapabilities).catch(() => {/* non-fatal */});
     return () => { if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; } };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -957,6 +1027,7 @@ export function Models() {
       <ActiveRolesBanner
         roles={activeRoles}
         memoryStatus={memoryStatus}
+        capabilities={capabilities}
         onRefresh={loadRoles}
         loading={rolesLoading}
         onNavigate={(cat) => setCategory(cat)}

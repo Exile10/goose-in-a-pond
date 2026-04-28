@@ -1097,9 +1097,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build ToolAgent for the HTTP path — uses the same provider as the main LLM
+    // Build ToolAgent for the HTTP path — uses the same provider as the main LLM.
+    // When tool_model is unset or matches chat_model, same_model=true → zero swap overhead.
+    let same_model = settings.tool_model.is_none()
+        || settings.tool_model.as_deref() == Some(&settings.chat_model);
+    println!("  Tool Agent: same_model={} (tool_model={:?}, chat_model={})",
+        same_model, settings.tool_model, settings.chat_model);
     let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent { provider: chat_provider_arc }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+        Some(Arc::new(GiapToolAgent { provider: chat_provider_arc, same_model }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
 
     let db = Arc::new(db);
 
@@ -1916,7 +1921,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             };
 
         if let Some(provider) = classifier_provider {
-            let ta = GiapToolAgent { provider };
+            let ta = GiapToolAgent { provider, same_model: true };
             chat_service = chat_service.with_tool_agent(Arc::new(ta));
             println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
         } else {
@@ -1929,10 +1934,15 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     Ok(())
 }
 
-/// Tool Agent implementation for the CLI voice mode.
-/// Uses the same LLM provider for classification and pond-mcp-server for tool execution.
+/// Tool Agent implementation for both HTTP and CLI voice paths.
+/// Uses the main LLM provider for classification and pond-mcp-server for tool execution.
+///
+/// When `same_model` is true, the tool_model matches the chat_model (or is unset),
+/// so the classifier uses the already-loaded model with zero swap overhead.
 struct GiapToolAgent {
     provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    /// True when tool_model == chat_model — no model-swap overhead for classification.
+    same_model: bool,
 }
 
 #[async_trait::async_trait]
@@ -1942,10 +1952,10 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
         let classify_prompt = pond_core::prompts::build_classifier_prompt();
         let classify_msg = vec![pond_core::domain::message::ChatMessage::user(message)];
 
-        println!("[voice-tool-classifier] classifying: {:?}", message);
+        println!("[tool-classifier] classifying (same_model={}): {:?}", self.same_model, message);
         let response = self.provider.complete(&classify_prompt, classify_msg).await?;
         let text = response.content.trim().to_lowercase();
-        println!("[voice-tool-classifier] response: {:?}", text);
+        println!("[tool-classifier] response: {:?}", text);
 
         let needs_tool = text.contains("\"needs_tool\": true")
             || text.contains("\"needs_tool\":true")
@@ -1969,12 +1979,17 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                 println!("[voice-tool-agent] got result ({} chars)", info.len());
                 Ok(Some(format!(
                     "{}\n\n\
-                    [Retrieved information for this request]\n\
+                    [Retrieved information — USE THIS AS YOUR PRIMARY SOURCE]\n\
                     {}\n\n\
-                    Respond to the user's message above naturally, using your personality and style from the system prompt. \
-                    Use the retrieved information to give a helpful, concise answer. \
-                    Do not mention tools, Wikipedia, APIs, or that anything was looked up. \
-                    Consider the conversation history for context.",
+                    INSTRUCTIONS: Answer the user's question using the retrieved information above as \
+                    your authoritative source. Be thorough and detailed — include specific facts, numbers, \
+                    dates, and comparisons from the retrieved data. If the user asked to compare things, \
+                    highlight concrete differences and similarities. If they asked how something works, \
+                    explain the mechanism step by step. \
+                    Do NOT give a vague or generic answer when you have specific information available. \
+                    Do NOT mention tools, Wikipedia, APIs, or that anything was looked up — present \
+                    the information naturally as your own knowledge. \
+                    Match the personality and style from your system prompt.",
                     message, info
                 )))
             }
@@ -3152,6 +3167,11 @@ async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domai
                 }
                 break;
             }
+            AgentStreamEvent::Thinking { content } => {
+                // In CLI, show thinking in dim text for debugging
+                eprint!("\r\x1b[K\x1b[2m  💭 {content}\x1b[0m");
+                let _ = io::stderr().flush();
+            }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");
                 std::process::exit(1);
@@ -3236,6 +3256,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 message,
                 session_id: session,
                 model_role,
+                images: Vec::new(),
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -3290,6 +3311,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     message,
                     session_id: session.clone(),
                     model_role,
+                    images: Vec::new(),
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

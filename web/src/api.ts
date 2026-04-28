@@ -502,6 +502,10 @@ export const api = {
   searchLlamafileModels: (q: string, token: string) =>
     getReq<{ models: LlamafileAsset[]; error?: string }>(`/models/search/llamafile?q=${encodeURIComponent(q)}`, token),
 
+  /** Get runtime capabilities of the active model */
+  getModelCapabilities: (token: string) =>
+    getReq<{ thinking: boolean; vision: boolean; audio_input: boolean; context_window_tokens: number; structured_output: boolean }>('/models/capabilities', token),
+
   /** Get current RAM usage and loaded model info */
   getMemoryStatus: (token: string) =>
     getReq<MemoryStatus>('/models/memory-status', token),
