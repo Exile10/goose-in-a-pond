@@ -53,6 +53,54 @@ pub struct PromptState {
     /// When set, prompts instruct the LLM to keep responses short, spoken-friendly,
     /// and free of visual formatting.
     pub voice_mode: bool,
+    /// Available tool descriptions for the Tool Agent classifier.
+    /// Each entry is a human-readable line like "wikipedia — Look up factual information..."
+    pub available_tools: Vec<String>,
+}
+
+/// Tool definitions shared between the system prompt template and the classifier.
+/// Returns a list of `(id, description)` pairs.
+pub fn giap_tool_definitions() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("wikipedia", "Look up factual information about people, places, events, science, history, geography, technology. Use for ANY factual question the assistant might not know or might get wrong."),
+        ("weather", "Get current real-time weather conditions (temperature, humidity, wind) for the user's configured location. Use when the user asks about current weather, temperature, or forecast."),
+        ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves). Use when the user says 'remember', 'don't forget', 'save this', or states a personal preference."),
+        ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before."),
+        ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
+        ("schedules", "List scheduled tasks and automations. Use when the user asks about their schedules, reminders, or timed tasks."),
+    ]
+}
+
+/// Build the classifier system prompt dynamically from the tool definitions.
+pub fn build_classifier_prompt() -> String {
+    let tools = giap_tool_definitions();
+    let tool_lines: Vec<String> = tools.iter()
+        .enumerate()
+        .map(|(i, (name, desc))| format!("{}. {} — {}", i + 1, name, desc))
+        .collect();
+
+    format!(
+        "You are a tool routing classifier. Your ONLY job is to output a JSON object.\n\n\
+        TOOLS:\n{tools}\n\n\
+        EXAMPLES:\n\
+        User: \"What's the weather like?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\
+        User: \"Who is Albert Einstein?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
+        User: \"Remember that I love peanuts\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
+        User: \"Don't forget my birthday is March 5\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
+        User: \"Do you remember what food I like?\" → {{\"needs_tool\": true, \"tool\": \"recall_memory\"}}\n\
+        User: \"What devices are connected?\" → {{\"needs_tool\": true, \"tool\": \"devices\"}}\n\
+        User: \"What's on my schedule?\" → {{\"needs_tool\": true, \"tool\": \"schedules\"}}\n\
+        User: \"Tell me about black holes\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
+        User: \"Hello!\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Tell me a joke\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Thanks\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"How's the temperature outside?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\
+        User: \"Save this: my favorite color is blue\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
+        User: \"What did I tell you about my preferences?\" → {{\"needs_tool\": true, \"tool\": \"recall_memory\"}}\n\
+        User: \"Weather?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\n\
+        Output ONLY the JSON object. No explanation.",
+        tools = tool_lines.join("\n"),
+    )
 }
 
 // ── Static fallback ───────────────────────────────────────────────────────────
@@ -78,7 +126,8 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 //   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
 //           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
 //   usize:  {{device_count}}
-//   bool:   {{has_home_devices}}, {{atypical_speech}}
+//   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}}
+//   list:   {{tools}} — available Tool Agent capabilities (human-readable lines)
 //
 // Home-control sections are gated behind {% if has_home_devices %} so the prompt
 // adapts automatically when no devices are configured. Extension injection is
@@ -111,8 +160,19 @@ If a routine includes a lock or alarm step, pause and confirm that step explicit
 If a request requires leaving the local network, say so clearly and wait for confirmation.
 {% endif %}
 
-IMPORTANT: Only use tools listed in your schema. Never use shell commands, bash, \
-python, curl, or execution tools. If a tool is unavailable, tell the user directly.
+{% if has_tools %}
+## Available Capabilities
+You have access to the following tools (handled automatically by the Tool Agent — \
+you do not call them yourself, but you can confidently answer questions in these areas):
+{% for tool in tools %}- {{tool}}
+{% endfor %}
+When the user asks something covered by these tools, answer confidently — the Tool Agent \
+will retrieve the information for you behind the scenes. Never say you lack access to \
+real-time data, weather, or external information when these tools are available.
+{% endif %}
+
+IMPORTANT: Never use shell commands, bash, python, curl, or execution tools. \
+If something is outside your capabilities, tell the user directly.
 {% if voice_mode %}
 
 ## Voice Mode
@@ -307,6 +367,13 @@ pub fn render_jinja_template(
     ctx.insert("has_home_devices",    &has_home);
     ctx.insert("online_device_names", online_names);
     ctx.insert("voice_mode",          &state.map(|s| s.voice_mode).unwrap_or(false));
+
+    // Available tools — rendered into the prompt so the model knows its capabilities
+    let tools: Vec<String> = state
+        .map(|s| s.available_tools.clone())
+        .unwrap_or_default();
+    ctx.insert("has_tools", &!tools.is_empty());
+    ctx.insert("tools", &tools);
 
     // Profile context
     ctx.insert(

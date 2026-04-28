@@ -48,7 +48,6 @@ use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
-use pond_core::services::model_router::ModelRouter;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
@@ -925,9 +924,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // LLM — only start llamafile when at least one role is configured to use it.
     // ModelService handles downloading autonomously inside try_start.
-    let any_role_needs_llamafile = settings.chat_provider == "llamafile"
-        || settings.think_provider.as_deref() == Some("llamafile")
-        || settings.task_provider.as_deref()  == Some("llamafile");
+    let any_role_needs_llamafile = settings.chat_provider == "llamafile";
 
     let active_llm_name: String = settings.chat_model.clone();
     let (initial_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
@@ -1096,26 +1093,13 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         &llamafile_url, data_dir_ref, max_tokens, temperature,
     ).await;
 
-    // Think role: reuse chat Arc if not separately configured.
-    let think_provider_arc: Arc<dyn LlmProvider> =
-        if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
-        } else {
-            chat_provider_arc.clone()
-        };
-
-    // Task role: reuse chat Arc if not separately configured.
-    let task_provider_arc: Arc<dyn LlmProvider> =
-        if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
-        } else {
-            chat_provider_arc.clone()
-        };
-
     let llm_provider = Arc::new(tokio::sync::RwLock::new(Some(
-        Arc::new(ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc))
-            as Arc<dyn LlmProvider>
+        chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
+
+    // Build ToolAgent for the HTTP path — uses the same provider as the main LLM
+    let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
+        Some(Arc::new(GiapToolAgent { provider: chat_provider_arc }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
 
     let db = Arc::new(db);
 
@@ -1192,7 +1176,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // ── Agent backend ────────────────────────────────────────────────────────────
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager) = build_goose_backend(
+    let (agent, extension_manager, tool_caller) = build_goose_backend(
         agent_backend,
         &llamafile_url,
         &data_dir,
@@ -1208,6 +1192,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         false, // voice_mode — server mode, not voice
     ).await;
 
+    #[cfg(not(feature = "goose-agent"))]
+    let tool_caller: Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>> = None;
     #[cfg(not(feature = "goose-agent"))]
     let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
         if agent_backend == "goose" {
@@ -1325,6 +1311,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: tool_agent_for_http,
     });
 
     // Warn if static assets haven't been built yet
@@ -1618,7 +1605,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             s.chat_model    = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
-        let (a, _ext_mgr) = build_goose_backend(
+        let (a, _ext_mgr, _tc) = build_goose_backend(
             "goose",
             &llamafile_url,
             &data_dir,
@@ -1896,9 +1883,107 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
+    // ── Wire Tool Agent for voice mode ──
+    // Build a provider for the tool classifier. When goose-agent is active,
+    // ChatService.provider is None (GooseAdapter manages its own provider),
+    // so we construct one explicitly for classification calls.
+    {
+        let classifier_provider: Option<Arc<dyn pond_core::ports::provider::LlmProvider>> =
+            if let Some(ref p) = chat_service.provider_ref() {
+                Some(p.clone())
+            } else {
+                // GooseAdapter mode — build a provider from settings for classification
+                match effective_provider {
+                    "local" | "gguf" => {
+                        #[cfg(feature = "local-inference")]
+                        {
+                            use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                            LocalInferenceLlmAdapter::new_with_data_dir(effective_model, &data_dir)
+                                .await
+                                .ok()
+                                .map(|p| Arc::new(p) as Arc<dyn pond_core::ports::provider::LlmProvider>)
+                        }
+                        #[cfg(not(feature = "local-inference"))]
+                        { None }
+                    }
+                    "ollama" => Some(Arc::new(
+                        OllamaProvider::new(None, Some(effective_model))
+                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
+                    _ => Some(Arc::new(
+                        LlamafileProvider::new(Some(&llamafile_url))
+                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
+                }
+            };
+
+        if let Some(provider) = classifier_provider {
+            let ta = GiapToolAgent { provider };
+            chat_service = chat_service.with_tool_agent(Arc::new(ta));
+            println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
+        } else {
+            println!("  Tool Agent: inactive (no provider available for classification)");
+        }
+    }
+
     chat_service.run_loop().await?;
 
     Ok(())
+}
+
+/// Tool Agent implementation for the CLI voice mode.
+/// Uses the same LLM provider for classification and pond-mcp-server for tool execution.
+struct GiapToolAgent {
+    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+}
+
+#[async_trait::async_trait]
+impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
+    async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
+        // Classify using the main LLM
+        let classify_prompt = pond_core::prompts::build_classifier_prompt();
+        let classify_msg = vec![pond_core::domain::message::ChatMessage::user(message)];
+
+        println!("[voice-tool-classifier] classifying: {:?}", message);
+        let response = self.provider.complete(&classify_prompt, classify_msg).await?;
+        let text = response.content.trim().to_lowercase();
+        println!("[voice-tool-classifier] response: {:?}", text);
+
+        let needs_tool = text.contains("\"needs_tool\": true")
+            || text.contains("\"needs_tool\":true")
+            || text.contains("needs_tool\": true");
+
+        if !needs_tool {
+            return Ok(None);
+        }
+
+        let tool = if text.contains("weather") { "weather" }
+            else if text.contains("save_memory") { "save_memory" }
+            else if text.contains("recall_memory") { "recall_memory" }
+            else if text.contains("devices") { "devices" }
+            else if text.contains("schedules") { "schedules" }
+            else { "wikipedia" };
+
+        println!("[voice-tool-agent] tool={}, executing...", tool);
+
+        match pond_mcp_server::try_tool_agent(tool, message).await {
+            Some(info) => {
+                println!("[voice-tool-agent] got result ({} chars)", info.len());
+                Ok(Some(format!(
+                    "{}\n\n\
+                    [Retrieved information for this request]\n\
+                    {}\n\n\
+                    Respond to the user's message above naturally, using your personality and style from the system prompt. \
+                    Use the retrieved information to give a helpful, concise answer. \
+                    Do not mention tools, Wikipedia, APIs, or that anything was looked up. \
+                    Consider the conversation history for context.",
+                    message, info
+                )))
+            }
+            None => {
+                println!("[voice-tool-agent] tool returned no result");
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Returns `true` when the process has access to a graphical display.
@@ -2660,13 +2745,43 @@ async fn build_goose_backend(
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+    Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
 ) {
     use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
+    use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::ports::extension_manager::ExtensionManagerPort;
+    use pond_core::ports::tool_caller::ToolCaller;
 
     if agent_backend != "goose" {
-        return (Arc::new(MockAgent::new()), None);
+        return (Arc::new(MockAgent::new()), None, None);
     }
+
+    // Build tool-calling specialist (FunctionGemma) if configured.
+    // The Tool Agent runs BEFORE the main LLM — model swap overhead is
+    // accepted because the main model never attempts tool calls itself.
+    let tool_caller: Option<Arc<dyn ToolCaller>> = {
+        let settings = settings_repo.get().await.unwrap_or_default();
+        match settings.tool_model.as_deref() {
+            Some(model_name) if !model_name.is_empty() => {
+                match ToolCallerEngine::new(model_name, data_dir).await {
+                    Ok(engine) => {
+                        println!("[tool-agent] FunctionGemma specialist loaded: {}", model_name);
+                        tracing::info!("Tool-calling specialist loaded: {}", model_name);
+                        Some(Arc::new(engine) as Arc<dyn ToolCaller>)
+                    }
+                    Err(e) => {
+                        println!("[tool-agent] FAILED to load specialist '{}': {e}", model_name);
+                        tracing::warn!("Failed to load tool specialist '{}': {e}", model_name);
+                        None
+                    }
+                }
+            }
+            _ => {
+                println!("[tool-agent] no tool_model configured, using code-path fallback");
+                None
+            }
+        }
+    };
 
     // Register the GIAP MCP server into Goose's builtin extension registry.
     let handles = Arc::new(GiapServiceHandles {
@@ -2678,11 +2793,12 @@ async fn build_goose_backend(
         skill_repo: skill_repo.clone(),
         recipe_repo: recipe_repo.clone(),
         http_client: reqwest::Client::new(),
+        tool_caller: tool_caller.clone(),
         last_user_message: tokio::sync::RwLock::new(String::new()),
     });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
-        return (Arc::new(MockAgent::new()), None);
+        return (Arc::new(MockAgent::new()), None, None);
     }
 
     // Build the adapter with all repos injected.
@@ -2704,11 +2820,11 @@ async fn build_goose_backend(
                 adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
             let agent: Arc<dyn Agent> = Arc::new(adapter);
-            (agent, Some(ext_mgr))
+            (agent, Some(ext_mgr), tool_caller)
         }
         Err(e) => {
             tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
-            (Arc::new(MockAgent::new()), None)
+            (Arc::new(MockAgent::new()), None, None)
         }
     }
 }
@@ -3100,7 +3216,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             eprintln!("  {} | provider: {}  model: {}  role: {}",
                 settings.assistant_name, settings.chat_provider, settings.chat_model, model_role);
 
-            let (agent, _ext_mgr) = build_goose_backend(
+            let (agent, _ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3128,7 +3244,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             use pond_core::domain::agent::AgentRequest;
             use tokio::io::AsyncBufReadExt as _;
 
-            let (agent, _ext_mgr) = build_goose_backend(
+            let (agent, _ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3182,7 +3298,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         }
 
         AgentAction::Tools => {
-            let (_agent, ext_mgr) = build_goose_backend(
+            let (_agent, ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,

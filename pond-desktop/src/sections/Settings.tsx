@@ -349,9 +349,8 @@ function ModelRoleRow({
 }
 
 function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
-  const [pickerRole, setPickerRole] = useState<ModelRole | null>(null);
-  const [thinkSameAsChat, setThinkSameAsChat] = useState(!s.think_provider && !s.think_model);
-  const [taskSameAsChat, setTaskSameAsChat]   = useState(!s.task_provider && !s.task_model);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [toolModels, setToolModels] = useState<string[]>([]);
 
   // Seed model fields from live active roles if settings don't already have them
   useEffect(() => {
@@ -360,16 +359,14 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
         patch("chat_provider", roles.chat.provider);
         patch("chat_model", roles.chat.model);
       }
-      if (!s.think_provider && !s.think_model && roles.think) {
-        setThinkSameAsChat(false);
-        patch("think_provider", roles.think.provider);
-        patch("think_model", roles.think.model);
-      }
-      if (!s.task_provider && !s.task_model && roles.task) {
-        setTaskSameAsChat(false);
-        patch("task_provider", roles.task.provider);
-        patch("task_model", roles.task.model);
-      }
+    }).catch(() => {/* non-fatal */});
+
+    // Fetch available GGUF models for the tool-caller dropdown
+    api.listModels().then((models) => {
+      const gguf = models
+        .filter((m) => m.provider === "gguf" || m.provider === "local")
+        .map((m) => m.name);
+      setToolModels(gguf);
     }).catch(() => {/* non-fatal */});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -377,65 +374,28 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
   const temp = s.llm_temperature ?? 0.7;
   const maxTokenOpts = [128, 256, 512, 1024, 2048, 4096];
 
-  function handleModelSelect(role: ModelRole, provider: string, model: string) {
-    patch(`${role}_provider`, provider);
-    patch(`${role}_model`, model);
-    setPickerRole(null);
-  }
-
   return (
     <div className="settings-body">
       <Section title="AI Models">
-        <FormRow label="Conversation" hint="Used for everyday chat and questions">
+        <FormRow label="Main LLM" hint="Handles all conversation, reasoning, and response generation">
           <ModelRoleRow
             provider={s.chat_provider}
             model={s.chat_model}
-            onPick={() => setPickerRole("chat")}
+            onPick={() => setPickerOpen(true)}
           />
         </FormRow>
 
-        <FormRow label="Reasoning" hint="Used for complex, multi-step thinking">
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
-            <Switch
-              isSelected={thinkSameAsChat}
-              onChange={(v) => {
-                setThinkSameAsChat(v);
-                if (v) { patch("think_provider", null); patch("think_model", null); }
-              }}
-            >
-              <Switch.Control><Switch.Thumb /></Switch.Control>
-              Same as Conversation
-            </Switch>
-            {!thinkSameAsChat && (
-              <ModelRoleRow
-                provider={s.think_provider}
-                model={s.think_model}
-                onPick={() => setPickerRole("think")}
-              />
-            )}
-          </div>
-        </FormRow>
-
-        <FormRow label="Tools & Tasks" hint="Used when running actions or automations">
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", width: "100%" }}>
-            <Switch
-              isSelected={taskSameAsChat}
-              onChange={(v) => {
-                setTaskSameAsChat(v);
-                if (v) { patch("task_provider", null); patch("task_model", null); }
-              }}
-            >
-              <Switch.Control><Switch.Thumb /></Switch.Control>
-              Same as Conversation
-            </Switch>
-            {!taskSameAsChat && (
-              <ModelRoleRow
-                provider={s.task_provider}
-                model={s.task_model}
-                onPick={() => setPickerRole("task")}
-              />
-            )}
-          </div>
+        <FormRow label="Tool Caller" hint="Small specialist model for structured tool-call arguments (optional)">
+          <select
+            value={s.tool_model ?? ""}
+            onChange={(e) => patch("tool_model", e.target.value || null)}
+            style={{ width: "100%", padding: "var(--space-2)", borderRadius: "var(--radius-2)", border: "1px solid var(--border)", background: "var(--surface)" }}
+          >
+            <option value="">None (use main LLM for tool calls)</option>
+            {toolModels.map((name) => (
+              <option key={name} value={name}>{name}</option>
+            ))}
+          </select>
         </FormRow>
       </Section>
 
@@ -462,13 +422,17 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
         </FormRow>
       </Section>
 
-      {pickerRole && (
+      {pickerOpen && (
         <ModelPickerModal
-          role={pickerRole}
-          currentProvider={pickerRole === "chat" ? s.chat_provider : pickerRole === "think" ? s.think_provider : s.task_provider}
-          currentModel={pickerRole === "chat" ? s.chat_model : pickerRole === "think" ? s.think_model : s.task_model}
-          onSelect={(provider, model) => handleModelSelect(pickerRole, provider, model)}
-          onClose={() => setPickerRole(null)}
+          role="chat"
+          currentProvider={s.chat_provider}
+          currentModel={s.chat_model}
+          onSelect={(provider, model) => {
+            patch("chat_provider", provider);
+            patch("chat_model", model);
+            setPickerOpen(false);
+          }}
+          onClose={() => setPickerOpen(false)}
         />
       )}
     </div>

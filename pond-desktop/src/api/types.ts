@@ -33,10 +33,7 @@ export interface Settings {
   // Model roles
   chat_provider?: string;
   chat_model?: string;
-  think_provider?: string | null;
-  think_model?: string | null;
-  task_provider?: string | null;
-  task_model?: string | null;
+  tool_model?: string | null;
   llm_provider?: string;
   llm_temperature?: number;
   llm_max_tokens?: number;
@@ -199,8 +196,7 @@ export interface ModelRoleAssignment {
 
 export interface ModelActiveRoles {
   chat:  ModelRoleAssignment | null;
-  think: ModelRoleAssignment | null;
-  task:  ModelRoleAssignment | null;
+  tool:  { model: string | null } | null;
   asr:   ModelRoleAssignment | null;
   tts:   ModelRoleAssignment | null;
 }

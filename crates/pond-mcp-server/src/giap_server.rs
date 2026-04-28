@@ -184,7 +184,7 @@ impl GiapMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Get the current model role assignments: which provider and model handles Chat, Think, and Task requests.")]
+    #[tool(description = "Get the current model configuration: which LLM and tool-calling model are active.")]
     async fn get_model_assignments(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -192,15 +192,10 @@ impl GiapMcpServer {
         let s = self.services.settings_repo.get().await.map_err(|e| {
             ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Settings error: {}", e), None)
         })?;
-        let think_provider = s.think_provider.as_deref().unwrap_or(&s.chat_provider);
-        let think_model    = s.think_model.as_deref().unwrap_or(&s.chat_model);
-        let task_provider  = s.task_provider.as_deref().unwrap_or(&s.chat_provider);
-        let task_model     = s.task_model.as_deref().unwrap_or(&s.chat_model);
+        let tool = s.tool_model.as_deref().unwrap_or("(none)");
         let text = format!(
-            "Chat:  {}/{}\nThink: {}/{}\nTask:  {}/{}",
-            s.chat_provider, s.chat_model,
-            think_provider, think_model,
-            task_provider, task_model,
+            "Main LLM:    {}/{}\nTool caller: {}",
+            s.chat_provider, s.chat_model, tool,
         );
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
@@ -465,28 +460,82 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
             }
         }
     }
-    // 4. Last resort — use the user's original message
-    let fallback = services.last_user_message.read().await.clone();
-    let trimmed = fallback.trim().to_string();
-    if !trimmed.is_empty() {
-        println!("[wikipedia] extract_topic: using user message fallback: {:?}", trimmed);
-        return trimmed;
+    // 4. Try the tool-calling specialist model (if configured)
+    let user_msg = services.last_user_message.read().await.clone();
+    if let Some(ref tool_caller) = services.tool_caller {
+        let schema = r#"{"topic": "string — the topic, person, place, or concept to look up"}"#;
+        let query = user_msg.trim();
+        if !query.is_empty() {
+            println!("[wikipedia] extract_topic: invoking tool-caller specialist for {:?}", query);
+            match tool_caller.generate_tool_call("get_wikipedia_article", schema, query).await {
+                Ok(args) => {
+                    if let Some(t) = args.get("topic").and_then(|v| v.as_str()) {
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() {
+                            println!("[wikipedia] extract_topic: specialist returned: {:?}", trimmed);
+                            return trimmed.to_string();
+                        }
+                    }
+                    println!("[wikipedia] extract_topic: specialist returned args without 'topic': {:?}", args);
+                }
+                Err(e) => {
+                    println!("[wikipedia] extract_topic: specialist failed: {e}");
+                }
+            }
+        }
+    }
+    // 5. Last resort — extract topic from user message with query cleaning
+    let cleaned = clean_query_for_search(&user_msg);
+    if !cleaned.is_empty() {
+        println!("[wikipedia] extract_topic: cleaned user message: {:?}", cleaned);
+        return cleaned;
     }
     println!("[wikipedia] extract_topic: no topic found in params: {:?}", params);
     String::new()
 }
 
+/// Strip common question prefixes to extract the core topic for search.
+///
+/// "who is Wangari Maathai?" → "Wangari Maathai"
+/// "tell me about black holes" → "black holes"
+/// "Nairobi" → "Nairobi" (unchanged)
+pub fn clean_query_for_search(raw: &str) -> String {
+    let stripped = raw.trim().trim_end_matches('?').trim_end_matches('.').trim();
+    let lower = stripped.to_lowercase();
+    let prefixes = [
+        "who is ", "who was ", "who are ",
+        "what is ", "what are ", "what was ", "what were ",
+        "where is ", "where are ",
+        "when was ", "when did ",
+        "tell me about ", "explain ", "describe ",
+        "how does ", "how do ", "how did ",
+        "look up ", "search for ", "search ", "find ",
+        "define ", "can you tell me about ",
+    ];
+    for prefix in prefixes {
+        if lower.starts_with(prefix) {
+            return stripped[prefix.len()..].trim().to_string();
+        }
+    }
+    stripped.to_string()
+}
+
 #[derive(Debug)]
-pub(crate) enum WikiFetchError {
+pub enum WikiFetchError {
     NotFound,
     Mcp(ErrorData),
 }
 
 impl GiapMcpServer {
-    /// Fetch the summary for an exact Wikipedia article title.
-    pub(crate) async fn fetch_article_summary(&self, title: &str) -> Result<String, WikiFetchError> {
+    /// Fetch the full article content for an exact Wikipedia title.
+    ///
+    /// Uses the MediaWiki `action=query&prop=extracts` endpoint which returns
+    /// the complete article as plain text (no HTML). Falls back to the REST
+    /// summary API if the full extract is empty.
+    pub async fn fetch_article_summary(&self, title: &str) -> Result<String, WikiFetchError> {
+        // Full article via MediaWiki API (plaintext, no character limit)
         let url = format!(
-            "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+            "https://en.wikipedia.org/w/api.php?action=query&titles={}&prop=extracts|info&explaintext=1&inprop=url&format=json&redirects=1",
             urlencoding::encode(title),
         );
         println!("[wikipedia] GET {}", url);
@@ -494,7 +543,7 @@ impl GiapMcpServer {
         let resp = self.services.http_client
             .get(&url)
             .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await
             .map_err(|e| {
@@ -508,9 +557,6 @@ impl GiapMcpServer {
 
         println!("[wikipedia] article response status: {}", resp.status());
 
-        if resp.status().as_u16() == 404 {
-            return Err(WikiFetchError::NotFound);
-        }
         if !resp.status().is_success() {
             println!("[wikipedia] article fetch failed with HTTP {}", resp.status());
             return Err(WikiFetchError::Mcp(ErrorData::new(
@@ -529,21 +575,44 @@ impl GiapMcpServer {
             ))
         })?;
 
-        let display_title = body["title"].as_str().unwrap_or(title);
-        let description = body["description"].as_str().unwrap_or("");
-        let extract = body["extract"].as_str().unwrap_or("No extract available.");
-        let page_url = body["content_urls"]["desktop"]["page"].as_str().unwrap_or("");
+        // MediaWiki returns pages as { "query": { "pages": { "<id>": { ... } } } }
+        let pages = &body["query"]["pages"];
+        let page = pages.as_object()
+            .and_then(|m| m.values().next());
 
-        println!("[wikipedia] article fetched: title={:?}, description={:?}, extract_len={}", display_title, description, extract.len());
+        let page = match page {
+            Some(p) if p.get("missing").is_none() => p,
+            _ => return Err(WikiFetchError::NotFound),
+        };
+
+        let display_title = page["title"].as_str().unwrap_or(title);
+        let extract = page["extract"].as_str().unwrap_or("");
+        let fallback_url = format!("https://en.wikipedia.org/wiki/{}", urlencoding::encode(title));
+        let page_url = page["fullurl"].as_str().unwrap_or(&fallback_url);
+
+        if extract.is_empty() {
+            return Err(WikiFetchError::NotFound);
+        }
+
+        // Cap at ~8000 chars to stay within model context limits
+        let truncated = if extract.len() > 8000 {
+            let mut cut = 8000;
+            while cut > 0 && !extract.is_char_boundary(cut) { cut -= 1; }
+            format!("{}...\n\n[Article truncated — full article at source]", &extract[..cut])
+        } else {
+            extract.to_string()
+        };
+
+        println!("[wikipedia] article fetched: title={:?}, extract_len={}", display_title, extract.len());
 
         Ok(format!(
-            "# {}\n*{}*\n\n{}\n\nSource: {}",
-            display_title, description, extract, page_url,
+            "# {}\n\n{}\n\nSource: {}",
+            display_title, truncated, page_url,
         ))
     }
 
     /// Search Wikipedia and fetch the summary of the best matching article.
-    pub(crate) async fn search_and_fetch_best(&self, query: &str) -> Result<String, ErrorData> {
+    pub async fn search_and_fetch_best(&self, query: &str) -> Result<String, ErrorData> {
         let search_url = format!(
             "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit=1&format=json",
             urlencoding::encode(query),
@@ -703,6 +772,7 @@ mod tests {
             skill_repo: Arc::new(StubSkills),
             recipe_repo: Arc::new(StubRecipes),
             http_client: reqwest::Client::new(),
+            tool_caller: None,
             last_user_message: tokio::sync::RwLock::new(String::new()),
         });
         GiapMcpServer::new(handles)

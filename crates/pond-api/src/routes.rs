@@ -29,9 +29,8 @@ use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext};
 use pond_core::ports::provider::LlmProvider;
 use pond_core::services::chat::ChatService;
-use pond_core::services::model_router::ModelRouter;
 use pond_core::services::onboarding::OnboardingService;
-use pond_core::services::request_classifier::classify_request;
+// Tool classification is handled by the ToolAgent port (injected via AppState).
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -338,15 +337,7 @@ async fn chat(
             })?;
     }
 
-    // Classify the message to determine which model role will handle it
-    let model_role = {
-        use pond_core::domain::model_role::ModelRole;
-        match classify_request(&req.message) {
-            ModelRole::Think => "think",
-            ModelRole::Task  => "task",
-            ModelRole::Chat  => "chat",
-        }
-    };
+    let model_role = "chat";
 
     // Build ChatService — agent is always primary (GooseAdapter builds system
     // prompt from DB settings, manages history, handles MCP tools internally).
@@ -632,14 +623,28 @@ async fn chat_stream(
             }
         }
 
-        // Classify message for model role
-        let model_role = {
-            use pond_core::domain::model_role::ModelRole;
-            match classify_request(&req.message) {
-                ModelRole::Think => "think",
-                ModelRole::Task  => "task",
-                ModelRole::Chat  => "chat",
+        let model_role = "chat";
+
+        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
+        // Delegates to the ToolAgent port (injected via AppState). The same
+        // implementation serves both HTTP and CLI voice paths — no duplicate
+        // classifier logic. pond-api never calls pond-mcp-server directly.
+        let tool_context: Option<String> = if let Some(ref ta) = state.tool_agent {
+            let status = json!({"type": "status", "content": "Thinking..."}).to_string();
+            yield Ok(Event::default().data(status));
+            match ta.process(&req.message).await {
+                Ok(Some(augmented)) => {
+                    tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
+                    Some(augmented)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!(target: "giap::tool_agent", "classification error: {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         // Persist user message
@@ -659,9 +664,7 @@ async fn chat_stream(
         // If any role uses llamafile and the process is not responding, emit a
         // status event and wait up to 90 s before attempting to stream.
         {
-            let is_llamafile_role = settings.chat_provider == "llamafile"
-                || settings.think_provider.as_deref() == Some("llamafile")
-                || settings.task_provider.as_deref()  == Some("llamafile");
+            let is_llamafile_role = settings.chat_provider == "llamafile";
 
             if is_llamafile_role {
                 if let Some(manager) = &state.llamafile_manager {
@@ -696,23 +699,12 @@ async fn chat_stream(
         let usage_prompt_tokens: u32 = 0;
         let usage_completion_tokens: u32 = 0;
 
-        let model_name_for_done = match model_role {
-            "think" => settings
-                .think_model
-                .as_deref()
-                .unwrap_or(settings.chat_model.as_str())
-                .to_string(),
-            "task" => settings
-                .task_model
-                .as_deref()
-                .unwrap_or(settings.chat_model.as_str())
-                .to_string(),
-            _ => settings.chat_model.clone(),
-        };
+        let model_name_for_done = settings.chat_model.clone();
 
         use pond_core::domain::agent::AgentRequest;
+        let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
         let agent_req = AgentRequest {
-            message: req.message.clone(),
+            message: agent_message,
             session_id: session_id.clone(),
             model_role: model_role.to_string(),
         };
@@ -1093,12 +1085,11 @@ async fn update_settings(
         })?;
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
-    let provider_keys = ["chat_provider","chat_model","think_provider","think_model",
-                         "task_provider","task_model",
+    let provider_keys = ["chat_provider","chat_model","tool_model",
                          "active_whisper_model","active_tts_model"];
     if let Some(obj) = patch.as_object() {
         if obj.keys().any(|k| provider_keys.contains(&k.as_str())) {
-            rebuild_model_router(&state, &merged).await;
+            rebuild_llm_provider(&state, &merged).await;
 
             // Sync role fields → model_role_assignments (source of truth).
             // This ensures CLI `models list` and `/activate` see the same state
@@ -1106,8 +1097,6 @@ async fn update_settings(
             if let Some(repo) = &state.model_repo {
                 let role_map: &[(&str, &str, &str)] = &[
                     ("chat",  &merged.chat_provider,  &merged.chat_model),
-                    ("think", merged.think_provider.as_deref().unwrap_or(""), merged.think_model.as_deref().unwrap_or("")),
-                    ("task",  merged.task_provider.as_deref().unwrap_or(""),  merged.task_model.as_deref().unwrap_or("")),
                     ("asr",  "", &merged.active_whisper_model),
                     ("tts",  "", &merged.active_tts_model),
                 ];
@@ -1138,7 +1127,7 @@ async fn update_settings(
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
 /// Called whenever the user changes any provider/model assignment.
-async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
+async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
     use pond_adapters_llamafile::LlamafileProvider;
     use pond_adapters_ollama::OllamaProvider;
     #[allow(unused_imports)]
@@ -1209,28 +1198,12 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
 
     let chat = build_one(&effective_chat_provider, &effective_chat_model,
                          url, data_dir.clone(), max_tokens, temperature).await;
-    let think = if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-        build_one(tp, tm, url, data_dir.clone(), max_tokens, temperature).await
-    } else { chat.clone() };
-    let task  = if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-        build_one(tp, tm, url, data_dir, max_tokens, temperature).await
-    } else { chat.clone() };
-
-    // If any role uses llamafile, ensure the process is running before
-    // the new router goes live (so the first request doesn't time out).
-    let any_llamafile = effective_chat_provider == "llamafile"
-        || settings.think_provider.as_deref() == Some("llamafile")
-        || settings.task_provider.as_deref()  == Some("llamafile");
-
-    if any_llamafile {
+    // If chat uses llamafile, ensure the process is running before
+    // the new provider goes live (so the first request doesn't time out).
+    if effective_chat_provider == "llamafile" {
         if let Some(manager) = &state.llamafile_manager {
             tracing::info!("llamafile provider selected — ensuring server is running");
-            let model_hint = if effective_chat_provider == "llamafile" {
-                Some(effective_chat_model.as_str())
-            } else {
-                None
-            };
-            manager.ensure_started(model_hint).await;
+            manager.ensure_started(Some(effective_chat_model.as_str())).await;
         } else {
             tracing::warn!(
                 "llamafile provider selected but no LlamafileManager wired in AppState; \
@@ -1239,12 +1212,11 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
         }
     }
 
-    let new_router: Arc<dyn LlmProvider> = Arc::new(ModelRouter::new(chat, think, task));
-    *state.llm_provider.write().await = Some(new_router);
-    tracing::info!("ModelRouter hot-reloaded: chat={}/{} think={:?}/{:?} task={:?}/{:?}",
+    println!("[model-switch] hot-reloading LLM provider: {}/{}", effective_chat_provider, effective_chat_model);
+    *state.llm_provider.write().await = Some(chat);
+    println!("[model-switch] hot-reload complete: {}/{}", effective_chat_provider, effective_chat_model);
+    tracing::info!("LLM provider hot-reloaded: {}/{}",
         effective_chat_provider, effective_chat_model,
-        settings.think_provider, settings.think_model,
-        settings.task_provider, settings.task_model,
     );
 }
 
@@ -1282,15 +1254,8 @@ async fn get_active_roles(
             "model":    chat_model,
             "model_id": assignments.get("chat"),
         },
-        "think": {
-            "provider": settings.think_provider,
-            "model":    settings.think_model,
-            "model_id": assignments.get("think"),
-        },
-        "task":  {
-            "provider": settings.task_provider,
-            "model":    settings.task_model,
-            "model_id": assignments.get("task"),
+        "tool": {
+            "model": settings.tool_model,
         },
         "asr": { "model_id": assignments.get("asr") },
         "tts": { "model_id": assignments.get("tts") },
@@ -1706,14 +1671,7 @@ async fn activate_model(
             let _ = settings_repo.set_key("chat_model",    name.clone()).await;
             let _ = settings_repo.set_key("chat_provider", provider.to_string()).await;
         }
-        "think" => {
-            let _ = settings_repo.set_key("think_model",    name.clone()).await;
-            let _ = settings_repo.set_key("think_provider", provider.to_string()).await;
-        }
-        "task"  => {
-            let _ = settings_repo.set_key("task_model",    name.clone()).await;
-            let _ = settings_repo.set_key("task_provider", provider.to_string()).await;
-        }
+        "tool"  => { let _ = settings_repo.set_key("tool_model", name.clone()).await; }
         "asr"   => { let _ = settings_repo.set_key("active_whisper_model", name.clone()).await; }
         "tts"   => { let _ = settings_repo.set_key("active_tts_model",     name.clone()).await; }
         _       => {}
@@ -1722,7 +1680,7 @@ async fn activate_model(
     // Hot-rebuild the ModelRouter for LLM roles using the existing helper
     if matches!(role.as_str(), "chat" | "think" | "task") {
         let settings = state.settings_repo.get().await.unwrap_or_default();
-        rebuild_model_router(&state, &settings).await;
+        rebuild_llm_provider(&state, &settings).await;
     }
 
     Ok(Json(json!({"role": role, "model_id": model_id})))

@@ -43,7 +43,7 @@ impl Database {
         .pragma("mmap_size", "33554432");   // 32MB mmap — friendly to ARM flash
 
         Ok(SqlitePoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect_with(opts)
             .await?)
     }
