@@ -37,10 +37,9 @@ describe("desktopState", () => {
   });
 
   it("DESKTOP_SECTIONS is a flat ordered list of all 12 sidebar items", () => {
-    // 12 = the original 11 (dashboard, chat, devices, schedules, memory, skills,
-    // models, prompts, settings, agent, logs) plus the new `faces` entry that
-    // sits in the CONFIGURE group between Prompts and Settings.
-    expect(DESKTOP_SECTIONS).toHaveLength(12);
+    // 13 = dashboard, chat, canvas, devices, schedules, memory, skills,
+    // models, prompts, faces, settings, agent, logs.
+    expect(DESKTOP_SECTIONS).toHaveLength(13);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
     const sectionKeys = DESKTOP_SECTIONS.map((s) => s.section);

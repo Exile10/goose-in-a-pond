@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod answer_reviewer;
 pub mod event_log;
 pub mod model_catalog_provider;
 pub mod model_downloader;
@@ -27,6 +28,8 @@ pub mod sensor_storage;
 pub mod session_storage;
 pub mod settings;
 pub mod skill;
+pub mod tool_agent;
+pub mod tool_caller;
 pub mod onboarding;
 pub mod voice_input;
 pub mod voice_output;

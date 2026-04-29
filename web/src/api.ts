@@ -182,10 +182,7 @@ export interface Settings {
   // Model role assignments
   chat_provider:  string
   chat_model:     string
-  think_provider: string | null
-  think_model:    string | null
-  task_provider:  string | null
-  task_model:     string | null
+  tool_model:     string | null
 }
 
 // ── Agent data types ──────────────────────────────────────────────────────────
@@ -504,6 +501,10 @@ export const api = {
   /** List llamafile releases from GitHub */
   searchLlamafileModels: (q: string, token: string) =>
     getReq<{ models: LlamafileAsset[]; error?: string }>(`/models/search/llamafile?q=${encodeURIComponent(q)}`, token),
+
+  /** Get runtime capabilities of the active model */
+  getModelCapabilities: (token: string) =>
+    getReq<{ thinking: boolean; vision: boolean; audio_input: boolean; context_window_tokens: number; structured_output: boolean }>('/models/capabilities', token),
 
   /** Get current RAM usage and loaded model info */
   getMemoryStatus: (token: string) =>

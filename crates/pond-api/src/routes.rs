@@ -29,9 +29,8 @@ use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext};
 use pond_core::ports::provider::LlmProvider;
 use pond_core::services::chat::ChatService;
-use pond_core::services::model_router::ModelRouter;
 use pond_core::services::onboarding::OnboardingService;
-use pond_core::services::request_classifier::classify_request;
+// Tool classification is handled by the ToolAgent port (injected via AppState).
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -89,6 +88,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
+        .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/memory-status", get(get_memory_status))
         .route("/models/active-roles", get(get_active_roles))
         .route("/models/registry/refresh", post(refresh_model_registry))
@@ -305,6 +305,9 @@ async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 struct ChatRequest {
     session_id: Option<String>,
     message: String,
+    /// Optional image attachments for multimodal models (base64-encoded).
+    #[serde(default)]
+    images: Vec<pond_core::domain::message::ImageAttachment>,
 }
 
 /// Send a message and get a response.
@@ -338,15 +341,7 @@ async fn chat(
             })?;
     }
 
-    // Classify the message to determine which model role will handle it
-    let model_role = {
-        use pond_core::domain::model_role::ModelRole;
-        match classify_request(&req.message) {
-            ModelRole::Think => "think",
-            ModelRole::Task  => "task",
-            ModelRole::Chat  => "chat",
-        }
-    };
+    let model_role = "chat";
 
     // Build ChatService — agent is always primary (GooseAdapter builds system
     // prompt from DB settings, manages history, handles MCP tools internally).
@@ -522,11 +517,15 @@ async fn chat_stream(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     use futures::StreamExt;
     use pond_core::ports::agent::AgentStreamEvent;
+    let permit = state.sse_semaphore.clone().try_acquire_owned().map_err(|_| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"})))
+    })?;
     let Json(req) = body.map_err(|e| {
         (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
     })?;
 
     let stream = async_stream::stream! {
+        let _permit = permit;
         let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let storage = &state.session_storage;
 
@@ -559,10 +558,10 @@ async fn chat_stream(
                 None
             };
 
-            let file_template = state
-                .prompt_template_dir
-                .as_ref()
-                .and_then(|dir| std::fs::read_to_string(dir.join("system.md")).ok());
+            let file_template = match state.prompt_template_dir.as_ref() {
+                Some(dir) => tokio::fs::read_to_string(dir.join("system.md")).await.ok(),
+                None => None,
+            };
 
             match file_template {
                 Some(tmpl) => {
@@ -628,14 +627,28 @@ async fn chat_stream(
             }
         }
 
-        // Classify message for model role
-        let model_role = {
-            use pond_core::domain::model_role::ModelRole;
-            match classify_request(&req.message) {
-                ModelRole::Think => "think",
-                ModelRole::Task  => "task",
-                ModelRole::Chat  => "chat",
+        let model_role = "chat";
+
+        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
+        // Delegates to the ToolAgent port (injected via AppState). The same
+        // implementation serves both HTTP and CLI voice paths — no duplicate
+        // classifier logic. pond-api never calls pond-mcp-server directly.
+        let tool_context: Option<String> = if let Some(ref ta) = state.tool_agent {
+            let status = json!({"type": "status", "content": "Thinking..."}).to_string();
+            yield Ok(Event::default().data(status));
+            match ta.process(&req.message).await {
+                Ok(Some(augmented)) => {
+                    tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
+                    Some(augmented)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!(target: "giap::tool_agent", "classification error: {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         // Persist user message
@@ -655,9 +668,7 @@ async fn chat_stream(
         // If any role uses llamafile and the process is not responding, emit a
         // status event and wait up to 90 s before attempting to stream.
         {
-            let is_llamafile_role = settings.chat_provider == "llamafile"
-                || settings.think_provider.as_deref() == Some("llamafile")
-                || settings.task_provider.as_deref()  == Some("llamafile");
+            let is_llamafile_role = settings.chat_provider == "llamafile";
 
             if is_llamafile_role {
                 if let Some(manager) = &state.llamafile_manager {
@@ -692,39 +703,28 @@ async fn chat_stream(
         let usage_prompt_tokens: u32 = 0;
         let usage_completion_tokens: u32 = 0;
 
-        let model_name_for_done = match model_role {
-            "think" => settings
-                .think_model
-                .as_deref()
-                .unwrap_or(settings.chat_model.as_str())
-                .to_string(),
-            "task" => settings
-                .task_model
-                .as_deref()
-                .unwrap_or(settings.chat_model.as_str())
-                .to_string(),
-            _ => settings.chat_model.clone(),
-        };
+        let model_name_for_done = settings.chat_model.clone();
 
         use pond_core::domain::agent::AgentRequest;
+        // Keep a reference to tool context for the reviewer (needs it to evaluate answer quality)
+        let tool_context_for_review = tool_context.clone();
+        let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
         let agent_req = AgentRequest {
-            message: req.message.clone(),
+            message: agent_message,
             session_id: session_id.clone(),
             model_role: model_role.to_string(),
+            images: req.images.clone(),
         };
 
         let mut full_text = String::new();
-        // Two-stage stream filter:
-        //   1. `filter_thinking` strips `<think>…</think>` reasoning blocks
-        //      that some open-source models (Qwen-think, DeepSeek-R1) emit
-        //      around their chain-of-thought.
-        //   2. `ThoughtFilter` strips Harmony-channel preambles
-        //      (`<|channel>thought … <channel|>`) and `<|tool_call> …
-        //      <tool_call|>` envelopes that Gemma-4 / gpt-oss emit.
-        // Both filters are needed: they catch different markup conventions
-        // and a single chat may use either depending on the active model.
-        let mut in_think_block = false;
-        let mut thought = crate::thought_filter::ThoughtFilter::new();
+        // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
+        // preambles and `<think>…</think>` blocks out of the per-token stream.
+        // When show_thinking is enabled, capture thinking blocks as SSE events.
+        let mut thought = if settings.show_thinking {
+            crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
+        } else {
+            crate::thought_filter::ThoughtFilter::new()
+        };
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -741,6 +741,9 @@ async fn chat_stream(
                         AgentStreamEvent::Status { content } => {
                             Some(json!({"type": "status", "content": content}).to_string())
                         }
+                        AgentStreamEvent::Thinking { content } => {
+                            Some(json!({"type": "thinking", "content": content}).to_string())
+                        }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
                             Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                         }
@@ -748,22 +751,19 @@ async fn chat_stream(
                             Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
                         }
                         AgentStreamEvent::Text { content } => {
-                            // Stage 1: <think>…</think> stripping.
-                            let (post_think, next_state) =
-                                pond_core::services::chat::filter_thinking(&content, in_think_block);
-                            in_think_block = next_state;
-                            if post_think.is_empty() {
+                            let visible = thought.push(&content);
+                            if visible.is_empty() {
                                 None
                             } else {
-                                // Stage 2: Harmony channel + tool_call stripping.
-                                let visible = thought.push(&post_think);
-                                if visible.is_empty() {
-                                    None
-                                } else {
-                                    full_text.push_str(&visible);
-                                    Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                                }
+                                full_text.push_str(&visible);
+                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
                             }
+                        }
+                        AgentStreamEvent::ReviewStatus { content } => {
+                            Some(json!({"type": "review_status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                         }
                         AgentStreamEvent::Done { .. } => {
                             // Handled at the end of the loop
@@ -774,6 +774,11 @@ async fn chat_stream(
                         }
                     };
                     if let Some(data) = maybe_data {
+                        yield Ok(Event::default().data(data));
+                    }
+                    // Emit captured thinking blocks as SSE events (when show_thinking is on)
+                    for thinking_content in thought.take_thinking() {
+                        let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok(Event::default().data(data));
                     }
                     // After every push the filter may have captured a complete
@@ -814,7 +819,56 @@ async fn chat_stream(
             yield Ok(Event::default().data(data));
         }
 
-        // Persist full assistant response
+        // ── Adversarial answer review (post-inference) ───────────────
+        // When review_mode is "on" or "auto", evaluate the answer before
+        // persisting. If the reviewer rejects it, revise and emit a
+        // review_revision event that the frontend uses to replace the text.
+        {
+            let should_review = match settings.review_mode.as_str() {
+                "on" => true,
+                "auto" => {
+                    // Review factual/analytical questions or tool-augmented answers
+                    use pond_core::services::request_classifier::classify_request;
+                    use pond_core::domain::model_role::ModelRole;
+                    let role = classify_request(&req.message);
+                    role == ModelRole::Think || tool_context_for_review.is_some()
+                }
+                _ => false,
+            };
+
+            if should_review {
+                if let Some(ref reviewer) = state.answer_reviewer {
+                    let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
+                    yield Ok(Event::default().data(status));
+
+                    let tool_ctx = tool_context_for_review.as_deref();
+                    match reviewer.review(&req.message, &full_text, tool_ctx).await {
+                        Ok(result) if result.was_revised => {
+                            full_text = result.final_answer.clone();
+                            let data = json!({
+                                "type": "review_revision",
+                                "content": result.final_answer,
+                                "score": result.verdict.score,
+                                "rounds": result.rounds,
+                            }).to_string();
+                            yield Ok(Event::default().data(data));
+                        }
+                        Ok(result) => {
+                            let status = json!({
+                                "type": "review_status",
+                                "content": format!("Answer verified (score: {}/5)", result.verdict.score),
+                            }).to_string();
+                            yield Ok(Event::default().data(status));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Answer review failed (non-fatal): {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist full assistant response (uses revised text if review triggered revision)
         {
             use pond_core::domain::message::ChatMessage;
             use pond_core::domain::session::SessionMessage;
@@ -911,19 +965,35 @@ async fn rename_session(
     })))
 }
 
-/// Get all messages for a session.
+/// Get messages for a session (paginated).
 ///
-/// GET /api/v1/sessions/:session_id/messages
+/// GET /api/v1/sessions/:session_id/messages?limit=100&offset=0
+///
+/// Query params (optional):
+/// - `limit`:  max messages to return (default 100, capped at 500)
+/// - `offset`: skip this many oldest messages (default 0)
+///
+/// When called without params, returns the 100 most recent messages — enough
+/// for the UI to render a session without loading the full history into RAM.
 async fn get_session_messages(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     use pond_core::domain::message::Role;
     use pond_core::ports::session_storage::SessionStorageError;
 
+    let limit: usize = params.get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(500);
+    let offset: usize = params.get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let messages = state
         .session_storage
-        .get_messages(&session_id)
+        .get_messages_paginated(&session_id, limit, offset)
         .await
         .map_err(|e| {
             let status = match &e {
@@ -1090,12 +1160,11 @@ async fn update_settings(
         })?;
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
-    let provider_keys = ["chat_provider","chat_model","think_provider","think_model",
-                         "task_provider","task_model",
+    let provider_keys = ["chat_provider","chat_model","tool_model",
                          "active_whisper_model","active_tts_model"];
     if let Some(obj) = patch.as_object() {
         if obj.keys().any(|k| provider_keys.contains(&k.as_str())) {
-            rebuild_model_router(&state, &merged).await;
+            rebuild_llm_provider(&state, &merged).await;
 
             // Sync role fields → model_role_assignments (source of truth).
             // This ensures CLI `models list` and `/activate` see the same state
@@ -1103,8 +1172,6 @@ async fn update_settings(
             if let Some(repo) = &state.model_repo {
                 let role_map: &[(&str, &str, &str)] = &[
                     ("chat",  &merged.chat_provider,  &merged.chat_model),
-                    ("think", merged.think_provider.as_deref().unwrap_or(""), merged.think_model.as_deref().unwrap_or("")),
-                    ("task",  merged.task_provider.as_deref().unwrap_or(""),  merged.task_model.as_deref().unwrap_or("")),
                     ("asr",  "", &merged.active_whisper_model),
                     ("tts",  "", &merged.active_tts_model),
                 ];
@@ -1135,7 +1202,7 @@ async fn update_settings(
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
 /// Called whenever the user changes any provider/model assignment.
-async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
+async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
     use pond_adapters_llamafile::LlamafileProvider;
     use pond_adapters_ollama::OllamaProvider;
     #[allow(unused_imports)]
@@ -1206,28 +1273,12 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
 
     let chat = build_one(&effective_chat_provider, &effective_chat_model,
                          url, data_dir.clone(), max_tokens, temperature).await;
-    let think = if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-        build_one(tp, tm, url, data_dir.clone(), max_tokens, temperature).await
-    } else { chat.clone() };
-    let task  = if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-        build_one(tp, tm, url, data_dir, max_tokens, temperature).await
-    } else { chat.clone() };
-
-    // If any role uses llamafile, ensure the process is running before
-    // the new router goes live (so the first request doesn't time out).
-    let any_llamafile = effective_chat_provider == "llamafile"
-        || settings.think_provider.as_deref() == Some("llamafile")
-        || settings.task_provider.as_deref()  == Some("llamafile");
-
-    if any_llamafile {
+    // If chat uses llamafile, ensure the process is running before
+    // the new provider goes live (so the first request doesn't time out).
+    if effective_chat_provider == "llamafile" {
         if let Some(manager) = &state.llamafile_manager {
             tracing::info!("llamafile provider selected — ensuring server is running");
-            let model_hint = if effective_chat_provider == "llamafile" {
-                Some(effective_chat_model.as_str())
-            } else {
-                None
-            };
-            manager.ensure_started(model_hint).await;
+            manager.ensure_started(Some(effective_chat_model.as_str())).await;
         } else {
             tracing::warn!(
                 "llamafile provider selected but no LlamafileManager wired in AppState; \
@@ -1236,16 +1287,23 @@ async fn rebuild_model_router(state: &Arc<AppState>, settings: &Settings) {
         }
     }
 
-    let new_router: Arc<dyn LlmProvider> = Arc::new(ModelRouter::new(chat, think, task));
-    *state.llm_provider.write().await = Some(new_router);
-    tracing::info!("ModelRouter hot-reloaded: chat={}/{} think={:?}/{:?} task={:?}/{:?}",
+    println!("[model-switch] hot-reloading LLM provider: {}/{}", effective_chat_provider, effective_chat_model);
+    *state.llm_provider.write().await = Some(chat);
+    println!("[model-switch] hot-reload complete: {}/{}", effective_chat_provider, effective_chat_model);
+    tracing::info!("LLM provider hot-reloaded: {}/{}",
         effective_chat_provider, effective_chat_model,
-        settings.think_provider, settings.think_model,
-        settings.task_provider, settings.task_model,
     );
 }
 
 // ── Model registry handlers ───────────────────────────────────────────────────
+
+/// GET /api/v1/models/capabilities — returns the active model's runtime capabilities.
+async fn get_model_capabilities(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let caps = state.agent.capabilities();
+    Json(serde_json::to_value(caps).unwrap_or_default())
+}
 
 /// GET /api/v1/models/active-roles — returns the provider+model currently wired for each role.
 ///
@@ -1279,15 +1337,8 @@ async fn get_active_roles(
             "model":    chat_model,
             "model_id": assignments.get("chat"),
         },
-        "think": {
-            "provider": settings.think_provider,
-            "model":    settings.think_model,
-            "model_id": assignments.get("think"),
-        },
-        "task":  {
-            "provider": settings.task_provider,
-            "model":    settings.task_model,
-            "model_id": assignments.get("task"),
+        "tool": {
+            "model": settings.tool_model,
         },
         "asr": { "model_id": assignments.get("asr") },
         "tts": { "model_id": assignments.get("tts") },
@@ -1348,62 +1399,67 @@ async fn scan_filesystem_extras(
         .filter_map(|m| m.filename.clone())
         .collect();
 
-    let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&'static str]|
-        -> Vec<ModelRecord>
-    {
-        let mut found = vec![];
-        let Ok(rd) = std::fs::read_dir(&dir) else { return found };
-        for entry in rd.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
-            if known_filenames.contains(&fname) { continue; }
-            let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
-            let name = fname
-                .trim_end_matches(".gguf")
-                .trim_end_matches(".llamafile")
-                .trim_end_matches(".onnx")
-                .trim_end_matches(".bin")
-                .to_string();
-            found.push(ModelRecord {
-                id:              ModelRecord::id_for(&category, &name),
-                category:        category.clone(),
-                name,
-                filename:        Some(fname),
-                description:     "(detected on disk)".to_string(),
-                size_mb,
-                url:             None,
-                hf_id:           None,
-                ram_estimate_mb: None,
-                recommended_role: None,
-                context_length:  None,
-                quantization:    None,
-                asr_language:    None,
-                asr_size:        None,
-                tts_engine:      None,
-                tts_voice_name:  None,
-                config_filename: None,
-                config_url:      None,
-                tts_url:         None,
-                sample_rate:     None,
-                downloaded:      true,
-                is_custom:       true,
-            });
-        }
-        found
-    };
+    let data_dir_owned = data_dir.to_path_buf();
+    let known = known_filenames;
+    let extras_from_disk = tokio::task::spawn_blocking(move || {
+        let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]|
+            -> Vec<ModelRecord>
+        {
+            let mut found = vec![];
+            let Ok(rd) = std::fs::read_dir(&dir) else { return found };
+            for entry in rd.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
+                if known.contains(&fname) { continue; }
+                let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+                let name = fname
+                    .trim_end_matches(".gguf")
+                    .trim_end_matches(".llamafile")
+                    .trim_end_matches(".onnx")
+                    .trim_end_matches(".bin")
+                    .to_string();
+                found.push(ModelRecord {
+                    id:              ModelRecord::id_for(&category, &name),
+                    category:        category.clone(),
+                    name,
+                    filename:        Some(fname),
+                    description:     "(detected on disk)".to_string(),
+                    size_mb,
+                    url:             None,
+                    hf_id:           None,
+                    ram_estimate_mb: None,
+                    recommended_role: None,
+                    context_length:  None,
+                    quantization:    None,
+                    asr_language:    None,
+                    asr_size:        None,
+                    tts_engine:      None,
+                    tts_voice_name:  None,
+                    config_filename: None,
+                    config_url:      None,
+                    tts_url:         None,
+                    sample_rate:     None,
+                    downloaded:      true,
+                    is_custom:       true,
+                });
+            }
+            found
+        };
 
-    let mut extras = vec![];
-    extras.extend(scan_dir(data_dir.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
-    extras.extend(scan_dir(data_dir.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
-    extras.extend(scan_dir(data_dir.join("models"),               ModelCategory::Whisper,   &[".bin"]));
-    extras.extend(scan_dir(data_dir.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+        let mut extras = vec![];
+        extras.extend(scan_dir(data_dir_owned.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
+        extras.extend(scan_dir(data_dir_owned.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
+        extras.extend(scan_dir(data_dir_owned.join("models"),               ModelCategory::Whisper,   &[".bin"]));
+        extras.extend(scan_dir(data_dir_owned.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+        extras
+    }).await.unwrap_or_default();
 
     // Persist newly discovered models to the catalog
-    for m in &extras {
+    for m in &extras_from_disk {
         let _ = model_repo.upsert(m).await;
     }
 
-    extras
+    extras_from_disk
 }
 
 /// GET /api/v1/models — returns all catalog models with downloaded/active flags.
@@ -1505,10 +1561,20 @@ async fn refresh_model_registry(
 }
 
 /// GET /api/v1/models/download/progress — return all active/recent downloads.
+///
+/// Also evicts entries that finished more than 5 minutes ago to prevent
+/// unbounded growth of the in-memory tracker over long server uptimes.
 async fn get_download_progress(
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
-    let tracker = state.download_tracker.read().await;
+    let mut tracker = state.download_tracker.write().await;
+    let now = std::time::Instant::now();
+    tracker.retain(|_, e| {
+        match e.finished_at {
+            Some(t) => now.duration_since(t) < std::time::Duration::from_secs(300),
+            None => true, // still in progress — keep
+        }
+    });
     let entries: Vec<&DownloadEntry> = tracker.values().collect();
     Json(json!({"downloads": entries}))
 }
@@ -1554,11 +1620,12 @@ async fn download_model(
     };
 
     let tracker     = Arc::clone(&state.download_tracker);
+    let dl_client   = state.http_client.clone();
     let dl_filename = filename.clone();
     let dl_category = category.clone();
 
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, async move {
+        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, dl_client, async move {
             let _ = model_repo.set_downloaded(&model_id, true).await;
         }).await;
     });
@@ -1608,7 +1675,7 @@ async fn delete_model(
             ModelCategory::Ollama    => data_dir.join("models").join(filename),
         };
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
+            tokio::fs::remove_file(&path).await.map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete file: {e}")})))
             })?;
         }
@@ -1687,14 +1754,7 @@ async fn activate_model(
             let _ = settings_repo.set_key("chat_model",    name.clone()).await;
             let _ = settings_repo.set_key("chat_provider", provider.to_string()).await;
         }
-        "think" => {
-            let _ = settings_repo.set_key("think_model",    name.clone()).await;
-            let _ = settings_repo.set_key("think_provider", provider.to_string()).await;
-        }
-        "task"  => {
-            let _ = settings_repo.set_key("task_model",    name.clone()).await;
-            let _ = settings_repo.set_key("task_provider", provider.to_string()).await;
-        }
+        "tool"  => { let _ = settings_repo.set_key("tool_model", name.clone()).await; }
         "asr"   => { let _ = settings_repo.set_key("active_whisper_model", name.clone()).await; }
         "tts"   => { let _ = settings_repo.set_key("active_tts_model",     name.clone()).await; }
         _       => {}
@@ -1703,7 +1763,7 @@ async fn activate_model(
     // Hot-rebuild the ModelRouter for LLM roles using the existing helper
     if matches!(role.as_str(), "chat" | "think" | "task") {
         let settings = state.settings_repo.get().await.unwrap_or_default();
-        rebuild_model_router(&state, &settings).await;
+        rebuild_llm_provider(&state, &settings).await;
     }
 
     Ok(Json(json!({"role": role, "model_id": model_id})))
@@ -1711,12 +1771,13 @@ async fn activate_model(
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
 /// Returns `{"models": [...]}` or `{"models": [], "error": "..."}` if Ollama is unreachable.
-async fn list_ollama_models() -> Json<Value> {
-    let client = reqwest::Client::builder()
+async fn list_ollama_models(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let client = &state.http_client;
+    match client.get("http://localhost:11434/api/tags")
         .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-    match client.get("http://localhost:11434/api/tags").send().await {
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({"models": []}));
             Json(body)
@@ -1751,6 +1812,7 @@ async fn pull_ollama_model(
 
 /// GET /api/v1/models/search/gguf?q=<query> — proxy HuggingFace API for GGUF models.
 async fn search_gguf_models(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
@@ -1758,12 +1820,11 @@ async fn search_gguf_models(
         "https://huggingface.co/api/models?filter=gguf&search={}&limit=20&sort=downloads&direction=-1",
         urlencoding::encode(q)
     );
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(&url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let models: Vec<Value> = resp.json().await.unwrap_or_default();
             // Return a simplified shape: id, downloads, likes, tags
@@ -1783,16 +1844,16 @@ async fn search_gguf_models(
 
 /// GET /api/v1/models/search/llamafile?q=<query> — list llamafile releases from GitHub.
 async fn search_llamafile_models(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let q = params.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let releases: Vec<Value> = resp.json().await.unwrap_or_default();
             let mut assets: Vec<Value> = Vec::new();
@@ -1826,6 +1887,7 @@ async fn search_llamafile_models(
 
 /// GET /api/v1/models/search/gguf/files?repo=<owner/name> — list .gguf files inside a HF repo.
 async fn list_hf_model_files(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let repo = match params.get("repo") {
@@ -1835,12 +1897,11 @@ async fn list_hf_model_files(
     // Do NOT percent-encode the repo — HF expects the literal owner/name path segment
     // (urlencoding::encode would turn '/' into '%2F' which returns 400)
     let url = format!("https://huggingface.co/api/models/{}", repo);
-    let client = reqwest::Client::builder()
+    let client = &state.http_client;
+    match client.get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_default();
-    match client.get(&url).send().await {
+        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+        .send().await {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
             let files: Vec<Value> = meta["siblings"]
@@ -1908,8 +1969,9 @@ async fn download_model_from_url(
     let resp_filename = filename.clone();
     let resp_category = category.clone();
 
+    let dl_client = state.http_client.clone();
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, filename, category, tracker, async {}).await;
+        spawn_tracked_download(url, dest, filename, category, tracker, dl_client, async {}).await;
     });
 
     (StatusCode::ACCEPTED, Json(json!({"status": "downloading", "filename": resp_filename, "category": resp_category})))
@@ -1924,6 +1986,7 @@ async fn spawn_tracked_download<F>(
     filename: String,
     category: String,
     tracker:  Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    client:   reqwest::Client,
     on_done:  F,
 ) where F: std::future::Future<Output = ()> + Send {
     use tokio::io::AsyncWriteExt;
@@ -1937,17 +2000,13 @@ async fn spawn_tracked_download<F>(
             downloaded_bytes: 0,
             total_bytes:      None,
             status:           "downloading".to_string(),
+            finished_at:      None,
         });
     }
 
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(7200))
-        .build()
-        .unwrap_or_default();
 
     tracing::info!("Downloading {} from {}", filename, url);
 
@@ -1990,6 +2049,7 @@ async fn spawn_tracked_download<F>(
                 let mut t = tracker.write().await;
                 if let Some(e) = t.get_mut(&filename) {
                     e.status = "done".to_string();
+                    e.finished_at = Some(std::time::Instant::now());
                 }
             }
             on_done.await;
@@ -1999,6 +2059,7 @@ async fn spawn_tracked_download<F>(
             let mut t = tracker.write().await;
             if let Some(e) = t.get_mut(&filename) {
                 e.status = "error".to_string();
+                e.finished_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -3698,6 +3759,13 @@ async fn agent_chat_stream(
     use pond_core::ports::agent::AgentStreamEvent;
     use futures::stream::StreamExt;
 
+    let permit = match state.sse_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"}))).into_response();
+        }
+    };
+
     let body = match body {
         Ok(b) => b.0,
         Err(e) => {
@@ -3714,13 +3782,14 @@ async fn agent_chat_stream(
     let agent = state.agent.clone();
 
     let stream = async_stream::stream! {
+        let _permit = permit;
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
             model_role: "task".to_string(),
+            images: Vec::new(),
         };
 
-        let mut in_think_block = false; // filter <think> blocks
         let mut agent_stream = match agent.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => {
@@ -3740,6 +3809,9 @@ async fn agent_chat_stream(
                         AgentStreamEvent::Status { content } => {
                             Some(json!({"type": "status", "content": content}).to_string())
                         }
+                        AgentStreamEvent::Thinking { content } => {
+                            Some(json!({"type": "thinking", "content": content}).to_string())
+                        }
                         AgentStreamEvent::ToolCall { tool, id, input } => {
                             Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                         }
@@ -3747,24 +3819,18 @@ async fn agent_chat_stream(
                             Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
                         }
                         AgentStreamEvent::Text { content } => {
-                            // Same two-stage filter as chat_stream above:
-                            // strip <think>…</think> first, then Harmony
-                            // markup. See the comment by the declarations
-                            // of `in_think_block` + `thought` for why
-                            // both are needed.
-                            let (post_think, next_state) =
-                                pond_core::services::chat::filter_thinking(&content, in_think_block);
-                            in_think_block = next_state;
-                            if post_think.is_empty() {
+                            let visible = thought.push(&content);
+                            if visible.is_empty() {
                                 None
                             } else {
-                                let visible = thought.push(&post_think);
-                                if visible.is_empty() {
-                                    None
-                                } else {
-                                    Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                                }
+                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
                             }
+                        }
+                        AgentStreamEvent::ReviewStatus { content } => {
+                            Some(json!({"type": "review_status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                         }
                         AgentStreamEvent::Done { .. } => {
                             Some(json!({"done": true, "session_id": session_id.clone()}).to_string())
@@ -3774,6 +3840,11 @@ async fn agent_chat_stream(
                         }
                     };
                     if let Some(data) = maybe_data {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                    }
+                    // Emit thinking blocks captured by the filter
+                    for thinking_content in thought.take_thinking() {
+                        let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // See chat_stream for rationale — surface Harmony-format
@@ -4648,37 +4719,40 @@ async fn list_face_models_handler(
         .as_ref()
         .map(|d| d.join("models").join("face"));
 
-    fn describe(dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str) -> Value {
-        let path = dir.as_ref().map(|d| d.join(name));
-        let (downloaded, size_mb) = match &path {
-            Some(p) => match std::fs::metadata(p) {
-                Ok(md) => (true, Some(md.len() / 1_048_576)),
-                Err(_) => (false, None),
-            },
-            None => (false, None),
+    let dir_clone = dir.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let describe = |dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str| -> Value {
+            let path = dir.as_ref().map(|d| d.join(name));
+            let (downloaded, size_mb) = match &path {
+                Some(p) => match std::fs::metadata(p) {
+                    Ok(md) => (true, Some(md.len() / 1_048_576)),
+                    Err(_) => (false, None),
+                },
+                None => (false, None),
+            };
+            json!({
+                "name": name,
+                "label": label,
+                "role": role,
+                "expected_mb": expected_mb,
+                "size_mb": size_mb,
+                "downloaded": downloaded,
+                "path": path.as_ref().map(|p| p.display().to_string()),
+            })
         };
-        json!({
-            "name": name,
-            "label": label,
-            "role": role,
-            "expected_mb": expected_mb,
-            "size_mb": size_mb,
-            "downloaded": downloaded,
-            "path": path.as_ref().map(|p| p.display().to_string()),
-        })
-    }
 
-    let entries = vec![
-        // Embedder slot — preferred + fallback.
-        describe(&dir, "adaface_ir101.onnx", "AdaFace IR-101 (preferred)", 250, "embedding"),
-        describe(&dir, "w600k_r50.onnx",     "ArcFace R50 (fallback)",     174, "embedding"),
-        // Detector slot — preferred + fallback.
-        describe(&dir, "scrfd_34g.onnx",     "SCRFD 34G (preferred)",      140, "detector"),
-        describe(&dir, "scrfd.onnx",         "SCRFD 10G (fallback)",        17, "detector"),
-        // Anti-spoof ensemble.
-        describe(&dir, "antispoof.onnx",     "Silent-Face V2 (primary PAD)",  2, "antispoof"),
-        describe(&dir, "OULU_Protocol_2_model_0_0.onnx", "DeepPixBis OULU-NPU (secondary PAD)", 13, "antispoof"),
-    ];
+        vec![
+            // Embedder slot — preferred + fallback.
+            describe(&dir_clone, "adaface_ir101.onnx", "AdaFace IR-101 (preferred)", 250, "embedding"),
+            describe(&dir_clone, "w600k_r50.onnx",     "ArcFace R50 (fallback)",     174, "embedding"),
+            // Detector slot — preferred + fallback.
+            describe(&dir_clone, "scrfd_34g.onnx",     "SCRFD 34G (preferred)",      140, "detector"),
+            describe(&dir_clone, "scrfd.onnx",         "SCRFD 10G (fallback)",        17, "detector"),
+            // Anti-spoof ensemble.
+            describe(&dir_clone, "antispoof.onnx",     "Silent-Face V2 (primary PAD)",  2, "antispoof"),
+            describe(&dir_clone, "OULU_Protocol_2_model_0_0.onnx", "DeepPixBis OULU-NPU (secondary PAD)", 13, "antispoof"),
+        ]
+    }).await.unwrap_or_default();
 
     Json(json!({
         "feature_enabled": feature_enabled,

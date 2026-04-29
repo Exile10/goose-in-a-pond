@@ -209,6 +209,16 @@ pub struct AppState {
     /// restart); re-identification is cheap enough to redo each session.
     pub session_user_bindings:
         Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Limits concurrent SSE streams to prevent unbounded memory use from
+    /// stalled or abandoned clients. Acquired at the start of `chat_stream`
+    /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
+    pub sse_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Tool Agent — classifies messages, executes tools (Wikipedia, weather,
+    /// memory), and returns augmented context before the main LLM runs.
+    pub tool_agent: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>>,
+    /// Answer Reviewer — adversarial post-inference review that evaluates
+    /// answer quality and triggers revision when below threshold.
+    pub answer_reviewer: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.
@@ -220,6 +230,10 @@ pub struct DownloadEntry {
     pub total_bytes:      Option<u64>,
     /// "downloading" | "done" | "error"
     pub status:           String,
+    /// When the download finished (status became "done" or "error").
+    /// `None` while still downloading. Used to evict stale entries.
+    #[serde(skip)]
+    pub finished_at:      Option<std::time::Instant>,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.

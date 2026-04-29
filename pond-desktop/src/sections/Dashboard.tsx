@@ -46,6 +46,28 @@ export function Dashboard() {
   const state = useAppState();
   const dispatch = useAppDispatch();
 
+  /* Recent chat sessions */
+  const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
+  useEffect(() => {
+    if (!state.serverOnline || !state.sessionToken) return;
+    let cancelled = false;
+    api.listSessions()
+      .then((sessions) => {
+        if (cancelled) return;
+        const sorted = [...sessions]
+          .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+          .slice(0, 5);
+        setRecentSessions(sorted);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [state.serverOnline, state.sessionToken]);
+
+  function openSession(id: string) {
+    dispatch({ type: "SET_SESSION_ID", payload: id });
+    dispatch({ type: "SET_SECTION", payload: "chat" });
+  }
+
   /* VU meter animation state */
   const [vuLevel, setVuLevel] = useState(0);
 
@@ -87,50 +109,6 @@ export function Dashboard() {
     { label: "Think", variant: "warning", model: activeModel },
     { label: "Task", variant: "success", model: activeModel },
   ];
-
-  // Recent text-chat sessions. The voice transcript above only captures
-  // wake-word / mic conversations; the typed Chat section persists into
-  // the backend's session store. We pull the 5 most recent and render
-  // them as clickable items that take the user straight to chat.
-  const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
-  useEffect(() => {
-    // Wait for both the connection AND the handshake-issued bearer token —
-    // listSessions is gated by the auth middleware, so calling it before
-    // the token is set just produces a silent 401 and an empty Recents card.
-    if (!state.serverOnline || !state.sessionToken) return;
-    let cancelled = false;
-    api.listSessions()
-      .then((sessions) => {
-        if (cancelled) return;
-        const sorted = [...sessions]
-          .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
-          .slice(0, 5);
-        setRecentSessions(sorted);
-      })
-      .catch((err) => {
-        // Non-fatal — Recent card just stays hidden.
-        console.warn("Dashboard: listSessions failed:", err);
-      });
-    return () => { cancelled = true; };
-  }, [state.serverOnline, state.sessionToken]);
-
-  function openSession(id: string) {
-    dispatch({ type: "SET_SESSION_ID", payload: id });
-    dispatch({ type: "SET_SECTION", payload: "chat" });
-  }
-
-  function relativeTime(iso: string): string {
-    const then = Date.parse(iso);
-    if (Number.isNaN(then)) return "";
-    const diff = Date.now() - then;
-    const min = Math.round(diff / 60_000);
-    if (min < 1)  return "just now";
-    if (min < 60) return `${min} min ago`;
-    const h = Math.round(min / 60);
-    if (h < 24) return `${h} h ago`;
-    const d = Math.round(h / 24);
-    return `${d} day${d === 1 ? "" : "s"} ago`;
-  }
 
   return (
     <div className="screen">
@@ -387,54 +365,47 @@ export function Dashboard() {
         </CardContent>
       </Card>
 
-      {/* ── Recent conversations ───────────────────────────────
-       * Lists the 5 most-recent typed-chat sessions persisted in the
-       * backend's session store. Click a row to jump straight back into
-       * that conversation in the Chat section. Hidden until the server is
-       * online AND the handshake has issued a bearer token (gated to avoid
-       * silent 401s during the boot race). */}
+      {/* ── Recent conversations ─────────────────────────────── */}
       {state.serverOnline && recentSessions.length > 0 && (
         <Card shadow="none" className="giap-card">
           <CardContent>
             <div className="card-header" style={{ padding: 0, marginBottom: 10 }}>
               <span className="card__label">Recent conversations</span>
             </div>
-
-            <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               {recentSessions.map((s) => {
-                const title =
-                  s.title?.trim() ||
-                  `Conversation from ${new Date(s.created_at).toLocaleString(undefined, {
-                    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-                  })}`;
+                const ago = timeAgo(s.updated_at);
                 return (
-                  <li
+                  <button
                     key={s.id}
                     onClick={() => openSession(s.id)}
-                    role="button"
-                    aria-label={`Open ${title}`}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 10,
-                      padding: "8px 10px", borderRadius: "var(--radius-sm, 6px)",
-                      cursor: "pointer", transition: "background 120ms",
-                    }}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = "var(--grey-100, #f4f4f5)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    className="quick-action"
+                    style={{ textAlign: "left" }}
                   >
-                    <MessageSquare size={14} style={{ color: "var(--color-role-chat, #8c5cff)", flexShrink: 0 }} />
-                    <span style={{ flex: 1, minWidth: 0, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {title}
+                    <span className="quick-action__icon"><MessageSquare size={14} /></span>
+                    <span className="quick-action__label" style={{ flex: 1 }}>
+                      {s.title || `Session ${s.id.slice(0, 8)}`}
                     </span>
-                    <span style={{ fontSize: 11, color: "var(--grey-500, #71717a)", flexShrink: 0 }}>
-                      {relativeTime(s.updated_at)}
-                    </span>
-                  </li>
+                    <span style={{ fontSize: 11, color: "var(--grey-500)", whiteSpace: "nowrap" }}>{ago}</span>
+                    <ChevronRight size={14} className="quick-action__arrow" />
+                  </button>
                 );
               })}
-            </ul>
+            </div>
           </CardContent>
         </Card>
       )}
     </div>
   );
+}
+
+function timeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
 }

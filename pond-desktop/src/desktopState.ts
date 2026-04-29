@@ -12,6 +12,7 @@ export type GuiSection =
   | "settings"
   | "faces"
   | "agent"
+  | "canvas"
   | "logs";
 
 export const DESKTOP_MODES: DesktopMode[] = ["gui", "voice", "canvas"];
@@ -27,6 +28,7 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
     sections: [
       { section: "dashboard", label: "Dashboard", icon: "home" },
       { section: "chat",      label: "Chat",      icon: "chat" },
+      { section: "canvas",   label: "Canvas",   icon: "canvas" },
     ],
   },
   {
