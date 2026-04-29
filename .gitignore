@@ -40,3 +40,4 @@ llama.log
 .claude/
 .vscode/
 
+**/*.log
