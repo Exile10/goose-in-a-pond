@@ -1,14 +1,18 @@
 //! `CronSchedulerAdapter` — implements `SchedulerPort` via `tokio-cron-scheduler`.
 //!
-//! Task state (id, label, cron, payload, paused) is persisted to a JSON file
-//! so tasks survive process restarts.  The scheduler job map is rebuilt from
-//! the persisted state on startup.
+//! Task state (id, label, cron, kind, timezone, paused) is persisted to a JSON
+//! file so tasks survive process restarts.  The scheduler job map is rebuilt
+//! from the persisted state on startup.
+//!
+//! Execution history is stored in a separate JSON file via [`JsonRunHistory`].
 
-use crate::webhook_executor::TaskExecutor;
+use crate::run_history::JsonRunHistory;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::ports::scheduler::{CreateTaskRequest, ScheduledTask, SchedulerPort};
+use pond_core::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
+use pond_core::ports::schedule_execution::ScheduleExecutor;
+use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,8 +27,23 @@ struct PersistedTask {
     id: String,
     label: String,
     cron: String,
-    payload: serde_json::Value,
+    /// IANA timezone.  Defaults to "UTC" for legacy tasks.
+    #[serde(default = "default_timezone")]
+    timezone: String,
+    /// What the task does on each fire.
+    /// `None` for legacy tasks — migrated from `payload` during rehydration.
+    #[serde(default)]
+    kind: Option<TaskKind>,
+    /// Legacy field — kept for backward-compat deserialization.
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
     paused: bool,
+    #[serde(default)]
+    created_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 // ── In-memory state ───────────────────────────────────────────────────────────
@@ -33,6 +52,7 @@ struct TaskEntry {
     persisted: PersistedTask,
     job_id: uuid::Uuid,
     currently_running: bool,
+    last_run: Option<chrono::DateTime<Utc>>,
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
@@ -41,27 +61,32 @@ pub struct CronSchedulerAdapter {
     scheduler: JobScheduler,
     tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
     persist_path: PathBuf,
-    executor: Arc<dyn TaskExecutor>,
+    executor: Arc<dyn ScheduleExecutor>,
+    run_history: Arc<JsonRunHistory>,
 }
 
 impl CronSchedulerAdapter {
     /// Create (or rehydrate) the scheduler.
     ///
-    /// `persist_path` — path to the JSON file used to persist task definitions.
-    /// `executor`     — called on each job fire.
+    /// `persist_path`  — path to the JSON file used to persist task definitions.
+    /// `runs_path`     — path to the JSON file for execution history.
+    /// `executor`      — called on each job fire.
     pub async fn new(
         persist_path: PathBuf,
-        executor: Arc<dyn TaskExecutor>,
+        runs_path: PathBuf,
+        executor: Arc<dyn ScheduleExecutor>,
     ) -> Result<Self> {
         let scheduler = JobScheduler::new().await?;
         let tasks: Arc<Mutex<HashMap<String, TaskEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let run_history = Arc::new(JsonRunHistory::new(runs_path).await?);
 
         let adapter = Self {
             scheduler,
             tasks,
             persist_path,
             executor,
+            run_history,
         };
 
         // Rehydrate persisted tasks
@@ -96,29 +121,53 @@ impl CronSchedulerAdapter {
         let json = tokio::fs::read_to_string(&self.persist_path).await?;
         let records: Vec<PersistedTask> = serde_json::from_str(&json)?;
 
-        for record in records {
-            // Skip paused tasks — they won't be scheduled but we still keep them
-            // in memory so they can be resumed later.
+        let mut migrated = false;
+        for mut record in records {
+            // ── Backward-compatible migration ────────────────────────────
+            // Old tasks have `payload` but no `kind`.  Infer from payload.
+            if record.kind.is_none() {
+                record.kind = Some(migrate_kind_from_payload(&record));
+                migrated = true;
+            }
+            if record.created_at.is_none() {
+                record.created_at = Some(Utc::now());
+                migrated = true;
+            }
+
             if record.paused {
                 let mut guard = self.tasks.lock().await;
-                guard.insert(record.id.clone(), TaskEntry {
-                    persisted: record,
-                    job_id: uuid::Uuid::nil(),
-                    currently_running: false,
-                });
+                guard.insert(
+                    record.id.clone(),
+                    TaskEntry {
+                        persisted: record,
+                        job_id: uuid::Uuid::nil(),
+                        currently_running: false,
+                        last_run: None,
+                    },
+                );
                 continue;
             }
 
+            let kind = record.kind.clone().unwrap();
             let job_id = self
-                .add_job_to_scheduler(&record.id, &record.cron, record.payload.clone())
+                .add_job_to_scheduler(&record.id, &record.cron, kind)
                 .await?;
 
             let mut guard = self.tasks.lock().await;
-            guard.insert(record.id.clone(), TaskEntry {
-                persisted: record,
-                job_id,
-                currently_running: false,
-            });
+            guard.insert(
+                record.id.clone(),
+                TaskEntry {
+                    persisted: record,
+                    job_id,
+                    currently_running: false,
+                    last_run: None,
+                },
+            );
+        }
+
+        // Re-save if any tasks were migrated to the new format.
+        if migrated {
+            self.save().await?;
         }
 
         Ok(())
@@ -130,18 +179,21 @@ impl CronSchedulerAdapter {
         &self,
         task_id: &str,
         cron: &str,
-        payload: serde_json::Value,
+        kind: TaskKind,
     ) -> Result<uuid::Uuid> {
         let executor = self.executor.clone();
         let tasks = self.tasks.clone();
+        let run_history = self.run_history.clone();
         let id = task_id.to_string();
 
         let job = Job::new_async(cron, move |_uuid, _lock| {
             let executor = executor.clone();
             let tasks = tasks.clone();
+            let run_history = run_history.clone();
             let id = id.clone();
-            let payload = payload.clone();
+            let kind = kind.clone();
             Box::pin(async move {
+                // Mark running
                 {
                     let mut guard = tasks.lock().await;
                     if let Some(entry) = guard.get_mut(&id) {
@@ -149,15 +201,43 @@ impl CronSchedulerAdapter {
                     }
                 }
 
-                if let Err(e) = executor.execute(&id, payload).await {
-                    tracing::error!("Scheduled task {id} failed: {e}");
+                // Record run start
+                let run_id = run_history.record_start(&id).await;
+
+                // Execute
+                let result = executor.execute(&id, &kind).await;
+
+                // Record run finish
+                match &result {
+                    Ok(text) => {
+                        run_history
+                            .record_finish(
+                                &run_id,
+                                RunStatus::Completed,
+                                Some(text.clone()),
+                                None,
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Scheduled task {id} failed: {e}");
+                        run_history
+                            .record_finish(
+                                &run_id,
+                                RunStatus::Failed,
+                                None,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                    }
                 }
 
+                // Mark not-running, update last_run
                 {
                     let mut guard = tasks.lock().await;
                     if let Some(entry) = guard.get_mut(&id) {
                         entry.currently_running = false;
-                        entry.persisted.paused = false; // ensure not marked paused after run
+                        entry.last_run = Some(Utc::now());
                     }
                 }
             })
@@ -167,13 +247,58 @@ impl CronSchedulerAdapter {
         let job_id = self.scheduler.add(job).await?;
         Ok(job_id)
     }
+
+    /// Resolve the `TaskKind` for a task entry.
+    fn resolve_kind(entry: &TaskEntry) -> TaskKind {
+        entry
+            .persisted
+            .kind
+            .clone()
+            .unwrap_or_else(|| migrate_kind_from_payload(&entry.persisted))
+    }
+
+    /// Convert a `TaskEntry` into a `Schedule` domain object.
+    fn to_schedule(entry: &TaskEntry) -> Schedule {
+        Schedule {
+            id: entry.persisted.id.clone(),
+            label: entry.persisted.label.clone(),
+            cron: entry.persisted.cron.clone(),
+            timezone: entry.persisted.timezone.clone(),
+            kind: Self::resolve_kind(entry),
+            paused: entry.persisted.paused,
+            currently_running: entry.currently_running,
+            last_run: entry.last_run,
+            next_run: None, // TODO: compute from cron
+            created_at: entry.persisted.created_at.unwrap_or_else(Utc::now),
+        }
+    }
+}
+
+/// Infer `TaskKind` from a legacy `payload` field.
+fn migrate_kind_from_payload(record: &PersistedTask) -> TaskKind {
+    if let Some(payload) = &record.payload {
+        if let Some(url) = payload.get("webhook_url").and_then(|v| v.as_str()) {
+            return TaskKind::Webhook {
+                webhook_url: url.to_string(),
+            };
+        }
+        if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+            return TaskKind::AgentPrompt {
+                prompt: prompt.to_string(),
+            };
+        }
+    }
+    // Fallback: use the label as a prompt.
+    TaskKind::AgentPrompt {
+        prompt: record.label.clone(),
+    }
 }
 
 // ── SchedulerPort impl ────────────────────────────────────────────────────────
 
 #[async_trait]
 impl SchedulerPort for CronSchedulerAdapter {
-    async fn create_task(&self, req: CreateTaskRequest) -> Result<ScheduledTask> {
+    async fn create_task(&self, req: CreateScheduleRequest) -> Result<Schedule> {
         // Reject duplicates
         {
             let guard = self.tasks.lock().await;
@@ -186,65 +311,62 @@ impl SchedulerPort for CronSchedulerAdapter {
             id: req.id.clone(),
             label: req.label.clone(),
             cron: req.cron.clone(),
-            payload: req.payload.clone(),
+            timezone: req.timezone.clone(),
+            kind: Some(req.kind.clone()),
+            payload: None,
             paused: false,
+            created_at: Some(Utc::now()),
         };
 
         let job_id = self
-            .add_job_to_scheduler(&req.id, &req.cron, req.payload)
+            .add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
             .await?;
 
-        let task = ScheduledTask {
+        let schedule = Schedule {
             id: req.id.clone(),
             label: req.label,
             cron: req.cron,
+            timezone: req.timezone,
+            kind: req.kind,
             last_run: None,
             next_run: None,
             paused: false,
             currently_running: false,
-            payload: Some(record.payload.clone()),
+            created_at: record.created_at.unwrap(),
         };
 
         {
             let mut guard = self.tasks.lock().await;
-            guard.insert(req.id, TaskEntry {
-                persisted: record,
-                job_id,
-                currently_running: false,
-            });
+            guard.insert(
+                req.id,
+                TaskEntry {
+                    persisted: record,
+                    job_id,
+                    currently_running: false,
+                    last_run: None,
+                },
+            );
         }
 
         self.save().await?;
-
-        Ok(task)
+        Ok(schedule)
     }
 
-    async fn list_tasks(&self) -> Result<Vec<ScheduledTask>> {
+    async fn list_tasks(&self) -> Result<Vec<Schedule>> {
         let guard = self.tasks.lock().await;
-        let tasks = guard
-            .values()
-            .map(|e| ScheduledTask {
-                id: e.persisted.id.clone(),
-                label: e.persisted.label.clone(),
-                cron: e.persisted.cron.clone(),
-                last_run: None,
-                next_run: None,
-                paused: e.persisted.paused,
-                currently_running: e.currently_running,
-                payload: Some(e.persisted.payload.clone()),
-            })
-            .collect();
+        let tasks = guard.values().map(Self::to_schedule).collect();
         Ok(tasks)
     }
 
     async fn delete_task(&self, id: &str) -> Result<()> {
         let job_id = {
             let mut guard = self.tasks.lock().await;
-            let entry = guard.remove(id).ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+            let entry = guard
+                .remove(id)
+                .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
             entry.job_id
         };
 
-        // Nil UUID means the job was paused and never added to the scheduler
         if job_id != uuid::Uuid::nil() {
             self.scheduler.remove(&job_id).await?;
         }
@@ -256,9 +378,11 @@ impl SchedulerPort for CronSchedulerAdapter {
     async fn pause_task(&self, id: &str) -> Result<()> {
         let job_id = {
             let mut guard = self.tasks.lock().await;
-            let entry = guard.get_mut(id).ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+            let entry = guard
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
             if entry.persisted.paused {
-                return Ok(()); // already paused
+                return Ok(());
             }
             entry.persisted.paused = true;
             let jid = entry.job_id;
@@ -275,16 +399,18 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn resume_task(&self, id: &str) -> Result<()> {
-        let (cron, payload) = {
+        let (cron, kind) = {
             let guard = self.tasks.lock().await;
-            let entry = guard.get(id).ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+            let entry = guard
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
             if !entry.persisted.paused {
-                return Ok(()); // not paused
+                return Ok(());
             }
-            (entry.persisted.cron.clone(), entry.persisted.payload.clone())
+            (entry.persisted.cron.clone(), Self::resolve_kind(entry))
         };
 
-        let job_id = self.add_job_to_scheduler(id, &cron, payload).await?;
+        let job_id = self.add_job_to_scheduler(id, &cron, kind).await?;
 
         {
             let mut guard = self.tasks.lock().await;
@@ -299,20 +425,80 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn run_now(&self, id: &str) -> Result<()> {
-        let (payload, _paused) = {
+        let kind = {
             let guard = self.tasks.lock().await;
-            let entry = guard.get(id).ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
-            (entry.persisted.payload.clone(), entry.persisted.paused)
+            let entry = guard
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+            Self::resolve_kind(entry)
         };
 
         let executor = self.executor.clone();
+        let tasks = self.tasks.clone();
+        let run_history = self.run_history.clone();
         let id = id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = executor.execute(&id, payload).await {
-                tracing::error!("run_now task {id} failed: {e}");
+            // Mark running
+            {
+                let mut guard = tasks.lock().await;
+                if let Some(entry) = guard.get_mut(&id) {
+                    entry.currently_running = true;
+                }
+            }
+
+            let run_id = run_history.record_start(&id).await;
+            let result = executor.execute(&id, &kind).await;
+
+            match &result {
+                Ok(text) => {
+                    run_history
+                        .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("run_now task {id} failed: {e}");
+                    run_history
+                        .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
+                        .await;
+                }
+            }
+
+            // Mark not-running
+            {
+                let mut guard = tasks.lock().await;
+                if let Some(entry) = guard.get_mut(&id) {
+                    entry.currently_running = false;
+                    entry.last_run = Some(Utc::now());
+                }
             }
         });
 
+        Ok(())
+    }
+
+    async fn get_runs(&self, schedule_id: &str, limit: u32) -> Result<Vec<ScheduleRun>> {
+        Ok(self.run_history.get_runs(schedule_id, limit).await)
+    }
+
+    async fn list_upcoming(&self, limit: u32) -> Result<Vec<Schedule>> {
+        let guard = self.tasks.lock().await;
+        let mut schedules: Vec<Schedule> = guard
+            .values()
+            .filter(|e| !e.persisted.paused)
+            .map(Self::to_schedule)
+            .collect();
+        // Sort by created_at as a proxy (next_run computation deferred).
+        schedules.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        schedules.truncate(limit as usize);
+        Ok(schedules)
+    }
+
+    async fn set_executor(
+        &self,
+        _executor: Arc<dyn ScheduleExecutor>,
+    ) -> Result<()> {
+        // The executor is injected at construction time via `DeferredExecutor`.
+        // This method exists on the trait for flexibility but is a no-op here.
         Ok(())
     }
 }
@@ -321,7 +507,6 @@ impl SchedulerPort for CronSchedulerAdapter {
 
 impl Drop for CronSchedulerAdapter {
     fn drop(&mut self) {
-        // Best-effort shutdown — tokio-cron-scheduler handles cleanup internally.
         let _now = Utc::now(); // suppress unused import warning
     }
 }
@@ -331,34 +516,40 @@ impl Drop for CronSchedulerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webhook_executor::TaskExecutor;
+    use pond_core::ports::schedule_execution::ScheduleExecutor;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct CountingExecutor(Arc<AtomicU32>);
 
     #[async_trait]
-    impl TaskExecutor for CountingExecutor {
-        async fn execute(&self, _id: &str, _payload: serde_json::Value) -> Result<()> {
+    impl ScheduleExecutor for CountingExecutor {
+        async fn execute(&self, _id: &str, _kind: &TaskKind) -> Result<String> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok("ok".to_string())
         }
     }
 
     async fn make_scheduler(dir: &std::path::Path) -> CronSchedulerAdapter {
         let counter = Arc::new(AtomicU32::new(0));
-        let exec = Arc::new(CountingExecutor(counter));
-        CronSchedulerAdapter::new(dir.join("schedules.json"), exec)
-            .await
-            .expect("scheduler init failed")
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter));
+        CronSchedulerAdapter::new(
+            dir.join("schedules.json"),
+            dir.join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        .expect("scheduler init failed")
     }
 
-    // tokio-cron-scheduler uses 6-field cron: sec min hour dom month dow
-    fn create_req(id: &str, cron: &str) -> CreateTaskRequest {
-        CreateTaskRequest {
+    fn create_req(id: &str, cron: &str) -> CreateScheduleRequest {
+        CreateScheduleRequest {
             id: id.to_string(),
             label: format!("Test task {id}"),
             cron: cron.to_string(),
-            payload: serde_json::json!({"webhook_url": "http://localhost:9999/hook"}),
+            timezone: "UTC".to_string(),
+            kind: TaskKind::AgentPrompt {
+                prompt: "Hello".to_string(),
+            },
         }
     }
 
@@ -367,8 +558,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
 
-        sched.create_task(create_req("t1", "0 0 0 * * *")).await.unwrap();
-        sched.create_task(create_req("t2", "0 0 1 * * *")).await.unwrap();
+        sched
+            .create_task(create_req("t1", "0 0 0 * * *"))
+            .await
+            .unwrap();
+        sched
+            .create_task(create_req("t2", "0 0 1 * * *"))
+            .await
+            .unwrap();
 
         let tasks = sched.list_tasks().await.unwrap();
         assert_eq!(tasks.len(), 2);
@@ -381,7 +578,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
 
-        sched.create_task(create_req("del", "0 0 2 * * *")).await.unwrap();
+        sched
+            .create_task(create_req("del", "0 0 2 * * *"))
+            .await
+            .unwrap();
         sched.delete_task("del").await.unwrap();
 
         let tasks = sched.list_tasks().await.unwrap();
@@ -400,7 +600,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
 
-        sched.create_task(create_req("p1", "0 0 3 * * *")).await.unwrap();
+        sched
+            .create_task(create_req("p1", "0 0 3 * * *"))
+            .await
+            .unwrap();
         sched.pause_task("p1").await.unwrap();
 
         let tasks = sched.list_tasks().await.unwrap();
@@ -425,7 +628,10 @@ mod tests {
 
         {
             let sched = make_scheduler(tmp.path()).await;
-            sched.create_task(create_req("persist1", "0 0 4 * * *")).await.unwrap();
+            sched
+                .create_task(create_req("persist1", "0 0 4 * * *"))
+                .await
+                .unwrap();
         }
 
         // Rehydrate from disk
@@ -433,13 +639,51 @@ mod tests {
         let tasks = sched2.list_tasks().await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "persist1");
+        assert_eq!(tasks[0].timezone, "UTC");
     }
 
     #[tokio::test]
     async fn duplicate_id_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
-        sched.create_task(create_req("dup", "0 0 5 * * *")).await.unwrap();
-        assert!(sched.create_task(create_req("dup", "0 0 6 * * *")).await.is_err());
+        sched
+            .create_task(create_req("dup", "0 0 5 * * *"))
+            .await
+            .unwrap();
+        assert!(sched
+            .create_task(create_req("dup", "0 0 6 * * *"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn backward_compat_legacy_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a legacy schedules.json without kind/timezone fields.
+        let legacy = serde_json::json!([{
+            "id": "legacy1",
+            "label": "Old webhook task",
+            "cron": "0 0 8 * * *",
+            "payload": {"webhook_url": "https://example.com/hook"},
+            "paused": false
+        }]);
+        tokio::fs::write(
+            tmp.path().join("schedules.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let sched = make_scheduler(tmp.path()).await;
+        let tasks = sched.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "legacy1");
+        assert_eq!(tasks[0].timezone, "UTC"); // default
+        match &tasks[0].kind {
+            TaskKind::Webhook { webhook_url } => {
+                assert_eq!(webhook_url, "https://example.com/hook");
+            }
+            _ => panic!("expected Webhook kind"),
+        }
     }
 }

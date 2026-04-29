@@ -549,6 +549,13 @@ impl GooseAdapter {
             }
         }
 
+        // ── 4b. Upcoming schedules context ──────────────────────────────────
+        if let Some(sched_context) = pond_mcp_server::registry::try_upcoming_schedules_context().await {
+            self.agent
+                .extend_system_prompt("upcoming_schedules".to_string(), sched_context)
+                .await;
+        }
+
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
         if let Err(e) = self.ensure_provider_current(&settings, &goose_sid).await {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");

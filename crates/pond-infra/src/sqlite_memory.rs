@@ -1,14 +1,15 @@
 //! SQLite-backed implementation of `MemoryRepository`.
 //!
-//! Uses the `memory_fragments` table in `pond_system.db` (migration 0005_memory.sql).
+//! Uses the `memory_fragments` table in `pond_system.db`.
+//! Migration 0005 creates the base table; 0015 adds segment/importance/decay fields.
 //! Embeddings are stored as raw little-endian f32 BLOBs.
-//! `search_similar()` loads all non-NULL embedding rows, deserializes, and cosine-ranks them.
-//! O(n) is fine at home-assistant scale (hundreds of fragments, not millions).
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::memory::MemoryFragment;
+use pond_core::domain::memory::{
+    MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
+};
 use pond_core::ports::memory_repository::MemoryRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
@@ -53,14 +54,23 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[derive(sqlx::FromRow)]
 struct FragmentRow {
-    id:         String,
-    profile_id: Option<String>,
-    session_id: Option<String>,
-    content:    String,
-    embedding:  Option<Vec<u8>>,
-    source:     String,
-    tags:       String,
-    created_at: String,
+    id:              String,
+    profile_id:      Option<String>,
+    session_id:      Option<String>,
+    content:         String,
+    embedding:       Option<Vec<u8>>,
+    source:          String,
+    tags:            String,
+    created_at:      String,
+    // ── Segment-aware columns (nullable for pre-migration rows) ───────
+    segment:         Option<String>,
+    importance:      Option<f64>,  // SQLite REAL → f64
+    tier:            Option<String>,
+    decay_rate:      Option<f64>,
+    access_count:    i64,
+    last_accessed_at: Option<String>,
+    lifecycle:       Option<String>,
+    superseded_by:   Option<String>,
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -69,18 +79,72 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn parse_segment(s: &str) -> Option<MemorySegment> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
+fn parse_tier(s: &str) -> Option<MemoryTier> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
+fn parse_lifecycle(s: &str) -> Option<MemoryLifecycle> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
 fn row_to_fragment(row: FragmentRow) -> MemoryFragment {
     let tags: Vec<String> = serde_json::from_str(&row.tags).unwrap_or_default();
     let embedding = row.embedding.as_deref().map(blob_to_vec);
     MemoryFragment {
-        id:         row.id,
-        profile_id: row.profile_id,
-        session_id: row.session_id,
-        content:    row.content,
+        id:              row.id,
+        profile_id:      row.profile_id,
+        session_id:      row.session_id,
+        content:         row.content,
         embedding,
-        source:     row.source,
+        source:          row.source,
         tags,
-        created_at: parse_dt(&row.created_at),
+        created_at:      parse_dt(&row.created_at),
+        segment:         row.segment.as_deref().and_then(parse_segment),
+        importance:      row.importance.map(|v| v as f32),
+        tier:            row.tier.as_deref().and_then(parse_tier),
+        decay_rate:      row.decay_rate.map(|v| v as f32),
+        access_count:    row.access_count as u32,
+        last_accessed_at: row.last_accessed_at.as_deref().map(parse_dt),
+        lifecycle:       row.lifecycle.as_deref().and_then(parse_lifecycle),
+        superseded_by:   row.superseded_by,
+    }
+}
+
+/// All columns selected by all queries.
+const SELECT_ALL: &str = "\
+    id, profile_id, session_id, content, embedding, source, tags, created_at, \
+    segment, importance, tier, decay_rate, access_count, last_accessed_at, \
+    lifecycle, superseded_by";
+
+fn segment_to_str(s: &MemorySegment) -> &'static str {
+    match s {
+        MemorySegment::Identity     => "identity",
+        MemorySegment::Preference   => "preference",
+        MemorySegment::Correction   => "correction",
+        MemorySegment::Relationship => "relationship",
+        MemorySegment::Project      => "project",
+        MemorySegment::Knowledge    => "knowledge",
+        MemorySegment::Context      => "context",
+    }
+}
+
+fn lifecycle_to_str(l: &MemoryLifecycle) -> &'static str {
+    match l {
+        MemoryLifecycle::Active   => "active",
+        MemoryLifecycle::Archived => "archived",
+        MemoryLifecycle::Merged   => "merged",
+    }
+}
+
+fn tier_to_str(t: &MemoryTier) -> &'static str {
+    match t {
+        MemoryTier::Short     => "short",
+        MemoryTier::Long      => "long",
+        MemoryTier::Permanent => "permanent",
     }
 }
 
@@ -90,11 +154,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         let tags_json = serde_json::to_string(&fragment.tags)?;
         let created_str = fragment.created_at.format("%Y-%m-%d %H:%M:%S").to_string();
         let embedding_blob = fragment.embedding.as_deref().map(vec_to_blob);
+        let segment_str = fragment.segment.as_ref().map(segment_to_str);
+        let tier_str = fragment.tier.as_ref().map(tier_to_str).or(Some("long"));
+        let lifecycle_str = Some(
+            fragment.lifecycle.as_ref().map(lifecycle_to_str).unwrap_or("active"),
+        );
+        let last_accessed_str = fragment
+            .last_accessed_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
 
         sqlx::query(
             "INSERT INTO memory_fragments \
-             (id, profile_id, session_id, content, embedding, source, tags, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, profile_id, session_id, content, embedding, source, tags, created_at, \
+              segment, importance, tier, decay_rate, access_count, last_accessed_at, \
+              lifecycle, superseded_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&fragment.id)
         .bind(&fragment.profile_id)
@@ -104,6 +178,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(&fragment.source)
         .bind(&tags_json)
         .bind(&created_str)
+        .bind(segment_str)
+        .bind(fragment.importance.map(|v| v as f64))
+        .bind(tier_str)
+        .bind(fragment.decay_rate.map(|v| v as f64))
+        .bind(fragment.access_count as i64)
+        .bind(last_accessed_str)
+        .bind(lifecycle_str)
+        .bind(&fragment.superseded_by)
         .execute(&self.pool)
         .await?;
 
@@ -115,23 +197,29 @@ impl MemoryRepository for SqliteMemoryRepository {
         profile_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
+        let query = match profile_id {
+            Some(_) => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE profile_id = ? AND (lifecycle IS NULL OR lifecycle = 'active') \
+                 ORDER BY created_at DESC LIMIT ?"
+            ),
+            None => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
+                 ORDER BY created_at DESC LIMIT ?"
+            ),
+        };
+
         let rows: Vec<FragmentRow> = match profile_id {
-            Some(pid) => sqlx::query_as(
-                "SELECT id, profile_id, session_id, content, embedding, source, tags, created_at \
-                 FROM memory_fragments WHERE profile_id = ? \
-                 ORDER BY created_at DESC LIMIT ?",
-            )
-            .bind(pid)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?,
-            None => sqlx::query_as(
-                "SELECT id, profile_id, session_id, content, embedding, source, tags, created_at \
-                 FROM memory_fragments ORDER BY created_at DESC LIMIT ?",
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?,
+            Some(pid) => sqlx::query_as(&query)
+                .bind(pid)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?,
+            None => sqlx::query_as(&query)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?,
         };
         Ok(rows.into_iter().map(row_to_fragment).collect())
     }
@@ -142,29 +230,33 @@ impl MemoryRepository for SqliteMemoryRepository {
         profile_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        // Load all fragments that have stored embeddings
+        let query = match profile_id {
+            Some(_) => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE embedding IS NOT NULL AND profile_id = ? \
+                 AND (lifecycle IS NULL OR lifecycle = 'active')"
+            ),
+            None => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE embedding IS NOT NULL \
+                 AND (lifecycle IS NULL OR lifecycle = 'active')"
+            ),
+        };
+
         let rows: Vec<FragmentRow> = match profile_id {
-            Some(pid) => sqlx::query_as(
-                "SELECT id, profile_id, session_id, content, embedding, source, tags, created_at \
-                 FROM memory_fragments WHERE embedding IS NOT NULL AND profile_id = ?",
-            )
-            .bind(pid)
-            .fetch_all(&self.pool)
-            .await?,
-            None => sqlx::query_as(
-                "SELECT id, profile_id, session_id, content, embedding, source, tags, created_at \
-                 FROM memory_fragments WHERE embedding IS NOT NULL",
-            )
-            .fetch_all(&self.pool)
-            .await?,
+            Some(pid) => sqlx::query_as(&query)
+                .bind(pid)
+                .fetch_all(&self.pool)
+                .await?,
+            None => sqlx::query_as(&query)
+                .fetch_all(&self.pool)
+                .await?,
         };
 
         if rows.is_empty() {
-            // No embeddings stored yet — fall back to recency
             return self.search_recent(profile_id, limit).await;
         }
 
-        // Compute cosine similarity and sort descending
         let mut scored: Vec<(f32, MemoryFragment)> = rows
             .into_iter()
             .map(row_to_fragment)
@@ -187,6 +279,120 @@ impl MemoryRepository for SqliteMemoryRepository {
             .await?;
         Ok(())
     }
+
+    // ── Segment-aware methods ────────────────────────────────────────────────
+
+    async fn record_access(&self, id: &str) -> Result<()> {
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query(
+            "UPDATE memory_fragments \
+             SET access_count = access_count + 1, last_accessed_at = ? \
+             WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<()> {
+        sqlx::query("UPDATE memory_fragments SET lifecycle = ? WHERE id = ?")
+            .bind(lifecycle_to_str(&lifecycle))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn search_by_segment(
+        &self,
+        segment: MemorySegment,
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        let query = match profile_id {
+            Some(_) => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE segment = ? AND profile_id = ? \
+                 AND (lifecycle IS NULL OR lifecycle = 'active') \
+                 ORDER BY created_at DESC LIMIT ?"
+            ),
+            None => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE segment = ? AND (lifecycle IS NULL OR lifecycle = 'active') \
+                 ORDER BY created_at DESC LIMIT ?"
+            ),
+        };
+
+        let seg = segment_to_str(&segment);
+        let rows: Vec<FragmentRow> = match profile_id {
+            Some(pid) => sqlx::query_as(&query)
+                .bind(seg)
+                .bind(pid)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?,
+            None => sqlx::query_as(&query)
+                .bind(seg)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?,
+        };
+        Ok(rows.into_iter().map(row_to_fragment).collect())
+    }
+
+    async fn search_scoreable(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<Vec<MemoryFragment>> {
+        let query = match profile_id {
+            Some(_) => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
+                 AND importance IS NOT NULL AND profile_id = ? \
+                 ORDER BY created_at DESC LIMIT 1000"
+            ),
+            None => format!(
+                "SELECT {SELECT_ALL} FROM memory_fragments \
+                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
+                 AND importance IS NOT NULL \
+                 ORDER BY created_at DESC LIMIT 1000"
+            ),
+        };
+
+        let rows: Vec<FragmentRow> = match profile_id {
+            Some(pid) => sqlx::query_as(&query)
+                .bind(pid)
+                .fetch_all(&self.pool)
+                .await?,
+            None => sqlx::query_as(&query)
+                .fetch_all(&self.pool)
+                .await?,
+        };
+        Ok(rows.into_iter().map(row_to_fragment).collect())
+    }
+
+    async fn batch_update_lifecycle(
+        &self,
+        updates: &[(String, MemoryLifecycle)],
+    ) -> Result<()> {
+        for (id, lifecycle) in updates {
+            self.update_lifecycle(id, lifecycle.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_superseded(&self, id: &str, superseded_by: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE memory_fragments SET lifecycle = 'merged', superseded_by = ? WHERE id = ?",
+        )
+        .bind(superseded_by)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +410,6 @@ mod tests {
     #[tokio::test]
     async fn add_and_search_recent() {
         let (repo, _tmp) = make_repo().await;
-        // Use profile_id=None — a real profile UUID would need to be inserted first
         let frag = MemoryFragment::from_chat(
             "f1".to_string(),
             None,
@@ -253,5 +458,76 @@ mod tests {
         let results = repo.search_similar(&query, None, 2).await.unwrap();
         assert_eq!(results[0].id, "high");
         assert_eq!(results[1].id, "low");
+    }
+
+    #[tokio::test]
+    async fn add_with_segment_fields() {
+        let (repo, _tmp) = make_repo().await;
+        let frag = MemoryFragment::from_extraction(
+            "ext1".to_string(),
+            None,
+            "User prefers dark mode".to_string(),
+            MemorySegment::Preference,
+            0.75,
+        );
+        repo.add(frag).await.unwrap();
+        let results = repo.search_recent(None, 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].segment, Some(MemorySegment::Preference));
+        assert!((results[0].importance.unwrap() - 0.75).abs() < 0.01);
+        assert_eq!(results[0].tier, Some(MemoryTier::Long));
+        assert_eq!(results[0].lifecycle, Some(MemoryLifecycle::Active));
+    }
+
+    #[tokio::test]
+    async fn record_access_increments_count() {
+        let (repo, _tmp) = make_repo().await;
+        let frag = MemoryFragment::from_extraction(
+            "acc1".to_string(),
+            None,
+            "Test access".to_string(),
+            MemorySegment::Knowledge,
+            0.5,
+        );
+        repo.add(frag).await.unwrap();
+        repo.record_access("acc1").await.unwrap();
+        repo.record_access("acc1").await.unwrap();
+        let results = repo.search_recent(None, 10).await.unwrap();
+        assert_eq!(results[0].access_count, 2);
+        assert!(results[0].last_accessed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_hides_from_search() {
+        let (repo, _tmp) = make_repo().await;
+        let frag = MemoryFragment::from_extraction(
+            "arch1".to_string(),
+            None,
+            "To archive".to_string(),
+            MemorySegment::Context,
+            0.2,
+        );
+        repo.add(frag).await.unwrap();
+        repo.update_lifecycle("arch1", MemoryLifecycle::Archived).await.unwrap();
+        // Archived memories should not appear in search_recent
+        let results = repo.search_recent(None, 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_by_segment_filters() {
+        let (repo, _tmp) = make_repo().await;
+        repo.add(MemoryFragment::from_extraction(
+            "id1".to_string(), None, "Name is Jerry".to_string(),
+            MemorySegment::Identity, 0.85,
+        )).await.unwrap();
+        repo.add(MemoryFragment::from_extraction(
+            "pref1".to_string(), None, "Likes dark mode".to_string(),
+            MemorySegment::Preference, 0.7,
+        )).await.unwrap();
+
+        let identities = repo.search_by_segment(MemorySegment::Identity, None, 10).await.unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, "id1");
     }
 }

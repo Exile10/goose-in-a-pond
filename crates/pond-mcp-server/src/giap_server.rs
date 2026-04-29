@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use pond_core::domain::memory::MemoryFragment;
+use pond_core::domain::schedule::TaskKind;
+use pond_core::ports::scheduler::CreateScheduleRequest;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -48,6 +50,35 @@ pub struct WikipediaQueryParams {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+// ── Schedule parameter structs ──────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CreateScheduleParams {
+    /// Human-readable name for the scheduled task.
+    pub name: String,
+    /// 6-field cron expression: sec min hr dom mon dow.
+    /// Example: "0 0 8 * * *" = daily at 8:00 AM.
+    pub cron: String,
+    /// The prompt to send to the agent on each fire.
+    pub prompt: String,
+    /// IANA timezone (e.g. "Africa/Nairobi"). If omitted, uses the user's configured timezone.
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ScheduleIdParam {
+    /// The schedule ID to operate on.
+    pub id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct GetScheduleRunsParams {
+    /// The schedule ID.
+    pub id: String,
+    /// Maximum number of runs to return (default 10).
+    pub limit: Option<u32>,
 }
 
 // ── MCP server ───────────────────────────────────────────────────────────────
@@ -124,7 +155,7 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "List all scheduled tasks on this GIAP instance.")]
+    #[tool(description = "List all scheduled tasks on this GIAP instance, including their cron schedule, timezone, type, and status.")]
     async fn list_schedules(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -142,12 +173,20 @@ impl GiapMcpServer {
                         tasks
                             .iter()
                             .map(|t| {
+                                let kind_label = match &t.kind {
+                                    TaskKind::AgentPrompt { .. } => "agent",
+                                    TaskKind::Webhook { .. } => "webhook",
+                                };
+                                let status = if t.currently_running {
+                                    "running"
+                                } else if t.paused {
+                                    "paused"
+                                } else {
+                                    "active"
+                                };
                                 format!(
-                                    "- {} [{}]: {} ({})",
-                                    t.label,
-                                    t.id,
-                                    t.cron,
-                                    if t.paused { "paused" } else { "active" }
+                                    "- {} [{}]: {} {} ({}, {})",
+                                    t.label, t.id, t.cron, t.timezone, kind_label, status
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -161,6 +200,221 @@ impl GiapMcpServer {
                     None,
                 )),
             },
+        }
+    }
+
+    #[tool(description = "Create a new scheduled task that runs the given prompt against the agent \
+        at the specified cron interval. The cron is 6-field format: sec min hr dom mon dow. \
+        Example: '0 0 8 * * *' = daily at 8:00 AM. Use the user's timezone unless they specify otherwise.")]
+    async fn create_schedule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<CreateScheduleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured. Inform the user directly.",
+            )])),
+        };
+
+        // Default timezone to user's setting if not provided.
+        let timezone = match &params.0.timezone {
+            Some(tz) if !tz.is_empty() => tz.clone(),
+            _ => {
+                self.services
+                    .settings_repo
+                    .get()
+                    .await
+                    .map(|s| s.timezone.clone())
+                    .unwrap_or_else(|_| "UTC".to_string())
+            }
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let req = CreateScheduleRequest {
+            id: id.clone(),
+            label: params.0.name.clone(),
+            cron: params.0.cron.clone(),
+            timezone: timezone.clone(),
+            kind: TaskKind::AgentPrompt {
+                prompt: params.0.prompt.clone(),
+            },
+        };
+
+        match scheduler.create_task(req).await {
+            Ok(schedule) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Schedule created: \"{}\" [{}] — {} {} (agent prompt)",
+                schedule.label, schedule.id, schedule.cron, schedule.timezone,
+            ))])),
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to create schedule: {}", e),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Delete a scheduled task by its ID.")]
+    async fn delete_schedule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ScheduleIdParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured.",
+            )])),
+        };
+
+        match scheduler.delete_task(&params.0.id).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Schedule '{}' deleted.",
+                params.0.id
+            ))])),
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to delete schedule: {}", e),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Pause a scheduled task so it stops firing until resumed.")]
+    async fn pause_schedule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ScheduleIdParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured.",
+            )])),
+        };
+
+        match scheduler.pause_task(&params.0.id).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Schedule '{}' paused.",
+                params.0.id
+            ))])),
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to pause schedule: {}", e),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Resume a paused scheduled task so it starts firing again.")]
+    async fn resume_schedule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ScheduleIdParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured.",
+            )])),
+        };
+
+        match scheduler.resume_task(&params.0.id).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Schedule '{}' resumed.",
+                params.0.id
+            ))])),
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to resume schedule: {}", e),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Trigger a scheduled task to run immediately, regardless of its cron schedule.")]
+    async fn run_schedule_now(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ScheduleIdParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured.",
+            )])),
+        };
+
+        match scheduler.run_now(&params.0.id).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Schedule '{}' triggered for immediate execution.",
+                params.0.id
+            ))])),
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to run schedule: {}", e),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Get the execution history for a scheduled task — shows recent runs with status, result, and duration.")]
+    async fn get_schedule_runs(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<GetScheduleRunsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let scheduler = match &self.services.scheduler {
+            Some(s) => s,
+            None => return Ok(CallToolResult::success(vec![Content::text(
+                "The scheduler service is not configured.",
+            )])),
+        };
+
+        let limit = params.0.limit.unwrap_or(10);
+        match scheduler.get_runs(&params.0.id, limit).await {
+            Ok(runs) => {
+                let text = if runs.is_empty() {
+                    format!("No execution history for schedule '{}'.", params.0.id)
+                } else {
+                    runs.iter()
+                        .map(|r| {
+                            let duration = r
+                                .duration_ms
+                                .map(|d| format!(" ({d}ms)"))
+                                .unwrap_or_default();
+                            let detail = match &r.status {
+                                pond_core::domain::schedule::RunStatus::Completed => {
+                                    let preview = r
+                                        .result
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(200)
+                                        .collect::<String>();
+                                    format!("completed{duration}: {preview}")
+                                }
+                                pond_core::domain::schedule::RunStatus::Failed => {
+                                    let err = r.error.as_deref().unwrap_or("unknown error");
+                                    format!("failed{duration}: {err}")
+                                }
+                                pond_core::domain::schedule::RunStatus::Running => {
+                                    "running...".to_string()
+                                }
+                            };
+                            format!("- [{}] {}", r.started_at.format("%Y-%m-%d %H:%M"), detail)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(e) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to get runs: {}", e),
+                None,
+            )),
         }
     }
 
@@ -253,6 +507,14 @@ impl GiapMcpServer {
             source: "mcp_tool".to_string(),
             tags: tag_list,
             created_at: chrono::Utc::now(),
+            segment: None,
+            importance: None,
+            tier: None,
+            decay_rate: None,
+            access_count: 0,
+            last_accessed_at: None,
+            lifecycle: None,
+            superseded_by: None,
         };
         self.services.memory_repo.add(fragment).await.map_err(|e| {
             ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to save memory: {}", e), None)
@@ -502,15 +764,28 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
 pub fn clean_query_for_search(raw: &str) -> String {
     let stripped = raw.trim().trim_end_matches('?').trim_end_matches('.').trim();
     let lower = stripped.to_lowercase();
+    // Ordered longest-first so more specific prefixes match before short ones.
     let prefixes = [
+        "can you tell me about ",
+        "could you tell me about ",
+        "tell me about ",
+        "tell me more about ",
+        "i want to know about ",
+        "i'd like to know about ",
+        "what do you know about ",
+        "what can you tell me about ",
+        "would you recommend ", "do you recommend ",
+        "should i ", "how about ",
         "who is ", "who was ", "who are ",
         "what is ", "what are ", "what was ", "what were ",
+        "what is the ", "what are the ",
         "where is ", "where are ",
-        "when was ", "when did ",
-        "tell me about ", "explain ", "describe ",
-        "how does ", "how do ", "how did ",
+        "when was ", "when did ", "when is ",
+        "how does ", "how do ", "how did ", "how is ",
+        "why does ", "why do ", "why is ", "why did ",
+        "explain ", "describe ",
         "look up ", "search for ", "search ", "find ",
-        "define ", "can you tell me about ",
+        "define ",
     ];
     for prefix in prefixes {
         if lower.starts_with(prefix) {

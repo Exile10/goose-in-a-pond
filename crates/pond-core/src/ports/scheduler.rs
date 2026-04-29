@@ -4,46 +4,54 @@
 //! summarise overnight sensor readings").  The adapter lives in
 //! `pond-infra-scheduler` (workspace-included, no Goose dep).
 
+use crate::domain::schedule::{Schedule, ScheduleRun, TaskKind};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-/// A scheduled task persisted by the scheduler.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduledTask {
+/// Request payload for creating a new scheduled task.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CreateScheduleRequest {
     pub id: String,
     pub label: String,
     /// 6-field cron expression with leading seconds field
     /// (e.g. `"0 0 8 * * *"` = 08:00:00 daily).
-    /// Format: `<sec> <min> <hour> <day-of-month> <month> <day-of-week>`
     pub cron: String,
-    pub last_run: Option<DateTime<Utc>>,
-    pub next_run: Option<DateTime<Utc>>,
-    pub paused: bool,
-    pub currently_running: bool,
-    /// The JSON payload stored with this task (e.g. `{"prompt": "..."}`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
-}
-
-/// Request payload for creating a new scheduled task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateTaskRequest {
-    pub id: String,
-    pub label: String,
-    pub cron: String,
-    /// Arbitrary JSON payload delivered to the task executor on each fire.
-    /// For `WebhookTaskExecutor`, must contain `"webhook_url"`.
-    pub payload: serde_json::Value,
+    /// IANA timezone (e.g. `"Africa/Nairobi"`).
+    pub timezone: String,
+    /// What to do on each fire.
+    pub kind: TaskKind,
 }
 
 #[async_trait]
 pub trait SchedulerPort: Send + Sync {
-    async fn create_task(&self, req: CreateTaskRequest) -> Result<ScheduledTask>;
-    async fn list_tasks(&self) -> Result<Vec<ScheduledTask>>;
+    async fn create_task(&self, req: CreateScheduleRequest) -> Result<Schedule>;
+    async fn list_tasks(&self) -> Result<Vec<Schedule>>;
     async fn delete_task(&self, id: &str) -> Result<()>;
     async fn pause_task(&self, id: &str) -> Result<()>;
     async fn resume_task(&self, id: &str) -> Result<()>;
     async fn run_now(&self, id: &str) -> Result<()>;
+
+    /// Retrieve execution history for a schedule, most recent first.
+    async fn get_runs(&self, schedule_id: &str, limit: u32) -> Result<Vec<ScheduleRun>>;
+
+    /// List schedules sorted by next fire time (soonest first).
+    async fn list_upcoming(&self, limit: u32) -> Result<Vec<Schedule>>;
+
+    /// Inject the real executor after the agent is constructed.
+    /// Called once during startup to break the circular init dependency.
+    async fn set_executor(
+        &self,
+        executor: Arc<dyn crate::ports::schedule_execution::ScheduleExecutor>,
+    ) -> Result<()>;
 }
+
+// ── Backward-compatible aliases ───���──────────────────────────────────────────
+// These allow existing code that references the old names to keep compiling
+// during the transition. Remove once all call sites are migrated.
+
+/// Deprecated — use [`CreateScheduleRequest`] instead.
+pub type CreateTaskRequest = CreateScheduleRequest;
+
+/// Deprecated — use [`Schedule`] instead.
+pub type ScheduledTask = Schedule;
