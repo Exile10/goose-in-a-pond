@@ -41,6 +41,17 @@ pub enum AgentStreamEvent {
     Text {
         content: String,
     },
+    /// Adversarial review status — emitted during post-inference answer review.
+    ReviewStatus {
+        content: String,
+    },
+    /// Revised answer from the adversarial reviewer.
+    /// The frontend should replace the previously streamed text with this content.
+    ReviewRevision {
+        content: String,
+        score: u8,
+        rounds: u32,
+    },
     Done {
         session_id: String,
         model_role: String,

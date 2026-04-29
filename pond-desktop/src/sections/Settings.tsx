@@ -416,6 +416,17 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             <option value="off">Off</option>
           </select>
         </FormRow>
+        <FormRow label="Answer Review" hint="Adversarial critic reviews answers for completeness, accuracy, and depth before delivery">
+          <select
+            style={selectFallback}
+            value={s.review_mode ?? "off"}
+            onChange={(e) => patch("review_mode", e.target.value)}
+          >
+            <option value="off">Off</option>
+            <option value="auto">Auto (review factual/analytical questions only)</option>
+            <option value="on">Always On (review every answer)</option>
+          </select>
+        </FormRow>
         <FormRow label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
           <input
             type="range"

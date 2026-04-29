@@ -63,6 +63,7 @@ export default function Settings({ token }: Props) {
   const [chatProvider,  setChatProvider]  = useState(() => localStorage.getItem('pond_chat_provider') ?? '')
   const [chatModel,     setChatModel]     = useState(() => localStorage.getItem('pond_chat_model') ?? '')
   const [toolModel,     setToolModel]     = useState(() => localStorage.getItem('pond_tool_model') ?? '')
+  const [reviewMode,    setReviewMode]    = useState(() => localStorage.getItem('pond_review_mode') ?? 'off')
 
   // ── Voice ──
   const [wakeWord, setWakeWord]               = useState(() => localStorage.getItem('pond_wake_word') ?? '')
@@ -104,6 +105,7 @@ export default function Settings({ token }: Props) {
     if (s.chat_provider)  setChatProvider(s.chat_provider)
     if (s.chat_model)     setChatModel(s.chat_model)
     if (s.tool_model)     setToolModel(s.tool_model)
+    if ((s as any).review_mode) setReviewMode((s as any).review_mode)
     // Voice
     if (s.voice_wake_word)               setWakeWord(s.voice_wake_word)
     if (s.active_whisper_model)          setWhisperModel(s.active_whisper_model)
@@ -163,6 +165,7 @@ export default function Settings({ token }: Props) {
             chat_provider:         chatProvider.trim(),
             chat_model:            chatModel.trim(),
             tool_model:            toolModel.trim() || null,
+            review_mode:           reviewMode,
           },
           token,
         )
@@ -336,6 +339,23 @@ export default function Settings({ token }: Props) {
               <option value="auto">Auto (enable for capable models)</option>
               <option value="on">Always On</option>
               <option value="off">Off</option>
+            </select>
+          </div>
+
+          {/* Answer review */}
+          <div className="db-settings-field" style={{ borderTop: '1px solid rgba(128,128,128,0.1)', paddingTop: '0.85rem' }}>
+            <label className="db-settings-label">Answer Review</label>
+            <p className="db-settings-hint" style={{ margin: '0 0 0.5rem' }}>
+              Adversarial critic reviews answers for completeness, accuracy, and depth before delivery. Adds ~3-5s per review.
+            </p>
+            <select
+              className="db-settings-input"
+              value={reviewMode}
+              onChange={e => setReviewMode(e.target.value)}
+            >
+              <option value="off">Off</option>
+              <option value="auto">Auto (review factual/analytical questions only)</option>
+              <option value="on">Always On (review every answer)</option>
             </select>
           </div>
 

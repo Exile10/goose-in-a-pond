@@ -36,6 +36,9 @@ export interface Settings {
   tool_model?: string | null;
   thinking_mode?: string;
   show_thinking?: boolean;
+  review_mode?: string;
+  review_max_rounds?: number;
+  review_pass_threshold?: number;
   llm_provider?: string;
   llm_temperature?: number;
   llm_max_tokens?: number;
@@ -158,7 +161,7 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision";
 
 export interface ChatEvent {
   type: ChatEventType;
