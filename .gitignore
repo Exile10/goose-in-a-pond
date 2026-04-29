@@ -28,3 +28,4 @@ node_modules/
 .ai/*{txt,md,log}
 **/scratchpad.md
 
+**/*.log
