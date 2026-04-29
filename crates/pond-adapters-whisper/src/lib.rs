@@ -148,7 +148,9 @@ impl VoiceInput for WhisperInput {
             .await??;
 
             match wav_bytes {
-                Some(wav) => self.transcribe_wav(wav).await,
+                // Transcribe and convert None (blank audio) to empty string
+                // so the chat loop resets to wake word mode instead of exiting.
+                Some(wav) => Ok(self.transcribe_wav(wav).await?.or(Some(String::new()))),
                 None => Ok(Some(String::new())),
             }
         } else {
@@ -169,7 +171,7 @@ impl VoiceInput for WhisperInput {
             .await??;
 
             match wav_bytes {
-                Some(wav) => self.transcribe_wav(wav).await,
+                Some(wav) => Ok(self.transcribe_wav(wav).await?.or(Some(String::new()))),
                 None => Ok(Some(String::new())),
             }
         }
