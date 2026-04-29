@@ -16,6 +16,7 @@ import {
   PenLine,            // Prompts — editing pen
   Settings,           // Settings — gear
   Bot,                // Agent — robot
+  ScanFace,           // Faces — face-recognition section
   ChevronLeft,
   ChevronRight,
   Mic,
@@ -35,6 +36,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   model:    Box,
   prompt:   PenLine,
   settings: Settings,
+  face:     ScanFace,
   agent:    Bot,
 };
 

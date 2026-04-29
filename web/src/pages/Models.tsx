@@ -82,6 +82,106 @@ function DownloadBar({ entry }: { entry: DownloadEntry }) {
   )
 }
 
+// ── Face Recognition card ────────────────────────────────────────────────────
+//
+// Mirrors the visual treatment of the LLM/ASR/TTS category cards but binds
+// to GET /api/v1/faces/models — a read-only status panel since the three
+// models (ArcFace R50 + SCRFD 10G + Silent-Face PAD) are auto-managed by
+// pond-server's boot-time downloader. There is intentionally no per-model
+// "Download" button: the buffalo_l zip ships embedder + detector together
+// and the antispoof file is only ~2 MB.
+function FaceModelsCard({ token }: { token: string }) {
+  type FaceModel = { name: string; label: string; role: string; expected_mb: number; size_mb: number | null; downloaded: boolean }
+  const [enabled, setEnabled]   = useState<boolean | null>(null)
+  const [modelsDir, setModelsDir] = useState<string | null>(null)
+  const [models, setModels]     = useState<FaceModel[]>([])
+  const [error, setError]       = useState<string | null>(null)
+
+  const reload = useCallback(async () => {
+    try {
+      const r = await api.listFaceModels(token)
+      setEnabled(r.feature_enabled)
+      setModelsDir(r.models_dir)
+      setModels(r.models)
+      setError(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load face models')
+    }
+  }, [token])
+
+  useEffect(() => { void reload() }, [reload])
+
+  const installed = models.filter(m => m.downloaded).length
+
+  return (
+    <div className="db-card" style={{ marginTop: '1.25rem' }}>
+      <div className="db-card-header">
+        <h3>
+          Face Recognition
+          {installed > 0 && (
+            <span style={{ marginLeft: '0.5rem', fontSize: '0.72rem', fontWeight: 600, color: '#4ade80', background: 'rgba(74,222,128,0.12)', border: '1px solid rgba(74,222,128,0.3)', borderRadius: '20px', padding: '0.1rem 0.5rem' }}>
+              {installed} of {models.length} installed
+            </span>
+          )}
+          {enabled === false && (
+            <span style={{ marginLeft: '0.5rem', fontSize: '0.72rem', fontWeight: 600, color: '#e8a020', background: 'rgba(232,160,32,0.12)', border: '1px solid rgba(232,160,32,0.3)', borderRadius: '20px', padding: '0.1rem 0.5rem' }}>
+              feature disabled
+            </span>
+          )}
+        </h3>
+        <span style={{ fontSize: '0.75rem', opacity: 0.55 }}>
+          ArcFace embeddings + SCRFD detector + Silent-Face anti-spoof. Auto-downloaded on first server boot.
+        </span>
+      </div>
+
+      {error && <p style={{ fontSize: '0.8rem', color: '#e55', padding: '0.5rem 0' }}>{error}</p>}
+
+      {enabled === false && (
+        <p style={{ fontSize: '0.8rem', opacity: 0.7, padding: '0.5rem 0' }}>
+          Rebuild pond-server with <code>--features face-onnx</code> to enable per-user identification.
+        </p>
+      )}
+
+      <div className="db-model-list">
+        {models.map(m => (
+          <div className="db-model-card" key={m.name} data-downloaded={m.downloaded ? 'true' : 'false'}>
+            <div className="db-model-card-info">
+              <div className="db-model-card-name">
+                {m.label}
+                {m.downloaded ? (
+                  <span className="db-badge db-badge-green">ready</span>
+                ) : (
+                  <span className="db-badge" style={{ background: 'rgba(232,160,32,0.18)', color: '#e8a020', border: '1px solid rgba(232,160,32,0.3)' }}>missing</span>
+                )}
+                <span className="db-badge" style={{ background: 'rgba(169,111,245,0.18)', color: '#a96ff5', border: '1px solid rgba(169,111,245,0.3)' }}>
+                  {m.role}
+                </span>
+              </div>
+              <div className="db-model-card-size">
+                {m.size_mb != null ? formatSize(m.size_mb) : `~${formatSize(m.expected_mb)} expected`}
+                <span style={{ marginLeft: '0.5rem', opacity: 0.55, fontFamily: 'monospace' }}>{m.name}</span>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {modelsDir && (
+        <p style={{ fontSize: '0.7rem', opacity: 0.45, marginTop: '0.5rem', fontFamily: 'monospace' }}>
+          {modelsDir}
+        </p>
+      )}
+
+      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
+        <a href="#faces" className="db-btn-sm" onClick={(e) => { e.preventDefault(); window.dispatchEvent(new CustomEvent('pond-nav', { detail: 'faces' })) }}>
+          Open Face Enrollment →
+        </a>
+        <button className="db-btn-sm" onClick={() => void reload()}>Refresh</button>
+      </div>
+    </div>
+  )
+}
+
 function MemoryBar({ status }: { status: MemoryStatus | null }) {
   if (!status || status.total_mb === 0) return null
   const usedMb   = status.total_mb - status.available_for_llm_mb
@@ -1126,6 +1226,9 @@ export default function Models({ token }: Props) {
                 </div>
               )}
             </div>
+
+            {/* Face Recognition (auto-managed; read-only status) */}
+            <FaceModelsCard token={token} />
           </>
         )}
       </div>

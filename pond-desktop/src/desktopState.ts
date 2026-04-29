@@ -10,6 +10,7 @@ export type GuiSection =
   | "models"
   | "prompts"
   | "settings"
+  | "faces"
   | "agent"
   | "logs";
 
@@ -43,6 +44,7 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
     sections: [
       { section: "models",   label: "Models",   icon: "model" },
       { section: "prompts",  label: "Prompts",  icon: "prompt" },
+      { section: "faces",    label: "Faces",    icon: "face" },
       { section: "settings", label: "Settings", icon: "settings" },
     ],
   },
