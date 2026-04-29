@@ -49,6 +49,7 @@ pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
 pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
+pond-adapters-gotg = { path = "../../crates/pond-adapters-gotg" }
 # NOTE: pond-mcp-server and pond-adapters-goose are NOT deps here.
 # Both depend on the goose submodule which creates a diamond rmcp conflict when
 # linked into the workspace build. They are built in isolation:

@@ -25,7 +25,9 @@ use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::device_registry::RegisterDeviceRequest;
 use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::ports::handshake::{
+    HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest, VerifyRequest,
+};
 use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext};
 use pond_core::ports::provider::LlmProvider;
 use pond_core::services::chat::ChatService;
@@ -56,6 +58,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
+        .route("/handshake/init", post(handshake_init_handler))
+        .route("/handshake/verify", post(handshake_verify_handler))
+        .route("/handshake/refresh", post(handshake_refresh_handler))
+        .route("/handshake/revoke", post(handshake_revoke_handler))
+        .route("/handshake/pairing-code", get(pairing_code_handler))
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
@@ -218,6 +225,123 @@ async fn handshake_handler(
         })?;
 
     Ok(Json(response))
+}
+
+/// Phase 1 of the two-phase handshake: client requests a challenge.
+async fn handshake_init_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<InitRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {}", e), "status": 400 })),
+        )
+    })?;
+    let resp = state.handshake.init_handshake(req).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("init failed: {}", e), "status": 500 })),
+        )
+    })?;
+    Ok(Json(json!(resp)))
+}
+
+/// Phase 2: client proves possession of the pairing code via HMAC.
+async fn handshake_verify_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<VerifyRequest>, JsonRejection>,
+) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {}", e), "status": 400 })),
+        )
+    })?;
+    let resp = state.handshake.verify_handshake(req).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("verify failed: {}", e), "status": 500 })),
+        )
+    })?;
+    Ok(Json(resp))
+}
+
+/// Exchange a refresh token for a fresh session+refresh pair.
+async fn handshake_refresh_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RefreshRequest>, JsonRejection>,
+) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {}", e), "status": 400 })),
+        )
+    })?;
+    let resp = state.handshake.refresh(req).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("refresh failed: {}", e), "status": 500 })),
+        )
+    })?;
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct RevokeRequest {
+    token: String,
+}
+
+/// Revoke a session token. Caller authenticates via Bearer (already enforced
+/// by `auth_middleware` for non-loopback clients) or by sending the token in
+/// the body for self-service from the dashboard.
+async fn handshake_revoke_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RevokeRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {}", e), "status": 400 })),
+        )
+    })?;
+    state.handshake.revoke_token(&req.token).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("revoke failed: {}", e), "status": 500 })),
+        )
+    })?;
+    Ok(Json(json!({ "revoked": true })))
+}
+
+/// Loopback-only: returns the active pairing code so the dashboard / Tauri
+/// app can render it. Auth middleware bypasses Bearer for loopback clients,
+/// and `is_public_route` includes this path so onboarded servers can still
+/// surface a fresh code on demand.
+async fn pairing_code_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    req: axum::extract::Request,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _ = headers;
+    let is_loopback = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(true); // tests / direct router calls have no ConnectInfo
+    if !is_loopback {
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "loopback only" }))));
+    }
+    let current = state.handshake.current_pairing_code().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("read failed: {}", e) })),
+        )
+    })?;
+    Ok(Json(match current {
+        Some(pc) => json!({ "code": pc.code, "expires_at": pc.expires_at }),
+        None => json!({ "code": null }),
+    }))
 }
 
 /// Start or report onboarding state (public)
