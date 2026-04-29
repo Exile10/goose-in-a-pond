@@ -23,6 +23,7 @@ import {
   type PromptExtra,
   type PromptTemplate,
   type Schedule,
+  type ScheduleRun,
   type SessionMessage,
   type SessionSummary,
   type Settings,
@@ -120,39 +121,62 @@ export class PondApiClient {
   }
 
   // ── Schedules ─────────────────────────────────────────────
-  // Backend field mapping: label ↔ name, payload.prompt ↔ prompt, paused ↔ !enabled
 
   listSchedules(): Promise<Schedule[]> {
     return this.get<Array<Record<string, unknown>>>("/api/v1/schedules").then((items) =>
-      (Array.isArray(items) ? items : []).map((t) => ({
-        id: t.id as string,
-        name: (t.label ?? t.name ?? "") as string,
-        cron: t.cron as string,
-        prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? "",
-        enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
-        created_at: t.created_at as string | undefined,
-      })),
+      (Array.isArray(items) ? items : []).map((t) => {
+        // Extract prompt from kind.prompt or legacy payload.prompt
+        const kind = t.kind as Record<string, unknown> | undefined;
+        const payload = t.payload as Record<string, unknown> | undefined;
+        const prompt = (kind?.prompt as string) ?? (payload?.prompt as string) ?? "";
+        return {
+          id: t.id as string,
+          name: (t.label ?? t.name ?? "") as string,
+          cron: t.cron as string,
+          prompt,
+          enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
+          timezone: (t.timezone as string) ?? "UTC",
+          kind: t.kind as Schedule["kind"],
+          last_run: t.last_run as string | undefined,
+          next_run: t.next_run as string | undefined,
+          created_at: t.created_at as string | undefined,
+        };
+      }),
     );
   }
 
   createSchedule(body: Omit<Schedule, "id" | "created_at">): Promise<Schedule> {
-    const id = crypto.randomUUID();
     return this.post<Record<string, unknown>>("/api/v1/schedules", {
-      id,
-      label: body.name,
+      name: body.name,
       cron: body.cron,
-      payload: { prompt: body.prompt },
-    }).then((t) => ({
-      id: t.id as string,
-      name: (t.label ?? t.name ?? body.name) as string,
-      cron: t.cron as string,
-      prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? body.prompt,
-      enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
-    }));
+      prompt: body.prompt,
+      timezone: body.timezone ?? "UTC",
+    }).then((t) => {
+      const kind = t.kind as Record<string, unknown> | undefined;
+      const prompt = (kind?.prompt as string) ?? body.prompt;
+      return {
+        id: t.id as string,
+        name: (t.label ?? t.name ?? body.name) as string,
+        cron: t.cron as string,
+        prompt,
+        enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
+        timezone: (t.timezone as string) ?? body.timezone ?? "UTC",
+        kind: t.kind as Schedule["kind"],
+        created_at: t.created_at as string | undefined,
+      };
+    });
   }
 
   deleteSchedule(id: string): Promise<void> {
     return this.del(`/api/v1/schedules/${id}`);
+  }
+
+  getScheduleRuns(id: string, limit = 10): Promise<ScheduleRun[]> {
+    return this.get<ScheduleRun[]>(`/api/v1/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`);
+  }
+
+  getUpcomingSchedules(limit = 10): Promise<Schedule[]> {
+    return this.get<Schedule[]>(`/api/v1/schedules/upcoming?limit=${limit}`);
   }
 
   // ── Memory ────────────────────────────────────────────────

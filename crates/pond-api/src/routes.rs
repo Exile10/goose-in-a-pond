@@ -7,7 +7,7 @@
 
 use axum::{
     body::Body,
-    extract::{rejection::JsonRejection, Multipart, Path, State},
+    extract::{rejection::JsonRejection, Multipart, Path, Query, State},
     http::{Response, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -19,7 +19,8 @@ use axum::{
 use pond_core::domain::message::ChatMessage;
 use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
-use pond_core::ports::scheduler::CreateTaskRequest;
+use pond_core::domain::schedule::TaskKind;
+use pond_core::ports::scheduler::CreateScheduleRequest;
 use pond_core::domain::settings::Settings;
 use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::device_registry::RegisterDeviceRequest;
@@ -111,10 +112,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/camera/events/{id}/acknowledge", patch(acknowledge_camera_event))
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
+        .route("/schedules/upcoming", get(list_upcoming_schedules))
         .route("/schedules/{id}", delete(delete_schedule))
         .route("/schedules/{id}/pause", post(pause_schedule))
         .route("/schedules/{id}/resume", post(resume_schedule))
         .route("/schedules/{id}/run-now", post(run_schedule_now))
+        .route("/schedules/{id}/runs", get(list_schedule_runs))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
         .route("/extensions/{name}", delete(remove_extension_handler).patch(toggle_extension_handler))
@@ -3620,10 +3623,30 @@ async fn list_schedules(State(state): State<Arc<AppState>>) -> (StatusCode, Json
     }
 }
 
+/// API-level create schedule request — supports both the new format (`kind`,
+/// `timezone`) and the legacy format (`prompt` + `payload`).
+#[derive(Debug, serde::Deserialize)]
+struct ApiCreateScheduleRequest {
+    /// Optional: if absent, a UUID is generated.
+    id: Option<String>,
+    /// Human-readable name.  Falls back to `label` for backward compat.
+    #[serde(alias = "label")]
+    name: String,
+    cron: String,
+    /// The prompt to send to the agent (shorthand for AgentPrompt kind).
+    prompt: Option<String>,
+    /// IANA timezone.  Defaults to "UTC" if absent.
+    timezone: Option<String>,
+    /// Explicit kind — if omitted, inferred from `prompt` or `payload`.
+    kind: Option<TaskKind>,
+    /// Legacy field: `{"webhook_url": "..."}` or `{"prompt": "..."}`.
+    payload: Option<serde_json::Value>,
+}
+
 /// `POST /api/v1/schedules` — create a new scheduled task.
 async fn create_schedule(
     State(state): State<Arc<AppState>>,
-    result: Result<Json<CreateTaskRequest>, JsonRejection>,
+    result: Result<Json<ApiCreateScheduleRequest>, JsonRejection>,
 ) -> (StatusCode, Json<Value>) {
     let Some(scheduler) = &state.scheduler else {
         return (
@@ -3631,10 +3654,36 @@ async fn create_schedule(
             Json(json!({"error": "scheduler not configured"})),
         );
     };
-    let Json(req) = match result {
+    let Json(api_req) = match result {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     };
+
+    // Resolve task kind: explicit `kind` > `prompt` field > legacy `payload`.
+    let kind = if let Some(k) = api_req.kind {
+        k
+    } else if let Some(prompt) = api_req.prompt {
+        TaskKind::AgentPrompt { prompt }
+    } else if let Some(payload) = &api_req.payload {
+        if let Some(url) = payload.get("webhook_url").and_then(|v| v.as_str()) {
+            TaskKind::Webhook { webhook_url: url.to_string() }
+        } else if let Some(p) = payload.get("prompt").and_then(|v| v.as_str()) {
+            TaskKind::AgentPrompt { prompt: p.to_string() }
+        } else {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'prompt', 'kind', or 'payload.webhook_url'"})));
+        }
+    } else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'prompt' or 'kind'"})));
+    };
+
+    let req = CreateScheduleRequest {
+        id: api_req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        label: api_req.name,
+        cron: api_req.cron,
+        timezone: api_req.timezone.unwrap_or_else(|| "UTC".to_string()),
+        kind,
+    };
+
     match scheduler.create_task(req).await {
         Ok(task) => (StatusCode::CREATED, Json(json!(task))),
         Err(e) => (
@@ -3709,6 +3758,55 @@ async fn run_schedule_now(
     match scheduler.run_now(&id).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"fired": id}))),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `GET /api/v1/schedules/:id/runs` — execution history for a schedule.
+async fn list_schedule_runs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v: &String| v.parse().ok())
+        .unwrap_or(10);
+    match scheduler.get_runs(&id, limit).await {
+        Ok(runs) => (StatusCode::OK, Json(json!(runs))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// `GET /api/v1/schedules/upcoming` — active schedules sorted by next fire.
+async fn list_upcoming_schedules(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v: &String| v.parse().ok())
+        .unwrap_or(10);
+    match scheduler.list_upcoming(limit).await {
+        Ok(tasks) => (StatusCode::OK, Json(json!(tasks))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -4274,6 +4372,14 @@ async fn save_memory(
         source: req.source,
         tags: req.tags,
         created_at: chrono::Utc::now(),
+        segment: None,
+        importance: None,
+        tier: None,
+        decay_rate: None,
+        access_count: 0,
+        last_accessed_at: None,
+        lifecycle: None,
+        superseded_by: None,
     };
     match state.memory_repo.add(fragment.clone()).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(fragment))).into_response(),

@@ -26,6 +26,7 @@ mod piper_http;
 mod piper_process;
 mod ports;
 mod reqwest_model_downloader;
+mod schedule_executors;
 mod startup;
 mod system_deps;
 mod whisper_process;
@@ -52,7 +53,8 @@ use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
-use pond_infra_scheduler::{CronSchedulerAdapter, WebhookTaskExecutor};
+use pond_infra_scheduler::CronSchedulerAdapter;
+use schedule_executors::{AgentScheduleExecutor, DeferredExecutor};
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
@@ -1162,10 +1164,21 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         }
     };
 
-    // Scheduler — persist task list next to the databases
+    // Scheduler — persist task list next to the databases.
+    // Uses a DeferredExecutor so the scheduler can be created before the agent
+    // exists.  The real executor (AgentScheduleExecutor) is injected after the
+    // agent is constructed further below.
+    let deferred_executor = Arc::new(DeferredExecutor::new());
     let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
-        let exec = Arc::new(WebhookTaskExecutor::new());
-        match CronSchedulerAdapter::new(data_dir.join("schedules.json"), exec).await {
+        let exec: Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor> =
+            deferred_executor.clone();
+        match CronSchedulerAdapter::new(
+            data_dir.join("schedules.json"),
+            data_dir.join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        {
             Ok(s) => {
                 tracing::info!("scheduler ready ({})", data_dir.join("schedules.json").display());
                 Some(Arc::new(s))
@@ -1219,6 +1232,18 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         }
         (Arc::new(MockAgent::new()), None)
     };
+
+    // ── Fill the deferred schedule executor now that the agent exists ─────────
+    {
+        let real_executor = Arc::new(AgentScheduleExecutor::new(
+            agent.clone(),
+            session_storage.clone(),
+        ));
+        deferred_executor
+            .init(real_executor as Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor>)
+            .await;
+        tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
+    }
 
     // MCP client — load persisted server configs and auto-connect enabled ones.
     let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
@@ -2037,6 +2062,7 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
             else if text.contains("save_memory") { "save_memory" }
             else if text.contains("recall_memory") { "recall_memory" }
             else if text.contains("devices") { "devices" }
+            else if text.contains("create_schedule") { "create_schedule" }
             else if text.contains("schedules") { "schedules" }
             else { "wikipedia" };
 
@@ -2045,21 +2071,44 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
         match pond_mcp_server::try_tool_agent(tool, message).await {
             Some(info) => {
                 println!("[voice-tool-agent] got result ({} chars)", info.len());
-                Ok(Some(format!(
-                    "{}\n\n\
-                    [Retrieved information — USE THIS AS YOUR PRIMARY SOURCE]\n\
-                    {}\n\n\
-                    INSTRUCTIONS: Answer the user's question using the retrieved information above as \
-                    your authoritative source. Be thorough and detailed — include specific facts, numbers, \
-                    dates, and comparisons from the retrieved data. If the user asked to compare things, \
-                    highlight concrete differences and similarities. If they asked how something works, \
-                    explain the mechanism step by step. \
-                    Do NOT give a vague or generic answer when you have specific information available. \
-                    Do NOT mention tools, Wikipedia, APIs, or that anything was looked up — present \
-                    the information naturally as your own knowledge. \
-                    Match the personality and style from your system prompt.",
-                    message, info
-                )))
+
+                // Tool-specific context templates — avoid bloated instructions
+                // that overwhelm small models' limited context windows.
+                let augmented = match tool {
+                    // Action confirmations: relay directly, no "authoritative source" framing.
+                    "create_schedule" | "save_memory" | "devices" | "schedules" => {
+                        format!(
+                            "{}\n\n[Action result]\n{}\n\n\
+                            Tell the user what happened. Be concise and natural.",
+                            message, info
+                        )
+                    }
+                    // Weather: compact context.
+                    "weather" => {
+                        format!(
+                            "{}\n\n[Current weather data]\n{}\n\n\
+                            Report the weather naturally. No need to mention the data source.",
+                            message, info
+                        )
+                    }
+                    // Wikipedia / knowledge lookups: truncate to ~2000 chars to
+                    // stay within small-model context budgets.
+                    _ => {
+                        let truncated = if info.len() > 2000 {
+                            format!("{}…", &info[..2000])
+                        } else {
+                            info.clone()
+                        };
+                        format!(
+                            "{}\n\n[Reference]\n{}\n\n\
+                            Answer using the reference above. Include specific facts. \
+                            Do not mention that anything was looked up.",
+                            message, truncated
+                        )
+                    }
+                };
+
+                Ok(Some(augmented))
             }
             None => {
                 println!("[voice-tool-agent] tool returned no result");
@@ -3962,6 +4011,14 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
                 source: "cli".to_string(),
                 tags: vec![],
                 created_at: chrono::Utc::now(),
+                segment: None,
+                importance: None,
+                tier: None,
+                decay_rate: None,
+                access_count: 0,
+                last_accessed_at: None,
+                lifecycle: None,
+                superseded_by: None,
             };
             repo.add(fragment).await?;
             println!("✓ Memory saved (id: {id})");

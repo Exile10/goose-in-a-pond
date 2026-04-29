@@ -84,10 +84,26 @@ export interface Device {
 export interface Schedule {
   id: string;
   name: string;
+  label?: string;
   cron: string;
   prompt: string;
   enabled: boolean;
+  timezone?: string;
+  kind?: { type: "agent_prompt"; prompt: string } | { type: "webhook"; webhook_url: string };
+  last_run?: string;
+  next_run?: string;
   created_at?: string;
+}
+
+export interface ScheduleRun {
+  id: string;
+  schedule_id: string;
+  status: "running" | "completed" | "failed";
+  result?: string;
+  error?: string;
+  started_at: string;
+  finished_at?: string;
+  duration_ms?: number;
 }
 
 // ── Memory ────────────────────────────────────────────────────

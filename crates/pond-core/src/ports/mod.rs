@@ -23,6 +23,7 @@ pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;
 pub mod recipe;
+pub mod schedule_execution;
 pub mod scheduler;
 pub mod sensor_storage;
 pub mod session_storage;

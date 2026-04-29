@@ -86,9 +86,9 @@ pond-server  (binary — wires adapters into AppState, starts Axum + Tauri)
 pond-api     (Axum HTTP router, AppState struct, SSE streaming, REST handlers)
     │
 pond-core    (pure Rust domain — no external deps)
-  ├── domain/    ChatMessage, Device, Schedule, MemoryFragment, Settings …
-  ├── ports/     async_trait interfaces — LlmProvider, Agent, VoiceInput, SchedulerPort …
-  └── services/  ModelRouter, ChatService, request_classifier, mock impls
+  ├── domain/    ChatMessage, Device, Schedule, MemoryFragment, Settings, ModelCapabilities, ImageAttachment …
+  ├── ports/     async_trait interfaces — LlmProvider, Agent, VoiceInput, ToolAgent, AnswerReviewer …
+  └── services/  ChatService, request_classifier, context_budget, mock impls
     │
 pond-infra           (SQLite via SQLx — two databases)
 pond-infra-scheduler (tokio-cron-scheduler adapter)
@@ -105,11 +105,25 @@ Follow the 5-step pattern (documented in `docs/creating-ports-and-adapters.md`):
 4. **Real adapter** as `crates/pond-adapters-<name>/` — implements the port trait
 5. **Wire** in `crates/pond-server/src/main.rs` — inject into `AppState`
 
-### LLM Routing (`ModelRouter`)
+### Agent Pipeline
 
-Every chat message is classified by `pond-core/src/services/request_classifier.rs` into one of three roles: **Chat** (default) · **Think** (reasoning keywords like "explain why", "analyze") · **Task** (agentic keywords like "remind me", "schedule", "turn on"). The `ModelRouter` routes each role to a separately configured provider.
+Every chat message flows through a configurable pipeline:
 
-Provider switch at runtime: `PUT /api/v1/settings` with `chat_provider` / `chat_model` triggers `rebuild_model_router()` in `pond-api/src/routes.rs`, which hot-swaps `AppState.llm_provider` (a `RwLock`). Supported providers: `"llamafile"` · `"ollama"` · `"local"` (in-process GGUF via llama-cpp-2).
+1. **ToolAgent** (pre-processor): Classifies the message using the main LLM, fetches tool data (Wikipedia, weather, memory) if needed, and injects it into the agent message. Uses the live provider via `RwLock` -- zero model swap overhead.
+2. **Main LLM** (GooseAdapter): Generates the response with system prompt, conversation history, skills, and memory. Streams tokens via SSE.
+3. **AnswerReviewer** (post-processor, configurable): Adversarial critic evaluates answer quality. If score below threshold, sends critique back to the LLM for revision. Settings: `review_mode` ("off"/"on"/"auto"), `review_pass_threshold` (1-5), `review_max_rounds`.
+
+See `docs/architecture/agent_pipeline.md` for full details.
+
+### Model Capabilities
+
+`ModelCapabilities` struct (thinking, vision, audio, context_window, structured_output) is populated by each adapter from the model name. Used to drive: thinking mode in system prompts, context window budgeting, vision/image upload, capability badges in the UI.
+
+See `docs/architecture/model_capabilities.md` for details.
+
+### LLM Provider
+
+Provider switch at runtime: `PUT /api/v1/settings` with `chat_provider` / `chat_model` triggers `rebuild_llm_provider()` in `pond-api/src/routes.rs`, which hot-swaps `AppState.llm_provider` (a `RwLock`). Supported providers: `"llamafile"` · `"ollama"` · `"local"` (in-process GGUF via llama-cpp-2). Platform-aware settings (Metal GPU offload, flash attention, context size) are applied automatically.
 
 ### GGUF Provider (`local`)
 

@@ -1,10 +1,12 @@
 //! Integration tests for the scheduler REST routes:
 //!   GET    /api/v1/schedules
 //!   POST   /api/v1/schedules
+//!   GET    /api/v1/schedules/upcoming
 //!   DELETE /api/v1/schedules/:id
 //!   POST   /api/v1/schedules/:id/pause
 //!   POST   /api/v1/schedules/:id/resume
 //!   POST   /api/v1/schedules/:id/run-now
+//!   GET    /api/v1/schedules/:id/runs
 //!
 //! Run: cargo test -p pond-api --test schedule_integration_test
 
@@ -12,9 +14,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::domain::schedule::{Schedule, ScheduleRun};
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::ports::scheduler::{CreateTaskRequest, ScheduledTask, SchedulerPort};
+use pond_core::ports::schedule_execution::ScheduleExecutor;
+use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
@@ -59,7 +63,7 @@ impl DeviceRegistry for NoDevices {
 // ── In-memory mock scheduler ──────────────────────────────────────────────────
 
 struct InMemoryScheduler {
-    tasks: Mutex<HashMap<String, ScheduledTask>>,
+    tasks: Mutex<HashMap<String, Schedule>>,
 }
 
 impl InMemoryScheduler {
@@ -70,26 +74,28 @@ impl InMemoryScheduler {
 
 #[async_trait::async_trait]
 impl SchedulerPort for InMemoryScheduler {
-    async fn create_task(&self, req: CreateTaskRequest) -> anyhow::Result<ScheduledTask> {
+    async fn create_task(&self, req: CreateScheduleRequest) -> anyhow::Result<Schedule> {
         let mut guard = self.tasks.lock().await;
         if guard.contains_key(&req.id) {
             anyhow::bail!("task '{}' already exists", req.id);
         }
-        let task = ScheduledTask {
+        let schedule = Schedule {
             id: req.id.clone(),
             label: req.label,
             cron: req.cron,
+            timezone: req.timezone,
+            kind: req.kind,
             last_run: None,
             next_run: None,
             paused: false,
             currently_running: false,
-            payload: Some(req.payload),
+            created_at: chrono::Utc::now(),
         };
-        guard.insert(req.id, task.clone());
-        Ok(task)
+        guard.insert(req.id, schedule.clone());
+        Ok(schedule)
     }
 
-    async fn list_tasks(&self) -> anyhow::Result<Vec<ScheduledTask>> {
+    async fn list_tasks(&self) -> anyhow::Result<Vec<Schedule>> {
         Ok(self.tasks.lock().await.values().cloned().collect())
     }
 
@@ -115,6 +121,21 @@ impl SchedulerPort for InMemoryScheduler {
     async fn run_now(&self, id: &str) -> anyhow::Result<()> {
         let guard = self.tasks.lock().await;
         guard.get(id).map(|_| ()).ok_or_else(|| anyhow::anyhow!("not found"))
+    }
+
+    async fn get_runs(&self, _schedule_id: &str, _limit: u32) -> anyhow::Result<Vec<ScheduleRun>> {
+        Ok(vec![])
+    }
+
+    async fn list_upcoming(&self, limit: u32) -> anyhow::Result<Vec<Schedule>> {
+        let guard = self.tasks.lock().await;
+        let mut schedules: Vec<_> = guard.values().filter(|t| !t.paused).cloned().collect();
+        schedules.truncate(limit as usize);
+        Ok(schedules)
+    }
+
+    async fn set_executor(&self, _: Arc<dyn ScheduleExecutor>) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -220,7 +241,6 @@ async fn list_schedules_returns_empty_array_initially() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = json_body(resp).await;
-    // Should be an array (possibly empty), NOT {"error":"..."}
     assert!(
         json.is_array(),
         "expected array from GET /schedules, got: {json}"
@@ -231,11 +251,12 @@ async fn list_schedules_returns_empty_array_initially() {
 async fn create_schedule_returns_created_task() {
     let (app, _tmp) = make_app().await;
 
+    // Test new format with `prompt` field directly.
     let body = serde_json::json!({
-        "id": "daily-summary",
-        "label": "Daily Summary",
+        "name": "Daily Summary",
         "cron": "0 0 8 * * *",
-        "payload": {"prompt": "Summarize yesterday's events"}
+        "prompt": "Summarize yesterday's events",
+        "timezone": "Africa/Nairobi"
     });
 
     let resp = app
@@ -245,9 +266,33 @@ async fn create_schedule_returns_created_task() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let json = json_body(resp).await;
-    assert_eq!(json.get("id").and_then(|v| v.as_str()), Some("daily-summary"));
+    // ID is auto-generated.
+    assert!(json.get("id").and_then(|v| v.as_str()).is_some());
     assert_eq!(json.get("label").and_then(|v| v.as_str()), Some("Daily Summary"));
+    assert_eq!(json.get("timezone").and_then(|v| v.as_str()), Some("Africa/Nairobi"));
     assert_eq!(json.get("paused").and_then(|v| v.as_bool()), Some(false));
+}
+
+#[tokio::test]
+async fn create_schedule_legacy_payload_format() {
+    let (app, _tmp) = make_app().await;
+
+    // Legacy format with `payload.prompt`.
+    let body = serde_json::json!({
+        "id": "legacy-task",
+        "name": "Legacy Task",
+        "cron": "0 0 7 * * *",
+        "payload": {"prompt": "What's the weather today?"}
+    });
+
+    let resp = app
+        .oneshot(auth_post("/api/v1/schedules", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    assert_eq!(json.get("id").and_then(|v| v.as_str()), Some("legacy-task"));
 }
 
 #[tokio::test]
@@ -256,9 +301,9 @@ async fn created_schedule_appears_in_list() {
 
     let body = serde_json::json!({
         "id": "weather-check",
-        "label": "Weather Check",
+        "name": "Weather Check",
         "cron": "0 0 7 * * *",
-        "payload": {"prompt": "What's the weather today?"}
+        "prompt": "What's the weather today?"
     });
     app.clone()
         .oneshot(auth_post("/api/v1/schedules", body))
@@ -280,19 +325,17 @@ async fn created_schedule_appears_in_list() {
 async fn delete_schedule_removes_it() {
     let (app, _tmp) = make_app().await;
 
-    // Create
     let body = serde_json::json!({
         "id": "to-delete",
-        "label": "To Delete",
+        "name": "To Delete",
         "cron": "0 0 9 * * *",
-        "payload": {}
+        "prompt": "delete me"
     });
     app.clone()
         .oneshot(auth_post("/api/v1/schedules", body))
         .await
         .unwrap();
 
-    // Delete
     let del_resp = app
         .clone()
         .oneshot(auth_delete("/api/v1/schedules/to-delete"))
@@ -300,7 +343,6 @@ async fn delete_schedule_removes_it() {
         .unwrap();
     assert_eq!(del_resp.status(), StatusCode::OK);
 
-    // Should no longer be in list
     let list_resp = app.oneshot(auth_get("/api/v1/schedules")).await.unwrap();
     let json = json_body(list_resp).await;
     let tasks = json.as_array().unwrap();
@@ -314,12 +356,11 @@ async fn delete_schedule_removes_it() {
 async fn pause_and_resume_schedule() {
     let (app, _tmp) = make_app().await;
 
-    // Create
     let body = serde_json::json!({
         "id": "pausable",
-        "label": "Pausable",
+        "name": "Pausable",
         "cron": "0 0 10 * * *",
-        "payload": {}
+        "prompt": "pause me"
     });
     app.clone()
         .oneshot(auth_post("/api/v1/schedules", body))
@@ -334,7 +375,7 @@ async fn pause_and_resume_schedule() {
         .unwrap();
     assert_eq!(pause_resp.status(), StatusCode::OK);
 
-    // Verify paused in list
+    // Verify paused
     let list_resp = app.clone().oneshot(auth_get("/api/v1/schedules")).await.unwrap();
     let json = json_body(list_resp).await;
     let task = json.as_array().unwrap()
@@ -365,19 +406,17 @@ async fn pause_and_resume_schedule() {
 async fn run_now_returns_accepted() {
     let (app, _tmp) = make_app().await;
 
-    // Create
     let body = serde_json::json!({
         "id": "run-now-task",
-        "label": "Run Now",
+        "name": "Run Now",
         "cron": "0 0 11 * * *",
-        "payload": {"prompt": "run this now"}
+        "prompt": "run this now"
     });
     app.clone()
         .oneshot(auth_post("/api/v1/schedules", body))
         .await
         .unwrap();
 
-    // Run now
     let run_resp = app
         .oneshot(auth_post("/api/v1/schedules/run-now-task/run-now", serde_json::json!({})))
         .await
@@ -394,4 +433,53 @@ async fn delete_nonexistent_schedule_returns_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_runs_returns_empty_for_new_schedule() {
+    let (app, _tmp) = make_app().await;
+
+    let body = serde_json::json!({
+        "id": "has-no-runs",
+        "name": "No Runs",
+        "cron": "0 0 12 * * *",
+        "prompt": "test"
+    });
+    app.clone()
+        .oneshot(auth_post("/api/v1/schedules", body))
+        .await
+        .unwrap();
+
+    let resp = app.oneshot(auth_get("/api/v1/schedules/has-no-runs/runs")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = json_body(resp).await;
+    assert!(json.is_array());
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn upcoming_returns_active_schedules() {
+    let (app, _tmp) = make_app().await;
+
+    let body = serde_json::json!({
+        "id": "upcoming-task",
+        "name": "Upcoming",
+        "cron": "0 0 8 * * *",
+        "prompt": "test"
+    });
+    app.clone()
+        .oneshot(auth_post("/api/v1/schedules", body))
+        .await
+        .unwrap();
+
+    let resp = app.oneshot(auth_get("/api/v1/schedules/upcoming")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = json_body(resp).await;
+    let tasks = json.as_array().unwrap();
+    assert!(
+        tasks.iter().any(|t| t.get("id").and_then(|v| v.as_str()) == Some("upcoming-task")),
+        "upcoming task not found: {tasks:?}"
+    );
 }

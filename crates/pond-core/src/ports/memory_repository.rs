@@ -1,6 +1,6 @@
 //! MemoryRepository port — driven port for semantic memory persistence.
 
-use crate::domain::memory::MemoryFragment;
+use crate::domain::memory::{MemoryFragment, MemoryLifecycle, MemorySegment};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -33,4 +33,48 @@ pub trait MemoryRepository: Send + Sync {
 
     /// Delete a memory fragment by ID.
     async fn delete(&self, id: &str) -> Result<()>;
+
+    // ── Segment-aware methods (default no-op impls for backward compat) ──
+
+    /// Increment access_count and update last_accessed_at for a memory.
+    async fn record_access(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Update the lifecycle status of a memory.
+    async fn update_lifecycle(&self, _id: &str, _lifecycle: MemoryLifecycle) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search active memories by segment.
+    async fn search_by_segment(
+        &self,
+        _segment: MemorySegment,
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        self.search_recent(profile_id, limit).await
+    }
+
+    /// Retrieve all active memories that have decay fields for scoring.
+    /// Used by the cleanup service to find archive/prune candidates.
+    async fn search_scoreable(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<Vec<MemoryFragment>> {
+        self.search_recent(profile_id, 1000).await
+    }
+
+    /// Batch update lifecycle for multiple memories at once.
+    async fn batch_update_lifecycle(
+        &self,
+        _updates: &[(String, MemoryLifecycle)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark a memory as superseded by another (for consolidation).
+    async fn mark_superseded(&self, _id: &str, _superseded_by: &str) -> Result<()> {
+        Ok(())
+    }
 }

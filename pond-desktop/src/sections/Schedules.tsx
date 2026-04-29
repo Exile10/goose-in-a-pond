@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Card,
   CardContent,
@@ -7,10 +7,10 @@ import {
   Chip,
   Separator,
 } from "@heroui/react";
-import { Plus, Trash2, Play, Pencil, CalendarClock } from "lucide-react";
+import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
-import type { Schedule } from "../api/types";
+import type { Schedule, ScheduleRun } from "../api/types";
 
 /* ── Frequency presets for the create form ─────────────────── */
 const FREQ_PRESETS: Record<string, string> = {
@@ -29,6 +29,28 @@ const RECIPE_PRESETS: Record<string, string> = {
   "Custom":               "",
 };
 
+/* ── Common IANA timezones ────────────────────────────────── */
+const TIMEZONE_OPTIONS = [
+  "UTC",
+  "Africa/Nairobi",
+  "Africa/Lagos",
+  "Africa/Cairo",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "America/Sao_Paulo",
+  "Asia/Tokyo",
+  "Asia/Shanghai",
+  "Asia/Kolkata",
+  "Asia/Dubai",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "Australia/Sydney",
+  "Pacific/Auckland",
+];
+
 export function Schedules() {
   const state = useAppState();
   const [schedules, setSchedules]     = useState<Schedule[]>([]);
@@ -42,9 +64,14 @@ export function Schedules() {
   const [name, setName]               = useState("");
   const [cron, setCron]               = useState("");
   const [prompt, setPrompt]           = useState("");
+  const [timezone, setTimezone]       = useState("UTC");
   const [freqKey, setFreqKey]         = useState("Custom");
   const [recipeKey, setRecipeKey]     = useState("Custom");
   const [submitting, setSubmitting]   = useState(false);
+
+  // Run history per schedule (expanded state + cached runs)
+  const [expandedRuns, setExpandedRuns] = useState<string | null>(null);
+  const [runsCache, setRunsCache]       = useState<Record<string, ScheduleRun[]>>({});
 
   function load() {
     setLoading(true);
@@ -77,11 +104,13 @@ export function Schedules() {
         name: name.trim(),
         cron: cron.trim(),
         prompt: prompt.trim(),
+        timezone,
         enabled: true,
       });
       setName("");
       setCron("");
       setPrompt("");
+      setTimezone("UTC");
       setFreqKey("Custom");
       setRecipeKey("Custom");
       setShowForm(false);
@@ -128,6 +157,20 @@ export function Schedules() {
       flashMsg(String(e), true);
     }
   }
+
+  const toggleRuns = useCallback(async (id: string) => {
+    if (expandedRuns === id) {
+      setExpandedRuns(null);
+      return;
+    }
+    setExpandedRuns(id);
+    try {
+      const runs = await api.getScheduleRuns(id, 5);
+      setRunsCache((prev) => ({ ...prev, [id]: runs }));
+    } catch {
+      setRunsCache((prev) => ({ ...prev, [id]: [] }));
+    }
+  }, [expandedRuns]);
 
   function handleFreqChange(key: string) {
     setFreqKey(key);
@@ -205,6 +248,21 @@ export function Schedules() {
                 onChange={(e) => setCron(e.target.value)}
                 spellCheck={false}
               />
+            </div>
+
+            {/* Timezone */}
+            <div style={modalStyles.fieldGroup}>
+              <label style={modalStyles.label}>Timezone</label>
+              <select
+                style={modalStyles.select}
+                value={timezone}
+                onChange={(e) => setTimezone(e.target.value)}
+                aria-label="Schedule timezone"
+              >
+                {TIMEZONE_OPTIONS.map((tz) => (
+                  <option key={tz} value={tz}>{tz}</option>
+                ))}
+              </select>
             </div>
 
             {/* Recipe select */}
@@ -313,7 +371,15 @@ export function Schedules() {
                   </div>
                   <div className="sched-card__main">
                     <div className="sched-card__name">{s.name}</div>
-                    <code style={cronStyle}>{s.cron}</code>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                      <code style={cronStyle}>{s.cron}</code>
+                      {s.timezone && s.timezone !== "UTC" && (
+                        <span style={{ fontSize: 11, color: "var(--grey-500)" }}>
+                          <Clock size={10} style={{ marginRight: 2, verticalAlign: "middle" }} />
+                          {s.timezone}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <Switch
                     size="sm"
@@ -386,6 +452,69 @@ export function Schedules() {
                   >
                     Delete
                   </Button>
+                </div>
+
+                {/* ── Run history toggle ─────────────────── */}
+                <div style={{ marginTop: 8 }}>
+                  <button
+                    onClick={() => toggleRuns(s.id)}
+                    style={{
+                      background: "none", border: "none", cursor: "pointer",
+                      fontSize: 12, color: "var(--grey-500)", display: "flex",
+                      alignItems: "center", gap: 4, padding: 0,
+                    }}
+                  >
+                    {expandedRuns === s.id ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                    History
+                  </button>
+
+                  {expandedRuns === s.id && (
+                    <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {(runsCache[s.id] ?? []).length === 0 ? (
+                        <span style={{ fontSize: 12, color: "var(--grey-400)" }}>No runs yet.</span>
+                      ) : (
+                        (runsCache[s.id] ?? []).map((r) => (
+                          <div
+                            key={r.id}
+                            style={{
+                              fontSize: 12, padding: "4px 8px",
+                              background: "var(--grey-50, #fafafa)",
+                              borderRadius: 4, display: "flex", gap: 8, alignItems: "center",
+                            }}
+                          >
+                            <Chip
+                              size="sm"
+                              variant="flat"
+                              color={r.status === "completed" ? "success" : r.status === "failed" ? "danger" : "warning"}
+                            >
+                              {r.status}
+                            </Chip>
+                            <span style={{ color: "var(--grey-500)", whiteSpace: "nowrap" }}>
+                              {new Date(r.started_at).toLocaleString(undefined, {
+                                month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                              })}
+                            </span>
+                            {r.duration_ms != null && (
+                              <span style={{ color: "var(--grey-400)" }}>{(r.duration_ms / 1000).toFixed(1)}s</span>
+                            )}
+                            {r.result && (
+                              <span style={{
+                                flex: 1, overflow: "hidden", textOverflow: "ellipsis",
+                                whiteSpace: "nowrap", color: "var(--grey-600)",
+                              }}>
+                                {r.result.slice(0, 120)}
+                              </span>
+                            )}
+                            {r.error && (
+                              <span style={{ color: "var(--color-destructive)", flex: 1 }}>
+                                {r.error.slice(0, 120)}
+                              </span>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>

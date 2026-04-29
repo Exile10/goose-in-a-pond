@@ -224,6 +224,23 @@ pub struct Settings {
     /// How many memory fragments to inject (most recent first)
     #[serde(default = "Settings::default_agent_memory_limit")]
     pub agent_memory_limit: u32,
+
+    /// When true, durable facts are automatically extracted from each conversation
+    /// turn and stored as categorised memories (segment, importance, decay).
+    #[serde(default)]
+    pub memory_extraction_enabled: bool,
+
+    /// When true, a background task periodically prunes/archives decayed memories.
+    #[serde(default)]
+    pub memory_cleanup_enabled: bool,
+
+    /// When true, a background task periodically merges duplicate/contradicting memories.
+    #[serde(default)]
+    pub memory_consolidation_enabled: bool,
+
+    /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
+    #[serde(default = "Settings::default_schedule_result_notify")]
+    pub schedule_result_notify: bool,
 }
 
 impl Default for Settings {
@@ -272,6 +289,10 @@ impl Default for Settings {
             agent_max_turns:                 Self::default_agent_max_turns(),
             agent_memory_inject:             Self::default_agent_memory_inject(),
             agent_memory_limit:              Self::default_agent_memory_limit(),
+            memory_extraction_enabled:       false,
+            memory_cleanup_enabled:          false,
+            memory_consolidation_enabled:    false,
+            schedule_result_notify:          Self::default_schedule_result_notify(),
         }
     }
 }
@@ -316,6 +337,7 @@ impl Settings {
     fn default_agent_max_turns()            -> u32    { 20 }
     fn default_agent_memory_inject()        -> bool   { false }
     fn default_agent_memory_limit()         -> u32    { 5 }
+    fn default_schedule_result_notify()     -> bool   { true }
 }
 
 #[cfg(test)]

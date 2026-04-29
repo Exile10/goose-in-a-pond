@@ -71,6 +71,7 @@ pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
         ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before, or asks about their own preferences/history."),
         ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
         ("schedules", "List scheduled tasks and automations. Use when the user asks about their schedules, reminders, or timed tasks."),
+        ("create_schedule", "Create a new scheduled automation that runs a prompt at a recurring time. Use when the user wants to schedule something, set up a recurring task, or says 'every morning', 'every day at', 'schedule to', 'remind me every', 'at 10 am do'."),
     ]
 }
 
@@ -105,47 +106,50 @@ fn build_classifier_prompt_inner() -> String {
         .collect();
 
     format!(
-        "You are a tool routing classifier. Your ONLY job is to output a JSON object.\n\n\
-        IMPORTANT: You are classifying for a small on-device language model with LIMITED knowledge. \
-        This model frequently gets facts wrong, confuses details, or gives shallow answers when \
-        asked about real-world topics. The wikipedia tool gives it accurate, detailed information \
-        that dramatically improves answer quality. When in doubt, USE THE TOOL — a lookup that \
-        wasn't strictly needed costs nothing, but a wrong answer without a lookup is harmful.\n\n\
-        RULE: If the user asks about ANY real-world topic, concept, person, place, event, science, \
-        comparison, definition, or factual question — route to wikipedia. Only skip the tool for \
-        purely conversational messages (greetings, jokes, opinions, creative writing, personal \
-        chat, coding help).\n\n\
+        "You are a tool routing classifier. Output ONLY a JSON object.\n\n\
+        DEFAULT: Most messages need NO tool. The assistant can answer opinions, advice, \
+        recommendations, creative requests, coding questions, follow-ups, and general \
+        conversation from its own knowledge. Only route to a tool when the user explicitly \
+        requests an ACTION (schedule, remember, device control) or asks a SPECIFIC FACTUAL \
+        question about a real-world entity (a person, place, scientific concept, historical event).\n\n\
+        NEVER use a tool for:\n\
+        - Opinions, advice, or recommendations (\"should I...\", \"do you think...\", \"would you recommend...\")\n\
+        - Follow-up questions (\"how about...\", \"what about...\", \"and...\")\n\
+        - Creative requests (poems, jokes, stories, brainstorming)\n\
+        - Coding or technical help\n\
+        - Personal conversation, greetings, thanks\n\
+        - Subjective questions (\"is X good?\", \"what's the best...\")\n\n\
+        USE wikipedia ONLY for: specific named entities, factual definitions, historical facts, \
+        scientific explanations. The question must name a concrete topic to look up.\n\n\
         TOOLS:\n{tools}\n\n\
         EXAMPLES:\n\
         User: \"What's the weather like?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\
+        User: \"How's the temperature outside?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\
         User: \"Who is Albert Einstein?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
         User: \"Tell me about black holes\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
         User: \"What is photosynthesis?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"Compare Python and Rust\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"What is the difference between TCP and UDP?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"How does a combustion engine work?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"Tell me about Kenya\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"What are the symptoms of malaria?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"Who invented the telephone?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"What is quantum computing?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"Explain the theory of relativity\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"What are the pros and cons of solar energy?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
         User: \"How tall is Mount Kilimanjaro?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
-        User: \"What is machine learning?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
+        User: \"What are the symptoms of malaria?\" → {{\"needs_tool\": true, \"tool\": \"wikipedia\"}}\n\
         User: \"Remember that I love peanuts\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
         User: \"Don't forget my birthday is March 5\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
-        User: \"Note that I'm allergic to shellfish\" → {{\"needs_tool\": true, \"tool\": \"save_memory\"}}\n\
         User: \"Do you remember what food I like?\" → {{\"needs_tool\": true, \"tool\": \"recall_memory\"}}\n\
-        User: \"What did I tell you about my preferences?\" → {{\"needs_tool\": true, \"tool\": \"recall_memory\"}}\n\
         User: \"What devices are connected?\" → {{\"needs_tool\": true, \"tool\": \"devices\"}}\n\
         User: \"What's on my schedule?\" → {{\"needs_tool\": true, \"tool\": \"schedules\"}}\n\
-        User: \"How's the temperature outside?\" → {{\"needs_tool\": true, \"tool\": \"weather\"}}\n\
+        User: \"Schedule to get the weather at 10 am every morning\" → {{\"needs_tool\": true, \"tool\": \"create_schedule\"}}\n\
+        User: \"Every day at 8 AM, give me a briefing\" → {{\"needs_tool\": true, \"tool\": \"create_schedule\"}}\n\
         User: \"Hello!\" → {{\"needs_tool\": false, \"tool\": null}}\n\
         User: \"Tell me a joke\" → {{\"needs_tool\": false, \"tool\": null}}\n\
         User: \"Thanks\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Would you recommend that I drink milk?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"How about pizza?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Should I exercise more?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"What do you think about AI?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Is it a good idea to learn Python?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
         User: \"Write me a poem about the sea\" → {{\"needs_tool\": false, \"tool\": null}}\n\
         User: \"Help me debug this code\" → {{\"needs_tool\": false, \"tool\": null}}\n\
-        User: \"What do you think about AI?\" → {{\"needs_tool\": false, \"tool\": null}}\n\n\
+        User: \"What's the best way to cook rice?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Can you help me plan my weekend?\" → {{\"needs_tool\": false, \"tool\": null}}\n\
+        User: \"Compare these two approaches\" → {{\"needs_tool\": false, \"tool\": null}}\n\n\
         Output ONLY the JSON object. No explanation.",
         tools = tool_lines.join("\n"),
     )

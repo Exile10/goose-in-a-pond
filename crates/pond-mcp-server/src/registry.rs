@@ -99,6 +99,7 @@ pub async fn try_tool_agent(tool: &str, message: &str) -> Option<String> {
         "recall_memory" => try_recall_memory(message).await,
         "devices" => try_list_devices().await,
         "schedules" => try_list_schedules().await,
+        "create_schedule" => try_create_schedule(message).await,
         "wikipedia" | _ => try_wikipedia_lookup(message).await,
     }
 }
@@ -118,6 +119,14 @@ async fn try_save_memory(message: &str) -> Option<String> {
         source: "tool_agent".to_string(),
         tags: vec![],
         created_at: chrono::Utc::now(),
+        segment: None,
+        importance: None,
+        tier: None,
+        decay_rate: None,
+        access_count: 0,
+        last_accessed_at: None,
+        lifecycle: None,
+        superseded_by: None,
     };
     match services.memory_repo.add(fragment).await {
         Ok(_) => {
@@ -172,20 +181,318 @@ async fn try_list_devices() -> Option<String> {
     Some(text)
 }
 
-/// List scheduled tasks.
+/// List scheduled tasks with kind and timezone info.
 async fn try_list_schedules() -> Option<String> {
+    use pond_core::domain::schedule::TaskKind;
     let services = GIAP_SERVICES.get()?;
     let scheduler = services.scheduler.as_ref()?;
     let tasks = scheduler.list_tasks().await.ok()?;
     if tasks.is_empty() {
         return Some("No scheduled tasks.".to_string());
     }
-    let text = tasks.iter()
-        .map(|t| format!("- {} [{}]: {} ({})", t.label, t.id, t.cron, if t.paused { "paused" } else { "active" }))
+    let text = tasks
+        .iter()
+        .map(|t| {
+            let kind_label = match &t.kind {
+                TaskKind::AgentPrompt { .. } => "agent",
+                TaskKind::Webhook { .. } => "webhook",
+            };
+            let status = if t.currently_running {
+                "running"
+            } else if t.paused {
+                "paused"
+            } else {
+                "active"
+            };
+            format!(
+                "- {} [{}]: {} {} ({}, {})",
+                t.label, t.id, t.cron, t.timezone, kind_label, status
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     println!("[tool-agent] listed {} schedules", tasks.len());
     Some(text)
+}
+
+/// Create a schedule from a natural language message.
+///
+/// Parses common time patterns (e.g. "at 10 am every morning", "every day at 8",
+/// "every hour") into a 6-field cron expression and creates the schedule.
+/// Returns a confirmation message on success.
+async fn try_create_schedule(message: &str) -> Option<String> {
+    use pond_core::domain::schedule::TaskKind;
+    use pond_core::ports::scheduler::CreateScheduleRequest;
+
+    let services = GIAP_SERVICES.get()?;
+    let scheduler = services.scheduler.as_ref()?;
+
+    let lower = message.to_lowercase();
+
+    // ── Parse time from message ──────────────────────────────────────────
+    let cron = parse_cron_from_message(&lower)?;
+
+    // ── Extract the action/prompt ────────────────────────────────────────
+    // Strip scheduling prefixes to get what the user actually wants done.
+    let prompt = extract_prompt_from_message(&lower, message);
+
+    // Get user timezone from settings.
+    let timezone = services
+        .settings_repo
+        .get()
+        .await
+        .map(|s| s.timezone.clone())
+        .unwrap_or_else(|_| "UTC".to_string());
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let label = if prompt.len() > 40 {
+        format!("{}...", &prompt[..37])
+    } else {
+        prompt.clone()
+    };
+
+    let req = CreateScheduleRequest {
+        id: id.clone(),
+        label,
+        cron: cron.clone(),
+        timezone: timezone.clone(),
+        kind: TaskKind::AgentPrompt {
+            prompt: prompt.clone(),
+        },
+    };
+
+    match scheduler.create_task(req).await {
+        Ok(schedule) => {
+            println!(
+                "[tool-agent] created schedule: {} [{}] cron={} tz={}",
+                schedule.label, schedule.id, schedule.cron, schedule.timezone
+            );
+            Some(format!(
+                "Schedule created successfully!\n\
+                 - Name: {}\n\
+                 - Schedule: {} ({})\n\
+                 - Prompt: \"{}\"\n\
+                 - ID: {}\n\n\
+                 The agent will automatically run this prompt at the scheduled time.",
+                schedule.label, schedule.cron, schedule.timezone, prompt, schedule.id,
+            ))
+        }
+        Err(e) => {
+            println!("[tool-agent] create_schedule failed: {e}");
+            Some(format!("Failed to create schedule: {e}"))
+        }
+    }
+}
+
+/// Parse a 6-field cron expression from a natural language time description.
+/// Returns `None` if no recognizable time pattern is found.
+fn parse_cron_from_message(lower: &str) -> Option<String> {
+    // Try to extract "at HH" or "at HH:MM" patterns
+    let hour = extract_hour(lower);
+
+    if lower.contains("every minute") {
+        return Some("0 * * * * *".to_string());
+    }
+    if lower.contains("every hour") || lower.contains("hourly") {
+        let min = extract_minute(lower).unwrap_or(0);
+        return Some(format!("0 {min} * * * *"));
+    }
+
+    // "every morning" / "every day" / "daily"
+    if lower.contains("every morning")
+        || lower.contains("every day")
+        || lower.contains("daily")
+        || lower.contains("each morning")
+        || lower.contains("each day")
+    {
+        let h = hour.unwrap_or(8); // default 8 AM for "every morning"
+        let m = extract_minute(lower).unwrap_or(0);
+        return Some(format!("0 {m} {h} * * *"));
+    }
+
+    // "every evening" / "every night"
+    if lower.contains("every evening") || lower.contains("every night") {
+        let h = hour.unwrap_or(20); // default 8 PM
+        let m = extract_minute(lower).unwrap_or(0);
+        return Some(format!("0 {m} {h} * * *"));
+    }
+
+    // "every week" / "weekly" / "every monday" etc.
+    if lower.contains("every week") || lower.contains("weekly") {
+        let h = hour.unwrap_or(8);
+        let m = extract_minute(lower).unwrap_or(0);
+        let dow = extract_day_of_week(lower).unwrap_or(1); // default Monday
+        return Some(format!("0 {m} {h} * * {dow}"));
+    }
+
+    // Bare "at X am/pm" without frequency → default to daily
+    if let Some(h) = hour {
+        let m = extract_minute(lower).unwrap_or(0);
+        return Some(format!("0 {m} {h} * * *"));
+    }
+
+    None
+}
+
+/// Extract hour from patterns like "at 10 am", "at 8pm", "at 14:30"
+fn extract_hour(s: &str) -> Option<u32> {
+    // Pattern: "at HH" or "at H"
+    let patterns = ["at ", "by "];
+    for pat in patterns {
+        if let Some(idx) = s.find(pat) {
+            let after = &s[idx + pat.len()..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(mut h) = num_str.parse::<u32>() {
+                let rest = after[num_str.len()..].trim_start();
+                if rest.starts_with("pm") || rest.starts_with("p.m") {
+                    if h < 12 {
+                        h += 12;
+                    }
+                } else if rest.starts_with("am") || rest.starts_with("a.m") {
+                    if h == 12 {
+                        h = 0;
+                    }
+                }
+                if h <= 23 {
+                    return Some(h);
+                }
+            }
+        }
+    }
+    // Pattern: "N o'clock"
+    if let Some(idx) = s.find("o'clock").or_else(|| s.find("o clock")) {
+        let before = s[..idx].trim_end();
+        let num_str: String = before.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect();
+        if let Ok(h) = num_str.parse::<u32>() {
+            if h <= 23 {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
+/// Extract minute from "HH:MM" or ":MM"
+fn extract_minute(s: &str) -> Option<u32> {
+    // Look for :MM pattern after a digit
+    for (i, _) in s.match_indices(':') {
+        if i > 0 && s.as_bytes()[i - 1].is_ascii_digit() {
+            let after = &s[i + 1..];
+            let num_str: String = after.chars().take(2).take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(m) = num_str.parse::<u32>() {
+                if m < 60 {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract day of week (0=Sun, 1=Mon, ... 6=Sat) for tokio-cron-scheduler.
+fn extract_day_of_week(s: &str) -> Option<u32> {
+    if s.contains("sunday") || s.contains("sun") { return Some(0); }
+    if s.contains("monday") || s.contains("mon") { return Some(1); }
+    if s.contains("tuesday") || s.contains("tue") { return Some(2); }
+    if s.contains("wednesday") || s.contains("wed") { return Some(3); }
+    if s.contains("thursday") || s.contains("thu") { return Some(4); }
+    if s.contains("friday") || s.contains("fri") { return Some(5); }
+    if s.contains("saturday") || s.contains("sat") { return Some(6); }
+    None
+}
+
+/// Extract the action prompt from a scheduling message.
+/// Strips scheduling-related prefixes to get the core task description.
+fn extract_prompt_from_message(lower: &str, original: &str) -> String {
+    // Common prefixes to strip
+    let strip_patterns = [
+        "schedule to ", "schedule ", "set up a ", "set up ",
+        "every morning ", "every day ", "every evening ", "every night ",
+        "every hour ", "every week ", "every minute ",
+        "daily ", "hourly ", "weekly ",
+        "remind me to ", "remind me ",
+        "at ", "by ",
+    ];
+
+    let mut work = lower.to_string();
+
+    // Strip leading scheduling/time words
+    for pat in &strip_patterns {
+        if let Some(rest) = work.strip_prefix(pat) {
+            work = rest.to_string();
+        }
+    }
+
+    // Strip "at HH am/pm" and "every X" from middle
+    let time_re_patterns = [
+        "at ", "every morning", "every day", "every evening",
+        "every night", "every hour", "every week", "every minute",
+        "daily", "hourly", "weekly",
+    ];
+    for pat in &time_re_patterns {
+        work = work.replace(pat, " ");
+    }
+
+    // Strip am/pm and digits that look like times
+    let cleaned: String = work
+        .split_whitespace()
+        .filter(|w| {
+            !w.chars().all(|c| c.is_ascii_digit() || c == ':')
+                && *w != "am"
+                && *w != "pm"
+                && *w != "a.m."
+                && *w != "p.m."
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let trimmed = cleaned.trim().to_string();
+
+    // If extraction left nothing useful, use the original message as the prompt
+    if trimmed.len() < 5 {
+        return original.trim().to_string();
+    }
+
+    // Capitalize first letter
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(c) => format!("{}{}", c.to_uppercase(), chars.collect::<String>()),
+        None => original.trim().to_string(),
+    }
+}
+
+/// Build a context block of upcoming scheduled tasks for system prompt injection.
+/// Returns `Some("## Upcoming Scheduled Tasks\n- ...")` or `None` if no active tasks.
+pub async fn try_upcoming_schedules_context() -> Option<String> {
+    let services = GIAP_SERVICES.get()?;
+    let scheduler = services.scheduler.as_ref()?;
+    let tasks = scheduler.list_upcoming(5).await.ok()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = tasks
+        .iter()
+        .map(|t| {
+            let kind_label = match &t.kind {
+                pond_core::domain::schedule::TaskKind::AgentPrompt { prompt } => {
+                    let preview = if prompt.len() > 60 {
+                        format!("{}...", &prompt[..57])
+                    } else {
+                        prompt.clone()
+                    };
+                    format!("agent: \"{preview}\"")
+                }
+                pond_core::domain::schedule::TaskKind::Webhook { webhook_url } => {
+                    format!("webhook: {webhook_url}")
+                }
+            };
+            format!("- \"{}\" — {} {} ({})", t.label, t.cron, t.timezone, kind_label)
+        })
+        .collect();
+    Some(format!(
+        "## Upcoming Scheduled Tasks\n{}",
+        lines.join("\n")
+    ))
 }
 
 pub fn spawn_giap_server(reader: DuplexStream, writer: DuplexStream) {

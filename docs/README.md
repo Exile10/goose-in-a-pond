@@ -10,6 +10,8 @@ Welcome to the GIAP documentation. This index covers architecture, development g
 |---|---|
 | [Component Breakdown](./architecture/components.md) | Purpose and structure of every crate in `crates/` and `pond-desktop/` |
 | [Data Flow & Lifecycle](./architecture/data_flow.md) | How a chat request travels from HTTP → Core → Goose → response |
+| [Agent Pipeline](./architecture/agent_pipeline.md) | ToolAgent pre-processor, Main LLM, AnswerReviewer post-processor |
+| [Model Capabilities](./architecture/model_capabilities.md) | Runtime capability discovery: thinking, vision, context window |
 | [Visual Workflow](./architecture/visual_workflow.md) | Flowcharts and sequence diagrams using the Weather feature as an example |
 | [Data Pipeline](./architecture/data_pipeline.md) | Constrained inference architecture for edge hardware (Jetson Orin Nano) |
 
@@ -20,6 +22,8 @@ Welcome to the GIAP documentation. This index covers architecture, development g
 | Document | Description |
 |---|---|
 | [Creating Ports & Adapters](../docs/creating-ports-and-adapters.md) | Step-by-step guide for adding new capabilities while keeping the Core pure |
+| [Inference Optimization](./developer/inference_optimization.md) | Platform settings, context management, classifier tuning, memory pressure |
+| [Voice Pipeline Interrupt](./developer/voice_pipeline_interrupt.md) | Wake-word interrupt during inference/TTS, pipelined synthesis |
 | [TDD Guide](./testing/tdd_guide.md) | Test-driven development practices — Core mocks first, then real adapters |
 | [Onboarding System](./Onboarding_Doc/Onboarding_guide.md) | Multi-step device onboarding flow and API protection |
 
