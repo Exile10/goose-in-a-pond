@@ -104,12 +104,20 @@ pub async fn try_tool_agent(tool: &str, message: &str) -> Option<String> {
     }
 }
 
-/// Save a memory fragment from the user's message.
+/// Save a memory fragment from the user's message, with auto-segment classification.
 async fn try_save_memory(message: &str) -> Option<String> {
-    use pond_core::domain::memory::MemoryFragment;
+    use pond_core::domain::memory::{MemoryFragment, MemoryLifecycle};
+    use crate::giap_server::auto_classify_segment;
+
     let services = GIAP_SERVICES.get()?;
     let cleaned = crate::giap_server::clean_query_for_search(message);
     let content = if cleaned.is_empty() { message.trim().to_string() } else { cleaned };
+
+    let segment = auto_classify_segment(&content);
+    let importance = segment.default_importance();
+    let tier = segment.default_tier();
+    let decay_rate = tier.default_decay_rate();
+
     let fragment = MemoryFragment {
         id: uuid::Uuid::new_v4().to_string(),
         profile_id: None,
@@ -119,13 +127,13 @@ async fn try_save_memory(message: &str) -> Option<String> {
         source: "tool_agent".to_string(),
         tags: vec![],
         created_at: chrono::Utc::now(),
-        segment: None,
-        importance: None,
-        tier: None,
-        decay_rate: None,
+        segment: Some(segment),
+        importance: Some(importance),
+        tier: Some(tier),
+        decay_rate: Some(decay_rate),
         access_count: 0,
         last_accessed_at: None,
-        lifecycle: None,
+        lifecycle: Some(MemoryLifecycle::Active),
         superseded_by: None,
     };
     match services.memory_repo.add(fragment).await {
