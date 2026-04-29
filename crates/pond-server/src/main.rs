@@ -550,6 +550,15 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
+    // Step 7 (face-onnx feature only): face recognition models
+    #[cfg(feature = "face-onnx")]
+    {
+        println!("\n  [7/7] Setting up face recognition models...");
+        if let Err(e) = model_download::download_face_models(&data_dir).await {
+            println!("  ⚠  Face model setup failed: {} — face recognition will be disabled until you add the files manually", e);
+        }
+    }
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
@@ -692,6 +701,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("  ╚═══════════════════════════════════════╝");
+
+    // Bake in the face-recognition runtime defaults so the server Just Works
+    // on a fresh macOS install without the operator having to remember a
+    // four-line env-var incantation.  Every var stays overridable — we only
+    // set it when it is currently *unset*.
+    apply_face_recognition_defaults();
 
     // Initialize databases
     let data_dir = default_data_dir();
@@ -939,6 +954,29 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         Arc::new(SqliteSensorStorage::new(db.logs.clone()));
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
         Arc::new(SqliteCameraStorage::new(db.logs.clone()));
+
+    // ── Face recognition (Phase 2) ──────────────────────────────────────────
+    // Built only when the --features face-onnx build flag is enabled AND an
+    // ONNX embedding model is present on disk.  Missing model file → None
+    // (server starts normally; /api/v1/faces/* return 503).
+    //
+    // First call the auto-downloader so a fresh `cargo run` brings the
+    // models down on its own, exactly the way whisper / piper do.  We
+    // do this only when the face feature is compiled in, and we let
+    // failures fall through — `build_face_recognition` will simply
+    // return `None` when the files are absent.
+    #[cfg(feature = "face-onnx")]
+    {
+        if let Err(e) = model_download::download_face_models(&data_dir).await {
+            tracing::warn!("face model auto-download failed: {e:#}");
+        }
+        // Re-apply defaults: the antispoof file may have just appeared on
+        // disk for the first time, in which case the earlier env-default
+        // pass was a no-op.  Idempotent — only sets unset vars.
+        apply_face_recognition_defaults();
+    }
+    let face_recognition: Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> =
+        build_face_recognition(&data_dir, db.system.clone());
 
     let prompt_template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
         Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
@@ -1270,6 +1308,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
         event_log_repo: event_log_repo,
+        face_recognition,
+        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     // Warn if static assets haven't been built yet
@@ -1947,6 +1987,75 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// Populate the face-recognition env vars with values that are known to
+/// work end-to-end on a fresh macOS dev install, so the operator no longer
+/// has to remember:
+///
+/// ```bash
+/// ORT_DYLIB_PATH=… POND_FACE_ANTISPOOF_PATH=… \
+/// POND_FACE_ANTISPOOF_LIVE_INDEX=2 \
+/// POND_FACE_ANTISPOOF_PIXEL_SCALE=unit \
+/// cargo run … serve
+/// ```
+///
+/// Each var is only set when currently **unset** — explicit values from
+/// the operator's shell keep taking precedence, so nothing a power user
+/// has configured gets clobbered.
+///
+/// The anti-spoof tuning (`LIVE_INDEX=2`, `PIXEL_SCALE=unit`) reflects the
+/// specific 3-class Silent-Face ONNX file we shipped install instructions
+/// for — on that export, slot 2 is the live class and the preprocess
+/// expects `[0, 1]` pixels.  Other exports need different values; override
+/// at the shell if you swap the model file.
+fn apply_face_recognition_defaults() {
+    // ONNX Runtime dylib — Homebrew installs to /opt/homebrew on Apple
+    // Silicon and /usr/local on Intel.  Try both.
+    let ort_candidates = [
+        "/opt/homebrew/lib/libonnxruntime.dylib",
+        "/usr/local/lib/libonnxruntime.dylib",
+    ];
+    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        for p in ort_candidates {
+            if std::path::Path::new(p).exists() {
+                // SAFETY: single-threaded setup, before any worker spawns.
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+                break;
+            }
+        }
+    }
+
+    // Anti-spoof ONNX model — default to the canonical location under the
+    // platform data dir so users who followed the README land here too.
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
+        let default_path = default_data_dir()
+            .join("models").join("face").join("antispoof.onnx");
+        if default_path.exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
+        }
+    }
+
+    // Tuning for the specific 3-class Silent-Face export we ship.
+    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2") };
+    }
+    if std::env::var_os("POND_FACE_ANTISPOOF_PIXEL_SCALE").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PIXEL_SCALE", "unit") };
+    }
+
+    // Secondary PAD (DeepPixBis) for the ensemble — same auto-opt-in logic
+    // as in `build_face_recognition`. Kept in both code paths because each
+    // is reachable under different launch flows (`setup` vs `serve`).
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
+        let default_path = default_data_dir()
+            .join("models").join("face").join("OULU_Protocol_2_model_0_0.onnx");
+        if default_path.exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
+        }
+    }
+}
+
 /// `pond-server calibrate` — record N samples of the wake-word phrase and store
 /// Whisper's transcriptions as calibration variants in settings.
 async fn run_calibrate(
@@ -2085,6 +2194,257 @@ fn default_data_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("goose-in-a-pond")
+}
+
+/// Build the face-recognition service for Phase 2.
+///
+/// Returns `None` in three cases:
+///   1. The `face-onnx` Cargo feature is disabled.
+///   2. No ONNX embedding model is present at `$DATA_DIR/models/face/arcface.onnx`.
+///   3. The ONNX Runtime shared library could not be loaded.
+///
+/// In all cases the server continues to start normally; the face endpoints
+/// return 503 until a model is supplied.
+#[cfg(feature = "face-onnx")]
+fn build_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+    use pond_adapters_face_onnx::{
+        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
+    };
+    use pond_core::ports::face_detector::FaceDetector;
+    use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
+
+    // Embedder lookup, preferred → fallback:
+    //   1. `POND_FACE_MODEL_PATH` (explicit operator override)
+    //   2. `adaface_ir101.onnx`   (AdaFace IR-101 — best low-light tolerance)
+    //   3. `w600k_r50.onnx`       (ArcFace R50 from buffalo_l)
+    //   4. `arcface.onnx`         (legacy filename, still supported)
+    let model_path = match std::env::var("POND_FACE_MODEL_PATH") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let adaface  = data_dir.join("models/face/adaface_ir101.onnx");
+            let arcface  = data_dir.join("models/face/w600k_r50.onnx");
+            let legacy   = data_dir.join("models/face/arcface.onnx");
+            if adaface.exists() { adaface }
+            else if arcface.exists() { arcface }
+            else { legacy }
+        }
+    };
+
+    // Default the anti-spoof path so users get the Silent-Face PAD gate
+    // for free once the model file is present, with no env-var setup.
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
+        let antispoof_default = data_dir.join("models/face/antispoof.onnx");
+        if antispoof_default.exists() {
+            // SAFETY: single-threaded init phase before any task scheduling.
+            unsafe {
+                std::env::set_var(
+                    "POND_FACE_ANTISPOOF_PATH",
+                    antispoof_default.as_os_str(),
+                );
+            }
+        }
+    }
+    // Same idea for the live-class index — the Silent-Face MiniFASNetV2
+    // export at the install URL we ship has [fake_2D, fake_3D, live] order
+    // (live is index 2), but the in-tree default is `auto` which assumes
+    // index 0.  Pin the default to 2 so the model works out-of-the-box.
+    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2"); }
+    }
+
+    // Secondary PAD (DeepPixBis) for the ensemble path in
+    // `pond-adapters-face-onnx`.  When the file is on disk and the env var
+    // is unset, opt the user into the stronger ensemble automatically —
+    // the adapter already takes `max(spoof_score)` of primary + secondary
+    // so a missing or dud secondary just falls back to primary-alone.
+    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
+        let secondary_default = data_dir.join("models/face/OULU_Protocol_2_model_0_0.onnx");
+        if secondary_default.exists() {
+            // SAFETY: single-threaded init phase before any task scheduling.
+            unsafe {
+                std::env::set_var(
+                    "POND_FACE_ANTISPOOF_PATH_2",
+                    secondary_default.as_os_str(),
+                );
+            }
+        }
+    }
+
+    if !model_path.exists() {
+        tracing::info!(
+            "face-onnx feature enabled but no embedding model at {}; face recognition disabled",
+            model_path.display()
+        );
+        return None;
+    }
+
+    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
+        EmbeddingModel::MobileFaceNet128
+    } else {
+        EmbeddingModel::ArcFace512
+    };
+
+    // ONNX Runtime initialises lazily on the first `Session::builder()` call
+    // and *panics* (rather than returning Err) when its dynamic library is
+    // missing — see the `ort` crate.  Wrap the entire constructor in
+    // `catch_unwind` so a missing libonnxruntime.dylib downgrades to
+    // "face disabled" instead of taking down the whole server.  This makes
+    // the misconfigured-ORT case behave the same as the missing-model case.
+    let extractor: Arc<dyn FaceEmbeddingExtractor> = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| OnnxFaceEmbeddingExtractor::new(&model_path, model_kind)),
+    ) {
+        Ok(Ok(e)) => Arc::new(e),
+        Ok(Err(e)) => {
+            tracing::warn!("face recognition disabled: {e:#}");
+            return None;
+        }
+        Err(panic) => {
+            // Best-effort: ort's panic payload is a String; surface it.
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "ort init panicked (unknown payload)".to_string());
+            tracing::warn!(
+                "face recognition disabled: ONNX Runtime failed to initialise — {} \
+                 (hint: install onnxruntime and set ORT_DYLIB_PATH)",
+                msg
+            );
+            return None;
+        }
+    };
+
+    // Detector resolution order:
+    //   1. SCRFD at $POND_FACE_SCRFD_PATH or $DATA_DIR/models/face/scrfd.onnx
+    //      — landmark-producing, drives similarity-transform alignment
+    //      (dramatically better real-world accuracy).
+    //   2. UltraFace at $POND_FACE_DETECTOR_PATH or $DATA_DIR/models/face/ultraface.onnx
+    //      — bbox only; no alignment, roughly phase-2 baseline behaviour.
+    //   3. No detector; adapter falls back to center-square cropping.  Safe
+    //      but prone to the "everyone matches" failure mode — log loudly.
+    // Detector preference: SCRFD 34G > SCRFD 10G > UltraFace > center-square.
+    // 34G catches faces at smaller pixel sizes than 10G (deeper backbone)
+    // but is ~140 MB instead of ~17 MB. `POND_FACE_SCRFD_PATH` overrides
+    // both SCRFD candidates explicitly.
+    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let scrfd_34 = data_dir.join("models/face/scrfd_34g.onnx");
+            if scrfd_34.exists() {
+                scrfd_34
+            } else {
+                data_dir.join("models/face/scrfd.onnx")
+            }
+        });
+    let ultraface_path = std::env::var("POND_FACE_DETECTOR_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("models/face/ultraface.onnx"));
+
+    let detector: Option<Arc<dyn FaceDetector>> = if scrfd_path.exists() {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ScrfdDetector::new(&scrfd_path, 0.5, 0.4)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("SCRFD ort init panicked"))) {
+            Ok(d) => {
+                tracing::info!(
+                    "SCRFD face detector loaded from {} — landmark alignment enabled",
+                    scrfd_path.display()
+                );
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                tracing::warn!("SCRFD detector unavailable: {e:#}; falling back to UltraFace");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let detector = detector.or_else(|| {
+        if ultraface_path.exists() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                UltraFaceDetector::new(&ultraface_path, 0.85, 0.3)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("UltraFace ort init panicked"))) {
+                Ok(d) => {
+                    tracing::warn!(
+                        "SCRFD model not found at {}; using UltraFace fallback (no landmark alignment). \
+                         Download SCRFD to restore real-world accuracy.",
+                        scrfd_path.display()
+                    );
+                    Some(Arc::new(d) as Arc<dyn FaceDetector>)
+                }
+                Err(e) => {
+                    tracing::warn!("UltraFace detector unavailable: {e:#}");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                "No face detector model found (looked at {} and {}). \
+                 Face recognition will use center-square fallback — \
+                 accuracy will be poor.",
+                scrfd_path.display(), ultraface_path.display(),
+            );
+            None
+        }
+    });
+
+    // Thresholds calibrated against ArcFace R100 on Umeyama-aligned 112×112
+    // crops.  The previous 0.50 floor was tuned for small in-house test
+    // sets where every profile was visually distinct; on real webcams
+    // with lighting / pose variance, 0.50 admits far too many
+    // cross-identity near-neighbours (a different person can trivially
+    // hit 0.55–0.65 post-blend once S-norm + centroid weights are in
+    // play).  The new floors sit inside the empirically-safe 0.68–0.75
+    // band for ArcFace aligned.  `POND_FACE_MATCH_THRESHOLD` still
+    // overrides via the env-driven default, but only when this code
+    // path does NOT call `.with_threshold()` — see below.
+    let threshold = match (&detector, model_kind) {
+        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
+        (Some(_), EmbeddingModel::ArcFace512)                            => 0.72,
+        (None, EmbeddingModel::ArcFace512)                                => 0.85,
+        (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
+        (Some(_), EmbeddingModel::MobileFaceNet128)                      => 0.72,
+        (None, EmbeddingModel::MobileFaceNet128)                         => 0.85,
+    };
+    // Allow a shell-level override to take precedence over the
+    // model-aware default — useful when a power user has tuned the gate
+    // for their specific enrollment quality.
+    let threshold = std::env::var("POND_FACE_MATCH_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(threshold);
+
+    tracing::info!(
+        "face recognition enabled (model={:?}, threshold={}, aligned={})",
+        model_kind,
+        threshold,
+        detector.as_ref().map(|d| d.produces_landmarks()).unwrap_or(false),
+    );
+
+    let mut svc = SqliteFaceRecognition::new(pool, extractor)
+        .with_threshold(threshold)
+        .with_model_name(match model_kind {
+            EmbeddingModel::ArcFace512 => "arcface-512",
+            EmbeddingModel::MobileFaceNet128 => "mobilefacenet-128",
+        });
+    if let Some(d) = detector { svc = svc.with_detector(d); }
+    Some(Arc::new(svc))
+}
+
+#[cfg(not(feature = "face-onnx"))]
+fn build_face_recognition(
+    _data_dir: &std::path::Path,
+    _pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+    None
 }
 
 fn get_local_ip() -> Option<String> {
