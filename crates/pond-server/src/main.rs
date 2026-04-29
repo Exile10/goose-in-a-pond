@@ -1145,6 +1145,28 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         });
     }
 
+    // Spawn background memory decay/cleanup task (runs every 6 hours)
+    if settings.memory_cleanup_enabled {
+        let cleanup_repo = memory_repo.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                interval.tick().await;
+                match pond_core::services::memory_cleanup::run_cleanup(cleanup_repo.as_ref()).await {
+                    Ok((scanned, archived, pruned)) => {
+                        if archived > 0 || pruned > 0 {
+                            tracing::info!(
+                                "memory cleanup: scanned={scanned}, archived={archived}, pruned={pruned}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("memory cleanup failed: {e}"),
+                }
+            }
+        });
+        tracing::info!("memory cleanup enabled — runs every 6 hours");
+    }
+
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
     // terminal in real time. Polls every second and only surfaces rows added
     // after startup, so existing history is not replayed.

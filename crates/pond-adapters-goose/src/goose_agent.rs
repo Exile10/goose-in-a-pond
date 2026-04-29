@@ -537,7 +537,16 @@ impl GooseAdapter {
             if !memories.is_empty() {
                 let block = memories
                     .iter()
-                    .map(|m| format!("- {}", m.content))
+                    .map(|m| {
+                        let seg = m.segment.as_ref()
+                            .map(|s| format!("{:?}", s).to_lowercase())
+                            .unwrap_or_default();
+                        if seg.is_empty() {
+                            format!("- {}", m.content)
+                        } else {
+                            format!("- [{}] {}", seg, m.content)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.agent
@@ -546,6 +555,11 @@ impl GooseAdapter {
                         format!("Relevant memories:\n{block}"),
                     )
                     .await;
+
+                // Record access for decay tracking
+                for m in &memories {
+                    let _ = self.memory_repo.record_access(&m.id).await;
+                }
             }
         }
 

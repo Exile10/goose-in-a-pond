@@ -31,6 +31,21 @@ pub struct SaveMemoryParams {
     pub content: String,
     /// Optional comma-separated tags (e.g. "preferences,home").
     pub tags: Option<String>,
+    /// Memory segment: identity, preference, correction, relationship, project, knowledge, or context.
+    /// If omitted, auto-classified from content.
+    pub segment: Option<String>,
+    /// Importance score 0.0-1.0. If omitted, defaults by segment.
+    pub importance: Option<f32>,
+    /// Tier: short, long, or permanent. If omitted, defaults by segment.
+    pub tier: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ForgetMemoryParams {
+    /// The memory ID to delete.
+    pub id: Option<String>,
+    /// Exact content to search for and delete (if id not provided).
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -454,7 +469,8 @@ impl GiapMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Recall recent memories, optionally filtered by a keyword.")]
+    #[tool(description = "Recall recent memories, optionally filtered by a keyword. Returns memories \
+        with their segment (identity, preference, etc.) and importance score.")]
     async fn recall_memories(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -473,23 +489,41 @@ impl GiapMcpServer {
             fragments
         };
 
+        // Record access for decay tracking
+        for f in &filtered {
+            let _ = self.services.memory_repo.record_access(&f.id).await;
+        }
+
         let text = if filtered.is_empty() {
             "No memories found.".to_string()
         } else {
             filtered.iter()
-                .map(|f| format!("[{}] {}", f.created_at.format("%Y-%m-%d"), f.content))
+                .map(|f| {
+                    let seg = f.segment.as_ref()
+                        .map(|s| format!("{:?}", s).to_lowercase())
+                        .unwrap_or_else(|| "—".to_string());
+                    let imp = f.importance
+                        .map(|i| format!("{:.1}", i))
+                        .unwrap_or_else(|| "—".to_string());
+                    format!("[{}] [{}, {}] {}", f.created_at.format("%Y-%m-%d"), seg, imp, f.content)
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Save a new memory fragment for future recall.")]
+    #[tool(description = "Save a new memory fragment for future recall. Supports optional segment \
+        (identity, preference, correction, relationship, project, knowledge, context), importance \
+        (0-1), and tier (short, long, permanent). If segment is omitted, it is auto-classified \
+        from the content.")]
     async fn save_memory(
         &self,
         _ctx: RequestContext<RoleServer>,
         params: Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        use pond_core::domain::memory::{MemoryLifecycle, MemorySegment, MemoryTier};
+
         let id = uuid::Uuid::new_v4().to_string();
         let content = params.0.content.clone();
         let tag_list: Vec<String> = params.0.tags
@@ -498,6 +532,24 @@ impl GiapMcpServer {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
+
+        // Resolve segment: explicit > auto-classify from content
+        let segment = params.0.segment
+            .as_deref()
+            .and_then(parse_memory_segment)
+            .unwrap_or_else(|| auto_classify_segment(&content));
+
+        let importance = params.0.importance
+            .map(|i| i.clamp(0.0, 1.0))
+            .unwrap_or_else(|| segment.default_importance());
+
+        let tier = params.0.tier
+            .as_deref()
+            .and_then(parse_memory_tier)
+            .unwrap_or_else(|| segment.default_tier());
+
+        let decay_rate = tier.default_decay_rate();
+
         let fragment = MemoryFragment {
             id,
             profile_id: None,
@@ -507,19 +559,67 @@ impl GiapMcpServer {
             source: "mcp_tool".to_string(),
             tags: tag_list,
             created_at: chrono::Utc::now(),
-            segment: None,
-            importance: None,
-            tier: None,
-            decay_rate: None,
+            segment: Some(segment.clone()),
+            importance: Some(importance),
+            tier: Some(tier.clone()),
+            decay_rate: Some(decay_rate),
             access_count: 0,
             last_accessed_at: None,
-            lifecycle: None,
+            lifecycle: Some(MemoryLifecycle::Active),
             superseded_by: None,
         };
+
         self.services.memory_repo.add(fragment).await.map_err(|e| {
             ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to save memory: {}", e), None)
         })?;
-        Ok(CallToolResult::success(vec![Content::text(format!("Memory saved: {}", content))]))
+
+        let seg_label = format!("{:?}", segment).to_lowercase();
+        let tier_label = format!("{:?}", tier).to_lowercase();
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Memory saved ({seg_label}, importance={importance:.1}, tier={tier_label}): {content}"
+        ))]))
+    }
+
+    #[tool(description = "Delete a specific memory by ID or by exact content match.")]
+    async fn forget_memory(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ForgetMemoryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(id) = &params.0.id {
+            self.services.memory_repo.delete(id).await.map_err(|e| {
+                ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to delete: {}", e), None)
+            })?;
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Memory {id} deleted."
+            ))]));
+        }
+
+        if let Some(content) = &params.0.content {
+            let memories = self.services.memory_repo
+                .search_recent(None, 100)
+                .await
+                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+            let lower = content.to_lowercase();
+            if let Some(found) = memories.iter().find(|m| m.content.to_lowercase() == lower) {
+                let id = found.id.clone();
+                self.services.memory_repo.delete(&id).await.map_err(|e| {
+                    ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to delete: {}", e), None)
+                })?;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Memory deleted: {}", found.content
+                ))]));
+            }
+
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No memory found with that exact content.".to_string()
+            )]));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            "Provide either an 'id' or 'content' to identify the memory to forget.".to_string()
+        )]))
     }
 
     #[tool(description = "List all active user skills injected into the assistant's context.")]
@@ -794,6 +894,116 @@ pub fn clean_query_for_search(raw: &str) -> String {
     }
     stripped.to_string()
 }
+
+// ── Memory helpers ──────────────────────────────────────────────────────────
+
+use pond_core::domain::memory::{MemorySegment, MemoryTier};
+
+pub fn parse_memory_segment(s: &str) -> Option<MemorySegment> {
+    match s.to_lowercase().as_str() {
+        "identity" => Some(MemorySegment::Identity),
+        "preference" => Some(MemorySegment::Preference),
+        "correction" => Some(MemorySegment::Correction),
+        "relationship" => Some(MemorySegment::Relationship),
+        "project" => Some(MemorySegment::Project),
+        "knowledge" => Some(MemorySegment::Knowledge),
+        "context" => Some(MemorySegment::Context),
+        _ => None,
+    }
+}
+
+pub fn parse_memory_tier(s: &str) -> Option<MemoryTier> {
+    match s.to_lowercase().as_str() {
+        "short" => Some(MemoryTier::Short),
+        "long" => Some(MemoryTier::Long),
+        "permanent" => Some(MemoryTier::Permanent),
+        _ => None,
+    }
+}
+
+/// Auto-classify a memory's segment from its content using keyword heuristics.
+/// No LLM needed — fast and deterministic.
+pub fn auto_classify_segment(content: &str) -> MemorySegment {
+    let lower = content.to_lowercase();
+
+    // Correction indicators (highest priority)
+    if lower.starts_with("actually")
+        || lower.starts_with("no, ")
+        || lower.starts_with("correction:")
+        || lower.contains("that's wrong")
+        || lower.contains("that's not right")
+        || lower.contains("not correct")
+    {
+        return MemorySegment::Correction;
+    }
+
+    // Identity indicators
+    if lower.starts_with("my name is")
+        || lower.starts_with("i am a ")
+        || lower.starts_with("i'm a ")
+        || lower.contains("i live in")
+        || lower.contains("i work at")
+        || lower.contains("i work as")
+        || lower.contains("my job is")
+        || lower.contains("my role is")
+    {
+        return MemorySegment::Identity;
+    }
+
+    // Relationship indicators
+    if lower.contains("my wife")
+        || lower.contains("my husband")
+        || lower.contains("my partner")
+        || lower.contains("my friend")
+        || lower.contains("my boss")
+        || lower.contains("my colleague")
+        || lower.contains("my sister")
+        || lower.contains("my brother")
+        || lower.contains("my mother")
+        || lower.contains("my father")
+        || lower.contains("my son")
+        || lower.contains("my daughter")
+    {
+        return MemorySegment::Relationship;
+    }
+
+    // Preference indicators
+    if lower.starts_with("i prefer")
+        || lower.starts_with("i like")
+        || lower.starts_with("i love")
+        || lower.starts_with("i hate")
+        || lower.starts_with("i don't like")
+        || lower.contains("my favorite")
+        || lower.contains("my favourite")
+    {
+        return MemorySegment::Preference;
+    }
+
+    // Project indicators
+    if lower.contains("working on")
+        || lower.contains("my project")
+        || lower.contains("my goal")
+        || lower.contains("deadline")
+        || lower.contains("i'm building")
+        || lower.contains("i'm developing")
+    {
+        return MemorySegment::Project;
+    }
+
+    // Context indicators (transient)
+    if lower.starts_with("right now")
+        || lower.starts_with("currently")
+        || lower.starts_with("today ")
+        || lower.contains("at the moment")
+    {
+        return MemorySegment::Context;
+    }
+
+    // Default
+    MemorySegment::Knowledge
+}
+
+// ── Wikipedia helpers ───────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum WikiFetchError {
