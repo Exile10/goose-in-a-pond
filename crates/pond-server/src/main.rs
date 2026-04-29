@@ -48,7 +48,6 @@ use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
-use pond_core::services::model_router::ModelRouter;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
@@ -373,8 +372,22 @@ enum MemoryAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // On Jetson Orin Nano (6 cores), cap at 4 to leave headroom for OS + audio.
+    // On dev machines, use all cores.
+    let workers = if num_cpus <= 6 { num_cpus.min(4) } else { num_cpus };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -912,9 +925,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // LLM — only start llamafile when at least one role is configured to use it.
     // ModelService handles downloading autonomously inside try_start.
-    let any_role_needs_llamafile = settings.chat_provider == "llamafile"
-        || settings.think_provider.as_deref() == Some("llamafile")
-        || settings.task_provider.as_deref()  == Some("llamafile");
+    let any_role_needs_llamafile = settings.chat_provider == "llamafile";
 
     let active_llm_name: String = settings.chat_model.clone();
     let (initial_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
@@ -1083,26 +1094,27 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         &llamafile_url, data_dir_ref, max_tokens, temperature,
     ).await;
 
-    // Think role: reuse chat Arc if not separately configured.
-    let think_provider_arc: Arc<dyn LlmProvider> =
-        if let (Some(tp), Some(tm)) = (&settings.think_provider, &settings.think_model) {
-            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
-        } else {
-            chat_provider_arc.clone()
-        };
-
-    // Task role: reuse chat Arc if not separately configured.
-    let task_provider_arc: Arc<dyn LlmProvider> =
-        if let (Some(tp), Some(tm)) = (&settings.task_provider, &settings.task_model) {
-            build_provider(tp, tm, &llamafile_url, data_dir_ref, max_tokens, temperature).await
-        } else {
-            chat_provider_arc.clone()
-        };
-
     let llm_provider = Arc::new(tokio::sync::RwLock::new(Some(
-        Arc::new(ModelRouter::new(chat_provider_arc, think_provider_arc, task_provider_arc))
-            as Arc<dyn LlmProvider>
+        chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
+
+    // Build ToolAgent for the HTTP path — uses the LIVE provider (RwLock) so the
+    // classifier always uses whatever model is currently loaded. No model swap.
+    println!("  Tool Agent: using live provider (zero model-swap overhead)");
+    let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
+        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+
+    // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
+    // Always constructed so the user can toggle it on/off at runtime via settings.
+    // The routes.rs handler checks review_mode at request time, not at startup.
+    println!("  Answer Reviewer: ready (mode={}, threshold={}/5, max_rounds={})",
+        settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds);
+    let answer_reviewer_for_http: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>> =
+        Some(Arc::new(GiapAnswerReviewer {
+            provider: chat_provider_arc,
+            pass_threshold: settings.review_pass_threshold,
+            max_rounds: settings.review_max_rounds,
+        }) as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
 
     let db = Arc::new(db);
 
@@ -1179,7 +1191,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // ── Agent backend ────────────────────────────────────────────────────────────
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager) = build_goose_backend(
+    let (agent, extension_manager, tool_caller) = build_goose_backend(
         agent_backend,
         &llamafile_url,
         &data_dir,
@@ -1195,6 +1207,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         false, // voice_mode — server mode, not voice
     ).await;
 
+    #[cfg(not(feature = "goose-agent"))]
+    let tool_caller: Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>> = None;
     #[cfg(not(feature = "goose-agent"))]
     let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
         if agent_backend == "goose" {
@@ -1316,6 +1330,9 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         event_log_repo: event_log_repo,
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: tool_agent_for_http,
+        answer_reviewer: answer_reviewer_for_http,
     });
 
     // Warn if static assets haven't been built yet
@@ -1626,7 +1643,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             s.chat_model    = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
-        let (a, _ext_mgr) = build_goose_backend(
+        let (a, _ext_mgr, _tc) = build_goose_backend(
             "goose",
             &llamafile_url,
             &data_dir,
@@ -1904,9 +1921,343 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
+    // ── Wire Tool Agent for voice mode ──
+    // Build a provider for the tool classifier. When goose-agent is active,
+    // ChatService.provider is None (GooseAdapter manages its own provider),
+    // so we construct one explicitly for classification calls.
+    {
+        let classifier_provider: Option<Arc<dyn pond_core::ports::provider::LlmProvider>> =
+            if let Some(ref p) = chat_service.provider_ref() {
+                Some(p.clone())
+            } else {
+                // GooseAdapter mode — build a provider from settings for classification
+                match effective_provider {
+                    "local" | "gguf" => {
+                        #[cfg(feature = "local-inference")]
+                        {
+                            use pond_adapters_local_inference::LocalInferenceLlmAdapter;
+                            LocalInferenceLlmAdapter::new_with_data_dir(effective_model, &data_dir)
+                                .await
+                                .ok()
+                                .map(|p| Arc::new(p) as Arc<dyn pond_core::ports::provider::LlmProvider>)
+                        }
+                        #[cfg(not(feature = "local-inference"))]
+                        { None }
+                    }
+                    "ollama" => Some(Arc::new(
+                        OllamaProvider::new(None, Some(effective_model))
+                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
+                    _ => Some(Arc::new(
+                        LlamafileProvider::new(Some(&llamafile_url))
+                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
+                }
+            };
+
+        if let Some(provider) = classifier_provider {
+            let live = Arc::new(tokio::sync::RwLock::new(
+                Some(provider as Arc<dyn pond_core::ports::provider::LlmProvider>)
+            ));
+            let ta = GiapToolAgent { live_provider: live };
+            chat_service = chat_service.with_tool_agent(Arc::new(ta));
+            println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
+        } else {
+            println!("  Tool Agent: inactive (no provider available for classification)");
+        }
+    }
+
     chat_service.run_loop().await?;
 
     Ok(())
+}
+
+/// Tool Agent implementation for both HTTP and CLI voice paths.
+/// Uses the LIVE LLM provider (from the RwLock) for classification so it always
+/// uses the currently loaded model — no model swap, no unload/reload overhead.
+///
+/// Before this fix, the classifier held a startup-time Arc snapshot. When the user
+/// hot-reloaded the model via the UI, the classifier still used the old model,
+/// causing a full model unload/reload on every message.
+struct GiapToolAgent {
+    /// Live provider reference — reads from the RwLock on each call so it always
+    /// uses whatever model is currently loaded. Zero model-swap overhead.
+    live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
+}
+
+#[async_trait::async_trait]
+impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
+    async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
+        // Read the LIVE provider — always uses whatever model is currently loaded.
+        // No model swap, no unload/reload overhead.
+        let provider = {
+            let guard = self.live_provider.read().await;
+            match guard.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    println!("[tool-classifier] no provider available, skipping classification");
+                    return Ok(None);
+                }
+            }
+        };
+
+        let classify_prompt = pond_core::prompts::build_classifier_prompt();
+
+        // Retry classifier up to 3 times — thinking models sometimes generate
+        // only reasoning tokens without the required JSON output.
+        const MAX_CLASSIFIER_RETRIES: usize = 3;
+        let mut text = String::new();
+        let mut classified = false;
+
+        for attempt in 1..=MAX_CLASSIFIER_RETRIES {
+            println!("[tool-classifier] classifying (attempt {}/{}, model={}): {:?}",
+                attempt, MAX_CLASSIFIER_RETRIES, provider.model_name(), message);
+
+            let classify_msg_retry = vec![pond_core::domain::message::ChatMessage::user(message)];
+            let response = match provider.complete(&classify_prompt, classify_msg_retry).await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[tool-classifier] inference error on attempt {}: {}", attempt, e);
+                    continue;
+                }
+            };
+
+            // Strip thinking tokens — models like Gemma 4 emit
+            // <|channel>thought...<channel|> preambles even in classifier mode.
+            let raw = &response.content;
+            let stripped = strip_thinking_from_classifier(raw);
+            text = stripped.to_lowercase();
+            println!("[tool-classifier] response (attempt {}, stripped): {:?}",
+                attempt, &text[..text.len().min(200)]);
+
+            // Check if we got valid JSON with needs_tool field
+            if text.contains("needs_tool") {
+                classified = true;
+                break;
+            }
+
+            // Also accept empty JSON {} as "no tool needed"
+            if text.trim() == "{}" {
+                classified = true;
+                break;
+            }
+
+            println!("[tool-classifier] attempt {} produced no valid JSON, retrying...", attempt);
+        }
+
+        if !classified {
+            println!("[tool-classifier] all {} attempts failed to produce valid JSON, skipping tool", MAX_CLASSIFIER_RETRIES);
+            return Ok(None);
+        }
+
+        let needs_tool = text.contains("\"needs_tool\": true")
+            || text.contains("\"needs_tool\":true")
+            || text.contains("needs_tool\": true");
+
+        if !needs_tool {
+            return Ok(None);
+        }
+
+        let tool = if text.contains("weather") { "weather" }
+            else if text.contains("save_memory") { "save_memory" }
+            else if text.contains("recall_memory") { "recall_memory" }
+            else if text.contains("devices") { "devices" }
+            else if text.contains("schedules") { "schedules" }
+            else { "wikipedia" };
+
+        println!("[voice-tool-agent] tool={}, executing...", tool);
+
+        match pond_mcp_server::try_tool_agent(tool, message).await {
+            Some(info) => {
+                println!("[voice-tool-agent] got result ({} chars)", info.len());
+                Ok(Some(format!(
+                    "{}\n\n\
+                    [Retrieved information — USE THIS AS YOUR PRIMARY SOURCE]\n\
+                    {}\n\n\
+                    INSTRUCTIONS: Answer the user's question using the retrieved information above as \
+                    your authoritative source. Be thorough and detailed — include specific facts, numbers, \
+                    dates, and comparisons from the retrieved data. If the user asked to compare things, \
+                    highlight concrete differences and similarities. If they asked how something works, \
+                    explain the mechanism step by step. \
+                    Do NOT give a vague or generic answer when you have specific information available. \
+                    Do NOT mention tools, Wikipedia, APIs, or that anything was looked up — present \
+                    the information naturally as your own knowledge. \
+                    Match the personality and style from your system prompt.",
+                    message, info
+                )))
+            }
+            None => {
+                println!("[voice-tool-agent] tool returned no result");
+                Ok(None)
+            }
+        }
+    }
+}
+
+// ── Adversarial Answer Reviewer ───────────────────────────────────────────────
+
+/// Adversarial answer reviewer — post-inference quality gate.
+///
+/// Uses the same LlmProvider as the main LLM with a critic system prompt.
+/// Reviews the completed answer, and if it scores below threshold, sends
+/// the critique back to the LLM for revision.
+struct GiapAnswerReviewer {
+    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    pass_threshold: u8,
+    max_rounds: u32,
+}
+
+#[async_trait::async_trait]
+impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
+    async fn review(
+        &self,
+        question: &str,
+        answer: &str,
+        tool_context: Option<&str>,
+    ) -> anyhow::Result<pond_core::ports::answer_reviewer::ReviewResult> {
+        use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
+        use pond_core::domain::message::ChatMessage;
+
+        let mut current_answer = answer.to_string();
+        let mut rounds = 0u32;
+        let mut last_verdict: Option<ReviewVerdict> = None;
+
+        for _ in 0..self.max_rounds {
+            rounds += 1;
+
+            // Step 1: Review the current answer
+            let review_input = if let Some(ctx) = tool_context {
+                format!(
+                    "QUESTION: {}\n\nCONTEXT PROVIDED TO THE ANSWERER:\n{}\n\nANSWER TO REVIEW:\n{}",
+                    question, ctx, current_answer
+                )
+            } else {
+                format!(
+                    "QUESTION: {}\n\nANSWER TO REVIEW:\n{}",
+                    question, current_answer
+                )
+            };
+
+            println!("[answer-reviewer] reviewing (round {})...", rounds);
+            let review_msg = vec![ChatMessage::user(review_input)];
+            let review_response = self.provider
+                .complete(pond_core::prompts::REVIEW_SYSTEM_PROMPT, review_msg)
+                .await?;
+
+            let verdict = parse_review_verdict(&review_response.content);
+            println!("[answer-reviewer] verdict: pass={}, score={}/5", verdict.pass, verdict.score);
+
+            if verdict.pass || verdict.score >= self.pass_threshold {
+                return Ok(ReviewResult {
+                    final_answer: current_answer,
+                    was_revised: last_verdict.is_some(),
+                    verdict,
+                    rounds,
+                });
+            }
+
+            // Step 2: Revise the answer using the critique
+            println!("[answer-reviewer] critique: {}", verdict.critique);
+            let revision_input = format!(
+                "ORIGINAL QUESTION: {}\n\n\
+                YOUR PREVIOUS ANSWER:\n{}\n\n\
+                REVIEWER CRITIQUE:\n{}\n\n\
+                WHAT THE ANSWER SHOULD INCLUDE:\n- {}\n\n\
+                Please provide an improved, more thorough answer.",
+                question,
+                current_answer,
+                verdict.critique,
+                verdict.expectations.join("\n- ")
+            );
+
+            println!("[answer-reviewer] revising...");
+            let revision_msg = vec![ChatMessage::user(revision_input)];
+            let revision_response = self.provider
+                .complete(pond_core::prompts::REVISION_SYSTEM_PROMPT, revision_msg)
+                .await?;
+
+            current_answer = revision_response.content.clone();
+            last_verdict = Some(verdict);
+        }
+
+        // Exhausted rounds — return the last revision
+        Ok(ReviewResult {
+            final_answer: current_answer,
+            was_revised: true,
+            verdict: last_verdict.unwrap_or(ReviewVerdict {
+                pass: true,
+                score: 3,
+                expectations: Vec::new(),
+                critique: String::new(),
+            }),
+            rounds,
+        })
+    }
+}
+
+/// Strip thinking tokens from classifier output so JSON can be parsed.
+///
+/// Handles Gemma 4 (`<|channel>thought...<channel|>JSON`) and Qwen3/DeepSeek
+/// (`<think>...</think>JSON`). Also extracts JSON from mixed text by finding
+/// the first `{` and last `}`.
+fn strip_thinking_from_classifier(raw: &str) -> String {
+    let mut text = raw.to_string();
+
+    // Gemma 4: everything after last <channel|>
+    if let Some(pos) = text.rfind("<channel|>") {
+        text = text[pos + "<channel|>".len()..].trim().to_string();
+    }
+
+    // Qwen3/DeepSeek: remove <think>...</think> blocks
+    while let Some(start) = text.find("<think>") {
+        if let Some(end) = text[start..].find("</think>") {
+            let before = &text[..start];
+            let after = &text[start + end + "</think>".len()..];
+            text = format!("{}{}", before, after);
+        } else {
+            // Unclosed think block — take everything before it
+            text = text[..start].to_string();
+            break;
+        }
+    }
+
+    // Try to extract JSON object from remaining text
+    let trimmed = text.trim();
+    if let Some(json_start) = trimmed.find('{') {
+        if let Some(json_end) = trimmed.rfind('}') {
+            if json_end > json_start {
+                return trimmed[json_start..=json_end].to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Parse a review verdict from LLM output.
+///
+/// Tries to extract JSON from the response text. If parsing fails,
+/// defaults to `pass: true` — review must never block the user.
+fn parse_review_verdict(text: &str) -> pond_core::ports::answer_reviewer::ReviewVerdict {
+    use pond_core::ports::answer_reviewer::ReviewVerdict;
+
+    let json_start = text.find('{');
+    let json_end = text.rfind('}');
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        if end > start {
+            if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(&text[start..=end]) {
+                return verdict;
+            }
+        }
+    }
+
+    // Fallback — unparseable output defaults to pass
+    println!("[answer-reviewer] WARNING: unparseable verdict, defaulting to pass: {:?}",
+        &text[..text.len().min(100)]);
+    ReviewVerdict {
+        pass: true,
+        score: 3,
+        expectations: Vec::new(),
+        critique: String::new(),
+    }
 }
 
 /// Returns `true` when the process has access to a graphical display.
@@ -2078,7 +2429,6 @@ fn apply_face_recognition_defaults() {
         }
     }
 }
-
 /// `pond-server calibrate` — record N samples of the wake-word phrase and store
 /// Whisper's transcriptions as calibration variants in settings.
 async fn run_calibrate(
@@ -2092,7 +2442,6 @@ async fn run_calibrate(
     let settings_repo = SqliteSettingsRepository::new(db.system.clone());
     let mut settings = settings_repo.get().await?;
 
-    // Resolve phrase and whisper URL from args → settings → defaults.
     let phrase = phrase_arg
         .unwrap_or(settings.voice_wake_word.as_str())
         .to_string();
@@ -2123,7 +2472,6 @@ async fn run_calibrate(
         println!();
     }
 
-    // Save the phrase to settings in case it was provided via --phrase.
     if phrase_arg.is_some() {
         settings.voice_wake_word = phrase.clone();
     }
@@ -2137,7 +2485,6 @@ async fn run_calibrate(
         println!("  ── Sample {} / {} ─────────────────────────────────", collected + 1, target_samples);
         println!("  Press Enter, then say \"{}\"...", phrase);
         {
-            // Wait for Enter
             let mut buf = String::new();
             io::stdin().read_line(&mut buf)?;
         }
@@ -2160,7 +2507,6 @@ async fn run_calibrate(
             }
         };
 
-        // Normalize: strip punctuation, collapse whitespace, lowercase.
         let normalized: String = text
             .chars()
             .map(|c| if c.is_alphabetic() { c } else { ' ' })
@@ -2179,7 +2525,6 @@ async fn run_calibrate(
 
         if settings.voice_wake_word_transcriptions.contains(&normalized) {
             println!("  (already stored as a variant — skipping duplicate)");
-            // Still count toward progress so the loop terminates.
             collected += 1;
             continue;
         }
@@ -2744,13 +3089,43 @@ async fn build_goose_backend(
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+    Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
 ) {
     use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
+    use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::ports::extension_manager::ExtensionManagerPort;
+    use pond_core::ports::tool_caller::ToolCaller;
 
     if agent_backend != "goose" {
-        return (Arc::new(MockAgent::new()), None);
+        return (Arc::new(MockAgent::new()), None, None);
     }
+
+    // Build tool-calling specialist (FunctionGemma) if configured.
+    // The Tool Agent runs BEFORE the main LLM — model swap overhead is
+    // accepted because the main model never attempts tool calls itself.
+    let tool_caller: Option<Arc<dyn ToolCaller>> = {
+        let settings = settings_repo.get().await.unwrap_or_default();
+        match settings.tool_model.as_deref() {
+            Some(model_name) if !model_name.is_empty() => {
+                match ToolCallerEngine::new(model_name, data_dir).await {
+                    Ok(engine) => {
+                        println!("[tool-agent] FunctionGemma specialist loaded: {}", model_name);
+                        tracing::info!("Tool-calling specialist loaded: {}", model_name);
+                        Some(Arc::new(engine) as Arc<dyn ToolCaller>)
+                    }
+                    Err(e) => {
+                        println!("[tool-agent] FAILED to load specialist '{}': {e}", model_name);
+                        tracing::warn!("Failed to load tool specialist '{}': {e}", model_name);
+                        None
+                    }
+                }
+            }
+            _ => {
+                println!("[tool-agent] no tool_model configured, using code-path fallback");
+                None
+            }
+        }
+    };
 
     // Register the GIAP MCP server into Goose's builtin extension registry.
     let handles = Arc::new(GiapServiceHandles {
@@ -2761,10 +3136,13 @@ async fn build_goose_backend(
         memory_repo: memory_repo.clone(),
         skill_repo: skill_repo.clone(),
         recipe_repo: recipe_repo.clone(),
+        http_client: reqwest::Client::new(),
+        tool_caller: tool_caller.clone(),
+        last_user_message: tokio::sync::RwLock::new(String::new()),
     });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
-        return (Arc::new(MockAgent::new()), None);
+        return (Arc::new(MockAgent::new()), None, None);
     }
 
     // Build the adapter with all repos injected.
@@ -2786,11 +3164,11 @@ async fn build_goose_backend(
                 adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
             let agent: Arc<dyn Agent> = Arc::new(adapter);
-            (agent, Some(ext_mgr))
+            (agent, Some(ext_mgr), tool_caller)
         }
         Err(e) => {
             tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
-            (Arc::new(MockAgent::new()), None)
+            (Arc::new(MockAgent::new()), None, None)
         }
     }
 }
@@ -3118,6 +3496,20 @@ async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domai
                 }
                 break;
             }
+            AgentStreamEvent::Thinking { content } => {
+                eprint!("\r\x1b[K\x1b[2m  💭 {content}\x1b[0m");
+                let _ = io::stderr().flush();
+            }
+            AgentStreamEvent::ReviewStatus { content } => {
+                eprint!("\r\x1b[K\x1b[33m  🔍 {content}\x1b[0m");
+                let _ = io::stderr().flush();
+            }
+            AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                // Clear previous answer and print revised version
+                eprintln!("\r\x1b[K\x1b[33m  📝 Revised (score: {score}/5, rounds: {rounds})\x1b[0m");
+                println!("{content}");
+                printed_newline = content.ends_with('\n');
+            }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");
                 std::process::exit(1);
@@ -3182,7 +3574,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             eprintln!("  {} | provider: {}  model: {}  role: {}",
                 settings.assistant_name, settings.chat_provider, settings.chat_model, model_role);
 
-            let (agent, _ext_mgr) = build_goose_backend(
+            let (agent, _ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3202,6 +3594,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 message,
                 session_id: session,
                 model_role,
+                images: Vec::new(),
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -3210,7 +3603,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             use pond_core::domain::agent::AgentRequest;
             use tokio::io::AsyncBufReadExt as _;
 
-            let (agent, _ext_mgr) = build_goose_backend(
+            let (agent, _ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3256,6 +3649,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     message,
                     session_id: session.clone(),
                     model_role,
+                    images: Vec::new(),
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -3264,7 +3658,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         }
 
         AgentAction::Tools => {
-            let (_agent, ext_mgr) = build_goose_backend(
+            let (_agent, ext_mgr, _tc) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,

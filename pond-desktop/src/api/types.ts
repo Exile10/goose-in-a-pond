@@ -33,10 +33,12 @@ export interface Settings {
   // Model roles
   chat_provider?: string;
   chat_model?: string;
-  think_provider?: string | null;
-  think_model?: string | null;
-  task_provider?: string | null;
-  task_model?: string | null;
+  tool_model?: string | null;
+  thinking_mode?: string;
+  show_thinking?: boolean;
+  review_mode?: string;
+  review_max_rounds?: number;
+  review_pass_threshold?: number;
   llm_provider?: string;
   llm_temperature?: number;
   llm_max_tokens?: number;
@@ -123,6 +125,14 @@ export interface ModelMemoryStatus {
   loaded_model: string | null;
 }
 
+export interface ModelCapabilities {
+  thinking: boolean;
+  vision: boolean;
+  audio_input: boolean;
+  context_window_tokens: number;
+  structured_output: boolean;
+}
+
 // ── Prompt Templates ──────────────────────────────────────────
 export interface PromptTemplate {
   name: string;
@@ -151,7 +161,7 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "tool_call" | "tool_result" | "done" | "error" | "status";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision";
 
 export interface ChatEvent {
   type: ChatEventType;
@@ -199,8 +209,7 @@ export interface ModelRoleAssignment {
 
 export interface ModelActiveRoles {
   chat:  ModelRoleAssignment | null;
-  think: ModelRoleAssignment | null;
-  task:  ModelRoleAssignment | null;
+  tool:  { model: string | null } | null;
   asr:   ModelRoleAssignment | null;
   tts:   ModelRoleAssignment | null;
 }
@@ -240,8 +249,9 @@ export interface HfModelFile {
 export interface DownloadEntry {
   filename: string;
   category: string;
-  progress_pct: number;
-  status: string;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  status: "downloading" | "done" | "error";
   error?: string;
 }
 

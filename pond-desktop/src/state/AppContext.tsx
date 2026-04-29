@@ -37,13 +37,13 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    // Ensure onboarding is complete so protected routes are accessible.
-    // pond-desktop has no onboarding wizard UI, so we auto-complete on first connect.
+    // Check onboarding status — if not yet onboarded, show the wizard UI
+    // instead of auto-completing silently.
     const ensureOnboarded = async () => {
       try {
         const status = await api.getOnboardingStatus();
         if (!status.onboarded) {
-          await api.completeOnboarding();
+          dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true });
         }
       } catch (err) {
         console.warn("Onboarding check failed (non-fatal):", err);

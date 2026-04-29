@@ -117,6 +117,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: None,
+        answer_reviewer: None,
     });
 
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
@@ -282,6 +285,9 @@ async fn prompt_template_delete_system_returns_403() {
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: None,
+        answer_reviewer: None,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -554,6 +560,9 @@ async fn returns_501_when_repos_not_configured() {
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        tool_agent: None,
+        answer_reviewer: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
