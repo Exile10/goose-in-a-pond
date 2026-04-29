@@ -872,12 +872,28 @@ async fn chat_stream(
         }
 
         // Persist full assistant response (uses revised text if review triggered revision)
+        let full_text_for_extraction = full_text.clone();
         {
             use pond_core::domain::message::ChatMessage;
             use pond_core::domain::session::SessionMessage;
             let assistant_msg = ChatMessage::assistant(full_text);
             let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
             let _ = storage.add_message(session_id.clone(), sm).await;
+        }
+
+        // Background memory extraction — asynchronous, never blocks SSE.
+        if let (Some(extractor), Some(service)) =
+            (&state.memory_extractor, &state.memory_extraction_service)
+        {
+            let ext = extractor.clone();
+            let svc = service.clone();
+            let repo = state.memory_repo.clone();
+            let user_msg = req.message.clone();
+            let asst_resp = full_text_for_extraction;
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                svc.run(ext.as_ref(), repo.as_ref(), &user_msg, &asst_resp, Some(&sid)).await;
+            });
         }
 
         // Done event

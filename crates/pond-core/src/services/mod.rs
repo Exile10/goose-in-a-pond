@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod memory_extraction;
 pub mod model_service;
 pub mod request_classifier;
 pub mod context_budget;

@@ -3,5 +3,6 @@
 //! Exposing key modules here allows integration tests in `tests/` to import
 //! them without duplicating code from `main.rs`.
 
+pub mod llm_memory_extractor;
 pub mod schedule_executors;
 pub mod startup;
