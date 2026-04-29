@@ -219,6 +219,11 @@ pub struct AppState {
     /// Answer Reviewer — adversarial post-inference review that evaluates
     /// answer quality and triggers revision when below threshold.
     pub answer_reviewer: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>>,
+    /// Memory Extractor — extracts durable facts from conversation turns.
+    /// `None` when `memory_extraction_enabled` is false.
+    pub memory_extractor: Option<Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor>>,
+    /// Shared extraction service instance (rate limiter + dedup state).
+    pub memory_extraction_service: Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

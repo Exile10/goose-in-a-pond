@@ -102,6 +102,8 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

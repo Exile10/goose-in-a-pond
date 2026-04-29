@@ -209,6 +209,8 @@ async fn make_app_with_provider(
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -483,6 +485,8 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -553,6 +557,8 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

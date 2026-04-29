@@ -21,6 +21,7 @@ mod filesystem_model_storage;
 mod composite_model_catalog_provider;
 mod http_model_downloader;
 mod llamafile_process;
+mod llm_memory_extractor;
 mod model_download;
 mod piper_http;
 mod piper_process;
@@ -1117,6 +1118,22 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             max_rounds: settings.review_max_rounds,
         }) as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
 
+    // Memory extractor — background extraction of durable facts from conversations.
+    let (memory_extractor_for_http, memory_extraction_service_for_http) =
+        if settings.memory_extraction_enabled {
+            let extractor: Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor> =
+                Arc::new(llm_memory_extractor::LlmMemoryExtractor::new(
+                    llm_provider.clone(),
+                ));
+            let service = Arc::new(
+                pond_core::services::memory_extraction::MemoryExtractionService::new(),
+            );
+            tracing::info!("memory extraction enabled — facts will be auto-extracted from conversations");
+            (Some(extractor), Some(service))
+        } else {
+            (None, None)
+        };
+
     let db = Arc::new(db);
 
     // Spawn background TTL pruning task (runs every 6 hours)
@@ -1352,6 +1369,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: tool_agent_for_http,
         answer_reviewer: answer_reviewer_for_http,
+        memory_extractor: memory_extractor_for_http,
+        memory_extraction_service: memory_extraction_service_for_http,
     });
 
     // Warn if static assets haven't been built yet
