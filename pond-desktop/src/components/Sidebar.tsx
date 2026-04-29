@@ -5,21 +5,21 @@ import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import logoSrc from "../assets/logo.png";
 import {
-  LayoutDashboard,    // Dashboard — grid overview
-  MessageCircle,      // Chat — speech bubble
-  Monitor,            // Devices — screen
-  CalendarClock,      // Schedules — calendar + time
-  Brain,              // Memory — brain
-  Sparkles,           // Skills — sparkles
-  ScrollText,         // Logs — scrollable text
-  Box,                // Models — 3D box / model
-  PenLine,            // Prompts — editing pen
-  Settings,           // Settings — gear
-  Bot,                // Agent — robot
-  ScanFace,           // Faces — face-recognition section
+  LayoutDashboard,
+  MessageCircle,
+  Monitor,
+  CalendarClock,
+  Brain,
+  Sparkles,
+  ScrollText,
+  Box,
+  PenLine,
+  Settings,
+  Bot,
   ChevronLeft,
   ChevronRight,
   Mic,
+  ScanFace,
   Layers,
 } from "lucide-react";
 
@@ -37,6 +37,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   prompt:   PenLine,
   settings: Settings,
   face:     ScanFace,
+  canvas:   Layers,
   agent:    Bot,
 };
 
