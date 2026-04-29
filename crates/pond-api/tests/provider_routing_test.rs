@@ -208,6 +208,7 @@ async fn make_app_with_provider(
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
+        answer_reviewer: None,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -481,6 +482,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
+        answer_reviewer: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -550,6 +552,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: None,
+        answer_reviewer: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

@@ -487,11 +487,9 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Build tool descriptions for the prompt template
-            let available_tools: Vec<String> = pond_core::prompts::giap_tool_definitions()
-                .iter()
-                .map(|(name, desc)| format!("{} — {}", name, desc))
-                .collect();
+            // Use cached tool description lines (avoids 6 format!() allocations per turn)
+            let available_tools: Vec<String> = pond_core::prompts::giap_tool_description_lines()
+                .to_vec();
 
             // Resolve thinking mode from settings + capabilities
             let caps = self.model_capabilities.lock().unwrap().clone();

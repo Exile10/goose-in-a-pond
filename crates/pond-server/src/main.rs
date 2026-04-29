@@ -1097,14 +1097,23 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build ToolAgent for the HTTP path — uses the same provider as the main LLM.
-    // When tool_model is unset or matches chat_model, same_model=true → zero swap overhead.
-    let same_model = settings.tool_model.is_none()
-        || settings.tool_model.as_deref() == Some(&settings.chat_model);
-    println!("  Tool Agent: same_model={} (tool_model={:?}, chat_model={})",
-        same_model, settings.tool_model, settings.chat_model);
+    // Build ToolAgent for the HTTP path — uses the LIVE provider (RwLock) so the
+    // classifier always uses whatever model is currently loaded. No model swap.
+    println!("  Tool Agent: using live provider (zero model-swap overhead)");
     let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent { provider: chat_provider_arc, same_model }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+
+    // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
+    // Always constructed so the user can toggle it on/off at runtime via settings.
+    // The routes.rs handler checks review_mode at request time, not at startup.
+    println!("  Answer Reviewer: ready (mode={}, threshold={}/5, max_rounds={})",
+        settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds);
+    let answer_reviewer_for_http: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>> =
+        Some(Arc::new(GiapAnswerReviewer {
+            provider: chat_provider_arc,
+            pass_threshold: settings.review_pass_threshold,
+            max_rounds: settings.review_max_rounds,
+        }) as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
 
     let db = Arc::new(db);
 
@@ -1317,6 +1326,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         tool_agent: tool_agent_for_http,
+        answer_reviewer: answer_reviewer_for_http,
     });
 
     // Warn if static assets haven't been built yet
@@ -1921,7 +1931,10 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             };
 
         if let Some(provider) = classifier_provider {
-            let ta = GiapToolAgent { provider, same_model: true };
+            let live = Arc::new(tokio::sync::RwLock::new(
+                Some(provider as Arc<dyn pond_core::ports::provider::LlmProvider>)
+            ));
+            let ta = GiapToolAgent { live_provider: live };
             chat_service = chat_service.with_tool_agent(Arc::new(ta));
             println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
         } else {
@@ -1935,27 +1948,82 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
 }
 
 /// Tool Agent implementation for both HTTP and CLI voice paths.
-/// Uses the main LLM provider for classification and pond-mcp-server for tool execution.
+/// Uses the LIVE LLM provider (from the RwLock) for classification so it always
+/// uses the currently loaded model — no model swap, no unload/reload overhead.
 ///
-/// When `same_model` is true, the tool_model matches the chat_model (or is unset),
-/// so the classifier uses the already-loaded model with zero swap overhead.
+/// Before this fix, the classifier held a startup-time Arc snapshot. When the user
+/// hot-reloaded the model via the UI, the classifier still used the old model,
+/// causing a full model unload/reload on every message.
 struct GiapToolAgent {
-    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
-    /// True when tool_model == chat_model — no model-swap overhead for classification.
-    same_model: bool,
+    /// Live provider reference — reads from the RwLock on each call so it always
+    /// uses whatever model is currently loaded. Zero model-swap overhead.
+    live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
 }
 
 #[async_trait::async_trait]
 impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
     async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
-        // Classify using the main LLM
-        let classify_prompt = pond_core::prompts::build_classifier_prompt();
-        let classify_msg = vec![pond_core::domain::message::ChatMessage::user(message)];
+        // Read the LIVE provider — always uses whatever model is currently loaded.
+        // No model swap, no unload/reload overhead.
+        let provider = {
+            let guard = self.live_provider.read().await;
+            match guard.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    println!("[tool-classifier] no provider available, skipping classification");
+                    return Ok(None);
+                }
+            }
+        };
 
-        println!("[tool-classifier] classifying (same_model={}): {:?}", self.same_model, message);
-        let response = self.provider.complete(&classify_prompt, classify_msg).await?;
-        let text = response.content.trim().to_lowercase();
-        println!("[tool-classifier] response: {:?}", text);
+        let classify_prompt = pond_core::prompts::build_classifier_prompt();
+
+        // Retry classifier up to 3 times — thinking models sometimes generate
+        // only reasoning tokens without the required JSON output.
+        const MAX_CLASSIFIER_RETRIES: usize = 3;
+        let mut text = String::new();
+        let mut classified = false;
+
+        for attempt in 1..=MAX_CLASSIFIER_RETRIES {
+            println!("[tool-classifier] classifying (attempt {}/{}, model={}): {:?}",
+                attempt, MAX_CLASSIFIER_RETRIES, provider.model_name(), message);
+
+            let classify_msg_retry = vec![pond_core::domain::message::ChatMessage::user(message)];
+            let response = match provider.complete(&classify_prompt, classify_msg_retry).await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[tool-classifier] inference error on attempt {}: {}", attempt, e);
+                    continue;
+                }
+            };
+
+            // Strip thinking tokens — models like Gemma 4 emit
+            // <|channel>thought...<channel|> preambles even in classifier mode.
+            let raw = &response.content;
+            let stripped = strip_thinking_from_classifier(raw);
+            text = stripped.to_lowercase();
+            println!("[tool-classifier] response (attempt {}, stripped): {:?}",
+                attempt, &text[..text.len().min(200)]);
+
+            // Check if we got valid JSON with needs_tool field
+            if text.contains("needs_tool") {
+                classified = true;
+                break;
+            }
+
+            // Also accept empty JSON {} as "no tool needed"
+            if text.trim() == "{}" {
+                classified = true;
+                break;
+            }
+
+            println!("[tool-classifier] attempt {} produced no valid JSON, retrying...", attempt);
+        }
+
+        if !classified {
+            println!("[tool-classifier] all {} attempts failed to produce valid JSON, skipping tool", MAX_CLASSIFIER_RETRIES);
+            return Ok(None);
+        }
 
         let needs_tool = text.contains("\"needs_tool\": true")
             || text.contains("\"needs_tool\":true")
@@ -1998,6 +2066,174 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                 Ok(None)
             }
         }
+    }
+}
+
+// ── Adversarial Answer Reviewer ───────────────────────────────────────────────
+
+/// Adversarial answer reviewer — post-inference quality gate.
+///
+/// Uses the same LlmProvider as the main LLM with a critic system prompt.
+/// Reviews the completed answer, and if it scores below threshold, sends
+/// the critique back to the LLM for revision.
+struct GiapAnswerReviewer {
+    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    pass_threshold: u8,
+    max_rounds: u32,
+}
+
+#[async_trait::async_trait]
+impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
+    async fn review(
+        &self,
+        question: &str,
+        answer: &str,
+        tool_context: Option<&str>,
+    ) -> anyhow::Result<pond_core::ports::answer_reviewer::ReviewResult> {
+        use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
+        use pond_core::domain::message::ChatMessage;
+
+        let mut current_answer = answer.to_string();
+        let mut rounds = 0u32;
+        let mut last_verdict: Option<ReviewVerdict> = None;
+
+        for _ in 0..self.max_rounds {
+            rounds += 1;
+
+            // Step 1: Review the current answer
+            let review_input = if let Some(ctx) = tool_context {
+                format!(
+                    "QUESTION: {}\n\nCONTEXT PROVIDED TO THE ANSWERER:\n{}\n\nANSWER TO REVIEW:\n{}",
+                    question, ctx, current_answer
+                )
+            } else {
+                format!(
+                    "QUESTION: {}\n\nANSWER TO REVIEW:\n{}",
+                    question, current_answer
+                )
+            };
+
+            println!("[answer-reviewer] reviewing (round {})...", rounds);
+            let review_msg = vec![ChatMessage::user(review_input)];
+            let review_response = self.provider
+                .complete(pond_core::prompts::REVIEW_SYSTEM_PROMPT, review_msg)
+                .await?;
+
+            let verdict = parse_review_verdict(&review_response.content);
+            println!("[answer-reviewer] verdict: pass={}, score={}/5", verdict.pass, verdict.score);
+
+            if verdict.pass || verdict.score >= self.pass_threshold {
+                return Ok(ReviewResult {
+                    final_answer: current_answer,
+                    was_revised: last_verdict.is_some(),
+                    verdict,
+                    rounds,
+                });
+            }
+
+            // Step 2: Revise the answer using the critique
+            println!("[answer-reviewer] critique: {}", verdict.critique);
+            let revision_input = format!(
+                "ORIGINAL QUESTION: {}\n\n\
+                YOUR PREVIOUS ANSWER:\n{}\n\n\
+                REVIEWER CRITIQUE:\n{}\n\n\
+                WHAT THE ANSWER SHOULD INCLUDE:\n- {}\n\n\
+                Please provide an improved, more thorough answer.",
+                question,
+                current_answer,
+                verdict.critique,
+                verdict.expectations.join("\n- ")
+            );
+
+            println!("[answer-reviewer] revising...");
+            let revision_msg = vec![ChatMessage::user(revision_input)];
+            let revision_response = self.provider
+                .complete(pond_core::prompts::REVISION_SYSTEM_PROMPT, revision_msg)
+                .await?;
+
+            current_answer = revision_response.content.clone();
+            last_verdict = Some(verdict);
+        }
+
+        // Exhausted rounds — return the last revision
+        Ok(ReviewResult {
+            final_answer: current_answer,
+            was_revised: true,
+            verdict: last_verdict.unwrap_or(ReviewVerdict {
+                pass: true,
+                score: 3,
+                expectations: Vec::new(),
+                critique: String::new(),
+            }),
+            rounds,
+        })
+    }
+}
+
+/// Strip thinking tokens from classifier output so JSON can be parsed.
+///
+/// Handles Gemma 4 (`<|channel>thought...<channel|>JSON`) and Qwen3/DeepSeek
+/// (`<think>...</think>JSON`). Also extracts JSON from mixed text by finding
+/// the first `{` and last `}`.
+fn strip_thinking_from_classifier(raw: &str) -> String {
+    let mut text = raw.to_string();
+
+    // Gemma 4: everything after last <channel|>
+    if let Some(pos) = text.rfind("<channel|>") {
+        text = text[pos + "<channel|>".len()..].trim().to_string();
+    }
+
+    // Qwen3/DeepSeek: remove <think>...</think> blocks
+    while let Some(start) = text.find("<think>") {
+        if let Some(end) = text[start..].find("</think>") {
+            let before = &text[..start];
+            let after = &text[start + end + "</think>".len()..];
+            text = format!("{}{}", before, after);
+        } else {
+            // Unclosed think block — take everything before it
+            text = text[..start].to_string();
+            break;
+        }
+    }
+
+    // Try to extract JSON object from remaining text
+    let trimmed = text.trim();
+    if let Some(json_start) = trimmed.find('{') {
+        if let Some(json_end) = trimmed.rfind('}') {
+            if json_end > json_start {
+                return trimmed[json_start..=json_end].to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Parse a review verdict from LLM output.
+///
+/// Tries to extract JSON from the response text. If parsing fails,
+/// defaults to `pass: true` — review must never block the user.
+fn parse_review_verdict(text: &str) -> pond_core::ports::answer_reviewer::ReviewVerdict {
+    use pond_core::ports::answer_reviewer::ReviewVerdict;
+
+    let json_start = text.find('{');
+    let json_end = text.rfind('}');
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        if end > start {
+            if let Ok(verdict) = serde_json::from_str::<ReviewVerdict>(&text[start..=end]) {
+                return verdict;
+            }
+        }
+    }
+
+    // Fallback — unparseable output defaults to pass
+    println!("[answer-reviewer] WARNING: unparseable verdict, defaulting to pass: {:?}",
+        &text[..text.len().min(100)]);
+    ReviewVerdict {
+        pass: true,
+        score: 3,
+        expectations: Vec::new(),
+        critique: String::new(),
     }
 }
 
@@ -3168,9 +3404,18 @@ async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domai
                 break;
             }
             AgentStreamEvent::Thinking { content } => {
-                // In CLI, show thinking in dim text for debugging
                 eprint!("\r\x1b[K\x1b[2m  💭 {content}\x1b[0m");
                 let _ = io::stderr().flush();
+            }
+            AgentStreamEvent::ReviewStatus { content } => {
+                eprint!("\r\x1b[K\x1b[33m  🔍 {content}\x1b[0m");
+                let _ = io::stderr().flush();
+            }
+            AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                // Clear previous answer and print revised version
+                eprintln!("\r\x1b[K\x1b[33m  📝 Revised (score: {score}/5, rounds: {rounds})\x1b[0m");
+                println!("{content}");
+                printed_newline = content.ends_with('\n');
             }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");

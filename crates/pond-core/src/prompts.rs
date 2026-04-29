@@ -62,9 +62,9 @@ pub struct PromptState {
 }
 
 /// Tool definitions shared between the system prompt template and the classifier.
-/// Returns a list of `(id, description)` pairs.
-pub fn giap_tool_definitions() -> Vec<(&'static str, &'static str)> {
-    vec![
+/// Returns a list of `(id, description)` pairs. Content is static.
+pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
+    &[
         ("wikipedia", "Look up ANY factual, conceptual, or encyclopedic information. Use for: people, places, events, science, history, geography, technology, definitions, concepts, comparisons (\"compare X and Y\"), \"what is X\", \"how does X work\", \"what is the difference between X and Y\", cultural topics, organizations, species, diseases, inventions, wars, countries, languages — anything where accurate, detailed knowledge matters. ALWAYS prefer this over guessing from memory. When in doubt, look it up."),
         ("weather", "Get current real-time weather conditions (temperature, humidity, wind, forecast) for the user's configured location. Use when the user asks about current weather, temperature, forecast, or whether to bring an umbrella."),
         ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves, important dates, notes). Use when the user says 'remember', 'don't forget', 'save this', 'note that', or states a personal preference or fact about themselves."),
@@ -74,8 +74,30 @@ pub fn giap_tool_definitions() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Build the classifier system prompt dynamically from the tool definitions.
+/// Pre-formatted tool description lines for prompt template injection.
+/// Cached to avoid 6 `format!()` allocations per turn.
+pub fn giap_tool_description_lines() -> &'static [String] {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        giap_tool_definitions()
+            .iter()
+            .map(|(name, desc)| format!("{} — {}", name, desc))
+            .collect()
+    })
+}
+
+/// Build the classifier system prompt from tool definitions.
+///
+/// The prompt is cached after the first call — it's static content that
+/// doesn't change between requests. Avoids ~3KB of string allocations per message.
 pub fn build_classifier_prompt() -> String {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    return CACHED.get_or_init(build_classifier_prompt_inner).clone();
+}
+
+fn build_classifier_prompt_inner() -> String {
     let tools = giap_tool_definitions();
     let tool_lines: Vec<String> = tools.iter()
         .enumerate()
@@ -158,6 +180,57 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32 {
         base_max_tokens                     // 4096 default
     }
 }
+
+// ── Adversarial Review Prompts ────────────────────────────────────────────────
+
+/// System prompt for the adversarial answer reviewer.
+///
+/// The reviewer evaluates answers against a rubric and outputs a structured
+/// JSON verdict. Uses the SAME model as the main LLM with a critic persona.
+pub const REVIEW_SYSTEM_PROMPT: &str = "\
+You are a strict quality reviewer for an AI assistant's answers. Your job is to \
+evaluate whether an answer is COMPLETE, CORRECT, and HELPFUL for the user's question.
+
+Be adversarial: assume the answer might be wrong, shallow, or missing key information.
+
+Evaluate these criteria:
+1. COMPLETENESS: Does the answer address ALL parts of the question? If the user asked \
+to compare two things, are BOTH sides covered with specific details?
+2. ACCURACY: Are the facts, numbers, and claims correct? Flag anything that sounds \
+made up or suspiciously vague.
+3. DEPTH: Is the answer detailed and substantive, or is it vague platitudes? Does it \
+give specific examples, concrete numbers, real comparisons?
+4. RELEVANCE: Does it answer what was actually asked, not something adjacent?
+5. USEFULNESS: Would a human reading this feel genuinely helped, or would they need \
+to search elsewhere for the real answer?
+
+Output ONLY a JSON object with this exact structure:
+{\"pass\": true, \"score\": 4, \"expectations\": [\"what the answer should contain\"], \"critique\": \"\"}
+
+Scoring guide:
+5 = Excellent: thorough, accurate, specific, well-structured, genuinely helpful
+4 = Good: covers the question well, minor gaps only
+3 = Adequate: answers the question but lacks depth or specificity
+2 = Poor: significant gaps, vague, or partially wrong
+1 = Unusable: wrong, off-topic, or dangerously misleading
+
+Be HARSH. A score of 3 means barely adequate. Only give 4-5 for genuinely good answers. \
+Set pass to false and provide a specific critique when the score is below the threshold.
+
+Output ONLY the JSON object. No explanation before or after.";
+
+/// System prompt for the revision pass when the reviewer rejects an answer.
+///
+/// Instructs the main LLM to revise using the reviewer's critique.
+pub const REVISION_SYSTEM_PROMPT: &str = "\
+You previously answered a question, but a quality reviewer found issues with your response. \
+Revise your answer to address the specific critique below. Be more thorough, more specific, \
+and more accurate. Include concrete details, examples, and comparisons where relevant.
+
+Do NOT mention the review process, the reviewer, or that this is a revision. Just give \
+the best possible answer to the original question, as if answering for the first time.
+
+Match the tone and personality from your usual system prompt.";
 
 // ── Static fallback ───────────────────────────────────────────────────────────
 

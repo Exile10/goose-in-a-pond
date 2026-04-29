@@ -706,6 +706,8 @@ async fn chat_stream(
         let model_name_for_done = settings.chat_model.clone();
 
         use pond_core::domain::agent::AgentRequest;
+        // Keep a reference to tool context for the reviewer (needs it to evaluate answer quality)
+        let tool_context_for_review = tool_context.clone();
         let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
         let agent_req = AgentRequest {
             message: agent_message,
@@ -756,6 +758,12 @@ async fn chat_stream(
                                 full_text.push_str(&visible);
                                 Some(json!({"type": "text", "content": visible}).to_string())
                             }
+                        }
+                        AgentStreamEvent::ReviewStatus { content } => {
+                            Some(json!({"type": "review_status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                         }
                         AgentStreamEvent::Done { .. } => {
                             // Handled at the end of the loop
@@ -811,7 +819,56 @@ async fn chat_stream(
             yield Ok(Event::default().data(data));
         }
 
-        // Persist full assistant response
+        // ── Adversarial answer review (post-inference) ───────────────
+        // When review_mode is "on" or "auto", evaluate the answer before
+        // persisting. If the reviewer rejects it, revise and emit a
+        // review_revision event that the frontend uses to replace the text.
+        {
+            let should_review = match settings.review_mode.as_str() {
+                "on" => true,
+                "auto" => {
+                    // Review factual/analytical questions or tool-augmented answers
+                    use pond_core::services::request_classifier::classify_request;
+                    use pond_core::domain::model_role::ModelRole;
+                    let role = classify_request(&req.message);
+                    role == ModelRole::Think || tool_context_for_review.is_some()
+                }
+                _ => false,
+            };
+
+            if should_review {
+                if let Some(ref reviewer) = state.answer_reviewer {
+                    let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
+                    yield Ok(Event::default().data(status));
+
+                    let tool_ctx = tool_context_for_review.as_deref();
+                    match reviewer.review(&req.message, &full_text, tool_ctx).await {
+                        Ok(result) if result.was_revised => {
+                            full_text = result.final_answer.clone();
+                            let data = json!({
+                                "type": "review_revision",
+                                "content": result.final_answer,
+                                "score": result.verdict.score,
+                                "rounds": result.rounds,
+                            }).to_string();
+                            yield Ok(Event::default().data(data));
+                        }
+                        Ok(result) => {
+                            let status = json!({
+                                "type": "review_status",
+                                "content": format!("Answer verified (score: {}/5)", result.verdict.score),
+                            }).to_string();
+                            yield Ok(Event::default().data(status));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Answer review failed (non-fatal): {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist full assistant response (uses revised text if review triggered revision)
         {
             use pond_core::domain::message::ChatMessage;
             use pond_core::domain::session::SessionMessage;
@@ -3769,6 +3826,12 @@ async fn agent_chat_stream(
                             } else {
                                 Some(json!({"type": "text", "content": visible}).to_string())
                             }
+                        }
+                        AgentStreamEvent::ReviewStatus { content } => {
+                            Some(json!({"type": "review_status", "content": content}).to_string())
+                        }
+                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                         }
                         AgentStreamEvent::Done { .. } => {
                             Some(json!({"done": true, "session_id": session_id.clone()}).to_string())

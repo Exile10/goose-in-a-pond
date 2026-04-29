@@ -216,6 +216,9 @@ pub struct AppState {
     /// Tool Agent — classifies messages, executes tools (Wikipedia, weather,
     /// memory), and returns augmented context before the main LLM runs.
     pub tool_agent: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>>,
+    /// Answer Reviewer — adversarial post-inference review that evaluates
+    /// answer quality and triggers revision when below threshold.
+    pub answer_reviewer: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

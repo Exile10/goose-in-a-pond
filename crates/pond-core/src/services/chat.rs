@@ -907,6 +907,8 @@ pub struct ChatService {
     /// Optional Tool Agent — classifies messages and pre-fetches tool data
     /// (Wikipedia, weather, memory) before the main LLM runs.
     tool_agent: Option<Arc<dyn ToolAgent>>,
+    /// Optional Answer Reviewer — adversarial post-inference quality gate.
+    answer_reviewer: Option<Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>>,
 }
 
 impl ChatService {
@@ -926,12 +928,19 @@ impl ChatService {
             system_prompt: SYSTEM_PROMPT.to_string(),
             compactor: None,
             tool_agent: None,
+            answer_reviewer: None,
         }
     }
 
     /// Attach a Tool Agent for pre-inference tool classification and execution.
     pub fn with_tool_agent(mut self, agent: Arc<dyn ToolAgent>) -> Self {
         self.tool_agent = Some(agent);
+        self
+    }
+
+    /// Attach an Answer Reviewer for post-inference adversarial quality review.
+    pub fn with_answer_reviewer(mut self, reviewer: Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>) -> Self {
+        self.answer_reviewer = Some(reviewer);
         self
     }
 
@@ -1172,6 +1181,43 @@ impl ChatService {
         let mut spoken_first = false;
         let mut in_think_block = false;
 
+        // Pipelined TTS: synthesize the next sentence while the current one plays.
+        // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
+        let mut pending_audio: Option<Vec<u8>> = None;
+
+        /// Speak a chunk, using pipelined synthesis when available.
+        /// If `pending_audio` has buffered audio, plays it while synthesizing `text` in parallel.
+        /// Otherwise falls back to sequential speak().
+        macro_rules! speak_pipelined {
+            ($self:expr, $text:expr, $pending:expr) => {{
+                let text = $text;
+                // Try pipelined path: synthesize new text, play old audio concurrently
+                match $self.voice_output.synthesize(&text).await {
+                    Ok(Some(new_wav)) => {
+                        // Play previously buffered audio (if any) and stash the new synthesis
+                        if let Some(prev) = $pending.take() {
+                            if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                tracing::warn!("TTS playback failed: {}", e);
+                            }
+                        }
+                        *$pending = Some(new_wav);
+                    }
+                    _ => {
+                        // Flush any pending audio first
+                        if let Some(prev) = $pending.take() {
+                            if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                tracing::warn!("TTS playback failed: {}", e);
+                            }
+                        }
+                        // Fallback: sequential speak
+                        if let Err(e) = $self.voice_output.speak(&text).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                }
+            }};
+        }
+
         while let Some(event_result) = stream.next().await {
             match event_result? {
                 AgentStreamEvent::ToolCall { tool, .. } => {
@@ -1180,8 +1226,12 @@ impl ChatService {
                         let chunk = sentence_buf.trim().to_string();
                         sentence_buf.clear();
                         stop_tone!();
-                        if let Err(e) = self.voice_output.speak(&chunk).await {
-                            tracing::warn!("TTS failed: {}", e);
+                        speak_pipelined!(self, chunk, &mut pending_audio);
+                    }
+                    // Flush pending audio before the announcement
+                    if let Some(prev) = pending_audio.take() {
+                        if let Err(e) = self.voice_output.play_audio(prev).await {
+                            tracing::warn!("TTS playback failed: {}", e);
                         }
                     }
                     let announcement = tool_announcement(&tool);
@@ -1214,9 +1264,7 @@ impl ChatService {
                             continue;
                         }
                         stop_tone!();
-                        if let Err(e) = self.voice_output.speak(&spoken).await {
-                            tracing::warn!("TTS failed: {}", e);
-                        }
+                        speak_pipelined!(self, spoken, &mut pending_audio);
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
@@ -1226,9 +1274,7 @@ impl ChatService {
                         let spoken = strip_markdown_for_speech(&remainder);
                         if !spoken.is_empty() {
                             stop_tone!();
-                            if let Err(e) = self.voice_output.speak(&spoken).await {
-                                tracing::warn!("TTS flush failed: {}", e);
-                            }
+                            speak_pipelined!(self, spoken, &mut pending_audio);
                         }
                     }
                     sentence_buf.clear();
@@ -1237,9 +1283,20 @@ impl ChatService {
                 AgentStreamEvent::Error { content } => {
                     return Err(anyhow::anyhow!("Agent stream error: {}", content));
                 }
-                AgentStreamEvent::Status { .. } | AgentStreamEvent::ToolResult { .. } | AgentStreamEvent::Thinking { .. } => {
-                    // Not spoken — status/tool results/thinking are informational only
+                AgentStreamEvent::Status { .. }
+                | AgentStreamEvent::ToolResult { .. }
+                | AgentStreamEvent::Thinking { .. }
+                | AgentStreamEvent::ReviewStatus { .. }
+                | AgentStreamEvent::ReviewRevision { .. } => {
+                    // Not spoken during streaming — informational only
                 }
+            }
+        }
+
+        // Play any remaining synthesized audio
+        if let Some(last) = pending_audio.take() {
+            if let Err(e) = self.voice_output.play_audio(last).await {
+                tracing::warn!("TTS final playback failed: {}", e);
             }
         }
 
@@ -1372,17 +1429,79 @@ impl ChatService {
 
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
-            // ── Thinking → Speak (streaming) ──
+            // ── Thinking → Speak (streaming), with wake-word interrupt ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
 
-            match self.chat_stream_once(input).await {
-                Ok(response_text) => {
-                    self.emit_event(WorkflowEvent::AgentOutput(response_text));
+            // Race the agent response against the wake word detector.
+            // If the user says the wake word during inference or TTS playback,
+            // interrupt immediately: stop TTS, drop the stream, and process
+            // the new speech as a fresh request.
+            let chat_fut = self.chat_stream_once(input);
+            let wake_fut = self.wake_word_detector.wait_for_activation_with_audio();
+
+            tokio::pin!(chat_fut);
+            tokio::pin!(wake_fut);
+
+            tokio::select! {
+                chat_result = &mut chat_fut => {
+                    // Normal completion — agent finished before any interrupt
+                    match chat_result {
+                        Ok(response_text) => {
+                            self.emit_event(WorkflowEvent::AgentOutput(response_text));
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ Error: {}", e);
+                            first_turn = true;
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("  ❌ Error: {}", e);
-                    // On error, fall back to wake word mode
-                    first_turn = true;
+                wake_result = &mut wake_fut => {
+                    // Wake word detected during inference/TTS — INTERRUPT
+                    println!("\n  🔄 Interrupted! Listening for new request...");
+
+                    // Stop any in-progress TTS playback immediately
+                    self.voice_output.stop_speaking();
+                    self.voice_output.stop_thinking_tone();
+
+                    // The chat_fut is dropped here, which drops the agent stream.
+                    // Goose may continue background inference but we won't consume it.
+
+                    // Capture the user's new speech (wake word may include trailing audio)
+                    match wake_result {
+                        Ok(activation) => {
+                            self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                            print!("  {}", self.voice_input.prompt());
+                            let _ = io::stdout().flush();
+
+                            if let Some(wav) = activation.captured_audio {
+                                self.voice_input.prime_with_captured(wav);
+                            }
+
+                            match self.voice_input.listen().await {
+                                Ok(Some(new_text)) if !new_text.is_empty() => {
+                                    // Process the new request immediately
+                                    self.emit_event(WorkflowEvent::UserInput(new_text.clone()));
+                                    self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
+                                    match self.chat_stream_once(new_text).await {
+                                        Ok(response_text) => {
+                                            self.emit_event(WorkflowEvent::AgentOutput(response_text));
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ❌ Error: {}", e);
+                                            first_turn = true;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // No speech after interrupt — return to conversational mode
+                                    println!("  💤 No speech after interrupt.");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Wake word interrupt error: {}", e);
+                        }
+                    }
                 }
             }
         }

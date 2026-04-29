@@ -186,6 +186,22 @@ pub struct Settings {
     #[serde(default)]
     pub show_thinking: bool,
 
+    // ── Answer Review ──────────────────────────────────────────────────────
+    /// Review mode: "off" (default) | "on" | "auto"
+    /// "off": no review — answers stream directly to the user
+    /// "on": every answer is reviewed by the adversarial critic before delivery
+    /// "auto": only review factual/analytical questions (Think-classified or tool-augmented)
+    #[serde(default = "Settings::default_review_mode")]
+    pub review_mode: String,
+
+    /// Maximum review-revision rounds. 1 = one review + one optional revision.
+    #[serde(default = "Settings::default_review_max_rounds")]
+    pub review_max_rounds: u32,
+
+    /// Minimum score (1-5) for the reviewer to pass an answer. Below this triggers revision.
+    #[serde(default = "Settings::default_review_pass_threshold")]
+    pub review_pass_threshold: u8,
+
     /// Override the model's reported context window (tokens).
     /// 0 (default) = use the model's own value.
     /// Non-zero = cap at this value (useful for memory-constrained deployments).
@@ -248,6 +264,9 @@ impl Default for Settings {
             retention_session_messages_keep: Self::default_session_messages_keep(),
             thinking_mode:                   Self::default_thinking_mode(),
             show_thinking:                   false,
+            review_mode:                     Self::default_review_mode(),
+            review_max_rounds:               Self::default_review_max_rounds(),
+            review_pass_threshold:           Self::default_review_pass_threshold(),
             context_window_override:         0,
             agent_goose_mode:                Self::default_agent_goose_mode(),
             agent_max_turns:                 Self::default_agent_max_turns(),
@@ -290,6 +309,9 @@ impl Settings {
     fn default_sensor_days()                -> u32    { 7 }
     fn default_session_messages_keep()      -> u32    { 500 }
     fn default_thinking_mode()              -> String { "auto".to_string() }
+    fn default_review_mode()               -> String { "off".to_string() }
+    fn default_review_max_rounds()         -> u32    { 1 }
+    fn default_review_pass_threshold()     -> u8     { 3 }
     fn default_agent_goose_mode()           -> String { "auto".to_string() }
     fn default_agent_max_turns()            -> u32    { 20 }
     fn default_agent_memory_inject()        -> bool   { false }
