@@ -810,13 +810,40 @@ function FacePanel() {
   const installed = data?.models.filter(m => m.downloaded).length ?? 0;
   const total     = data?.models.length ?? 0;
 
+  // Inline style helpers (kept local so FacePanel doesn't depend on the
+  // top-of-file style objects that upstream replaced with CSS classes).
+  const fpHint: React.CSSProperties = {
+    color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0,
+  };
+  const fpBadge: React.CSSProperties = {
+    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+    color: "var(--color-text-tertiary)", background: "rgba(23,22,22,0.05)",
+    padding: "1px 6px", borderRadius: "var(--radius-xs, 4px)", flexShrink: 0,
+  };
+  const fpRow: React.CSSProperties = {
+    display: "flex", alignItems: "center", gap: "var(--space-3)",
+    padding: "var(--space-3) var(--space-4)",
+    background: "var(--color-bg)", border: "1px solid var(--color-border)",
+    borderLeft: "4px solid", transition: "border-color 120ms",
+  };
+  const fpInlineCode: React.CSSProperties = {
+    fontFamily: "var(--font-mono)", fontSize: "0.85em",
+    background: "rgba(23,22,22,0.06)", padding: "1px 5px", borderRadius: 4,
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-      <div style={rootSt.sectionHeader}>
+      <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
         <ScanFace size={14} style={{ color: CAT_COLOR.face }} />
-        <span style={{ ...rootSt.sectionTitle, color: CAT_COLOR.face }}>Face Recognition</span>
+        <span style={{
+          fontFamily: "var(--font-display)", fontWeight: 700,
+          fontSize: "var(--text-sm)", textTransform: "uppercase" as const,
+          letterSpacing: "0.06em", color: CAT_COLOR.face,
+        }}>
+          Face Recognition
+        </span>
         {data && (
-          <span style={mlSt.badge}>
+          <span style={fpBadge}>
             {data.feature_enabled ? `${installed}/${total} ready` : "feature disabled"}
           </span>
         )}
@@ -826,13 +853,13 @@ function FacePanel() {
         </Button>
       </div>
 
-      {loading && <p style={hint}>Loading…</p>}
-      {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
+      {loading && <p style={fpHint}>Loading…</p>}
+      {error && <p style={{ ...fpHint, color: "var(--color-destructive)" }}>{error}</p>}
 
       {data && !data.feature_enabled && (
-        <p style={hint}>
+        <p style={fpHint}>
           Face recognition is disabled in this build. Rebuild pond-server with
-          {" "}<code style={inlineCode}>--features face-onnx</code>{" "}
+          {" "}<code style={fpInlineCode}>--features face-onnx</code>{" "}
           to enable per-user identification.
         </p>
       )}
@@ -842,26 +869,33 @@ function FacePanel() {
           {data.models.map(m => (
             <div
               key={m.name}
-              style={{
-                ...mlSt.row,
-                borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent",
-              }}
+              style={{ ...fpRow, borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent" }}
             >
-              <div style={mlSt.left}>
-                <div style={mlSt.nameRow}>
-                  <span style={mlSt.name}>{m.label}</span>
-                  <span style={mlSt.badge}>{m.role}</span>
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const }}>
+                  <span style={{
+                    fontWeight: 600, fontSize: "var(--text-sm)", color: "var(--color-text)",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+                  }}>
+                    {m.label}
+                  </span>
+                  <span style={fpBadge}>{m.role}</span>
                   {m.downloaded ? (
-                    <span style={{ ...mlSt.badge, color: "var(--color-success)" }}>
+                    <span style={{ ...fpBadge, color: "var(--color-success)" }}>
                       {m.size_mb != null ? `${m.size_mb} MB` : "ready"}
                     </span>
                   ) : (
-                    <span style={{ ...mlSt.badge, color: "#e5a000" }}>
+                    <span style={{ ...fpBadge, color: "#e5a000" }}>
                       missing · ~{m.expected_mb} MB
                     </span>
                   )}
                 </div>
-                <span style={mlSt.sub}>{m.name}</span>
+                <span style={{
+                  fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
+                  color: "var(--color-text-tertiary)",
+                }}>
+                  {m.name}
+                </span>
               </div>
             </div>
           ))}
@@ -869,15 +903,16 @@ function FacePanel() {
       )}
 
       {data?.models_dir && (
-        <p style={{ ...hint, fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", opacity: 0.6 }}>
+        <p style={{ ...fpHint, fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", opacity: 0.6 }}>
           {data.models_dir}
         </p>
       )}
 
-      <p style={hint}>
-        Models auto-download on first server boot. The buffalo_l zip ships ArcFace R50 +
-        SCRFD 10G in a single ~281 MB archive; Silent-Face PAD is ~2 MB. Once installed,
-        use the <strong>Face Enrollment</strong> page (web UI) to register household members.
+      <p style={fpHint}>
+        Models auto-download on first server boot. The buffalo_l fallback zip ships
+        ArcFace R50 + SCRFD 10G; Glint-R100 + SCRFD 34G are fetched separately when
+        their mirrors are reachable. Once installed, use the <strong>Faces</strong>
+        section (left sidebar) to enroll household members.
       </p>
     </div>
   );

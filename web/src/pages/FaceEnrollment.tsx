@@ -76,8 +76,24 @@ export default function FaceEnrollment({ token }: Props) {
         return
       }
       try {
+        // Low-light tuning: ask the webcam ISP for continuous auto-exposure
+        // with a +1 EV bias and continuous AWB.  Items in `advanced[]` are
+        // best-effort per the MediaCapabilities spec — unsupported entries
+        // are silently dropped, so cameras without these capabilities still
+        // honour the base resolution + facingMode constraints.
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+          video: {
+            width:      { ideal: 640 },
+            height:     { ideal: 480 },
+            facingMode: 'user',
+            advanced: [{
+              exposureMode:         'continuous',
+              exposureCompensation: 1.0,    // +1 EV brighter
+              brightness:           128,
+              whiteBalanceMode:     'continuous',
+              focusMode:            'continuous',
+            }] as unknown as MediaTrackConstraintSet[],
+          },
           audio: false,
         })
         if (cancelled) {
