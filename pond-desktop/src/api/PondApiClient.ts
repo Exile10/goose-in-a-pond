@@ -219,6 +219,10 @@ export class PondApiClient {
     });
   }
 
+  getModelCapabilities(): Promise<import("./types").ModelCapabilities> {
+    return this.get("/api/v1/models/capabilities");
+  }
+
   getMemoryStatus(): Promise<ModelMemoryStatus> {
     return this.get("/api/v1/models/memory-status");
   }
@@ -241,8 +245,7 @@ export class PondApiClient {
       }
       return {
         chat:  normalize(raw.chat),
-        think: normalize(raw.think),
-        task:  normalize(raw.task),
+        tool:  raw.tool ?? null,
         asr:   normalize(raw.asr),
         tts:   normalize(raw.tts),
       } as ModelActiveRoles;
