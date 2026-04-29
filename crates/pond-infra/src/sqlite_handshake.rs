@@ -111,6 +111,11 @@ impl SqliteHandshakeAdapter {
 
     /// Mint a new session+refresh token pair, persist hashed, and return the
     /// plaintext to the caller.
+    ///
+    /// Side effect: revokes any previously-active session+refresh pairs for
+    /// the same `device_id`. A device that re-pairs (e.g. the user runs the
+    /// wizard a second time on the same phone) ends up with exactly one
+    /// active row, not a growing pile of orphans.
     async fn issue_session_pair(
         &self,
         client_id: &str,
@@ -122,6 +127,17 @@ impl SqliteHandshakeAdapter {
         let now = Self::now();
         let expires = now + Duration::hours(SESSION_TTL_HOURS);
         let refresh_expires = now + Duration::days(REFRESH_TTL_DAYS);
+
+        // Revoke any prior active sessions for this device — a re-pair from
+        // the same install should supersede, not accumulate.
+        sqlx::query(
+            "UPDATE session_tokens SET revoked_at = ?
+             WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now.to_rfc3339())
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
 
         let token_hash = Self::sha256_hex(session_token.as_bytes());
         let refresh_hash = Self::sha256_hex(refresh_token.as_bytes());
@@ -668,6 +684,64 @@ mod tests {
             .unwrap();
         assert!(!resp.accepted);
         assert_eq!(resp.rejection_reason.as_deref(), Some("invalid_mac"));
+    }
+
+    #[tokio::test]
+    async fn re_pair_same_device_revokes_prior_sessions() {
+        let hs = fresh().await;
+
+        // First pairing.
+        let pc1 = hs.issue_pairing_code().await.unwrap();
+        let init1 = hs
+            .init_handshake(InitRequest {
+                client_id: "device-D".into(),
+                client_type: "gotg".into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+        let challenge1 = B64.decode(init1.challenge.as_bytes()).unwrap();
+        let mut mac1 = Hmac::<Sha256>::new_from_slice(pc1.code.as_bytes()).unwrap();
+        mac1.update(&challenge1);
+        mac1.update(b"device-D");
+        let resp1 = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init1.challenge_id,
+                mac: hex_lower(&mac1.finalize().into_bytes()),
+                device_name: Some("Phone".into()),
+            })
+            .await
+            .unwrap();
+        let token1 = resp1.session_token.unwrap();
+        assert!(hs.validate_token(&token1).await.unwrap());
+
+        // Second pairing from the same device — same client_id.
+        let pc2 = hs.issue_pairing_code().await.unwrap();
+        let init2 = hs
+            .init_handshake(InitRequest {
+                client_id: "device-D".into(),
+                client_type: "gotg".into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+        let challenge2 = B64.decode(init2.challenge.as_bytes()).unwrap();
+        let mut mac2 = Hmac::<Sha256>::new_from_slice(pc2.code.as_bytes()).unwrap();
+        mac2.update(&challenge2);
+        mac2.update(b"device-D");
+        let resp2 = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init2.challenge_id,
+                mac: hex_lower(&mac2.finalize().into_bytes()),
+                device_name: Some("Phone".into()),
+            })
+            .await
+            .unwrap();
+        let token2 = resp2.session_token.unwrap();
+
+        // Old token is revoked, new one is live.
+        assert!(!hs.validate_token(&token1).await.unwrap(), "old session must be revoked");
+        assert!(hs.validate_token(&token2).await.unwrap(), "new session must be live");
     }
 
     #[tokio::test]
