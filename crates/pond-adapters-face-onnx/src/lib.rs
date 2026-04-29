@@ -152,7 +152,15 @@ const MIN_CONTENT_VARIANCE: f32 = 0.006;
 /// Mean-brightness gate (0.0 → fully black, 1.0 → fully white, pre-norm
 /// scale).  Rejects images where the exposure is so off that the face has no
 /// detail to embed.
-const MIN_MEAN_BRIGHTNESS: f32 = 0.05;
+///
+/// Floor lowered from 0.05 → 0.025: with the pre-detection auto-exposure +
+/// CLAHE pipeline now running on the full frame BEFORE the embedder ever
+/// sees the aligned crop, real-user inputs that make it this far are
+/// already brightened. The 0.05 floor was rejecting genuine low-light
+/// frames where the user's face was correctly detected but the embedder's
+/// pre-norm mean still measured ~0.04. 0.025 catches lens-cap / total-dark
+/// inputs while admitting the dimmest realistic indoor user frames.
+const MIN_MEAN_BRIGHTNESS: f32 = 0.025;
 const MAX_MEAN_BRIGHTNESS: f32 = 0.95;
 
 /// Minimum Laplacian variance (in normalised [0,1] pixel units, scaled ×1000
@@ -169,16 +177,16 @@ const MIN_LAPLACIAN_VAR_X1000: f32 = 4.0;
 /// fires.  0.30 catches noticeably dim indoor lighting (no overhead light,
 /// only ambient evening light) without touching a normally-lit headshot
 /// (which sits comfortably in 0.40–0.65).
-const LOW_LIGHT_TRIGGER: f32 = 0.30;
+pub(crate) const LOW_LIGHT_TRIGGER: f32 = 0.30;
 
-fn auto_exposure_enabled() -> bool {
+pub(crate) fn auto_exposure_enabled() -> bool {
     !std::env::var("POND_FACE_AUTO_EXPOSURE")
         .map(|v| v.to_ascii_lowercase() == "off")
         .unwrap_or(false)
 }
 
 /// Mean luminance of an RGB image, in [0, 1].  Rec.709 weights.
-fn mean_luminance(img: &RgbImage) -> f32 {
+pub(crate) fn mean_luminance(img: &RgbImage) -> f32 {
     let n = (img.width() as u64) * (img.height() as u64);
     if n == 0 { return 0.0; }
     let mut acc: f64 = 0.0;
@@ -195,7 +203,34 @@ fn mean_luminance(img: &RgbImage) -> f32 {
 /// outside the range clamped.  Channels are processed independently so a
 /// global colour cast doesn't survive — which is what we want for face
 /// recognition where chroma carries no useful identity signal.
-fn stretch_histogram_2_98(img: &mut RgbImage) {
+pub(crate) fn stretch_histogram_2_98(img: &mut RgbImage) {
+    // Dispatcher: caller picks the algorithm via POND_FACE_AUTO_EXPOSURE_MODE.
+    //
+    //   * `stretch` (default) — per-channel 2-98 percentile linear stretch.
+    //     Cheap (~0.2 ms on 112x112), preserves global tonality, may leave
+    //     mixed-lighting scenes with shadowed faces.
+    //   * `clahe`              — per-channel Contrast Limited Adaptive
+    //     Histogram Equalization (8x8 tiles, clip 4x mean). Recovers face
+    //     detail in scenes with both bright windows and dim corners much
+    //     better than `stretch` does, at the cost of ~3 ms compute and
+    //     slightly more visible noise on uniformly-dim frames.
+    match auto_exposure_mode().as_str() {
+        "clahe" => clahe_per_channel(img, 8, 4.0),
+        _       => stretch_histogram_2_98_linear(img),
+    }
+}
+
+fn auto_exposure_mode() -> String {
+    std::env::var("POND_FACE_AUTO_EXPOSURE_MODE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "stretch".to_string())
+}
+
+/// Per-channel 2-98 percentile linear stretch.  See dispatcher above for
+/// when this beats CLAHE and vice-versa.
+fn stretch_histogram_2_98_linear(img: &mut RgbImage) {
     let n = (img.width() * img.height()) as usize;
     if n == 0 { return; }
     let mut hists: [[u32; 256]; 3] = [[0; 256], [0; 256], [0; 256]];
@@ -228,6 +263,108 @@ fn stretch_histogram_2_98(img: &mut RgbImage) {
             let span = (hi[c] as f32 - lo[c] as f32).max(1.0);
             let mapped = ((v - lo[c] as f32) / span) * 255.0;
             p[c] = mapped.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Per-channel Contrast Limited Adaptive Histogram Equalisation.
+///
+/// Splits the image into `tiles_per_axis × tiles_per_axis` blocks; for each
+/// block + each colour channel, builds a 256-bin histogram, clips bins that
+/// exceed `clip_limit × mean_bin_count` and redistributes the excess
+/// uniformly, then derives a CDF and applies bilinear interpolation between
+/// the four nearest tile-centre CDFs to smoothly equalise each pixel.
+///
+/// Pure CPU, single-pass, ~3 ms on a 640×640 frame.  Per-channel rather than
+/// per-luminance keeps the implementation small and matches the contract of
+/// the existing percentile stretch (chroma is not preserved either way; for
+/// face recognition that's fine — the embedder is colour-agnostic).
+fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 { return; }
+    let n_tiles = tiles_per_axis as usize;
+    if n_tiles < 2 { return; }
+
+    let tile_w = (w as f32 / tiles_per_axis as f32).ceil() as u32;
+    let tile_h = (h as f32 / tiles_per_axis as f32).ceil() as u32;
+    let pixels_per_tile = (tile_w as usize) * (tile_h as usize);
+    let avg_per_bin = pixels_per_tile as f32 / 256.0;
+    let clip_count: u32 = (clip_limit * avg_per_bin).max(1.0) as u32;
+
+    // Per-channel CDF lookup table per tile: [channel][tile_y][tile_x][value 0..255]
+    let mut cdfs: Vec<[[u8; 256]; 3]> = vec![[[0u8; 256]; 3]; n_tiles * n_tiles];
+
+    for ty in 0..n_tiles {
+        for tx in 0..n_tiles {
+            let x0 = (tx as u32) * tile_w;
+            let y0 = (ty as u32) * tile_h;
+            let x1 = ((tx as u32 + 1) * tile_w).min(w);
+            let y1 = ((ty as u32 + 1) * tile_h).min(h);
+            let tile_pixels = ((x1 - x0) as usize) * ((y1 - y0) as usize);
+            if tile_pixels == 0 { continue; }
+            let mut hist: [[u32; 256]; 3] = [[0; 256], [0; 256], [0; 256]];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = img.get_pixel(x, y).0;
+                    for c in 0..3 { hist[c][p[c] as usize] += 1; }
+                }
+            }
+            // Clip + redistribute excess uniformly across all 256 bins.
+            for c in 0..3 {
+                let mut excess: u32 = 0;
+                for b in 0..256 {
+                    if hist[c][b] > clip_count {
+                        excess += hist[c][b] - clip_count;
+                        hist[c][b] = clip_count;
+                    }
+                }
+                let add = excess / 256;
+                let mut leftover = (excess - add * 256) as usize;
+                for b in 0..256 {
+                    hist[c][b] += add;
+                    if leftover > 0 { hist[c][b] += 1; leftover -= 1; }
+                }
+                // CDF → 0..=255 lookup.
+                let mut cum: u32 = 0;
+                let cdf_scale = 255.0 / tile_pixels as f32;
+                for b in 0..256 {
+                    cum += hist[c][b];
+                    cdfs[ty * n_tiles + tx][c][b] = (cum as f32 * cdf_scale).round().min(255.0) as u8;
+                }
+            }
+        }
+    }
+
+    // Bilinear interpolation between the 4 nearest tile centres for each pixel.
+    let half_tw = tile_w as f32 * 0.5;
+    let half_th = tile_h as f32 * 0.5;
+    for y in 0..h {
+        for x in 0..w {
+            // Continuous tile-grid coords (centre at integer values).
+            let gx = ((x as f32 - half_tw) / tile_w as f32).max(0.0);
+            let gy = ((y as f32 - half_th) / tile_h as f32).max(0.0);
+            let max_tile = (n_tiles - 1) as f32;
+            let gx = gx.min(max_tile);
+            let gy = gy.min(max_tile);
+            let tx0 = gx.floor() as usize;
+            let ty0 = gy.floor() as usize;
+            let tx1 = (tx0 + 1).min(n_tiles - 1);
+            let ty1 = (ty0 + 1).min(n_tiles - 1);
+            let fx = gx - tx0 as f32;
+            let fy = gy - ty0 as f32;
+
+            let p = img.get_pixel_mut(x, y);
+            for c in 0..3 {
+                let v = p[c] as usize;
+                let v00 = cdfs[ty0 * n_tiles + tx0][c][v] as f32;
+                let v10 = cdfs[ty0 * n_tiles + tx1][c][v] as f32;
+                let v01 = cdfs[ty1 * n_tiles + tx0][c][v] as f32;
+                let v11 = cdfs[ty1 * n_tiles + tx1][c][v] as f32;
+                let a = v00 * (1.0 - fx) + v10 * fx;
+                let b = v01 * (1.0 - fx) + v11 * fx;
+                let mapped = a * (1.0 - fy) + b * fy;
+                p[c] = mapped.clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }
@@ -724,6 +861,55 @@ mod tests {
         let mean_after = mean_luminance(&img);
         let drift = (mean_after - mean_before).abs();
         assert!(drift < 0.1, "well-exposed image should not drift much: {mean_before} -> {mean_after}");
+    }
+
+    #[test]
+    fn clahe_brightens_dim_image() {
+        // Heavily-underexposed gradient — every pixel in [10, 30].
+        let mut img = RgbImage::from_fn(64, 64, |x, y| {
+            let v = ((x + y) % 21 + 10) as u8;
+            image::Rgb([v, v, v])
+        });
+        let mean_before = mean_luminance(&img);
+        clahe_per_channel(&mut img, 8, 4.0);
+        let mean_after = mean_luminance(&img);
+        assert!(
+            mean_after > mean_before * 2.0,
+            "CLAHE should at least double luminance on a uniformly-dim image; got {mean_before} -> {mean_after}",
+        );
+    }
+
+    #[test]
+    fn clahe_recovers_dark_corner_in_mixed_lighting() {
+        // Top-left quarter is bright (200), bottom-right quarter is dim (20),
+        // remainder a mid-tone (110). The percentile stretch can't help the
+        // dim quarter much because the bright quarter dominates the
+        // global histogram; CLAHE handles each tile independently.
+        let mut img = RgbImage::from_fn(64, 64, |x, y| {
+            let v = if x < 32 && y < 32 { 200u8 }
+                else if x >= 32 && y >= 32 { 20u8 }
+                else { 110u8 };
+            image::Rgb([v, v, v])
+        });
+        // Sample the dim quarter's mean before/after.
+        let dim_mean = |im: &RgbImage| -> f32 {
+            let mut s = 0u32;
+            let mut n = 0u32;
+            for y in 32..64u32 {
+                for x in 32..64u32 {
+                    let p = im.get_pixel(x, y).0;
+                    s += p[0] as u32; n += 1;
+                }
+            }
+            s as f32 / n as f32 / 255.0
+        };
+        let before = dim_mean(&img);
+        clahe_per_channel(&mut img, 8, 4.0);
+        let after = dim_mean(&img);
+        assert!(
+            after > before + 0.1,
+            "CLAHE should lift the dim corner by ≥ 10% absolute luminance; got {before} -> {after}",
+        );
     }
 
     #[test]

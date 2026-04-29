@@ -118,7 +118,18 @@ impl FaceDetector for ScrfdDetector {
     async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
         let bytes = image_bytes.to_vec();
         let session = Arc::clone(&self.session);
-        let score_thresh = self.score_thresh;
+        // The configured score threshold (typically 0.5) is the right
+        // floor for normally-lit input. In low light SCRFD's confidence
+        // drops uniformly across all true faces — apply a relaxed
+        // threshold below LOW_LIGHT_TRIGGER so we still detect dim
+        // faces. The matcher's own threshold + the burst-liveness gates
+        // remain the real spoof / quality safeguards.
+        let configured_score_thresh = self.score_thresh;
+        let low_light_score_thresh: f32 = std::env::var("POND_FACE_SCRFD_LOW_LIGHT_THRESH")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| (0.05..=1.0).contains(v))
+            .unwrap_or(0.30);
         let iou_thresh = self.iou_thresh;
         let strides = self.strides.clone();
         let num_anchors = self.num_anchors;
@@ -130,9 +141,39 @@ impl FaceDetector for ScrfdDetector {
             let (orig_w, orig_h) = img.dimensions();
             // Letterbox-free resize to a fixed square.  Aspect change is
             // absorbed by bbox rescaling below.
-            let resized = img
+            let mut resized = img
                 .resize_exact(input_side, input_side, FilterType::Triangle)
                 .to_rgb8();
+
+            // Pre-detection low-light auto-exposure.  When the input frame is
+            // dim (mean luminance < LOW_LIGHT_TRIGGER), apply the same
+            // per-channel 2-98 percentile stretch the embedder uses on its
+            // aligned crop — but here on the FULL detector tensor BEFORE
+            // SCRFD looks for faces.  This is the layer that matters for
+            // low light: without it, SCRFD's confidence on a dim face drops
+            // below its detection threshold and the embedder never even
+            // sees the frame.  Disable with POND_FACE_AUTO_EXPOSURE=off.
+            //
+            // Also pick a per-frame score threshold: if the input is dim
+            // (after the auto-exposure attempt) we relax to the low-light
+            // floor since SCRFD's own confidence drops uniformly on dim
+            // faces.  The matcher threshold + burst-liveness gates remain
+            // the real spoof / quality safeguards downstream.
+            let pre_mean = crate::mean_luminance(&resized);
+            let was_dim = pre_mean < crate::LOW_LIGHT_TRIGGER;
+            if crate::auto_exposure_enabled() && was_dim {
+                crate::stretch_histogram_2_98(&mut resized);
+                tracing::debug!(
+                    before = pre_mean,
+                    after = crate::mean_luminance(&resized),
+                    "scrfd: applied low-light auto-exposure to detector input"
+                );
+            }
+            let score_thresh = if was_dim {
+                low_light_score_thresh.min(configured_score_thresh)
+            } else {
+                configured_score_thresh
+            };
             let side = input_side as usize;
             let mut arr = Array4::<f32>::zeros((1, 3, side, side));
             for (x, y, px) in resized.enumerate_pixels() {

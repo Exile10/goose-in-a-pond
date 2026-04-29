@@ -80,8 +80,27 @@ export function Faces() {
         return;
       }
       try {
+        // Low-light tuning: ask the webcam ISP for continuous auto-exposure +
+        // a +1 EV bias and continuous auto-white-balance.  The `advanced[]`
+        // entries are best-effort per the MediaCapabilities spec — any
+        // constraint the device doesn't support is silently dropped, so
+        // browsers/cameras without these capabilities still honour the
+        // base ideal-resolution + facingMode constraints.
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+          video: {
+            width:       { ideal: 640 },
+            height:      { ideal: 480 },
+            facingMode:  "user",
+            // Cast keeps older TS lib.dom.d.ts happy: not every TS release
+            // ships the image-capture extensions in MediaTrackConstraintSet.
+            advanced: [{
+              exposureMode:         "continuous",
+              exposureCompensation: 1.0,    // +1 EV brighter
+              brightness:           128,
+              whiteBalanceMode:     "continuous",
+              focusMode:            "continuous",
+            }] as unknown as MediaTrackConstraintSet[],
+          },
           audio: false,
         });
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
