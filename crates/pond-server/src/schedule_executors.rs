@@ -30,12 +30,13 @@ impl AgentScheduleExecutor {
     pub fn new(
         agent: Arc<dyn Agent>,
         session_storage: Arc<dyn SessionStorage>,
+        max_concurrent: u32,
     ) -> Self {
         Self {
             agent,
             session_storage,
             http_client: reqwest::Client::new(),
-            semaphore: Semaphore::new(2),
+            semaphore: Semaphore::new(max_concurrent.max(1) as usize),
         }
     }
 }

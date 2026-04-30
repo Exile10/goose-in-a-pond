@@ -59,6 +59,18 @@ pub struct ScheduleRun {
     pub duration_ms: Option<u64>,
 }
 
+/// Event emitted when a scheduled task completes (for SSE broadcast / desktop notification).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleResultEvent {
+    pub schedule_id: String,
+    pub schedule_label: String,
+    pub run_id: String,
+    pub status: RunStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

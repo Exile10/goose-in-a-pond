@@ -10,11 +10,6 @@ use crate::domain::memory::{MemoryFragment, MemoryLifecycle, MemoryTier};
 use crate::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 
-/// Memories with effective score below this are deleted.
-const PRUNE_THRESHOLD: f32 = 0.05;
-/// Memories with effective score below this (but above prune) are archived.
-const ARCHIVE_THRESHOLD: f32 = 0.15;
-
 /// Compute the effective score of a memory after time-based decay.
 ///
 /// Formula: `importance * exp(-decay_rate * days_since_access) * (1 + ln(access_count + 1) * 0.1)`
@@ -50,30 +45,35 @@ pub fn effective_score(fragment: &MemoryFragment) -> f32 {
 
 /// Run one cleanup pass: compute scores, archive/prune low-value memories.
 ///
+/// `prune_threshold` — memories below this score are deleted (default 0.05).
+/// `archive_threshold` — memories below this score are archived (default 0.15).
+///
 /// Returns (scanned, archived, pruned) counts.
-pub async fn run_cleanup(repo: &dyn MemoryRepository) -> Result<(usize, usize, usize)> {
+pub async fn run_cleanup(
+    repo: &dyn MemoryRepository,
+    prune_threshold: f32,
+    archive_threshold: f32,
+) -> Result<(usize, usize, usize)> {
     let memories = repo.search_scoreable(None).await?;
     let mut updates: Vec<(String, MemoryLifecycle)> = Vec::new();
     let mut pruned = 0;
     let mut archived = 0;
 
     for mem in &memories {
-        // Skip memories without decay fields (legacy, pre-segment)
         if mem.importance.is_none() {
             continue;
         }
 
-        // Permanent tier is exempt
         if mem.tier.as_ref() == Some(&MemoryTier::Permanent) {
             continue;
         }
 
         let score = effective_score(mem);
 
-        if score < PRUNE_THRESHOLD {
-            updates.push((mem.id.clone(), MemoryLifecycle::Archived)); // soft delete
+        if score < prune_threshold {
+            updates.push((mem.id.clone(), MemoryLifecycle::Archived));
             pruned += 1;
-        } else if score < ARCHIVE_THRESHOLD {
+        } else if score < archive_threshold {
             updates.push((mem.id.clone(), MemoryLifecycle::Archived));
             archived += 1;
         }
@@ -132,7 +132,7 @@ mod tests {
         let mem = make_memory(0.5, 0.1, 30.0, 0, MemoryTier::Short);
         let score = effective_score(&mem);
         // 0.5 * exp(-0.1 * 30) ≈ 0.5 * 0.05 ≈ 0.025
-        assert!(score < PRUNE_THRESHOLD, "short-tier 30-day-old memory should be below prune threshold, got {score}");
+        assert!(score < 0.05, "short-tier 30-day-old memory should be below default prune threshold (0.05), got {score}");
     }
 
     #[test]

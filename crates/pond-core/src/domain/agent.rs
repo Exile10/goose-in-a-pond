@@ -55,6 +55,8 @@ pub enum AgentStreamEvent {
     Done {
         session_id: String,
         model_role: String,
+        /// Token usage for this response (estimated if real counts unavailable).
+        usage: Option<crate::ports::provider::UsageStats>,
     },
     Error {
         content: String,

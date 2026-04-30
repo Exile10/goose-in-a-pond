@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
-/// Maximum runs retained per schedule.
-const MAX_RUNS_PER_SCHEDULE: usize = 50;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedRuns {
     runs: Vec<ScheduleRun>,
@@ -21,10 +18,11 @@ struct PersistedRuns {
 pub struct JsonRunHistory {
     path: PathBuf,
     state: Mutex<Vec<ScheduleRun>>,
+    max_runs_per_schedule: usize,
 }
 
 impl JsonRunHistory {
-    pub async fn new(path: PathBuf) -> Result<Self> {
+    pub async fn new(path: PathBuf, max_runs_per_schedule: u32) -> Result<Self> {
         let runs = if path.exists() {
             let json = tokio::fs::read_to_string(&path).await?;
             let persisted: PersistedRuns =
@@ -37,6 +35,7 @@ impl JsonRunHistory {
         Ok(Self {
             path,
             state: Mutex::new(runs),
+            max_runs_per_schedule: max_runs_per_schedule.max(1) as usize,
         })
     }
 
@@ -112,7 +111,7 @@ impl JsonRunHistory {
         runs.retain(|r| {
             let count = counts.entry(r.schedule_id.clone()).or_insert(0);
             *count += 1;
-            *count <= MAX_RUNS_PER_SCHEDULE
+            *count <= self.max_runs_per_schedule
         });
     }
 

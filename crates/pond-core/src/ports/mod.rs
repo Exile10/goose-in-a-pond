@@ -16,6 +16,7 @@ pub mod handshake;
 pub mod mcp_memory;
 pub mod mcp_server;
 pub mod model_scheduler;
+pub mod memory_consolidator;
 pub mod memory_extractor;
 pub mod memory_repository;
 pub mod notification;

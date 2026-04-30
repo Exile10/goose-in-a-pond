@@ -128,6 +128,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }

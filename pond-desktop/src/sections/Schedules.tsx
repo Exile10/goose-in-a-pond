@@ -86,6 +86,27 @@ export function Schedules() {
     load();
   }, []);
 
+  // Subscribe to schedule result events via SSE for live notifications.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    const baseUrl = (state as Record<string, unknown>).serverUrl as string | undefined;
+    const url = `${baseUrl || "http://127.0.0.1:4000"}/api/v1/schedules/events`;
+    const es = new EventSource(url);
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as ScheduleRun & { schedule_label?: string };
+        const label = data.schedule_label || data.schedule_id;
+        if (data.status === "completed") {
+          flashMsg(`Schedule "${label}" completed.`);
+        } else if (data.status === "failed") {
+          flashMsg(`Schedule "${label}" failed: ${data.error || "unknown"}`, true);
+        }
+        load(); // refresh the list
+      } catch { /* ignore parse errors */ }
+    };
+    return () => es.close();
+  }, [state.serverOnline]);
+
   function flashMsg(msg: string, isError = false) {
     if (isError) {
       setActionError(msg);

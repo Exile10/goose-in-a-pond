@@ -24,11 +24,15 @@ Output ONLY the JSON array.";
 
 pub struct LlmMemoryExtractor {
     live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
+    max_facts: usize,
 }
 
 impl LlmMemoryExtractor {
-    pub fn new(live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>) -> Self {
-        Self { live_provider }
+    pub fn new(live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>, max_facts: u32) -> Self {
+        Self {
+            live_provider,
+            max_facts: max_facts as usize,
+        }
     }
 }
 
@@ -60,7 +64,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
         let messages = vec![ChatMessage::user(input)];
         let response = provider.complete(EXTRACTION_PROMPT, messages).await?;
 
-        parse_extraction_response(&response.content, existing_content)
+        parse_extraction_response(&response.content, existing_content, self.max_facts)
     }
 }
 
@@ -71,6 +75,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
 fn parse_extraction_response(
     raw: &str,
     existing_content: &[String],
+    max_facts: usize,
 ) -> Result<Vec<ExtractedFact>> {
     let text = raw.trim();
 
@@ -95,7 +100,7 @@ fn parse_extraction_response(
                 let facts: Vec<ExtractedFact> = arr
                     .iter()
                     .filter_map(|v| parse_fact_json(v, existing_content))
-                    .take(3)
+                    .take(max_facts)
                     .collect();
                 return Ok(facts);
             }
@@ -125,7 +130,7 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
     let segment = v
         .get("segment")
         .and_then(|s| s.as_str())
-        .and_then(parse_segment)
+        .and_then(parse_segment_str)
         .unwrap_or(MemorySegment::Knowledge);
 
     let importance = v
@@ -144,7 +149,7 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
     })
 }
 
-fn parse_segment(s: &str) -> Option<MemorySegment> {
+pub fn parse_segment_str(s: &str) -> Option<MemorySegment> {
     match s.to_lowercase().as_str() {
         "identity" => Some(MemorySegment::Identity),
         "preference" => Some(MemorySegment::Preference),
@@ -158,7 +163,7 @@ fn parse_segment(s: &str) -> Option<MemorySegment> {
 }
 
 /// Strip `<think>…</think>` and `<|channel>…<channel|>` tokens.
-fn strip_thinking(text: &str) -> String {
+pub fn strip_thinking(text: &str) -> String {
     let mut result = text.to_string();
 
     // Strip <think>…</think>
@@ -195,7 +200,7 @@ mod tests {
             {"fact": "User's name is Jerry", "segment": "identity", "importance": 0.85},
             {"fact": "User prefers dark mode", "segment": "preference", "importance": 0.7}
         ]"#;
-        let facts = parse_extraction_response(json, &[]).unwrap();
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].content, "User's name is Jerry");
         assert_eq!(facts[0].segment, MemorySegment::Identity);
@@ -205,14 +210,14 @@ mod tests {
 
     #[test]
     fn parse_empty_array() {
-        let facts = parse_extraction_response("[]", &[]).unwrap();
+        let facts = parse_extraction_response("[]", &[], 3).unwrap();
         assert!(facts.is_empty());
     }
 
     #[test]
     fn parse_json_with_preamble() {
         let text = "Here are the facts:\n[{\"fact\": \"Lives in Nairobi\", \"segment\": \"identity\", \"importance\": 0.8}]";
-        let facts = parse_extraction_response(text, &[]).unwrap();
+        let facts = parse_extraction_response(text, &[], 3).unwrap();
         assert_eq!(facts.len(), 1);
     }
 
@@ -220,7 +225,7 @@ mod tests {
     fn dedup_skips_existing() {
         let existing = vec!["user's name is jerry".to_string()];
         let json = r#"[{"fact": "User's name is Jerry", "segment": "identity", "importance": 0.85}]"#;
-        let facts = parse_extraction_response(json, &existing).unwrap();
+        let facts = parse_extraction_response(json, &existing, 3).unwrap();
         assert!(facts.is_empty());
     }
 
@@ -232,7 +237,7 @@ mod tests {
             {"fact": "Fact three", "segment": "knowledge", "importance": 0.5},
             {"fact": "Fact four", "segment": "knowledge", "importance": 0.5}
         ]"#;
-        let facts = parse_extraction_response(json, &[]).unwrap();
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts.len(), 3);
     }
 
@@ -241,14 +246,14 @@ mod tests {
         let text = "<think>reasoning here</think>[{\"fact\": \"Test fact\", \"segment\": \"knowledge\", \"importance\": 0.5}]";
         let stripped = strip_thinking(text);
         assert!(stripped.contains("[{"), "stripped should contain JSON, got: {stripped:?}");
-        let facts = parse_extraction_response(text, &[]).unwrap();
+        let facts = parse_extraction_response(text, &[], 3).unwrap();
         assert_eq!(facts.len(), 1);
     }
 
     #[test]
     fn missing_segment_defaults_to_knowledge() {
         let json = r#"[{"fact": "Some fact", "importance": 0.6}]"#;
-        let facts = parse_extraction_response(json, &[]).unwrap();
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].segment, MemorySegment::Knowledge);
     }
@@ -256,7 +261,7 @@ mod tests {
     #[test]
     fn importance_clamped() {
         let json = r#"[{"fact": "High importance", "segment": "identity", "importance": 1.5}]"#;
-        let facts = parse_extraction_response(json, &[]).unwrap();
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts[0].importance, 1.0);
     }
 }

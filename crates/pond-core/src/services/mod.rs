@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod memory_cleanup;
+pub mod memory_consolidation;
 pub mod memory_extraction;
 pub mod model_service;
 pub mod request_classifier;

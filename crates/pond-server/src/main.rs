@@ -21,6 +21,7 @@ mod filesystem_model_storage;
 mod composite_model_catalog_provider;
 mod http_model_downloader;
 mod llamafile_process;
+mod llm_memory_consolidator;
 mod llm_memory_extractor;
 mod model_download;
 mod piper_http;
@@ -1124,9 +1125,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             let extractor: Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor> =
                 Arc::new(llm_memory_extractor::LlmMemoryExtractor::new(
                     llm_provider.clone(),
+                    settings.memory_extraction_max_facts,
                 ));
             let service = Arc::new(
-                pond_core::services::memory_extraction::MemoryExtractionService::new(),
+                pond_core::services::memory_extraction::MemoryExtractionService::new(
+                    settings.memory_extraction_interval_secs,
+                ),
             );
             tracing::info!("memory extraction enabled — facts will be auto-extracted from conversations");
             (Some(extractor), Some(service))
@@ -1145,14 +1149,17 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         });
     }
 
-    // Spawn background memory decay/cleanup task (runs every 6 hours)
+    // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
         let cleanup_repo = memory_repo.clone();
+        let cleanup_interval_secs = settings.memory_cleanup_interval_hours as u64 * 3600;
+        let prune_threshold = settings.memory_prune_threshold;
+        let archive_threshold = settings.memory_archive_threshold;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
             loop {
                 interval.tick().await;
-                match pond_core::services::memory_cleanup::run_cleanup(cleanup_repo.as_ref()).await {
+                match pond_core::services::memory_cleanup::run_cleanup(cleanup_repo.as_ref(), prune_threshold, archive_threshold).await {
                     Ok((scanned, archived, pruned)) => {
                         if archived > 0 || pruned > 0 {
                             tracing::info!(
@@ -1165,6 +1172,36 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             }
         });
         tracing::info!("memory cleanup enabled — runs every 6 hours");
+    }
+
+    // Spawn background memory consolidation task
+    if settings.memory_consolidation_enabled {
+        let consol_repo = memory_repo.clone();
+        let consol_provider = llm_provider.clone();
+        let consol_interval_secs = settings.memory_consolidation_interval_hours as u64 * 3600;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(consol_interval_secs));
+            loop {
+                interval.tick().await;
+                let consolidator = llm_memory_consolidator::LlmMemoryConsolidator::new(
+                    consol_provider.clone(),
+                );
+                match pond_core::services::memory_consolidation::run_consolidation(
+                    &consolidator,
+                    consol_repo.as_ref(),
+                ).await {
+                    Ok((merged, pruned)) => {
+                        if merged > 0 || pruned > 0 {
+                            tracing::info!(
+                                "memory consolidation: merged={merged}, pruned={pruned}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("memory consolidation failed: {e}"),
+                }
+            }
+        });
+        tracing::info!("memory consolidation enabled — runs every 24 hours");
     }
 
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
@@ -1208,13 +1245,16 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // exists.  The real executor (AgentScheduleExecutor) is injected after the
     // agent is constructed further below.
     let deferred_executor = Arc::new(DeferredExecutor::new());
+    let (schedule_result_tx, _) = tokio::sync::broadcast::channel::<pond_core::domain::schedule::ScheduleResultEvent>(32);
     let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
         let exec: Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor> =
             deferred_executor.clone();
-        match CronSchedulerAdapter::new(
+        match CronSchedulerAdapter::with_options(
             data_dir.join("schedules.json"),
             data_dir.join("schedule_runs.json"),
             exec,
+            Some(schedule_result_tx.clone()),
+            settings.schedule_max_runs_per_task,
         )
         .await
         {
@@ -1277,6 +1317,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         let real_executor = Arc::new(AgentScheduleExecutor::new(
             agent.clone(),
             session_storage.clone(),
+            settings.schedule_max_concurrent,
         ));
         deferred_executor
             .init(real_executor as Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor>)
@@ -1393,6 +1434,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,
+        schedule_result_tx: schedule_result_tx.clone(),
     });
 
     // Warn if static assets haven't been built yet

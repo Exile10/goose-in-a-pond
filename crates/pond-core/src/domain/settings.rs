@@ -241,6 +241,56 @@ pub struct Settings {
     /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
     #[serde(default = "Settings::default_schedule_result_notify")]
     pub schedule_result_notify: bool,
+
+    // ── Memory tuning ────────────────────────────────────────────────────────
+
+    /// Memory decay: effective score below this → prune (delete). Default 0.05.
+    #[serde(default = "Settings::default_memory_prune_threshold")]
+    pub memory_prune_threshold: f32,
+
+    /// Memory decay: effective score below this → archive (hide). Default 0.15.
+    #[serde(default = "Settings::default_memory_archive_threshold")]
+    pub memory_archive_threshold: f32,
+
+    /// Memory cleanup background task interval in hours. Default 6.
+    #[serde(default = "Settings::default_memory_cleanup_interval_hours")]
+    pub memory_cleanup_interval_hours: u32,
+
+    /// Memory consolidation background task interval in hours. Default 24.
+    #[serde(default = "Settings::default_memory_consolidation_interval_hours")]
+    pub memory_consolidation_interval_hours: u32,
+
+    /// Max memories to process per consolidation batch. Default 20.
+    #[serde(default = "Settings::default_memory_consolidation_batch_size")]
+    pub memory_consolidation_batch_size: u32,
+
+    /// Max facts to extract per conversation turn. Default 3.
+    #[serde(default = "Settings::default_memory_extraction_max_facts")]
+    pub memory_extraction_max_facts: u32,
+
+    /// Minimum seconds between extraction runs (rate limit). Default 10.
+    #[serde(default = "Settings::default_memory_extraction_interval_secs")]
+    pub memory_extraction_interval_secs: u32,
+
+    // ── Scheduling tuning ────────────────────────────────────────────────────
+
+    /// Max concurrent scheduled task executions. Default 2.
+    #[serde(default = "Settings::default_schedule_max_concurrent")]
+    pub schedule_max_concurrent: u32,
+
+    /// Max execution history entries retained per schedule. Default 50.
+    #[serde(default = "Settings::default_schedule_max_runs_per_task")]
+    pub schedule_max_runs_per_task: u32,
+
+    // ── Cost comparison ──────────────────────────────────────────────────────
+
+    /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
+    #[serde(default = "Settings::default_cloud_input_price_per_million")]
+    pub cloud_input_price_per_million: f64,
+
+    /// Cloud API output token price per million. Default 10.00 (GPT-4o).
+    #[serde(default = "Settings::default_cloud_output_price_per_million")]
+    pub cloud_output_price_per_million: f64,
 }
 
 impl Default for Settings {
@@ -293,6 +343,17 @@ impl Default for Settings {
             memory_cleanup_enabled:          false,
             memory_consolidation_enabled:    false,
             schedule_result_notify:          Self::default_schedule_result_notify(),
+            memory_prune_threshold:          Self::default_memory_prune_threshold(),
+            memory_archive_threshold:        Self::default_memory_archive_threshold(),
+            memory_cleanup_interval_hours:   Self::default_memory_cleanup_interval_hours(),
+            memory_consolidation_interval_hours: Self::default_memory_consolidation_interval_hours(),
+            memory_consolidation_batch_size: Self::default_memory_consolidation_batch_size(),
+            memory_extraction_max_facts:     Self::default_memory_extraction_max_facts(),
+            memory_extraction_interval_secs: Self::default_memory_extraction_interval_secs(),
+            schedule_max_concurrent:         Self::default_schedule_max_concurrent(),
+            schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
+            cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
+            cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
         }
     }
 }
@@ -338,6 +399,17 @@ impl Settings {
     fn default_agent_memory_inject()        -> bool   { false }
     fn default_agent_memory_limit()         -> u32    { 5 }
     fn default_schedule_result_notify()     -> bool   { true }
+    fn default_memory_prune_threshold()     -> f32    { 0.05 }
+    fn default_memory_archive_threshold()   -> f32    { 0.15 }
+    fn default_memory_cleanup_interval_hours() -> u32 { 6 }
+    fn default_memory_consolidation_interval_hours() -> u32 { 24 }
+    fn default_memory_consolidation_batch_size() -> u32 { 20 }
+    fn default_memory_extraction_max_facts() -> u32   { 3 }
+    fn default_memory_extraction_interval_secs() -> u32 { 10 }
+    fn default_schedule_max_concurrent()    -> u32    { 2 }
+    fn default_schedule_max_runs_per_task() -> u32    { 50 }
+    fn default_cloud_input_price_per_million() -> f64 { 2.50 }
+    fn default_cloud_output_price_per_million() -> f64 { 10.00 }
 }
 
 #[cfg(test)]

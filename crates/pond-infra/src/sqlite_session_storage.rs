@@ -13,10 +13,13 @@ use sqlx::{Pool, Sqlite};
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
-    id:         String,
-    title:      Option<String>,
-    created_at: String,
-    updated_at: String,
+    id:                       String,
+    title:                    Option<String>,
+    total_prompt_tokens:      i64,
+    total_completion_tokens:  i64,
+    model_name:               Option<String>,
+    created_at:               String,
+    updated_at:               String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -60,10 +63,13 @@ impl TryFrom<SessionRow> for Session {
     type Error = SessionStorageError;
     fn try_from(r: SessionRow) -> Result<Self, Self::Error> {
         Ok(Session {
-            id:         r.id,
-            title:      r.title,
-            created_at: parse_dt(&r.created_at),
-            updated_at: parse_dt(&r.updated_at),
+            id:                       r.id,
+            title:                    r.title,
+            total_prompt_tokens:      r.total_prompt_tokens as u32,
+            total_completion_tokens:  r.total_completion_tokens as u32,
+            model_name:               r.model_name,
+            created_at:               parse_dt(&r.created_at),
+            updated_at:               parse_dt(&r.updated_at),
         })
     }
 }
@@ -109,7 +115,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -198,7 +204,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -257,6 +263,31 @@ impl SessionStorage for SqliteSessionStorage {
             rows.into_iter().map(SessionMessage::try_from).collect::<Result<_, _>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    async fn increment_usage(
+        &self,
+        session_id: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        model_name: Option<&str>,
+    ) -> Result<(), SessionStorageError> {
+        sqlx::query(
+            "UPDATE sessions SET \
+                total_prompt_tokens = total_prompt_tokens + ?, \
+                total_completion_tokens = total_completion_tokens + ?, \
+                model_name = COALESCE(?, model_name), \
+                updated_at = datetime('now') \
+             WHERE id = ?",
+        )
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(model_name)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
     }
 }
 
