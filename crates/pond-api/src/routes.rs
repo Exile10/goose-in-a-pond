@@ -634,40 +634,57 @@ async fn chat_stream(
 
         let model_role = "chat";
 
-        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
-        // Delegates to the ToolAgent port (injected via AppState). The same
-        // implementation serves both HTTP and CLI voice paths — no duplicate
-        // classifier logic. pond-api never calls pond-mcp-server directly.
-        let tool_context: Option<String> = if let Some(ref ta) = state.tool_agent {
-            let status = json!({"type": "status", "content": "Thinking..."}).to_string();
-            yield Ok(Event::default().data(status));
-            match ta.process(&req.message).await {
-                Ok(Some(augmented)) => {
-                    tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
-                    Some(augmented)
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::debug!(target: "giap::tool_agent", "classification error: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // ── Parallel Prep: LLM classification + user message persist ────────
+        // The ToolAgent runs LLM classification on a concurrent thread while
+        // message persistence happens in parallel. On HTTP providers (Ollama/
+        // llamafile), the classifier LLM call runs on a separate connection,
+        // truly parallel. On GGUF, it serializes behind the model mutex but
+        // the DB persist still runs concurrently.
+        let tool_agent_ref = state.tool_agent.clone();
+        let msg_for_tool = req.message.clone();
+        let msg_for_persist = req.message.clone();
+        let sid_for_persist = session_id.clone();
+        let storage_ref = storage.clone();
 
-        // Persist user message
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let user_msg = ChatMessage::user(req.message.clone());
-            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), user_msg);
-            if let Err(e) = storage.add_message(session_id.clone(), sm).await {
-                let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
-            }
+        let (tool_result, persist_result) = tokio::join!(
+            async {
+                match &tool_agent_ref {
+                    Some(ta) => ta.process(&msg_for_tool).await,
+                    None => Ok(None),
+                }
+            },
+            async {
+                use pond_core::domain::message::ChatMessage;
+                use pond_core::domain::session::SessionMessage;
+                let user_msg = ChatMessage::user(msg_for_persist);
+                let sm = SessionMessage::new(
+                    Uuid::new_v4().to_string(),
+                    sid_for_persist,
+                    user_msg,
+                );
+                storage_ref.add_message(session_id.clone(), sm).await
+            },
+        );
+
+        // Check persist result
+        if let Err(e) = persist_result {
+            let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+            yield Ok(Event::default().data(data));
+            return;
         }
+
+        // Extract tool context
+        let tool_context: Option<String> = match tool_result {
+            Ok(Some(augmented)) => {
+                tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
+                Some(augmented)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(target: "giap::tool_agent", "tool agent error: {e}");
+                None
+            }
+        };
 
         // ── On-demand llamafile startup ─────────────────────────────────────
         // If any role uses llamafile and the process is not responding, emit a
@@ -876,17 +893,17 @@ async fn chat_stream(
             }
         }
 
-        // Persist full assistant response (uses revised text if review triggered revision)
-        let full_text_for_extraction = full_text.clone();
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let assistant_msg = ChatMessage::assistant(full_text);
-            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
-            let _ = storage.add_message(session_id.clone(), sm).await;
-        }
+        // ── Parallel Post-Processing ──────────────────────────────────
+        // Memory extraction is spawned as a background task immediately,
+        // running concurrently with the answer persist below. On HTTP
+        // providers (Ollama/llamafile), the extraction LLM call can
+        // overlap with whatever the main model is doing next.
+        //
+        // The review (above) must remain synchronous because it may
+        // revise `full_text`, which we need before persisting.
 
-        // Background memory extraction — asynchronous, never blocks SSE.
+        // Start memory extraction ASAP — don't wait for persist.
+        let full_text_for_extraction = full_text.clone();
         if let (Some(extractor), Some(service)) =
             (&state.memory_extractor, &state.memory_extraction_service)
         {
@@ -899,6 +916,15 @@ async fn chat_stream(
             tokio::spawn(async move {
                 svc.run(ext.as_ref(), repo.as_ref(), &user_msg, &asst_resp, Some(&sid)).await;
             });
+        }
+
+        // Persist full assistant response (uses revised text if review triggered revision)
+        {
+            use pond_core::domain::message::ChatMessage;
+            use pond_core::domain::session::SessionMessage;
+            let assistant_msg = ChatMessage::assistant(full_text);
+            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
+            let _ = storage.add_message(session_id.clone(), sm).await;
         }
 
         // Persist token usage to session

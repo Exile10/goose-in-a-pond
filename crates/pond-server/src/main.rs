@@ -20,6 +20,7 @@
 mod filesystem_model_storage;
 mod composite_model_catalog_provider;
 mod http_model_downloader;
+mod inference_pool;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
@@ -1101,9 +1102,23 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build ToolAgent for the HTTP path — uses the LIVE provider (RwLock) so the
-    // classifier always uses whatever model is currently loaded. No model swap.
-    println!("  Tool Agent: using live provider (zero model-swap overhead)");
+    // Build InferencePool — concurrent LLM task submission with provider-aware
+    // concurrency limits. HTTP providers (Ollama/llamafile) get 3 concurrent
+    // slots; local GGUF gets 1 (serialized by Goose's model mutex anyway).
+    let inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>> = {
+        use pond_core::ports::inference_pool::InferencePool as _;
+        let pool = inference_pool::TokioInferencePool::for_provider(
+            llm_provider.clone(),
+            &effective_chat_provider,
+        );
+        println!("  Inference Pool: concurrency={} (provider={})",
+            pool.concurrency(), effective_chat_provider);
+        Some(Arc::new(pool))
+    };
+
+    // Build ToolAgent for the HTTP path — uses keyword routing (instant, no LLM call).
+    // The live_provider is retained for potential fallback classification.
+    println!("  Tool Agent: keyword routing (zero LLM overhead)");
     let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
         Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
 
@@ -1114,7 +1129,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds);
     let answer_reviewer_for_http: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>> =
         Some(Arc::new(GiapAnswerReviewer {
-            provider: chat_provider_arc,
+            live_provider: llm_provider.clone(),
             pass_threshold: settings.review_pass_threshold,
             max_rounds: settings.review_max_rounds,
         }) as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
@@ -1434,6 +1449,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,
+        inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
     });
 
@@ -2055,30 +2071,32 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     Ok(())
 }
 
-/// Tool Agent implementation for both HTTP and CLI voice paths.
-/// Uses the LIVE LLM provider (from the RwLock) for classification so it always
-/// uses the currently loaded model — no model swap, no unload/reload overhead.
+/// Tool Agent — LLM-based classification on a concurrent thread.
 ///
-/// Before this fix, the classifier held a startup-time Arc snapshot. When the user
-/// hot-reloaded the model via the UI, the classifier still used the old model,
-/// causing a full model unload/reload on every message.
+/// Uses the live LLM provider to classify every message. The classification
+/// runs concurrently with I/O prep work (memory prefetch, message persist,
+/// llamafile readiness) via `tokio::join!` in routes.rs — so the LLM call
+/// overlaps with other work instead of blocking serially.
+///
+/// On HTTP providers (Ollama/llamafile), the classifier LLM call runs on a
+/// separate HTTP connection, truly parallel with the main chat's prep phase.
+/// On local GGUF, it serializes behind the model mutex but the I/O prep
+/// still runs concurrently.
 struct GiapToolAgent {
-    /// Live provider reference — reads from the RwLock on each call so it always
-    /// uses whatever model is currently loaded. Zero model-swap overhead.
+    /// Live provider — reads from the RwLock so it always uses whatever
+    /// model is currently loaded. Zero model-swap overhead.
     live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
 }
 
 #[async_trait::async_trait]
 impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
     async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
-        // Read the LIVE provider — always uses whatever model is currently loaded.
-        // No model swap, no unload/reload overhead.
         let provider = {
             let guard = self.live_provider.read().await;
             match guard.as_ref() {
                 Some(p) => p.clone(),
                 None => {
-                    println!("[tool-classifier] no provider available, skipping classification");
+                    println!("[tool-agent] no provider available, skipping");
                     return Ok(None);
                 }
             }
@@ -2086,52 +2104,20 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         let classify_prompt = pond_core::prompts::build_classifier_prompt();
 
-        // Retry classifier up to 3 times — thinking models sometimes generate
-        // only reasoning tokens without the required JSON output.
-        const MAX_CLASSIFIER_RETRIES: usize = 3;
-        let mut text = String::new();
-        let mut classified = false;
+        println!("[tool-agent] classifying (model={}): {:?}",
+            provider.model_name(), &message[..message.len().min(80)]);
 
-        for attempt in 1..=MAX_CLASSIFIER_RETRIES {
-            println!("[tool-classifier] classifying (attempt {}/{}, model={}): {:?}",
-                attempt, MAX_CLASSIFIER_RETRIES, provider.model_name(), message);
-
-            let classify_msg_retry = vec![pond_core::domain::message::ChatMessage::user(message)];
-            let response = match provider.complete(&classify_prompt, classify_msg_retry).await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("[tool-classifier] inference error on attempt {}: {}", attempt, e);
-                    continue;
-                }
-            };
-
-            // Strip thinking tokens — models like Gemma 4 emit
-            // <|channel>thought...<channel|> preambles even in classifier mode.
-            let raw = &response.content;
-            let stripped = strip_thinking_from_classifier(raw);
-            text = stripped.to_lowercase();
-            println!("[tool-classifier] response (attempt {}, stripped): {:?}",
-                attempt, &text[..text.len().min(200)]);
-
-            // Check if we got valid JSON with needs_tool field
-            if text.contains("needs_tool") {
-                classified = true;
-                break;
+        let classify_msg = vec![pond_core::domain::message::ChatMessage::user(message)];
+        let response = match provider.complete(&classify_prompt, classify_msg).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("[tool-agent] classify error: {e}");
+                return Ok(None);
             }
+        };
 
-            // Also accept empty JSON {} as "no tool needed"
-            if text.trim() == "{}" {
-                classified = true;
-                break;
-            }
-
-            println!("[tool-classifier] attempt {} produced no valid JSON, retrying...", attempt);
-        }
-
-        if !classified {
-            println!("[tool-classifier] all {} attempts failed to produce valid JSON, skipping tool", MAX_CLASSIFIER_RETRIES);
-            return Ok(None);
-        }
+        let text = strip_thinking_tags(&response.content).to_lowercase();
+        println!("[tool-agent] classify result: {:?}", &text[..text.len().min(200)]);
 
         let needs_tool = text.contains("\"needs_tool\": true")
             || text.contains("\"needs_tool\":true")
@@ -2149,52 +2135,15 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
             else if text.contains("schedules") { "schedules" }
             else { "wikipedia" };
 
-        println!("[voice-tool-agent] tool={}, executing...", tool);
+        println!("[tool-agent] tool={}, executing...", tool);
 
         match pond_mcp_server::try_tool_agent(tool, message).await {
             Some(info) => {
-                println!("[voice-tool-agent] got result ({} chars)", info.len());
-
-                // Tool-specific context templates — avoid bloated instructions
-                // that overwhelm small models' limited context windows.
-                let augmented = match tool {
-                    // Action confirmations: relay directly, no "authoritative source" framing.
-                    "create_schedule" | "save_memory" | "devices" | "schedules" => {
-                        format!(
-                            "{}\n\n[Action result]\n{}\n\n\
-                            Tell the user what happened. Be concise and natural.",
-                            message, info
-                        )
-                    }
-                    // Weather: compact context.
-                    "weather" => {
-                        format!(
-                            "{}\n\n[Current weather data]\n{}\n\n\
-                            Report the weather naturally. No need to mention the data source.",
-                            message, info
-                        )
-                    }
-                    // Wikipedia / knowledge lookups: truncate to ~2000 chars to
-                    // stay within small-model context budgets.
-                    _ => {
-                        let truncated = if info.len() > 2000 {
-                            format!("{}…", &info[..2000])
-                        } else {
-                            info.clone()
-                        };
-                        format!(
-                            "{}\n\n[Reference]\n{}\n\n\
-                            Answer using the reference above. Include specific facts. \
-                            Do not mention that anything was looked up.",
-                            message, truncated
-                        )
-                    }
-                };
-
-                Ok(Some(augmented))
+                println!("[tool-agent] got result ({} chars)", info.len());
+                Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &info)))
             }
             None => {
-                println!("[voice-tool-agent] tool returned no result");
+                println!("[tool-agent] tool returned no result");
                 Ok(None)
             }
         }
@@ -2209,7 +2158,9 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 /// Reviews the completed answer, and if it scores below threshold, sends
 /// the critique back to the LLM for revision.
 struct GiapAnswerReviewer {
-    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    /// Live provider reference — reads from the RwLock so it always uses
+    /// whatever model is currently loaded. Matches the GiapToolAgent pattern.
+    live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
     pass_threshold: u8,
     max_rounds: u32,
 }
@@ -2224,6 +2175,15 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
     ) -> anyhow::Result<pond_core::ports::answer_reviewer::ReviewResult> {
         use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
         use pond_core::domain::message::ChatMessage;
+
+        // Read the LIVE provider — always uses whatever model is currently loaded.
+        let provider = {
+            let guard = self.live_provider.read().await;
+            match guard.as_ref() {
+                Some(p) => p.clone(),
+                None => return Err(anyhow::anyhow!("no LLM provider available for review")),
+            }
+        };
 
         let mut current_answer = answer.to_string();
         let mut rounds = 0u32;
@@ -2247,7 +2207,7 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
 
             println!("[answer-reviewer] reviewing (round {})...", rounds);
             let review_msg = vec![ChatMessage::user(review_input)];
-            let review_response = self.provider
+            let review_response = provider
                 .complete(pond_core::prompts::REVIEW_SYSTEM_PROMPT, review_msg)
                 .await?;
 
@@ -2279,11 +2239,14 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
 
             println!("[answer-reviewer] revising...");
             let revision_msg = vec![ChatMessage::user(revision_input)];
-            let revision_response = self.provider
+            let revision_response = provider
                 .complete(pond_core::prompts::REVISION_SYSTEM_PROMPT, revision_msg)
                 .await?;
 
-            current_answer = revision_response.content.clone();
+            // Strip thinking tags — the revision model (same GGUF provider)
+            // may emit <think>/<thought>/<|channel>thought reasoning in its
+            // revision, and this bypasses the SSE ThoughtFilter.
+            current_answer = strip_thinking_tags(&revision_response.content);
             last_verdict = Some(verdict);
         }
 
@@ -2302,12 +2265,11 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
     }
 }
 
-/// Strip thinking tokens from classifier output so JSON can be parsed.
+/// Strip reasoning-channel tags from model output.
 ///
-/// Handles Gemma 4 (`<|channel>thought...<channel|>JSON`) and Qwen3/DeepSeek
-/// (`<think>...</think>JSON`). Also extracts JSON from mixed text by finding
-/// the first `{` and last `}`.
-fn strip_thinking_from_classifier(raw: &str) -> String {
+/// Handles Gemma 4 (`<|channel>thought...<channel|>`), Qwen3/DeepSeek
+/// (`<think>...</think>`), and alternate `<thought>...</thought>` format.
+fn strip_thinking_tags(raw: &str) -> String {
     let mut text = raw.to_string();
 
     // Gemma 4: everything after last <channel|>
@@ -2315,31 +2277,33 @@ fn strip_thinking_from_classifier(raw: &str) -> String {
         text = text[pos + "<channel|>".len()..].trim().to_string();
     }
 
-    // Qwen3/DeepSeek: remove <think>...</think> blocks
+    // <think>...</think> blocks
     while let Some(start) = text.find("<think>") {
         if let Some(end) = text[start..].find("</think>") {
             let before = &text[..start];
             let after = &text[start + end + "</think>".len()..];
             text = format!("{}{}", before, after);
         } else {
-            // Unclosed think block — take everything before it
             text = text[..start].to_string();
             break;
         }
     }
 
-    // Try to extract JSON object from remaining text
-    let trimmed = text.trim();
-    if let Some(json_start) = trimmed.find('{') {
-        if let Some(json_end) = trimmed.rfind('}') {
-            if json_end > json_start {
-                return trimmed[json_start..=json_end].to_string();
-            }
+    // <thought>...</thought> blocks
+    while let Some(start) = text.find("<thought>") {
+        if let Some(end) = text[start..].find("</thought>") {
+            let before = &text[..start];
+            let after = &text[start + end + "</thought>".len()..];
+            text = format!("{}{}", before, after);
+        } else {
+            text = text[..start].to_string();
+            break;
         }
     }
 
-    trimmed.to_string()
+    text.trim().to_string()
 }
+
 
 /// Parse a review verdict from LLM output.
 ///

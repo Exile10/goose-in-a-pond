@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod answer_reviewer;
+pub mod inference_pool;
 pub mod event_log;
 pub mod model_catalog_provider;
 pub mod model_downloader;

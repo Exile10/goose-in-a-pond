@@ -21,47 +21,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::extension_manager::GiapGooseExtensionManager;
 
-/// Strip thinking-token preambles from model output.
-///
-/// Handles:
-/// - Gemma 4: `<|channel>thought … <channel|>ACTUAL REPLY`
-/// - Qwen3 / DeepSeek-R1 / QwQ: `<think>…</think>ACTUAL REPLY`
-fn strip_thinking_tokens(text: &str) -> String {
-    // Gemma 4 format — everything after last <channel|>
-    const CHANNEL_CLOSE: &str = "<channel|>";
-    if let Some(pos) = text.rfind(CHANNEL_CLOSE) {
-        let cleaned = text[pos + CHANNEL_CLOSE.len()..].trim();
-        if !cleaned.is_empty() {
-            return cleaned.to_string();
-        }
-    }
-
-    // <think>…</think> format — strip all blocks
-    if text.contains("<think>") {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        loop {
-            if let Some(start) = rest.find("<think>") {
-                out.push_str(&rest[..start]);
-                if let Some(end) = rest[start..].find("</think>") {
-                    rest = &rest[start + end + "</think>".len()..];
-                } else {
-                    break; // unclosed — discard tail
-                }
-            } else {
-                out.push_str(rest);
-                break;
-            }
-        }
-        let trimmed = out.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    text.to_string()
-}
-
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
 const FALLBACK_PROMPT: &str =
@@ -456,18 +415,49 @@ impl GooseAdapter {
             None
         };
 
-        let (template_result, devices_result, extras_result, skills_result, memories_result) = tokio::join!(
+        // Extract keywords from user message for relevance-based memory search.
+        // Simple approach: split on whitespace, keep words ≥3 chars, lowercase.
+        let memory_keywords: Vec<String> = request.message
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        let (template_result, devices_result, extras_result, skills_result, recent_memories, relevant_memories) = tokio::join!(
             self.template_repo.get(&settings.prompt_style),
             self.device_repo.list_devices(),
             self.extras_repo.list_active(),
             self.skill_repo.list_active(),
+            // Recent memories (recency-based)
             async {
                 match memory_limit {
                     Some(limit) => self.memory_repo.search_recent(None, limit).await,
                     None => Ok(vec![]),
                 }
             },
+            // Relevant memories (content keyword match — surfaces old but topical memories)
+            async {
+                match memory_limit {
+                    Some(limit) if !memory_keywords.is_empty() => {
+                        self.memory_repo.search_by_content(&memory_keywords, None, limit).await
+                    }
+                    _ => Ok(vec![]),
+                }
+            },
         );
+
+        // Merge recent + relevant, deduplicate by ID
+        let memories_result: Result<Vec<pond_core::domain::memory::MemoryFragment>> = {
+            let mut merged = recent_memories.unwrap_or_default();
+            let relevant = relevant_memories.unwrap_or_default();
+            let seen: std::collections::HashSet<String> = merged.iter().map(|m| m.id.clone()).collect();
+            for m in relevant {
+                if !seen.contains(&m.id) {
+                    merged.push(m);
+                }
+            }
+            Ok(merged)
+        };
 
         let template_content = template_result
             .ok()
@@ -491,12 +481,19 @@ impl GooseAdapter {
             let available_tools: Vec<String> = pond_core::prompts::giap_tool_description_lines()
                 .to_vec();
 
-            // Resolve thinking mode from settings + capabilities
+            // Resolve thinking mode from settings + capabilities.
+            // Voice mode always disables thinking — reasoning tokens waste TTS
+            // time and leak as spoken text if any filter layer misses them.
+            let is_voice = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
             let caps = self.model_capabilities.lock().unwrap().clone();
-            let thinking_enabled = match settings.thinking_mode.as_str() {
-                "on"  => true,
-                "off" => false,
-                _     => caps.thinking, // "auto" — enable when model supports it
+            let thinking_enabled = if is_voice {
+                false
+            } else {
+                match settings.thinking_mode.as_str() {
+                    "on"  => true,
+                    "off" => false,
+                    _     => caps.thinking, // "auto" — enable when model supports it
+                }
             };
 
             PromptState {
@@ -689,16 +686,16 @@ impl GooseAdapter {
                                     _ => {}
                                 }
                             }
-                            // Emit text — strip <think> blocks and Gemma 4 channel tags
-                            // before yielding so all consumers (CLI, HTTP SSE, voice TTS)
-                            // receive clean text without internal reasoning.
+                            // Emit raw text — the SSE layer's stateful ThoughtFilter
+                            // handles stripping of <think>, <thought>, and
+                            // <|channel>thought...<channel|> tags across chunk
+                            // boundaries.  A per-chunk strip here interferes with
+                            // the stateful filter (it eats close tags the filter
+                            // is waiting for, causing answer text to be swallowed).
                             let raw_text = msg.as_concat_text();
                             if !raw_text.is_empty() {
-                                let text = strip_thinking_tokens(&raw_text);
-                                if !text.is_empty() {
-                                    total_output_chars += text.len();
-                                    yield Ok(AgentStreamEvent::Text { content: text });
-                                }
+                                total_output_chars += raw_text.len();
+                                yield Ok(AgentStreamEvent::Text { content: raw_text });
                             }
                         }
                         goose::agents::AgentEvent::HistoryReplaced(_) => {
@@ -728,7 +725,15 @@ impl GooseAdapter {
 #[async_trait]
 impl AgentPort for GooseAdapter {
     fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
-        self.model_capabilities.lock().unwrap().clone()
+        let mut caps = self.model_capabilities.lock().unwrap().clone();
+        // Voice mode disables expensive/leaky capabilities: thinking tokens
+        // waste TTS time, vision/audio inputs aren't used in voice flow.
+        if self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) {
+            caps.thinking = false;
+            caps.vision = false;
+            caps.audio_input = false;
+        }
+        caps
     }
 
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {

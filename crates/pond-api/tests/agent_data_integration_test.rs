@@ -121,7 +121,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None,
+        memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
 
@@ -292,7 +292,7 @@ async fn prompt_template_delete_system_returns_403() {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None,
+        memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
 
@@ -570,7 +570,7 @@ async fn returns_501_when_repos_not_configured() {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None,
+        memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));

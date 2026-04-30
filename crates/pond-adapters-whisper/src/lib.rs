@@ -325,7 +325,7 @@ fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 /// Stops when `silence_ms` consecutive milliseconds of silence are detected,
 /// or after `max_record_secs` total recording time.
 fn record_mono_f32_until_silence(max_record_secs: u32, silence_ms: u64) -> Result<(Vec<f32>, u32)> {
-    const SILENCE_RMS: f32 = 0.008;
+    const SILENCE_RMS: f32 = 0.005;
     const POLL_MS: u64     = 30;
 
     let host = cpal::default_host();
@@ -447,8 +447,8 @@ fn record_mono_f32_until_silence(max_record_secs: u32, silence_ms: u64) -> Resul
 /// Returns mono f32 PCM samples and the device's sample rate.
 /// Returns `Ok((empty, rate))` if no speech was detected within the wait period.
 fn record_mono_f32_vad(max_wait_secs: u32, max_record_secs: u32, silence_ms: u64) -> Result<(Vec<f32>, u32)> {
-    const SPEECH_RMS: f32  = 0.018;  // onset threshold — raised to reject ambient noise
-    const SILENCE_RMS: f32 = 0.008;  // end-of-speech threshold (hysteresis)
+    const SPEECH_RMS: f32  = 0.010;  // onset threshold — lowered for better sensitivity
+    const SILENCE_RMS: f32 = 0.005;  // end-of-speech threshold (hysteresis)
     const POLL_MS: u64     = 30;
 
     let host = cpal::default_host();
@@ -697,11 +697,11 @@ impl Default for KeywordDetectorConfig {
     fn default() -> Self {
         Self {
             window_ms:               2500,
-            slide_ms:                400,
+            slide_ms:                300,
             post_trigger_ms:         5000,
             hysteresis_enabled:      true,
-            hysteresis_slide_ms:     200,
-            energy_threshold:        0.015,
+            hysteresis_slide_ms:     150,
+            energy_threshold:        0.003,
             post_trigger_silence_ms: 600,
             cooldown_ms:             2000,
         }
@@ -752,7 +752,7 @@ impl WhisperKeywordDetector {
     /// (e.g. "hey goose" / "hey, goose" / "a goose").
     ///
     /// When `variants` is empty the detector keeps the single normalized trigger
-    /// set by `new()`.
+    /// set by `new()`, plus built-in fuzzy variants for common wake words.
     pub fn with_transcriptions(mut self, variants: Vec<String>) -> Self {
         if !variants.is_empty() {
             self.triggers = variants
@@ -765,6 +765,15 @@ impl WhisperKeywordDetector {
                 self.triggers = vec![normalize_transcript(&self.prompt)];
             }
         }
+        // Always add built-in fuzzy variants for the primary trigger.
+        // Whisper frequently misheard common wake words.
+        let primary = self.triggers.first().cloned().unwrap_or_default();
+        let builtins = builtin_fuzzy_variants(&primary);
+        for variant in builtins {
+            if !self.triggers.contains(&variant) {
+                self.triggers.push(variant);
+            }
+        }
         self
     }
 
@@ -772,6 +781,34 @@ impl WhisperKeywordDetector {
     pub fn with_config(mut self, config: KeywordDetectorConfig) -> Self {
         self.config = config;
         self
+    }
+}
+
+/// Built-in fuzzy variants for common wake words.
+///
+/// Whisper (especially tiny/base models) frequently mishears short words.
+/// These variants catch the most common transcription errors without
+/// requiring user calibration.
+fn builtin_fuzzy_variants(primary_trigger: &str) -> Vec<String> {
+    match primary_trigger {
+        "goose" => vec![
+            "goose".to_string(),
+            "goos".to_string(),
+            "gooes".to_string(),
+            "gus".to_string(),
+            "gooch".to_string(),
+            "hey goose".to_string(),
+            "a goose".to_string(),
+            "the goose".to_string(),
+        ],
+        "hey goose" => vec![
+            "hey goose".to_string(),
+            "hey goos".to_string(),
+            "hey gus".to_string(),
+            "a goose".to_string(),
+            "hey gooch".to_string(),
+        ],
+        _ => vec![],
     }
 }
 

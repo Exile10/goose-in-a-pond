@@ -39,6 +39,7 @@
 pub mod middleware;
 pub mod routes;
 pub mod thought_filter;
+pub mod tool_context;
 
 /// Controls the lifecycle of the local llamafile server process.
 ///
@@ -224,6 +225,10 @@ pub struct AppState {
     pub memory_extractor: Option<Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor>>,
     /// Shared extraction service instance (rate limiter + dedup state).
     pub memory_extraction_service: Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
+    /// Inference pool — concurrent LLM task submission with provider-aware
+    /// semaphore (3 for HTTP providers, 1 for GGUF). Used for parallel
+    /// post-processing (review + extraction can run concurrently on HTTP providers).
+    pub inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>>,
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
     pub schedule_result_tx: tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
 }

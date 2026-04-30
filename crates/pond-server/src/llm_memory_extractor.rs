@@ -14,12 +14,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const EXTRACTION_PROMPT: &str = "\
-Extract durable facts from this conversation. Output a JSON array only.
+Extract ONLY facts about the USER from this conversation. Output a JSON array only.
 Each item: {\"fact\": \"...\", \"segment\": \"identity|preference|correction|relationship|project|knowledge|context\", \"importance\": 0.0-1.0}
 Rules:
-- Only facts worth remembering long-term. Skip greetings, small talk, questions without useful answers.
-- identity: name, role, location. preference: likes/dislikes. correction: user correcting you. relationship: people they know. project: ongoing work/goals. knowledge: learned facts. context: current situation.
-- Max 3 facts. If nothing durable, output [].
+- ONLY save facts about the user — their identity, preferences, corrections, relationships, projects.
+- NEVER save general knowledge, encyclopedia facts, or information the assistant provided. Only save what the USER revealed about themselves.
+- identity: user's name, role, location, age. preference: user's likes/dislikes/allergies. correction: user correcting the assistant. relationship: people the user knows. project: user's ongoing work/goals. knowledge: facts the user taught that aren't common knowledge. context: user's current situation.
+- Max 3 facts. If the user didn't reveal anything about themselves, output [].
 Output ONLY the JSON array.";
 
 pub struct LlmMemoryExtractor {
