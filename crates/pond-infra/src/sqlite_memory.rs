@@ -280,6 +280,56 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn search_by_content(
+        &self,
+        keywords: &[String],
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        if keywords.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build a WHERE clause with OR'd LIKE conditions for each keyword.
+        // e.g. (content LIKE '%cat%' OR content LIKE '%dog%')
+        let like_clauses: Vec<String> = keywords
+            .iter()
+            .map(|_| "LOWER(content) LIKE ?".to_string())
+            .collect();
+        let likes_sql = like_clauses.join(" OR ");
+
+        let profile_filter = if profile_id.is_some() {
+            "AND profile_id = ?"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE (lifecycle IS NULL OR lifecycle = 'active') \
+             AND ({likes_sql}) \
+             {profile_filter} \
+             ORDER BY COALESCE(importance, 0.5) DESC, created_at DESC \
+             LIMIT ?"
+        );
+
+        let mut query = sqlx::query_as::<_, FragmentRow>(&sql);
+
+        // Bind each keyword as '%keyword%'
+        for kw in keywords {
+            query = query.bind(format!("%{}%", kw.to_lowercase()));
+        }
+
+        if let Some(pid) = profile_id {
+            query = query.bind(pid);
+        }
+
+        query = query.bind(limit as i64);
+
+        let rows: Vec<FragmentRow> = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(row_to_fragment).collect())
+    }
+
     // ── Segment-aware methods ────────────────────────────────────────────────
 
     async fn record_access(&self, id: &str) -> Result<()> {
@@ -511,6 +561,49 @@ mod tests {
         repo.update_lifecycle("arch1", MemoryLifecycle::Archived).await.unwrap();
         // Archived memories should not appear in search_recent
         let results = repo.search_recent(None, 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_by_content_finds_matching_keywords() {
+        let (repo, _tmp) = make_repo().await;
+        repo.add(MemoryFragment::from_extraction(
+            "cat1".to_string(), None, "User loves cats".to_string(),
+            MemorySegment::Preference, 0.8,
+        )).await.unwrap();
+        repo.add(MemoryFragment::from_extraction(
+            "dog1".to_string(), None, "User has a dog named Rex".to_string(),
+            MemorySegment::Knowledge, 0.6,
+        )).await.unwrap();
+        repo.add(MemoryFragment::from_extraction(
+            "work1".to_string(), None, "User works at Jarida".to_string(),
+            MemorySegment::Identity, 0.85,
+        )).await.unwrap();
+
+        // Search for "cats" — should find cat1
+        let results = repo.search_by_content(
+            &["cats".to_string()], None, 10
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "cat1");
+
+        // Search for "dog" — should find dog1
+        let results = repo.search_by_content(
+            &["dog".to_string()], None, 10
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "dog1");
+
+        // Search for "cats" + "dog" — should find both
+        let results = repo.search_by_content(
+            &["cats".to_string(), "dog".to_string()], None, 10
+        ).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Empty keywords — no results
+        let results = repo.search_by_content(
+            &[], None, 10
+        ).await.unwrap();
         assert!(results.is_empty());
     }
 

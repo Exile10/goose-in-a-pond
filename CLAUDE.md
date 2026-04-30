@@ -4,6 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
+## Terminology & Workflow Conventions
+
+- **"UI"** always means **Pond Desktop** (the Tauri 2.0 desktop app in `pond-desktop/`)
+- **"voice mode"** means **both** the CLI voice mode (`pond-server chat --input whisper`) **and** the desktop voice mode (mic orb in Pond Desktop)
+- **Proposal reference**: `.ai/proposal.txt` describes the project vision and quarterly milestones — consult it when making architectural decisions
+- **Before implementing changes, fixes, or features**: do deep research on the query first (use web search if needed), then write your plan to `.ai/scratchpad.md` before coding
+
+---
+
+## First-Time Installation
+
+```bash
+# One-command setup: submodule init → deps → build → DB → models → verify
+bash scripts/install.sh
+
+# Options:
+bash scripts/install.sh --desktop        # also install desktop app
+bash scripts/install.sh --ollama         # pull LLM via Ollama
+bash scripts/install.sh --llamafile      # download llamafile binary
+bash scripts/install.sh --no-models      # skip model downloads (faster)
+bash scripts/install.sh --full           # build entire workspace (10+ min)
+```
+
 ## Build Commands
 
 ```bash
@@ -105,15 +128,36 @@ Follow the 5-step pattern (documented in `docs/creating-ports-and-adapters.md`):
 4. **Real adapter** as `crates/pond-adapters-<name>/` — implements the port trait
 5. **Wire** in `crates/pond-server/src/main.rs` — inject into `AppState`
 
-### Agent Pipeline
+### Agent Pipeline (Multi-Threaded)
 
-Every chat message flows through a configurable pipeline:
+Every chat message flows through a parallelized pipeline:
 
-1. **ToolAgent** (pre-processor): Classifies the message using the main LLM, fetches tool data (Wikipedia, weather, memory) if needed, and injects it into the agent message. Uses the live provider via `RwLock` -- zero model swap overhead.
-2. **Main LLM** (GooseAdapter): Generates the response with system prompt, conversation history, skills, and memory. Streams tokens via SSE.
-3. **AnswerReviewer** (post-processor, configurable): Adversarial critic evaluates answer quality. If score below threshold, sends critique back to the LLM for revision. Settings: `review_mode` ("off"/"on"/"auto"), `review_pass_threshold` (1-5), `review_max_rounds`.
+```
+Phase 1 — Parallel Prep (no LLM, <50ms):
+  ├── route_to_tool(message)           // keyword routing, instant
+  ├── persist user message             // DB write, ~1ms
+  └── llamafile readiness check        // HTTP ping (if needed)
 
-See `docs/architecture/agent_pipeline.md` for full details.
+Phase 2 — Tool Execution (HTTP/DB only, 100-500ms):
+  └── try_tool_agent(tool, message)    // weather API, wikipedia, DB query
+
+Phase 3 — Main Chat Stream (5-30s):
+  └── agent.chat_stream(augmented_msg) // SSE tokens → client
+
+Phase 4 — Parallel Post-Processing:
+  ├── memory_extraction (background)   // tokio::spawn, concurrent LLM call
+  ├── answer_review (if enabled)       // concurrent on HTTP providers
+  └── persist assistant response       // DB write
+```
+
+Key design decisions:
+- **LLM classification on a concurrent thread**: `GiapToolAgent` uses the live LLM provider for reliable classification. The LLM call runs concurrently with I/O prep (message persist, memory prefetch) via `tokio::join!` in routes.rs — so the classifier overlaps with other work instead of blocking serially. On HTTP providers (Ollama/llamafile), the classifier runs on a separate HTTP connection, truly parallel.
+- **Keyword routing** (`route_to_tool()` in `request_classifier.rs`) is available as a utility for fast pre-filtering but is not used in the primary path — LLM classification is more reliable for natural language.
+- **InferencePool** (`pond-core/ports/inference_pool.rs`) provides provider-aware concurrency: 3 concurrent requests for HTTP providers (Ollama/llamafile), 1 for local GGUF (serialized by Goose's model mutex).
+- **Memory injection is ON by default** (`agent_memory_inject: true`). Recent memories are injected into the system prompt every turn.
+- **AnswerReviewer** uses the live provider (`RwLock`) so it always uses the currently loaded model.
+
+See `docs/architecture/agent_pipeline.md` and `.ai/multi-threaded-agent-loop.md` for full details.
 
 ### Model Capabilities
 
@@ -137,10 +181,28 @@ The registry is a global `OnceLock<Mutex<LocalModelRegistry>>` in Goose. Registr
 
 Chat responses stream over Server-Sent Events at `POST /api/v1/chat/stream`. Each event is a JSON line:
 - `{"type":"text","content":"...","token":"..."}` — partial token
+- `{"type":"thinking","content":"..."}` — reasoning content (when `show_thinking` enabled)
 - `{"done":true,"session_id":"...","model_role":"chat|think|task","usage":{"prompt_tokens":N,"completion_tokens":N}}`
 - `{"error":"..."}` — provider error
 
 Token usage comes from Ollama (`prompt_eval_count`/`eval_count`); llamafile only emits usage in its final SSE chunk (many builds omit it entirely); GGUF (via Goose) discards usage internally.
+
+### Reasoning-Tag Stripping (ThoughtFilter)
+
+Local models emit reasoning markup that must be stripped before reaching the user. Three tag formats exist:
+- **Gemma 4**: `<|channel>thought…<channel|>`
+- **Qwen3 / DeepSeek-R1**: `<think>…</think>`
+- **Alternate**: `<thought>…</thought>`
+
+The **authoritative filter** is `ThoughtFilter` in `crates/pond-api/src/thought_filter.rs` — a stateful, cross-chunk filter applied at the SSE layer (`routes.rs`). It handles all tag formats plus standalone sentinels (`<eos>`, `<|eos|>`, `<end_of_turn>`). **Do not add per-chunk tag stripping in adapters** — non-stateful stripping on streaming deltas interferes with ThoughtFilter's cross-chunk state and causes answers to be swallowed.
+
+Tag stripping layers (defense-in-depth):
+1. **Backend SSE** (`routes.rs`): `ThoughtFilter` — primary, handles all formats
+2. **Non-streaming complete()** (`pond-adapters-local-inference/lib.rs`): `strip_thinking_tokens()` — for direct `LlmProvider::complete()` calls (reviewer, classifier)
+3. **Desktop voice** (`tts_text.rs`): `filter_thinking()` — safety net for TTS pipeline
+4. **Desktop display** (`canvas_feed.rs`): wraps `filter_thinking()` with persistent state
+5. **Frontend** (`thinkFilter.ts`): JavaScript safety net for chat UI
+6. **Reviewer** (`main.rs`): `strip_thinking_tags()` applied to revision responses
 
 ### Databases
 
@@ -187,7 +249,7 @@ Segment-based memory with importance scoring, decay, and automatic extraction fr
 - **Consolidation**: `MemoryConsolidator` port → single-pass LLM merge/prune (simplified from boop's 3-phase). Runs every 24 hours. Max 20 memories per batch.
 - **Auto-classify**: `auto_classify_segment()` uses keyword heuristics (no LLM) — "I prefer" → Preference, "My name is" → Identity, etc.
 - **MCP Tools**: `save_memory` (accepts segment/importance/tier), `recall_memories` (returns segment metadata, records access), `forget_memory` (delete by ID or content)
-- **Settings**: `memory_extraction_enabled`, `memory_cleanup_enabled`, `memory_consolidation_enabled` (all default false), `agent_memory_inject`, `agent_memory_limit`
+- **Settings**: `memory_extraction_enabled` (default **true**), `memory_cleanup_enabled` (default **true**), `memory_consolidation_enabled` (default false), `agent_memory_inject` (default **true**), `agent_memory_limit`
 
 ### Token Usage Tracking
 
@@ -209,3 +271,10 @@ Per-session token accumulation with estimated usage from the agent stream.
 - **Ollama**: `gemma3:4b` · `gemma4:latest`
 - **GGUF**: `gemma-4-E2B-it-Q4_K_M.gguf` (3.1 GB, at `$DATA_DIR/models/gguf/`)
 - **Piper TTS voice**: `en_US-lessac-medium.onnx`
+
+### Jetson Orin Nano Deployment
+
+The primary deployment target is NVIDIA Jetson Orin Nano. The `Makefile` has cross-compilation targets:
+- `make server` — CPU-only cross-compile via `cross` (requires Docker)
+- `make deploy JETSON_HOST=user@ip` — cross-compile + scp to device
+- CUDA builds must be done natively on the Jetson: `bash scripts/build-jetson-native.sh --cuda`

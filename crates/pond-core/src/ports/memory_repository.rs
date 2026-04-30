@@ -34,6 +34,22 @@ pub trait MemoryRepository: Send + Sync {
     /// Delete a memory fragment by ID.
     async fn delete(&self, id: &str) -> Result<()>;
 
+    /// Search active memories whose content matches any of the given keywords.
+    ///
+    /// Used for relevance-based retrieval: extract keywords from the user's
+    /// message and find memories that mention those topics, regardless of age.
+    /// Results are ordered by importance (highest first), then recency.
+    async fn search_by_content(
+        &self,
+        keywords: &[String],
+        profile_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        // Default: fall back to search_recent for adapters that don't implement this.
+        let _ = keywords;
+        self.search_recent(profile_id, limit).await
+    }
+
     // ── Segment-aware methods (default no-op impls for backward compat) ──
 
     /// Increment access_count and update last_accessed_at for a memory.

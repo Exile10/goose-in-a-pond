@@ -227,11 +227,11 @@ pub struct Settings {
 
     /// When true, durable facts are automatically extracted from each conversation
     /// turn and stored as categorised memories (segment, importance, decay).
-    #[serde(default)]
+    #[serde(default = "Settings::default_memory_extraction_enabled")]
     pub memory_extraction_enabled: bool,
 
     /// When true, a background task periodically prunes/archives decayed memories.
-    #[serde(default)]
+    #[serde(default = "Settings::default_memory_cleanup_enabled")]
     pub memory_cleanup_enabled: bool,
 
     /// When true, a background task periodically merges duplicate/contradicting memories.
@@ -339,9 +339,9 @@ impl Default for Settings {
             agent_max_turns:                 Self::default_agent_max_turns(),
             agent_memory_inject:             Self::default_agent_memory_inject(),
             agent_memory_limit:              Self::default_agent_memory_limit(),
-            memory_extraction_enabled:       false,
-            memory_cleanup_enabled:          false,
-            memory_consolidation_enabled:    false,
+            memory_extraction_enabled:       true,
+            memory_cleanup_enabled:          true,
+            memory_consolidation_enabled:    false, // requires enough memories to be useful
             schedule_result_notify:          Self::default_schedule_result_notify(),
             memory_prune_threshold:          Self::default_memory_prune_threshold(),
             memory_archive_threshold:        Self::default_memory_archive_threshold(),
@@ -374,7 +374,7 @@ impl Settings {
     fn default_temperature()                -> f32    { 0.7 }
     fn default_llm_provider()               -> String { "".to_string() }
     fn default_wake_word()                  -> String { "goose".to_string() }
-    fn default_kws_energy_threshold()       -> f32    { 0.01 }
+    fn default_kws_energy_threshold()       -> f32    { 0.003 }
     fn default_kws_post_trigger_silence_ms() -> u64   { 400 }
     fn default_kws_cooldown_ms()            -> u64    { 2000 }
     fn default_tts_voice()                  -> String { "".to_string() }
@@ -396,11 +396,13 @@ impl Settings {
     fn default_review_pass_threshold()     -> u8     { 3 }
     fn default_agent_goose_mode()           -> String { "auto".to_string() }
     fn default_agent_max_turns()            -> u32    { 20 }
-    fn default_agent_memory_inject()        -> bool   { false }
+    fn default_agent_memory_inject()        -> bool   { true }
     fn default_agent_memory_limit()         -> u32    { 5 }
     fn default_schedule_result_notify()     -> bool   { true }
     fn default_memory_prune_threshold()     -> f32    { 0.05 }
     fn default_memory_archive_threshold()   -> f32    { 0.15 }
+    fn default_memory_extraction_enabled()    -> bool  { true }
+    fn default_memory_cleanup_enabled()       -> bool  { true }
     fn default_memory_cleanup_interval_hours() -> u32 { 6 }
     fn default_memory_consolidation_interval_hours() -> u32 { 24 }
     fn default_memory_consolidation_batch_size() -> u32 { 20 }
