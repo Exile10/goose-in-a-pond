@@ -3,7 +3,20 @@ use crate::canvas_feed::dispatch_sse_event;
 use crate::process::ServerProcess;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+
+/// Global audio kill switch — stops ALL Goose audio (TTS + thinking tone)
+/// when the wake word is detected. Checked by `play_wav_interruptible` every
+/// 50 ms during playback. Reset at the start of each voice pipeline run.
+pub struct AudioKillSwitch(pub Arc<AtomicBool>);
+
+impl AudioKillSwitch {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptResult {
@@ -225,8 +238,13 @@ pub async fn run_voice_pipeline(
     auth_token: String,
     session_id: Option<String>,
     server: State<'_, ServerProcess>,
+    kill_switch: State<'_, AudioKillSwitch>,
 ) -> Result<(), String> {
     use crate::tts_text;
+
+    // Reset kill switch at the start of each pipeline run.
+    kill_switch.0.store(false, Ordering::Relaxed);
+    let kill_flag = kill_switch.0.clone();
 
     let base_url = server.get_url();
     let client = reqwest::Client::new();
@@ -284,9 +302,9 @@ pub async fn run_voice_pipeline(
     // ── Dismissal / farewell handling (matching CLI's "bye" / "exit") ────
     if let Some((farewell, is_exit)) = tts_text::check_dismissal(&transcript) {
         let _ = app.emit("transcript", TranscriptResult { text: farewell.to_string() });
-        // Speak the farewell via TTS
+        // Speak the farewell via TTS (interruptible — wake word can still barge in)
         match fetch_tts_bytes(&client, &base_url, farewell).await {
-            Ok(bytes) => { let _ = play_wav_bytes(bytes).await; }
+            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, kill_flag.clone()).await; }
             Err(e)    => { tracing::debug!("Farewell TTS skipped: {e}"); }
         }
         let _ = app.emit("tts-end", ());
@@ -299,9 +317,10 @@ pub async fn run_voice_pipeline(
     let quip_text   = pick_quip();
     let quip_client = client.clone();
     let quip_url    = base_url.clone();
+    let quip_kill   = kill_flag.clone();
     let quip_handle = tokio::spawn(async move {
         match fetch_tts_bytes(&quip_client, &quip_url, quip_text).await {
-            Ok(bytes) => { let _ = play_wav_bytes(bytes).await; }
+            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, quip_kill).await; }
             Err(e)    => { tracing::debug!("Quip TTS skipped: {e}"); }
         }
     });
@@ -333,11 +352,11 @@ pub async fn run_voice_pipeline(
     // ── Thinking tone — loops on a separate thread while the LLM is working ──
     // A subtle rhythmic pulse that fills the silence between the quip and the
     // first real sentence. Stopped via an atomic flag when TTS starts.
-    let thinking_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let thinking_active = std::sync::Arc::new(AtomicBool::new(true));
     let thinking_flag   = thinking_active.clone();
+    let tone_kill       = kill_flag.clone();
     let thinking_tone   = tokio::task::spawn_blocking(move || {
         use rodio::{OutputStream, Sink};
-        use std::sync::atomic::Ordering;
 
         let Ok((_stream, handle)) = OutputStream::try_default() else { return };
         let Ok(sink) = Sink::try_new(&handle) else { return };
@@ -354,14 +373,13 @@ pub async fn run_voice_pipeline(
             })
             .collect();
 
-        // Loop the pulse while the flag is set
-        while thinking_flag.load(Ordering::Relaxed) {
+        // Loop the pulse while active — also checks kill switch for wake word barge-in
+        while thinking_flag.load(Ordering::Relaxed) && !tone_kill.load(Ordering::Relaxed) {
             let buf = rodio::buffer::SamplesBuffer::new(1, rate, pulse.clone());
             sink.append(buf);
-            // Sleep through most of the pulse, checking the flag periodically
             for _ in 0..10 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                if !thinking_flag.load(Ordering::Relaxed) {
+                if !thinking_flag.load(Ordering::Relaxed) || tone_kill.load(Ordering::Relaxed) {
                     sink.stop();
                     return;
                 }
@@ -376,14 +394,22 @@ pub async fn run_voice_pipeline(
     let tts_client = client.clone();
     let tts_url    = base_url.clone();
     let tts_app    = app.clone();
+    let tts_kill   = kill_flag.clone();
     let tts_task   = tokio::spawn(async move {
         let mut quip_done = false;
         let mut quip = Some(quip_handle);
 
         while let Some(text) = tts_rx.recv().await {
+            // Kill switch — stop all audio immediately (wake word barge-in)
+            if tts_kill.load(Ordering::Relaxed) {
+                thinking_active.store(false, Ordering::Relaxed);
+                if let Some(h) = quip.take() { h.abort(); }
+                break;
+            }
+
             if !quip_done {
                 // Stop the thinking tone — first real content is arriving
-                thinking_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                thinking_active.store(false, Ordering::Relaxed);
                 if let Some(h) = quip.take() {
                     h.await.ok();
                 }
@@ -391,7 +417,7 @@ pub async fn run_voice_pipeline(
                 let _ = tts_app.emit("tts-start", ());
             }
             match fetch_tts_bytes(&tts_client, &tts_url, &text).await {
-                Ok(bytes) => { let _ = play_wav_bytes(bytes).await; }
+                Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, tts_kill.clone()).await; }
                 Err(e)    => { tracing::warn!("Sentence TTS failed: {e}"); }
             }
         }
@@ -542,7 +568,9 @@ async fn fetch_tts_bytes(
 }
 
 /// Play WAV bytes through the system audio output via rodio.
-async fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), String> {
+/// Play WAV bytes with an interruptible loop. Checks `kill` every 50 ms;
+/// if set, stops playback immediately (wake word barge-in).
+async fn play_wav_bytes_interruptible(bytes: Vec<u8>, kill: Arc<AtomicBool>) -> Result<(), String> {
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
@@ -552,13 +580,26 @@ async fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), String> {
             let cursor = std::io::Cursor::new(bytes);
             let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
             sink.append(source);
-            sink.sleep_until_end();
+            // Poll instead of sleep_until_end so the kill switch can stop us.
+            while !sink.empty() {
+                if kill.load(Ordering::Relaxed) {
+                    sink.stop();
+                    tracing::debug!("Audio playback killed by wake word");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             Ok::<_, String>(())
         }),
     )
     .await
     .map_err(|_| "Audio playback timed out".to_string())?
     .map_err(|e| e.to_string())?
+}
+
+/// Non-interruptible playback — used for short pings where barge-in is unwanted.
+async fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), String> {
+    play_wav_bytes_interruptible(bytes, Arc::new(AtomicBool::new(false))).await
 }
 
 /// Synthesise `text` and play it — convenience wrapper.

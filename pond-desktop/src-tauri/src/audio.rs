@@ -4,7 +4,7 @@
 /// Instead we keep only Arc/AtomicBool in managed state and run the cpal stream
 /// on a dedicated OS thread that lives as long as recording is active.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -275,8 +275,8 @@ pub fn record_with_vad(
     max_record_secs: u32,
     silence_ms: u64,
 ) -> Result<Vec<u8>, String> {
-    const SPEECH_RMS: f32  = 0.018; // onset threshold
-    const SILENCE_RMS: f32 = 0.008; // end-of-speech threshold (hysteresis)
+    const SPEECH_RMS: f32  = 0.010; // onset threshold — lowered for better sensitivity
+    const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
     const POLL_MS: u64     = 30;
 
     let host = cpal::default_host();
@@ -479,14 +479,15 @@ fn wake_listener_thread(
     const FRAME_MS: u64 = 30;
 
     /// RMS above this → speech onset candidate (two-threshold hysteresis).
-    const SPEECH_RMS: f32 = 0.015;
+    /// Lowered from 0.015 to improve wake word sensitivity in quiet environments.
+    const SPEECH_RMS: f32 = 0.008;
 
     /// RMS below this → silence (lower than SPEECH_RMS to prevent flapping).
-    const SILENCE_RMS: f32 = 0.008;
+    const SILENCE_RMS: f32 = 0.004;
 
     /// Consecutive above-threshold frames required to confirm speech started.
-    /// 3 × 30 ms = 90 ms — short enough not to miss word beginnings.
-    const ONSET_FRAMES: u32 = 3;
+    /// 2 × 30 ms = 60 ms — faster onset to catch quiet wake words.
+    const ONSET_FRAMES: u32 = 2;
 
     /// Consecutive below-threshold frames before speech is declared ended.
     /// 12 × 30 ms = 360 ms tail — natural inter-word pause tolerance.
@@ -717,6 +718,13 @@ fn wake_listener_thread(
                         tracing::debug!("Wake ASR: {:?} (matched: {})", transcript, matched);
                         if matched {
                             tracing::info!("Wake word '{}' detected — capturing command audio", wake_word);
+
+                            // Kill all Goose audio immediately (quip, thinking tone, TTS)
+                            // so the mic doesn't pick up its own output.
+                            let ks: tauri::State<'_, crate::commands::audio_cmd::AudioKillSwitch> =
+                                app.state();
+                            ks.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                            tracing::debug!("Audio kill switch activated by wake word");
 
                             // ── One-breath flow ─────────────────────────────────
                             // speech_buf already contains the FULL utterance that
