@@ -4782,10 +4782,11 @@ async fn identify_face_handler(
     })?;
 
     Ok(Json(json!({
-        "identified": result.identified,
-        "profile_id": result.profile_id,
-        "confidence": result.confidence,
-        "threshold":  face.match_threshold(),
+        "identified":       result.identified,
+        "profile_id":       result.profile_id,
+        "confidence":       result.confidence,
+        "threshold":        face.match_threshold(),
+        "rejection_reason": result.rejection_reason,
     })))
 }
 
@@ -5128,6 +5129,24 @@ fn env_or(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Mean of a set of L2-normalised embeddings, re-normalised to unit length
+/// so the result lives on the same sphere as every individual embedding.
+/// Returns `None` for empty input or a degenerate (zero-norm) sum.
+fn unit_centroid(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let first = embeddings.first()?;
+    let dims = first.len();
+    if dims == 0 { return None; }
+    let mut acc = vec![0.0_f32; dims];
+    for e in embeddings {
+        if e.len() != dims { return None; }
+        for i in 0..dims { acc[i] += e[i]; }
+    }
+    let norm: f32 = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm <= 1e-8 { return None; }
+    for v in &mut acc { *v /= norm; }
+    Some(acc)
+}
+
 /// POST /api/v1/faces/identify-burst — multi-frame consensus identify.
 ///
 /// Accepts N (1..=12) `image` fields representing successive camera frames
@@ -5176,10 +5195,11 @@ async fn burst_identify_face_handler(
             Ok(details) => {
                 let r = &details.identification;
                 per_frame.push(json!({
-                    "frame":      idx,
-                    "identified": r.identified,
-                    "profile_id": r.profile_id,
-                    "confidence": r.confidence,
+                    "frame":            idx,
+                    "identified":       r.identified,
+                    "profile_id":       r.profile_id,
+                    "confidence":       r.confidence,
+                    "rejection_reason": r.rejection_reason,
                 }));
                 if r.identified {
                     if let (Some(pid), Some(c)) = (r.profile_id.clone(), r.confidence) {
@@ -5291,8 +5311,16 @@ async fn burst_identify_face_handler(
     // when threshold=0.70) splits the middle cleanly: live clears it,
     // photos don't.  If you swap in a different embedder with tighter
     // calibration, lower these via env vars.
-    let single_frame_margin = env_or("POND_FACE_BURST_FRAME_MARGIN", 0.10_f32);
-    let mean_margin         = env_or("POND_FACE_BURST_MEAN_MARGIN",  0.12_f32);
+    // Margins calibrated against real captures (logged 2026-04-30):
+    //   * Hand-held printed photo: per-frame confidence 0.819–0.834,
+    //     mean ≈ 0.829.
+    //   * Live face of the same person: per-frame confidence 0.888–0.904,
+    //     mean ≈ 0.894.
+    // A frame floor of 0.84 (= threshold+0.14) sits between the two with
+    // 0.05 of headroom for live; a mean floor of 0.86 (= threshold+0.16)
+    // gives ~0.03 of headroom while still rejecting the photo's 0.829.
+    let single_frame_margin = env_or("POND_FACE_BURST_FRAME_MARGIN", 0.14_f32);
+    let mean_margin         = env_or("POND_FACE_BURST_MEAN_MARGIN",  0.16_f32);
     let suspicious_extra    = env_or("POND_FACE_BURST_SUSPICIOUS_MARGIN", 0.05_f32);
     let no_face_budget      = env_or("POND_FACE_BURST_NOFACE_BUDGET", 0.20_f32);
 
@@ -5319,6 +5347,13 @@ async fn burst_identify_face_handler(
         }).collect()
     }).unwrap_or_default();
     let min_winner_conf = winner_frame_confs.iter().cloned().fold(f32::INFINITY, f32::min);
+
+    // NOTE: an earlier iteration tried gating on the spread of per-frame
+    // confidences (the assumption being that photos produce stable scores
+    // and live faces vary). Real captures showed live faces sitting still
+    // produce the same 0.015 spread as photos, so the signal cannot
+    // separate the two and was removed. The confidence-magnitude floors
+    // above (frame_floor and mean_floor) do the actual work.
 
     let required: u32 = if n == 1 { 1 } else { face_bearing.max(2) };
 
@@ -5357,6 +5392,56 @@ async fn burst_identify_face_handler(
         );
     }
 
+    // Aggregate a single dominant `rejection_reason` so the frontend can
+    // give one piece of actionable copy without having to mode the
+    // per-frame array. We pick the most-common reason across rejected
+    // frames; ties are broken by per_frame order. `None` when the burst
+    // succeeded or every frame had no rejection reason recorded.
+    let rejection_reason: Option<String> = if identified {
+        None
+    } else {
+        let mut counts: Vec<(String, u32)> = Vec::new();
+        for pf in &per_frame {
+            if let Some(r) = pf.get("rejection_reason").and_then(|v| v.as_str()) {
+                if let Some(slot) = counts.iter_mut().find(|(k, _)| k == r) {
+                    slot.1 += 1;
+                } else {
+                    counts.push((r.to_string(), 1));
+                }
+            }
+        }
+        counts.into_iter().max_by_key(|(_, c)| *c).map(|(r, _)| r)
+    };
+
+    // ── Opportunistic auto-enrollment ────────────────────────────────────
+    // Only fires when the FULL burst has cleared every gate that defends
+    // against presentation attacks: real motion (`!suspicious`), no
+    // photo/screen patterns (the hard_reject branch above already returned
+    // early), and a comfortable cushion above the configured thresholds.
+    // We require n >= 3 so the inter-frame liveness signal had something
+    // to work with — single-frame bursts never auto-enroll because a still
+    // photo can pass a per-frame anti-spoof but cannot pass `landmark_motion`
+    // or `differential_motion`. Storing the centroid of all winning frames
+    // means the new reference embedding represents the user's *real* face
+    // distribution at that moment, not a single noisy frame.
+    if identified
+        && n >= 3
+        && !suspicious
+        && liveness.is_some()
+        && !frame_embeddings.is_empty()
+    {
+        if let (Some(pid), Some(mean_c)) = (profile_id.clone(), mean_conf) {
+            let cushion_score = env_or("POND_FACE_AUTO_ENROLL_BURST_MEAN_MARGIN", 0.05_f32);
+            if mean_c >= mean_floor + cushion_score {
+                if let Some(centroid) = unit_centroid(&frame_embeddings) {
+                    if let Err(e) = face.auto_enroll_high_confidence(&pid, &centroid).await {
+                        tracing::warn!(%pid, "auto-enroll skipped: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Json(json!({
         "identified":         identified,
         "profile_id":         if identified { profile_id.clone() } else { None },
@@ -5368,6 +5453,7 @@ async fn burst_identify_face_handler(
         "no_face_frames":     no_face_count,
         "threshold":          threshold,
         "suspicious":         suspicious,
+        "rejection_reason":   rejection_reason,
         "liveness":           liveness.as_ref().map(|r| r.to_json()),
         "per_frame":          per_frame,
     })))
@@ -5626,16 +5712,21 @@ fn compute_liveness_report(
     //                                         screen replays have ≥ 0.9995
     //                                         cosine because the same pixels
     //                                         are re-imaged each frame)
+    // Floors raised after a real-world report of a hand-held printed photo
+    // slipping through with hand-jitter producing just enough non-rigid
+    // motion to clear the old 0.60 px floor. Live faces produce
+    // differential_motion well above 1.0 px from blinks/mouth/eyebrows;
+    // photos rarely clear 0.8 even with vigorous hand movement.
     let diff_floor = std::env::var("POND_FACE_LIVENESS_DIFF_MOTION_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.60);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.80);
     let motion_floor = std::env::var("POND_FACE_LIVENESS_MOTION_MIN")
         .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.5);
     let eye_floor = std::env::var("POND_FACE_LIVENESS_EYE_SPREAD_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.003);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.004);
     let size_floor = std::env::var("POND_FACE_LIVENESS_SIZE_SPREAD_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.012);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.015);
     let cos_ceiling = std::env::var("POND_FACE_LIVENESS_INTER_COS_MAX")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.9994);
+        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.9990);
 
     let barely_moving     = landmark_motion < motion_floor && landmarks.len() >= 3;
     let flat_eye_ratio    = eye_ratio_spread < eye_floor;
@@ -5643,13 +5734,13 @@ fn compute_liveness_report(
     let dimensionally_rigid = face_size_spread < size_floor && landmarks.len() >= 3;
     let frozen_embedding  = mean_inter_cos > cos_ceiling && embeddings.len() >= 3;
 
-    // Hard reject on **any two** photo-like signals.  Previously we required
-    // (flat_eye_ratio) to be one of them, which let a phone-screen photo with
-    // slight zoom artefacts pass when its eye ratio happened to vary > 0.002.
-    // The new "any two of five" rule is strictly stricter: a live face
-    // typically fails ONE gate (e.g. brief still moment between blinks); a
-    // photo fails THREE or more (eyes flat, size flat, rigid motion, frozen
-    // embedding all at once).
+    // Hard reject if **any single** photo-like signal trips. The previous
+    // 2-of-5 rule was too generous — a hand-held printed photo can produce
+    // exactly one gate failure (e.g. frozen_embedding only) and slip
+    // through. False rejects on live faces are recoverable (user retries
+    // and blinks); a false accept defeats the entire feature, so we err
+    // strongly on the security side. If you need a softer policy for a
+    // specific deployment, set POND_FACE_LIVENESS_HARD_REJECT_MIN higher.
     let photo_like = [
         barely_moving,
         flat_eye_ratio,
@@ -5657,9 +5748,12 @@ fn compute_liveness_report(
         dimensionally_rigid,
         frozen_embedding,
     ].iter().filter(|x| **x).count();
-    let hard_reject = photo_like >= 2;
+    let hard_floor = std::env::var("POND_FACE_LIVENESS_HARD_REJECT_MIN")
+        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+    let hard_reject = photo_like >= hard_floor;
 
-    // Soft suspicious tightens consensus on a single failed axis.
+    // Suspicious is moot when the floor is 1 — kept for completeness so
+    // operators who raise the floor can still get the soft signal.
     let suspicious = !hard_reject && photo_like >= 1;
 
     LivenessReport {
