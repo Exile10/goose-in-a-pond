@@ -243,6 +243,16 @@ export class PondApiClient {
             is_active: (item.active as boolean | undefined) ?? false,
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
+            downloaded: item.downloaded as boolean | undefined,
+            description: item.description as string | undefined,
+            size_mb: item.size_mb as number | undefined,
+            category: (item.category as string | undefined) ?? category,
+            filename: item.filename as string | undefined,
+            url: item.url as string | undefined,
+            asr_language: item.asr_language as string | undefined,
+            asr_size: item.asr_size as string | undefined,
+            tts_engine: item.tts_engine as string | undefined,
+            config_filename: item.config_filename as string | undefined,
           });
         }
       }
@@ -459,6 +469,11 @@ export class PondApiClient {
   // Delete model file from disk (409 ApiError if model is active in a role)
   deleteModel(category: string, name: string): Promise<void> {
     return this.del(`/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}`);
+  }
+
+  // Trigger async download of a catalog model by category and name
+  downloadModel(category: string, name: string): Promise<{ status: string }> {
+    return this.post(`/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}/download`);
   }
 
   // ── Ollama ────────────────────────────────────────────────

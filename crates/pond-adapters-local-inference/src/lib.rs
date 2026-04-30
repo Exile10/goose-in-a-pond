@@ -353,10 +353,35 @@ impl LocalInferenceLlmAdapter {
 ///
 /// If neither pattern is present the original text is returned unchanged.
 fn strip_thinking_tokens(text: &str) -> String {
-    // Gemma 4 format
+    // Gemma 4 format — return everything after the last <channel|>.
+    // If nothing follows the tag, return empty (the tag was the entire text).
     const CHANNEL_CLOSE: &str = "<channel|>";
     if let Some(pos) = text.rfind(CHANNEL_CLOSE) {
         return text[pos + CHANNEL_CLOSE.len()..].trim().to_string();
+    }
+
+    // Also handle <thought>…</thought> (alternate reasoning tag format)
+    if text.contains("<thought>") {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            if let Some(start) = rest.find("<thought>") {
+                out.push_str(&rest[..start]);
+                if let Some(end) = rest[start..].find("</thought>") {
+                    rest = &rest[start + end + "</thought>".len()..];
+                } else {
+                    break; // unclosed — discard tail
+                }
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        return String::new();
     }
 
     // <think>…</think> format — strip all blocks
@@ -405,6 +430,19 @@ impl LlmProvider for LocalInferenceLlmAdapter {
 
     fn model_name(&self) -> String {
         self.inner.model_name()
+    }
+}
+
+impl LocalInferenceLlmAdapter {
+    /// Like `complete()` but returns the RAW model output WITHOUT applying
+    /// `strip_thinking_tokens()`. Useful for diagnostics — see what the model
+    /// actually emits before any post-processing.
+    pub async fn raw_complete(
+        &self,
+        system: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<ChatMessage> {
+        self.inner.complete(system, messages).await
     }
 }
 
@@ -529,6 +567,26 @@ mod tests {
         // If multiple <channel|> appear, we take everything after the last one
         let raw = "<|channel>thought Step 1.<channel|>intermediate<channel|>Final answer.";
         assert_eq!(strip_thinking_tokens(raw), "Final answer.");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_channel_close_at_end_returns_empty() {
+        // Edge case: <channel|> at end with nothing after → should return empty,
+        // not the original text containing the tag.
+        let raw = "<|channel>thought reasoning here<channel|>";
+        assert_eq!(strip_thinking_tokens(raw), "");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_removes_thought_tags() {
+        let raw = "<thought>internal reasoning</thought>Hello!";
+        assert_eq!(strip_thinking_tokens(raw), "Hello!");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_thought_only_returns_empty() {
+        let raw = "<thought>only reasoning</thought>";
+        assert_eq!(strip_thinking_tokens(raw), "");
     }
 
     #[test]

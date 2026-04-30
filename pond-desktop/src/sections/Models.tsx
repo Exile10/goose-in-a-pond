@@ -772,7 +772,10 @@ function LlmTab({
   onDownloadStarted: () => void;
   onScanModels: () => void;
 }) {
+  const state = useAppState();
   const [provider, setProvider] = useState<LlmProvider>("gguf");
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
   const PROVIDERS: Array<{ key: LlmProvider; label: string }> = [
     { key: "gguf", label: "GGUF" },
     { key: "llamafile", label: "Llamafile" },
@@ -782,6 +785,21 @@ function LlmTab({
   const ggufModels = models.filter((m) => m.provider === "gguf");
   const llamafileModels = models.filter((m) => m.provider === "llamafile");
   const ollamaRegistryModels = models.filter((m) => m.provider === "ollama");
+
+  const ggufDownloaded  = ggufModels.filter((m) => m.downloaded !== false);
+  const ggufAvailable   = ggufModels.filter((m) => m.downloaded === false);
+  const llamaDownloaded = llamafileModels.filter((m) => m.downloaded !== false);
+  const llamaAvailable  = llamafileModels.filter((m) => m.downloaded === false);
+
+  async function handleCatalogDownload(category: string, m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel(category, m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -807,19 +825,68 @@ function LlmTab({
         </div>
       </div>
 
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
       {/* GGUF panel */}
       {provider === "gguf" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-          <ModelList
-            models={ggufModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["chat", "tool"]}
-            onActivate={onActivate}
-            onDelete={onDelete}
-            emptyMessage="No GGUF models found. Download one below."
-          />
+          {ggufDownloaded.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Installed
+              </span>
+              <ModelList
+                models={ggufDownloaded}
+                loading={modelsLoading}
+                error={modelsError}
+                activeRoles={activeRoles}
+                availableRoles={["chat", "tool"]}
+                onActivate={onActivate}
+                onDelete={onDelete}
+                emptyMessage=""
+              />
+            </>
+          )}
+          {!modelsLoading && ggufAvailable.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Available for download
+              </span>
+              <div className="models-list">
+                {ggufAvailable.map((m) => (
+                  <div key={m.id} className="giap-model-row">
+                    <div>
+                      <div className="giap-model-row__title-row">
+                        <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                        {m.ram_estimate_mb && <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB RAM</Chip>}
+                        {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                        {m.recommended_role && <Chip size="sm" variant="soft">{m.recommended_role}</Chip>}
+                        <CapabilityBadges name={m.name} />
+                      </div>
+                      {m.description && (
+                        <div className="giap-model-row__file"><code>{m.description}</code></div>
+                      )}
+                    </div>
+                    <div className="giap-model-row__actions">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onPress={() => handleCatalogDownload("gguf", m)}
+                        isDisabled={downloadingModel === m.name || !state.serverOnline}
+                      >
+                        <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {modelsLoading && ggufDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
           <BrowseHfAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
@@ -827,16 +894,59 @@ function LlmTab({
       {/* Llamafile panel */}
       {provider === "llamafile" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-          <ModelList
-            models={llamafileModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["chat"]}
-            onActivate={onActivate}
-            onDelete={onDelete}
-            emptyMessage="No Llamafile models found. Download one below."
-          />
+          {llamaDownloaded.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Installed
+              </span>
+              <ModelList
+                models={llamaDownloaded}
+                loading={modelsLoading}
+                error={modelsError}
+                activeRoles={activeRoles}
+                availableRoles={["chat"]}
+                onActivate={onActivate}
+                onDelete={onDelete}
+                emptyMessage=""
+              />
+            </>
+          )}
+          {!modelsLoading && llamaAvailable.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Available for download
+              </span>
+              <div className="models-list">
+                {llamaAvailable.map((m) => (
+                  <div key={m.id} className="giap-model-row">
+                    <div>
+                      <div className="giap-model-row__title-row">
+                        <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                        {m.ram_estimate_mb && <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB RAM</Chip>}
+                        {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                        {m.recommended_role && <Chip size="sm" variant="soft">{m.recommended_role}</Chip>}
+                        <CapabilityBadges name={m.name} />
+                      </div>
+                      {m.description && (
+                        <div className="giap-model-row__file"><code>{m.description}</code></div>
+                      )}
+                    </div>
+                    <div className="giap-model-row__actions">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onPress={() => handleCatalogDownload("llamafile", m)}
+                        isDisabled={downloadingModel === m.name || !state.serverOnline}
+                      >
+                        <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {modelsLoading && llamaDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
           <BrowseGithubAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
@@ -1025,6 +1135,225 @@ function MemoryStatusBar({ status }: { status: ModelMemoryStatus | null }) {
           }}
         />
       </div>
+    </div>
+  );
+}
+
+// ── ASR Catalog Panel ────────────────────────────────────────
+
+function AsrCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+
+  const downloaded = models.filter((m) => m.downloaded !== false);
+  const available  = models.filter((m) => m.downloaded === false);
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("whisper", m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner seg-banner--info">
+        <Mic size={14} />
+        <span>Automatic Speech Recognition &mdash; Whisper models for voice-to-text</span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {/* Downloaded models */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["asr"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="models-list">
+            {available.map((m) => (
+              <div key={m.id} className="giap-model-row">
+                <div>
+                  <div className="giap-model-row__title-row">
+                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                    {m.asr_language && <Chip size="sm" variant="soft">{m.asr_language}</Chip>}
+                    {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                  </div>
+                  <div className="giap-model-row__file"><code>whisper / {m.name}</code></div>
+                </div>
+                <div className="giap-model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No Whisper models found in catalog. Try refreshing the registry.</p>
+      )}
+    </div>
+  );
+}
+
+// ── TTS Catalog Panel ────────────────────────────────────────
+
+function TtsCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+
+  const downloaded = models.filter((m) => m.downloaded !== false);
+  const available  = models.filter((m) => m.downloaded === false);
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("tts", m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner seg-banner--warn">
+        <Volume2 size={14} />
+        <span>Text-to-Speech &mdash; Piper voices for spoken output</span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {/* Downloaded voices */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["tts"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="models-list">
+            {available.map((m) => (
+              <div key={m.id} className="giap-model-row">
+                <div>
+                  <div className="giap-model-row__title-row">
+                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                  </div>
+                  {m.description && (
+                    <div className="giap-model-row__file"><code>{m.description}</code></div>
+                  )}
+                </div>
+                <div className="giap-model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No TTS voices found in catalog. Try refreshing the registry.</p>
+      )}
     </div>
   );
 }
@@ -1230,43 +1559,27 @@ export function Models() {
       )}
 
       {category === "asr" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--info">
-            <Mic size={14} />
-            <span>Automatic Speech Recognition</span>
-          </div>
-          <ModelList
-            models={asrModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["asr"]}
-            onActivate={handleActivate}
-            onDelete={handleDelete}
-            emptyMessage="No Whisper models found. Run a model scan or download from HuggingFace."
-          />
-          <p className="muted-foot">Whisper models power voice-to-text transcription. Place <code>.bin</code> files in <code>models/whisper/</code> and click Scan.</p>
-        </div>
+        <AsrCatalogPanel
+          models={asrModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
       )}
 
       {category === "tts" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--warn">
-            <Volume2 size={14} />
-            <span>Text-to-Speech</span>
-          </div>
-          <ModelList
-            models={ttsModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["tts"]}
-            onActivate={handleActivate}
-            onDelete={handleDelete}
-            emptyMessage="No TTS models found. Place Piper .onnx files in models/tts/ and scan."
-          />
-          <p className="muted-foot">TTS models power the voice output. Piper voices use <code>.onnx</code> + <code>.json</code> pairs in <code>models/tts/</code>.</p>
-        </div>
+        <TtsCatalogPanel
+          models={ttsModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
       )}
 
       {category === "face" && <FacePanel />}

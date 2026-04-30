@@ -64,6 +64,7 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                     session_id: session_id.clone(),
                     model_role: "task".to_string(),
                     images: vec![],
+                    voice_mode: false,
                 };
 
                 tracing::info!("[scheduler] executing prompt for task {task_id}");

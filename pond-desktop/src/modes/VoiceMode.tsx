@@ -248,33 +248,42 @@ export function VoiceMode() {
 
           // One-breath flow: the Rust wake listener captures audio (wake word +
           // any following command) and passes WAV bytes in the event payload.
+          // The wake listener is always-on — it does NOT stop on detection.
           const unsub = await listen<number[]>("wake-word-detected", (e) => {
-            // Guard: if component unmounted while listen() was resolving,
-            // the listener leaked — clean it up and do nothing.
             if (unmounted) {
               unsub();
               return;
             }
 
-            invoke("stop_wake_listener").catch(() => undefined);
-            // Audible confirmation so the user knows they were heard
+            // Don't stop the wake listener — it keeps running for barge-in.
             invoke("play_ping").catch(() => undefined);
 
             const wavBytes = e.payload;
             if (wavBytes && Array.isArray(wavBytes) && wavBytes.length > 100) {
-              // One-breath: audio already captured — send to pipeline
               handleWakeAudioRef.current(wavBytes);
             } else {
-              // No captured audio — start fresh recording
               startRecordingRef.current();
             }
           });
 
-          // If cleanup ran while listen() was pending, immediately unsubscribe
+          // Barge-in: wake word detected while pipeline is active (thinking/speaking).
+          // TTS is already being killed by the kill switch — just update UI state.
+          const unsubInterrupt = await listen("wake-word-interrupt", () => {
+            if (unmounted) {
+              unsubInterrupt();
+              return;
+            }
+            // The pipeline's kill switch stops TTS; the pipeline will end
+            // naturally, emitting tts-end → voiceState goes idle →
+            // conversational turn-taking starts the next recording.
+            console.debug("Wake word barge-in — TTS interrupted");
+          });
+
           if (unmounted) {
             unsub();
+            unsubInterrupt();
           } else {
-            wakeUnlisten = unsub;
+            wakeUnlisten = () => { unsub(); unsubInterrupt(); };
           }
         }
       })
@@ -314,29 +323,11 @@ export function VoiceMode() {
       noSpeechTimerRef.current = setTimeout(() => {
         if (!hasSpeechRef.current) {
           // User didn't respond — conversation over. Abort recording and
-          // return to "wait" (if wake word configured) or "idle".
-          // Use invoke directly since abortRecording captures stale state.
+          // return to passive wake listening (wake listener is already running).
           invoke("abort_recording").catch(() => undefined);
-          const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-          if (isTauri) {
-            api.getSettings()
-              .then(async (s) => {
-                const raw = s as Record<string, unknown>;
-                const ww = raw.voice_wake_word ?? raw.wake_word;
-                if (ww && typeof ww === "string" && ww.trim()) {
-                  const variants = Array.isArray(raw.voice_wake_word_transcriptions)
-                    ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
-                    : [];
-                  await invoke("start_wake_listener", {
-                    wakeWord: ww.trim(),
-                    variants: variants.length > 0 ? variants : null,
-                  }).catch(() => undefined);
-                  dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
-                } else {
-                  dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-                }
-              })
-              .catch(() => dispatch({ type: "SET_VOICE_STATE", payload: "idle" }));
+          // Wake listener is always-on — just flip UI state back to "wait".
+          if (wakeWord) {
+            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
           } else {
             dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
           }
@@ -344,26 +335,11 @@ export function VoiceMode() {
       }, NO_SPEECH_TIMEOUT_MS);
     }
 
-    // On error, go back to passive wake listening immediately
+    // On error, go back to passive wake listening immediately.
+    // Wake listener is always-on — just flip UI state.
     if (state.voiceState === "idle" && prev === "error") {
-      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      if (isTauri) {
-        api.getSettings()
-          .then(async (s) => {
-            const raw = s as Record<string, unknown>;
-            const ww = raw.voice_wake_word ?? raw.wake_word;
-            if (!ww || typeof ww !== "string" || !ww.trim()) return;
-            setWakeWord(ww.trim());
-            const variants = Array.isArray(raw.voice_wake_word_transcriptions)
-              ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
-              : [];
-            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
-            await invoke("start_wake_listener", {
-              wakeWord: ww.trim(),
-              variants: variants.length > 0 ? variants : null,
-            }).catch(() => undefined);
-          })
-          .catch(() => undefined);
+      if (wakeWord) {
+        dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
       }
     }
   }, [state.voiceState]); // eslint-disable-line react-hooks/exhaustive-deps

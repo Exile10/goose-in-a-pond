@@ -133,6 +133,16 @@ export interface ModelEntry {
   is_active: boolean;
   ram_estimate_mb?: number;
   recommended_role?: string;
+  downloaded?: boolean;
+  description?: string;
+  size_mb?: number;
+  category?: string;
+  filename?: string;
+  url?: string;
+  asr_language?: string;
+  asr_size?: string;
+  tts_engine?: string;
+  config_filename?: string;
 }
 
 export interface ModelMemoryStatus {

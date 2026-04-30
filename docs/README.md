@@ -14,6 +14,9 @@ Welcome to the GIAP documentation. This index covers architecture, development g
 | [Model Capabilities](./architecture/model_capabilities.md) | Runtime capability discovery: thinking, vision, context window |
 | [Visual Workflow](./architecture/visual_workflow.md) | Flowcharts and sequence diagrams using the Weather feature as an example |
 | [Data Pipeline](./architecture/data_pipeline.md) | Constrained inference architecture for edge hardware (Jetson Orin Nano) |
+| [Scheduling System](./architecture/scheduling.md) | Cron-based automation: agent prompts, webhooks, MCP tools, run history |
+| [Memory System](./architecture/memory_system.md) | Segments, importance scoring, decay, extraction, consolidation |
+| [Token Tracking](./architecture/token_tracking.md) | Per-session usage, estimation, cost savings vs cloud API |
 
 ---
 
@@ -21,6 +24,7 @@ Welcome to the GIAP documentation. This index covers architecture, development g
 
 | Document | Description |
 |---|---|
+| [Installation Guide](./developer/installation.md) | First-time setup, prerequisites, install script, LLM providers, troubleshooting |
 | [Creating Ports & Adapters](../docs/creating-ports-and-adapters.md) | Step-by-step guide for adding new capabilities while keeping the Core pure |
 | [Inference Optimization](./developer/inference_optimization.md) | Platform settings, context management, classifier tuning, memory pressure |
 | [Voice Pipeline Interrupt](./developer/voice_pipeline_interrupt.md) | Wake-word interrupt during inference/TTS, pipelined synthesis |

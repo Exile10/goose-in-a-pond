@@ -423,6 +423,7 @@ pub fn start_wake_listener(
     variants: Vec<String>,
     base_url: String,
     app: tauri::AppHandle,
+    pipeline_active: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // Cancel any existing listener first
     stop_wake_listener(state);
@@ -434,7 +435,7 @@ pub fn start_wake_listener(
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
 
     thread::spawn(move || {
-        let result = wake_listener_thread(app, wake_word, variants, base_url, is_running.clone(), stop_rx);
+        let result = wake_listener_thread(app, wake_word, variants, base_url, is_running.clone(), stop_rx, pipeline_active);
         is_running.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             tracing::error!("Wake listener thread error: {e}");
@@ -473,6 +474,7 @@ fn wake_listener_thread(
     base_url: String,
     is_running: Arc<AtomicBool>,
     stop_rx: std::sync::mpsc::Receiver<()>,
+    pipeline_active: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // ── VAD tuning ──────────────────────────────────────────────────────────
     /// Frame poll interval — matches WebRTC VAD frame size.
@@ -603,7 +605,7 @@ fn wake_listener_thread(
     let mut speech_buf:     Vec<i16> = Vec::new();
 
     // ── Main loop ───────────────────────────────────────────────────────────
-    loop {
+    'vad: loop {
         if stop_rx.try_recv().is_ok() || !is_running.load(Ordering::SeqCst) {
             break;
         }
@@ -717,8 +719,6 @@ fn wake_listener_thread(
                         let matched = triggers.iter().any(|t| transcript.contains(t.as_str()));
                         tracing::debug!("Wake ASR: {:?} (matched: {})", transcript, matched);
                         if matched {
-                            tracing::info!("Wake word '{}' detected — capturing command audio", wake_word);
-
                             // Kill all Goose audio immediately (quip, thinking tone, TTS)
                             // so the mic doesn't pick up its own output.
                             let ks: tauri::State<'_, crate::commands::audio_cmd::AudioKillSwitch> =
@@ -726,79 +726,96 @@ fn wake_listener_thread(
                             ks.0.store(true, std::sync::atomic::Ordering::Relaxed);
                             tracing::debug!("Audio kill switch activated by wake word");
 
-                            // ── One-breath flow ─────────────────────────────────
-                            // speech_buf already contains the FULL utterance that
-                            // was just transcribed (wake word + any command in the
-                            // same breath, e.g. "hey goose what's the weather").
-                            //
-                            // Additionally, capture any continuation speech: the
-                            // user might pause briefly between wake word and
-                            // command ("hey goose" [brief pause] "what time is it").
-                            // The ring buffer accumulates audio during the ASR call
-                            // and afterwards; drain it for continuation.
-                            const POST_TRIGGER_MS: u64       = 2000;
-                            const POST_TRIGGER_SILENCE: u64  = 400;
-                            const POLL_MS: u64               = 30;
+                            if pipeline_active.load(std::sync::atomic::Ordering::Relaxed) {
+                                // ── Barge-in: pipeline is running ───────────────
+                                // Kill switch is already set — TTS will stop within
+                                // 50ms. Emit a lightweight interrupt event (no audio
+                                // capture needed; conversational turn-taking will
+                                // handle the next recording after the pipeline ends).
+                                tracing::info!("Wake word '{}' — barge-in interrupt (pipeline active)", wake_word);
+                                let _ = app.emit("wake-word-interrupt", ());
 
-                            let mut continuation: Vec<i16> = Vec::new();
-                            let mut elapsed: u64 = 0;
-                            let mut silent_for: u64 = 0;
-                            let mut heard_speech = false;
+                                // Drain the ring buffer so we don't re-process the
+                                // same audio on the next VAD cycle.
+                                ring.lock().unwrap().clear();
+                            } else {
+                                // ── Initial activation: one-breath flow ─────────
+                                tracing::info!("Wake word '{}' detected — capturing command audio", wake_word);
 
-                            while elapsed < POST_TRIGGER_MS {
-                                thread::sleep(Duration::from_millis(POLL_MS));
-                                elapsed += POLL_MS;
+                                // speech_buf already contains the FULL utterance that
+                                // was just transcribed (wake word + any command in the
+                                // same breath, e.g. "hey goose what's the weather").
+                                //
+                                // Additionally, capture any continuation speech: the
+                                // user might pause briefly between wake word and
+                                // command ("hey goose" [brief pause] "what time is it").
+                                const POST_TRIGGER_MS: u64       = 2000;
+                                const POST_TRIGGER_SILENCE: u64  = 400;
+                                const POLL_MS: u64               = 30;
 
-                                let frame: Vec<i16> = {
-                                    let mut buf = ring.lock().unwrap();
-                                    buf.drain(..).collect()
-                                };
-                                if frame.is_empty() {
-                                    silent_for += POLL_MS;
-                                } else {
-                                    let rms = compute_rms(&frame);
-                                    if rms >= SILENCE_RMS {
-                                        heard_speech = true;
-                                        silent_for = 0;
-                                        continuation.extend_from_slice(&frame);
-                                    } else {
+                                let mut continuation: Vec<i16> = Vec::new();
+                                let mut elapsed: u64 = 0;
+                                let mut silent_for: u64 = 0;
+                                let mut heard_speech = false;
+
+                                while elapsed < POST_TRIGGER_MS {
+                                    thread::sleep(Duration::from_millis(POLL_MS));
+                                    elapsed += POLL_MS;
+
+                                    let frame: Vec<i16> = {
+                                        let mut buf = ring.lock().unwrap();
+                                        buf.drain(..).collect()
+                                    };
+                                    if frame.is_empty() {
                                         silent_for += POLL_MS;
-                                        // Keep trailing audio if user was speaking
-                                        if heard_speech {
+                                    } else {
+                                        let rms = compute_rms(&frame);
+                                        if rms >= SILENCE_RMS {
+                                            heard_speech = true;
+                                            silent_for = 0;
                                             continuation.extend_from_slice(&frame);
+                                        } else {
+                                            silent_for += POLL_MS;
+                                            if heard_speech {
+                                                continuation.extend_from_slice(&frame);
+                                            }
                                         }
+                                    }
+
+                                    if silent_for >= POST_TRIGGER_SILENCE {
+                                        break;
                                     }
                                 }
 
-                                if silent_for >= POST_TRIGGER_SILENCE {
-                                    break;
-                                }
+                                let mut full_audio = speech_buf.clone();
+                                full_audio.extend_from_slice(&continuation);
+
+                                let pcm_16k = if native_rate != 16000 {
+                                    resample_linear(&full_audio, native_rate, 16000)
+                                } else {
+                                    full_audio
+                                };
+                                let command_wav = encode_wav(&pcm_16k, 16000)
+                                    .unwrap_or_default();
+
+                                let duration_ms = pcm_16k.len() as u64 * 1000 / 16000;
+                                tracing::info!(
+                                    "One-breath: {}ms audio ({}ms original + {}ms continuation)",
+                                    duration_ms,
+                                    speech_buf.len() as u64 * 1000 / native_rate as u64,
+                                    continuation.len() as u64 * 1000 / native_rate as u64,
+                                );
+
+                                let _ = app.emit("wake-word-detected", command_wav);
                             }
 
-                            // Combine: speech_buf (wake word + any initial
-                            // command from the same breath) + continuation
-                            // (speech after a brief pause).
-                            let mut full_audio = speech_buf.clone();
-                            full_audio.extend_from_slice(&continuation);
-
-                            let pcm_16k = if native_rate != 16000 {
-                                resample_linear(&full_audio, native_rate, 16000)
-                            } else {
-                                full_audio
-                            };
-                            let command_wav = encode_wav(&pcm_16k, 16000)
-                                .unwrap_or_default();
-
-                            let duration_ms = pcm_16k.len() as u64 * 1000 / 16000;
-                            tracing::info!(
-                                "One-breath: {}ms audio ({}ms original + {}ms continuation)",
-                                duration_ms,
-                                speech_buf.len() as u64 * 1000 / native_rate as u64,
-                                continuation.len() as u64 * 1000 / native_rate as u64,
-                            );
-
-                            let _ = app.emit("wake-word-detected", command_wav);
-                            return Ok(());
+                            // Reset VAD and continue listening — the wake listener
+                            // is always-on and never exits on detection.
+                            speech_buf.clear();
+                            onset_frames = 0;
+                            tail_frames  = 0;
+                            in_speech    = false;
+                            continue 'vad;
                         }
                     }
                 }

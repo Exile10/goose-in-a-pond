@@ -247,7 +247,9 @@ impl GooseAdapter {
                 if let Some(ref dd) = self.data_dir {
                     Self::register_gguf_model(&model_name, dd);
                 }
-                let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
+                // Registry key is the stem (no ".gguf") — ModelConfig must match.
+                let registry_key = model_name.trim_end_matches(".gguf");
+                let cfg = goose::model::ModelConfig::new_or_fail(registry_key);
                 println!("[model-switch] building LocalInferenceProvider for '{}'...", model_name);
                 match goose::providers::local_inference::LocalInferenceProvider::from_env(cfg, vec![]).await {
                     Ok(p) => {
@@ -484,7 +486,10 @@ impl GooseAdapter {
             // Resolve thinking mode from settings + capabilities.
             // Voice mode always disables thinking — reasoning tokens waste TTS
             // time and leak as spoken text if any filter layer misses them.
-            let is_voice = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
+            // Check both the instance-level flag (CLI --input whisper) and the
+            // per-request flag (desktop voice pipeline sends voice_mode: true).
+            let is_voice = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed)
+                || request.voice_mode;
             let caps = self.model_capabilities.lock().unwrap().clone();
             let thinking_enabled = if is_voice {
                 false
@@ -502,7 +507,7 @@ impl GooseAdapter {
                 device_count,
                 has_home_devices,
                 online_device_names,
-                voice_mode: self.voice_mode.load(std::sync::atomic::Ordering::Relaxed),
+                voice_mode: is_voice,
                 available_tools,
                 thinking_enabled,
             }
@@ -795,6 +800,8 @@ mod tests {
             message: "Say hello and nothing else".to_string(),
             session_id: "test-session".to_string(),
             model_role: "chat".to_string(),
+            images: Vec::new(),
+            voice_mode: false,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

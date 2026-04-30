@@ -3668,6 +3668,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 session_id: session,
                 model_role,
                 images: Vec::new(),
+                voice_mode: false,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -3723,6 +3724,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     session_id: session.clone(),
                     model_role,
                     images: Vec::new(),
+                    voice_mode: false,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

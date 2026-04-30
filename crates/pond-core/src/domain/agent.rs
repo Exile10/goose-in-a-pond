@@ -9,6 +9,10 @@ pub struct AgentRequest {
     /// Optional image attachments for multimodal models.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<crate::domain::message::ImageAttachment>,
+    /// When true, the request originates from voice mode. The agent should
+    /// disable thinking, keep responses concise, and avoid formatting.
+    #[serde(default)]
+    pub voice_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
