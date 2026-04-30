@@ -14,6 +14,91 @@ use crate::domain::model_capabilities::ModelCapabilities;
 const CHARS_PER_TOKEN: usize = 4;
 const MIN_USABLE_HISTORY_CHARS: usize = 256;
 
+// ── Compaction profile ──────────────────────────────────────────────────────
+
+/// Per-model compaction parameters derived from the effective context window.
+///
+/// Goose's auto-compaction triggers at ~80% of its configured context_limit.
+/// On tiny KV caches (3K Jetson, 8K macOS Metal), that 80% threshold still
+/// leaves very little headroom. CompactionProfile tunes thresholds, memory
+/// injection budgets, and prompt budgets so the agent operates comfortably
+/// within the actual hardware limit.
+///
+/// Use [`CompactionProfile::from_context_window`] to derive the correct
+/// profile from the effective context size reported by the provider adapter.
+#[derive(Debug, Clone)]
+pub struct CompactionProfile {
+    /// Fraction of context at which proactive compaction should trigger (0.0-1.0).
+    /// Goose uses this via GOOSE_CONTEXT_LIMIT; we also use it for GIAP-side
+    /// budget calculations.
+    pub compaction_threshold: f32,
+    /// Max tokens to allocate for memory injection into the system prompt.
+    pub memory_token_budget: usize,
+    /// Max number of memory fragments to inject per turn.
+    pub max_memory_fragments: usize,
+    /// Max tokens for the full system prompt (base + extras + memories).
+    pub system_prompt_budget: usize,
+    /// The effective context window this profile was derived from.
+    pub context_window_tokens: usize,
+}
+
+impl CompactionProfile {
+    /// Derive a compaction profile from the effective context window in tokens.
+    ///
+    /// The tiers are tuned for GIAP's chat workflow:
+    /// - **3K** (Jetson CUDA): aggressive compaction, minimal memory injection.
+    /// - **8K** (macOS Metal default): balanced — enough for 5 memories + prompt.
+    /// - **32K** (Ollama/llamafile with medium models): generous budgets.
+    /// - **128K+** (large context HTTP models): near-unlimited for local use.
+    pub fn from_context_window(context_tokens: usize) -> Self {
+        if context_tokens <= 4096 {
+            // Jetson-class: 3K–4K tokens
+            Self {
+                compaction_threshold: 0.60,
+                memory_token_budget: 200,
+                max_memory_fragments: 3,
+                system_prompt_budget: 1500,
+                context_window_tokens: context_tokens,
+            }
+        } else if context_tokens <= 12288 {
+            // macOS Metal default: 8K–12K tokens
+            Self {
+                compaction_threshold: 0.70,
+                memory_token_budget: 500,
+                max_memory_fragments: 5,
+                system_prompt_budget: 3000,
+                context_window_tokens: context_tokens,
+            }
+        } else if context_tokens <= 65536 {
+            // Medium context: 32K–64K tokens
+            Self {
+                compaction_threshold: 0.75,
+                memory_token_budget: 1500,
+                max_memory_fragments: 10,
+                system_prompt_budget: 6000,
+                context_window_tokens: context_tokens,
+            }
+        } else {
+            // Large context: 128K+ tokens
+            Self {
+                compaction_threshold: 0.80,
+                memory_token_budget: 4000,
+                max_memory_fragments: 15,
+                system_prompt_budget: 10000,
+                context_window_tokens: context_tokens,
+            }
+        }
+    }
+
+    /// Whether the system prompt should use a compact format.
+    ///
+    /// Returns true when the context window is small enough that verbose
+    /// tool descriptions and detailed instructions waste precious tokens.
+    pub fn use_compact_prompt(&self) -> bool {
+        self.context_window_tokens <= 12288
+    }
+}
+
 /// Maximum assistant tool-output size kept verbatim in history.
 pub const TOOL_RESULT_MAX_CHARS: usize = 1_500;
 
@@ -293,5 +378,69 @@ mod tests {
         let result = trim_to_budget_for_model(messages, &caps, 4096);
         // Override to 4K should trim just like the small context case
         assert!(result.len() < 200);
+    }
+
+    // ── CompactionProfile tests ─────────────────────────────────────────
+
+    #[test]
+    fn compaction_profile_jetson_3k() {
+        let p = CompactionProfile::from_context_window(3072);
+        assert!((p.compaction_threshold - 0.60).abs() < f32::EPSILON);
+        assert_eq!(p.memory_token_budget, 200);
+        assert_eq!(p.max_memory_fragments, 3);
+        assert_eq!(p.system_prompt_budget, 1500);
+        assert!(p.use_compact_prompt());
+    }
+
+    #[test]
+    fn compaction_profile_macos_8k() {
+        let p = CompactionProfile::from_context_window(8192);
+        assert!((p.compaction_threshold - 0.70).abs() < f32::EPSILON);
+        assert_eq!(p.memory_token_budget, 500);
+        assert_eq!(p.max_memory_fragments, 5);
+        assert_eq!(p.system_prompt_budget, 3000);
+        assert!(p.use_compact_prompt());
+    }
+
+    #[test]
+    fn compaction_profile_32k() {
+        let p = CompactionProfile::from_context_window(32768);
+        assert!((p.compaction_threshold - 0.75).abs() < f32::EPSILON);
+        assert_eq!(p.memory_token_budget, 1500);
+        assert_eq!(p.max_memory_fragments, 10);
+        assert_eq!(p.system_prompt_budget, 6000);
+        assert!(!p.use_compact_prompt());
+    }
+
+    #[test]
+    fn compaction_profile_128k() {
+        let p = CompactionProfile::from_context_window(128_000);
+        assert!((p.compaction_threshold - 0.80).abs() < f32::EPSILON);
+        assert_eq!(p.memory_token_budget, 4000);
+        assert_eq!(p.max_memory_fragments, 15);
+        assert_eq!(p.system_prompt_budget, 10000);
+        assert!(!p.use_compact_prompt());
+    }
+
+    #[test]
+    fn compaction_profile_boundary_4096() {
+        // 4096 is the upper boundary of the Jetson tier
+        let p = CompactionProfile::from_context_window(4096);
+        assert!((p.compaction_threshold - 0.60).abs() < f32::EPSILON);
+        assert_eq!(p.max_memory_fragments, 3);
+    }
+
+    #[test]
+    fn compaction_profile_boundary_12288() {
+        // 12288 is the upper boundary of the macOS tier
+        let p = CompactionProfile::from_context_window(12288);
+        assert!((p.compaction_threshold - 0.70).abs() < f32::EPSILON);
+        assert_eq!(p.max_memory_fragments, 5);
+    }
+
+    #[test]
+    fn compaction_profile_stores_context_window() {
+        let p = CompactionProfile::from_context_window(8192);
+        assert_eq!(p.context_window_tokens, 8192);
     }
 }
