@@ -126,6 +126,7 @@ impl Agent for ToolCallingAgent {
             yield Ok(pond_core::domain::agent::AgentStreamEvent::Done {
                 session_id: request.session_id,
                 model_role: request.model_role,
+                usage: None,
             });
         };
         Ok(futures::stream::StreamExt::boxed(stream))
@@ -211,6 +212,7 @@ async fn make_app_with_provider(
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -487,6 +489,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -559,6 +562,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

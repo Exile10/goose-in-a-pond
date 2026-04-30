@@ -162,6 +162,43 @@ Playwright E2E tests in `tests/e2e/` use `helpers/api-mocks.ts` (`mockAllApiRout
 
 Whisper ASR (HTTP server at port 9000) → wake word detection → record → `POST /api/v1/transcribe` → chat. TTS via Piper subprocess or Piper HTTP server. Working voice config: `en_US-lessac-medium.onnx` (Piper).
 
+### Scheduling System
+
+Cron-based automation engine in `pond-infra-scheduler`. Tasks fire at cron intervals and execute prompts against the LLM agent or POST webhooks.
+
+- **Domain**: `TaskKind` (AgentPrompt | Webhook), `Schedule`, `ScheduleRun`, `ScheduleResultEvent` in `pond-core/src/domain/schedule.rs`
+- **Port**: `SchedulerPort` in `pond-core/src/ports/scheduler.rs` — create, list, delete, pause, resume, run_now, get_runs, list_upcoming
+- **Executor**: `ScheduleExecutor` port → `AgentScheduleExecutor` creates ephemeral sessions (prefix `sched-`) and calls `agent.chat()`. `DeferredExecutor` breaks the circular init dependency (scheduler → agent → scheduler).
+- **Adapter**: `CronSchedulerAdapter` in `pond-infra-scheduler/src/cron_scheduler.rs` — tokio-cron-scheduler, JSON persistence, `JsonRunHistory` for execution logs
+- **MCP Tools** (7): `list_schedules`, `create_schedule`, `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs`
+- **Natural language**: Tool classifier routes "schedule to get weather at 10am" → `create_schedule` → keyword parser extracts cron + prompt
+- **Result delivery**: `ScheduleResultEvent` broadcast via `tokio::sync::broadcast` → SSE at `GET /api/v1/schedules/events` → desktop notification
+- **Settings**: `schedule_result_notify` (default true)
+
+### Memory System (Enhanced)
+
+Segment-based memory with importance scoring, decay, and automatic extraction from conversations. Inspired by boop-agent.
+
+- **Segments**: `MemorySegment` — Identity (0.8), Correction (0.9), Preference (0.7), Relationship (0.7), Project (0.6), Knowledge (0.5), Context (0.3). Each has default importance and tier.
+- **Tiers**: `MemoryTier` — Short (decay 0.1), Long (decay 0.01), Permanent (no decay). Identity defaults to Permanent, Context to Short.
+- **Lifecycle**: Active → Archived → Merged. Archived memories are hidden from recall. Merged memories link via `superseded_by`.
+- **Background extraction**: `MemoryExtractor` port → `LlmMemoryExtractor` runs after each chat turn (tokio::spawn, never blocks SSE). Compact prompt (~150 tokens) for 3B models. Max 3 facts per turn. Rate-limited to 10s intervals.
+- **Decay formula**: `effective_score = importance * exp(-decay_rate * days) * (1 + ln(access_count + 1) * 0.1)`. Below 0.05 → prune, below 0.15 → archive. Cleanup runs every 6 hours.
+- **Consolidation**: `MemoryConsolidator` port → single-pass LLM merge/prune (simplified from boop's 3-phase). Runs every 24 hours. Max 20 memories per batch.
+- **Auto-classify**: `auto_classify_segment()` uses keyword heuristics (no LLM) — "I prefer" → Preference, "My name is" → Identity, etc.
+- **MCP Tools**: `save_memory` (accepts segment/importance/tier), `recall_memories` (returns segment metadata, records access), `forget_memory` (delete by ID or content)
+- **Settings**: `memory_extraction_enabled`, `memory_cleanup_enabled`, `memory_consolidation_enabled` (all default false), `agent_memory_inject`, `agent_memory_limit`
+
+### Token Usage Tracking
+
+Per-session token accumulation with estimated usage from the agent stream.
+
+- **Estimation**: GooseAdapter tracks `system_prompt_len` + accumulated `full_text_len` during streaming. Emits `UsageStats` in `AgentStreamEvent::Done` using chars/4 heuristic (~estimated).
+- **Storage**: `sessions` table has `total_prompt_tokens`, `total_completion_tokens`, `model_name` columns (migration 0016). Incremented after each chat response via `SessionStorage::increment_usage()`.
+- **API**: `GET /api/v1/usage/summary` returns aggregate `{ total_prompt_tokens, total_completion_tokens, total_tokens, session_count }`. `GET /api/v1/sessions` includes per-session token counts.
+- **Dashboard**: "Usage & Savings" card shows total tokens + money saved vs GPT-4o API ($2.50/M input + $10/M output).
+- **Chat**: Session dropdown shows per-session token badges.
+
 ### Goose Submodule
 
 `goose/` is a git submodule of Block's Goose agent framework. `pond-adapters-goose` and `pond-adapters-local-inference` depend on it. The outer GIAP workspace re-declares Goose's transitive dependencies (rmcp, sacp, tree-sitter-*) in the root `Cargo.toml` to resolve workspace version conflicts — do not remove them.

@@ -10,27 +10,23 @@ use crate::ports::memory_repository::MemoryRepository;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Rate limiter: skip extraction if the last run was less than this many seconds ago.
-const MIN_INTERVAL_SECS: i64 = 10;
-
-/// Minimum message length to trigger extraction (skip greetings / single words).
 const MIN_MESSAGE_LEN: usize = 15;
 
 pub struct MemoryExtractionService {
     last_run: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Minimum seconds between extraction runs.
+    interval_secs: i64,
 }
 
 impl MemoryExtractionService {
-    pub fn new() -> Self {
+    pub fn new(interval_secs: u32) -> Self {
         Self {
             last_run: Mutex::new(None),
+            interval_secs: interval_secs as i64,
         }
     }
 
     /// Run extraction for a conversation turn.
-    ///
-    /// Skips if the user message is trivially short or if called too soon
-    /// after the previous extraction.
     pub async fn run(
         &self,
         extractor: &dyn MemoryExtractor,
@@ -39,7 +35,6 @@ impl MemoryExtractionService {
         assistant_response: &str,
         session_id: Option<&str>,
     ) {
-        // Skip trivial messages
         if user_message.len() < MIN_MESSAGE_LEN && assistant_response.len() < MIN_MESSAGE_LEN {
             return;
         }
@@ -49,7 +44,7 @@ impl MemoryExtractionService {
             let mut last = self.last_run.lock().await;
             let now = chrono::Utc::now();
             if let Some(prev) = *last {
-                if (now - prev).num_seconds() < MIN_INTERVAL_SECS {
+                if (now - prev).num_seconds() < self.interval_secs {
                     tracing::debug!("[memory-extraction] rate-limited, skipping");
                     return;
                 }
@@ -112,8 +107,3 @@ impl MemoryExtractionService {
     }
 }
 
-impl Default for MemoryExtractionService {
-    fn default() -> Self {
-        Self::new()
-    }
-}

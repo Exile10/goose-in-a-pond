@@ -224,6 +224,8 @@ pub struct AppState {
     pub memory_extractor: Option<Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor>>,
     /// Shared extraction service instance (rate limiter + dedup state).
     pub memory_extraction_service: Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
+    /// Broadcast channel for schedule completion events (SSE + desktop notifications).
+    pub schedule_result_tx: tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

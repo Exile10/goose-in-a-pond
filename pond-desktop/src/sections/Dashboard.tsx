@@ -19,7 +19,8 @@ import {
 } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { api } from "../api/PondApiClient";
-import type { SessionSummary } from "../api/types";
+import { UsageStatsCard } from "../components/UsageStatsCard";
+import type { SessionSummary, UsageSummary } from "../api/types";
 
 /* ── Helpers ─────────────────────────────────────────────────────────────────── */
 
@@ -48,6 +49,9 @@ export function Dashboard() {
 
   /* Recent chat sessions */
   const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
+  const [usageData, setUsageData] = useState<UsageSummary | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+
   useEffect(() => {
     if (!state.serverOnline || !state.sessionToken) return;
     let cancelled = false;
@@ -60,6 +64,14 @@ export function Dashboard() {
         setRecentSessions(sorted);
       })
       .catch(() => {});
+
+    // Fetch usage summary
+    setUsageLoading(true);
+    api.getUsageSummary()
+      .then((data) => { if (!cancelled) setUsageData(data); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setUsageLoading(false); });
+
     return () => { cancelled = true; };
   }, [state.serverOnline, state.sessionToken]);
 
@@ -195,6 +207,14 @@ export function Dashboard() {
           </div>
         </CardContent>
       </Card>
+
+      {/* ── Usage & Savings ───────────────────────────────────── */}
+      <UsageStatsCard
+        data={usageData}
+        loading={usageLoading}
+        inputPricePerMillion={usageData?.cloud_input_price_per_million}
+        outputPricePerMillion={usageData?.cloud_output_price_per_million}
+      />
 
       {/* ── Dashboard grid (status + quick actions) ──────────── */}
       <div className="dash-grid">

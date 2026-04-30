@@ -27,6 +27,7 @@ import {
   type SessionMessage,
   type SessionSummary,
   type Settings,
+  type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
 } from "./types";
@@ -177,6 +178,12 @@ export class PondApiClient {
 
   getUpcomingSchedules(limit = 10): Promise<Schedule[]> {
     return this.get<Schedule[]>(`/api/v1/schedules/upcoming?limit=${limit}`);
+  }
+
+  // ── Usage ─────────────────────────────────────────────────
+
+  getUsageSummary(): Promise<UsageSummary> {
+    return this.get<UsageSummary>("/api/v1/usage/summary");
   }
 
   // ── Memory ────────────────────────────────────────────────

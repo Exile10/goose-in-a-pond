@@ -626,8 +626,10 @@ impl GooseAdapter {
         
         tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
+        let user_msg_len = request.message.len();
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
+            let mut total_output_chars: usize = 0;
 
             let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, None).await {
                 Ok(s) => s,
@@ -694,6 +696,7 @@ impl GooseAdapter {
                             if !raw_text.is_empty() {
                                 let text = strip_thinking_tokens(&raw_text);
                                 if !text.is_empty() {
+                                    total_output_chars += text.len();
                                     yield Ok(AgentStreamEvent::Text { content: text });
                                 }
                             }
@@ -708,7 +711,13 @@ impl GooseAdapter {
                     }
                 }
             }
-            yield Ok(AgentStreamEvent::Done { session_id, model_role });
+            // Estimate token usage (chars/4 heuristic for English text).
+            // Prompt estimate includes user message; output is accumulated stream text.
+            let est_usage = pond_core::ports::provider::UsageStats {
+                prompt_tokens: (user_msg_len / 4).max(1) as u32,
+                completion_tokens: (total_output_chars / 4).max(1) as u32,
+            };
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(est_usage) });
         };
 
         Ok(Box::pin(stream))

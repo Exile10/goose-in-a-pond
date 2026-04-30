@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button, Chip } from "@heroui/react";
-import { ArrowUp, Cpu, Mic, Paperclip, Zap } from "lucide-react";
+import { ArrowUp, Cpu, History, Mic, Paperclip, Zap } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ContextCard } from "../components/ContextCard";
+import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
-import type { ChatEvent } from "../api/types";
+import type { ChatEvent, SessionSummary } from "../api/types";
 import { filterThinking } from "../lib/thinkFilter";
 
 // Human-readable tool status for the chat bubble while a tool runs.
@@ -49,6 +50,8 @@ export function Chat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [showSessions, setShowSessions] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
@@ -78,6 +81,11 @@ export function Chat() {
       });
   }, [state.sessionId]);
 
+  // Refresh session list for dropdown
+  const refreshSessions = useCallback(() => {
+    api.listSessions().then(setSessions).catch(() => {});
+  }, []);
+
   // Load most recent session on mount (once server is online)
   useEffect(() => {
     if (!state.serverOnline || messages.length > 0) return;
@@ -103,7 +111,7 @@ export function Chat() {
       .catch((err) => {
         console.warn("Could not load session history (non-fatal):", err);
       })
-      .finally(() => setLoadingSession(false));
+      .finally(() => { setLoadingSession(false); refreshSessions(); });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.serverOnline]);
 
@@ -238,8 +246,9 @@ export function Chat() {
       });
       setBusy(false);
       textareaRef.current?.focus();
+      refreshSessions();
     }
-  }, [input, busy, state.serverOnline, state.sessionToken, dispatch]);
+  }, [input, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -262,6 +271,15 @@ export function Chat() {
       {/* Chat Toolbar */}
       <div className="chat-toolbar">
         <div className="chat-toolbar__left">
+          <Button
+            size="sm"
+            variant="ghost"
+            isIconOnly
+            onPress={() => { refreshSessions(); setShowSessions(!showSessions); }}
+            aria-label="Session history"
+          >
+            <History size={16} />
+          </Button>
           <h1 className="page-header__title chat-toolbar__title">Chat</h1>
           <Chip size="sm" variant="soft">
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
@@ -284,6 +302,17 @@ export function Chat() {
             </span>
           </Button>
         </div>
+
+        <SessionDropdown
+          sessions={sessions}
+          currentSessionId={sessionIdRef.current ?? null}
+          onSelect={(id) => {
+            dispatch({ type: "SET_SESSION_ID", payload: id });
+          }}
+          onNewChat={newConversation}
+          isOpen={showSessions}
+          onClose={() => setShowSessions(false)}
+        />
       </div>
 
       {/* Messages */}

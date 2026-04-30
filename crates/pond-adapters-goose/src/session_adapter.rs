@@ -45,6 +45,9 @@ fn goose_session_to_pond(gs: &GooseSession) -> Session {
     Session {
         id: gs.id.clone(),
         title: Some(gs.name.clone()),
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        model_name: None,
         created_at: gs.created_at,
         updated_at: gs.updated_at,
     }

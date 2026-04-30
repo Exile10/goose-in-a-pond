@@ -84,6 +84,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", patch(rename_session))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
+        .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
@@ -118,6 +119,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/resume", post(resume_schedule))
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         .route("/schedules/{id}/runs", get(list_schedule_runs))
+        .route("/schedules/events", get(schedule_events_sse))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
         .route("/extensions/{name}", delete(remove_extension_handler).patch(toggle_extension_handler))
@@ -703,8 +705,8 @@ async fn chat_stream(
             }
         }
 
-        let usage_prompt_tokens: u32 = 0;
-        let usage_completion_tokens: u32 = 0;
+        let mut usage_prompt_tokens: u32 = 0;
+        let mut usage_completion_tokens: u32 = 0;
 
         let model_name_for_done = settings.chat_model.clone();
 
@@ -768,8 +770,11 @@ async fn chat_stream(
                         AgentStreamEvent::ReviewRevision { content, score, rounds } => {
                             Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                         }
-                        AgentStreamEvent::Done { .. } => {
-                            // Handled at the end of the loop
+                        AgentStreamEvent::Done { usage, .. } => {
+                            if let Some(u) = usage {
+                                usage_prompt_tokens = u.prompt_tokens;
+                                usage_completion_tokens = u.completion_tokens;
+                            }
                             continue;
                         }
                         AgentStreamEvent::Error { content } => {
@@ -896,6 +901,16 @@ async fn chat_stream(
             });
         }
 
+        // Persist token usage to session
+        if usage_prompt_tokens > 0 || usage_completion_tokens > 0 {
+            let _ = storage.increment_usage(
+                &session_id,
+                usage_prompt_tokens,
+                usage_completion_tokens,
+                Some(&model_name_for_done),
+            ).await;
+        }
+
         // Done event
         let data = json!({
             "done": true,
@@ -934,6 +949,9 @@ async fn list_sessions(
             json!({
                 "id": s.id,
                 "title": s.title,
+                "total_prompt_tokens": s.total_prompt_tokens,
+                "total_completion_tokens": s.total_completion_tokens,
+                "model_name": s.model_name,
                 "created_at": s.created_at.to_rfc3339(),
                 "updated_at": s.updated_at.to_rfc3339(),
             })
@@ -941,6 +959,39 @@ async fn list_sessions(
         .collect();
 
     Ok(Json(json!({ "sessions": session_list })))
+}
+
+/// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
+async fn usage_summary(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sessions = state
+        .session_storage
+        .list_sessions()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to list sessions: {}", e)})),
+            )
+        })?;
+
+    let total_prompt: u64 = sessions.iter().map(|s| s.total_prompt_tokens as u64).sum();
+    let total_completion: u64 = sessions.iter().map(|s| s.total_completion_tokens as u64).sum();
+    let total_tokens = total_prompt + total_completion;
+
+    let settings = state.settings_repo.get().await.ok();
+    let cloud_input = settings.as_ref().map(|s| s.cloud_input_price_per_million).unwrap_or(2.50);
+    let cloud_output = settings.as_ref().map(|s| s.cloud_output_price_per_million).unwrap_or(10.00);
+
+    Ok(Json(json!({
+        "total_prompt_tokens": total_prompt,
+        "total_completion_tokens": total_completion,
+        "total_tokens": total_tokens,
+        "session_count": sessions.len(),
+        "cloud_input_price_per_million": cloud_input,
+        "cloud_output_price_per_million": cloud_output,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -3824,6 +3875,34 @@ async fn list_upcoming_schedules(
             Json(json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// `GET /api/v1/schedules/events` — SSE stream of schedule completion events.
+///
+/// The desktop subscribes to this on load to receive real-time notifications
+/// when scheduled tasks complete (or fail).
+async fn schedule_events_sse(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = state.schedule_result_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    yield Ok(Event::default().data(data));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("schedule events SSE lagged by {n} messages");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ── Agent tools handler ───────────────────────────────────────────────────────

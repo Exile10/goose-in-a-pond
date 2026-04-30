@@ -39,7 +39,7 @@ impl Agent for MockAgent {
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Status { content: "Mock agent thinking...".to_string() });
             yield Ok(AgentStreamEvent::Text { content: response_text });
-            yield Ok(AgentStreamEvent::Done { session_id, model_role });
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None });
         };
 
         Ok(stream.boxed())

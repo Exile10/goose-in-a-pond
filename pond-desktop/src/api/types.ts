@@ -237,6 +237,18 @@ export interface SessionSummary {
   created_at: string;
   updated_at: string;
   message_count?: number;
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  model_name?: string;
+}
+
+export interface UsageSummary {
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  session_count: number;
+  cloud_input_price_per_million?: number;
+  cloud_output_price_per_million?: number;
 }
 
 export interface SessionMessage {

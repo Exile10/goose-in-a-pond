@@ -63,6 +63,8 @@ pub struct CronSchedulerAdapter {
     persist_path: PathBuf,
     executor: Arc<dyn ScheduleExecutor>,
     run_history: Arc<JsonRunHistory>,
+    /// Optional broadcast sender for schedule result events (SSE delivery).
+    result_tx: Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
 }
 
 impl CronSchedulerAdapter {
@@ -76,10 +78,21 @@ impl CronSchedulerAdapter {
         runs_path: PathBuf,
         executor: Arc<dyn ScheduleExecutor>,
     ) -> Result<Self> {
+        Self::with_options(persist_path, runs_path, executor, None, 50).await
+    }
+
+    /// Create with all options.
+    pub async fn with_options(
+        persist_path: PathBuf,
+        runs_path: PathBuf,
+        executor: Arc<dyn ScheduleExecutor>,
+        result_tx: Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
+        max_runs_per_task: u32,
+    ) -> Result<Self> {
         let scheduler = JobScheduler::new().await?;
         let tasks: Arc<Mutex<HashMap<String, TaskEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let run_history = Arc::new(JsonRunHistory::new(runs_path).await?);
+        let run_history = Arc::new(JsonRunHistory::new(runs_path, max_runs_per_task).await?);
 
         let adapter = Self {
             scheduler,
@@ -87,6 +100,7 @@ impl CronSchedulerAdapter {
             persist_path,
             executor,
             run_history,
+            result_tx,
         };
 
         // Rehydrate persisted tasks
@@ -181,18 +195,28 @@ impl CronSchedulerAdapter {
         cron: &str,
         kind: TaskKind,
     ) -> Result<uuid::Uuid> {
+        use pond_core::domain::schedule::ScheduleResultEvent;
+
         let executor = self.executor.clone();
         let tasks = self.tasks.clone();
         let run_history = self.run_history.clone();
+        let result_tx = self.result_tx.clone();
         let id = task_id.to_string();
 
         let job = Job::new_async(cron, move |_uuid, _lock| {
             let executor = executor.clone();
             let tasks = tasks.clone();
             let run_history = run_history.clone();
+            let result_tx = result_tx.clone();
             let id = id.clone();
             let kind = kind.clone();
             Box::pin(async move {
+                // Get label for the event
+                let label = {
+                    let guard = tasks.lock().await;
+                    guard.get(&id).map(|e| e.persisted.label.clone()).unwrap_or_default()
+                };
+
                 // Mark running
                 {
                     let mut guard = tasks.lock().await;
@@ -203,12 +227,14 @@ impl CronSchedulerAdapter {
 
                 // Record run start
                 let run_id = run_history.record_start(&id).await;
+                let start = std::time::Instant::now();
 
                 // Execute
                 let result = executor.execute(&id, &kind).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
 
-                // Record run finish
-                match &result {
+                // Record run finish + broadcast event
+                let (status, result_text, error_text) = match &result {
                     Ok(text) => {
                         run_history
                             .record_finish(
@@ -218,6 +244,7 @@ impl CronSchedulerAdapter {
                                 None,
                             )
                             .await;
+                        (RunStatus::Completed, Some(text.clone()), None)
                     }
                     Err(e) => {
                         tracing::error!("Scheduled task {id} failed: {e}");
@@ -229,7 +256,21 @@ impl CronSchedulerAdapter {
                                 Some(e.to_string()),
                             )
                             .await;
+                        (RunStatus::Failed, None, Some(e.to_string()))
                     }
+                };
+
+                // Broadcast result event (for SSE / desktop notifications)
+                if let Some(tx) = &result_tx {
+                    let _ = tx.send(ScheduleResultEvent {
+                        schedule_id: id.clone(),
+                        schedule_label: label,
+                        run_id: run_id.clone(),
+                        status,
+                        result: result_text,
+                        error: error_text,
+                        duration_ms: Some(duration_ms),
+                    });
                 }
 
                 // Mark not-running, update last_run
@@ -425,17 +466,20 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn run_now(&self, id: &str) -> Result<()> {
-        let kind = {
+        use pond_core::domain::schedule::ScheduleResultEvent;
+
+        let (kind, label) = {
             let guard = self.tasks.lock().await;
             let entry = guard
                 .get(id)
                 .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
-            Self::resolve_kind(entry)
+            (Self::resolve_kind(entry), entry.persisted.label.clone())
         };
 
         let executor = self.executor.clone();
         let tasks = self.tasks.clone();
         let run_history = self.run_history.clone();
+        let result_tx = self.result_tx.clone();
         let id = id.to_string();
         tokio::spawn(async move {
             // Mark running
@@ -447,20 +491,37 @@ impl SchedulerPort for CronSchedulerAdapter {
             }
 
             let run_id = run_history.record_start(&id).await;
+            let start = std::time::Instant::now();
             let result = executor.execute(&id, &kind).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
 
-            match &result {
+            let (status, result_text, error_text) = match &result {
                 Ok(text) => {
                     run_history
                         .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
                         .await;
+                    (RunStatus::Completed, Some(text.clone()), None)
                 }
                 Err(e) => {
                     tracing::error!("run_now task {id} failed: {e}");
                     run_history
                         .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
                         .await;
+                    (RunStatus::Failed, None, Some(e.to_string()))
                 }
+            };
+
+            // Broadcast result event
+            if let Some(tx) = &result_tx {
+                let _ = tx.send(ScheduleResultEvent {
+                    schedule_id: id.clone(),
+                    schedule_label: label,
+                    run_id: run_id.clone(),
+                    status,
+                    result: result_text,
+                    error: error_text,
+                    duration_ms: Some(duration_ms),
+                });
             }
 
             // Mark not-running
