@@ -504,3 +504,187 @@ async fn llamafile_autostart_guard_kills_on_drop() {
 
     assert!(!still_up, "expected llamafile to be down after guard drop");
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  GGUF Diagnostic — Thinking Token Detection
+//
+//  These tests capture raw model output at multiple pipeline stages
+//  to identify exactly which tokens leak through the filters.
+//
+//  Run:
+//    GIAP_GGUF_MODEL_PATH="$HOME/Library/Application Support/goose-in-a-pond/models/gguf/gemma-4-E2B-it-Q4_K_M.gguf" \
+//      cargo test -p pond-server --test live_provider_test -- --ignored gguf_live_diagnose --nocapture
+// ═══════════════════════════════════════════════════════════════════
+
+/// Highlight every `<` in a string so tag boundaries are visible in test output.
+fn highlight_tags(s: &str) -> String {
+    s.replace('<', "\n  «<")
+     .replace('>', ">»")
+}
+
+/// Diagnose what tokens a GGUF model emits and what passes through each filter layer.
+///
+/// Prints:
+///   1. Raw `complete()` output with all `<` highlighted
+///   2. Output after `strip_thinking_tokens()` (non-streaming path)
+///   3. Each streaming `stream_complete()` chunk with markers
+///   4. Output after ThoughtFilter (simulating SSE pipeline)
+#[cfg(feature = "local-inference")]
+#[tokio::test]
+#[ignore = "requires GIAP_GGUF_MODEL_PATH pointing to a .gguf file on disk"]
+async fn gguf_live_diagnose_thinking_tokens() {
+    let path = match gguf_model_path() { None => return, Some(p) => p };
+    let path_str = path.to_string_lossy().into_owned();
+    let model_name = path.file_name().unwrap_or_default().to_string_lossy();
+
+    println!("\n{}", "=".repeat(70));
+    println!("  GGUF THINKING TOKEN DIAGNOSTIC");
+    println!("  Model: {}", model_name);
+    println!("{}\n", "=".repeat(70));
+
+    let adapter = pond_adapters_local_inference::LocalInferenceLlmAdapter
+        ::new_with_data_dir(&path_str, std::path::Path::new("/tmp"))
+        .await
+        .expect("GGUF adapter init failed — check model path");
+
+    // ── 1. Non-streaming: RAW complete() (bypass strip_thinking_tokens) ──
+    // Use the inner GooseProviderAdapter to get RAW output before stripping.
+    println!("─── 1. RAW complete() — BEFORE strip_thinking_tokens ───");
+    let raw_reply = adapter.raw_complete(
+        "You are a helpful, thoughtful assistant. Think step by step before answering.",
+        vec![ChatMessage::user("If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reasoning.")],
+    ).await;
+
+    match raw_reply {
+        Ok(reply) => {
+            println!("  Raw content ({} chars):", reply.content.len());
+            println!("  {}", highlight_tags(&reply.content));
+            println!();
+        }
+        Err(e) => {
+            println!("  raw_complete unavailable ({}), using stripped complete()...", e);
+            // Fallback: use the normal complete() which applies stripping
+            let reply = adapter
+                .complete(
+                    "You are a helpful, thoughtful assistant. Think step by step.",
+                    vec![ChatMessage::user("If a train travels at 60 mph for 2.5 hours, how far does it go?")],
+                )
+                .await
+                .expect("GGUF complete() failed");
+            println!("  Stripped content ({} chars):", reply.content.len());
+            println!("  {}", highlight_tags(&reply.content));
+            println!();
+        }
+    }
+
+    // Also run normal complete() to see what stripping does
+    println!("─── 1b. complete() — AFTER strip_thinking_tokens ───");
+    let reply = adapter
+        .complete(
+            "You are a helpful, thoughtful assistant. Think step by step before answering.",
+            vec![ChatMessage::user("If a train travels at 60 mph for 2.5 hours, how far does it go? Show your reasoning.")],
+        )
+        .await
+        .expect("GGUF complete() failed");
+
+    println!("  Stripped content ({} chars):", reply.content.len());
+    println!("  {}", highlight_tags(&reply.content));
+    println!();
+
+    // NOTE: complete() already applies strip_thinking_tokens() internally.
+    // The content we see here is ALREADY STRIPPED. If it still contains tags,
+    // strip_thinking_tokens() is not catching them.
+    let has_tags = reply.content.contains('<') && reply.content.contains('>');
+    if has_tags {
+        println!("  ⚠️  TAGS STILL PRESENT after strip_thinking_tokens()!");
+        // Print each <...> segment
+        for (i, part) in reply.content.split('<').enumerate() {
+            if i == 0 { continue; }
+            if let Some(close) = part.find('>') {
+                println!("  LEAKED TAG: <{}>", &part[..close]);
+            }
+        }
+    } else {
+        println!("  ✅ No tags detected in complete() output.");
+    }
+    println!();
+
+    // ── 2. Streaming: stream_complete() ──────────────────────────────────
+    println!("─── 2. stream_complete() — STREAMING CHUNKS ───");
+    let mut stream = adapter.stream_complete(
+        "You are a helpful, thoughtful assistant. Think carefully before answering.",
+        vec![ChatMessage::user("What is 17 * 23? Show your work.")],
+    );
+
+    let mut chunks = Vec::new();
+    let mut chunk_idx = 0u32;
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(StreamToken::Text(t)) => {
+                // Print each chunk with visible markers
+                let display = t.replace('\n', "\\n");
+                let has_angle = t.contains('<');
+                let marker = if has_angle { " ⚠️" } else { "" };
+                println!("  [CHUNK {:3}] {:?}{}", chunk_idx, display, marker);
+                chunks.push(t);
+                chunk_idx += 1;
+            }
+            Ok(StreamToken::Usage(u)) => {
+                println!("  [USAGE] prompt={} completion={}", u.prompt_tokens, u.completion_tokens);
+            }
+            Err(e) => {
+                println!("  [ERROR] {}", e);
+                break;
+            }
+        }
+    }
+
+    let raw_stream = chunks.join("");
+    println!();
+    println!("  Full streamed text ({} chunks, {} chars):", chunks.len(), raw_stream.len());
+    println!("  {}", highlight_tags(&raw_stream));
+    println!();
+
+    // ── 3. Simulate ThoughtFilter on the streaming chunks ────────────────
+    println!("─── 3. ThoughtFilter SIMULATION ───");
+    let mut thought = pond_api::thought_filter::ThoughtFilter::new();
+    let mut filtered_output = String::new();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let visible = thought.push(chunk);
+        if !visible.is_empty() {
+            filtered_output.push_str(&visible);
+            println!("  [FILTER {:3}] → {:?}", i, visible);
+        }
+    }
+    let tail = thought.flush();
+    if !tail.is_empty() {
+        filtered_output.push_str(&tail);
+        println!("  [FLUSH] → {:?}", tail);
+    }
+
+    println!();
+    println!("  Filtered output ({} chars):", filtered_output.len());
+    println!("  {}", &filtered_output);
+
+    let leaked = filtered_output.contains('<') && filtered_output.contains('>');
+    if leaked {
+        println!();
+        println!("  ⚠️  TAGS LEAKED THROUGH ThoughtFilter!");
+        for (i, part) in filtered_output.split('<').enumerate() {
+            if i == 0 { continue; }
+            if let Some(close) = part.find('>') {
+                println!("  LEAKED: <{}>", &part[..close]);
+            }
+        }
+    } else {
+        println!("  ✅ ThoughtFilter caught all tags.");
+    }
+
+    println!();
+    println!("─── SUMMARY ───");
+    println!("  Model: {}", model_name);
+    println!("  complete() has tags: {}", has_tags);
+    println!("  stream ThoughtFilter leaked: {}", leaked);
+    println!("  Raw stream tags: {}", raw_stream.contains('<'));
+}

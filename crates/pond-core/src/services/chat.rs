@@ -1022,6 +1022,7 @@ impl ChatService {
             session_id: self.session_id.clone(),
             model_role: resolve_voice_role(&message),
             images: Vec::new(),
+            voice_mode: false,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1159,6 +1160,7 @@ impl ChatService {
             session_id: self.session_id.clone(),
             model_role: "chat".to_string(),
             images: Vec::new(),
+            voice_mode: false,
         };
 
         // Start a soft ambient thinking tone while the LLM infers.
@@ -1179,7 +1181,7 @@ impl ChatService {
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
-        let mut in_think_block = false;
+        let mut thought_filter = crate::services::thought_filter::ThoughtFilter::new();
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
         // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
@@ -1241,10 +1243,8 @@ impl ChatService {
                     }
                 }
                 AgentStreamEvent::Text { content } => {
-                    // Strip <think>…</think> reasoning blocks — not meant for TTS or transcript.
-                    let (visible, new_in_think) = filter_thinking(&content, in_think_block);
-                    in_think_block = new_in_think;
-                    let content = visible;
+                    // Strip all thinking/reasoning tags — not meant for TTS or transcript.
+                    let content = thought_filter.push(&content);
                     if content.is_empty() {
                         continue;
                     }
@@ -1268,6 +1268,11 @@ impl ChatService {
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
+                    // Flush any tail held back by the thought filter
+                    let tail = thought_filter.flush();
+                    if !tail.is_empty() {
+                        sentence_buf.push_str(&tail);
+                    }
                     // Flush any remaining buffer
                     let remainder = sentence_buf.trim().to_string();
                     if !remainder.is_empty() {
@@ -1300,6 +1305,11 @@ impl ChatService {
             }
         }
 
+        // Flush thought filter tail if stream ended without Done
+        let tail = thought_filter.flush();
+        if !tail.is_empty() {
+            sentence_buf.push_str(&tail);
+        }
         // Flush anything left if stream ended without Done
         let remainder = sentence_buf.trim().to_string();
         if !remainder.is_empty() {

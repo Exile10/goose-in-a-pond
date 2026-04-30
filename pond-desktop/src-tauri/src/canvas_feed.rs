@@ -24,24 +24,22 @@ pub struct SessionCreated {
     pub model_role: String,
 }
 
-/// Persistent state for cross-chunk `<think>` block filtering.
-/// Reset to `false` at the start of each new chat stream.
-static IN_THINK_BLOCK: Mutex<bool> = Mutex::new(false);
+/// Persistent stateful filter for cross-chunk thinking tag stripping.
+/// Reset at the start of each new chat stream. Handles all tag formats:
+/// `<think>`, `<thought>`, `<|channel>thought`, `<|tool_call>`, and
+/// standalone sentinels (`<eos>`, `<end_of_turn>`, etc.).
+static THOUGHT_FILTER: Mutex<Option<crate::thought_filter::ThoughtFilter>> = Mutex::new(None);
 
-/// Reset the thinking block state — call at the start of each new stream.
+/// Reset the thinking filter — call at the start of each new stream.
 pub fn reset_think_filter() {
-    *IN_THINK_BLOCK.lock().unwrap() = false;
+    *THOUGHT_FILTER.lock().unwrap() = Some(crate::thought_filter::ThoughtFilter::new());
 }
 
-/// Filter `<think>…</think>` blocks from a streaming text chunk.
-/// Uses the shared `IN_THINK_BLOCK` state so blocks that span multiple
-/// SSE events are handled correctly.  Single lock acquisition to avoid
-/// TOCTOU race between reading and writing the state.
+/// Filter thinking/reasoning tags from a streaming text chunk.
 fn filter_thinking(text: &str) -> String {
-    let mut guard = IN_THINK_BLOCK.lock().unwrap();
-    let (visible, new_state) = crate::tts_text::filter_thinking(text, *guard);
-    *guard = new_state;
-    visible
+    let mut guard = THOUGHT_FILTER.lock().unwrap();
+    let filter = guard.get_or_insert_with(crate::thought_filter::ThoughtFilter::new);
+    filter.push(text)
 }
 
 /// Parse a single SSE line from the chat/stream endpoint and emit the

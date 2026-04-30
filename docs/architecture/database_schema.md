@@ -1,6 +1,6 @@
 # Database Schema — Goose In A Pond
 
-> Last updated: April 2026 — reflects migrations 0001–0012 (system) and 0001–0003 (logs)
+> Last updated: April 2026 — reflects migrations 0001–0016 (system) and 0001–0003 (logs)
 
 ## Overview
 
@@ -431,6 +431,10 @@ All retention values are read from the `settings` table at server startup.
 | `0010_prompt_extras.sql` | `prompt_extras` table — per-key extra instructions |
 | `0011_skills.sql` | `user_skills` table — named skills injected per turn |
 | `0012_recipes.sql` | `agent_recipes` table — Goose Recipe YAML definitions |
+| `0013_face_embeddings.sql` | `face_embeddings` table — per-profile face embedding vectors |
+| `0014_face_profile_thresholds.sql` | Per-profile cosine-similarity match thresholds |
+| `0015_memory_segments.sql` | Adds `segment`, `importance`, `tier`, `decay_rate`, `access_count`, `last_accessed_at`, `lifecycle`, `superseded_by` to `memory_fragments` |
+| `0016_session_usage.sql` | Adds `total_prompt_tokens`, `total_completion_tokens`, `model_name` to `sessions` |
 
 ### Logs DB
 

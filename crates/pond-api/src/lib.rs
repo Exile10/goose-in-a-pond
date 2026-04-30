@@ -269,6 +269,18 @@ pub struct ModelStatusEntry {
     pub ram_estimate_mb: Option<u64>,
     /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
     pub recommended_role: Option<String>,
+    /// ASR language ("en", "multilingual"). Whisper models only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asr_language: Option<String>,
+    /// ASR model size ("tiny", "base", "small", …). Whisper models only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asr_size: Option<String>,
+    /// TTS engine identifier ("piper"). TTS models only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tts_engine: Option<String>,
+    /// Companion config filename (.onnx.json). TTS models only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_filename: Option<String>,
 }
 
 /// Build the full API router.

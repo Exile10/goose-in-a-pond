@@ -313,6 +313,9 @@ struct ChatRequest {
     /// Optional image attachments for multimodal models (base64-encoded).
     #[serde(default)]
     images: Vec<pond_core::domain::message::ImageAttachment>,
+    /// When true, disable thinking and use voice-friendly responses.
+    #[serde(default)]
+    voice_mode: bool,
 }
 
 /// Send a message and get a response.
@@ -736,13 +739,15 @@ async fn chat_stream(
             session_id: session_id.clone(),
             model_role: model_role.to_string(),
             images: req.images.clone(),
+            voice_mode: req.voice_mode,
         };
 
         let mut full_text = String::new();
         // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
         // preambles and `<think>…</think>` blocks out of the per-token stream.
         // When show_thinking is enabled, capture thinking blocks as SSE events.
-        let mut thought = if settings.show_thinking {
+        // Voice mode always disables thinking capture.
+        let mut thought = if settings.show_thinking && !req.voice_mode {
             crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
         } else {
             crate::thought_filter::ThoughtFilter::new()
@@ -1480,6 +1485,10 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
         filename:         m.filename.clone(),
         ram_estimate_mb:  m.ram_estimate_mb,
         recommended_role: m.recommended_role.clone(),
+        asr_language:     m.asr_language.clone(),
+        asr_size:         m.asr_size.clone(),
+        tts_engine:       m.tts_engine.clone(),
+        config_filename:  m.config_filename.clone(),
     }
 }
 
@@ -1720,8 +1729,29 @@ async fn download_model(
     let dl_filename = filename.clone();
     let dl_category = category.clone();
 
+    // For TTS models, also download the companion config file (.onnx.json)
+    let cfg_url      = m.config_url.clone();
+    let cfg_filename = m.config_filename.clone();
+    let cfg_client   = state.http_client.clone();
+    let cfg_data_dir = data_dir.clone();
+
     tokio::spawn(async move {
         spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, dl_client, async move {
+            // Download config file before marking as downloaded
+            if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
+                let cfg_dest = cfg_data_dir.join("models").join("tts").join(&cf);
+                if let Some(parent) = cfg_dest.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match cfg_client.get(&cu).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(bytes) = resp.bytes().await {
+                            let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                        }
+                    }
+                    _ => tracing::warn!("Failed to download TTS config file {}", cf),
+                }
+            }
             let _ = model_repo.set_downloaded(&model_id, true).await;
         }).await;
     });
@@ -1774,6 +1804,13 @@ async fn delete_model(
             tokio::fs::remove_file(&path).await.map_err(|e| {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete file: {e}")})))
             })?;
+        }
+        // Also delete companion config file for TTS models (.onnx.json)
+        if let Some(cfg_filename) = &m.config_filename {
+            let cfg_path = data_dir.join("models").join("tts").join(cfg_filename);
+            if cfg_path.exists() {
+                let _ = tokio::fs::remove_file(&cfg_path).await;
+            }
         }
     }
 
@@ -4007,6 +4044,7 @@ async fn agent_chat_stream(
             session_id: session_id.clone(),
             model_role: "task".to_string(),
             images: Vec::new(),
+            voice_mode: false,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {

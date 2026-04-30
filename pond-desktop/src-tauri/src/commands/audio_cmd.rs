@@ -18,6 +18,18 @@ impl AudioKillSwitch {
     }
 }
 
+/// Tracks whether the voice pipeline is currently active (transcribe → chat →
+/// TTS).  The always-on wake listener reads this to decide between:
+///   - `false` → initial activation: full one-breath capture + `wake-word-detected`
+///   - `true`  → barge-in: just set kill switch + `wake-word-interrupt`
+pub struct PipelineActive(pub Arc<AtomicBool>);
+
+impl PipelineActive {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptResult {
     pub text: String,
@@ -196,10 +208,12 @@ pub async fn start_wake_listener(
     variants: Option<Vec<String>>,
     wake_state: State<'_, WakeListenerState>,
     server: State<'_, ServerProcess>,
+    pipeline_flag: State<'_, PipelineActive>,
 ) -> Result<(), String> {
     let base_url = server.get_url();
     let variants = variants.unwrap_or_default();
-    audio::start_wake_listener(&wake_state, wake_word, variants, base_url, app)
+    let pipeline_active = pipeline_flag.0.clone();
+    audio::start_wake_listener(&wake_state, wake_word, variants, base_url, app, pipeline_active)
 }
 
 /// Stop the passive wake-word listening loop.
@@ -239,12 +253,23 @@ pub async fn run_voice_pipeline(
     session_id: Option<String>,
     server: State<'_, ServerProcess>,
     kill_switch: State<'_, AudioKillSwitch>,
+    pipeline_flag: State<'_, PipelineActive>,
 ) -> Result<(), String> {
     use crate::tts_text;
 
     // Reset kill switch at the start of each pipeline run.
     kill_switch.0.store(false, Ordering::Relaxed);
     let kill_flag = kill_switch.0.clone();
+
+    // Mark pipeline as active so the always-on wake listener uses
+    // barge-in mode (kill switch only, no one-breath capture).
+    pipeline_flag.0.store(true, Ordering::Relaxed);
+    // RAII guard — clears the flag on all exit paths (Ok, Err, panic).
+    struct PipelineGuard(Arc<AtomicBool>);
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
+    }
+    let _pipeline_guard = PipelineGuard(pipeline_flag.0.clone());
 
     let base_url = server.get_url();
     let client = reqwest::Client::new();
@@ -330,7 +355,8 @@ pub async fn run_voice_pipeline(
     let effective_session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let chat_req = serde_json::json!({
         "message": transcript,
-        "session_id": effective_session_id
+        "session_id": effective_session_id,
+        "voice_mode": true
     });
 
     let mut chat_builder = client
@@ -433,7 +459,7 @@ pub async fn run_voice_pipeline(
 
     // ── SSE parsing — extract text for TTS while emitting events to UI ──────
     let mut sentence_buf    = String::new();
-    let mut in_think_block  = false;
+    let mut thought_filter  = crate::thought_filter::ThoughtFilter::new();
     // Line buffer for cross-chunk SSE lines — HTTP chunked transfer can split
     // at any byte boundary, so a partial JSON line at the end of one chunk must
     // be joined with the start of the next chunk.
@@ -483,8 +509,7 @@ pub async fn run_voice_pipeline(
             };
 
             if let Some(content) = content {
-                let (visible, new_in_think) = tts_text::filter_thinking(&content, in_think_block);
-                in_think_block = new_in_think;
+                let visible = thought_filter.push(&content);
                 if visible.is_empty() {
                     continue;
                 }
@@ -514,13 +539,19 @@ pub async fn run_voice_pipeline(
                     val.get("token").and_then(|t| t.as_str()).map(|s| s.to_string())
                 };
                 if let Some(content) = content {
-                    let (visible, _) = tts_text::filter_thinking(&content, in_think_block);
+                    let visible = thought_filter.push(&content);
                     if !visible.is_empty() {
                         sentence_buf.push_str(&visible);
                     }
                 }
             }
         }
+    }
+
+    // Flush any tail buffered by the thought filter
+    let tail = thought_filter.flush();
+    if !tail.is_empty() {
+        sentence_buf.push_str(&tail);
     }
 
     // ── Flush any remaining sentence buffer ──────────────────────────────────
