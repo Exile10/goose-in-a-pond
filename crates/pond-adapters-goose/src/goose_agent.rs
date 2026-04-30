@@ -217,6 +217,33 @@ impl GooseAdapter {
         }
     }
 
+    /// Determine the effective context window (in tokens) for this provider+model.
+    ///
+    /// For local/GGUF inference, the KV-cache size is hard-limited by the
+    /// platform settings (8K macOS Metal, 3K Jetson CUDA). The model's native
+    /// context window is irrelevant — llama-cpp will hit ContextLengthExceeded
+    /// at the KV-cache limit regardless of what the model card says.
+    ///
+    /// For HTTP providers (Ollama, llamafile), we use the model's reported
+    /// context window from capabilities (which comes from model name heuristics).
+    fn effective_context_window(provider: &str, model: &str) -> usize {
+        match provider {
+            "local" | "gguf" => {
+                // Must match the context_size set in apply_platform_settings /
+                // apply_jetson_settings in pond-adapters-local-inference.
+                #[cfg(feature = "cuda")]
+                { 3072 }
+                #[cfg(not(feature = "cuda"))]
+                { 8192 }
+            }
+            _ => {
+                // HTTP providers — use model-reported context window.
+                let caps = pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(model);
+                caps.context_window_tokens as usize
+            }
+        }
+    }
+
     /// Hot-swap the Goose provider when `chat_provider` / `chat_model` in settings changes.
     async fn ensure_provider_current(
         &self,
@@ -232,6 +259,32 @@ impl GooseAdapter {
             }
             println!("[model-switch] provider change detected: {:?} -> {}", *last, key);
         }
+
+        // ── Sync GOOSE_CONTEXT_LIMIT with the actual KV-cache / provider limit ─
+        //
+        // Critical fix: without this, Goose's ModelConfig defaults context_limit
+        // to 128K. Its auto-compaction triggers at ~80% of that (102K tokens),
+        // but the local llama-cpp KV cache is only 8K (macOS) or 3K (Jetson).
+        // The model hits ContextLengthExceeded long before 102K and falls into
+        // the expensive emergency compaction path. Setting this env var BEFORE
+        // ModelConfig::new_or_fail() ensures Goose sees the real limit.
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+        );
+        // SAFETY: set_var is unsafe in multi-threaded programs per Rust 1.66+,
+        // but Goose already calls set_var for OLLAMA_HOST/OLLAMA_TIMEOUT in the
+        // same code path, so we follow the existing pattern.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("GOOSE_CONTEXT_LIMIT", effective_ctx.to_string());
+        }
+        tracing::info!(
+            provider = %settings.chat_provider,
+            model = %settings.chat_model,
+            effective_ctx,
+            "Set GOOSE_CONTEXT_LIMIT to match actual KV-cache / provider limit"
+        );
 
         let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
             // In-process GGUF inference via llama.cpp — no HTTP server needed.
@@ -501,6 +554,16 @@ impl GooseAdapter {
                 }
             };
 
+            // Derive compact_prompt from the effective context window.
+            // On small-context platforms (Jetson 3K, macOS Metal 8K), verbose
+            // tool descriptions and detailed instructions waste precious tokens.
+            let effective_ctx = Self::effective_context_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+            );
+            let compact_prompt = pond_core::services::context_budget::CompactionProfile::from_context_window(effective_ctx)
+                .use_compact_prompt();
+
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
                 current_time: now.format("%H:%M").to_string(),
@@ -510,6 +573,7 @@ impl GooseAdapter {
                 voice_mode: is_voice,
                 available_tools,
                 thinking_enabled,
+                compact_prompt,
             }
         };
 
@@ -535,32 +599,78 @@ impl GooseAdapter {
             }
         }
 
-        if let Ok(memories) = memories_result {
-            if !memories.is_empty() {
-                let block = memories
-                    .iter()
-                    .map(|m| {
-                        let seg = m.segment.as_ref()
-                            .map(|s| format!("{:?}", s).to_lowercase())
-                            .unwrap_or_default();
-                        if seg.is_empty() {
-                            format!("- {}", m.content)
-                        } else {
-                            format!("- [{}] {}", seg, m.content)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.agent
-                    .extend_system_prompt(
-                        "memories".to_string(),
-                        format!("Relevant memories:\n{block}"),
-                    )
-                    .await;
+        // ── Token-budgeted memory injection ──────────────────────────────
+        //
+        // Derive a CompactionProfile from the effective context window so
+        // memory injection doesn't eat into the already-tight KV cache on
+        // small-context platforms (Jetson 3K, macOS Metal 8K).
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+        );
+        let compaction_profile = pond_core::services::context_budget::CompactionProfile::from_context_window(effective_ctx);
 
-                // Record access for decay tracking
+        if let Ok(mut memories) = memories_result {
+            if !memories.is_empty() {
+                // Sort by importance (highest first) so the most valuable
+                // memories survive the budget cut.
+                memories.sort_by(|a, b| {
+                    b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                // Apply fragment count limit from the compaction profile.
+                memories.truncate(compaction_profile.max_memory_fragments);
+
+                // Apply token budget: estimate tokens per fragment using the
+                // chars/4 heuristic, keep fragments until the budget is spent.
+                let token_budget = compaction_profile.memory_token_budget;
+                let mut tokens_used: usize = 0;
+                let mut budgeted: Vec<&pond_core::domain::memory::MemoryFragment> = Vec::new();
                 for m in &memories {
-                    let _ = self.memory_repo.record_access(&m.id).await;
+                    let estimated_tokens = m.content.len() / 4 + 1;
+                    if tokens_used + estimated_tokens > token_budget && !budgeted.is_empty() {
+                        break;
+                    }
+                    tokens_used += estimated_tokens;
+                    budgeted.push(m);
+                }
+
+                if !budgeted.is_empty() {
+                    let block = budgeted
+                        .iter()
+                        .map(|m| {
+                            let seg = m.segment.as_ref()
+                                .map(|s| format!("{:?}", s).to_lowercase())
+                                .unwrap_or_default();
+                            if seg.is_empty() {
+                                format!("- {}", m.content)
+                            } else {
+                                format!("- [{}] {}", seg, m.content)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    tracing::debug!(
+                        fragments_injected = budgeted.len(),
+                        fragments_available = memories.len(),
+                        tokens_used,
+                        token_budget,
+                        "Memory injection (budget from CompactionProfile ctx={})",
+                        effective_ctx,
+                    );
+
+                    self.agent
+                        .extend_system_prompt(
+                            "memories".to_string(),
+                            format!("Relevant memories:\n{block}"),
+                        )
+                        .await;
+
+                    // Record access for decay tracking
+                    for m in budgeted {
+                        let _ = self.memory_repo.record_access(&m.id).await;
+                    }
                 }
             }
         }
