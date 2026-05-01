@@ -259,6 +259,7 @@ mod tests {
             voice_mode: false,
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
             thinking_enabled: false,
+            compact_prompt: false,
             prefix_hash: None,
         }
     }
