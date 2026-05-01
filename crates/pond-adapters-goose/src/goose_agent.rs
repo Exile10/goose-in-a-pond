@@ -19,6 +19,8 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::extension_manager::GiapGooseExtensionManager;
 
 /// Minimal hard-coded fallback — used only when the DB has no template for the
@@ -739,11 +741,23 @@ impl GooseAdapter {
         tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         let user_msg_len = request.message.len();
+
+        // Cancellation token: when the stream is dropped (e.g. voice interrupt),
+        // the DropGuard fires and cancels the token.  Goose's agent loop checks
+        // `is_token_cancelled()` at each turn boundary and exits early, so
+        // interruption propagates faster than waiting for the channel-drop path
+        // through spawn_blocking.
+        let cancel_token = CancellationToken::new();
+        let cancel_guard = cancel_token.clone().drop_guard();
+
         let stream = async_stream::stream! {
+            // Hold the guard — dropped when the stream is dropped → cancels token.
+            let _guard = cancel_guard;
+
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
             let mut total_output_chars: usize = 0;
 
-            let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, None).await {
+            let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, Some(cancel_token)).await {
                 Ok(s) => s,
                 Err(e) => {
                     yield Ok(AgentStreamEvent::Error { content: e.to_string() });
