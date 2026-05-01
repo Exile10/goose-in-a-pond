@@ -28,3 +28,4 @@ pub mod instant_activation;
 pub mod print_output;
 pub mod stdin_input;
 pub mod thought_filter;
+pub mod tool_cache;
