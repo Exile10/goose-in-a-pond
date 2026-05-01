@@ -217,6 +217,14 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// When true, the system prompt is partitioned into a stable static prefix
+    /// and a dynamic suffix. The static prefix is only rebuilt when settings,
+    /// capabilities, or device state change — allowing local inference providers
+    /// to reuse their KV-cache for the stable portion across turns.
+    /// Default: true (recommended for local models on memory-constrained devices).
+    #[serde(default = "Settings::default_prefix_cache_prompt")]
+    pub prefix_cache_prompt: bool,
+
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
     pub agent_memory_inject: bool,
@@ -337,6 +345,7 @@ impl Default for Settings {
             context_window_override:         0,
             agent_goose_mode:                Self::default_agent_goose_mode(),
             agent_max_turns:                 Self::default_agent_max_turns(),
+            prefix_cache_prompt:             Self::default_prefix_cache_prompt(),
             agent_memory_inject:             Self::default_agent_memory_inject(),
             agent_memory_limit:              Self::default_agent_memory_limit(),
             memory_extraction_enabled:       true,
@@ -396,6 +405,7 @@ impl Settings {
     fn default_review_pass_threshold()     -> u8     { 3 }
     fn default_agent_goose_mode()           -> String { "auto".to_string() }
     fn default_agent_max_turns()            -> u32    { 20 }
+    fn default_prefix_cache_prompt()         -> bool   { true }
     fn default_agent_memory_inject()        -> bool   { true }
     fn default_agent_memory_limit()         -> u32    { 5 }
     fn default_schedule_result_notify()     -> bool   { true }
