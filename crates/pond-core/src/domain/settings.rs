@@ -354,6 +354,13 @@ pub struct Settings {
     /// Experimental — off by default.
     #[serde(default)]
     pub multi_tool_enabled: bool,
+    // ── Tool call validation ────────────────────────────────────────────────
+
+    /// When true, LLM tool call outputs are validated and repaired before
+    /// execution. Catches common JSON formatting errors from small local models
+    /// (3B-4B). Disable if tool calls are already reliable or handled upstream.
+    #[serde(default = "Settings::default_tool_call_validation")]
+    pub tool_call_validation: bool,
 }
 
 impl Default for Settings {
@@ -426,6 +433,7 @@ impl Default for Settings {
             telemetry_enabled:              Self::default_telemetry_enabled(),
             compact_encoding:                Self::default_compact_encoding(),
             multi_tool_enabled:             false,
+            tool_call_validation:            Self::default_tool_call_validation(),
         }
     }
 }
@@ -491,6 +499,7 @@ impl Settings {
     fn default_tool_cache_enabled()            -> bool { true }
     fn default_telemetry_enabled()             -> bool { true }
     fn default_compact_encoding()              -> bool { true }
+    fn default_tool_call_validation()         -> bool  { true }
 }
 
 #[cfg(test)]
@@ -505,6 +514,7 @@ mod tests {
         assert_eq!(s.llm_temperature, 0.7);
         assert_eq!(s.voice_wake_word, "goose");
         assert_eq!(s.retention_event_log_days, 30);
+        assert!(s.tool_call_validation); // on by default
     }
 
     #[test]
@@ -554,5 +564,14 @@ mod tests {
         assert_eq!(s.assistant_name, "Pond");
         assert_eq!(s.llm_max_tokens, 4096); // bumped from 1024 to fit Harmony preambles + long replies
         assert_eq!(s.timezone, "UTC");       // default
+    }
+
+    #[test]
+    fn tool_call_validation_toggleable() {
+        let json = r#"{"tool_call_validation": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.tool_call_validation);
+        // Other fields keep defaults
+        assert!(s.memory_extraction_enabled);
     }
 }
