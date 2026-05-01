@@ -200,6 +200,42 @@ impl MemoryFragment {
     }
 }
 
+// ── Memory graph (causal DAG) ───────────────────────────────────────────────
+
+/// The kind of causal or structural relationship between two memories.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeRelation {
+    /// This memory *led to* the creation of the target memory.
+    Caused,
+    /// This memory was *injected into context* when the target was created.
+    Referenced,
+    /// This memory *replaces* the target (e.g. consolidation, correction).
+    Superseded,
+}
+
+/// A directed edge between two [`MemoryFragment`]s in the causal graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEdge {
+    /// Source memory ID (the *from* end of the directed edge).
+    pub from_id: String,
+    /// Target memory ID (the *to* end of the directed edge).
+    pub to_id: String,
+    /// Semantic type of the relationship.
+    pub relation: EdgeRelation,
+    /// ISO-8601 timestamp when this edge was created.
+    pub created_at: String,
+}
+
+/// A subgraph of the memory DAG — a set of nodes and the edges that connect them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryGraph {
+    /// The memory fragments in this subgraph.
+    pub nodes: Vec<MemoryFragment>,
+    /// The edges connecting nodes in this subgraph.
+    pub edges: Vec<MemoryEdge>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +310,48 @@ mod tests {
         assert_eq!(MemorySegment::Context.default_importance(), 0.3);
         assert_eq!(MemorySegment::Identity.default_tier(), MemoryTier::Permanent);
         assert_eq!(MemorySegment::Context.default_tier(), MemoryTier::Short);
+    }
+
+    #[test]
+    fn edge_relation_serde_round_trip() {
+        let rel = EdgeRelation::Caused;
+        let json = serde_json::to_string(&rel).unwrap();
+        assert_eq!(json, "\"caused\"");
+        let back: EdgeRelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EdgeRelation::Caused);
+    }
+
+    #[test]
+    fn memory_edge_serde_round_trip() {
+        let edge = MemoryEdge {
+            from_id: "a".to_string(),
+            to_id: "b".to_string(),
+            relation: EdgeRelation::Referenced,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        let back: MemoryEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, edge);
+    }
+
+    #[test]
+    fn memory_graph_contains_nodes_and_edges() {
+        let graph = MemoryGraph {
+            nodes: vec![MemoryFragment::from_chat(
+                "n1".to_string(),
+                None,
+                None,
+                "test".to_string(),
+            )],
+            edges: vec![MemoryEdge {
+                from_id: "n1".to_string(),
+                to_id: "n2".to_string(),
+                relation: EdgeRelation::Superseded,
+                created_at: "2025-06-01T00:00:00Z".to_string(),
+            }],
+        };
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].relation, EdgeRelation::Superseded);
     }
 }
