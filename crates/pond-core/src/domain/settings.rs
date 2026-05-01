@@ -313,6 +313,12 @@ pub struct Settings {
     /// are cached in memory with per-tool TTLs to avoid redundant API calls.
     #[serde(default = "Settings::default_tool_cache_enabled")]
     pub tool_cache_enabled: bool,
+
+    // ── Telemetry ─────────────────────────────────────────────────────────
+    /// When true, per-turn telemetry metrics (TTFT, token counts, tool latency,
+    /// context utilization) are recorded for each chat turn.
+    #[serde(default = "Settings::default_telemetry_enabled")]
+    pub telemetry_enabled: bool,
 }
 
 impl Default for Settings {
@@ -379,6 +385,7 @@ impl Default for Settings {
             cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
             tool_cache_enabled:             Self::default_tool_cache_enabled(),
+            telemetry_enabled:              Self::default_telemetry_enabled(),
         }
     }
 }
@@ -440,6 +447,7 @@ impl Settings {
     fn default_cloud_input_price_per_million() -> f64 { 2.50 }
     fn default_cloud_output_price_per_million() -> f64 { 10.00 }
     fn default_tool_cache_enabled()            -> bool { true }
+    fn default_telemetry_enabled()             -> bool { true }
 }
 
 #[cfg(test)]
