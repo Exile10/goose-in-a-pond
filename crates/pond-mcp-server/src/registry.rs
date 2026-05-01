@@ -28,6 +28,10 @@ pub struct GiapServiceHandles {
     /// Used as fallback when a tool is called with empty parameters
     /// (common with small local models that struggle with tool-call schemas).
     pub last_user_message: tokio::sync::RwLock<String>,
+    /// The entity/topic from the last successful tool lookup (e.g. "John Cena").
+    /// Used to resolve pronoun-heavy follow-up queries like "how old is he?"
+    /// into "how old is John Cena?" before sending to Wikipedia.
+    pub last_tool_topic: tokio::sync::RwLock<String>,
 }
 
 static GIAP_SERVICES: OnceLock<Arc<GiapServiceHandles>> = OnceLock::new();
@@ -44,6 +48,71 @@ pub async fn set_last_user_message(msg: &str) {
     }
 }
 
+/// Check whether a query is pronoun-heavy and lacks a clear entity.
+///
+/// Returns `true` for queries like "how old is he?", "where was she born?",
+/// "what did they do?" — follow-ups that reference a previous topic without
+/// naming it.
+fn is_pronoun_query(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    let pronouns = ["he", "she", "they", "him", "her", "them", "his", "hers", "their", "it", "its"];
+    let has_pronoun = pronouns.iter().any(|p| {
+        // Match whole words: " he ", " he?", starts with "he ", etc.
+        lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == *p)
+    });
+    if !has_pronoun { return false; }
+
+    // Check that there's no proper noun (capitalized word that isn't sentence-start)
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let has_named_entity = words.iter().skip(1).any(|w| {
+        w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            && !["I", "I'm", "I'd", "I've", "I'll"].contains(w)
+    });
+
+    !has_named_entity
+}
+
+/// Expand a pronoun-heavy query using the last known tool topic.
+///
+/// "how old is he?" + last_topic="John Cena" → "how old is John Cena?"
+/// Replaces the first pronoun occurrence with the topic.
+fn expand_with_topic(query: &str, topic: &str) -> String {
+    let lower = query.to_lowercase();
+    let pronouns = [
+        ("he", topic), ("she", topic), ("they", topic),
+        ("him", topic), ("her", topic), ("them", topic),
+        ("his", &format!("{}'s", topic)), ("hers", &format!("{}'s", topic)),
+        ("their", &format!("{}'s", topic)), ("it", topic), ("its", &format!("{}'s", topic)),
+    ];
+
+    for (pronoun, replacement) in &pronouns {
+        // Find the pronoun as a whole word and replace the first occurrence
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let idx = words.iter().position(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase() == *pronoun
+        });
+        if let Some(i) = idx {
+            let mut result: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            // Preserve punctuation around the word
+            let original = words[i];
+            let prefix: String = original.chars().take_while(|c| !c.is_alphanumeric()).collect();
+            let suffix: String = original.chars().rev().take_while(|c| !c.is_alphanumeric()).collect::<String>().chars().rev().collect();
+            result[i] = format!("{}{}{}", prefix, replacement, suffix);
+            return result.join(" ");
+        }
+    }
+
+    // No pronoun found to replace — prepend topic for context
+    format!("{} — {}", topic, query)
+}
+
+/// Update the last tool topic after a successful lookup.
+async fn set_last_tool_topic(topic: &str) {
+    if let Some(handles) = GIAP_SERVICES.get() {
+        *handles.last_tool_topic.write().await = topic.to_string();
+    }
+}
+
 /// Tool Agent entry point: look up a topic on Wikipedia.
 ///
 /// Called by the route handler BEFORE the main LLM runs. Uses the same
@@ -53,20 +122,40 @@ pub async fn try_wikipedia_lookup(query: &str) -> Option<String> {
     let services = GIAP_SERVICES.get()?;
     let server = GiapMcpServer::new(services.clone());
     let cleaned = crate::giap_server::clean_query_for_search(query);
-    let topic = if cleaned.is_empty() { query.trim() } else { cleaned.as_str() };
+    let mut topic = if cleaned.is_empty() { query.trim().to_string() } else { cleaned };
     if topic.is_empty() { return None; }
+
+    // ── Coreference resolution: expand pronoun-heavy queries ──────────
+    // "how old is he?" + last_topic="John Cena" → "how old is John Cena"
+    if is_pronoun_query(query) {
+        let last_topic = services.last_tool_topic.read().await;
+        if !last_topic.is_empty() {
+            let expanded = expand_with_topic(query, &last_topic);
+            let expanded_clean = crate::giap_server::clean_query_for_search(&expanded);
+            println!("[tool-agent] pronoun query {:?} expanded to {:?} (last topic: {:?})",
+                query, expanded_clean, *last_topic);
+            topic = if expanded_clean.is_empty() { expanded } else { expanded_clean };
+        }
+    }
 
     println!("[tool-agent] wikipedia lookup for {:?}", topic);
 
     // Try direct title first, then search fallback
-    match server.fetch_article_summary(topic).await {
+    match server.fetch_article_summary(&topic).await {
         Ok(text) => {
             println!("[tool-agent] direct hit for {:?}", topic);
+            set_last_tool_topic(&topic).await;
             Some(text)
         }
         Err(crate::giap_server::WikiFetchError::NotFound) => {
             println!("[tool-agent] not found, searching for {:?}", topic);
-            server.search_and_fetch_best(topic).await.ok()
+            match server.search_and_fetch_best(&topic).await {
+                Ok(text) => {
+                    set_last_tool_topic(&topic).await;
+                    Some(text)
+                }
+                Err(_) => None,
+            }
         }
         Err(_) => None,
     }

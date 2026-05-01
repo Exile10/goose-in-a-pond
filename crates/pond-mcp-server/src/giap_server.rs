@@ -1259,6 +1259,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             tool_caller: None,
             last_user_message: tokio::sync::RwLock::new(String::new()),
+            last_tool_topic: tokio::sync::RwLock::new(String::new()),
         });
         GiapMcpServer::new(handles)
     }

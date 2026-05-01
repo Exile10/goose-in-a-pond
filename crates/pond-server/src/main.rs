@@ -3345,6 +3345,7 @@ async fn build_goose_backend(
         http_client: reqwest::Client::new(),
         tool_caller: tool_caller.clone(),
         last_user_message: tokio::sync::RwLock::new(String::new()),
+        last_tool_topic: tokio::sync::RwLock::new(String::new()),
     });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
