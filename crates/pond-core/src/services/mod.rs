@@ -28,6 +28,7 @@ pub mod instant_activation;
 pub mod print_output;
 pub mod stdin_input;
 pub mod prompt_builder;
+pub mod telemetry;
 pub mod thought_filter;
 pub mod tool_output_compactor;
 pub mod tool_cache;
