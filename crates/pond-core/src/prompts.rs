@@ -59,6 +59,15 @@ pub struct PromptState {
     /// True when the model supports thinking/reasoning (Gemma 4, Qwen3, etc.)
     /// and thinking_mode is not "off".
     pub thinking_enabled: bool,
+    /// Hash of the static prefix portion of the system prompt.
+    ///
+    /// When this value matches the previous turn's hash, the static prefix
+    /// has not changed and callers can skip `override_system_prompt()`,
+    /// allowing local inference providers to reuse their KV-cache.
+    ///
+    /// Set by `services::prompt_builder::build_prompt_partition()`.
+    /// `None` means partitioning was not used (backwards compatibility).
+    pub prefix_hash: Option<u64>,
 }
 
 /// Tool definitions shared between the system prompt template and the classifier.
