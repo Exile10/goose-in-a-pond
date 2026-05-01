@@ -1353,8 +1353,19 @@ impl ChatService {
         // If the user doesn't speak (empty transcription), fall back to wake word.
         let mut first_turn = true;
 
+        // Pre-captured input from a wake-word interrupt.  When set, the next
+        // loop iteration skips the listen/wake-word phase and processes this
+        // text directly — but still wrapped in `tokio::select!` so it remains
+        // interruptible.
+        let mut pending_input: Option<String> = None;
+
         loop {
-            let input = if first_turn {
+            let input = if let Some(text) = pending_input.take() {
+                // Interrupt gave us pre-captured text — skip listen phase.
+                // Emit events so the UI/state machine stays consistent.
+                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                Some(text)
+            } else if first_turn {
                 // ── Wait for wake word ──
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
                 println!("\n  🟢 {} (type \"exit\" to quit)", self.wake_word_detector.activation_prompt());
@@ -1473,10 +1484,15 @@ impl ChatService {
                     self.voice_output.stop_speaking();
                     self.voice_output.stop_thinking_tone();
 
-                    // The chat_fut is dropped here, which drops the agent stream.
-                    // Goose may continue background inference but we won't consume it.
+                    // chat_fut is dropped here by tokio::select!, which drops the
+                    // agent stream.  The channel-receiver drop propagates into
+                    // Goose's spawn_blocking inference, causing TokenAction::Stop
+                    // within one token cycle.
 
-                    // Capture the user's new speech (wake word may include trailing audio)
+                    // Capture the user's new speech (wake word may include trailing audio).
+                    // Instead of processing inline (which would be non-interruptible),
+                    // stash the text in `pending_input` and `continue` the loop so
+                    // the next iteration wraps it in tokio::select! again.
                     match wake_result {
                         Ok(activation) => {
                             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
@@ -1489,27 +1505,19 @@ impl ChatService {
 
                             match self.voice_input.listen().await {
                                 Ok(Some(new_text)) if !new_text.is_empty() => {
-                                    // Process the new request immediately
-                                    self.emit_event(WorkflowEvent::UserInput(new_text.clone()));
-                                    self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
-                                    match self.chat_stream_once(new_text).await {
-                                        Ok(response_text) => {
-                                            self.emit_event(WorkflowEvent::AgentOutput(response_text));
-                                        }
-                                        Err(e) => {
-                                            eprintln!("  ❌ Error: {}", e);
-                                            first_turn = true;
-                                        }
-                                    }
+                                    // Stash for the next loop iteration (interruptible path)
+                                    pending_input = Some(new_text);
                                 }
                                 _ => {
-                                    // No speech after interrupt — return to conversational mode
+                                    // No speech after interrupt — return to wake word mode
                                     println!("  💤 No speech after interrupt.");
+                                    first_turn = true;
                                 }
                             }
                         }
                         Err(e) => {
                             tracing::warn!("Wake word interrupt error: {}", e);
+                            first_turn = true;
                         }
                     }
                 }
