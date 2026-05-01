@@ -13,7 +13,8 @@ use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
-use pond_core::prompts::{build_system_prompt_from_template_full, PromptState};
+use pond_core::prompts::PromptState;
+use pond_core::services::prompt_builder::build_prompt_partition;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -72,6 +73,11 @@ pub struct GooseAdapter {
     voice_mode: std::sync::atomic::AtomicBool,
     /// Runtime capabilities of the currently loaded model.
     model_capabilities: Mutex<pond_core::domain::model_capabilities::ModelCapabilities>,
+    /// Hash of the last static prefix sent via `override_system_prompt()`.
+    /// When the current partition's `prefix_hash` matches this value, the static
+    /// prefix has not changed and we skip `override_system_prompt()` — allowing
+    /// local inference providers to reuse their KV-cache for the stable portion.
+    last_prefix_hash: Mutex<u64>,
 }
 
 impl GooseAdapter {
@@ -122,6 +128,7 @@ impl GooseAdapter {
             goose_session_map: Mutex::new(HashMap::new()),
             voice_mode: std::sync::atomic::AtomicBool::new(false),
             model_capabilities: Mutex::new(pond_core::domain::model_capabilities::ModelCapabilities::default()),
+            last_prefix_hash: Mutex::new(0),
         })
     }
 
@@ -329,6 +336,11 @@ impl GooseAdapter {
                 caps.thinking, caps.vision, caps.context_window_tokens / 1000);
             *self.model_capabilities.lock().unwrap() = caps;
 
+            // Reset prefix hash so the system prompt is rebuilt with the new model's
+            // capabilities on the next turn. KV-cache is invalidated by the provider
+            // swap anyway — no cache to preserve.
+            *self.last_prefix_hash.lock().unwrap() = 0;
+
             println!("[model-switch] swap complete, key={}", key);
         } else {
             println!("[model-switch] no provider built for {}:{}", settings.chat_provider, settings.chat_model);
@@ -510,16 +522,47 @@ impl GooseAdapter {
                 voice_mode: is_voice,
                 available_tools,
                 thinking_enabled,
+                prefix_hash: None, // filled by build_prompt_partition below
             }
         };
 
-        let system_prompt = build_system_prompt_from_template_full(
+        // ── Partitioned prompt: static prefix + dynamic suffix ──────────
+        // The static prefix (identity, capabilities, rules) only changes when
+        // settings, model capabilities, or device state change. By tracking
+        // its hash we can skip override_system_prompt() on consecutive turns,
+        // allowing local inference providers to reuse their KV-cache.
+        let partition = build_prompt_partition(
             &settings,
-            None,
-            Some(&prompt_state),
+            None, // ProfileContext — TODO: wire when profile port is available
+            &prompt_state,
             &template_content,
         );
-        self.agent.override_system_prompt(system_prompt).await;
+
+        {
+            let mut last_hash = self.last_prefix_hash.lock().unwrap();
+            if *last_hash != partition.prefix_hash {
+                tracing::info!(
+                    old_hash = %last_hash,
+                    new_hash = %partition.prefix_hash,
+                    "Static prefix changed — rebuilding system prompt"
+                );
+                self.agent.override_system_prompt(partition.static_prefix).await;
+                *last_hash = partition.prefix_hash;
+            } else {
+                tracing::debug!(
+                    hash = %partition.prefix_hash,
+                    "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
+                );
+            }
+        }
+
+        // Dynamic suffix: current date/time, profile context, addendum.
+        // Always updated because it changes every turn (at minimum, the time).
+        if !partition.dynamic_suffix.is_empty() {
+            self.agent
+                .extend_system_prompt("temporal".to_string(), partition.dynamic_suffix)
+                .await;
+        }
 
         if let Ok(extras) = extras_result {
             for extra in extras {
