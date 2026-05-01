@@ -100,6 +100,7 @@ pub fn build_prompt_partition(
         voice_mode: state.voice_mode,
         available_tools: state.available_tools.clone(),
         thinking_enabled: state.thinking_enabled,
+        prefix_hash: None,
     };
 
     let template = if let Some(ref custom) = settings.custom_system_prompt {
@@ -257,6 +258,7 @@ mod tests {
             voice_mode: false,
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
             thinking_enabled: false,
+            prefix_hash: None,
         }
     }
 
