@@ -5,6 +5,7 @@ pub mod fast_responder;
 pub mod memory_cleanup;
 pub mod memory_consolidation;
 pub mod memory_extraction;
+pub mod memory_graph;
 pub mod model_service;
 pub mod request_classifier;
 pub mod context_budget;

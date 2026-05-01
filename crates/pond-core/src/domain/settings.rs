@@ -259,6 +259,12 @@ pub struct Settings {
     #[serde(default)]
     pub memory_consolidation_enabled: bool,
 
+    /// When true, memory retrieval uses causal graph traversal (experimental).
+    /// Edges between memories are followed to inject causally relevant context
+    /// rather than only recency-based results.
+    #[serde(default)]
+    pub memory_graph_enabled: bool,
+
     /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
     #[serde(default = "Settings::default_schedule_result_notify")]
     pub schedule_result_notify: bool,
@@ -402,6 +408,7 @@ impl Default for Settings {
             memory_extraction_enabled:       true,
             memory_cleanup_enabled:          true,
             memory_consolidation_enabled:    false, // requires enough memories to be useful
+            memory_graph_enabled:            false, // experimental causal graph retrieval
             schedule_result_notify:          Self::default_schedule_result_notify(),
             memory_prune_threshold:          Self::default_memory_prune_threshold(),
             memory_archive_threshold:        Self::default_memory_archive_threshold(),
