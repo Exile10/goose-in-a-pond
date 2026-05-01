@@ -1118,9 +1118,16 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // Build ToolAgent for the HTTP path — uses keyword routing (instant, no LLM call).
     // The live_provider is retained for potential fallback classification.
-    println!("  Tool Agent: keyword routing (zero LLM overhead)");
+    // Tool result cache: in-memory LRU with per-tool TTLs (weather=5m, wikipedia=1h, etc.)
+    let tool_cache: Arc<dyn pond_core::ports::tool_cache::ToolCache> =
+        Arc::new(pond_core::services::tool_cache::InMemoryToolCache::new());
+    println!("  Tool Agent: keyword routing (zero LLM overhead), cache=enabled");
     let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone(), settings_repo: settings_repo.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+        Some(Arc::new(GiapToolAgent {
+            live_provider: llm_provider.clone(),
+            tool_cache: Some(tool_cache),
+            settings_repo: settings_repo.clone(),
+        }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
 
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
@@ -2058,9 +2065,17 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             let live = Arc::new(tokio::sync::RwLock::new(
                 Some(provider as Arc<dyn pond_core::ports::provider::LlmProvider>)
             ));
-            let ta = GiapToolAgent { live_provider: live, settings_repo: settings_repo_arc.clone() };
+            let chat_tool_cache: Arc<dyn pond_core::ports::tool_cache::ToolCache> =
+                Arc::new(pond_core::services::tool_cache::InMemoryToolCache::new());
+            let chat_settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
+                Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+            let ta = GiapToolAgent {
+                live_provider: live,
+                tool_cache: Some(chat_tool_cache),
+                settings_repo: chat_settings_repo,
+            };
             chat_service = chat_service.with_tool_agent(Arc::new(ta));
-            println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
+            println!("  Tool Agent: active (classifier + wikipedia/weather/memory + cache)");
         } else {
             println!("  Tool Agent: inactive (no provider available for classification)");
         }
@@ -2086,8 +2101,12 @@ struct GiapToolAgent {
     /// Live provider — reads from the RwLock so it always uses whatever
     /// model is currently loaded. Zero model-swap overhead.
     live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
-    /// Settings repository — used to check `tool_output_compaction` toggle.
-    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository>,
+    /// Optional tool result cache — when present and the `tool_cache_enabled`
+    /// setting is true, tool results are cached with per-tool TTLs to avoid
+    /// redundant API calls for identical queries.
+    tool_cache: Option<Arc<dyn pond_core::ports::tool_cache::ToolCache>>,
+    /// Settings repository — used to check `tool_output_compaction` and `tool_cache_enabled`.
+    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
 }
 
 #[async_trait::async_trait]
@@ -2139,9 +2158,40 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         println!("[tool-agent] tool={}, executing...", tool);
 
+        // ── Tool result cache ────────────────────────────────────────────
+        // Check if we have a cached result for this tool+query before
+        // making the (potentially expensive) API call. Mutation tools
+        // (save_memory, create_schedule) and personalized reads (recall_memory)
+        // are never cached.
+        let use_cache = pond_core::domain::tool_cache::is_cacheable_tool(tool)
+            && self.settings_repo.get().await
+                .map(|s| s.tool_cache_enabled)
+                .unwrap_or(true);
+
+        if use_cache {
+            if let Some(ref cache) = self.tool_cache {
+                if let Some(cached) = cache.get(tool, message) {
+                    println!("[tool-agent] cache HIT for {}:{} ({} chars)",
+                        tool, &message[..message.len().min(40)], cached.len());
+                    return Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &cached)));
+                }
+            }
+        }
+
         match pond_mcp_server::try_tool_agent(tool, message).await {
             Some(info) => {
                 let raw_len = info.len();
+
+                // Cache the raw result for future identical queries.
+                if use_cache {
+                    if let Some(ref cache) = self.tool_cache {
+                        let ttl = pond_core::domain::tool_cache::default_ttl_for_tool(tool);
+                        cache.put(tool, message, info.clone(), ttl);
+                        println!("[tool-agent] cached {}:{} (ttl={}s)",
+                            tool, &message[..message.len().min(40)], ttl.as_secs());
+                    }
+                }
+
                 // Apply semantic compaction when enabled in settings.
                 let compacted = {
                     let settings = self.settings_repo.get().await.unwrap_or_default();
