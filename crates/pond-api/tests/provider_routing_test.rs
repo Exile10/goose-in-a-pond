@@ -213,6 +213,7 @@ async fn make_app_with_provider(
         memory_extractor: None,
         memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
@@ -490,6 +491,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         memory_extractor: None,
         memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -563,6 +565,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         memory_extractor: None,
         memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
