@@ -711,15 +711,33 @@ async fn chat_stream(
         // the DB persist still runs concurrently.
         let tool_agent_ref = state.tool_agent.clone();
         let msg_for_tool = req.message.clone();
+        let multi_tool_enabled = settings.multi_tool_enabled;
         let msg_for_persist = req.message.clone();
         let sid_for_persist = session_id.clone();
         let storage_ref = storage.clone();
 
-        let (tool_result, persist_result) = tokio::join!(
+        // Choose single-tool or multi-tool dispatch based on settings.
+        // Both branches produce an Option<String> tool_context.
+        let (tool_result, multi_tool_result, persist_result) = tokio::join!(
             async {
-                match &tool_agent_ref {
-                    Some(ta) => ta.process(&msg_for_tool).await,
-                    None => Ok(None),
+                if multi_tool_enabled {
+                    // Multi-tool path — skip the single-tool dispatch.
+                    Ok(None)
+                } else {
+                    match &tool_agent_ref {
+                        Some(ta) => ta.process(&msg_for_tool).await,
+                        None => Ok(None),
+                    }
+                }
+            },
+            async {
+                if multi_tool_enabled {
+                    match &tool_agent_ref {
+                        Some(ta) => ta.process_multi(&msg_for_tool).await,
+                        None => Ok(vec![]),
+                    }
+                } else {
+                    Ok(vec![])
                 }
             },
             async {
@@ -742,16 +760,37 @@ async fn chat_stream(
             return;
         }
 
-        // Extract tool context
-        let tool_context: Option<String> = match tool_result {
-            Ok(Some(augmented)) => {
-                tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
-                Some(augmented)
+        // Extract tool context — from multi-tool or single-tool path.
+        let tool_context: Option<String> = if multi_tool_enabled {
+            match multi_tool_result {
+                Ok(results) if !results.is_empty() => {
+                    tracing::debug!(
+                        target: "giap::tool_agent",
+                        "multi-tool: {} results injected",
+                        results.len()
+                    );
+                    let ctx = crate::tool_context::format_multi_tool_context(
+                        &req.message, &results,
+                    );
+                    Some(ctx)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!(target: "giap::tool_agent", "multi-tool agent error: {e}");
+                    None
+                }
             }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::debug!(target: "giap::tool_agent", "tool agent error: {e}");
-                None
+        } else {
+            match tool_result {
+                Ok(Some(augmented)) => {
+                    tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
+                    Some(augmented)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!(target: "giap::tool_agent", "tool agent error: {e}");
+                    None
+                }
             }
         };
 

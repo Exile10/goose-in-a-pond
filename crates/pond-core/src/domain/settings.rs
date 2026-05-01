@@ -333,6 +333,14 @@ pub struct Settings {
     /// by 30-60%. Default: true.
     #[serde(default = "Settings::default_compact_encoding")]
     pub compact_encoding: bool,
+
+    // ── Experimental ────────────────────────────────────────────────────────
+
+    /// When true, the ToolAgent detects multiple tool intents per message
+    /// and dispatches them concurrently via `tokio::join_all`.
+    /// Experimental — off by default.
+    #[serde(default)]
+    pub multi_tool_enabled: bool,
 }
 
 impl Default for Settings {
@@ -402,6 +410,7 @@ impl Default for Settings {
             tool_cache_enabled:             Self::default_tool_cache_enabled(),
             telemetry_enabled:              Self::default_telemetry_enabled(),
             compact_encoding:                Self::default_compact_encoding(),
+            multi_tool_enabled:             false,
         }
     }
 }

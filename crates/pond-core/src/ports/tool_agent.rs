@@ -7,6 +7,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::domain::tool_result::ToolResult;
+
 /// Driven Port: pre-inference tool agent.
 ///
 /// Runs BEFORE the main LLM. Classifies the user's message, executes
@@ -23,4 +25,18 @@ pub trait ToolAgent: Send + Sync {
     /// includes the original text + retrieved information + instructions).
     /// Returns `None` if no tool was needed.
     async fn process(&self, message: &str) -> Result<Option<String>>;
+
+    /// Classify and execute multiple tools for the given message in parallel.
+    ///
+    /// Returns a list of `ToolResult` for each tool that produced output.
+    /// Empty vec means no tools were needed.
+    ///
+    /// Default implementation delegates to `process()` for backward
+    /// compatibility with existing single-tool implementations.
+    async fn process_multi(&self, message: &str) -> Result<Vec<ToolResult>> {
+        match self.process(message).await? {
+            Some(result) => Ok(vec![ToolResult::new("unknown", result)]),
+            None => Ok(vec![]),
+        }
+    }
 }
