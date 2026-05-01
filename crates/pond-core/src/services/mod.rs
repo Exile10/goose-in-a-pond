@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod fast_responder;
 pub mod memory_cleanup;
 pub mod memory_consolidation;
 pub mod memory_extraction;
