@@ -15,3 +15,4 @@ pub mod sensor;
 pub mod session;
 pub mod settings;
 pub mod skill;
+pub mod tool_cache;
