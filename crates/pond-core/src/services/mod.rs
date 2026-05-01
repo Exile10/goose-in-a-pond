@@ -38,3 +38,4 @@ pub mod tool_output_compactor;
 pub mod tool_cache;
 pub mod tool_call_schemas;
 pub mod tool_call_validator;
+pub mod tool_request_detector;

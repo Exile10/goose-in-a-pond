@@ -361,6 +361,14 @@ pub struct Settings {
     /// (3B-4B). Disable if tool calls are already reliable or handled upstream.
     #[serde(default = "Settings::default_tool_call_validation")]
     pub tool_call_validation: bool,
+
+    // ── Post-inference tool request detection ──────────────────────────
+
+    /// When true, the LLM's response is scanned for natural language tool
+    /// requests (e.g. "Let me look up X"). If detected, the tool is executed
+    /// and the response is revised with the tool data.
+    #[serde(default = "Settings::default_tool_request_detection")]
+    pub tool_request_detection: bool,
 }
 
 impl Default for Settings {
@@ -434,6 +442,7 @@ impl Default for Settings {
             compact_encoding:                Self::default_compact_encoding(),
             multi_tool_enabled:             false,
             tool_call_validation:            Self::default_tool_call_validation(),
+            tool_request_detection:          Self::default_tool_request_detection(),
         }
     }
 }
@@ -500,6 +509,7 @@ impl Settings {
     fn default_telemetry_enabled()             -> bool { true }
     fn default_compact_encoding()              -> bool { true }
     fn default_tool_call_validation()         -> bool  { true }
+    fn default_tool_request_detection()       -> bool  { true }
 }
 
 #[cfg(test)]
