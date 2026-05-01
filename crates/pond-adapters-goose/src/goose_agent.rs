@@ -610,22 +610,26 @@ impl GooseAdapter {
                 &template_content,
             );
 
-            {
+            // Check whether the static prefix changed. Drop the MutexGuard
+            // before any `.await` to keep the future `Send`.
+            let prefix_changed = {
+                let last_hash = self.last_prefix_hash.lock().unwrap();
+                *last_hash != partition.prefix_hash
+            };
+
+            if prefix_changed {
+                tracing::info!(
+                    new_hash = %partition.prefix_hash,
+                    "Static prefix changed — rebuilding system prompt"
+                );
+                self.agent.override_system_prompt(partition.static_prefix).await;
                 let mut last_hash = self.last_prefix_hash.lock().unwrap();
-                if *last_hash != partition.prefix_hash {
-                    tracing::info!(
-                        old_hash = %last_hash,
-                        new_hash = %partition.prefix_hash,
-                        "Static prefix changed — rebuilding system prompt"
-                    );
-                    self.agent.override_system_prompt(partition.static_prefix).await;
-                    *last_hash = partition.prefix_hash;
-                } else {
-                    tracing::debug!(
-                        hash = %partition.prefix_hash,
-                        "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
-                    );
-                }
+                *last_hash = partition.prefix_hash;
+            } else {
+                tracing::debug!(
+                    hash = %partition.prefix_hash,
+                    "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
+                );
             }
 
             // Dynamic suffix: current date/time, profile context, addendum.

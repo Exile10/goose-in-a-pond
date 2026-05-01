@@ -1813,7 +1813,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
 
     let db_system = db.system.clone();
-    let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
+    let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
         match e {

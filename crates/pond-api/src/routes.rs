@@ -1094,7 +1094,7 @@ async fn chat_stream(
                 settings.context_window_override
             } else {
                 let caps = state.agent.capabilities();
-                caps.context_window
+                caps.context_window_tokens
             };
 
             if estimated_tokens > 0 && context_limit > 0 {

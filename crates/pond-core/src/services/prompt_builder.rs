@@ -100,6 +100,7 @@ pub fn build_prompt_partition(
         voice_mode: state.voice_mode,
         available_tools: state.available_tools.clone(),
         thinking_enabled: state.thinking_enabled,
+        compact_prompt: state.compact_prompt,
         prefix_hash: None,
     };
 
