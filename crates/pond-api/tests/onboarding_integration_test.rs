@@ -129,6 +129,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         memory_extractor: None,
         memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
 }
