@@ -184,24 +184,25 @@ mod tests {
 
         // Fill cache to capacity
         cache.put("a", "q1", "r1".to_string(), Duration::from_secs(3600));
-        // Small pause to ensure different Instant values
         cache.put("b", "q2", "r2".to_string(), Duration::from_secs(3600));
         cache.put("c", "q3", "r3".to_string(), Duration::from_secs(3600));
 
-        // Access "a" to make it most-recently-used
+        // Access "a" and "c" to bump their last_accessed timestamps.
+        // "b" remains the only entry that was never re-accessed, making it
+        // the deterministic LRU victim regardless of Instant resolution.
         assert_eq!(cache.get("a", "q1"), Some("r1".to_string()));
+        assert_eq!(cache.get("c", "q3"), Some("r3".to_string()));
 
-        // Insert 4th entry — should evict "b" (least recently accessed,
-        // since "a" was just accessed and "c" was inserted after "b")
+        // Insert 4th entry — should evict "b" (the only entry never re-accessed)
         cache.put("d", "q4", "r4".to_string(), Duration::from_secs(3600));
 
         // "a" should still be present (recently accessed)
         assert_eq!(cache.get("a", "q1"), Some("r1".to_string()));
         // "d" should be present (just inserted)
         assert_eq!(cache.get("d", "q4"), Some("r4".to_string()));
-        // "c" should still be present (inserted after "b")
+        // "c" should still be present (recently accessed)
         assert_eq!(cache.get("c", "q3"), Some("r3".to_string()));
-        // "b" should be evicted (least recently accessed)
+        // "b" should be evicted (least recently accessed — never re-accessed)
         assert!(cache.get("b", "q2").is_none());
     }
 
