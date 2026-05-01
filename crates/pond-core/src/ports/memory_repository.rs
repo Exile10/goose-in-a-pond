@@ -1,6 +1,6 @@
 //! MemoryRepository port — driven port for semantic memory persistence.
 
-use crate::domain::memory::{MemoryFragment, MemoryLifecycle, MemorySegment};
+use crate::domain::memory::{MemoryEdge, MemoryFragment, MemoryGraph, MemoryLifecycle, MemorySegment};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -92,5 +92,31 @@ pub trait MemoryRepository: Send + Sync {
     /// Mark a memory as superseded by another (for consolidation).
     async fn mark_superseded(&self, _id: &str, _superseded_by: &str) -> Result<()> {
         Ok(())
+    }
+
+    // ── Graph edge methods (default no-op impls for backward compat) ────
+
+    /// Persist a directed edge between two memories.
+    async fn add_edge(&self, _edge: MemoryEdge) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return all edges originating from `memory_id`.
+    async fn get_edges_from(&self, _memory_id: &str) -> Result<Vec<MemoryEdge>> {
+        Ok(vec![])
+    }
+
+    /// Return all edges pointing to `memory_id`.
+    async fn get_edges_to(&self, _memory_id: &str) -> Result<Vec<MemoryEdge>> {
+        Ok(vec![])
+    }
+
+    /// Traverse the graph starting from `root_ids` up to `max_depth` hops,
+    /// returning the discovered subgraph (nodes + edges).
+    async fn get_subgraph(&self, _root_ids: &[String], _max_depth: u32) -> Result<MemoryGraph> {
+        Ok(MemoryGraph {
+            nodes: vec![],
+            edges: vec![],
+        })
     }
 }
