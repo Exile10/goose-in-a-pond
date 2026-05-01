@@ -2160,11 +2160,10 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         println!("[tool-agent] tool={}, executing...", tool);
 
+        // Extract the cleaned query for tool attribution (e.g. "John Cena" from "who is John Cena?")
+        let query = pond_mcp_server::clean_query_for_search(message);
+
         // ── Tool result cache ────────────────────────────────────────────
-        // Check if we have a cached result for this tool+query before
-        // making the (potentially expensive) API call. Mutation tools
-        // (save_memory, create_schedule) and personalized reads (recall_memory)
-        // are never cached.
         let use_cache = pond_core::domain::tool_cache::is_cacheable_tool(tool)
             && self.settings_repo.get().await
                 .map(|s| s.tool_cache_enabled)
@@ -2175,7 +2174,7 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                 if let Some(cached) = cache.get(tool, message) {
                     println!("[tool-agent] cache HIT for {}:{} ({} chars)",
                         tool, &message[..message.len().min(40)], cached.len());
-                    return Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &cached)));
+                    return Ok(Some(pond_api::tool_context::format_tool_context(tool, &query, message, &cached)));
                 }
             }
         }
@@ -2207,11 +2206,12 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                         info
                     }
                 };
-                Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &compacted)))
+                Ok(Some(pond_api::tool_context::format_tool_context(tool, &query, message, &compacted)))
             }
             None => {
-                println!("[tool-agent] tool returned no result");
-                Ok(None)
+                // Tool was classified but returned no result — tell the LLM
+                println!("[tool-agent] tool returned no result, injecting failure context");
+                Ok(Some(pond_api::tool_context::format_tool_failure(tool, &query, message)))
             }
         }
     }

@@ -1007,6 +1007,61 @@ async fn chat_stream(
             }
         }
 
+        // ── Post-inference tool request detection ─────────────────────
+        // If the LLM's response contains a natural language tool request
+        // (e.g. "Let me look up X for you"), execute the tool via the
+        // ToolAgent, then re-generate the response with tool data injected.
+        if settings.tool_request_detection {
+            if let Some(tool_req) = pond_core::services::tool_request_detector::detect_tool_request(&full_text) {
+                tracing::info!(
+                    target: "giap::tool_request",
+                    tool = %tool_req.tool_name,
+                    query = %tool_req.query,
+                    "LLM requested tool via natural language"
+                );
+
+                // Use the ToolAgent to execute — it handles caching, compaction, etc.
+                if let Some(ref ta) = state.tool_agent {
+                    // Build a synthetic message for the tool agent that looks like a tool query
+                    let synthetic_msg = if tool_req.query.is_empty() {
+                        tool_req.tool_name.clone()
+                    } else {
+                        tool_req.query.clone()
+                    };
+
+                    if let Ok(Some(tool_context)) = ta.process(&synthetic_msg).await {
+                        // Re-generate with tool data
+                        let provider_guard = state.llm_provider.read().await;
+                        if let Some(ref provider) = *provider_guard {
+                            let msgs = vec![pond_core::domain::message::ChatMessage::user(tool_context)];
+                            match provider.complete(&_system_prompt, msgs).await {
+                                Ok(revision) => {
+                                    full_text = revision.content.clone();
+                                    let data = json!({
+                                        "type": "tool_revision",
+                                        "content": full_text,
+                                        "tool": tool_req.tool_name,
+                                    }).to_string();
+                                    yield Ok(Event::default().data(data));
+                                    tracing::info!(
+                                        target: "giap::tool_request",
+                                        "Revised response with {} tool data ({} chars)",
+                                        tool_req.tool_name, full_text.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        target: "giap::tool_request",
+                                        "Revision failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Parallel Post-Processing ──────────────────────────────────
         // Memory extraction is spawned as a background task immediately,
         // running concurrently with the answer persist below. On HTTP

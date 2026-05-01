@@ -272,6 +272,15 @@ export function Chat() {
             return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
           });
 
+        } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
+          // Replace the streamed text with the revised/tool-augmented version
+          inThinkBlockRef.current = false;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || last.role !== "agent") return prev;
+            return [...prev.slice(0, -1), { ...last, text: ev.content!, status: undefined }];
+          });
+
         } else if (ev.type === "error" || ev.error) {
           const errMsg = ev.error ?? "Unknown error from agent";
           setMessages((prev) => {
