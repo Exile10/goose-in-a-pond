@@ -291,6 +291,12 @@ pub struct Settings {
     /// Cloud API output token price per million. Default 10.00 (GPT-4o).
     #[serde(default = "Settings::default_cloud_output_price_per_million")]
     pub cloud_output_price_per_million: f64,
+
+    // ── Telemetry ─────────────────────────────────────────────────────────
+    /// When true, per-turn telemetry metrics (TTFT, token counts, tool latency,
+    /// context utilization) are recorded for each chat turn.
+    #[serde(default = "Settings::default_telemetry_enabled")]
+    pub telemetry_enabled: bool,
 }
 
 impl Default for Settings {
@@ -354,6 +360,7 @@ impl Default for Settings {
             schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
             cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
+            telemetry_enabled:              Self::default_telemetry_enabled(),
         }
     }
 }
@@ -412,6 +419,7 @@ impl Settings {
     fn default_schedule_max_runs_per_task() -> u32    { 50 }
     fn default_cloud_input_price_per_million() -> f64 { 2.50 }
     fn default_cloud_output_price_per_million() -> f64 { 10.00 }
+    fn default_telemetry_enabled()             -> bool { true }
 }
 
 #[cfg(test)]

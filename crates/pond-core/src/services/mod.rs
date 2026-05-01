@@ -27,4 +27,5 @@ pub mod onboarding;
 pub mod instant_activation;
 pub mod print_output;
 pub mod stdin_input;
+pub mod telemetry;
 pub mod thought_filter;
