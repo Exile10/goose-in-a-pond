@@ -291,6 +291,14 @@ pub struct Settings {
     /// Cloud API output token price per million. Default 10.00 (GPT-4o).
     #[serde(default = "Settings::default_cloud_output_price_per_million")]
     pub cloud_output_price_per_million: f64,
+
+    // ── Compact encoding ────────────────────────────────────────────────────
+
+    /// When true, structured data injected into LLM prompts (memories, tool
+    /// results) uses a compact TOON-style encoding that reduces token count
+    /// by 30-60%. Default: true.
+    #[serde(default = "Settings::default_compact_encoding")]
+    pub compact_encoding: bool,
 }
 
 impl Default for Settings {
@@ -354,6 +362,7 @@ impl Default for Settings {
             schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
             cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
+            compact_encoding:                Self::default_compact_encoding(),
         }
     }
 }
@@ -412,6 +421,7 @@ impl Settings {
     fn default_schedule_max_runs_per_task() -> u32    { 50 }
     fn default_cloud_input_price_per_million() -> f64 { 2.50 }
     fn default_cloud_output_price_per_million() -> f64 { 10.00 }
+    fn default_compact_encoding()              -> bool { true }
 }
 
 #[cfg(test)]
