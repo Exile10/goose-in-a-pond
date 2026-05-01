@@ -319,6 +319,14 @@ pub struct Settings {
     /// context utilization) are recorded for each chat turn.
     #[serde(default = "Settings::default_telemetry_enabled")]
     pub telemetry_enabled: bool,
+
+    // ── Compact encoding ────────────────────────────────────────────────────
+
+    /// When true, structured data injected into LLM prompts (memories, tool
+    /// results) uses a compact TOON-style encoding that reduces token count
+    /// by 30-60%. Default: true.
+    #[serde(default = "Settings::default_compact_encoding")]
+    pub compact_encoding: bool,
 }
 
 impl Default for Settings {
@@ -386,6 +394,7 @@ impl Default for Settings {
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
             tool_cache_enabled:             Self::default_tool_cache_enabled(),
             telemetry_enabled:              Self::default_telemetry_enabled(),
+            compact_encoding:                Self::default_compact_encoding(),
         }
     }
 }
@@ -448,6 +457,7 @@ impl Settings {
     fn default_cloud_output_price_per_million() -> f64 { 10.00 }
     fn default_tool_cache_enabled()            -> bool { true }
     fn default_telemetry_enabled()             -> bool { true }
+    fn default_compact_encoding()              -> bool { true }
 }
 
 #[cfg(test)]
