@@ -98,6 +98,7 @@ use pond_core::ports::scheduler::SchedulerPort;
 use pond_core::ports::sensor_storage::SensorStorage;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
+use pond_core::ports::telemetry::TelemetryPort;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
@@ -231,6 +232,8 @@ pub struct AppState {
     pub inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>>,
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
     pub schedule_result_tx: tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
+    /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
+    pub telemetry: Option<Arc<dyn TelemetryPort>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

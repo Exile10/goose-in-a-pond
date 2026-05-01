@@ -133,6 +133,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── System Prompt Extras ───────────────────────────────────────────────
         .route("/agent/extras", get(list_prompt_extras).post(upsert_prompt_extra))
         .route("/agent/extras/{key}", delete(delete_prompt_extra))
+        // ── Turn-level telemetry ──────────────────────────────────────────────
+        .route("/telemetry/turns", get(get_telemetry_turns))
+        .route("/telemetry/summary", get(get_telemetry_summary))
         // ── Event log / telemetry ─────────────────────────────────────────────
         .route("/logs", get(list_logs))
         .route("/logs/export", get(export_logs_csv))
@@ -534,6 +537,7 @@ async fn chat_stream(
 
     let stream = async_stream::stream! {
         let _permit = permit;
+        let turn_start = std::time::Instant::now();
         let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let storage = &state.session_storage;
 
@@ -743,6 +747,7 @@ async fn chat_stream(
         };
 
         let mut full_text = String::new();
+        let mut ttft_instant: Option<std::time::Instant> = None;
         // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
         // preambles and `<think>…</think>` blocks out of the per-token stream.
         // When show_thinking is enabled, capture thinking blocks as SSE events.
@@ -782,6 +787,9 @@ async fn chat_stream(
                             if visible.is_empty() {
                                 None
                             } else {
+                                if ttft_instant.is_none() {
+                                    ttft_instant = Some(std::time::Instant::now());
+                                }
                                 full_text.push_str(&visible);
                                 Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
                             }
@@ -942,6 +950,42 @@ async fn chat_stream(
             ).await;
         }
 
+        // ── Per-turn telemetry ──────────────────────────────────────────
+        if settings.telemetry_enabled {
+            if let Some(ref telemetry) = state.telemetry {
+                let total_latency_ms = turn_start.elapsed().as_millis() as u64;
+                let ttft_ms = ttft_instant
+                    .map(|t| t.duration_since(turn_start).as_millis() as u64)
+                    .unwrap_or(total_latency_ms);
+
+                // Estimate turn number from existing telemetry for this session.
+                let existing_turns = telemetry
+                    .get_turns(&session_id)
+                    .await
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+
+                let metrics = pond_core::domain::turn_metrics::TurnMetrics {
+                    session_id: session_id.clone(),
+                    turn_number: existing_turns + 1,
+                    prompt_tokens: usage_prompt_tokens,
+                    completion_tokens: usage_completion_tokens,
+                    ttft_ms,
+                    total_latency_ms,
+                    tool_name: None,   // TODO: populate from ToolAgent result
+                    tool_latency_ms: None,
+                    tool_cache_hit: None,
+                    context_utilization_pct: 0.0, // TODO: compute from context budget
+                    model_name: model_name_for_done.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+
+                if let Err(e) = telemetry.record_turn(metrics).await {
+                    tracing::debug!(target: "giap::telemetry", "failed to record turn metrics: {e}");
+                }
+            }
+        }
+
         // Done event
         let data = json!({
             "done": true,
@@ -1023,6 +1067,61 @@ async fn usage_summary(
         "cloud_input_price_per_million": cloud_input,
         "cloud_output_price_per_million": cloud_output,
     })))
+}
+
+// ── Telemetry endpoints ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TelemetryQuery {
+    session_id: String,
+}
+
+/// Return per-turn telemetry metrics for a session.
+///
+/// `GET /api/v1/telemetry/turns?session_id=X`
+async fn get_telemetry_turns(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TelemetryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let telemetry = state.telemetry.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Telemetry is not enabled"})),
+        )
+    })?;
+
+    let turns = telemetry.get_turns(&query.session_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get turns: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(json!({ "turns": turns })))
+}
+
+/// Return an aggregated telemetry summary for a session.
+///
+/// `GET /api/v1/telemetry/summary?session_id=X`
+async fn get_telemetry_summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TelemetryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let telemetry = state.telemetry.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Telemetry is not enabled"})),
+        )
+    })?;
+
+    let summary = telemetry.get_summary(&query.session_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get summary: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(json!(summary)))
 }
 
 #[derive(Deserialize)]
