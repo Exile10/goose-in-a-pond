@@ -48,13 +48,27 @@ impl CachedToolResult {
     }
 }
 
+/// Returns true if a tool's results are safe to cache.
+///
+/// Mutation tools (save_memory, create_schedule) and personalized reads
+/// (recall_memory) are excluded from caching because their results
+/// depend on side effects or change with every invocation.
+pub fn is_cacheable_tool(tool_name: &str) -> bool {
+    !matches!(
+        tool_name,
+        "save_memory" | "recall_memory" | "forget_memory" | "create_schedule"
+    )
+}
+
 /// Returns the default TTL for a given tool name.
+///
+/// Only called for cacheable tools (see [`is_cacheable_tool`]).
 pub fn default_ttl_for_tool(tool_name: &str) -> Duration {
     match tool_name {
         "weather" => TTL_WEATHER,
         "wikipedia" => TTL_WIKIPEDIA,
         "devices" => TTL_DEVICES,
-        "schedules" | "create_schedule" => TTL_SCHEDULES,
+        "schedules" => TTL_SCHEDULES,
         _ => TTL_DEFAULT,
     }
 }
@@ -72,12 +86,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cacheable_tools() {
+        assert!(is_cacheable_tool("weather"));
+        assert!(is_cacheable_tool("wikipedia"));
+        assert!(is_cacheable_tool("devices"));
+        assert!(is_cacheable_tool("schedules"));
+    }
+
+    #[test]
+    fn non_cacheable_tools() {
+        assert!(!is_cacheable_tool("save_memory"));
+        assert!(!is_cacheable_tool("recall_memory"));
+        assert!(!is_cacheable_tool("forget_memory"));
+        assert!(!is_cacheable_tool("create_schedule"));
+    }
+
+    #[test]
     fn default_ttls_match_spec() {
         assert_eq!(default_ttl_for_tool("weather"), Duration::from_secs(300));
         assert_eq!(default_ttl_for_tool("wikipedia"), Duration::from_secs(3600));
         assert_eq!(default_ttl_for_tool("devices"), Duration::from_secs(30));
         assert_eq!(default_ttl_for_tool("schedules"), Duration::from_secs(10));
-        assert_eq!(default_ttl_for_tool("create_schedule"), Duration::from_secs(10));
         assert_eq!(default_ttl_for_tool("unknown"), Duration::from_secs(120));
     }
 

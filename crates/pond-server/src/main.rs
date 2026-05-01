@@ -2160,12 +2160,15 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         // ── Tool result cache ────────────────────────────────────────────
         // Check if we have a cached result for this tool+query before
-        // making the (potentially expensive) API call.
-        let cache_enabled = self.settings_repo.get().await
-            .map(|s| s.tool_cache_enabled)
-            .unwrap_or(true);
+        // making the (potentially expensive) API call. Mutation tools
+        // (save_memory, create_schedule) and personalized reads (recall_memory)
+        // are never cached.
+        let use_cache = pond_core::domain::tool_cache::is_cacheable_tool(tool)
+            && self.settings_repo.get().await
+                .map(|s| s.tool_cache_enabled)
+                .unwrap_or(true);
 
-        if cache_enabled {
+        if use_cache {
             if let Some(ref cache) = self.tool_cache {
                 if let Some(cached) = cache.get(tool, message) {
                     println!("[tool-agent] cache HIT for {}:{} ({} chars)",
@@ -2180,7 +2183,7 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                 println!("[tool-agent] got result ({} chars)", info.len());
 
                 // Cache the result for future identical queries.
-                if cache_enabled {
+                if use_cache {
                     if let Some(ref cache) = self.tool_cache {
                         let ttl = pond_core::domain::tool_cache::default_ttl_for_tool(tool);
                         cache.put(tool, message, info.clone(), ttl);
