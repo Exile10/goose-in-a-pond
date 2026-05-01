@@ -2148,6 +2148,72 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
             }
         }
     }
+
+    async fn process_multi(
+        &self,
+        message: &str,
+    ) -> anyhow::Result<Vec<pond_core::domain::tool_result::ToolResult>> {
+        use pond_core::domain::tool_result::ToolResult;
+        use pond_core::services::request_classifier::{route_to_tools, ToolRouting};
+
+        let routings = route_to_tools(message);
+
+        // No tools matched — empty result.
+        if routings.is_empty() {
+            println!("[tool-agent-multi] no tools matched for: {:?}",
+                &message[..message.len().min(80)]);
+            return Ok(vec![]);
+        }
+
+        // Single tool — use the existing single-tool path for consistency.
+        if routings.len() == 1 {
+            let tool_name = routings[0].tool_name();
+            println!("[tool-agent-multi] single tool: {}, delegating to process()", tool_name);
+            return match self.process(message).await? {
+                Some(result) => Ok(vec![ToolResult::new(tool_name, result)]),
+                None => Ok(vec![]),
+            };
+        }
+
+        // Multiple tools — dispatch in parallel via join_all.
+        println!("[tool-agent-multi] dispatching {} tools in parallel: {:?}",
+            routings.len(),
+            routings.iter().map(|r| r.tool_name()).collect::<Vec<_>>());
+
+        let msg = message.to_string();
+        let futures: Vec<_> = routings
+            .iter()
+            .filter(|r| **r != ToolRouting::None)
+            .map(|routing| {
+                let tool_name = routing.tool_name().to_string();
+                let msg_clone = msg.clone();
+                async move {
+                    match pond_mcp_server::try_tool_agent(&tool_name, &msg_clone).await {
+                        Some(info) => {
+                            println!("[tool-agent-multi] {} returned {} chars",
+                                tool_name, info.len());
+                            Some(ToolResult::new(tool_name, info))
+                        }
+                        None => {
+                            println!("[tool-agent-multi] {} returned no result", tool_name);
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let results: Vec<ToolResult> = futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        println!("[tool-agent-multi] got {} results from {} tools",
+            results.len(), routings.len());
+
+        Ok(results)
+    }
 }
 
 // ── Adversarial Answer Reviewer ───────────────────────────────────────────────
