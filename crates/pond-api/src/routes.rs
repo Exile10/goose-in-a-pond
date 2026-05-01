@@ -1087,6 +1087,48 @@ async fn chat_stream(
             }
         }
 
+        // ── Context growth monitoring ─────────────────────────────────
+        if settings.context_monitor_enabled {
+            let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
+            let context_limit = if settings.context_window_override > 0 {
+                settings.context_window_override
+            } else {
+                let caps = state.agent.capabilities();
+                caps.context_window
+            };
+
+            if estimated_tokens > 0 && context_limit > 0 {
+                state.context_monitor.record_turn(
+                    &session_id,
+                    estimated_tokens,
+                    context_limit,
+                );
+
+                let health = state.context_monitor.check_context_health(&session_id);
+
+                if let Some(ref warning) = health.warning {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        utilization_pct = health.utilization_pct,
+                        turns_remaining = health.estimated_turns_remaining,
+                        "{}",
+                        warning,
+                    );
+                }
+
+                if health.should_compact {
+                    let data = json!({
+                        "type": "context_warning",
+                        "utilization_pct": health.utilization_pct,
+                        "turns_remaining": health.estimated_turns_remaining,
+                        "avg_growth_rate": health.avg_growth_rate,
+                        "warning": health.warning,
+                    }).to_string();
+                    yield Ok(Event::default().data(data));
+                }
+            }
+        }
+
         // Done event
         let data = json!({
             "done": true,
