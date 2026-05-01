@@ -233,6 +233,13 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_memory_limit")]
     pub agent_memory_limit: u32,
 
+    /// When true, tool outputs (weather, Wikipedia, schedules, devices) are
+    /// semantically compressed before injection into the LLM context. Saves
+    /// 50-80% of tokens on tool results with negligible information loss.
+    /// Disable only for debugging raw tool output.
+    #[serde(default = "Settings::default_tool_output_compaction")]
+    pub tool_output_compaction: bool,
+
     /// When true, durable facts are automatically extracted from each conversation
     /// turn and stored as categorised memories (segment, importance, decay).
     #[serde(default = "Settings::default_memory_extraction_enabled")]
@@ -348,6 +355,7 @@ impl Default for Settings {
             prefix_cache_prompt:             Self::default_prefix_cache_prompt(),
             agent_memory_inject:             Self::default_agent_memory_inject(),
             agent_memory_limit:              Self::default_agent_memory_limit(),
+            tool_output_compaction:          Self::default_tool_output_compaction(),
             memory_extraction_enabled:       true,
             memory_cleanup_enabled:          true,
             memory_consolidation_enabled:    false, // requires enough memories to be useful
@@ -411,6 +419,7 @@ impl Settings {
     fn default_schedule_result_notify()     -> bool   { true }
     fn default_memory_prune_threshold()     -> f32    { 0.05 }
     fn default_memory_archive_threshold()   -> f32    { 0.15 }
+    fn default_tool_output_compaction()        -> bool  { true }
     fn default_memory_extraction_enabled()    -> bool  { true }
     fn default_memory_cleanup_enabled()       -> bool  { true }
     fn default_memory_cleanup_interval_hours() -> u32 { 6 }

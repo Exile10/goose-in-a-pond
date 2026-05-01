@@ -1120,7 +1120,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // The live_provider is retained for potential fallback classification.
     println!("  Tool Agent: keyword routing (zero LLM overhead)");
     let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone(), settings_repo: settings_repo.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
 
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
@@ -2058,7 +2058,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             let live = Arc::new(tokio::sync::RwLock::new(
                 Some(provider as Arc<dyn pond_core::ports::provider::LlmProvider>)
             ));
-            let ta = GiapToolAgent { live_provider: live };
+            let ta = GiapToolAgent { live_provider: live, settings_repo: settings_repo_arc.clone() };
             chat_service = chat_service.with_tool_agent(Arc::new(ta));
             println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
         } else {
@@ -2086,6 +2086,8 @@ struct GiapToolAgent {
     /// Live provider — reads from the RwLock so it always uses whatever
     /// model is currently loaded. Zero model-swap overhead.
     live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
+    /// Settings repository — used to check `tool_output_compaction` toggle.
+    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository>,
 }
 
 #[async_trait::async_trait]
@@ -2139,8 +2141,21 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         match pond_mcp_server::try_tool_agent(tool, message).await {
             Some(info) => {
-                println!("[tool-agent] got result ({} chars)", info.len());
-                Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &info)))
+                let raw_len = info.len();
+                // Apply semantic compaction when enabled in settings.
+                let compacted = {
+                    let settings = self.settings_repo.get().await.unwrap_or_default();
+                    if settings.tool_output_compaction {
+                        let c = pond_core::services::tool_output_compactor::compact_tool_output(tool, &info);
+                        println!("[tool-agent] compacted {} -> {} chars ({}%)",
+                            raw_len, c.len(),
+                            if raw_len > 0 { 100 - (c.len() * 100 / raw_len) } else { 0 });
+                        c
+                    } else {
+                        info
+                    }
+                };
+                Ok(Some(pond_api::tool_context::format_tool_context(tool, message, &compacted)))
             }
             None => {
                 println!("[tool-agent] tool returned no result");
