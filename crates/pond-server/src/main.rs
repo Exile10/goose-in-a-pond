@@ -1451,6 +1451,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         memory_extraction_service: memory_extraction_service_for_http,
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
+        telemetry: Some(Arc::new(pond_core::services::telemetry::InMemoryTelemetry::new())),
     });
 
     // Warn if static assets haven't been built yet
