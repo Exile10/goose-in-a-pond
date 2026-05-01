@@ -246,6 +246,131 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
     ToolRouting::None
 }
 
+/// Route a user message to ALL matching tools using keyword matching.
+///
+/// Unlike `route_to_tool()` which returns the highest-priority single match,
+/// this function collects every tool whose keywords appear in the message.
+/// Duplicate tool variants are included at most once.
+///
+/// Used by the multi-tool parallel dispatch pipeline to detect multi-intent
+/// queries like "What's the weather and list my schedules".
+pub fn route_to_tools(message: &str) -> Vec<ToolRouting> {
+    let mut stripped = message.to_lowercase();
+    for prefix in WAKE_PREFIXES {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            stripped = rest.to_string();
+        }
+    }
+    let stripped = stripped.trim();
+
+    let mut results = Vec::new();
+
+    // ── CreateSchedule ──────────────────────────────────────────────
+    const SCHEDULE_CREATE_PATTERNS_MULTI: &[&str] = &[
+        "schedule to ", "schedule a ", "schedule me ",
+        "every day at", "every morning", "every evening", "every night",
+        "every hour", "every week",
+        "remind me every", "remind me at ", "remind me to ",
+        "at 1", "at 2", "at 3", "at 4", "at 5", "at 6", "at 7",
+        "at 8", "at 9", "at 10", "at 11", "at 12",
+        "set alarm", "set a timer", "set a reminder",
+    ];
+    if SCHEDULE_CREATE_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
+        let has_time_marker = stripped.contains("am") || stripped.contains("pm")
+            || stripped.contains("every") || stripped.contains("schedule")
+            || stripped.contains("remind") || stripped.contains("alarm")
+            || stripped.contains("timer") || stripped.contains("daily")
+            || stripped.contains("o'clock");
+        if has_time_marker {
+            results.push(ToolRouting::CreateSchedule);
+        }
+    }
+
+    // ── RecallMemory ────────────────────────────────────────────────
+    const RECALL_MEMORY_PATTERNS_MULTI: &[&str] = &[
+        "do you remember", "do you recall",
+        "what did i tell you", "what did i say",
+        "what do you know about me", "what do you remember",
+        "what's my name", "what is my name",
+        "what's my ", "what is my ",
+        "did i mention", "did i tell you",
+        "recall my", "recall what",
+    ];
+    if RECALL_MEMORY_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
+        results.push(ToolRouting::RecallMemory);
+    }
+
+    // ── SaveMemory ──────────────────────────────────────────────────
+    const SAVE_MEMORY_PATTERNS_MULTI: &[&str] = &[
+        "remember that", "remember this", "remember my", "remember i ",
+        "don't forget", "do not forget",
+        "save this", "save that", "note that", "note this",
+        "keep in mind", "make a note",
+        "my name is", "i am called", "call me ",
+        "i live in", "i'm from", "i am from",
+        "my birthday is", "my email is", "my phone",
+        "i prefer", "i like", "i love", "i hate", "i dislike",
+        "i'm allergic", "i am allergic",
+    ];
+    if !results.contains(&ToolRouting::RecallMemory)
+        && SAVE_MEMORY_PATTERNS_MULTI.iter().any(|p| stripped.contains(p))
+    {
+        results.push(ToolRouting::SaveMemory);
+    }
+
+    // ── Weather ─────────────────────────────────────────────────────
+    if stripped.contains("weather") || stripped.contains("temperature outside")
+        || stripped.contains("forecast") || stripped.starts_with("how cold")
+        || stripped.starts_with("how hot") || stripped.starts_with("how warm")
+        || stripped.starts_with("is it raining") || stripped.starts_with("will it rain")
+    {
+        results.push(ToolRouting::Weather);
+    }
+
+    // ── Devices ─────────────────────────────────────────────────────
+    const DEVICE_PATTERNS_MULTI: &[&str] = &[
+        "list devices", "my devices", "what devices",
+        "connected devices", "online devices",
+        "turn on the", "turn off the", "switch on", "switch off",
+    ];
+    if DEVICE_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
+        results.push(ToolRouting::Devices);
+    }
+
+    // ── Schedules (list) ────────────────────────────────────────────
+    const SCHEDULE_LIST_PATTERNS_MULTI: &[&str] = &[
+        "list schedules", "my schedules", "what schedules",
+        "show schedules", "show my schedule",
+        "what's scheduled", "what is scheduled",
+        "upcoming tasks", "upcoming schedules",
+    ];
+    // Only match Schedules (list) if we haven't already matched CreateSchedule
+    if !results.contains(&ToolRouting::CreateSchedule)
+        && SCHEDULE_LIST_PATTERNS_MULTI.iter().any(|p| stripped.contains(p))
+    {
+        results.push(ToolRouting::Schedules);
+    }
+
+    // ── Wikipedia / Knowledge ───────────────────────────────────────
+    const KNOWLEDGE_PREFIXES_MULTI: &[&str] = &[
+        "who is", "who was", "who are",
+        "what is", "what are", "what was", "what were",
+        "where is", "where are", "where was",
+        "when was", "when did", "when is",
+        "tell me about", "explain ", "describe ",
+        "how does", "how do", "how did",
+        "look up", "search for", "search ", "define ",
+        "can you tell me about",
+    ];
+    if KNOWLEDGE_PREFIXES_MULTI.iter().any(|p| stripped.starts_with(p))
+        || stripped.contains("wikipedia")
+    {
+        results.push(ToolRouting::Wikipedia);
+    }
+
+    results
+}
+
 /// Legacy helper — returns true when any tool is needed.
 /// Kept for backward compatibility with answer reviewer auto-mode.
 pub fn needs_tool_call(message: &str) -> bool {
@@ -392,5 +517,66 @@ mod tests {
         assert!(needs_tool_call("Who is Einstein?"));
         assert!(!needs_tool_call("Hello"));
         assert!(!needs_tool_call("Tell me a joke"));
+    }
+
+    // ── route_to_tools tests ────────────────────────────────────────
+
+    #[test]
+    fn route_to_tools_single_weather() {
+        let tools = route_to_tools("what's the weather");
+        assert_eq!(tools, vec![ToolRouting::Weather]);
+    }
+
+    #[test]
+    fn route_to_tools_weather_and_schedules() {
+        let tools = route_to_tools("what's the weather and list my schedules");
+        assert!(tools.contains(&ToolRouting::Weather));
+        assert!(tools.contains(&ToolRouting::Schedules));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn route_to_tools_empty_for_general() {
+        let tools = route_to_tools("hello");
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn route_to_tools_devices_and_weather() {
+        let tools = route_to_tools("check my devices and what's the weather");
+        assert!(tools.contains(&ToolRouting::Devices));
+        assert!(tools.contains(&ToolRouting::Weather));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn route_to_tools_no_duplicates() {
+        // "weather" appears once even if multiple weather keywords match
+        let tools = route_to_tools("what's the weather forecast");
+        let weather_count = tools.iter().filter(|t| **t == ToolRouting::Weather).count();
+        assert_eq!(weather_count, 1);
+    }
+
+    #[test]
+    fn route_to_tools_single_tool_backward_compat() {
+        // Single-tool messages should produce a single-element vec
+        let tools = route_to_tools("list devices");
+        assert_eq!(tools, vec![ToolRouting::Devices]);
+    }
+
+    #[test]
+    fn route_to_tools_three_tools() {
+        let tools = route_to_tools("list devices and what's the weather and show my schedules");
+        assert!(tools.contains(&ToolRouting::Weather));
+        assert!(tools.contains(&ToolRouting::Devices));
+        assert!(tools.contains(&ToolRouting::Schedules));
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn route_to_tools_with_wake_word() {
+        let tools = route_to_tools("Goose, what's the weather and list my schedules");
+        assert!(tools.contains(&ToolRouting::Weather));
+        assert!(tools.contains(&ToolRouting::Schedules));
     }
 }

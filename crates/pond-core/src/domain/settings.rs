@@ -291,6 +291,14 @@ pub struct Settings {
     /// Cloud API output token price per million. Default 10.00 (GPT-4o).
     #[serde(default = "Settings::default_cloud_output_price_per_million")]
     pub cloud_output_price_per_million: f64,
+
+    // ── Experimental ────────────────────────────────────────────────────────
+
+    /// When true, the ToolAgent detects multiple tool intents per message
+    /// and dispatches them concurrently via `tokio::join_all`.
+    /// Experimental — off by default.
+    #[serde(default)]
+    pub multi_tool_enabled: bool,
 }
 
 impl Default for Settings {
@@ -354,6 +362,7 @@ impl Default for Settings {
             schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
             cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
+            multi_tool_enabled:             false,
         }
     }
 }
