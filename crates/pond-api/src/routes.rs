@@ -548,6 +548,68 @@ async fn chat_stream(
 
         let settings = state.settings_repo.get().await.unwrap_or_default();
 
+        // ── Fast-path: deterministic response for trivial messages ─────
+        // Greetings, farewells, thanks, acknowledgments are answered in
+        // <10ms without invoking the LLM, tool agent, or any I/O beyond
+        // session persistence.
+        if settings.fast_path_enabled {
+            if let Some(fast_result) = pond_core::services::fast_responder::try_fast_path(&req.message) {
+                tracing::debug!(
+                    target: "giap::fast_path",
+                    category = ?fast_result.category,
+                    "fast-path match — skipping LLM pipeline"
+                );
+
+                // Persist user message
+                {
+                    use pond_core::domain::message::ChatMessage;
+                    use pond_core::domain::session::SessionMessage;
+                    let user_msg = ChatMessage::user(req.message.clone());
+                    let sm = SessionMessage::new(
+                        Uuid::new_v4().to_string(),
+                        session_id.clone(),
+                        user_msg,
+                    );
+                    let _ = storage.add_message(session_id.clone(), sm).await;
+                }
+
+                // Emit text event
+                let text_data = json!({
+                    "type": "text",
+                    "content": fast_result.response,
+                    "token": fast_result.response,
+                }).to_string();
+                yield Ok(Event::default().data(text_data));
+
+                // Persist assistant response
+                {
+                    use pond_core::domain::message::ChatMessage;
+                    use pond_core::domain::session::SessionMessage;
+                    let assistant_msg = ChatMessage::assistant(fast_result.response);
+                    let sm = SessionMessage::new(
+                        Uuid::new_v4().to_string(),
+                        session_id.clone(),
+                        assistant_msg,
+                    );
+                    let _ = storage.add_message(session_id.clone(), sm).await;
+                }
+
+                // Done event (zero token usage — no LLM was invoked)
+                let done_data = json!({
+                    "done": true,
+                    "session_id": session_id,
+                    "model_role": "chat",
+                    "model_name": settings.chat_model,
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                    }
+                }).to_string();
+                yield Ok(Event::default().data(done_data));
+                return;
+            }
+        }
+
         // Build the system prompt
         let system_prompt = {
             let profile_ctx: Option<ProfileContext> = if let Some(ref pid) = settings.primary_profile_id {
