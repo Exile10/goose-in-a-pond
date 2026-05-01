@@ -527,41 +527,57 @@ impl GooseAdapter {
         };
 
         // ── Partitioned prompt: static prefix + dynamic suffix ──────────
-        // The static prefix (identity, capabilities, rules) only changes when
-        // settings, model capabilities, or device state change. By tracking
-        // its hash we can skip override_system_prompt() on consecutive turns,
-        // allowing local inference providers to reuse their KV-cache.
-        let partition = build_prompt_partition(
-            &settings,
-            None, // ProfileContext — TODO: wire when profile port is available
-            &prompt_state,
-            &template_content,
-        );
+        // When prefix_cache_prompt is enabled (default), the system prompt is
+        // split into a stable static prefix and a per-turn dynamic suffix.
+        // The static prefix is only rebuilt when its hash changes (settings
+        // update, device change, model switch), allowing local inference
+        // providers to reuse their KV-cache for the stable portion.
+        //
+        // When disabled, falls back to rebuilding the full system prompt every
+        // turn (legacy behavior, useful for debugging or HTTP-only providers
+        // where KV-cache reuse doesn't apply).
+        if settings.prefix_cache_prompt {
+            let partition = build_prompt_partition(
+                &settings,
+                None, // ProfileContext — TODO: wire when profile port is available
+                &prompt_state,
+                &template_content,
+            );
 
-        {
-            let mut last_hash = self.last_prefix_hash.lock().unwrap();
-            if *last_hash != partition.prefix_hash {
-                tracing::info!(
-                    old_hash = %last_hash,
-                    new_hash = %partition.prefix_hash,
-                    "Static prefix changed — rebuilding system prompt"
-                );
-                self.agent.override_system_prompt(partition.static_prefix).await;
-                *last_hash = partition.prefix_hash;
-            } else {
-                tracing::debug!(
-                    hash = %partition.prefix_hash,
-                    "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
-                );
+            {
+                let mut last_hash = self.last_prefix_hash.lock().unwrap();
+                if *last_hash != partition.prefix_hash {
+                    tracing::info!(
+                        old_hash = %last_hash,
+                        new_hash = %partition.prefix_hash,
+                        "Static prefix changed — rebuilding system prompt"
+                    );
+                    self.agent.override_system_prompt(partition.static_prefix).await;
+                    *last_hash = partition.prefix_hash;
+                } else {
+                    tracing::debug!(
+                        hash = %partition.prefix_hash,
+                        "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
+                    );
+                }
             }
-        }
 
-        // Dynamic suffix: current date/time, profile context, addendum.
-        // Always updated because it changes every turn (at minimum, the time).
-        if !partition.dynamic_suffix.is_empty() {
-            self.agent
-                .extend_system_prompt("temporal".to_string(), partition.dynamic_suffix)
-                .await;
+            // Dynamic suffix: current date/time, profile context, addendum.
+            // Always updated because it changes every turn (at minimum, the time).
+            if !partition.dynamic_suffix.is_empty() {
+                self.agent
+                    .extend_system_prompt("temporal".to_string(), partition.dynamic_suffix)
+                    .await;
+            }
+        } else {
+            // Legacy path: rebuild full system prompt every turn
+            let system_prompt = pond_core::prompts::build_system_prompt_from_template_full(
+                &settings,
+                None,
+                Some(&prompt_state),
+                &template_content,
+            );
+            self.agent.override_system_prompt(system_prompt).await;
         }
 
         if let Ok(extras) = extras_result {
