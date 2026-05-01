@@ -282,6 +282,13 @@ pub struct Settings {
     #[serde(default = "Settings::default_schedule_max_runs_per_task")]
     pub schedule_max_runs_per_task: u32,
 
+    // ── Context monitoring ─────────────────────────────────────────────────
+
+    /// When true, tracks context window fill rate per session and emits
+    /// warnings before the context window saturates. Default true.
+    #[serde(default = "Settings::default_context_monitor_enabled")]
+    pub context_monitor_enabled: bool,
+
     // ── Cost comparison ──────────────────────────────────────────────────────
 
     /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
@@ -352,6 +359,7 @@ impl Default for Settings {
             memory_extraction_interval_secs: Self::default_memory_extraction_interval_secs(),
             schedule_max_concurrent:         Self::default_schedule_max_concurrent(),
             schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
+            context_monitor_enabled:         Self::default_context_monitor_enabled(),
             cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
         }
@@ -410,6 +418,7 @@ impl Settings {
     fn default_memory_extraction_interval_secs() -> u32 { 10 }
     fn default_schedule_max_concurrent()    -> u32    { 2 }
     fn default_schedule_max_runs_per_task() -> u32    { 50 }
+    fn default_context_monitor_enabled()       -> bool { true }
     fn default_cloud_input_price_per_million() -> f64 { 2.50 }
     fn default_cloud_output_price_per_million() -> f64 { 10.00 }
 }
