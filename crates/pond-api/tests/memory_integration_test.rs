@@ -120,6 +120,7 @@ async fn make_app_with_real_memory() -> (axum::Router, Arc<SqliteMemoryRepositor
         memory_extraction_service: None, inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
     });
 
     let router = build_router(state, std::path::PathBuf::from("web/dist"));

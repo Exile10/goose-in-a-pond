@@ -234,6 +234,9 @@ pub struct AppState {
     pub schedule_result_tx: tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
     /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
     pub telemetry: Option<Arc<dyn TelemetryPort>>,
+    /// Context growth monitor — tracks context window fill rate per session
+    /// and emits warnings before the "context cliff" where quality degrades.
+    pub context_monitor: Arc<pond_core::services::context_monitor::ContextMonitor>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

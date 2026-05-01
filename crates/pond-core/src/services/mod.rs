@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod compact_encoding;
+pub mod context_monitor;
 pub mod fast_responder;
 pub mod memory_cleanup;
 pub mod memory_consolidation;
