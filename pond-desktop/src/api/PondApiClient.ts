@@ -93,6 +93,10 @@ export class PondApiClient {
     return this.get("/api/v1/health");
   }
 
+  getSystemInfo(): Promise<{ hostname: string; version: string; platform: string; arch: string }> {
+    return this.get("/api/v1/system/info");
+  }
+
   // ── Onboarding ────────────────────────────────────────────
 
   getOnboardingStatus(): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {

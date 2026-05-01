@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Button, Tabs, Card, CardContent, Chip, ProgressBar } from "@heroui/react";
+import { Button, Tabs, Chip } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
@@ -50,7 +50,7 @@ function CapabilityBadges({ name }: { name: string }) {
   return (
     <>
       {badges.map(b => (
-        <Chip key={b.label} size="sm" variant="soft" color="default" title={b.title}>{b.label}</Chip>
+        <span key={b.label} className="cap-badge" title={b.title}>{b.label}</span>
       ))}
     </>
   );
@@ -88,122 +88,84 @@ function ActiveRolesBanner({
   onNavigate?: (category: "llm" | "asr" | "tts") => void;
 }) {
   const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" }> = [
-    { key: "chat", label: "Main LLM", icon: <MessageSquare size={10} />, category: "llm" },
-    { key: "asr",  label: "ASR",      icon: <Mic size={10} />,           category: "asr" },
-    { key: "tts",  label: "TTS",      icon: <Volume2 size={10} />,       category: "tts" },
+    { key: "chat", label: "Main LLM", icon: <MessageSquare size={12} strokeWidth={1.8} />, category: "llm" },
+    { key: "asr",  label: "ASR",      icon: <Mic size={12} strokeWidth={1.8} />,           category: "asr" },
+    { key: "tts",  label: "TTS",      icon: <Volume2 size={12} strokeWidth={1.8} />,       category: "tts" },
   ];
   const toolModel = roles?.tool?.model;
 
-  const memPct = memoryStatus && memoryStatus.total_mb > 0
-    ? Math.round(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100)
-    : null;
-
   return (
-    <Card className="giap-card">
-      <CardContent style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
-        <div className="card-header" style={{ padding: 0 }}>
-          <span className="card__label">Active Model Roles</span>
-          <div className="card-header__right">
-            {memoryStatus && memoryStatus.total_mb > 0 && (
-              <div style={{ width: 160, display: "flex", flexDirection: "column", gap: 4 }}>
-                <div className="mem-progress__label">
-                  <span>Memory</span>
-                  <span className="mem-progress__num">
-                    {memoryStatus.available_for_llm_mb.toLocaleString()} / {memoryStatus.total_mb.toLocaleString()} MB
-                  </span>
-                </div>
-                <ProgressBar
-                  size="sm"
-                  value={memPct ?? 0}
-                  color={memPct != null && memPct > 85 ? "warning" : "accent"}
-                  aria-label="Memory usage"
-                >
-                  <ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track>
-                </ProgressBar>
-              </div>
-            )}
-            <Button size="sm" variant="ghost" isIconOnly onPress={onRefresh} isDisabled={loading} aria-label="Refresh roles">
-              <RefreshCw size={13} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
-            </Button>
-          </div>
-        </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span className="card__label">Active Roles</span>
+        <Button size="sm" variant="ghost" isIconOnly onPress={onRefresh} isDisabled={loading} aria-label="Refresh roles">
+          <RefreshCw size={13} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
+        </Button>
+      </div>
 
-        <div className="role-grid">
-          {ROLE_DEFS.map(({ key, label, icon, category }) => {
-            const a = roles?.[key];
-            const isSet = !!(a?.provider && a?.model);
-            const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
-            return (
-              <div
-                key={key}
-                className={`role-chip role-chip--${variant}`}
-                onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
-                style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
-                title={!isSet ? `Click to set ${label} model` : undefined}
-              >
-                <div className="role-chip__bar" />
-                <div className="role-chip__body">
-                  <div className="role-chip__head">
-                    {icon}
-                    <span className="role-chip__role">{label}</span>
-                  </div>
-                  <span style={{
-                    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                    color: isSet ? "var(--fg)" : "var(--grey-500)", fontStyle: isSet ? "normal" : "italic",
-                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
-                  }}>
-                    {isSet ? `${a!.provider} / ${a!.model}` : "Not set"}
-                  </span>
+      <div className="role-grid">
+        {ROLE_DEFS.map(({ key, label, icon, category }) => {
+          const a = roles?.[key];
+          const isSet = !!(a?.provider && a?.model);
+          const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
+          return (
+            <div
+              key={key}
+              className={`role-chip role-chip--${variant}${isSet ? " is-set" : ""}`}
+              onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
+              style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
+              title={!isSet ? `Click to set ${label} model` : undefined}
+            >
+              <div className="role-chip__bar" />
+              <div className="role-chip__body">
+                <div className="role-chip__head">
+                  {icon}
+                  <span className="role-chip__role">{label}</span>
                 </div>
+                <span className={`role-chip__value ${isSet ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+                  {isSet ? `${a!.provider} / ${a!.model}` : "---"}
+                </span>
               </div>
-            );
-          })}
-          {/* Tool Caller chip */}
-          <div
-            className="role-chip role-chip--success"
-            onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
-            style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
-            title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
-          >
-            <div className="role-chip__bar" />
-            <div className="role-chip__body">
-              <div className="role-chip__head">
-                <Puzzle size={10} />
-                <span className="role-chip__role">Tool Caller</span>
-              </div>
-              <span style={{
-                fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                color: toolModel ? "var(--fg)" : "var(--grey-500)", fontStyle: toolModel ? "normal" : "italic",
-                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
-              }}>
-                {toolModel ?? "Not set"}
-              </span>
             </div>
+          );
+        })}
+        {/* Tool Caller chip */}
+        <div
+          className={`role-chip role-chip--success${toolModel ? " is-set" : ""}`}
+          onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
+          style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
+          title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
+        >
+          <div className="role-chip__bar" />
+          <div className="role-chip__body">
+            <div className="role-chip__head">
+              <Puzzle size={12} strokeWidth={1.8} />
+              <span className="role-chip__role">Tool Caller</span>
+            </div>
+            <span className={`role-chip__value ${toolModel ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+              {toolModel ?? "---"}
+            </span>
           </div>
         </div>
+      </div>
 
-        {/* Active model capabilities */}
-        {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
-          <div style={{
-            display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center",
-            padding: "6px 0 0", borderTop: "1px solid var(--grey-200)",
-          }}>
-            <span style={{ fontSize: "var(--text-xs)", color: "var(--grey-500)", marginRight: 4 }}>
-              Model features:
+      {/* Active model capabilities -- shown inline when set */}
+      {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
+        <div style={{
+          display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center",
+        }}>
+          {capabilities.thinking && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Thinking</span>}
+          {capabilities.vision && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Vision</span>}
+          {capabilities.audio_input && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Audio</span>}
+          {capabilities.structured_output && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Structured</span>}
+          {capabilities.context_window_tokens > 4096 && (
+            <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>
+              {Math.round(capabilities.context_window_tokens / 1000)}k ctx
             </span>
-            {capabilities.thinking && <Chip size="sm" variant="soft" color="accent">Thinking</Chip>}
-            {capabilities.vision && <Chip size="sm" variant="soft" color="accent">Vision</Chip>}
-            {capabilities.audio_input && <Chip size="sm" variant="soft" color="accent">Audio</Chip>}
-            {capabilities.structured_output && <Chip size="sm" variant="soft" color="accent">Structured Output</Chip>}
-            {capabilities.context_window_tokens > 4096 && (
-              <Chip size="sm" variant="soft" color="accent">
-                {Math.round(capabilities.context_window_tokens / 1000)}k context
-              </Chip>
-            )}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -317,10 +279,7 @@ function ModelList({
               <div className="giap-model-row__title-row">
                 <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
                 {m.ram_estimate_mb && (
-                  <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB</Chip>
-                )}
-                {m.recommended_role && (
-                  <Chip size="sm" variant="soft">{m.recommended_role}</Chip>
+                  <span className="giap-model-row__meta">{m.ram_estimate_mb} MB</span>
                 )}
                 {activeFor.map((r) => (
                   <Chip key={r} size="sm" color="accent" variant="soft">{ROLE_LABELS[r]}</Chip>
@@ -342,7 +301,7 @@ function ModelList({
                       isDisabled={!state.serverOnline}
                       aria-label={`Set ${m.name} as ${role} model`}
                     >
-                      {active && <CheckCircle size={11} />}
+                      {active && <CheckCircle size={11} strokeWidth={1.8} />}
                       {ROLE_LABELS[role]}
                     </Button>
                   );
@@ -350,14 +309,14 @@ function ModelList({
               </div>
               <Button
                 size="sm"
-                variant="outline"
+                variant="ghost"
                 isIconOnly
                 className="giap-model-row__trash"
                 onPress={() => onDelete(m.provider, m.name)}
                 isDisabled={!state.serverOnline}
                 aria-label={`Delete ${m.name}`}
               >
-                <Trash2 size={12} />
+                <Trash2 size={12} strokeWidth={1.8} />
               </Button>
             </div>
           </div>
@@ -802,7 +761,7 @@ function LlmTab({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Provider sub-tabs */}
       <div className="seg-toolbar">
         <Tabs
@@ -820,9 +779,11 @@ function LlmTab({
             </Tabs.List>
           </Tabs.ListContainer>
         </Tabs>
-        <div className="seg-toolbar__count">
-          <span>{ggufModels.length + llamafileModels.length + ollamaRegistryModels.length} models</span>
-        </div>
+        {(ggufModels.length + llamafileModels.length + ollamaRegistryModels.length) > 0 && (
+          <div className="seg-toolbar__count">
+            <span>{ggufModels.length + llamafileModels.length + ollamaRegistryModels.length} models</span>
+          </div>
+        )}
       </div>
 
       {dlMsg && (
@@ -858,13 +819,11 @@ function LlmTab({
               </span>
               <div className="models-list">
                 {ggufAvailable.map((m) => (
-                  <div key={m.id} className="giap-model-row">
+                  <div key={m.id} className="giap-model-row always-actions">
                     <div>
                       <div className="giap-model-row__title-row">
                         <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                        {m.ram_estimate_mb && <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB RAM</Chip>}
                         {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
-                        {m.recommended_role && <Chip size="sm" variant="soft">{m.recommended_role}</Chip>}
                         <CapabilityBadges name={m.name} />
                       </div>
                       {m.description && (
@@ -878,7 +837,7 @@ function LlmTab({
                         onPress={() => handleCatalogDownload("gguf", m)}
                         isDisabled={downloadingModel === m.name || !state.serverOnline}
                       >
-                        <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                        <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
                       </Button>
                     </div>
                   </div>
@@ -918,13 +877,11 @@ function LlmTab({
               </span>
               <div className="models-list">
                 {llamaAvailable.map((m) => (
-                  <div key={m.id} className="giap-model-row">
+                  <div key={m.id} className="giap-model-row always-actions">
                     <div>
                       <div className="giap-model-row__title-row">
                         <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                        {m.ram_estimate_mb && <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB RAM</Chip>}
                         {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
-                        {m.recommended_role && <Chip size="sm" variant="soft">{m.recommended_role}</Chip>}
                         <CapabilityBadges name={m.name} />
                       </div>
                       {m.description && (
@@ -938,7 +895,7 @@ function LlmTab({
                         onPress={() => handleCatalogDownload("llamafile", m)}
                         isDisabled={downloadingModel === m.name || !state.serverOnline}
                       >
-                        <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                        <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
                       </Button>
                     </div>
                   </div>
@@ -973,10 +930,10 @@ function LlmTab({
 type Category = "llm" | "asr" | "tts" | "face";
 
 const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; color: string }> = [
-  { key: "llm", label: "LLM", icon: <Brain size={14} />, color: CAT_COLOR.llm },
-  { key: "asr", label: "ASR", icon: <Mic size={14} />, color: CAT_COLOR.asr },
-  { key: "tts", label: "TTS", icon: <Volume2 size={14} />, color: CAT_COLOR.tts },
-  { key: "face", label: "Face", icon: <ScanFace size={14} />, color: "#3b82f6" },
+  { key: "llm", label: "LLM", icon: <Brain size={14} strokeWidth={1.8} />, color: CAT_COLOR.llm },
+  { key: "asr", label: "ASR", icon: <Mic size={14} strokeWidth={1.8} />, color: CAT_COLOR.asr },
+  { key: "tts", label: "TTS", icon: <Volume2 size={14} strokeWidth={1.8} />, color: CAT_COLOR.tts },
+  { key: "face", label: "Face", icon: <ScanFace size={14} strokeWidth={1.8} />, color: "#3b82f6" },
 ];
 
 // ── Face Recognition Panel ───────────────────────────────────
@@ -1215,12 +1172,12 @@ function AsrCatalogPanel({
           </span>
           <div className="models-list">
             {available.map((m) => (
-              <div key={m.id} className="giap-model-row">
+              <div key={m.id} className="giap-model-row always-actions">
                 <div>
                   <div className="giap-model-row__title-row">
                     <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                    {m.asr_language && <Chip size="sm" variant="soft">{m.asr_language}</Chip>}
-                    {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                    {m.asr_language && <span className="cap-badge">{m.asr_language}</span>}
+                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
                   </div>
                   <div className="giap-model-row__file"><code>whisper / {m.name}</code></div>
                 </div>
@@ -1231,7 +1188,7 @@ function AsrCatalogPanel({
                     onPress={() => handleDownload(m)}
                     isDisabled={downloadingModel === m.name || !state.serverOnline}
                   >
-                    <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
                   </Button>
                 </div>
               </div>
@@ -1324,11 +1281,11 @@ function TtsCatalogPanel({
           </span>
           <div className="models-list">
             {available.map((m) => (
-              <div key={m.id} className="giap-model-row">
+              <div key={m.id} className="giap-model-row always-actions">
                 <div>
                   <div className="giap-model-row__title-row">
                     <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                    {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
                   </div>
                   {m.description && (
                     <div className="giap-model-row__file"><code>{m.description}</code></div>
@@ -1341,7 +1298,7 @@ function TtsCatalogPanel({
                     onPress={() => handleDownload(m)}
                     isDisabled={downloadingModel === m.name || !state.serverOnline}
                   >
-                    <Download size={11} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
                   </Button>
                 </div>
               </div>
@@ -1477,8 +1434,8 @@ export function Models() {
       <div className="page-header">
         <h1 className="page-header__title">Models</h1>
         <div className="page-header__action">
-          <Button size="sm" variant="outline" onPress={handleScan}>
-            <RefreshCw size={14} /> Scan
+          <Button size="sm" variant="ghost" onPress={handleScan}>
+            <RefreshCw size={14} strokeWidth={1.8} /> Scan
           </Button>
         </div>
       </div>
@@ -1511,33 +1468,37 @@ export function Models() {
         >
           <Tabs.ListContainer>
             <Tabs.List aria-label="Model categories" className="models-toolbar__tabs">
-              {CATEGORIES.map(({ key, label, icon }) => (
-                <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
-                  <Tabs.Indicator />
-                  <div className="tab-title">
-                    {icon}
-                    <span>{label}</span>
-                    <span className="tab-title__count">
-                      {key === "llm" ? llmCount : key === "asr" ? asrModels.length : ttsModels.length}
-                    </span>
-                  </div>
-                </Tabs.Tab>
-              ))}
+              {CATEGORIES.map(({ key, label, icon }) => {
+                const count = key === "llm" ? llmCount : key === "asr" ? asrModels.length : key === "tts" ? ttsModels.length : 0;
+                return (
+                  <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
+                    <Tabs.Indicator />
+                    <div className="tab-title">
+                      {icon}
+                      <span>{label}</span>
+                      {count > 0 && <span className="tab-title__count">{count}</span>}
+                    </div>
+                  </Tabs.Tab>
+                );
+              })}
             </Tabs.List>
           </Tabs.ListContainer>
         </Tabs>
         <div className="models-toolbar__right">
           <div className="models-toolbar__search" style={{ position: "relative" }}>
-            <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-500)", pointerEvents: "none" }} />
+            <Search size={13} strokeWidth={1.8} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-300)", pointerEvents: "none" }} />
             <input
               style={{
-                width: "100%", height: "32px", paddingLeft: "32px", paddingRight: "12px",
-                border: "1px solid var(--grey-200)", borderRadius: "8px",
+                width: "100%", height: "30px", paddingLeft: "30px", paddingRight: "12px",
+                border: "1px solid var(--grey-100)", borderRadius: "var(--radius-md)",
                 fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-                background: "#fff", color: "var(--fg)", outline: "none",
+                background: "var(--grey-50)", color: "var(--fg)", outline: "none",
                 boxSizing: "border-box" as const,
+                transition: "border-color var(--transition-fast), background var(--transition-fast)",
               }}
-              placeholder="Search models…"
+              onFocus={(e) => { e.currentTarget.style.borderColor = "var(--grey-200)"; e.currentTarget.style.background = "#fff"; }}
+              onBlur={(e) => { e.currentTarget.style.borderColor = "var(--grey-100)"; e.currentTarget.style.background = "var(--grey-50)"; }}
+              placeholder="Search models..."
               aria-label="Search models"
             />
           </div>

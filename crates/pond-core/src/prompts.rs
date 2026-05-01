@@ -59,6 +59,11 @@ pub struct PromptState {
     /// True when the model supports thinking/reasoning (Gemma 4, Qwen3, etc.)
     /// and thinking_mode is not "off".
     pub thinking_enabled: bool,
+    /// True when the effective context window is small enough that the system
+    /// prompt should use a compact format (skip verbose tool descriptions and
+    /// detailed instructions to save tokens).  Derived from
+    /// [`CompactionProfile::use_compact_prompt()`].
+    pub compact_prompt: bool,
 }
 
 /// Tool definitions shared between the system prompt template and the classifier.
@@ -294,6 +299,12 @@ If a request requires leaving the local network, say so clearly and wait for con
 {% endif %}
 
 {% if has_tools %}
+{%- if compact_prompt %}
+## Tools
+Tools handle factual queries automatically. Use [Retrieved information] as authoritative.
+{% for tool in tools %}- {{tool}}
+{% endfor %}
+{%- else %}
 ## Knowledge and Tools
 You are a compact on-device model. Your training data may be incomplete, outdated, or wrong \
 on specific facts — especially names, dates, numbers, comparisons, and niche topics. You have \
@@ -315,17 +326,23 @@ retrieved content, use ALL of it to give the best possible answer.
 - When comparing concepts, provide specific differences, advantages, use cases, and concrete \
 details — not generic platitudes.
 - When explaining something, include how it works, why it matters, and real examples.
+{%- endif %}
 {% endif %}
 
 IMPORTANT: Never use shell commands, bash, python, curl, or execution tools. \
 If something is outside your capabilities, tell the user directly.
 {%- if thinking_enabled %}
+{%- if compact_prompt %}
+
+Think step by step for complex questions. Quality over speed.
+{%- else %}
 
 ## Deep Thinking
 For complex questions, reason through the problem step by step before answering. \
 For planning tasks, consider multiple approaches before recommending one. \
 When asked to explain or analyze, provide thorough responses with examples. \
 Quality matters more than speed — take time to think when the question deserves it.
+{%- endif %}
 {%- endif %}
 {% if voice_mode %}
 
@@ -394,6 +411,12 @@ routines with a lock or alarm step: pause and confirm that step separately.
 {% endif %}
 
 {% if has_tools %}
+{%- if compact_prompt %}
+## Tools
+Tools provide accurate data automatically. Use [Retrieved information] as authoritative.
+{% for tool in tools %}- {{tool}}
+{% endfor %}
+{%- else %}
 ## Available Tools
 You are a compact on-device model — your training data has gaps. These tools provide \
 accurate, current information automatically via the Tool Agent:
@@ -402,13 +425,19 @@ accurate, current information automatically via the Tool Agent:
 When you receive [Retrieved information], treat it as authoritative. Use ALL retrieved \
 data to give detailed, technically precise answers. For comparisons, cite specific \
 differences with concrete details. Never claim you lack access to information.
+{%- endif %}
 {% endif %}
 No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
 Tool use: ONLY use tools in your schema; NEVER use shell, bash, python, curl, or execution tools.
 {%- if thinking_enabled %}
+{%- if compact_prompt %}
+
+Deep analysis mode — show reasoning chain, surface uncertainty.
+{%- else %}
 
 Deep analysis mode active — for complex queries, show your reasoning chain, \
 evaluate trade-offs explicitly, and surface uncertainty. Prefer precision over brevity.
+{%- endif %}
 {%- endif %}
 {% if voice_mode %}
 
@@ -560,6 +589,10 @@ pub fn render_jinja_template(
 
     // Thinking mode — enables deep reasoning instructions in the prompt
     ctx.insert("thinking_enabled", &state.map(|s| s.thinking_enabled).unwrap_or(false));
+
+    // Compact prompt — when true, templates should skip verbose sections to
+    // save tokens on small-context platforms (Jetson 3K, macOS Metal 8K).
+    ctx.insert("compact_prompt", &state.map(|s| s.compact_prompt).unwrap_or(false));
 
     // Profile context
     ctx.insert(

@@ -34,6 +34,14 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       // Browser dev / Playwright mode: mark server online immediately so
       // all sections can load. Auth token not needed (loopback bypass).
       dispatch({ type: "SERVER_ONLINE" });
+      // Still check onboarding status so the wizard shows for new setups.
+      api.getOnboardingStatus()
+        .then((status) => {
+          if (!status.onboarded) {
+            dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true });
+          }
+        })
+        .catch(() => {});
       return;
     }
 
