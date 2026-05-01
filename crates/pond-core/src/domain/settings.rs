@@ -49,6 +49,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_prompt_addendum")]
     pub prompt_addendum: String,
 
+    // ── Fast path ──────────────────────────────────────────────────────────
+    /// When true, trivial messages (greetings, farewells, thanks, acknowledgments)
+    /// are answered deterministically in <10ms without invoking the LLM.
+    #[serde(default = "Settings::default_fast_path_enabled")]
+    pub fast_path_enabled: bool,
+
     // ── Model roles ────────────────────────────────────────────────────────
     /// Provider for the Chat role (fast, conversational). Default = llm_provider.
     #[serde(default = "Settings::default_llm_provider")]
@@ -304,6 +310,7 @@ impl Default for Settings {
             prompt_style:                    Self::default_prompt_style(),
             custom_system_prompt:            None,
             prompt_addendum:                 Self::default_prompt_addendum(),
+            fast_path_enabled:               Self::default_fast_path_enabled(),
             chat_provider:                   Self::default_llm_provider(),
             chat_model:                      Self::default_active_llm_model(),
             tool_model:                      None,
@@ -359,6 +366,7 @@ impl Default for Settings {
 }
 
 impl Settings {
+    fn default_fast_path_enabled()           -> bool   { true }
     fn default_prompt_style()                -> String { "balanced".to_string() }
     fn default_prompt_addendum()             -> String { "".to_string() }
     fn default_assistant_name()             -> String { "Goose".to_string() }
