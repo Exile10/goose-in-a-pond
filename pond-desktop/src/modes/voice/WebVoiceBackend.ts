@@ -1,0 +1,546 @@
+/**
+ * WebVoiceBackend -- Browser-native VoiceBackend implementation.
+ *
+ * Provides mic capture, ASR transcription, LLM chat streaming, sentence TTS,
+ * wake word detection, and barge-in using Web Audio API + HTTP calls to
+ * pond-server. Plain class with no React dependencies.
+ *
+ * @module WebVoiceBackend
+ */
+
+import { api } from "../../api/PondApiClient";
+import type {
+  VoiceBackend, VoiceState, PipelineOpts, ResponseMeta, ToolCallData,
+} from "./VoiceBackend";
+import {
+  encodeWav, calculateRms, downsampleTo16k, getAudioContext, closeAudioContext,
+  playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
+  isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
+  filterThinkingFull, createVadState, advanceVad, DEFAULT_VAD_CONFIG,
+} from "./webAudioUtils";
+
+// ── Internal types ───────────────────────────────────────────────
+
+interface RecordingContext {
+  stream: MediaStream;
+  processor: ScriptProcessorNode;
+  source: MediaStreamAudioSourceNode;
+  analyser: AnalyserNode;
+  audioContext: AudioContext;
+  chunks: Float32Array[];
+  sampleRate: number;
+  levelPump: ReturnType<typeof setInterval> | null;
+}
+
+// ── Constants ────────────────────────────────────────────────────
+
+const MIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    sampleRate: { ideal: 16000 }, channelCount: { exact: 1 },
+    echoCancellation: true, noiseSuppression: true,
+  } as MediaTrackConstraints,
+};
+
+const WAKE_SPEECH_RMS = 0.008;
+const WAKE_SILENCE_RMS = 0.004;
+const WAKE_ONSET_FRAMES = 2;       // 2 * 30ms = 60ms hysteresis
+const WAKE_TAIL_MS = 360;
+const WAKE_POST_TRIGGER_MS = 2000;
+const WAKE_MIN_SAMPLES = 800;
+const WAKE_CONT_SILENCE_MS = 600;
+
+// ── Class ────────────────────────────────────────────────────────
+
+export class WebVoiceBackend implements VoiceBackend {
+  // Callbacks (set by orchestration hook)
+  onAudioLevel: ((level: number) => void) | null = null;
+  onStateChange: ((state: VoiceState) => void) | null = null;
+  onTranscript: ((text: string) => void) | null = null;
+  onAgentToken: ((token: string, done: boolean) => void) | null = null;
+  onToolCall: ((data: ToolCallData) => void) | null = null;
+  onError: ((msg: string) => void) | null = null;
+  onSessionId: ((id: string) => void) | null = null;
+  onResponseMeta: ((meta: ResponseMeta) => void) | null = null;
+  onWakeDetected: ((wav: Blob) => void) | null = null;
+  onWakeInterrupt: (() => void) | null = null;
+  onDismissed: ((isExit: boolean) => void) | null = null;
+
+  // Private state
+  private serverUrl: string;
+  private cancelled = false;
+  private pipelineActive = false;
+  private abortController: AbortController | null = null;
+  private ttsSource: AudioBufferSourceNode | null = null;
+  private stopThinkingFn: (() => void) | null = null;
+  private recording: RecordingContext | null = null;
+  private wakeActive = false;
+  private wakeStream: MediaStream | null = null;
+  private wakeInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor(serverUrl: string) { this.serverUrl = serverUrl; }
+
+  // ════════════════════════════════════════════════════════════════
+  // Public -- VoiceBackend interface
+  // ════════════════════════════════════════════════════════════════
+
+  async recordWithVad(): Promise<Blob | null> {
+    this.closeMic();
+    this.cancelled = false;
+
+    let ctx: RecordingContext;
+    try { ctx = await this.openMic(); }
+    catch (err) { this.emitMicError(err); return null; }
+
+    const vad = createVadState();
+    const td = new Float32Array(ctx.analyser.fftSize);
+    const t0 = Date.now();
+
+    return new Promise<Blob | null>((resolve) => {
+      ctx.levelPump = setInterval(() => {
+        if (this.cancelled || !this.recording) {
+          this.endPump(ctx); resolve(null); return;
+        }
+        ctx.analyser.getFloatTimeDomainData(td);
+        const rms = calculateRms(td);
+        this.onAudioLevel?.(rms);
+
+        if (Date.now() - t0 >= DEFAULT_VAD_CONFIG.maxDurationMs
+            || advanceVad(vad, rms, Date.now(), DEFAULT_VAD_CONFIG)) {
+          this.endPump(ctx); resolve(this.blobFromCtx(ctx));
+        }
+      }, 30);
+    });
+  }
+
+  abortRecording(): void {
+    this.cancelled = true;
+    this.closeMic();
+    this.cancelPipeline();
+    this.onAudioLevel?.(0);
+  }
+
+  async runPipeline(wav: Blob, opts: PipelineOpts): Promise<void> {
+    this.cancelled = false;
+    this.pipelineActive = true;
+    const ac = new AbortController();
+    this.abortController = ac;
+
+    try {
+      // Step 1: Transcribe
+      let text = await this.transcribe(await wav.arrayBuffer());
+      if (this.cancelled || !text) { this.onStateChange?.("idle"); return; }
+
+      // Step 1a: Strip wake word
+      if (opts.stripWakeWord) {
+        const idx = text.toLowerCase().indexOf(opts.stripWakeWord.toLowerCase());
+        if (idx !== -1) text = text.slice(idx + opts.stripWakeWord.length).trim();
+        if (!text) {
+          this.onStateChange?.("recording");
+          const cmd = await this.recordWithVad();
+          if (cmd) { this.onStateChange?.("thinking"); return this.runPipeline(cmd, { ...opts, stripWakeWord: undefined }); }
+          this.onStateChange?.("idle"); return;
+        }
+      }
+
+      // Step 1b: Dismissal check
+      const dm = checkDismissal(text);
+      if (dm.dismissed) {
+        const msg = dm.isExit
+          ? "Goodbye! I'll be here whenever you need me."
+          : "Until next time. Just say my name when you need me.";
+        this.onStateChange?.("speaking");
+        await this.playTtsSentence(msg, ac.signal);
+        this.onDismissed?.(dm.isExit);
+        this.onStateChange?.("idle");
+        return;
+      }
+
+      // Step 1c: Dispatch transcript + thinking state
+      this.onTranscript?.(text);
+      this.onStateChange?.("thinking");
+
+      // Concurrent quip + thinking tone
+      let quipDone = false;
+      void this.playTtsSentence(getQuip(), ac.signal).catch(() => {}).then(() => { quipDone = true; });
+      const stopThink = playThinkingTone();
+      this.stopThinkingFn = stopThink;
+
+      // Step 2: SSE chat stream
+      await this.streamChat(text, opts, ac, () => {
+        stopThink(); this.stopThinkingFn = null;
+        if (!quipDone && this.ttsSource) { try { this.ttsSource.stop(); } catch { /* ok */ } }
+      });
+
+      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
+      if (!this.cancelled) this.onStateChange?.("idle");
+    } catch (err) {
+      if (this.cancelled || (err as Error).name === "AbortError") return;
+      console.error("Web voice pipeline error:", err);
+      this.onError?.(String(err));
+      this.onStateChange?.("error");
+    } finally {
+      this.pipelineActive = false;
+      this.abortController = null;
+      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
+    }
+  }
+
+  cancelPipeline(): void {
+    this.cancelled = true;
+    this.pipelineActive = false;
+    this.abortController?.abort(); this.abortController = null;
+    if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
+    if (this.ttsSource) { try { this.ttsSource.stop(); } catch { /* ok */ } this.ttsSource = null; }
+    this.closeMic();
+    this.onAudioLevel?.(0);
+  }
+
+  startWakeListener(word: string, variants: string[]): void {
+    this.stopWakeInternal();
+    this.wakeActive = true;
+    const norm = [word.toLowerCase().trim()];
+    for (const v of variants) {
+      const n = v.toLowerCase().trim();
+      if (n && !norm.includes(n)) norm.push(n);
+    }
+    navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
+      .then((s) => this.runWakeLoop(s, norm, word))
+      .catch((err) => {
+        console.warn("Wake listener mic failed:", err);
+        this.onError?.("Mic access required for wake word detection.");
+        this.onStateChange?.("error");
+      });
+  }
+
+  stopWakeListener(): void { this.stopWakeInternal(); }
+  playPing(): void { playPingTone(); }
+
+  destroy(): void {
+    this.cancelPipeline();
+    this.stopWakeInternal();
+    this.closeMic();
+    closeAudioContext();
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // Private -- mic management
+  // ════════════════════════════════════════════════════════════════
+
+  private async openMic(): Promise<RecordingContext> {
+    const stream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+    const audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(stream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    const chunks: Float32Array[] = [];
+    processor.onaudioprocess = (e) => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+
+    const ctx: RecordingContext = {
+      stream, processor, source, analyser, audioContext,
+      chunks, sampleRate: audioContext.sampleRate, levelPump: null,
+    };
+    this.recording = ctx;
+    return ctx;
+  }
+
+  private closeMic(): void {
+    const ctx = this.recording;
+    if (!ctx) return;
+    if (ctx.levelPump) clearInterval(ctx.levelPump);
+    try { ctx.processor.disconnect(); } catch { /* ok */ }
+    try { ctx.source.disconnect(); } catch { /* ok */ }
+    ctx.stream.getTracks().forEach((t) => t.stop());
+    if (ctx.audioContext.state !== "closed") ctx.audioContext.close().catch(() => {});
+    this.recording = null;
+  }
+
+  private collectWav(): ArrayBuffer {
+    const ctx = this.recording;
+    if (!ctx) return encodeWav(new Float32Array(0), 16000);
+    const total = ctx.chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of ctx.chunks) { merged.set(c, off); off += c.length; }
+    return encodeWav(downsampleTo16k(merged, ctx.sampleRate), 16000);
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // Private -- transcription + TTS
+  // ════════════════════════════════════════════════════════════════
+
+  private async transcribe(wavBuffer: ArrayBuffer): Promise<string | null> {
+    const r = await api.transcribe(wavBuffer);
+    const t = r.text?.trim() ?? "";
+    return (!t || isWhisperArtifact(t)) ? null : t;
+  }
+
+  private async playTtsSentence(text: string, signal: AbortSignal): Promise<void> {
+    if (this.cancelled || signal.aborted) return;
+    try {
+      const res = await fetch(`${this.serverUrl}/api/v1/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        signal,
+      });
+      if (!res.ok) { console.warn("TTS failed:", res.status); return; }
+
+      const data = await res.arrayBuffer();
+      if (this.cancelled || signal.aborted) return;
+      const actx = getAudioContext();
+      const buf = await actx.decodeAudioData(data);
+      if (this.cancelled || signal.aborted) return;
+
+      return new Promise<void>((resolve) => {
+        const src = actx.createBufferSource();
+        src.buffer = buf;
+        src.connect(actx.destination);
+        this.ttsSource = src;
+        src.onended = () => { this.ttsSource = null; resolve(); };
+        src.start(0);
+      });
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") console.warn("TTS error:", err);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // Private -- SSE chat stream
+  // ════════════════════════════════════════════════════════════════
+
+  private async streamChat(
+    text: string, opts: PipelineOpts, controller: AbortController, onFirst: () => void,
+  ): Promise<void> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (opts.authToken) headers["Authorization"] = `Bearer ${opts.authToken}`;
+
+    const res = await fetch(`${opts.serverUrl}/api/v1/chat/stream`, {
+      method: "POST", headers, signal: controller.signal,
+      body: JSON.stringify({ message: text, session_id: opts.sessionId, voice_mode: true }),
+    });
+    if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status} ${res.statusText}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = "", thinkIn = false, firstSent = false, ttsBuf = "";
+    const ttsQ: string[] = [];
+    let playing = false;
+
+    const playNext = async (): Promise<void> => {
+      if (this.cancelled || !ttsQ.length) { playing = false; return; }
+      playing = true;
+      const cleaned = normalizeForSpeech(stripMarkdown(ttsQ.shift()!));
+      if (cleaned.trim()) await this.playTtsSentence(cleaned, controller.signal);
+      return playNext();
+    };
+
+    const enqueue = (s: string): void => {
+      if (!firstSent) { firstSent = true; onFirst(); }
+      ttsQ.push(s);
+      if (!playing) { this.onStateChange?.("speaking"); void playNext(); }
+    };
+
+    try {
+      while (!this.cancelled) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        sseBuf += decoder.decode(value, { stream: true });
+        const lines = sseBuf.split("\n");
+        sseBuf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const tr = line.trim();
+          if (!tr || tr === "data: [DONE]") continue;
+          const raw = tr.startsWith("data: ") ? tr.slice(6) : tr;
+          let ev: Record<string, unknown>;
+          try { ev = JSON.parse(raw); } catch { continue; }
+
+          if (ev.error) { this.onError?.(String(ev.error)); this.onStateChange?.("error"); return; }
+
+          if (ev.type === "text") {
+            const tok = (ev.content ?? ev.token ?? "") as string;
+            const [vis, blk] = filterThinkingFull(tok, thinkIn);
+            thinkIn = blk;
+            if (vis) {
+              this.onAgentToken?.(vis, false);
+              ttsBuf += vis;
+              const sents = splitSentences(ttsBuf);
+              if (sents.length > 1) {
+                for (let i = 0; i < sents.length - 1; i++) enqueue(sents[i]);
+                ttsBuf = sents[sents.length - 1];
+              }
+            }
+          }
+
+          if (ev.type === "tool_call") {
+            const tn = (ev.tool as string) ?? "tool";
+            if (ttsBuf.trim()) { enqueue(ttsBuf.trim()); ttsBuf = ""; }
+            enqueue(getToolAnnouncement(tn));
+            this.onToolCall?.({ tool: tn, data: (ev.arguments as Record<string, unknown>) ?? {} });
+          }
+
+          if (ev.done === true) {
+            this.onAgentToken?.("", true);
+            if (typeof ev.session_id === "string") this.onSessionId?.(ev.session_id);
+            if (ev.model_name && ev.model_role && ev.usage) {
+              const u = ev.usage as { completion_tokens?: number };
+              this.onResponseMeta?.({
+                modelName: ev.model_name as string,
+                modelRole: ev.model_role as string,
+                completionTokens: u.completion_tokens ?? 0,
+              });
+            }
+          }
+        }
+      }
+    } finally { reader.releaseLock(); }
+
+    if (ttsBuf.trim() && !this.cancelled) enqueue(ttsBuf.trim());
+
+    // Wait for TTS queue to drain
+    await new Promise<void>((resolve) => {
+      const id = setInterval(() => { if (!playing || this.cancelled) { clearInterval(id); resolve(); } }, 100);
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // Private -- wake word listener
+  // ════════════════════════════════════════════════════════════════
+
+  private runWakeLoop(stream: MediaStream, normalised: string[], rawWord: string): void {
+    if (!this.wakeActive) { stream.getTracks().forEach((t) => t.stop()); return; }
+
+    this.wakeStream = stream;
+    const actx = new AudioContext();
+    const src = actx.createMediaStreamSource(stream);
+    const analyser = actx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+
+    const proc = actx.createScriptProcessor(4096, 1, 1);
+    let capturing = false;
+    let chunks: Float32Array[] = [];
+    proc.onaudioprocess = (e) => { if (capturing) chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    src.connect(proc);
+    proc.connect(actx.destination);
+
+    const td = new Float32Array(analyser.fftSize);
+    let speechStart: number | null = null;
+    let onsetFrames = 0;
+
+    this.wakeInterval = setInterval(async () => {
+      if (!this.wakeActive) return;
+      analyser.getFloatTimeDomainData(td);
+      const rms = calculateRms(td);
+      this.onAudioLevel?.(rms * 0.3);
+
+      // Speech onset (hysteresis)
+      if (!capturing) {
+        if (rms >= WAKE_SPEECH_RMS) { if (++onsetFrames >= WAKE_ONSET_FRAMES) { capturing = true; chunks = []; speechStart = Date.now(); onsetFrames = 0; } }
+        else onsetFrames = 0;
+        return;
+      }
+
+      // Speech end detection
+      if (!speechStart) return;
+      const elapsed = Date.now() - speechStart;
+      if (elapsed < WAKE_POST_TRIGGER_MS && !(rms < WAKE_SILENCE_RMS && elapsed > WAKE_TAIL_MS)) return;
+
+      capturing = false;
+      speechStart = null;
+      const total = chunks.reduce((s, c) => s + c.length, 0);
+      if (total < WAKE_MIN_SAMPLES) { chunks = []; return; }
+
+      const merged = new Float32Array(total);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.length; }
+      chunks = [];
+
+      const ds = downsampleTo16k(merged, actx.sampleRate);
+      try {
+        const transcript = await this.transcribe(encodeWav(ds, 16000));
+        if (!transcript || !this.wakeActive) return;
+        if (!normalised.some((w) => transcript.toLowerCase().includes(w))) return;
+
+        // Barge-in
+        if (this.pipelineActive) { this.cancelPipeline(); this.onWakeInterrupt?.(); return; }
+
+        // Initial activation: ping + post-trigger continuation
+        playPingTone();
+        this.runPostTrigger(analyser, td, ds, (c) => { capturing = c; }, (c) => { chunks = c; });
+      } catch { /* transcription failed, ignore in wake mode */ }
+    }, 30);
+  }
+
+  /** Keep recording 2s after wake word to capture spoken command. */
+  private runPostTrigger(
+    analyser: AnalyserNode,
+    td: Float32Array<ArrayBuffer>,
+    seed: Float32Array,
+    setCapturing: (v: boolean) => void,
+    setChunks: (c: Float32Array[]) => void,
+  ): void {
+    const postChunks: Float32Array[] = [seed];
+    setCapturing(true);
+    setChunks(postChunks);
+
+    const t0 = Date.now();
+    let silStart: number | null = null;
+
+    const iv = setInterval(() => {
+      if (!this.wakeActive) { clearInterval(iv); setCapturing(false); return; }
+      analyser.getFloatTimeDomainData(td);
+      const rms = calculateRms(td);
+
+      if (rms < WAKE_SILENCE_RMS) {
+        if (!silStart) silStart = Date.now();
+        else if (Date.now() - silStart > WAKE_CONT_SILENCE_MS) { clearInterval(iv); finish(); return; }
+      } else { silStart = null; }
+
+      if (Date.now() - t0 >= WAKE_POST_TRIGGER_MS) { clearInterval(iv); finish(); }
+    }, 30);
+
+    const finish = (): void => {
+      setCapturing(false);
+      const total = postChunks.reduce((s, c) => s + c.length, 0);
+      const combined = new Float32Array(total);
+      let off = 0;
+      for (const c of postChunks) { combined.set(c, off); off += c.length; }
+      setChunks([]);
+      this.onWakeDetected?.(new Blob([encodeWav(combined, 16000)], { type: "audio/wav" }));
+    };
+  }
+
+  private stopWakeInternal(): void {
+    this.wakeActive = false;
+    if (this.wakeInterval) { clearInterval(this.wakeInterval); this.wakeInterval = null; }
+    if (this.wakeStream) { this.wakeStream.getTracks().forEach((t) => t.stop()); this.wakeStream = null; }
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────
+
+  private blobFromCtx(ctx: RecordingContext): Blob {
+    this.recording = ctx;
+    const wav = this.collectWav();
+    this.closeMic();
+    return new Blob([wav], { type: "audio/wav" });
+  }
+
+  private endPump(ctx: RecordingContext): void {
+    if (ctx.levelPump) clearInterval(ctx.levelPump);
+    this.onAudioLevel?.(0);
+  }
+
+  private emitMicError(err: unknown): void {
+    const msg = String(err);
+    this.onError?.(/permission|notallowederror|denied/i.test(msg)
+      ? "Microphone access denied. Please allow mic access in your browser settings."
+      : `Mic error: ${msg}`);
+    this.onStateChange?.("error");
+  }
+}

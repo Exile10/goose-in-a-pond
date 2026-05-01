@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-import { Button, Chip } from "@heroui/react";
-import { ArrowUp, Cpu, History, Mic, Paperclip, Zap } from "lucide-react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { Button } from "@heroui/react";
+import { ArrowUp, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Zap } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -8,7 +8,7 @@ import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ContextCard } from "../components/ContextCard";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
-import type { ChatEvent, SessionSummary } from "../api/types";
+import type { ChatEvent, ModelEntry, SessionSummary } from "../api/types";
 import { filterThinking } from "../lib/thinkFilter";
 
 // Human-readable tool status for the chat bubble while a tool runs.
@@ -52,8 +52,12 @@ export function Chat() {
   const [loadingSession, setLoadingSession] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [showSessions, setShowSessions] = useState(false);
+  const [showModelSelector, setShowModelSelector] = useState(false);
+  const [availableModels, setAvailableModels] = useState<ModelEntry[]>([]);
+  const [modelSwitching, setModelSwitching] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const modelSelectorRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
   const inThinkBlockRef = useRef(false);
 
@@ -85,6 +89,76 @@ export function Chat() {
   const refreshSessions = useCallback(() => {
     api.listSessions().then(setSessions).catch(() => {});
   }, []);
+
+  // Fetch available models when the selector is opened
+  const openModelSelector = useCallback(() => {
+    setShowModelSelector(true);
+    api.listModels()
+      .then(setAvailableModels)
+      .catch(() => {});
+  }, []);
+
+  // Filter to only downloaded LLM-capable models
+  const chatModels = useMemo(() => {
+    return availableModels.filter((m) => {
+      if (m.downloaded === false) return false;
+      // Exclude ASR/TTS models (categories: whisper, tts, tts_piper, tts_http)
+      const cat = (m.category ?? m.provider ?? "").toLowerCase();
+      if (cat === "whisper" || cat.startsWith("tts")) return false;
+      return true;
+    });
+  }, [availableModels]);
+
+  // Group models by provider
+  const groupedModels = useMemo(() => {
+    const map = new Map<string, ModelEntry[]>();
+    for (const m of chatModels) {
+      const group = map.get(m.provider) ?? [];
+      group.push(m);
+      map.set(m.provider, group);
+    }
+    return Array.from(map.entries());
+  }, [chatModels]);
+
+  // Handle model activation
+  const handleModelSwitch = useCallback(async (provider: string, name: string) => {
+    setModelSwitching(true);
+    try {
+      await api.activateModel(provider, name, "chat");
+      dispatch({
+        type: "SET_LAST_RESPONSE_META",
+        payload: {
+          modelName: name,
+          modelRole: "chat",
+          completionTokens: 0,
+        },
+      });
+    } catch (e) {
+      console.warn("Model switch failed:", e);
+    } finally {
+      setModelSwitching(false);
+      setShowModelSelector(false);
+    }
+  }, [dispatch]);
+
+  // Close model selector on outside click
+  useEffect(() => {
+    if (!showModelSelector) return;
+    function handleClick(e: MouseEvent) {
+      if (modelSelectorRef.current && !modelSelectorRef.current.contains(e.target as Node)) {
+        setShowModelSelector(false);
+      }
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setShowModelSelector(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [showModelSelector]);
 
   // Load most recent session on mount (once server is online)
   useEffect(() => {
@@ -281,11 +355,6 @@ export function Chat() {
             <History size={16} />
           </Button>
           <h1 className="page-header__title chat-toolbar__title">Chat</h1>
-          <Chip size="sm" variant="soft">
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-              <Cpu size={12} /> {modelLabel}
-            </span>
-          </Chip>
         </div>
         <div className="chat-toolbar__right">
           <Button
@@ -413,9 +482,71 @@ export function Chat() {
           </div>
         </div>
         <div className="chat-composer__hint">
-          <span>Ctrl/Cmd + Enter to send</span>
+          {/* Model selector */}
+          <div ref={modelSelectorRef} style={{ position: "relative" }}>
+            <button
+              className={`model-selector-trigger${showModelSelector ? " is-open" : ""}`}
+              onClick={() => showModelSelector ? setShowModelSelector(false) : openModelSelector()}
+              disabled={modelSwitching}
+              aria-label="Select model"
+              aria-expanded={showModelSelector}
+            >
+              <Cpu size={11} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                {modelSwitching ? "Switching..." : modelLabel}
+              </span>
+              {modelSwitching
+                ? <Loader2 size={10} className="spin" />
+                : <ChevronDown size={10} />}
+            </button>
+
+            {showModelSelector && (
+              <div className="model-selector-dropdown">
+                <div className="model-selector-dropdown__header">
+                  <span>Switch Model</span>
+                </div>
+                <div className="model-selector-dropdown__list">
+                  {groupedModels.length === 0 && (
+                    <div className="model-selector-dropdown__empty">
+                      No models available
+                    </div>
+                  )}
+                  {groupedModels.map(([provider, group]) => {
+                    const providerLabel = provider.charAt(0).toUpperCase() + provider.slice(1);
+                    return (
+                      <div key={provider}>
+                        <div className="model-selector-dropdown__group-label">{providerLabel}</div>
+                        {group.map((m) => {
+                          const isActive = modelLabel === m.name || modelLabel === (m.display_name ?? m.name);
+                          // Use name as label; fall back to display_name but skip generic descriptions
+                          const label = m.name;
+                          return (
+                            <button
+                              key={m.id}
+                              className={`model-selector-dropdown__item${isActive ? " is-active" : ""}`}
+                              onClick={() => handleModelSwitch(m.provider, m.name)}
+                              disabled={modelSwitching}
+                            >
+                              <span className="model-selector-dropdown__item-name">
+                                {label}
+                              </span>
+                              <span className="model-selector-dropdown__item-meta">
+                                {m.size_mb ? `${m.size_mb >= 1024 ? (m.size_mb / 1024).toFixed(1) + " GB" : m.size_mb + " MB"}` : ""}
+                                {isActive && <Check size={12} color="var(--color-accent)" />}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
           <span>&middot;</span>
-          <span>Up arrow to edit last message</span>
+          <span>Cmd + Enter to send</span>
         </div>
       </div>
     </div>
