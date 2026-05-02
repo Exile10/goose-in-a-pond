@@ -15,7 +15,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { MemoryFragment, MemorySegment, MemoryTier } from "../api/types";
+import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
 
 // ── Segment metadata ──────────────────────────────────────────
 
@@ -640,6 +640,79 @@ const modalStyles: Record<string, React.CSSProperties> = {
   },
 };
 
+// ── Memory settings toggles ──────────────────────────────────
+
+function MemorySettingsCard({ settings, onToggle }: {
+  settings: Partial<Settings>;
+  onToggle: (key: string, value: boolean) => void;
+}) {
+  const toggles: { key: string; label: string; desc: string; value: boolean }[] = [
+    {
+      key: "agent_memory_inject",
+      label: "Inject into prompt",
+      desc: "Include recent memories in the LLM system prompt each turn",
+      value: settings.agent_memory_inject ?? true,
+    },
+    {
+      key: "memory_extraction_enabled",
+      label: "Auto-extraction",
+      desc: "Automatically extract facts from conversations in the background",
+      value: settings.memory_extraction_enabled ?? true,
+    },
+    {
+      key: "memory_cleanup_enabled",
+      label: "Decay and cleanup",
+      desc: "Archive low-scoring memories based on time decay (every 6 hours)",
+      value: settings.memory_cleanup_enabled ?? true,
+    },
+    {
+      key: "memory_consolidation_enabled",
+      label: "Consolidation",
+      desc: "Use the LLM to merge similar memories and prune duplicates (every 24 hours)",
+      value: settings.memory_consolidation_enabled ?? false,
+    },
+  ];
+
+  return (
+    <Card shadow="none" className="giap-card">
+      <CardContent>
+        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: 10, color: "var(--fg)" }}>
+          Memory Settings
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {toggles.map((t) => (
+            <label
+              key={t.key}
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 10,
+                cursor: "pointer",
+                padding: "4px 0",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={t.value}
+                onChange={(e) => onToggle(t.key, e.target.checked)}
+                style={{ marginTop: 2, accentColor: "var(--purple-600, #9333ea)" }}
+              />
+              <div>
+                <div style={{ fontSize: "13px", fontWeight: 500, color: "var(--fg)" }}>
+                  {t.label}
+                </div>
+                <div style={{ fontSize: "11px", color: "var(--grey-500)", marginTop: 1 }}>
+                  {t.desc}
+                </div>
+              </div>
+            </label>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── Main Memory component ─────────────────────────────────────
 
 export function Memory() {
@@ -648,6 +721,7 @@ export function Memory() {
   const [error, setError]         = useState<string | null>(null);
   const [activeFilter, setFilter] = useState<SegmentKey>("all");
   const [showAddModal, setShowAddModal] = useState(false);
+  const [memSettings, setMemSettings] = useState<Partial<Settings>>({});
 
   function load() {
     setLoading(true);
@@ -659,7 +733,24 @@ export function Memory() {
       .finally(() => setLoading(false));
   }
 
-  useEffect(() => { load(); }, []);
+  function loadSettings() {
+    api.getSettings()
+      .then(setMemSettings)
+      .catch(() => {}); // non-fatal
+  }
+
+  useEffect(() => { load(); loadSettings(); }, []);
+
+  async function handleToggleSetting(key: string, value: boolean) {
+    const patch = { [key]: value } as Partial<Settings>;
+    setMemSettings((prev) => ({ ...prev, ...patch }));
+    try {
+      await api.updateSettings(patch);
+    } catch (e) {
+      setError(String(e));
+      loadSettings(); // revert on failure
+    }
+  }
 
   async function handleAdd(
     content: string,
@@ -781,6 +872,9 @@ export function Memory() {
           </CardContent>
         </Card>
       )}
+
+      {/* Memory lifecycle settings */}
+      <MemorySettingsCard settings={memSettings} onToggle={handleToggleSetting} />
     </div>
   );
 }

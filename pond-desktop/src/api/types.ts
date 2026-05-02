@@ -63,6 +63,11 @@ export interface Settings {
   agent_memory_inject: boolean;
   agent_memory_limit?: number;
 
+  // Memory lifecycle
+  memory_extraction_enabled?: boolean;
+  memory_cleanup_enabled?: boolean;
+  memory_consolidation_enabled?: boolean;
+
   // Data retention
   retention_event_log_days?: number;
   retention_sensor_days?: number;
