@@ -4808,6 +4808,12 @@ struct SaveMemoryRequest {
     tags: Vec<String>,
     #[serde(default = "default_source")]
     source: String,
+    #[serde(default)]
+    segment: Option<pond_core::domain::memory::MemorySegment>,
+    #[serde(default)]
+    importance: Option<f32>,
+    #[serde(default)]
+    tier: Option<pond_core::domain::memory::MemoryTier>,
 }
 fn default_source() -> String { "api".to_string() }
 
@@ -4819,6 +4825,15 @@ async fn save_memory(
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
     };
+    // Derive defaults from segment if provided
+    let decay_rate = req.tier.as_ref()
+        .map(|t| t.default_decay_rate())
+        .or_else(|| req.segment.as_ref().map(|s| s.default_tier().default_decay_rate()));
+    let importance = req.importance
+        .or_else(|| req.segment.as_ref().map(|s| s.default_importance()));
+    let tier = req.tier
+        .or_else(|| req.segment.as_ref().map(|s| s.default_tier()));
+
     let fragment = MemoryFragment {
         id: Uuid::new_v4().to_string(),
         profile_id: None,
@@ -4828,13 +4843,13 @@ async fn save_memory(
         source: req.source,
         tags: req.tags,
         created_at: chrono::Utc::now(),
-        segment: None,
-        importance: None,
-        tier: None,
-        decay_rate: None,
+        segment: req.segment,
+        importance,
+        tier,
+        decay_rate,
         access_count: 0,
         last_accessed_at: None,
-        lifecycle: None,
+        lifecycle: Some(pond_core::domain::memory::MemoryLifecycle::Active),
         superseded_by: None,
     };
     match state.memory_repo.add(fragment.clone()).await {
