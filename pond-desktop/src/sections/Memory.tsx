@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { Card, CardContent, Button, Chip, Input } from "@heroui/react";
+import { useState, useEffect, useRef } from "react";
+import { Card, CardContent, Button, Chip } from "@heroui/react";
 import {
   BrainCircuit,
   Shield,
@@ -11,9 +11,8 @@ import {
   Star,
   Trash2,
   Plus,
-  ChevronDown,
-  ChevronUp,
   RefreshCw,
+  X,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { MemoryFragment, MemorySegment, MemoryTier } from "../api/types";
@@ -242,11 +241,11 @@ function MemCard({
   );
 }
 
-// ── Add memory form ───────────────────────────────────────────
+// ── Add memory modal ──────────────────────────────────────────
 
-function AddMemoryForm({
+function AddMemoryModal({
   onAdd,
-  disabled,
+  onClose,
 }: {
   onAdd: (
     content: string,
@@ -254,133 +253,392 @@ function AddMemoryForm({
     importance?: number,
     tier?: MemoryTier,
   ) => Promise<void>;
-  disabled: boolean;
+  onClose: () => void;
 }) {
-  const [input, setInput] = useState("");
+  const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [segment, setSegment] = useState<MemorySegment | "">("");
   const [importance, setImportance] = useState(0.7);
   const [tier, setTier] = useState<MemoryTier | "">("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  async function handleAdd() {
-    const content = input.trim();
-    if (!content) return;
+  // Auto-focus textarea on open
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, []);
+
+  // Close on Escape
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [onClose]);
+
+  async function handleSave() {
+    const trimmed = content.trim();
+    if (!trimmed) return;
     setSaving(true);
     try {
       await onAdd(
-        content,
+        trimmed,
         segment !== "" ? (segment as MemorySegment) : undefined,
-        showAdvanced && segment !== "" ? importance : undefined,
+        segment !== "" ? importance : undefined,
         tier !== "" ? (tier as MemoryTier) : undefined,
       );
-      setInput("");
-      if (!showAdvanced) {
-        // Keep advanced settings across adds when panel is open
-      }
+      onClose();
     } finally {
       setSaving(false);
     }
   }
 
+  const segmentColor = segment !== "" ? SEGMENT_IMPORT_FILL[segment as MemorySegment] : undefined;
+
   return (
-    <Card shadow="none" className="giap-card">
-      <CardContent>
-        <div className="mem-add-form">
-          <div className="mem-add-form__row">
-            <Input
-              className="mem-add__input"
-              size="sm"
-              radius="md"
-              variant="bordered"
-              placeholder="Add a memory..."
-              aria-label="New memory content"
-              value={input}
-              onValueChange={setInput}
-              onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && handleAdd()}
-              startContent={<BrainCircuit size={14} />}
+    <div style={modalStyles.overlay} onClick={onClose}>
+      <div style={modalStyles.dialog} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Add memory">
+        {/* Header */}
+        <div style={modalStyles.header}>
+          <div style={modalStyles.headerLeft}>
+            <div style={modalStyles.headerIcon}>
+              <BrainCircuit size={16} strokeWidth={1.8} />
+            </div>
+            <h2 style={modalStyles.title}>Add Memory</h2>
+          </div>
+          <button style={modalStyles.closeBtn} onClick={onClose} aria-label="Close">
+            <X size={16} strokeWidth={1.8} />
+          </button>
+        </div>
+
+        <div style={modalStyles.divider} />
+
+        {/* Body */}
+        <div style={modalStyles.body}>
+          {/* Content textarea */}
+          <div style={modalStyles.fieldGroup}>
+            <label style={modalStyles.label} htmlFor="mem-content">Content</label>
+            <textarea
+              id="mem-content"
+              ref={textareaRef}
+              style={modalStyles.textarea}
+              placeholder="What should the assistant remember?"
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              disabled={saving}
+              rows={4}
+              aria-label="Memory content"
             />
-            <Button
-              size="sm"
-              color="secondary"
-              onPress={handleAdd}
-              isDisabled={!input.trim() || saving || disabled}
-            >
-              <Plus size={14} strokeWidth={2} />
-              Add
-            </Button>
           </div>
 
-          <button
-            className="mem-add-form__toggle"
-            onClick={() => setShowAdvanced((v) => !v)}
-            type="button"
-          >
-            {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-            {showAdvanced ? "Hide options" : "Set segment, importance, tier"}
-          </button>
-
-          {showAdvanced && (
-            <div className="mem-add-form__fields">
-              {/* Segment */}
-              <div>
-                <div className="mem-add-form__field-label">Segment</div>
-                <select
-                  className="mem-add-form__select"
-                  value={segment}
-                  onChange={(e) => setSegment(e.target.value as MemorySegment | "")}
-                  disabled={saving}
-                >
-                  <option value="">Auto-classify</option>
-                  {SEGMENT_ORDER.map((s) => (
-                    <option key={s} value={s}>{SEGMENTS[s].label}</option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Importance */}
-              <div>
-                <div className="mem-add-form__field-label">Importance</div>
-                <div className="mem-add-form__importance-row">
-                  <input
-                    type="range"
-                    className="mem-add-form__range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={importance}
-                    onChange={(e) => setImportance(parseFloat(e.target.value))}
-                    disabled={saving || segment === ""}
-                    title={segment === "" ? "Select a segment first" : `Importance: ${importance}`}
-                  />
-                  <span className="mem-add-form__importance-val">
-                    {segment !== "" ? importance.toFixed(2) : "–"}
-                  </span>
-                </div>
-              </div>
-
-              {/* Tier */}
-              <div>
-                <div className="mem-add-form__field-label">Tier</div>
-                <select
-                  className="mem-add-form__select"
-                  value={tier}
-                  onChange={(e) => setTier(e.target.value as MemoryTier | "")}
-                  disabled={saving}
-                >
-                  <option value="">Auto (by segment)</option>
-                  <option value="short">Short</option>
-                  <option value="long">Long</option>
-                  <option value="permanent">Permanent</option>
-                </select>
-              </div>
+          {/* Segment dropdown */}
+          <div style={modalStyles.fieldGroup}>
+            <label style={modalStyles.label} htmlFor="mem-segment">Segment</label>
+            <div style={modalStyles.selectWrap}>
+              {segment !== "" && (
+                <span style={{ ...modalStyles.segDot, background: segmentColor }} />
+              )}
+              <select
+                id="mem-segment"
+                style={{
+                  ...modalStyles.select,
+                  paddingLeft: segment !== "" ? "28px" : "10px",
+                }}
+                value={segment}
+                onChange={(e) => {
+                  const val = e.target.value as MemorySegment | "";
+                  setSegment(val);
+                  if (val !== "") {
+                    setImportance(SEGMENTS[val as MemorySegment].importanceDefault);
+                  }
+                }}
+                disabled={saving}
+              >
+                <option value="">Auto-classify</option>
+                {SEGMENT_ORDER.map((s) => (
+                  <option key={s} value={s}>{SEGMENTS[s].label}</option>
+                ))}
+              </select>
             </div>
-          )}
+          </div>
+
+          {/* Importance slider */}
+          <div style={modalStyles.fieldGroup}>
+            <div style={modalStyles.importanceLabelRow}>
+              <label style={modalStyles.label} htmlFor="mem-importance">Importance</label>
+              <span style={modalStyles.importanceVal}>
+                {segment !== "" ? importance.toFixed(2) : "–"}
+              </span>
+            </div>
+            <input
+              id="mem-importance"
+              type="range"
+              style={{
+                ...modalStyles.range,
+                accentColor: segmentColor ?? "var(--color-accent)",
+                opacity: segment === "" ? 0.4 : 1,
+                cursor: segment === "" ? "not-allowed" : "pointer",
+              }}
+              min={0}
+              max={1}
+              step={0.05}
+              value={importance}
+              onChange={(e) => setImportance(parseFloat(e.target.value))}
+              disabled={saving || segment === ""}
+              title={segment === "" ? "Select a segment first to set importance" : `Importance: ${importance}`}
+            />
+            <div style={modalStyles.rangeLabels}>
+              <span>Low</span>
+              <span>High</span>
+            </div>
+          </div>
+
+          {/* Tier selector */}
+          <div style={modalStyles.fieldGroup}>
+            <label style={modalStyles.label}>Tier</label>
+            <div style={modalStyles.tierRow}>
+              {(["", "short", "long", "permanent"] as const).map((t) => {
+                const labels: Record<string, string> = {
+                  "": "Auto",
+                  short: "Short",
+                  long: "Long",
+                  permanent: "Permanent",
+                };
+                const isActive = tier === t;
+                return (
+                  <button
+                    key={t}
+                    style={{
+                      ...modalStyles.tierBtn,
+                      ...(isActive ? modalStyles.tierBtnActive : {}),
+                    }}
+                    onClick={() => setTier(t as MemoryTier | "")}
+                    disabled={saving}
+                    type="button"
+                    aria-pressed={isActive}
+                  >
+                    {labels[t]}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
-      </CardContent>
-    </Card>
+
+        {/* Footer */}
+        <div style={modalStyles.footer}>
+          <Button variant="ghost" size="sm" onPress={onClose} isDisabled={saving}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            color="secondary"
+            onPress={handleSave}
+            isDisabled={!content.trim() || saving}
+            isLoading={saving}
+          >
+            {!saving && <Plus size={14} strokeWidth={2} />}
+            Save Memory
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
+
+const modalStyles: Record<string, React.CSSProperties> = {
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(23, 22, 22, 0.45)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 1000,
+    backdropFilter: "blur(2px)",
+  },
+  dialog: {
+    background: "#fff",
+    borderRadius: "var(--radius-card)",
+    boxShadow: "0 12px 40px rgba(28,28,28,0.15), 0 2px 8px rgba(28,28,28,0.06)",
+    width: "480px",
+    maxWidth: "calc(100vw - 32px)",
+    maxHeight: "90vh",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+  },
+  header: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "16px 20px 14px",
+    flexShrink: 0,
+  },
+  headerLeft: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+  },
+  headerIcon: {
+    width: "32px",
+    height: "32px",
+    borderRadius: "8px",
+    background: "rgba(147, 51, 234, 0.08)",
+    color: "var(--purple-700, #6d28d9)",
+    display: "grid",
+    placeItems: "center",
+    flexShrink: 0,
+  },
+  title: {
+    fontFamily: "var(--font-heading)",
+    fontWeight: 700,
+    fontSize: "15px",
+    margin: 0,
+    color: "var(--fg)",
+  },
+  closeBtn: {
+    background: "none",
+    border: "none",
+    cursor: "pointer",
+    color: "var(--grey-500)",
+    padding: "6px",
+    lineHeight: 1,
+    borderRadius: "6px",
+    display: "grid",
+    placeItems: "center",
+    transition: "background 120ms, color 120ms",
+  },
+  divider: {
+    height: "1px",
+    background: "var(--grey-100)",
+    flexShrink: 0,
+  },
+  body: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "18px 20px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "16px",
+  },
+  fieldGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
+  },
+  label: {
+    fontSize: "11px",
+    fontWeight: 600,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase" as React.CSSProperties["textTransform"],
+    color: "var(--grey-500)",
+  },
+  textarea: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "1px solid var(--grey-200)",
+    borderRadius: "8px",
+    fontSize: "13.5px",
+    fontFamily: "var(--font-body)",
+    background: "#fff",
+    color: "var(--fg)",
+    outline: "none",
+    resize: "vertical" as React.CSSProperties["resize"],
+    lineHeight: 1.55,
+    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+    minHeight: "96px",
+    transition: "border-color 120ms",
+  },
+  selectWrap: {
+    position: "relative",
+    display: "flex",
+    alignItems: "center",
+  },
+  segDot: {
+    position: "absolute",
+    left: "10px",
+    width: "8px",
+    height: "8px",
+    borderRadius: "50%",
+    flexShrink: 0,
+    pointerEvents: "none" as React.CSSProperties["pointerEvents"],
+    zIndex: 1,
+  },
+  select: {
+    height: "34px",
+    paddingRight: "10px",
+    border: "1px solid var(--grey-200)",
+    borderRadius: "8px",
+    fontSize: "13px",
+    fontFamily: "var(--font-body)",
+    background: "#fff",
+    color: "var(--fg)",
+    outline: "none",
+    width: "100%",
+    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+    cursor: "pointer",
+    appearance: "auto" as React.CSSProperties["appearance"],
+    transition: "border-color 120ms",
+  },
+  importanceLabelRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  importanceVal: {
+    fontFamily: "var(--font-mono)",
+    fontSize: "12px",
+    color: "var(--grey-500)",
+    minWidth: "32px",
+    textAlign: "right" as React.CSSProperties["textAlign"],
+  },
+  range: {
+    width: "100%",
+    height: "20px",
+    cursor: "pointer",
+    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+  },
+  rangeLabels: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: "10px",
+    color: "var(--grey-400)",
+    marginTop: "-2px",
+  },
+  tierRow: {
+    display: "flex",
+    gap: "6px",
+  },
+  tierBtn: {
+    flex: 1,
+    height: "30px",
+    border: "1px solid var(--grey-200)",
+    borderRadius: "7px",
+    background: "transparent",
+    cursor: "pointer",
+    fontSize: "12px",
+    fontFamily: "var(--font-body)",
+    fontWeight: 500,
+    color: "var(--grey-600)",
+    transition: "background 120ms, border-color 120ms, color 120ms",
+  },
+  tierBtnActive: {
+    background: "rgba(147, 51, 234, 0.07)",
+    borderColor: "rgba(147, 51, 234, 0.35)",
+    color: "var(--purple-700, #6d28d9)",
+    fontWeight: 600,
+  },
+  footer: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: "8px",
+    padding: "12px 20px",
+    borderTop: "1px solid var(--grey-100)",
+    flexShrink: 0,
+    background: "var(--grey-50)",
+  },
+};
 
 // ── Main Memory component ─────────────────────────────────────
 
@@ -389,6 +647,7 @@ export function Memory() {
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState<string | null>(null);
   const [activeFilter, setFilter] = useState<SegmentKey>("all");
+  const [showAddModal, setShowAddModal] = useState(false);
 
   function load() {
     setLoading(true);
@@ -456,11 +715,20 @@ export function Memory() {
             <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
             Refresh
           </Button>
+          <Button size="sm" color="secondary" onPress={() => setShowAddModal(true)}>
+            <Plus size={14} strokeWidth={2} />
+            Add Memory
+          </Button>
         </div>
       </div>
 
-      {/* Add form */}
-      <AddMemoryForm onAdd={handleAdd} disabled={false} />
+      {/* Add memory modal */}
+      {showAddModal && (
+        <AddMemoryModal
+          onAdd={handleAdd}
+          onClose={() => setShowAddModal(false)}
+        />
+      )}
 
       {/* Error */}
       {error && (
