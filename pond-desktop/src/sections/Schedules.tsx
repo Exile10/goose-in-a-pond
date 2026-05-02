@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Card,
   CardContent,
@@ -7,20 +7,107 @@ import {
   Chip,
   Separator,
 } from "@heroui/react";
-import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar } from "lucide-react";
+import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type { Schedule, ScheduleRun } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
 
-/* ── Frequency presets for the create form ─────────────────── */
-const FREQ_PRESETS: Record<string, string> = {
-  "Every minute":  "0 * * * * *",
-  "Hourly":        "0 0 * * * *",
-  "Daily (8 AM)":  "0 0 8 * * *",
-  "Weekly (Mon)":  "0 0 8 * * 1",
-  "Custom":        "",
-};
+/* ── Repeat patterns ──────────────────────────────────────── */
+type RepeatPattern = "once" | "hourly" | "daily" | "weekly" | "monthly" | "custom";
+
+const REPEAT_PATTERNS: { key: RepeatPattern; label: string }[] = [
+  { key: "once",    label: "Once"    },
+  { key: "hourly",  label: "Hourly"  },
+  { key: "daily",   label: "Daily"   },
+  { key: "weekly",  label: "Weekly"  },
+  { key: "monthly", label: "Monthly" },
+  { key: "custom",  label: "Custom"  },
+];
+
+const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// cron day-of-week: 1=Mon … 7=Sun (or 0=Sun in some engines; use 1-7)
+const DAY_VALUES = [1, 2, 3, 4, 5, 6, 7];
+
+interface ScheduleConfig {
+  // hourly
+  everyNHours: number;
+  startMinute: number;
+  // daily / weekly / monthly
+  hour: number;
+  minute: number;
+  // weekly
+  daysOfWeek: number[];
+  // monthly
+  dayOfMonth: number;
+  // custom
+  customCron: string;
+}
+
+function defaultConfig(): ScheduleConfig {
+  return {
+    everyNHours: 1,
+    startMinute: 0,
+    hour: 8,
+    minute: 0,
+    daysOfWeek: [1],   // Monday
+    dayOfMonth: 1,
+    customCron: "0 0 8 * * *",
+  };
+}
+
+function buildCron(repeat: RepeatPattern, cfg: ScheduleConfig): string {
+  switch (repeat) {
+    case "once":
+      // "Once" fires at a specific time — daily cron the user can disable after first run
+      return `0 ${cfg.minute} ${cfg.hour} * * *`;
+    case "hourly":
+      return `0 ${cfg.startMinute} */${cfg.everyNHours} * * *`;
+    case "daily":
+      return `0 ${cfg.minute} ${cfg.hour} * * *`;
+    case "weekly": {
+      const days = cfg.daysOfWeek.length ? cfg.daysOfWeek.join(",") : "1";
+      return `0 ${cfg.minute} ${cfg.hour} * * ${days}`;
+    }
+    case "monthly":
+      return `0 ${cfg.minute} ${cfg.hour} ${cfg.dayOfMonth} * *`;
+    default:
+      return cfg.customCron;
+  }
+}
+
+function ordinal(n: number): string {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function humanPreview(repeat: RepeatPattern, cfg: ScheduleConfig, timezone: string): string {
+  const timeStr = `${String(cfg.hour).padStart(2, "0")}:${String(cfg.minute).padStart(2, "0")}`;
+  const tz = timezone !== "UTC" ? ` (${timezone})` : "";
+  switch (repeat) {
+    case "once":
+      return `Runs once at ${timeStr}${tz}`;
+    case "hourly":
+      return `Runs every ${cfg.everyNHours === 1 ? "hour" : `${cfg.everyNHours} hours`} at :${String(cfg.startMinute).padStart(2, "0")}${tz}`;
+    case "daily":
+      return `Runs every day at ${timeStr}${tz}`;
+    case "weekly": {
+      const days = cfg.daysOfWeek
+        .slice()
+        .sort((a, b) => a - b)
+        .map((d) => DAY_LABELS[d - 1])
+        .join(", ");
+      return `Runs every ${days || "Mon"} at ${timeStr}${tz}`;
+    }
+    case "monthly":
+      return `Runs on the ${ordinal(cfg.dayOfMonth)} of every month at ${timeStr}${tz}`;
+    case "custom":
+      return cfg.customCron ? `Cron: ${cfg.customCron}${tz}` : "Enter a cron expression above";
+    default:
+      return "";
+  }
+}
 
 /* ── Recipe / prompt presets ───────────────────────────────── */
 const RECIPE_PRESETS: Record<string, string> = {
@@ -80,9 +167,13 @@ export function Schedules() {
   const [cron, setCron]               = useState("");
   const [prompt, setPrompt]           = useState("");
   const [timezone, setTimezone]       = useState("UTC");
-  const [freqKey, setFreqKey]         = useState("Custom");
+  const [freqKey, setFreqKey]         = useState("Custom");   // kept for compat
   const [recipeKey, setRecipeKey]     = useState("Custom");
   const [submitting, setSubmitting]   = useState(false);
+
+  // Human-friendly repeat picker state
+  const [repeat, setRepeat]           = useState<RepeatPattern>("daily");
+  const [schedCfg, setSchedCfg]       = useState<ScheduleConfig>(defaultConfig());
 
   // Run history per schedule (expanded state + cached runs)
   const [expandedRuns, setExpandedRuns] = useState<string | null>(null);
@@ -120,13 +211,38 @@ export function Schedules() {
     }
   }
 
+  // Keep cron in sync with picker whenever picker state changes
+  const pickerCron = useMemo(() => buildCron(repeat, schedCfg), [repeat, schedCfg]);
+
+  // Sync the legacy `cron` state variable with the picker output so the API
+  // call always uses the latest value without any additional wiring.
+  useEffect(() => {
+    setCron(pickerCron);
+  }, [pickerCron]);
+
+  function updateCfg(patch: Partial<ScheduleConfig>) {
+    setSchedCfg((prev) => ({ ...prev, ...patch }));
+  }
+
+  function toggleDay(d: number) {
+    setSchedCfg((prev) => {
+      const already = prev.daysOfWeek.includes(d);
+      const next = already
+        ? prev.daysOfWeek.filter((x) => x !== d)
+        : [...prev.daysOfWeek, d];
+      // Always keep at least one day selected
+      return { ...prev, daysOfWeek: next.length ? next : [d] };
+    });
+  }
+
   async function handleCreate() {
-    if (!name.trim() || !cron.trim() || !prompt.trim()) return;
+    const finalCron = pickerCron.trim();
+    if (!name.trim() || !finalCron || !prompt.trim()) return;
     setSubmitting(true);
     try {
       await api.createSchedule({
         name: name.trim(),
-        cron: cron.trim(),
+        cron: finalCron,
         prompt: prompt.trim(),
         timezone,
         enabled: true,
@@ -137,6 +253,8 @@ export function Schedules() {
       setTimezone("UTC");
       setFreqKey("Custom");
       setRecipeKey("Custom");
+      setRepeat("daily");
+      setSchedCfg(defaultConfig());
       setShowForm(false);
       flashMsg("Schedule created.");
       load();
@@ -196,12 +314,6 @@ export function Schedules() {
     }
   }, [expandedRuns]);
 
-  function handleFreqChange(key: string) {
-    setFreqKey(key);
-    const preset = FREQ_PRESETS[key];
-    if (preset) setCron(preset);
-  }
-
   function handleRecipeChange(key: string) {
     setRecipeKey(key);
     const preset = RECIPE_PRESETS[key];
@@ -229,6 +341,7 @@ export function Schedules() {
 
           {/* Body */}
           <div style={modalStyles.body}>
+            {/* Name */}
             <div style={modalStyles.fieldGroup}>
               <label style={modalStyles.label}>Name</label>
               <input
@@ -240,43 +353,173 @@ export function Schedules() {
               />
             </div>
 
-            {/* Frequency select */}
+            {/* Repeat pattern — pill segmented control */}
             <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>Frequency</label>
-              <select
-                style={modalStyles.select}
-                value={freqKey}
-                onChange={(e) => handleFreqChange(e.target.value)}
-                aria-label="Schedule frequency"
-              >
-                {Object.keys(FREQ_PRESETS).map((k) => (
-                  <option key={k} value={k}>
-                    {k}
-                  </option>
+              <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+                <Repeat size={13} style={{ color: "var(--color-accent)" }} />
+                Repeat
+              </label>
+              <div style={pickerStyles.pillRow} role="group" aria-label="Repeat pattern">
+                {REPEAT_PATTERNS.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    type="button"
+                    style={{
+                      ...pickerStyles.pill,
+                      ...(repeat === key ? pickerStyles.pillActive : {}),
+                    }}
+                    onClick={() => setRepeat(key)}
+                    aria-pressed={repeat === key}
+                  >
+                    {label}
+                  </button>
                 ))}
-              </select>
+              </div>
             </div>
 
-            <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>
-                Cron expression
-                <span style={{ fontSize: "11px", color: "var(--grey-500)", fontWeight: 400 }}>
-                  {" "}-- sec min hr dom mon dow
-                </span>
-              </label>
-              <input
-                style={modalStyles.input}
-                placeholder="0 0 8 * * *"
-                aria-label="Cron expression"
-                value={cron}
-                onChange={(e) => setCron(e.target.value)}
-                spellCheck={false}
-              />
+            {/* Conditional controls per repeat pattern */}
+            {repeat === "hourly" && (
+              <div style={pickerStyles.inlineRow}>
+                <div style={modalStyles.fieldGroup}>
+                  <label style={modalStyles.label}>Every</label>
+                  <div style={pickerStyles.inlineInputGroup}>
+                    <select
+                      style={{ ...modalStyles.select, width: 80 }}
+                      value={schedCfg.everyNHours}
+                      onChange={(e) => updateCfg({ everyNHours: Number(e.target.value) })}
+                      aria-label="Every N hours"
+                    >
+                      {[1, 2, 3, 4, 6, 8, 12].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                    <span style={pickerStyles.unitLabel}>hours</span>
+                  </div>
+                </div>
+                <div style={modalStyles.fieldGroup}>
+                  <label style={modalStyles.label}>At minute</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={59}
+                    style={{ ...modalStyles.input, width: 80 }}
+                    value={schedCfg.startMinute}
+                    onChange={(e) => updateCfg({ startMinute: Math.min(59, Math.max(0, Number(e.target.value))) })}
+                    aria-label="Starting at minute"
+                  />
+                </div>
+              </div>
+            )}
+
+            {(repeat === "daily" || repeat === "weekly" || repeat === "monthly" || repeat === "once") && (
+              <div style={modalStyles.fieldGroup}>
+                <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+                  <Clock size={12} style={{ color: "var(--grey-500)" }} />
+                  Time
+                </label>
+                <div style={pickerStyles.inlineRow}>
+                  <div style={pickerStyles.inlineInputGroup}>
+                    <select
+                      style={{ ...modalStyles.select, width: 78 }}
+                      value={schedCfg.hour}
+                      onChange={(e) => updateCfg({ hour: Number(e.target.value) })}
+                      aria-label="Hour"
+                    >
+                      {Array.from({ length: 24 }, (_, i) => (
+                        <option key={i} value={i}>{String(i).padStart(2, "0")}</option>
+                      ))}
+                    </select>
+                    <span style={pickerStyles.timeSep}>:</span>
+                    <select
+                      style={{ ...modalStyles.select, width: 78 }}
+                      value={schedCfg.minute}
+                      onChange={(e) => updateCfg({ minute: Number(e.target.value) })}
+                      aria-label="Minute"
+                    >
+                      {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((m) => (
+                        <option key={m} value={m}>{String(m).padStart(2, "0")}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {repeat === "weekly" && (
+              <div style={modalStyles.fieldGroup}>
+                <label style={modalStyles.label}>Days</label>
+                <div style={pickerStyles.pillRow} role="group" aria-label="Days of week">
+                  {DAY_LABELS.map((day, i) => {
+                    const val = DAY_VALUES[i];
+                    const active = schedCfg.daysOfWeek.includes(val);
+                    return (
+                      <button
+                        key={day}
+                        type="button"
+                        style={{
+                          ...pickerStyles.pill,
+                          ...(active ? pickerStyles.pillActive : {}),
+                        }}
+                        onClick={() => toggleDay(val)}
+                        aria-pressed={active}
+                      >
+                        {day}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {repeat === "monthly" && (
+              <div style={modalStyles.fieldGroup}>
+                <label style={modalStyles.label}>Day of month</label>
+                <div style={pickerStyles.inlineInputGroup}>
+                  <input
+                    type="number"
+                    min={1}
+                    max={31}
+                    style={{ ...modalStyles.input, width: 80 }}
+                    value={schedCfg.dayOfMonth}
+                    onChange={(e) => updateCfg({ dayOfMonth: Math.min(31, Math.max(1, Number(e.target.value))) })}
+                    aria-label="Day of month"
+                  />
+                  <span style={pickerStyles.unitLabel}>of every month</span>
+                </div>
+              </div>
+            )}
+
+            {repeat === "custom" && (
+              <div style={modalStyles.fieldGroup}>
+                <label style={modalStyles.label}>
+                  Cron expression
+                  <span style={{ fontSize: "11px", color: "var(--grey-500)", fontWeight: 400, marginLeft: 6 }}>
+                    sec min hr dom mon dow
+                  </span>
+                </label>
+                <input
+                  style={modalStyles.input}
+                  placeholder="0 0 8 * * *"
+                  aria-label="Cron expression"
+                  value={schedCfg.customCron}
+                  onChange={(e) => updateCfg({ customCron: e.target.value })}
+                  spellCheck={false}
+                />
+              </div>
+            )}
+
+            {/* Preview line */}
+            <div style={pickerStyles.preview}>
+              <Clock size={12} style={{ color: "var(--color-accent)", flexShrink: 0 }} />
+              <span>{humanPreview(repeat, schedCfg, timezone)}</span>
             </div>
 
             {/* Timezone */}
             <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>Timezone</label>
+              <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+                <Calendar size={13} style={{ color: "var(--grey-500)" }} />
+                Timezone
+              </label>
               <select
                 style={modalStyles.select}
                 value={timezone}
@@ -288,6 +531,9 @@ export function Schedules() {
                 ))}
               </select>
             </div>
+
+            {/* Separator between timing and prompt */}
+            <Separator />
 
             {/* Recipe select */}
             <div style={modalStyles.fieldGroup}>
@@ -330,7 +576,7 @@ export function Schedules() {
               size="sm"
               color="secondary"
               onPress={handleCreate}
-              isDisabled={submitting || !name.trim() || !cron.trim() || !prompt.trim()}
+              isDisabled={submitting || !name.trim() || !pickerCron.trim() || !prompt.trim()}
             >
               {submitting ? "Creating..." : "Create Schedule"}
             </Button>
@@ -584,6 +830,69 @@ const cronStyle: React.CSSProperties = {
   borderRadius: "4px",
   display: "inline-block",
   marginTop: "2px",
+};
+
+/* ── Schedule picker styles ────────────────────────────────── */
+const pickerStyles: Record<string, React.CSSProperties> = {
+  pillRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "6px",
+  },
+  pill: {
+    height: "30px",
+    padding: "0 12px",
+    borderRadius: "var(--radius-pill)",
+    border: "1px solid var(--grey-300)",
+    background: "#fff",
+    color: "var(--grey-600)",
+    fontSize: "12px",
+    fontFamily: "var(--font-body)",
+    fontWeight: 500,
+    cursor: "pointer",
+    transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
+    lineHeight: 1,
+    whiteSpace: "nowrap" as React.CSSProperties["whiteSpace"],
+  },
+  pillActive: {
+    background: "var(--color-accent-soft)",
+    borderColor: "var(--color-accent)",
+    color: "var(--color-accent)",
+  },
+  inlineRow: {
+    display: "flex",
+    gap: "12px",
+    alignItems: "flex-end",
+    flexWrap: "wrap" as React.CSSProperties["flexWrap"],
+  },
+  inlineInputGroup: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  },
+  unitLabel: {
+    fontSize: "12px",
+    color: "var(--grey-500)",
+    whiteSpace: "nowrap" as React.CSSProperties["whiteSpace"],
+  },
+  timeSep: {
+    fontSize: "16px",
+    fontWeight: 600,
+    color: "var(--grey-500)",
+    lineHeight: 1,
+  },
+  preview: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "8px 12px",
+    background: "var(--color-accent-subtle)",
+    border: "1px solid var(--color-accent-soft)",
+    borderRadius: "var(--radius-md)",
+    fontSize: "12px",
+    color: "var(--grey-700)",
+    fontWeight: 500,
+  },
 };
 
 /* ── Modal styles (matching project pattern) ───────────────── */
