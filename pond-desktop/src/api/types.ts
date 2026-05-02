@@ -107,11 +107,31 @@ export interface ScheduleRun {
 }
 
 // ── Memory ────────────────────────────────────────────────────
+export type MemorySegment =
+  | "identity"
+  | "preference"
+  | "correction"
+  | "relationship"
+  | "project"
+  | "knowledge"
+  | "context";
+
+export type MemoryTier = "short" | "long" | "permanent";
+export type MemoryLifecycle = "active" | "archived" | "merged";
+
 export interface MemoryFragment {
   id: string;
   content: string;
+  source?: string;
   tags?: string[];
   created_at: string;
+  segment?: MemorySegment;
+  importance?: number;
+  tier?: MemoryTier;
+  lifecycle?: MemoryLifecycle;
+  access_count: number;
+  last_accessed_at?: string;
+  superseded_by?: string;
 }
 
 // ── User Skills ───────────────────────────────────────────────
