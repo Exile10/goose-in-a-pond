@@ -13,6 +13,7 @@ use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
+use pond_core::ports::tool_registry::ToolRegistryPort;
 use pond_core::prompts::PromptState;
 use pond_core::services::prompt_builder::build_prompt_partition;
 use std::collections::{HashMap, HashSet};
@@ -70,6 +71,12 @@ pub struct GooseAdapter {
     loaded_extensions: Mutex<HashSet<String>>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
+    /// Dynamic tool registry — provides tool descriptions for the system prompt.
+    /// When `None`, falls back to the static `giap_tool_description_lines()`.
+    tool_registry: Option<Arc<dyn ToolRegistryPort>>,
+    /// Tracks which extensions the user explicitly added via the REST API.
+    /// These are preserved across turns (not stripped in the extension cleanup loop).
+    user_extensions: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// When true, prompt templates include voice-mode instructions (keep responses
     /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
     voice_mode: std::sync::atomic::AtomicBool,
@@ -93,6 +100,7 @@ impl GooseAdapter {
         device_repo: Arc<dyn DeviceRegistry>,
         llamafile_url: String,
         data_dir: Option<PathBuf>,
+        tool_registry: Option<Arc<dyn ToolRegistryPort>>,
     ) -> Result<Self> {
         let session_manager = Arc::new(SessionManager::instance());
         let permission_manager = goose::config::permission::PermissionManager::instance();
@@ -128,6 +136,8 @@ impl GooseAdapter {
             last_provider_key: Mutex::new(String::new()),
             loaded_extensions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
+            tool_registry,
+            user_extensions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             voice_mode: std::sync::atomic::AtomicBool::new(false),
             model_capabilities: Mutex::new(pond_core::domain::model_capabilities::ModelCapabilities::default()),
             last_prefix_hash: Mutex::new(0),
@@ -160,12 +170,28 @@ impl GooseAdapter {
             Arc::new(MockDeviceRegistry),
             url,
             None,
+            None, // tool_registry — falls back to static giap_tool_description_lines()
         ).await
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
     pub fn extension_manager(&self) -> Arc<GiapGooseExtensionManager> {
         self.extension_manager.clone()
+    }
+
+    /// Returns the dynamic tool registry, if one was injected.
+    pub fn tool_registry(&self) -> Option<Arc<dyn ToolRegistryPort>> {
+        self.tool_registry.clone()
+    }
+
+    /// Mark an extension name as user-added so it survives the per-turn extension strip.
+    pub async fn track_user_extension(&self, name: &str) {
+        self.user_extensions.write().await.insert(name.to_string());
+    }
+
+    /// Remove an extension from the user-tracking set.
+    pub async fn untrack_user_extension(&self, name: &str) {
+        self.user_extensions.write().await.remove(name);
     }
 
     /// Add a named builtin extension to a Goose session (idempotent).
@@ -546,10 +572,6 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Use cached tool description lines (avoids 6 format!() allocations per turn)
-            let available_tools: Vec<String> = pond_core::prompts::giap_tool_description_lines()
-                .to_vec();
-
             // Resolve thinking mode from settings + capabilities.
             // Voice mode always disables thinking — reasoning tokens waste TTS
             // time and leak as spoken text if any filter layer misses them.
@@ -577,6 +599,12 @@ impl GooseAdapter {
             );
             let compact_prompt = pond_core::services::context_budget::CompactionProfile::from_context_window(effective_ctx)
                 .use_compact_prompt();
+
+            // Tool description lines: dynamic from registry, static fallback.
+            let available_tools: Vec<String> = match &self.tool_registry {
+                Some(registry) => registry.prompt_description_lines(compact_prompt).await,
+                None => pond_core::prompts::giap_tool_description_lines().to_vec(),
+            };
 
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
@@ -752,22 +780,22 @@ impl GooseAdapter {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");
         }
 
-        // ── 6. Tool-free mode ─────────────────────────────────────────────────
-        // GIAP tools (Wikipedia, weather, etc.) are handled by the Tool Agent
-        // pre-processor in routes.rs BEFORE the main LLM runs. The Goose agent
-        // operates with ZERO tools — no MCP extensions loaded, no tool schemas
-        // in the prompt, no tool-call formatting required from the model.
-        // This eliminates tool-call argument failures and model-swap overhead.
-        //
-        // Remove any extensions that may have bled in from prior sessions or
-        // Goose's default config.
+        // ── 6. Extension cleanup ──────────────────────────────────────────────
+        // GIAP built-in tools (Wikipedia, weather, etc.) are handled by the
+        // Tool Agent pre-processor in routes.rs BEFORE the main LLM runs.
+        // Strip Goose default extensions that would pollute the prompt, but
+        // PRESERVE user-added MCP extensions so Goose can invoke their tools.
+        let user_exts = self.user_extensions.read().await;
         for ext in &[
             "giap", "developer", "computercontroller", "extensionmanager",
             "todo", "apps", "analyze", "summon", "summarize",
             "orchestrator", "tom",
         ] {
-            self.agent.remove_extension(ext, &goose_sid).await.ok();
+            if !user_exts.contains(*ext) {
+                self.agent.remove_extension(ext, &goose_sid).await.ok();
+            }
         }
+        drop(user_exts);
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;
