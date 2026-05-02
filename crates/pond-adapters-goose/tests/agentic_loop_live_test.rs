@@ -48,6 +48,7 @@ async fn live_action_loop_ollama_executes_tool_call() {
         Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
         url,
         None,
+        None, // tool_registry
     ).await.unwrap();
 
     let request = AgentRequest {
@@ -108,6 +109,7 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
         url,
         None,
+        None, // tool_registry
     ).await.unwrap();
 
     let request = AgentRequest {
@@ -165,6 +167,7 @@ async fn live_action_loop_local_executes_tool_call() {
         Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
         url,
         None,
+        None, // tool_registry
     ).await.unwrap();
 
     let request = AgentRequest {

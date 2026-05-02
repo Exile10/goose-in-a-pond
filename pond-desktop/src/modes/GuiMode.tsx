@@ -16,6 +16,7 @@ import { Faces } from "../sections/Faces";
 import { Agent } from "../sections/Agent";
 import { Canvas } from "../sections/Canvas";
 import { Logs } from "../sections/Logs";
+import { Extensions } from "../sections/Extensions";
 
 function SectionContent({ section }: { section: GuiSection }) {
   switch (section) {
@@ -23,8 +24,9 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "chat":      return <Chat />;
     case "devices":   return <Devices />;
     case "schedules": return <Schedules />;
-    case "memory":    return <Memory />;
-    case "skills":    return <Skills />;
+    case "memory":     return <Memory />;
+    case "skills":     return <Skills />;
+    case "extensions": return <Extensions />;
     case "models":    return <Models />;
     case "prompts":   return <Prompts />;
     case "settings":  return <Settings />;

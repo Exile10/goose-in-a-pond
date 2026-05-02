@@ -7,6 +7,7 @@ export type GuiSection =
   | "schedules"
   | "memory"
   | "skills"
+  | "extensions"
   | "models"
   | "prompts"
   | "settings"
@@ -36,9 +37,10 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
     sections: [
       { section: "devices",   label: "Devices",   icon: "devices" },
       { section: "schedules", label: "Schedules", icon: "clock" },
-      { section: "memory",    label: "Memory",    icon: "memory" },
-      { section: "skills",    label: "Skills",    icon: "skills" },
-      { section: "logs",      label: "Logs",      icon: "logs" },
+      { section: "memory",     label: "Memory",     icon: "memory" },
+      { section: "skills",     label: "Skills",     icon: "skills" },
+      { section: "extensions", label: "Extensions", icon: "extensions" },
+      { section: "logs",       label: "Logs",       icon: "logs" },
     ],
   },
   {

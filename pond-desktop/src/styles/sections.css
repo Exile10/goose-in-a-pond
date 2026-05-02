@@ -1071,6 +1071,264 @@
 .ext-row__name { font-size: var(--text-base); font-weight: var(--weight-semibold); }
 .ext-row__meta { display: flex; gap: 6px; margin-top: 2px; }
 
+/* ─── Extensions ─── */
+
+.ext-list-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.ext-card {
+  border-bottom: 1px solid var(--grey-100);
+  transition: background var(--transition-fast);
+}
+.ext-card:last-child { border-bottom: none; }
+.ext-card--disabled { opacity: 0.65; }
+.ext-card:hover { background: var(--grey-50); }
+
+.ext-card__header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 4px;
+}
+
+.ext-card__icon {
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  background: var(--purple-50);
+  color: var(--purple-600);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.ext-card__info { min-width: 0; }
+
+.ext-card__title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ext-card__name {
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--fg);
+}
+
+.ext-card__kind-badge {
+  font-size: 9px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.ext-card__kind-badge--stdio {
+  background: rgba(0,114,245,0.08);
+  color: #0058c4;
+  border: 1px solid rgba(0,114,245,0.15);
+}
+.ext-card__kind-badge--http {
+  background: rgba(255,149,0,0.08);
+  color: #a47000;
+  border: 1px solid rgba(255,149,0,0.2);
+}
+
+.ext-card__tool-count {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--grey-400);
+  font-weight: var(--weight-regular);
+}
+
+.ext-card__desc {
+  font-size: var(--text-sm);
+  color: var(--grey-500);
+  margin-top: 2px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ext-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.ext-card__expand-btn {
+  display: grid;
+  place-items: center;
+  width: 26px; height: 26px;
+  border: 1px solid var(--grey-200);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--grey-500);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.ext-card__expand-btn:hover { background: var(--grey-100); color: var(--fg); }
+
+.ext-card__delete-btn {
+  display: grid;
+  place-items: center;
+  width: 26px; height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--grey-400);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.ext-card__delete-btn:hover:not(:disabled) { background: rgba(255,59,48,0.08); color: var(--color-destructive); }
+.ext-card__delete-btn:disabled { cursor: not-allowed; opacity: 0.4; }
+
+.ext-card__tools {
+  padding: 0 4px 12px 44px;
+}
+
+.ext-card__tools-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--grey-400);
+  margin-bottom: 6px;
+}
+
+.ext-card__tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ext-card__tool-item {
+  padding: 4px 8px;
+  background: var(--grey-50);
+  border: 1px solid var(--grey-100);
+  border-radius: 6px;
+  font-size: 11.5px;
+}
+.ext-card__tool-item code {
+  font-family: var(--font-mono);
+  color: var(--fg);
+}
+
+/* Add Extension accordion */
+
+.ext-add-accordion {
+  border: 1px solid var(--grey-200);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  background: #fff;
+}
+
+.ext-add-accordion__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--grey-600);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  transition: background var(--transition-fast);
+}
+.ext-add-accordion__trigger:hover { background: var(--grey-50); }
+
+.ext-add-accordion__trigger-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: var(--weight-semibold);
+}
+
+.ext-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border-top: 1px solid var(--grey-100);
+  background: var(--grey-50);
+}
+
+.ext-form-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 16px;
+  align-items: center;
+}
+
+.ext-form-label {
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--fg);
+}
+
+.ext-form-hint {
+  font-size: 11px;
+  font-weight: var(--weight-regular);
+  color: var(--grey-400);
+}
+
+.ext-form-required {
+  color: var(--color-destructive);
+  margin-left: 2px;
+}
+
+.ext-form-input,
+.ext-form-select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--grey-200);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-family: var(--font-body);
+  background: #fff;
+  color: var(--fg);
+  outline: none;
+  transition: border-color var(--transition-fast);
+  width: 100%;
+  box-sizing: border-box;
+}
+.ext-form-input:focus,
+.ext-form-select:focus { border-color: var(--color-accent); }
+.ext-form-input:disabled,
+.ext-form-select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.ext-form-select { cursor: pointer; appearance: auto; }
+
+.ext-form-error {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-destructive);
+  padding: 6px 10px;
+  background: rgba(255,59,48,0.06);
+  border: 1px solid rgba(255,59,48,0.15);
+  border-radius: var(--radius-sm);
+}
+
+.ext-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
 /* ─── Agent ─── */
 .agent-tabs { background: var(--grey-100); border-radius: 12px; padding: 4px; }
 .agent-tab { font-weight: var(--weight-semibold); }

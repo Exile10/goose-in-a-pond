@@ -1304,7 +1304,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     // ── Agent backend ────────────────────────────────────────────────────────────
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager, tool_caller) = build_goose_backend(
+    let (agent, extension_manager, tool_caller, tool_registry) = build_goose_backend(
         agent_backend,
         &llamafile_url,
         &data_dir,
@@ -1753,7 +1753,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             s.chat_model    = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
-        let (a, _ext_mgr, _tc) = build_goose_backend(
+        let (a, _ext_mgr, _tc, _tr) = build_goose_backend(
             "goose",
             &llamafile_url,
             &data_dir,
@@ -3296,14 +3296,19 @@ async fn build_goose_backend(
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
     Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
+    Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>,
 ) {
     use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
     use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::ports::extension_manager::ExtensionManagerPort;
     use pond_core::ports::tool_caller::ToolCaller;
+    use pond_core::ports::tool_registry::ToolRegistryPort;
+
+    let default_registry: Arc<dyn ToolRegistryPort> =
+        Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
 
     if agent_backend != "goose" {
-        return (Arc::new(MockAgent::new()), None, None);
+        return (Arc::new(MockAgent::new()), None, None, default_registry);
     }
 
     // Build tool-calling specialist (FunctionGemma) if configured.
@@ -3349,7 +3354,7 @@ async fn build_goose_backend(
     });
     if let Err(e) = register_giap_extension(handles) {
         tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
-        return (Arc::new(MockAgent::new()), None, None);
+        return (Arc::new(MockAgent::new()), None, None, default_registry);
     }
 
     // Build the adapter with all repos injected.
@@ -3362,6 +3367,7 @@ async fn build_goose_backend(
         device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
+        Some(default_registry.clone()),
     ).await {
         Ok(adapter) => {
             if voice_mode {
@@ -3371,11 +3377,11 @@ async fn build_goose_backend(
                 adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
             let agent: Arc<dyn Agent> = Arc::new(adapter);
-            (agent, Some(ext_mgr), tool_caller)
+            (agent, Some(ext_mgr), tool_caller, default_registry)
         }
         Err(e) => {
             tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
-            (Arc::new(MockAgent::new()), None, None)
+            (Arc::new(MockAgent::new()), None, None, default_registry)
         }
     }
 }
@@ -3781,7 +3787,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             eprintln!("  {} | provider: {}  model: {}  role: {}",
                 settings.assistant_name, settings.chat_provider, settings.chat_model, model_role);
 
-            let (agent, _ext_mgr, _tc) = build_goose_backend(
+            let (agent, _ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3811,7 +3817,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             use pond_core::domain::agent::AgentRequest;
             use tokio::io::AsyncBufReadExt as _;
 
-            let (agent, _ext_mgr, _tc) = build_goose_backend(
+            let (agent, _ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3867,7 +3873,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         }
 
         AgentAction::Tools => {
-            let (_agent, ext_mgr, _tc) = build_goose_backend(
+            let (_agent, ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
