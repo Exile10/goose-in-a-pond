@@ -7,10 +7,11 @@ import {
   Chip,
   Separator,
 } from "@heroui/react";
-import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock } from "lucide-react";
+import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type { Schedule, ScheduleRun } from "../api/types";
+import { ScheduleCalendar } from "./ScheduleCalendar";
 
 /* ── Frequency presets for the create form ─────────────────── */
 const FREQ_PRESETS: Record<string, string> = {
@@ -59,6 +60,20 @@ export function Schedules() {
   const [actionMsg, setActionMsg]     = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // View toggle: list vs calendar
+  const [view, setView] = useState<"list" | "calendar">(() => {
+    try {
+      return (localStorage.getItem("schedules-view") as "list" | "calendar") || "list";
+    } catch {
+      return "list";
+    }
+  });
+
+  function setViewPersisted(v: "list" | "calendar") {
+    try { localStorage.setItem("schedules-view", v); } catch { /* ignore */ }
+    setView(v);
+  }
+
   // New schedule form
   const [showForm, setShowForm]       = useState(false);
   const [name, setName]               = useState("");
@@ -86,26 +101,14 @@ export function Schedules() {
     load();
   }, []);
 
-  // Subscribe to schedule result events via SSE for live notifications.
+  // Refresh the list whenever a new schedule result arrives via the global
+  // SSE listener in AppContext (state.latestScheduleResult).
+  const latestResult = state.latestScheduleResult;
   useEffect(() => {
-    if (!state.serverOnline) return;
-    const baseUrl = (state as Record<string, unknown>).serverUrl as string | undefined;
-    const url = `${baseUrl || "http://127.0.0.1:4000"}/api/v1/schedules/events`;
-    const es = new EventSource(url);
-    es.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data) as ScheduleRun & { schedule_label?: string };
-        const label = data.schedule_label || data.schedule_id;
-        if (data.status === "completed") {
-          flashMsg(`Schedule "${label}" completed.`);
-        } else if (data.status === "failed") {
-          flashMsg(`Schedule "${label}" failed: ${data.error || "unknown"}`, true);
-        }
-        load(); // refresh the list
-      } catch { /* ignore parse errors */ }
-    };
-    return () => es.close();
-  }, [state.serverOnline]);
+    if (!latestResult) return;
+    load();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestResult]);
 
   function flashMsg(msg: string, isError = false) {
     if (isError) {
@@ -343,6 +346,26 @@ export function Schedules() {
       <div className="page-header">
         <h1 className="page-header__title">Schedules</h1>
         <div className="page-header__action">
+          <div className="view-toggle" role="group" aria-label="View mode">
+            <button
+              className={`view-toggle__btn${view === "list" ? " is-active" : ""}`}
+              onClick={() => setViewPersisted("list")}
+              aria-pressed={view === "list"}
+              aria-label="List view"
+              title="List view"
+            >
+              <List size={14} />
+            </button>
+            <button
+              className={`view-toggle__btn${view === "calendar" ? " is-active" : ""}`}
+              onClick={() => setViewPersisted("calendar")}
+              aria-pressed={view === "calendar"}
+              aria-label="Calendar view"
+              title="Calendar view"
+            >
+              <Calendar size={14} />
+            </button>
+          </div>
           <Button
             size="sm"
             color="secondary"
@@ -372,7 +395,7 @@ export function Schedules() {
         </p>
       )}
 
-      {/* ── Schedule grid ───────────────────────────────────── */}
+      {/* ── Schedule content ────────────────────────────────── */}
       {loading ? (
         <p className="muted-12">Loading...</p>
       ) : schedules.length === 0 ? (
@@ -380,6 +403,8 @@ export function Schedules() {
           <CalendarClock size={32} />
           <span>No schedules yet. Create one to automate recurring tasks.</span>
         </div>
+      ) : view === "calendar" ? (
+        <ScheduleCalendar schedules={schedules} />
       ) : (
         <div className="sched-grid">
           {schedules.map((s) => (

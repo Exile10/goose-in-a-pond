@@ -2053,3 +2053,366 @@
 
 .muted { color: var(--grey-500); }
 .muted-12 { font-size: var(--text-sm); color: var(--grey-500); }
+
+/* ─── Toast notifications ─── */
+.toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9000;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 300px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid var(--grey-200);
+  border-radius: var(--radius-card, 10px);
+  box-shadow: 0 4px 20px rgba(28, 28, 28, 0.12), 0 1px 4px rgba(28, 28, 28, 0.06);
+  cursor: pointer;
+  pointer-events: all;
+  animation: toast-slide-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.05);
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+.toast-card:hover { background: var(--grey-50); }
+
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(20px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.toast-card__icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.toast-card[data-status="completed"] .toast-card__icon {
+  background: rgba(52, 199, 89, 0.12);
+  color: var(--color-success, #34c759);
+}
+
+.toast-card[data-status="failed"] .toast-card__icon {
+  background: rgba(255, 59, 48, 0.10);
+  color: var(--color-destructive, #ff3b30);
+}
+
+.toast-card__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-card__title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-sm, 12px);
+  font-weight: var(--weight-semibold, 600);
+  color: var(--fg, #171616);
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.toast-card__title span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-card__badge {
+  font-size: 9px;
+  font-weight: var(--weight-bold, 700);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill, 999px);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.toast-card__badge--completed {
+  background: rgba(52, 199, 89, 0.12);
+  color: #0e8a4a;
+}
+
+.toast-card__badge--failed {
+  background: rgba(255, 59, 48, 0.10);
+  color: var(--color-destructive, #ff3b30);
+}
+
+.toast-card__preview {
+  margin: 4px 0 0;
+  font-size: var(--text-xs, 10px);
+  color: var(--grey-500);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.toast-card__close {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--grey-400);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  margin-top: 1px;
+}
+
+.toast-card__close:hover {
+  background: var(--grey-100);
+  color: var(--fg);
+}
+
+/* ─── Schedule Calendar ─── */
+.sched-cal {
+  display: grid;
+  /* time column (56px) + 7 day columns */
+  grid-template-columns: 56px repeat(7, 1fr);
+  border: 1px solid var(--grey-200);
+  border-radius: var(--radius-card, 10px);
+  overflow: hidden;
+  background: #fff;
+  font-size: var(--text-xs, 10px);
+}
+
+/* Header row */
+.sched-cal__header-spacer {
+  background: var(--grey-50);
+  border-bottom: 1px solid var(--grey-200);
+  border-right: 1px solid var(--grey-100);
+}
+
+.sched-cal__day-header {
+  background: var(--grey-50);
+  border-bottom: 1px solid var(--grey-200);
+  border-right: 1px solid var(--grey-100);
+  padding: 8px 4px;
+  text-align: center;
+  font-weight: var(--weight-bold, 700);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--grey-500);
+}
+
+.sched-cal__day-header:last-child { border-right: none; }
+.sched-cal__day-header.is-today {
+  color: var(--purple-700);
+  background: var(--purple-50);
+}
+
+/* Body: the scrollable time grid */
+.sched-cal__body {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 56px repeat(7, 1fr);
+  max-height: 520px;
+  overflow-y: auto;
+  position: relative;
+}
+.sched-cal__body::-webkit-scrollbar { width: 8px; }
+.sched-cal__body::-webkit-scrollbar-thumb { background: var(--grey-200); border-radius: 4px; }
+
+/* Hour row container */
+.sched-cal__hour-row {
+  display: contents;
+}
+
+/* Time label cell */
+.sched-cal__time-label {
+  grid-column: 1;
+  padding: 0 8px;
+  height: 48px;
+  display: flex;
+  align-items: flex-start;
+  padding-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--grey-400);
+  background: var(--grey-50);
+  border-right: 1px solid var(--grey-100);
+  border-bottom: 1px solid var(--grey-100);
+  position: relative;
+  z-index: 1;
+}
+
+/* Day cell within an hour row */
+.sched-cal__cell {
+  height: 48px;
+  border-right: 1px solid var(--grey-100);
+  border-bottom: 1px solid var(--grey-100);
+  position: relative;
+  padding: 2px;
+}
+
+.sched-cal__cell:last-child { border-right: none; }
+.sched-cal__cell.is-today { background: rgba(140, 75, 255, 0.02); }
+
+/* Schedule pills */
+.sched-cal__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold, 600);
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  border: none;
+  outline: none;
+  transition: opacity 0.15s, transform 0.12s;
+  position: relative;
+  z-index: 2;
+}
+
+.sched-cal__pill:hover {
+  opacity: 0.85;
+  transform: scale(1.03);
+}
+
+/* Hourly dot: smaller pill variant */
+.sched-cal__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.12s;
+  position: relative;
+  z-index: 2;
+}
+
+.sched-cal__dot:hover { transform: scale(1.4); }
+
+/* Current-time marker */
+.sched-cal__time-marker {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-destructive, #ff3b30);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.sched-cal__time-marker::before {
+  content: '';
+  position: absolute;
+  left: -4px;
+  top: -4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-destructive, #ff3b30);
+}
+
+/* Popover */
+.sched-cal__popover {
+  position: fixed;
+  z-index: 200;
+  background: #fff;
+  border: 1px solid var(--grey-200);
+  border-radius: var(--radius-card, 10px);
+  box-shadow: 0 8px 28px rgba(28,28,28,0.14), 0 2px 8px rgba(28,28,28,0.06);
+  padding: 12px 14px;
+  min-width: 220px;
+  max-width: 280px;
+  font-size: var(--text-sm, 12px);
+}
+
+.sched-cal__popover-title {
+  font-weight: var(--weight-bold, 700);
+  font-size: var(--text-base, 13px);
+  color: var(--fg);
+  margin-bottom: 6px;
+}
+
+.sched-cal__popover-cron {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--grey-600);
+  background: var(--grey-100);
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+  display: inline-block;
+}
+
+.sched-cal__popover-freq {
+  font-size: 11px;
+  color: var(--grey-500);
+  margin-bottom: 6px;
+}
+
+.sched-cal__popover-result {
+  font-size: 11px;
+  color: var(--grey-500);
+  line-height: 1.4;
+  border-top: 1px solid var(--grey-100);
+  padding-top: 6px;
+  margin-top: 6px;
+}
+
+/* View toggle button group in page header */
+.view-toggle {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--grey-200);
+  border-radius: 8px;
+  padding: 2px;
+  background: var(--grey-50);
+}
+
+.view-toggle__btn {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 26px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--grey-500);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.view-toggle__btn:hover { background: var(--grey-100); color: var(--fg); }
+
+.view-toggle__btn.is-active {
+  background: #fff;
+  color: var(--purple-700);
+  box-shadow: 0 1px 3px rgba(28,28,28,0.10);
+}

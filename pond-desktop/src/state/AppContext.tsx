@@ -3,6 +3,7 @@ import React, {
   useContext,
   useReducer,
   useEffect,
+  useRef,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -17,6 +18,7 @@ import {
   type AppAction,
   type TranscriptMessage,
   type ContextCard,
+  type ScheduleToast,
 } from "./reducer";
 
 const StateCtx = createContext<AppState | null>(null);
@@ -24,6 +26,56 @@ const DispatchCtx = createContext<React.Dispatch<AppAction> | null>(null);
 
 export function AppContextProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, buildInitialState);
+  const scheduleEsRef = useRef<EventSource | null>(null);
+
+  // Global SSE listener for schedule result events.
+  // Opens once when the server comes online and stays open regardless of which
+  // section is active, so toasts work on any page.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+
+    // Close any existing connection before opening a new one.
+    if (scheduleEsRef.current) {
+      scheduleEsRef.current.close();
+      scheduleEsRef.current = null;
+    }
+
+    const baseUrl = state.serverUrl || "http://127.0.0.1:4000";
+    const url = `${baseUrl}/api/v1/schedules/events`;
+    const es = new EventSource(url);
+    scheduleEsRef.current = es;
+
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as {
+          id?: string;
+          schedule_id?: string;
+          schedule_label?: string;
+          status?: string;
+          result?: string;
+          error?: string;
+        };
+        const status = data.status;
+        if (status !== "completed" && status !== "failed") return;
+        const toast: ScheduleToast = {
+          id: data.id || data.schedule_id || String(Date.now()),
+          schedule_label: data.schedule_label || data.schedule_id || "Schedule",
+          status: status as "completed" | "failed",
+          result: data.result,
+          error: data.error,
+          timestamp: Date.now(),
+        };
+        dispatch({ type: "SCHEDULE_RESULT", payload: toast });
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    return () => {
+      es.close();
+      scheduleEsRef.current = null;
+    };
+  }, [state.serverOnline, state.serverUrl]);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];

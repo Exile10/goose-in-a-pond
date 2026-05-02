@@ -1,4 +1,5 @@
 import { Sidebar } from "../components/Sidebar";
+import { ToastContainer } from "../components/Toast";
 import { useAppState } from "../state/AppContext";
 import type { GuiSection } from "../desktopState";
 
@@ -48,6 +49,7 @@ export function GuiMode() {
           <SectionContent section={state.section} />
         </main>
       </div>
+      <ToastContainer />
     </div>
   );
 }
