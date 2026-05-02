@@ -17,37 +17,59 @@
 //! | Schedules  | ~200/item | ~60/item   | 70%     |
 //! | Devices    | ~80/item  | ~30/item   | 62%     |
 
-/// Maximum length for the fallback truncation of unknown tool outputs.
-const FALLBACK_MAX_CHARS: usize = 200;
+/// Context-aware compaction limits.
+///
+/// Scales with the available context window so small models get aggressive
+/// compaction while larger contexts preserve more detail.
+struct CompactionLimits {
+    wiki_max_sentences: usize,
+    wiki_max_chars: usize,
+    fallback_max_chars: usize,
+}
 
-/// Maximum number of sentences to keep from Wikipedia articles.
-const WIKI_MAX_SENTENCES: usize = 3;
-
-/// Maximum character length for compacted Wikipedia output.
-const WIKI_MAX_CHARS: usize = 500;
+impl CompactionLimits {
+    fn from_context_tokens(ctx: usize) -> Self {
+        if ctx <= 4096 {
+            // Jetson-class: 3K-4K tokens — aggressive
+            Self { wiki_max_sentences: 3, wiki_max_chars: 500, fallback_max_chars: 200 }
+        } else if ctx <= 12288 {
+            // macOS Metal default: 8K-12K — balanced
+            Self { wiki_max_sentences: 8, wiki_max_chars: 1500, fallback_max_chars: 500 }
+        } else if ctx <= 65536 {
+            // Medium context: 32K-64K — generous
+            Self { wiki_max_sentences: 15, wiki_max_chars: 3000, fallback_max_chars: 1000 }
+        } else {
+            // Large context: 128K+ — minimal compaction
+            Self { wiki_max_sentences: 30, wiki_max_chars: 6000, fallback_max_chars: 2000 }
+        }
+    }
+}
 
 /// Compact a tool's raw output into a concise summary.
 ///
-/// The function selects a per-tool compaction strategy based on `tool_name`,
-/// preserving key information while minimising token usage. Unknown tools
-/// get a simple truncation fallback.
+/// `context_tokens` controls how aggressively the output is compressed:
+/// - 3K-4K: very aggressive (Jetson), 3 sentences / 500 chars for Wikipedia
+/// - 8K-12K: balanced, 8 sentences / 1500 chars
+/// - 32K+: generous, 15 sentences / 3000 chars
+/// - 128K+: minimal compaction
 ///
-/// This is a pure function — no I/O, no async, no allocations beyond the
-/// returned `String`.
-pub fn compact_tool_output(tool_name: &str, raw_output: &str) -> String {
+/// Use `0` for context_tokens to get the most aggressive (Jetson) defaults.
+pub fn compact_tool_output(tool_name: &str, raw_output: &str, context_tokens: usize) -> String {
     if raw_output.is_empty() {
         return String::new();
     }
 
+    let limits = CompactionLimits::from_context_tokens(context_tokens);
+
     match tool_name {
         "weather" => compact_weather(raw_output),
-        "wikipedia" => compact_wikipedia(raw_output),
+        "wikipedia" => compact_wikipedia(raw_output, &limits),
         "schedules" => compact_schedules(raw_output),
         "devices" => compact_devices(raw_output),
         "recall_memory" => compact_memories(raw_output),
-        "save_memory" => raw_output.to_string(), // confirmations are already terse
-        "create_schedule" => raw_output.to_string(), // confirmations are already terse
-        _ => compact_fallback(raw_output),
+        "save_memory" => raw_output.to_string(),
+        "create_schedule" => raw_output.to_string(),
+        _ => compact_fallback(raw_output, &limits),
     }
 }
 
@@ -65,20 +87,19 @@ fn compact_weather(raw: &str) -> String {
 /// Wikipedia tool output is raw article text that can be 500-2000+ chars.
 /// We keep the first few sentences (the lead, which Wikipedia's own style
 /// guide says should define the topic) and discard the rest.
-fn compact_wikipedia(raw: &str) -> String {
-    // Handle "No saved memories found." style messages
-    if raw.len() <= WIKI_MAX_CHARS {
+fn compact_wikipedia(raw: &str, limits: &CompactionLimits) -> String {
+    if raw.len() <= limits.wiki_max_chars {
         return raw.to_string();
     }
 
-    let sentences = extract_sentences(raw, WIKI_MAX_SENTENCES);
+    let sentences = extract_sentences(raw, limits.wiki_max_sentences);
     if sentences.is_empty() {
-        return truncate_safe(raw, WIKI_MAX_CHARS);
+        return truncate_safe(raw, limits.wiki_max_chars);
     }
 
     let result = sentences.join(" ");
-    if result.len() > WIKI_MAX_CHARS {
-        truncate_safe(&result, WIKI_MAX_CHARS)
+    if result.len() > limits.wiki_max_chars {
+        truncate_safe(&result, limits.wiki_max_chars)
     } else {
         result
     }
@@ -299,9 +320,9 @@ fn compact_memories(raw: &str) -> String {
     compacted.join("\n")
 }
 
-/// Fallback: truncate to [`FALLBACK_MAX_CHARS`] for unknown tools.
-fn compact_fallback(raw: &str) -> String {
-    truncate_safe(raw, FALLBACK_MAX_CHARS)
+/// Fallback: truncate to the context-aware limit for unknown tools.
+fn compact_fallback(raw: &str, limits: &CompactionLimits) -> String {
+    truncate_safe(raw, limits.fallback_max_chars)
 }
 
 /// Truncate a string at a char boundary, appending "..." if truncated.
@@ -394,7 +415,7 @@ mod tests {
     fn weather_output_passes_through_unchanged() {
         let weather = "[Current Weather \u{2014} Nairobi, KE]\n\
             Partly cloudy | 24.3\u{b0}C (feels like 23.1\u{b0}C) | Humidity: 68% | Wind: 12 km/h | Precip: 0.0 mm";
-        let result = compact_tool_output("weather", weather);
+        let result = compact_tool_output("weather", weather, 4096);
         assert_eq!(result, weather);
     }
 
@@ -403,7 +424,7 @@ mod tests {
     #[test]
     fn wikipedia_short_article_passes_through() {
         let short = "Rust is a programming language. It focuses on safety and performance.";
-        let result = compact_tool_output("wikipedia", short);
+        let result = compact_tool_output("wikipedia", short, 4096);
         assert_eq!(result, short);
     }
 
@@ -420,7 +441,7 @@ mod tests {
             He was born in Ulm, in the Kingdom of Württemberg in the German Empire, on 14 March 1879. \
             He moved to Switzerland in 1895, giving up his German citizenship the following year.";
 
-        let result = compact_tool_output("wikipedia", &article);
+        let result = compact_tool_output("wikipedia", &article, 4096);
 
         // Should keep first 3 sentences
         assert!(result.contains("Albert Einstein was a German-born theoretical physicist."));
@@ -437,7 +458,7 @@ mod tests {
     #[test]
     fn wikipedia_preserves_key_facts_within_budget() {
         let article = "Photosynthesis is a biological process. Plants use sunlight to convert carbon dioxide and water into glucose and oxygen. This process occurs in the chloroplasts of plant cells.";
-        let result = compact_tool_output("wikipedia", &article);
+        let result = compact_tool_output("wikipedia", &article, 4096);
         assert!(result.contains("Photosynthesis"));
         assert!(result.contains("biological process"));
     }
@@ -452,8 +473,8 @@ mod tests {
                 i
             ));
         }
-        let result = compact_tool_output("wikipedia", &article);
-        assert!(result.len() <= WIKI_MAX_CHARS + 3); // +3 for "..."
+        let result = compact_tool_output("wikipedia", &article, 4096);
+        assert!(result.len() <= 500 + 3); // Jetson limits: 500 chars + "..."
     }
 
     // ── Schedules ───────────────────────────────────────────────────────
@@ -462,7 +483,7 @@ mod tests {
     fn schedule_compaction_preserves_names_and_times() {
         let schedules = "- Morning briefing [abc-123]: 0 30 8 * * * Africa/Nairobi (agent, active)\n\
                          - Weather check [def-456]: 0 0 * * * * UTC (agent, active)";
-        let result = compact_tool_output("schedules", schedules);
+        let result = compact_tool_output("schedules", schedules, 4096);
 
         // Names preserved
         assert!(result.contains("Morning briefing"));
@@ -486,14 +507,14 @@ mod tests {
     #[test]
     fn schedule_no_tasks_passes_through() {
         let empty = "No scheduled tasks.";
-        let result = compact_tool_output("schedules", empty);
+        let result = compact_tool_output("schedules", empty, 4096);
         assert_eq!(result, empty);
     }
 
     #[test]
     fn schedule_weekly_is_humanized() {
         let schedule = "- Report [id-1]: 0 0 9 * * 1 UTC (agent, active)";
-        let result = compact_tool_output("schedules", &schedule);
+        let result = compact_tool_output("schedules", &schedule, 4096);
         assert!(result.contains("09:00 weekly"));
     }
 
@@ -503,7 +524,7 @@ mod tests {
     fn device_compaction_strips_type_keeps_status() {
         let devices = "- Living Room Light (smart_light): online\n\
                        - Kitchen Sensor (temperature_sensor): offline";
-        let result = compact_tool_output("devices", devices);
+        let result = compact_tool_output("devices", devices, 4096);
 
         // Names preserved
         assert!(result.contains("Living Room Light"));
@@ -521,7 +542,7 @@ mod tests {
     #[test]
     fn device_no_devices_passes_through() {
         let empty = "No devices registered.";
-        let result = compact_tool_output("devices", empty);
+        let result = compact_tool_output("devices", empty, 4096);
         assert_eq!(result, empty);
     }
 
@@ -531,7 +552,7 @@ mod tests {
     fn memory_compaction_strips_dates() {
         let memories = "- [2024-01-15] User prefers dark mode\n\
                         - [2024-01-10] User's name is Jerry";
-        let result = compact_tool_output("recall_memory", memories);
+        let result = compact_tool_output("recall_memory", memories, 4096);
         assert!(result.contains("User prefers dark mode"));
         assert!(result.contains("User's name is Jerry"));
         assert!(!result.contains("2024-01-15"));
@@ -541,7 +562,7 @@ mod tests {
     #[test]
     fn memory_no_memories_passes_through() {
         let empty = "No saved memories found.";
-        let result = compact_tool_output("recall_memory", empty);
+        let result = compact_tool_output("recall_memory", empty, 4096);
         assert_eq!(result, empty);
     }
 
@@ -550,15 +571,15 @@ mod tests {
     #[test]
     fn unknown_tool_truncates_to_fallback_limit() {
         let long_output = "x".repeat(500);
-        let result = compact_tool_output("unknown_tool", &long_output);
-        assert!(result.len() <= FALLBACK_MAX_CHARS + 3); // +3 for "..."
+        let result = compact_tool_output("unknown_tool", &long_output, 4096);
+        assert!(result.len() <= 200 + 3); // Jetson limits: 200 chars + "..."
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn unknown_tool_short_output_passes_through() {
         let short = "Some short result.";
-        let result = compact_tool_output("unknown_tool", short);
+        let result = compact_tool_output("unknown_tool", short, 4096);
         assert_eq!(result, short);
     }
 
@@ -566,9 +587,48 @@ mod tests {
 
     #[test]
     fn empty_output_returns_empty() {
-        assert_eq!(compact_tool_output("weather", ""), "");
-        assert_eq!(compact_tool_output("wikipedia", ""), "");
-        assert_eq!(compact_tool_output("unknown", ""), "");
+        assert_eq!(compact_tool_output("weather", "", 4096), "");
+        assert_eq!(compact_tool_output("wikipedia", "", 4096), "");
+        assert_eq!(compact_tool_output("unknown", "", 4096), "");
+    }
+
+    // ── Context-aware scaling ────────────────────────────────────────
+
+    #[test]
+    fn larger_context_preserves_more_wikipedia_content() {
+        // Build a long article (~3000 chars, 30 sentences)
+        let mut article = String::new();
+        for i in 0..30 {
+            article.push_str(&format!(
+                "This is detailed sentence number {} covering many important aspects of the topic at hand. ", i
+            ));
+        }
+
+        let jetson = compact_tool_output("wikipedia", &article, 3072);
+        let m4 = compact_tool_output("wikipedia", &article, 8192);
+        let large = compact_tool_output("wikipedia", &article, 32768);
+
+        // M4 should preserve more than Jetson
+        assert!(m4.len() > jetson.len(),
+            "8K context ({} chars) should preserve more than 3K ({} chars)",
+            m4.len(), jetson.len());
+
+        // Large should preserve more than M4
+        assert!(large.len() > m4.len(),
+            "32K context ({} chars) should preserve more than 8K ({} chars)",
+            large.len(), m4.len());
+    }
+
+    #[test]
+    fn larger_context_preserves_more_fallback_content() {
+        let long = "x".repeat(1500);
+
+        let jetson = compact_tool_output("unknown_tool", &long, 3072);
+        let m4 = compact_tool_output("unknown_tool", &long, 8192);
+
+        assert!(m4.len() > jetson.len(),
+            "8K fallback ({} chars) should preserve more than 3K ({} chars)",
+            m4.len(), jetson.len());
     }
 
     // ── Sentence extraction ─────────────────────────────────────────────

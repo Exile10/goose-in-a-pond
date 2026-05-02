@@ -2193,14 +2193,20 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
                     }
                 }
 
-                // Apply semantic compaction when enabled in settings.
+                // Apply context-aware semantic compaction when enabled.
                 let compacted = {
                     let settings = self.settings_repo.get().await.unwrap_or_default();
                     if settings.tool_output_compaction {
-                        let c = pond_core::services::tool_output_compactor::compact_tool_output(tool, &info);
-                        println!("[tool-agent] compacted {} -> {} chars ({}%)",
+                        let ctx = if settings.context_window_override > 0 {
+                            settings.context_window_override as usize
+                        } else {
+                            8192 // default M4/macOS context
+                        };
+                        let c = pond_core::services::tool_output_compactor::compact_tool_output(tool, &info, ctx);
+                        println!("[tool-agent] compacted {} -> {} chars ({}%) [ctx={}]",
                             raw_len, c.len(),
-                            if raw_len > 0 { 100 - (c.len() * 100 / raw_len) } else { 0 });
+                            if raw_len > 0 { 100 - (c.len() * 100 / raw_len) } else { 0 },
+                            ctx);
                         c
                     } else {
                         info
