@@ -300,6 +300,11 @@ impl CronSchedulerAdapter {
 
     /// Convert a `TaskEntry` into a `Schedule` domain object.
     fn to_schedule(entry: &TaskEntry) -> Schedule {
+        let next_run = if entry.persisted.paused {
+            None
+        } else {
+            compute_next_run(&entry.persisted.cron, &entry.persisted.timezone)
+        };
         Schedule {
             id: entry.persisted.id.clone(),
             label: entry.persisted.label.clone(),
@@ -309,8 +314,37 @@ impl CronSchedulerAdapter {
             paused: entry.persisted.paused,
             currently_running: entry.currently_running,
             last_run: entry.last_run,
-            next_run: None, // TODO: compute from cron
+            next_run,
             created_at: entry.persisted.created_at.unwrap_or_else(Utc::now),
+        }
+    }
+}
+
+/// Compute the next fire time for a cron expression from now.
+///
+/// Returns `None` if the cron expression is invalid or no upcoming occurrence
+/// can be found within a reasonable search window.
+///
+/// Note: `_timezone` is accepted for future use but computation is done in UTC.
+/// The cron expression is evaluated against UTC; the scheduler job itself
+/// handles timezone-correct firing via `tokio-cron-scheduler`.
+fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime<Utc>> {
+    // tokio-cron-scheduler uses 6-field cron (sec min hour dom month dow).
+    // croner 2.x with_seconds_optional allows both 5- and 6-field expressions.
+    let cron = croner::Cron::new(cron_expr)
+        .with_seconds_optional()
+        .parse()
+        .ok()?;
+    let now = Utc::now();
+    match cron.find_next_occurrence(&now, false) {
+        Ok(dt) => Some(dt),
+        Err(e) => {
+            tracing::debug!(
+                cron_expr,
+                error = %e,
+                "Failed to compute next_run for cron expression"
+            );
+            None
         }
     }
 }
@@ -363,6 +397,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             .add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
             .await?;
 
+        let next_run = compute_next_run(&req.cron, &req.timezone);
         let schedule = Schedule {
             id: req.id.clone(),
             label: req.label,
@@ -370,7 +405,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             timezone: req.timezone,
             kind: req.kind,
             last_run: None,
-            next_run: None,
+            next_run,
             paused: false,
             currently_running: false,
             created_at: record.created_at.unwrap(),
@@ -548,8 +583,15 @@ impl SchedulerPort for CronSchedulerAdapter {
             .filter(|e| !e.persisted.paused)
             .map(Self::to_schedule)
             .collect();
-        // Sort by created_at as a proxy (next_run computation deferred).
-        schedules.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Sort by next fire time (soonest first); schedules without next_run sort last.
+        schedules.sort_by(|a, b| {
+            match (&a.next_run, &b.next_run) {
+                (Some(a_next), Some(b_next)) => a_next.cmp(b_next),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.created_at.cmp(&b.created_at),
+            }
+        });
         schedules.truncate(limit as usize);
         Ok(schedules)
     }
@@ -715,6 +757,92 @@ mod tests {
             .create_task(create_req("dup", "0 0 6 * * *"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn next_run_is_populated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        let schedule = sched
+            .create_task(create_req("nr1", "0 0 12 * * *"))
+            .await
+            .unwrap();
+
+        // next_run should be populated for an active schedule.
+        assert!(
+            schedule.next_run.is_some(),
+            "next_run should be computed for an active schedule"
+        );
+
+        // The next run should be in the future.
+        let next = schedule.next_run.unwrap();
+        assert!(
+            next > chrono::Utc::now(),
+            "next_run should be in the future, got {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_schedule_has_no_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("pnr", "0 0 12 * * *"))
+            .await
+            .unwrap();
+        sched.pause_task("pnr").await.unwrap();
+
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "pnr").unwrap();
+        assert!(
+            task.next_run.is_none(),
+            "paused schedule should have no next_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_upcoming_sorted_by_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        // Create two tasks: one fires at noon, the other at 6am.
+        // The 6am task should sort before the noon task.
+        sched
+            .create_task(create_req("noon", "0 0 12 * * *"))
+            .await
+            .unwrap();
+        sched
+            .create_task(create_req("morning", "0 0 6 * * *"))
+            .await
+            .unwrap();
+
+        let upcoming = sched.list_upcoming(10).await.unwrap();
+        assert_eq!(upcoming.len(), 2);
+
+        // Both should have next_run populated.
+        assert!(upcoming[0].next_run.is_some());
+        assert!(upcoming[1].next_run.is_some());
+
+        // First should fire before or equal to the second.
+        assert!(
+            upcoming[0].next_run.unwrap() <= upcoming[1].next_run.unwrap(),
+            "upcoming schedules should be sorted by next_run"
+        );
+    }
+
+    #[test]
+    fn compute_next_run_valid_cron() {
+        let next = super::compute_next_run("0 0 12 * * *", "UTC");
+        assert!(next.is_some(), "valid cron should produce a next_run");
+        assert!(next.unwrap() > chrono::Utc::now());
+    }
+
+    #[test]
+    fn compute_next_run_invalid_cron() {
+        let next = super::compute_next_run("not a cron", "UTC");
+        assert!(next.is_none(), "invalid cron should return None");
     }
 
     #[tokio::test]
