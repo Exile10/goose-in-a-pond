@@ -196,8 +196,20 @@ export class PondApiClient {
     return this.get(`/api/v1/memories?limit=${limit}`);
   }
 
-  addMemory(content: string, tags?: string[]): Promise<MemoryFragment> {
-    return this.post("/api/v1/memories", { content, tags });
+  addMemory(
+    content: string,
+    tags?: string[],
+    segment?: import("./types").MemorySegment,
+    importance?: number,
+    tier?: import("./types").MemoryTier,
+  ): Promise<MemoryFragment> {
+    return this.post("/api/v1/memories", {
+      content,
+      ...(tags !== undefined && { tags }),
+      ...(segment !== undefined && { segment }),
+      ...(importance !== undefined && { importance }),
+      ...(tier !== undefined && { tier }),
+    });
   }
 
   deleteMemory(id: string): Promise<void> {
