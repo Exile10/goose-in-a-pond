@@ -101,6 +101,10 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("review_mode",            &settings.review_mode);
         upsert!("review_max_rounds",      settings.review_max_rounds.to_string());
         upsert!("review_pass_threshold",  settings.review_pass_threshold.to_string());
+        // Memory lifecycle
+        upsert!("memory_extraction_enabled",    if settings.memory_extraction_enabled { "true" } else { "false" });
+        upsert!("memory_cleanup_enabled",       if settings.memory_cleanup_enabled { "true" } else { "false" });
+        upsert!("memory_consolidation_enabled", if settings.memory_consolidation_enabled { "true" } else { "false" });
 
         Ok(())
     }
@@ -217,6 +221,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "review_pass_threshold"  => {
             if let Ok(v) = value.parse() { s.review_pass_threshold = v; }
         }
+        // Memory lifecycle
+        "memory_extraction_enabled"    => s.memory_extraction_enabled = value == "true",
+        "memory_cleanup_enabled"       => s.memory_cleanup_enabled = value == "true",
+        "memory_consolidation_enabled" => s.memory_consolidation_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }
