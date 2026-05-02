@@ -29,6 +29,15 @@ export interface LastResponseMeta {
   completionTokens: number;
 }
 
+export interface ScheduleToast {
+  id: string;
+  schedule_label: string;
+  status: "completed" | "failed";
+  result?: string;
+  error?: string;
+  timestamp: number;
+}
+
 export interface AppState {
   mode: DesktopMode;
   section: GuiSection;
@@ -44,6 +53,8 @@ export interface AppState {
   contextCards: ContextCard[];
   voiceRequestId: number;
   lastResponseMeta: LastResponseMeta | null;
+  scheduleToasts: ScheduleToast[];
+  latestScheduleResult: ScheduleToast | null;
 }
 
 export type AppAction =
@@ -64,7 +75,9 @@ export type AppAction =
   | { type: "CLEAR_CONTEXT_CARDS" }
   | { type: "VOICE_ACTIVATE" }
   | { type: "SET_LAST_RESPONSE_META"; payload: LastResponseMeta }
-  | { type: "SET_NEEDS_ONBOARDING"; payload: boolean };
+  | { type: "SET_NEEDS_ONBOARDING"; payload: boolean }
+  | { type: "SCHEDULE_RESULT"; payload: ScheduleToast }
+  | { type: "DISMISS_TOAST"; payload: string };
 
 let _transcriptIdCounter = 0;
 let _cardIdCounter = 0;
@@ -92,6 +105,8 @@ export function buildInitialState(): AppState {
     contextCards: [],
     voiceRequestId: 0,
     lastResponseMeta: null,
+    scheduleToasts: [],
+    latestScheduleResult: null,
   };
 }
 
@@ -180,6 +195,19 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "SET_NEEDS_ONBOARDING":
       return { ...state, needsOnboarding: action.payload };
+
+    case "SCHEDULE_RESULT":
+      return {
+        ...state,
+        scheduleToasts: [action.payload, ...state.scheduleToasts].slice(0, 10),
+        latestScheduleResult: action.payload,
+      };
+
+    case "DISMISS_TOAST":
+      return {
+        ...state,
+        scheduleToasts: state.scheduleToasts.filter((t) => t.id !== action.payload),
+      };
 
     default:
       return state;
