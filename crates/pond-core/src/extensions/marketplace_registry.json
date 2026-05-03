@@ -109,7 +109,7 @@
       "args": ["tsx", "extensions/music/src/server.ts"],
       "category": "entertainment",
       "author": "GIAP",
-      "tools": ["now_playing", "play", "pause", "next", "previous", "search_tracks", "search_albums", "get_playlists", "create_playlist", "add_to_playlist", "get_queue", "set_volume", "set_shuffle", "get_playlist_tracks"],
+      "tools": ["play", "status", "control"],
       "featured": true,
       "required_secrets": [
         {
