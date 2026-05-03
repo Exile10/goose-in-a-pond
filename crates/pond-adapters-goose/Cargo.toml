@@ -16,6 +16,7 @@ pond-core        = { path = "../pond-core" }
 pond-mcp-server  = { path = "../pond-mcp-server" }
 goose            = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls", "local-inference"] }
 rmcp             = { workspace = true }
+reqwest          = { workspace = true }
 anyhow = "1.0"
 tokio = { version = "1.49", features = ["full"] }
 async-stream = "0.3"

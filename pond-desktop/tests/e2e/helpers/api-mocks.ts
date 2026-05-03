@@ -141,4 +141,144 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   await page.route("**/api/v1/profiles", (route) =>
     route.fulfill({ json: [] }),
   );
+
+  // Extensions
+  await page.route("**/api/v1/extensions", (route) => {
+    if (route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({
+        status: 201,
+        json: {
+          name: body.name ?? "test-ext",
+          kind: body.kind ?? "stdio",
+          enabled: true,
+          tools: [],
+          description: null,
+          status: "connected",
+          last_error: null,
+        },
+      });
+    }
+    return route.fulfill({ json: { extensions: [] } });
+  });
+  await page.route("**/api/v1/extensions/**", (route) => {
+    if (route.request().method() === "DELETE") {
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ json: { status: "ok" } });
+  });
+
+  // Marketplace
+  await page.route("**/api/v1/marketplace", (route) =>
+    route.fulfill({
+      json: {
+        extensions: [
+          {
+            id: "weather-tools",
+            name: "Weather Tools",
+            description: "Real-time weather data and forecasts for any location worldwide.",
+            kind: "streamable_http",
+            uri: "http://localhost:3010/mcp",
+            category: "productivity",
+            author: "Pond Team",
+            tools: ["get_weather", "get_forecast", "get_alerts"],
+            featured: true,
+            required_secrets: [],
+          },
+          {
+            id: "git-helper",
+            name: "Git Helper",
+            description: "Git operations: commit, diff, log, branch management from the agent.",
+            kind: "stdio",
+            command: "git-mcp",
+            args: [],
+            category: "development",
+            author: "Community",
+            tools: ["git_status", "git_diff", "git_commit"],
+            featured: false,
+            required_secrets: [],
+          },
+          {
+            id: "github-mcp",
+            name: "GitHub",
+            description: "Access GitHub repos, issues, and pull requests with your personal access token.",
+            kind: "stdio",
+            command: "github-mcp",
+            args: [],
+            category: "development",
+            author: "Pond Team",
+            tools: ["list_repos", "get_issue", "create_pr"],
+            featured: false,
+            required_secrets: [
+              {
+                key: "GITHUB_PERSONAL_ACCESS_TOKEN",
+                display_name: "GitHub Personal Access Token",
+                description: "A classic token with repo scope. Generate one at github.com/settings/tokens.",
+                required: true,
+                kind: "api_key",
+              },
+            ],
+          },
+          {
+            id: "spotify-mcp",
+            name: "Spotify",
+            description: "Control Spotify playback, search tracks, and manage playlists.",
+            kind: "streamable_http",
+            uri: "http://localhost:3011/mcp",
+            category: "entertainment",
+            author: "Community",
+            tools: ["play_track", "search_music", "get_playlist"],
+            featured: false,
+            required_secrets: [
+              {
+                key: "SPOTIFY_ACCESS_TOKEN",
+                display_name: "Spotify",
+                description: "Sign in with your Spotify account to allow the agent to control playback.",
+                required: true,
+                kind: "oauth_flow",
+              },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/marketplace/*/install", (route) =>
+    route.fulfill({
+      status: 201,
+      json: {
+        name: "GitHub",
+        kind: "stdio",
+        enabled: true,
+        tools: ["list_repos", "get_issue", "create_pr"],
+        description: "Access GitHub repos, issues, and pull requests.",
+        status: "connected",
+        last_error: null,
+      },
+    }),
+  );
+
+  // Secrets
+  await page.route("**/api/v1/secrets/*/exists", (route) =>
+    route.fulfill({ json: { exists: false } }),
+  );
+  await page.route("**/api/v1/secrets/**", (route) => {
+    if (route.request().method() === "PUT") {
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ json: { keys: [] } });
+  });
+
+  // Extensions secrets endpoint
+  await page.route("**/api/v1/extensions/*/secrets", (route) => {
+    if (route.request().method() === "POST") {
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ json: { requirements: [], fulfilled: {} } });
+  });
+
+  // OAuth
+  await page.route("**/api/v1/oauth/**", (route) =>
+    route.fulfill({ json: { auth_url: "https://accounts.spotify.com/authorize?test=1", state: "test-state" } }),
+  );
 }

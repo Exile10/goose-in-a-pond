@@ -14,9 +14,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState};
-use pond_core::domain::memory::{
-    MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
-};
+use pond_core::domain::memory::{MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier};
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::memory_repository::MemoryRepository;
@@ -42,9 +40,15 @@ use tower::ServiceExt;
 struct CompletedOnboarding;
 #[async_trait::async_trait]
 impl OnboardingRepository for CompletedOnboarding {
-    async fn get_current_step(&self) -> Option<OnboardingStep> { Some(OnboardingStep::Completed) }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn get_current_step(&self) -> Option<OnboardingStep> {
+        Some(OnboardingStep::Completed)
+    }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -52,20 +56,35 @@ struct NoDevices;
 impl DeviceRegistry for NoDevices {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".into(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01T00:00:00Z".into(), last_seen: None, is_online: false,
+            id: "mock".into(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01T00:00:00Z".into(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Helper: create a real DB-backed app with SqliteMemoryRepository ──────────
 
-async fn make_app_with_real_memory() -> (axum::Router, Arc<SqliteMemoryRepository>, tempfile::TempDir) {
+async fn make_app_with_real_memory(
+) -> (axum::Router, Arc<SqliteMemoryRepository>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -101,6 +120,9 @@ async fn make_app_with_real_memory() -> (axum::Router, Arc<SqliteMemoryRepositor
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -117,10 +139,12 @@ async fn make_app_with_real_memory() -> (axum::Router, Arc<SqliteMemoryRepositor
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
 
     let router = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -129,28 +153,36 @@ async fn make_app_with_real_memory() -> (axum::Router, Arc<SqliteMemoryRepositor
 
 fn auth_get(uri: &str) -> Request<Body> {
     Request::builder()
-        .method("GET").uri(uri)
+        .method("GET")
+        .uri(uri)
         .header("Authorization", "Bearer test-token")
-        .body(Body::empty()).unwrap()
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
-        .method("POST").uri(uri)
+        .method("POST")
+        .uri(uri)
         .header("content-type", "application/json")
         .header("Authorization", "Bearer test-token")
-        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
 }
 
 fn auth_delete(uri: &str) -> Request<Body> {
     Request::builder()
-        .method("DELETE").uri(uri)
+        .method("DELETE")
+        .uri(uri)
         .header("Authorization", "Bearer test-token")
-        .body(Body::empty()).unwrap()
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -163,9 +195,11 @@ async fn segment_fields_round_trip_through_sqlite() {
     let repo = SqliteMemoryRepository::new(db.system);
 
     let frag = MemoryFragment::from_extraction(
-        "seg-1".into(), None,
+        "seg-1".into(),
+        None,
         "User's name is Jerry".into(),
-        MemorySegment::Identity, 0.85,
+        MemorySegment::Identity,
+        0.85,
     );
     repo.add(frag).await.unwrap();
 
@@ -187,8 +221,11 @@ async fn access_tracking_increments_and_timestamps() {
     let repo = SqliteMemoryRepository::new(db.system);
 
     let frag = MemoryFragment::from_extraction(
-        "acc-1".into(), None, "Test fact".into(),
-        MemorySegment::Knowledge, 0.5,
+        "acc-1".into(),
+        None,
+        "Test fact".into(),
+        MemorySegment::Knowledge,
+        0.5,
     );
     repo.add(frag).await.unwrap();
 
@@ -208,16 +245,28 @@ async fn lifecycle_update_hides_from_search() {
     let repo = SqliteMemoryRepository::new(db.system);
 
     repo.add(MemoryFragment::from_extraction(
-        "lc-1".into(), None, "Active memory".into(),
-        MemorySegment::Knowledge, 0.5,
-    )).await.unwrap();
+        "lc-1".into(),
+        None,
+        "Active memory".into(),
+        MemorySegment::Knowledge,
+        0.5,
+    ))
+    .await
+    .unwrap();
 
     repo.add(MemoryFragment::from_extraction(
-        "lc-2".into(), None, "To be archived".into(),
-        MemorySegment::Context, 0.3,
-    )).await.unwrap();
+        "lc-2".into(),
+        None,
+        "To be archived".into(),
+        MemorySegment::Context,
+        0.3,
+    ))
+    .await
+    .unwrap();
 
-    repo.update_lifecycle("lc-2", MemoryLifecycle::Archived).await.unwrap();
+    repo.update_lifecycle("lc-2", MemoryLifecycle::Archived)
+        .await
+        .unwrap();
 
     let results = repo.search_recent(None, 10).await.unwrap();
     assert_eq!(results.len(), 1);
@@ -231,23 +280,46 @@ async fn search_by_segment_filters_correctly() {
     let repo = SqliteMemoryRepository::new(db.system);
 
     repo.add(MemoryFragment::from_extraction(
-        "s1".into(), None, "Name is Jerry".into(),
-        MemorySegment::Identity, 0.85,
-    )).await.unwrap();
+        "s1".into(),
+        None,
+        "Name is Jerry".into(),
+        MemorySegment::Identity,
+        0.85,
+    ))
+    .await
+    .unwrap();
     repo.add(MemoryFragment::from_extraction(
-        "s2".into(), None, "Likes dark mode".into(),
-        MemorySegment::Preference, 0.7,
-    )).await.unwrap();
+        "s2".into(),
+        None,
+        "Likes dark mode".into(),
+        MemorySegment::Preference,
+        0.7,
+    ))
+    .await
+    .unwrap();
     repo.add(MemoryFragment::from_extraction(
-        "s3".into(), None, "Lives in Nairobi".into(),
-        MemorySegment::Identity, 0.8,
-    )).await.unwrap();
+        "s3".into(),
+        None,
+        "Lives in Nairobi".into(),
+        MemorySegment::Identity,
+        0.8,
+    ))
+    .await
+    .unwrap();
 
-    let identities = repo.search_by_segment(MemorySegment::Identity, None, 10).await.unwrap();
+    let identities = repo
+        .search_by_segment(MemorySegment::Identity, None, 10)
+        .await
+        .unwrap();
     assert_eq!(identities.len(), 2);
-    assert!(identities.iter().all(|m| m.segment == Some(MemorySegment::Identity)));
+    assert!(identities
+        .iter()
+        .all(|m| m.segment == Some(MemorySegment::Identity)));
 
-    let prefs = repo.search_by_segment(MemorySegment::Preference, None, 10).await.unwrap();
+    let prefs = repo
+        .search_by_segment(MemorySegment::Preference, None, 10)
+        .await
+        .unwrap();
     assert_eq!(prefs.len(), 1);
 }
 
@@ -258,13 +330,23 @@ async fn mark_superseded_sets_lifecycle_and_link() {
     let repo = SqliteMemoryRepository::new(db.system);
 
     repo.add(MemoryFragment::from_extraction(
-        "old-1".into(), None, "User likes coffee".into(),
-        MemorySegment::Preference, 0.7,
-    )).await.unwrap();
+        "old-1".into(),
+        None,
+        "User likes coffee".into(),
+        MemorySegment::Preference,
+        0.7,
+    ))
+    .await
+    .unwrap();
     repo.add(MemoryFragment::from_extraction(
-        "new-1".into(), None, "User likes coffee and tea".into(),
-        MemorySegment::Preference, 0.7,
-    )).await.unwrap();
+        "new-1".into(),
+        None,
+        "User likes coffee and tea".into(),
+        MemorySegment::Preference,
+        0.7,
+    ))
+    .await
+    .unwrap();
 
     repo.mark_superseded("old-1", "new-1").await.unwrap();
 
@@ -279,8 +361,11 @@ async fn mark_superseded_sets_lifecycle_and_link() {
 #[test]
 fn effective_score_permanent_tier_no_decay() {
     let frag = MemoryFragment::from_extraction(
-        "p1".into(), None, "Name".into(),
-        MemorySegment::Identity, 0.9,
+        "p1".into(),
+        None,
+        "Name".into(),
+        MemorySegment::Identity,
+        0.9,
     );
     let score = effective_score(&frag);
     assert!((score - 0.9).abs() < 0.01);
@@ -289,8 +374,11 @@ fn effective_score_permanent_tier_no_decay() {
 #[test]
 fn effective_score_decays_over_time() {
     let mut frag = MemoryFragment::from_extraction(
-        "d1".into(), None, "Old fact".into(),
-        MemorySegment::Context, 0.3,
+        "d1".into(),
+        None,
+        "Old fact".into(),
+        MemorySegment::Context,
+        0.3,
     );
     // Make it 30 days old
     frag.created_at = chrono::Utc::now() - chrono::Duration::days(30);
@@ -298,14 +386,20 @@ fn effective_score_decays_over_time() {
     frag.decay_rate = Some(0.1);
 
     let score = effective_score(&frag);
-    assert!(score < 0.05, "30-day-old short-tier memory should decay below 0.05, got {score}");
+    assert!(
+        score < 0.05,
+        "30-day-old short-tier memory should decay below 0.05, got {score}"
+    );
 }
 
 #[test]
 fn effective_score_access_reinforces() {
     let mut no_access = MemoryFragment::from_extraction(
-        "a1".into(), None, "Fact".into(),
-        MemorySegment::Knowledge, 0.5,
+        "a1".into(),
+        None,
+        "Fact".into(),
+        MemorySegment::Knowledge,
+        0.5,
     );
     no_access.created_at = chrono::Utc::now() - chrono::Duration::days(10);
 
@@ -325,14 +419,22 @@ async fn cleanup_archives_decayed_memories() {
 
     // Fresh memory — should survive
     repo.add(MemoryFragment::from_extraction(
-        "fresh".into(), None, "Recent fact".into(),
-        MemorySegment::Knowledge, 0.7,
-    )).await.unwrap();
+        "fresh".into(),
+        None,
+        "Recent fact".into(),
+        MemorySegment::Knowledge,
+        0.7,
+    ))
+    .await
+    .unwrap();
 
     // Old short-tier memory — should be pruned
     let mut old = MemoryFragment::from_extraction(
-        "old".into(), None, "Ancient context".into(),
-        MemorySegment::Context, 0.3,
+        "old".into(),
+        None,
+        "Ancient context".into(),
+        MemorySegment::Context,
+        0.3,
     );
     old.created_at = chrono::Utc::now() - chrono::Duration::days(60);
     old.tier = Some(MemoryTier::Short);
@@ -341,15 +443,25 @@ async fn cleanup_archives_decayed_memories() {
 
     // Permanent memory — should always survive
     repo.add(MemoryFragment::from_extraction(
-        "perm".into(), None, "Identity fact".into(),
-        MemorySegment::Identity, 0.9,
-    )).await.unwrap();
+        "perm".into(),
+        None,
+        "Identity fact".into(),
+        MemorySegment::Identity,
+        0.9,
+    ))
+    .await
+    .unwrap();
 
     let (scanned, archived, pruned) =
-        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15).await.unwrap();
+        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15)
+            .await
+            .unwrap();
 
     assert!(scanned >= 2, "should scan at least 2 scoreable memories");
-    assert!(archived + pruned >= 1, "should archive/prune the decayed memory");
+    assert!(
+        archived + pruned >= 1,
+        "should archive/prune the decayed memory"
+    );
 
     // Verify: only fresh + perm remain in active search
     let active = repo.search_recent(None, 10).await.unwrap();
@@ -370,7 +482,11 @@ async fn api_save_memory_with_segment() {
         "source": "api",
         "tags": ["preferences"]
     });
-    let resp = app.clone().oneshot(auth_post("/api/v1/memories", body)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(auth_post("/api/v1/memories", body))
+        .await
+        .unwrap();
     assert!(
         resp.status().is_success(),
         "save memory should succeed, got {}",
@@ -389,13 +505,23 @@ async fn api_list_memories_returns_recent() {
 
     // Insert directly via repo
     repo.add(MemoryFragment::from_extraction(
-        "m1".into(), None, "Fact one".into(),
-        MemorySegment::Knowledge, 0.5,
-    )).await.unwrap();
+        "m1".into(),
+        None,
+        "Fact one".into(),
+        MemorySegment::Knowledge,
+        0.5,
+    ))
+    .await
+    .unwrap();
     repo.add(MemoryFragment::from_extraction(
-        "m2".into(), None, "Fact two".into(),
-        MemorySegment::Preference, 0.7,
-    )).await.unwrap();
+        "m2".into(),
+        None,
+        "Fact two".into(),
+        MemorySegment::Preference,
+        0.7,
+    ))
+    .await
+    .unwrap();
 
     let resp = app.oneshot(auth_get("/api/v1/memories")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -410,13 +536,20 @@ async fn api_delete_memory_removes_from_db() {
     let (app, repo, _tmp) = make_app_with_real_memory().await;
 
     repo.add(MemoryFragment::from_extraction(
-        "del-1".into(), None, "To delete".into(),
-        MemorySegment::Context, 0.3,
-    )).await.unwrap();
+        "del-1".into(),
+        None,
+        "To delete".into(),
+        MemorySegment::Context,
+        0.3,
+    ))
+    .await
+    .unwrap();
 
-    let resp = app.clone()
+    let resp = app
+        .clone()
         .oneshot(auth_delete("/api/v1/memories/del-1"))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(
         resp.status().is_success(),
         "delete memory should succeed, got {}",
@@ -433,7 +566,10 @@ async fn api_delete_memory_removes_from_db() {
 async fn api_usage_summary_returns_zeros_initially() {
     let (app, _repo, _tmp) = make_app_with_real_memory().await;
 
-    let resp = app.oneshot(auth_get("/api/v1/usage/summary")).await.unwrap();
+    let resp = app
+        .oneshot(auth_get("/api/v1/usage/summary"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = json_body(resp).await;

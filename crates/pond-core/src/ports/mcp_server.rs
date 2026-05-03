@@ -42,4 +42,8 @@ pub trait McpServerRepository: Send + Sync {
     /// Remove the server configuration with the given `name`.
     /// Returns `Ok(())` even if no row matched.
     async fn delete(&self, name: &str) -> Result<()>;
+
+    /// Update the `enabled` flag for the server with the given `name`.
+    /// Returns `Ok(())` even if no row matched.
+    async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()>;
 }

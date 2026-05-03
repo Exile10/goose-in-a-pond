@@ -14,7 +14,9 @@ use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::agent::{Agent, AgentRequest, AgentResponse};
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::ports::extension_manager::{AddExtensionRequest, ExtensionInfo, ExtensionManagerPort};
+use pond_core::ports::extension_manager::{
+    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
+};
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
@@ -38,8 +40,12 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn get_current_step(&self) -> Option<OnboardingStep> {
         Some(OnboardingStep::Completed)
     }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -59,10 +65,18 @@ impl DeviceRegistry for NoDevices {
             is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct StubExtensionManager;
@@ -76,6 +90,8 @@ impl ExtensionManagerPort for StubExtensionManager {
             description: "GIAP builtin tools".to_string(),
             tools: vec!["giap__get_current_weather".to_string()],
             enabled: true,
+            status: "connected".to_string(),
+            last_error: None,
         }])
     }
 
@@ -115,7 +131,12 @@ impl Agent for ToolCallingAgent {
     async fn chat_stream(
         &self,
         request: AgentRequest,
-    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<pond_core::domain::agent::AgentStreamEvent>>> {
+    ) -> anyhow::Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<pond_core::domain::agent::AgentStreamEvent>,
+        >,
+    > {
         let stream = async_stream::stream! {
             yield Ok(pond_core::domain::agent::AgentStreamEvent::ToolCall {
                 id: "test-tool-call-id".to_string(),
@@ -151,7 +172,9 @@ fn sse_body_with_usage(tokens: &[&str], usage: Option<(u32, u32)>) -> String {
             prompt + completion
         ));
     } else {
-        body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n");
+        body.push_str(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
     }
     body.push_str("data: [DONE]\n\n");
     body
@@ -195,6 +218,9 @@ async fn make_app_with_provider(
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -211,12 +237,17 @@ async fn make_app_with_provider(
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 fn stream_request(body: serde_json::Value) -> Request<Body> {
@@ -240,7 +271,9 @@ async fn collect_sse_events(body: axum::body::Body) -> Vec<serde_json::Value> {
 }
 
 fn done_event(events: &[serde_json::Value]) -> Option<&serde_json::Value> {
-    events.iter().find(|e| e.get("done").and_then(|d| d.as_bool()).unwrap_or(false))
+    events
+        .iter()
+        .find(|e| e.get("done").and_then(|d| d.as_bool()).unwrap_or(false))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -264,7 +297,9 @@ async fn chat_message_routes_to_chat_provider() {
     let (app, _tmp) = make_app_with_provider(router).await;
 
     let resp = app
-        .oneshot(stream_request(serde_json::json!({"message": "hello there"})))
+        .oneshot(stream_request(
+            serde_json::json!({"message": "hello there"}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -298,7 +333,9 @@ async fn think_message_uses_single_provider() {
     let (app, _tmp) = make_app_with_provider(router).await;
 
     let resp = app
-        .oneshot(stream_request(serde_json::json!({"message": "explain why the sky is blue"})))
+        .oneshot(stream_request(
+            serde_json::json!({"message": "explain why the sky is blue"}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -327,7 +364,9 @@ async fn task_message_uses_single_provider() {
     let (app, _tmp) = make_app_with_provider(router).await;
 
     let resp = app
-        .oneshot(stream_request(serde_json::json!({"message": "remind me to call mum at 9am"})))
+        .oneshot(stream_request(
+            serde_json::json!({"message": "remind me to call mum at 9am"}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -369,7 +408,11 @@ async fn provider_failure_does_not_break_universal_agent_path() {
     let text_event = events
         .iter()
         .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("text"));
-    assert!(text_event.is_some(), "expected text event, got events: {:?}", events);
+    assert!(
+        text_event.is_some(),
+        "expected text event, got events: {:?}",
+        events
+    );
 }
 
 /// The done event must always include a non-empty session_id.
@@ -400,7 +443,11 @@ async fn done_event_has_session_id() {
     let done = done_event(&events).expect("no done event");
 
     let session_id = done["session_id"].as_str().unwrap_or("");
-    assert!(!session_id.is_empty(), "done event has empty session_id: {:?}", done);
+    assert!(
+        !session_id.is_empty(),
+        "done event has empty session_id: {:?}",
+        done
+    );
 }
 
 /// Agent-path responses currently emit usage fields with zero values.
@@ -432,8 +479,16 @@ async fn done_event_has_usage_shape_for_agent_path() {
 
     let prompt = done["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let completion = done["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    assert_eq!(prompt, 0, "expected prompt_tokens=0 in done event: {:?}", done);
-    assert_eq!(completion, 0, "expected completion_tokens=0 in done event: {:?}", done);
+    assert_eq!(
+        prompt, 0,
+        "expected prompt_tokens=0 in done event: {:?}",
+        done
+    );
+    assert_eq!(
+        completion, 0,
+        "expected completion_tokens=0 in done event: {:?}",
+        done
+    );
 }
 
 /// With universal agent routing, non-task messages still succeed even when
@@ -474,6 +529,9 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -490,10 +548,12 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -505,7 +565,11 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
 
     let events = collect_sse_events(resp.into_body()).await;
     let error_event = events.iter().find(|e| e.get("error").is_some());
-    assert!(error_event.is_none(), "did not expect error event: {:?}", events);
+    assert!(
+        error_event.is_none(),
+        "did not expect error event: {:?}",
+        events
+    );
 
     let done = done_event(&events).expect("no done event");
     assert_eq!(done["model_role"].as_str(), Some("chat"));
@@ -549,6 +613,9 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         mcp_memory: None,
         extension_manager: Some(Arc::new(StubExtensionManager)),
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -565,24 +632,32 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
     let resp = app
-        .oneshot(stream_request(serde_json::json!({"message": "remind me to water plants at 6"})))
+        .oneshot(stream_request(
+            serde_json::json!({"message": "remind me to water plants at 6"}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let events = collect_sse_events(resp.into_body()).await;
-    let tool_event = events.iter().find(|e| {
-        e.get("type").and_then(|t| t.as_str()) == Some("tool_call")
-    });
-    assert!(tool_event.is_some(), "expected tool_call event: {:?}", events);
+    let tool_event = events
+        .iter()
+        .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_call"));
+    assert!(
+        tool_event.is_some(),
+        "expected tool_call event: {:?}",
+        events
+    );
 
     let done = done_event(&events).expect("no done event");
     assert_eq!(done["model_role"].as_str(), Some("chat"));

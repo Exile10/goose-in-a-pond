@@ -32,6 +32,8 @@ chrono     = { version = "0.4", features = ["serde"] }
 schemars   = { version = "1", features = ["derive"] }
 reqwest      = { workspace = true }
 urlencoding  = { workspace = true }
+sysinfo      = "0.33"
+notify-rust  = "4"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }

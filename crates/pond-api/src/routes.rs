@@ -17,20 +17,22 @@ use axum::{
     Router,
 };
 use pond_core::domain::message::ChatMessage;
-use pond_core::domain::profile::CreateProfileRequest;
-use pond_core::domain::sensor::{CameraEvent, SensorReading};
-use pond_core::domain::schedule::TaskKind;
-use pond_core::ports::scheduler::CreateScheduleRequest;
-use pond_core::domain::settings::Settings;
-use pond_core::ports::extension_manager::ExtensionInfo;
-use pond_core::ports::device_registry::RegisterDeviceRequest;
-use tower_http::services::ServeDir;
 use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::domain::profile::CreateProfileRequest;
+use pond_core::domain::schedule::TaskKind;
+use pond_core::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::domain::settings::Settings;
+use pond_core::ports::device_registry::RegisterDeviceRequest;
+use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
-use pond_core::prompts::{build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext};
 use pond_core::ports::provider::LlmProvider;
+use pond_core::ports::scheduler::CreateScheduleRequest;
+use pond_core::prompts::{
+    build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext,
+};
 use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
+use tower_http::services::ServeDir;
 // Tool classification is handled by the ToolAgent port (injected via AppState).
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,15 +40,15 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::domain::memory::MemoryFragment;
+use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::domain::prompt_extra::PromptExtra;
 use pond_core::domain::prompt_template::PromptTemplate;
 use pond_core::domain::recipe::AgentRecipe;
 use pond_core::domain::skill::UserSkill;
 
-use crate::{AppState, DownloadEntry, ModelStatusEntry};
 use crate::middleware::onboarding_guard::require_onboarding_complete;
+use crate::{AppState, DownloadEntry, ModelStatusEntry};
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
@@ -109,8 +111,14 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
         .route("/sensors", post(record_sensor))
         .route("/sensors/{device_id}", get(get_recent_sensors))
-        .route("/camera/events", get(list_camera_events).post(record_camera_event))
-        .route("/camera/events/{id}/acknowledge", patch(acknowledge_camera_event))
+        .route(
+            "/camera/events",
+            get(list_camera_events).post(record_camera_event),
+        )
+        .route(
+            "/camera/events/{id}/acknowledge",
+            patch(acknowledge_camera_event),
+        )
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route("/schedules/upcoming", get(list_upcoming_schedules))
@@ -121,17 +129,53 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/runs", get(list_schedule_runs))
         .route("/schedules/events", get(schedule_events_sse))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
-        .route("/extensions", get(list_extensions_handler).post(add_extension_handler))
-        .route("/extensions/{name}", delete(remove_extension_handler).patch(toggle_extension_handler))
+        .route(
+            "/extensions",
+            get(list_extensions_handler).post(add_extension_handler),
+        )
+        .route(
+            "/extensions/{name}",
+            delete(remove_extension_handler).patch(toggle_extension_handler),
+        )
+        // ── Secrets ────────────────────────────────────────────────────────────
+        .route("/secrets", get(list_secrets_handler))
+        .route(
+            "/secrets/{key}",
+            put(set_secret_handler).delete(delete_secret_handler),
+        )
+        .route("/secrets/{key}/exists", get(check_secret_handler))
+        .route(
+            "/extensions/{name}/secrets",
+            get(get_extension_secrets_handler).post(set_extension_secrets_handler),
+        )
+        // ── OAuth PKCE ─────────────────────────────────────────────────────────
+        .route("/oauth/authorize", post(oauth_authorize_handler))
+        .route("/oauth/callback", get(oauth_callback_handler))
+        .route("/oauth/refresh", post(oauth_refresh_handler))
+        .route("/oauth/providers", get(oauth_providers_handler))
+        // ── Extension Marketplace ─────────────────────────────────────────────
+        .route("/marketplace", get(list_marketplace_handler))
+        .route(
+            "/marketplace/{id}/install",
+            post(install_marketplace_handler),
+        )
         // ── Prompt Templates ───────────────────────────────────────────────────
         .route("/prompts", get(list_prompt_templates))
-        .route("/prompts/{name}", get(get_prompt_template).put(upsert_prompt_template).delete(delete_prompt_template))
+        .route(
+            "/prompts/{name}",
+            get(get_prompt_template)
+                .put(upsert_prompt_template)
+                .delete(delete_prompt_template),
+        )
         // ── Agent Tools (MCP) ─────────────────────────────────────────────────
         .route("/agent/tools", get(list_agent_tools))
         // ── Agent chat stream (agentic tool-use loop) ─────────────────────────
         .route("/agent/chat/stream", post(agent_chat_stream))
         // ── System Prompt Extras ───────────────────────────────────────────────
-        .route("/agent/extras", get(list_prompt_extras).post(upsert_prompt_extra))
+        .route(
+            "/agent/extras",
+            get(list_prompt_extras).post(upsert_prompt_extra),
+        )
         .route("/agent/extras/{key}", delete(delete_prompt_extra))
         // ── Turn-level telemetry ──────────────────────────────────────────────
         .route("/telemetry/turns", get(get_telemetry_turns))
@@ -163,18 +207,26 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/faces/debug/pairwise", get(face_pairwise_debug))
         .route("/faces/debug/eval", get(face_eval_debug))
         .route("/faces/models", get(list_face_models_handler))
-        .route("/users/{profile_id}/biometrics", delete(delete_user_biometrics))
+        .route(
+            "/users/{profile_id}/biometrics",
+            delete(delete_user_biometrics),
+        )
         // Wake-on-face: bind an identified profile to an active chat session
-        .route("/sessions/{session_id}/identify-user", post(identify_session_user_handler))
-        .route("/sessions/{session_id}/user", get(get_session_user_handler).delete(clear_session_user_handler))
-        .layer(
-            axum::middleware::from_fn_with_state(state.clone(), require_onboarding_complete)
-        );
+        .route(
+            "/sessions/{session_id}/identify-user",
+            post(identify_session_user_handler),
+        )
+        .route(
+            "/sessions/{session_id}/user",
+            get(get_session_user_handler).delete(clear_session_user_handler),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_onboarding_complete,
+        ));
 
     // Merge public and protected routes, attach shared state
-    public_routes
-        .merge(protected_routes)
-        .with_state(state)
+    public_routes.merge(protected_routes).with_state(state)
 }
 
 // ───────────────────────── Web Dashboard Routes ─────────────────────
@@ -211,19 +263,15 @@ async fn handshake_handler(
         )
     })?;
 
-    let response = state
-        .handshake
-        .handshake(request)
-        .await
-        .map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Handshake failed: {}", e),
-                    "status": 500
-                })),
-            )
-        })?;
+    let response = state.handshake.handshake(request).await.map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("Handshake failed: {}", e),
+                "status": 500
+            })),
+        )
+    })?;
 
     Ok(Json(response))
 }
@@ -286,19 +334,23 @@ async fn complete_onboarding(
 async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
-    let total_steps = 9;  // Welcome Basics Location Accessibility Personality GooseIdentity WakeWord Model Extensions
+    let total_steps = 9; // Welcome Basics Location Accessibility Personality GooseIdentity WakeWord Model Extensions
     let (current_step, steps_completed, onboarded) = match service.status().await {
-        None                                   => ("not_started".to_string(),                    0, false),
-        Some(OnboardingStep::Welcome)           => (OnboardingStep::Welcome.to_string(),          1, false),
-        Some(OnboardingStep::Basics)            => (OnboardingStep::Basics.to_string(),           2, false),
-        Some(OnboardingStep::Location)          => (OnboardingStep::Location.to_string(),         3, false),
-        Some(OnboardingStep::Accessibility)     => (OnboardingStep::Accessibility.to_string(),    4, false),
-        Some(OnboardingStep::Personality)       => (OnboardingStep::Personality.to_string(),      5, false),
-        Some(OnboardingStep::GooseIdentity)     => (OnboardingStep::GooseIdentity.to_string(),    6, false),
-        Some(OnboardingStep::WakeWord)          => (OnboardingStep::WakeWord.to_string(),         7, false),
-        Some(OnboardingStep::Model)             => (OnboardingStep::Model.to_string(),            8, false),
-        Some(OnboardingStep::Extensions)        => (OnboardingStep::Extensions.to_string(),       8, false),
-        Some(OnboardingStep::Completed)         => ("Completed".to_string(),                      8, true),
+        None => ("not_started".to_string(), 0, false),
+        Some(OnboardingStep::Welcome) => (OnboardingStep::Welcome.to_string(), 1, false),
+        Some(OnboardingStep::Basics) => (OnboardingStep::Basics.to_string(), 2, false),
+        Some(OnboardingStep::Location) => (OnboardingStep::Location.to_string(), 3, false),
+        Some(OnboardingStep::Accessibility) => {
+            (OnboardingStep::Accessibility.to_string(), 4, false)
+        }
+        Some(OnboardingStep::Personality) => (OnboardingStep::Personality.to_string(), 5, false),
+        Some(OnboardingStep::GooseIdentity) => {
+            (OnboardingStep::GooseIdentity.to_string(), 6, false)
+        }
+        Some(OnboardingStep::WakeWord) => (OnboardingStep::WakeWord.to_string(), 7, false),
+        Some(OnboardingStep::Model) => (OnboardingStep::Model.to_string(), 8, false),
+        Some(OnboardingStep::Extensions) => (OnboardingStep::Extensions.to_string(), 8, false),
+        Some(OnboardingStep::Completed) => ("Completed".to_string(), 8, true),
     };
 
     Json(json!({
@@ -356,21 +408,14 @@ async fn chat(
 
     // Build ChatService — agent is always primary (GooseAdapter builds system
     // prompt from DB settings, manages history, handles MCP tools internally).
-    let service = ChatService::new(
-        state.agent.clone(),
-        session_id.clone(),
-        storage.clone(),
-    );
+    let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone());
 
-    let response_text = service
-        .chat_once(req.message)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
+    let response_text = service.chat_once(req.message).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -481,7 +526,8 @@ fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String 
         "## Tool Use Guidance".to_string(),
         "You may call tools when they are necessary to complete the user request.".to_string(),
         "- Prefer the smallest number of tool calls that can complete the task.".to_string(),
-        "- If a tool fails, explain what failed and continue with the best possible answer.".to_string(),
+        "- If a tool fails, explain what failed and continue with the best possible answer."
+            .to_string(),
         "".to_string(),
         "Available tools:".to_string(),
     ];
@@ -496,7 +542,12 @@ fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String 
         if ext.description.trim().is_empty() {
             lines.push(format!("- {} ({})", ext.name, ext.kind));
         } else {
-            lines.push(format!("- {} ({}) - {}", ext.name, ext.kind, ext.description.trim()));
+            lines.push(format!(
+                "- {} ({}) - {}",
+                ext.name,
+                ext.kind,
+                ext.description.trim()
+            ));
         }
 
         for tool in &ext.tools {
@@ -525,14 +576,25 @@ fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String 
 async fn chat_stream(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
     use futures::StreamExt;
     use pond_core::ports::agent::AgentStreamEvent;
-    let permit = state.sse_semaphore.clone().try_acquire_owned().map_err(|_| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"})))
-    })?;
+    let permit = state
+        .sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Too many concurrent streams"})),
+            )
+        })?;
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
 
     let stream = async_stream::stream! {
@@ -1205,16 +1267,12 @@ async fn chat_stream(
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let sessions = state
-        .session_storage
-        .list_sessions()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to list sessions: {}", e)})),
-            )
-        })?;
+    let sessions = state.session_storage.list_sessions().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to list sessions: {}", e)})),
+        )
+    })?;
 
     let session_list: Vec<Value> = sessions
         .iter()
@@ -1238,24 +1296,29 @@ async fn list_sessions(
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let sessions = state
-        .session_storage
-        .list_sessions()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to list sessions: {}", e)})),
-            )
-        })?;
+    let sessions = state.session_storage.list_sessions().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to list sessions: {}", e)})),
+        )
+    })?;
 
     let total_prompt: u64 = sessions.iter().map(|s| s.total_prompt_tokens as u64).sum();
-    let total_completion: u64 = sessions.iter().map(|s| s.total_completion_tokens as u64).sum();
+    let total_completion: u64 = sessions
+        .iter()
+        .map(|s| s.total_completion_tokens as u64)
+        .sum();
     let total_tokens = total_prompt + total_completion;
 
     let settings = state.settings_repo.get().await.ok();
-    let cloud_input = settings.as_ref().map(|s| s.cloud_input_price_per_million).unwrap_or(2.50);
-    let cloud_output = settings.as_ref().map(|s| s.cloud_output_price_per_million).unwrap_or(10.00);
+    let cloud_input = settings
+        .as_ref()
+        .map(|s| s.cloud_input_price_per_million)
+        .unwrap_or(2.50);
+    let cloud_output = settings
+        .as_ref()
+        .map(|s| s.cloud_output_price_per_million)
+        .unwrap_or(10.00);
 
     Ok(Json(json!({
         "total_prompt_tokens": total_prompt,
@@ -1312,12 +1375,15 @@ async fn get_telemetry_summary(
         )
     })?;
 
-    let summary = telemetry.get_summary(&query.session_id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to get summary: {}", e)})),
-        )
-    })?;
+    let summary = telemetry
+        .get_summary(&query.session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to get summary: {}", e)})),
+            )
+        })?;
 
     Ok(Json(json!(summary)))
 }
@@ -1381,11 +1447,13 @@ async fn get_session_messages(
     use pond_core::domain::message::Role;
     use pond_core::ports::session_storage::SessionStorageError;
 
-    let limit: usize = params.get("limit")
+    let limit: usize = params
+        .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100)
         .min(500);
-    let offset: usize = params.get("offset")
+    let offset: usize = params
+        .get("offset")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
@@ -1439,21 +1507,26 @@ async fn list_devices(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let devices = state.device_registry.list_devices().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     let list: Vec<Value> = devices
         .iter()
-        .map(|d| json!({
-            "id":            d.id,
-            "name":          d.name,
-            "device_type":   d.device_type,
-            "hostname":      d.hostname,
-            "ip_address":    d.ip_address,
-            "capabilities":  d.capabilities,
-            "registered_at": d.registered_at,
-            "last_seen":     d.last_seen,
-            "is_online":     d.is_online,
-        }))
+        .map(|d| {
+            json!({
+                "id":            d.id,
+                "name":          d.name,
+                "device_type":   d.device_type,
+                "hostname":      d.hostname,
+                "ip_address":    d.ip_address,
+                "capabilities":  d.capabilities,
+                "registered_at": d.registered_at,
+                "last_seen":     d.last_seen,
+                "is_online":     d.is_online,
+            })
+        })
         .collect();
     Ok(Json(json!({ "devices": list })))
 }
@@ -1463,19 +1536,28 @@ async fn register_device(
     body: Result<Json<RegisterDeviceRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
     let device = state.device_registry.register(req).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
-    Ok((StatusCode::CREATED, Json(json!({
-        "id":            device.id,
-        "name":          device.name,
-        "device_type":   device.device_type,
-        "capabilities":  device.capabilities,
-        "registered_at": device.registered_at,
-        "is_online":     device.is_online,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id":            device.id,
+            "name":          device.name,
+            "device_type":   device.device_type,
+            "capabilities":  device.capabilities,
+            "registered_at": device.registered_at,
+            "is_online":     device.is_online,
+        })),
+    ))
 }
 
 async fn unregister_device(
@@ -1483,7 +1565,10 @@ async fn unregister_device(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     state.device_registry.unregister(&id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1493,7 +1578,10 @@ async fn device_heartbeat(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.device_registry.heartbeat(&id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -1501,16 +1589,12 @@ async fn device_heartbeat(
 async fn get_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let settings = state
-        .settings_repo
-        .get()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to load settings: {}", e)})),
-            )
-        })?;
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to load settings: {}", e)})),
+        )
+    })?;
     Ok(Json(serde_json::to_value(settings).unwrap_or(json!({}))))
 }
 
@@ -1526,19 +1610,16 @@ async fn update_settings(
     })?;
 
     // Load current settings so we only overwrite the fields the caller provided.
-    let current = state
-        .settings_repo
-        .get()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to load current settings: {}", e)})),
-            )
-        })?;
+    let current = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to load current settings: {}", e)})),
+        )
+    })?;
 
     // Merge: serialise current → Value, apply patch fields, deserialise back.
-    let mut base = serde_json::to_value(&current).unwrap_or(serde_json::Value::Object(Default::default()));
+    let mut base =
+        serde_json::to_value(&current).unwrap_or(serde_json::Value::Object(Default::default()));
     if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
         for (k, v) in patch_obj {
             base_obj.insert(k.clone(), v.clone());
@@ -1546,20 +1627,21 @@ async fn update_settings(
     }
     let merged: Settings = serde_json::from_value(base).unwrap_or(current);
 
-    state
-        .settings_repo
-        .update(&merged)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to save settings: {}", e)})),
-            )
-        })?;
+    state.settings_repo.update(&merged).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save settings: {}", e)})),
+        )
+    })?;
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
-    let provider_keys = ["chat_provider","chat_model","tool_model",
-                         "active_whisper_model","active_tts_model"];
+    let provider_keys = [
+        "chat_provider",
+        "chat_model",
+        "tool_model",
+        "active_whisper_model",
+        "active_tts_model",
+    ];
     if let Some(obj) = patch.as_object() {
         if obj.keys().any(|k| provider_keys.contains(&k.as_str())) {
             rebuild_llm_provider(&state, &merged).await;
@@ -1569,9 +1651,9 @@ async fn update_settings(
             // as the Settings page write path.
             if let Some(repo) = &state.model_repo {
                 let role_map: &[(&str, &str, &str)] = &[
-                    ("chat",  &merged.chat_provider,  &merged.chat_model),
-                    ("asr",  "", &merged.active_whisper_model),
-                    ("tts",  "", &merged.active_tts_model),
+                    ("chat", &merged.chat_provider, &merged.chat_model),
+                    ("asr", "", &merged.active_whisper_model),
+                    ("tts", "", &merged.active_tts_model),
                 ];
                 for (role, provider, model_name) in role_map {
                     if model_name.is_empty() {
@@ -1595,7 +1677,9 @@ async fn update_settings(
 
     // Return the full merged Settings so the frontend can sync its local state
     // without a second GET request.
-    Ok(Json(serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" }))))
+    Ok(Json(
+        serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
+    ))
 }
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
@@ -1608,8 +1692,8 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
 
     let url = &state.llamafile_url;
     let data_dir = state.data_dir.clone();
-    let max_tokens   = settings.llm_max_tokens;
-    let temperature  = settings.llm_temperature;
+    let max_tokens = settings.llm_max_tokens;
+    let temperature = settings.llm_temperature;
 
     /// Build one `Arc<dyn LlmProvider>` for a given (provider, model) pair.
     ///
@@ -1641,7 +1725,7 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
                 // global registry so LocalInferenceProvider can locate the file.
                 let result = match &_data_dir {
                     Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
-                    None      => LocalInferenceLlmAdapter::new(model).await,
+                    None => LocalInferenceLlmAdapter::new(model).await,
                 };
                 match result {
                     Ok(adapter) => Arc::new(adapter) as Arc<dyn LlmProvider>,
@@ -1649,11 +1733,14 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
                         tracing::warn!(
                             "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
                              falling back to llamafile",
-                            model, e
+                            model,
+                            e
                         );
-                        Arc::new(LlamafileProvider::new(Some(url))
-                            .with_max_tokens(max_tokens)
-                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                        Arc::new(
+                            LlamafileProvider::new(Some(url))
+                                .with_max_tokens(max_tokens)
+                                .with_temperature(temperature),
+                        ) as Arc<dyn LlmProvider>
                     }
                 }
             }
@@ -1667,16 +1754,25 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
     }
 
     let effective_chat_provider = settings.chat_provider.clone();
-    let effective_chat_model    = settings.chat_model.clone();
+    let effective_chat_model = settings.chat_model.clone();
 
-    let chat = build_one(&effective_chat_provider, &effective_chat_model,
-                         url, data_dir.clone(), max_tokens, temperature).await;
+    let chat = build_one(
+        &effective_chat_provider,
+        &effective_chat_model,
+        url,
+        data_dir.clone(),
+        max_tokens,
+        temperature,
+    )
+    .await;
     // If chat uses llamafile, ensure the process is running before
     // the new provider goes live (so the first request doesn't time out).
     if effective_chat_provider == "llamafile" {
         if let Some(manager) = &state.llamafile_manager {
             tracing::info!("llamafile provider selected — ensuring server is running");
-            manager.ensure_started(Some(effective_chat_model.as_str())).await;
+            manager
+                .ensure_started(Some(effective_chat_model.as_str()))
+                .await;
         } else {
             tracing::warn!(
                 "llamafile provider selected but no LlamafileManager wired in AppState; \
@@ -1685,20 +1781,26 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
         }
     }
 
-    println!("[model-switch] hot-reloading LLM provider: {}/{}", effective_chat_provider, effective_chat_model);
+    println!(
+        "[model-switch] hot-reloading LLM provider: {}/{}",
+        effective_chat_provider, effective_chat_model
+    );
     *state.llm_provider.write().await = Some(chat);
-    println!("[model-switch] hot-reload complete: {}/{}", effective_chat_provider, effective_chat_model);
-    tracing::info!("LLM provider hot-reloaded: {}/{}",
-        effective_chat_provider, effective_chat_model,
+    println!(
+        "[model-switch] hot-reload complete: {}/{}",
+        effective_chat_provider, effective_chat_model
+    );
+    tracing::info!(
+        "LLM provider hot-reloaded: {}/{}",
+        effective_chat_provider,
+        effective_chat_model,
     );
 }
 
 // ── Model registry handlers ───────────────────────────────────────────────────
 
 /// GET /api/v1/models/capabilities — returns the active model's runtime capabilities.
-async fn get_model_capabilities(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn get_model_capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let caps = state.agent.capabilities();
     Json(serde_json::to_value(caps).unwrap_or_default())
 }
@@ -1706,11 +1808,10 @@ async fn get_model_capabilities(
 /// GET /api/v1/models/active-roles — returns the provider+model currently wired for each role.
 ///
 /// Reads from `model_role_assignments` (source of truth) with a settings KV fallback.
-async fn get_active_roles(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
     // Try to read from the persistent join table first
-    let assignments: std::collections::HashMap<String, String> = state.model_repo
+    let assignments: std::collections::HashMap<String, String> = state
+        .model_repo
         .as_ref()
         .and_then(|r| {
             // Use try_join in a blocking context — we're inside async so use block_in_place
@@ -1727,7 +1828,7 @@ async fn get_active_roles(
     // Fall back to settings KV hot-cache
     let settings = state.settings_repo.get().await.unwrap_or_default();
     let chat_provider = settings.chat_provider.clone();
-    let chat_model    = settings.chat_model.clone();
+    let chat_model = settings.chat_model.clone();
 
     Json(json!({
         "chat":  {
@@ -1748,9 +1849,7 @@ async fn get_active_roles(
 }
 
 /// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
-async fn get_memory_status(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let status = state
         .model_scheduler
         .as_ref()
@@ -1771,21 +1870,21 @@ async fn get_memory_status(
 fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelStatusEntry {
     let active = assignments.iter().any(|a| a.model_id == m.id);
     ModelStatusEntry {
-        category:         m.category.as_str().to_string(),
-        name:             m.name.clone(),
-        description:      m.description.clone(),
-        size_mb:          m.size_mb,
-        downloaded:       m.downloaded,
+        category: m.category.as_str().to_string(),
+        name: m.name.clone(),
+        description: m.description.clone(),
+        size_mb: m.size_mb,
+        downloaded: m.downloaded,
         active,
-        url:              m.url.clone(),
-        hf_id:            m.hf_id.clone(),
-        filename:         m.filename.clone(),
-        ram_estimate_mb:  m.ram_estimate_mb,
+        url: m.url.clone(),
+        hf_id: m.hf_id.clone(),
+        filename: m.filename.clone(),
+        ram_estimate_mb: m.ram_estimate_mb,
         recommended_role: m.recommended_role.clone(),
-        asr_language:     m.asr_language.clone(),
-        asr_size:         m.asr_size.clone(),
-        tts_engine:       m.tts_engine.clone(),
-        config_filename:  m.config_filename.clone(),
+        asr_language: m.asr_language.clone(),
+        asr_size: m.asr_size.clone(),
+        tts_engine: m.tts_engine.clone(),
+        config_filename: m.config_filename.clone(),
     }
 }
 
@@ -1797,64 +1896,86 @@ async fn scan_filesystem_extras(
     model_repo: &Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
 ) -> Vec<ModelRecord> {
     let all = model_repo.list_all().await.unwrap_or_default();
-    let known_filenames: std::collections::HashSet<String> = all.iter()
-        .filter_map(|m| m.filename.clone())
-        .collect();
+    let known_filenames: std::collections::HashSet<String> =
+        all.iter().filter_map(|m| m.filename.clone()).collect();
 
     let data_dir_owned = data_dir.to_path_buf();
     let known = known_filenames;
     let extras_from_disk = tokio::task::spawn_blocking(move || {
-        let scan_dir = |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]|
-            -> Vec<ModelRecord>
-        {
-            let mut found = vec![];
-            let Ok(rd) = std::fs::read_dir(&dir) else { return found };
-            for entry in rd.flatten() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if !exts.iter().any(|e| fname.ends_with(e)) { continue; }
-                if known.contains(&fname) { continue; }
-                let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
-                let name = fname
-                    .trim_end_matches(".gguf")
-                    .trim_end_matches(".llamafile")
-                    .trim_end_matches(".onnx")
-                    .trim_end_matches(".bin")
-                    .to_string();
-                found.push(ModelRecord {
-                    id:              ModelRecord::id_for(&category, &name),
-                    category:        category.clone(),
-                    name,
-                    filename:        Some(fname),
-                    description:     "(detected on disk)".to_string(),
-                    size_mb,
-                    url:             None,
-                    hf_id:           None,
-                    ram_estimate_mb: None,
-                    recommended_role: None,
-                    context_length:  None,
-                    quantization:    None,
-                    asr_language:    None,
-                    asr_size:        None,
-                    tts_engine:      None,
-                    tts_voice_name:  None,
-                    config_filename: None,
-                    config_url:      None,
-                    tts_url:         None,
-                    sample_rate:     None,
-                    downloaded:      true,
-                    is_custom:       true,
-                });
-            }
-            found
-        };
+        let scan_dir =
+            |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]| -> Vec<ModelRecord> {
+                let mut found = vec![];
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    return found;
+                };
+                for entry in rd.flatten() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if !exts.iter().any(|e| fname.ends_with(e)) {
+                        continue;
+                    }
+                    if known.contains(&fname) {
+                        continue;
+                    }
+                    let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+                    let name = fname
+                        .trim_end_matches(".gguf")
+                        .trim_end_matches(".llamafile")
+                        .trim_end_matches(".onnx")
+                        .trim_end_matches(".bin")
+                        .to_string();
+                    found.push(ModelRecord {
+                        id: ModelRecord::id_for(&category, &name),
+                        category: category.clone(),
+                        name,
+                        filename: Some(fname),
+                        description: "(detected on disk)".to_string(),
+                        size_mb,
+                        url: None,
+                        hf_id: None,
+                        ram_estimate_mb: None,
+                        recommended_role: None,
+                        context_length: None,
+                        quantization: None,
+                        asr_language: None,
+                        asr_size: None,
+                        tts_engine: None,
+                        tts_voice_name: None,
+                        config_filename: None,
+                        config_url: None,
+                        tts_url: None,
+                        sample_rate: None,
+                        downloaded: true,
+                        is_custom: true,
+                    });
+                }
+                found
+            };
 
         let mut extras = vec![];
-        extras.extend(scan_dir(data_dir_owned.join("models").join("gguf"),  ModelCategory::Gguf,      &[".gguf"]));
-        extras.extend(scan_dir(data_dir_owned.join("models").join("llm"),   ModelCategory::Llamafile, &[".llamafile", ".exe"]));
-        extras.extend(scan_dir(data_dir_owned.join("models"),               ModelCategory::Whisper,   &[".bin"]));
-        extras.extend(scan_dir(data_dir_owned.join("models").join("tts"),   ModelCategory::TtsPiper,  &[".onnx"]));
+        extras.extend(scan_dir(
+            data_dir_owned.join("models").join("gguf"),
+            ModelCategory::Gguf,
+            &[".gguf"],
+        ));
+        extras.extend(scan_dir(
+            data_dir_owned.join("models").join("llm"),
+            ModelCategory::Llamafile,
+            &[".llamafile", ".exe"],
+        ));
+        extras.extend(scan_dir(
+            data_dir_owned.join("models"),
+            ModelCategory::Whisper,
+            &[".bin"],
+        ));
+        extras.extend(scan_dir(
+            data_dir_owned.join("models").join("tts"),
+            ModelCategory::TtsPiper,
+            &[".onnx"],
+        ));
         extras
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
 
     // Persist newly discovered models to the catalog
     for m in &extras_from_disk {
@@ -1869,7 +1990,9 @@ async fn list_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_repo) = &state.model_repo else {
-        return Ok(Json(json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []})));
+        return Ok(Json(
+            json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []}),
+        ));
     };
 
     // Discover any files on disk not yet in the catalog
@@ -1878,42 +2001,44 @@ async fn list_models(
     }
 
     let records = model_repo.list_all().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
 
-    let mut whisper   = vec![];
+    let mut whisper = vec![];
     let mut llamafile = vec![];
-    let mut tts       = vec![];
-    let mut gguf      = vec![];
+    let mut tts = vec![];
+    let mut gguf = vec![];
 
     for m in &records {
         let v = serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default();
         match m.category {
-            ModelCategory::Whisper               => whisper.push(v),
-            ModelCategory::Llamafile             => llamafile.push(v),
-            ModelCategory::TtsPiper
-            | ModelCategory::TtsHttp             => tts.push(v),
-            ModelCategory::Gguf
-            | ModelCategory::Ollama              => gguf.push(v),
+            ModelCategory::Whisper => whisper.push(v),
+            ModelCategory::Llamafile => llamafile.push(v),
+            ModelCategory::TtsPiper | ModelCategory::TtsHttp => tts.push(v),
+            ModelCategory::Gguf | ModelCategory::Ollama => gguf.push(v),
         }
     }
 
-    Ok(Json(json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf})))
+    Ok(Json(
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf}),
+    ))
 }
 
 /// POST /api/v1/models/scan — explicit filesystem scan, persists and returns newly discovered entries.
-async fn scan_models(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let (Some(data_dir), Some(model_repo)) = (&state.data_dir, &state.model_repo) else {
         return Json(json!({"found": 0, "entries": []}));
     };
 
     let extras = scan_filesystem_extras(data_dir, model_repo).await;
-    let count  = extras.len();
+    let count = extras.len();
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
-    let entries: Vec<Value> = extras.iter()
+    let entries: Vec<Value> = extras
+        .iter()
         .map(|m| serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default())
         .collect();
 
@@ -1931,7 +2056,10 @@ async fn refresh_model_registry(
         return Ok(Json(json!({"status": "no_catalog_provider"})));
     };
 
-    let data_dir = state.model_storage_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let data_dir = state
+        .model_storage_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Fetch in the background so we don't block on slow network.
     tokio::spawn(async move {
@@ -1940,15 +2068,29 @@ async fn refresh_model_registry(
                 let count = models.len();
                 for mut m in models {
                     // Update downloaded flag from disk.
-                    m.downloaded = m.filename.as_ref()
+                    m.downloaded = m
+                        .filename
+                        .as_ref()
                         .map(|f| match m.category {
-                            pond_core::domain::model_record::ModelCategory::Whisper   => data_dir.join("models").join(f).exists(),
-                            pond_core::domain::model_record::ModelCategory::Llamafile => data_dir.join("models").join("llm").join(f).exists(),
-                            pond_core::domain::model_record::ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(f).exists(),
-                            pond_core::domain::model_record::ModelCategory::TtsPiper  => data_dir.join("models").join("tts").join(f).exists(),
+                            pond_core::domain::model_record::ModelCategory::Whisper => {
+                                data_dir.join("models").join(f).exists()
+                            }
+                            pond_core::domain::model_record::ModelCategory::Llamafile => {
+                                data_dir.join("models").join("llm").join(f).exists()
+                            }
+                            pond_core::domain::model_record::ModelCategory::Gguf => {
+                                data_dir.join("models").join("gguf").join(f).exists()
+                            }
+                            pond_core::domain::model_record::ModelCategory::TtsPiper => {
+                                data_dir.join("models").join("tts").join(f).exists()
+                            }
                             _ => false,
                         })
-                        .unwrap_or(matches!(m.category, pond_core::domain::model_record::ModelCategory::TtsHttp | pond_core::domain::model_record::ModelCategory::Ollama));
+                        .unwrap_or(matches!(
+                            m.category,
+                            pond_core::domain::model_record::ModelCategory::TtsHttp
+                                | pond_core::domain::model_record::ModelCategory::Ollama
+                        ));
                     if let Err(e) = model_repo.upsert(&m).await {
                         tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
                     }
@@ -1966,9 +2108,7 @@ async fn refresh_model_registry(
 ///
 /// Also evicts entries that finished more than 5 minutes ago to prevent
 /// unbounded growth of the in-memory tracker over long server uptimes.
-async fn get_download_progress(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn get_download_progress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut tracker = state.download_tracker.write().await;
     let now = std::time::Instant::now();
     tracker.retain(|_, e| {
@@ -1987,73 +2127,113 @@ async fn download_model(
     Path((category, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_repo) = state.model_repo.clone() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry not available"})),
+        ));
     };
     let Some(data_dir) = state.data_dir.clone() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "data_dir not configured"}))));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "data_dir not configured"})),
+        ));
     };
 
-    let cat = ModelCategory::from_str(&category)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
     let model_id = ModelRecord::id_for(&cat, &name);
 
-    let m = model_repo.get_by_id(&model_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+    let m = model_repo
+        .get_by_id(&model_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
+            )
+        })?;
 
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
     }
     let url = m.url.clone().ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": "model has no download URL"})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "model has no download URL"})),
+        )
     })?;
     let filename = m.filename.clone().ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": "model has no filename"})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "model has no filename"})),
+        )
     })?;
 
     // Determine destination path based on category
     let dest = match cat {
-        ModelCategory::Whisper   => data_dir.join("models").join(&filename),
+        ModelCategory::Whisper => data_dir.join("models").join(&filename),
         ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
-        ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(&filename),
-        ModelCategory::TtsPiper
-        | ModelCategory::TtsHttp => data_dir.join("models").join("tts").join(&filename),
-        ModelCategory::Ollama    => data_dir.join("models").join(&filename),
+        ModelCategory::Gguf => data_dir.join("models").join("gguf").join(&filename),
+        ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
+            data_dir.join("models").join("tts").join(&filename)
+        }
+        ModelCategory::Ollama => data_dir.join("models").join(&filename),
     };
 
-    let tracker     = Arc::clone(&state.download_tracker);
-    let dl_client   = state.http_client.clone();
+    let tracker = Arc::clone(&state.download_tracker);
+    let dl_client = state.http_client.clone();
     let dl_filename = filename.clone();
     let dl_category = category.clone();
 
     // For TTS models, also download the companion config file (.onnx.json)
-    let cfg_url      = m.config_url.clone();
+    let cfg_url = m.config_url.clone();
     let cfg_filename = m.config_filename.clone();
-    let cfg_client   = state.http_client.clone();
+    let cfg_client = state.http_client.clone();
     let cfg_data_dir = data_dir.clone();
 
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, dl_filename, dl_category, tracker, dl_client, async move {
-            // Download config file before marking as downloaded
-            if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
-                let cfg_dest = cfg_data_dir.join("models").join("tts").join(&cf);
-                if let Some(parent) = cfg_dest.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match cfg_client.get(&cu).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        if let Ok(bytes) = resp.bytes().await {
-                            let _ = tokio::fs::write(&cfg_dest, &bytes).await;
-                        }
+        spawn_tracked_download(
+            url,
+            dest,
+            dl_filename,
+            dl_category,
+            tracker,
+            dl_client,
+            async move {
+                // Download config file before marking as downloaded
+                if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
+                    let cfg_dest = cfg_data_dir.join("models").join("tts").join(&cf);
+                    if let Some(parent) = cfg_dest.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
                     }
-                    _ => tracing::warn!("Failed to download TTS config file {}", cf),
+                    match cfg_client.get(&cu).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(bytes) = resp.bytes().await {
+                                let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                            }
+                        }
+                        _ => tracing::warn!("Failed to download TTS config file {}", cf),
+                    }
                 }
-            }
-            let _ = model_repo.set_downloaded(&model_id, true).await;
-        }).await;
+                let _ = model_repo.set_downloaded(&model_id, true).await;
+            },
+        )
+        .await;
     });
 
-    Ok(Json(json!({"status": "download_started", "name": name, "category": category})))
+    Ok(Json(
+        json!({"status": "download_started", "name": name, "category": category}),
+    ))
 }
 
 /// DELETE /api/v1/models/{category}/{name} — delete the model file from disk.
@@ -2065,16 +2245,35 @@ async fn delete_model(
     Path((category, name)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let Some(model_repo) = state.model_repo.clone() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry not available"})),
+        ));
     };
 
-    let cat = ModelCategory::from_str(&category)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
     let model_id = ModelRecord::id_for(&cat, &name);
 
-    let m = model_repo.get_by_id(&model_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+    let m = model_repo
+        .get_by_id(&model_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
+            )
+        })?;
 
     // Block deletion if model is assigned to any active role
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
@@ -2090,16 +2289,20 @@ async fn delete_model(
     // Delete file from disk (ignore not-found)
     if let (Some(filename), Some(data_dir)) = (&m.filename, &state.data_dir) {
         let path = match cat {
-            ModelCategory::Whisper   => data_dir.join("models").join(filename),
+            ModelCategory::Whisper => data_dir.join("models").join(filename),
             ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
-            ModelCategory::Gguf      => data_dir.join("models").join("gguf").join(filename),
-            ModelCategory::TtsPiper
-            | ModelCategory::TtsHttp => data_dir.join("models").join("tts").join(filename),
-            ModelCategory::Ollama    => data_dir.join("models").join(filename),
+            ModelCategory::Gguf => data_dir.join("models").join("gguf").join(filename),
+            ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
+                data_dir.join("models").join("tts").join(filename)
+            }
+            ModelCategory::Ollama => data_dir.join("models").join(filename),
         };
         if path.exists() {
             tokio::fs::remove_file(&path).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("Failed to delete file: {e}")})))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Failed to delete file: {e}")})),
+                )
             })?;
         }
         // Also delete companion config file for TTS models (.onnx.json)
@@ -2111,8 +2314,15 @@ async fn delete_model(
         }
     }
 
-    model_repo.set_downloaded(&model_id, false).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    model_repo
+        .set_downloaded(&model_id, false)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2128,19 +2338,32 @@ async fn activate_model(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_repo) = state.model_repo.clone() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "registry not available"}))));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry not available"})),
+        ));
     };
 
     let Json(body) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid JSON: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid JSON: {e}")})),
+        )
     })?;
     let role = body["role"].as_str().unwrap_or("").to_string();
     if role.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "role is required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "role is required"})),
+        ));
     }
 
-    let cat = ModelCategory::from_str(&category)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown category '{}'", category)}))))?;
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
 
     // Validate role ↔ category compatibility
     if !ModelRoleAssignment::category_matches_role(&cat, &role) {
@@ -2158,36 +2381,67 @@ async fn activate_model(
     }
 
     let model_id = ModelRecord::id_for(&cat, &name);
-    model_repo.get_by_id(&model_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)}))))?;
+    model_repo
+        .get_by_id(&model_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
+            )
+        })?;
 
     // Persist provider keys using runtime provider names (not category names).
     // GGUF category maps to the "local" provider in runtime routing.
     let provider = match cat {
-        ModelCategory::Gguf      => "local",
+        ModelCategory::Gguf => "local",
         ModelCategory::Llamafile => "llamafile",
-        ModelCategory::Ollama    => "ollama",
-        ModelCategory::Whisper   => "asr",
-        ModelCategory::TtsPiper  => "tts",
-        ModelCategory::TtsHttp   => "tts",
+        ModelCategory::Ollama => "ollama",
+        ModelCategory::Whisper => "asr",
+        ModelCategory::TtsPiper => "tts",
+        ModelCategory::TtsHttp => "tts",
     };
 
     // Persist assignment
-    model_repo.set_assignment(&role, &model_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    model_repo
+        .set_assignment(&role, &model_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
 
     // Sync to settings KV hot-cache
     let settings_repo = state.settings_repo.clone();
     match role.as_str() {
-        "chat"  => {
-            let _ = settings_repo.set_key("chat_model",    name.clone()).await;
-            let _ = settings_repo.set_key("chat_provider", provider.to_string()).await;
+        "chat" => {
+            let _ = settings_repo.set_key("chat_model", name.clone()).await;
+            let _ = settings_repo
+                .set_key("chat_provider", provider.to_string())
+                .await;
         }
-        "tool"  => { let _ = settings_repo.set_key("tool_model", name.clone()).await; }
-        "asr"   => { let _ = settings_repo.set_key("active_whisper_model", name.clone()).await; }
-        "tts"   => { let _ = settings_repo.set_key("active_tts_model",     name.clone()).await; }
-        _       => {}
+        "tool" => {
+            let _ = settings_repo.set_key("tool_model", name.clone()).await;
+        }
+        "asr" => {
+            let _ = settings_repo
+                .set_key("active_whisper_model", name.clone())
+                .await;
+        }
+        "tts" => {
+            let _ = settings_repo
+                .set_key("active_tts_model", name.clone())
+                .await;
+        }
+        _ => {}
     }
 
     // Hot-rebuild the ModelRouter for LLM roles using the existing helper
@@ -2201,32 +2455,41 @@ async fn activate_model(
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
 /// Returns `{"models": [...]}` or `{"models": [], "error": "..."}` if Ollama is unreachable.
-async fn list_ollama_models(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn list_ollama_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let client = &state.http_client;
-    match client.get("http://localhost:11434/api/tags")
+    match client
+        .get("http://localhost:11434/api/tags")
         .timeout(std::time::Duration::from_secs(5))
-        .send().await {
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({"models": []}));
             Json(body)
         }
-        Ok(resp) => Json(json!({"models": [], "error": format!("Ollama returned {}", resp.status())})),
-        Err(_)   => Json(json!({"models": [], "error": "Ollama not running or not installed"})),
+        Ok(resp) => {
+            Json(json!({"models": [], "error": format!("Ollama returned {}", resp.status())}))
+        }
+        Err(_) => Json(json!({"models": [], "error": "Ollama not running or not installed"})),
     }
 }
 
 /// POST /api/v1/models/ollama/pull — trigger `ollama pull <model>` on the server.
-async fn pull_ollama_model(
-    body: Result<Json<Value>, JsonRejection>,
-) -> (StatusCode, Json<Value>) {
+async fn pull_ollama_model(body: Result<Json<Value>, JsonRejection>) -> (StatusCode, Json<Value>) {
     let model = match body {
         Ok(Json(v)) => v["model"].as_str().unwrap_or("").to_string(),
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "expected {\"model\":\"name\"}"})))
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "expected {\"model\":\"name\"}"})),
+            )
+        }
     };
     if model.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "model name is required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "model name is required"})),
+        );
     }
     // Spawn `ollama pull <model>` as a background process (non-blocking).
     match tokio::process::Command::new("ollama")
@@ -2235,8 +2498,14 @@ async fn pull_ollama_model(
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_)  => (StatusCode::ACCEPTED, Json(json!({"status": "pulling", "model": model}))),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("ollama not found: {e}")}))),
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"status": "pulling", "model": model})),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("ollama not found: {e}")})),
+        ),
     }
 }
 
@@ -2251,10 +2520,16 @@ async fn search_gguf_models(
         urlencoding::encode(q)
     );
     let client = &state.http_client;
-    match client.get(&url)
+    match client
+        .get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .send().await {
+        .header(
+            "user-agent",
+            concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let models: Vec<Value> = resp.json().await.unwrap_or_default();
             // Return a simplified shape: id, downloads, likes, tags
@@ -2267,8 +2542,10 @@ async fn search_gguf_models(
             })).collect();
             Json(json!({"models": simplified}))
         }
-        Ok(resp) => Json(json!({"models": [], "error": format!("HuggingFace returned {}", resp.status())})),
-        Err(e)   => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
+        Ok(resp) => {
+            Json(json!({"models": [], "error": format!("HuggingFace returned {}", resp.status())}))
+        }
+        Err(e) => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
     }
 }
 
@@ -2277,13 +2554,22 @@ async fn search_llamafile_models(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let q = params.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
+    let q = params
+        .get("q")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
     let client = &state.http_client;
-    match client.get(url)
+    match client
+        .get(url)
         .timeout(std::time::Duration::from_secs(10))
-        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .send().await {
+        .header(
+            "user-agent",
+            concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let releases: Vec<Value> = resp.json().await.unwrap_or_default();
             let mut assets: Vec<Value> = Vec::new();
@@ -2310,8 +2596,10 @@ async fn search_llamafile_models(
             }
             Json(json!({"models": assets}))
         }
-        Ok(resp) => Json(json!({"models": [], "error": format!("GitHub returned {}", resp.status())})),
-        Err(e)   => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
+        Ok(resp) => {
+            Json(json!({"models": [], "error": format!("GitHub returned {}", resp.status())}))
+        }
+        Err(e) => Json(json!({"models": [], "error": format!("Request failed: {e}")})),
     }
 }
 
@@ -2328,10 +2616,16 @@ async fn list_hf_model_files(
     // (urlencoding::encode would turn '/' into '%2F' which returns 400)
     let url = format!("https://huggingface.co/api/models/{}", repo);
     let client = &state.http_client;
-    match client.get(&url)
+    match client
+        .get(&url)
         .timeout(std::time::Duration::from_secs(10))
-        .header("user-agent", concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-        .send().await {
+        .header(
+            "user-agent",
+            concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
             let files: Vec<Value> = meta["siblings"]
@@ -2357,8 +2651,10 @@ async fn list_hf_model_files(
                 .unwrap_or_default();
             Json(json!({"files": files}))
         }
-        Ok(resp) => Json(json!({"files": [], "error": format!("HuggingFace returned {}", resp.status())})),
-        Err(e)   => Json(json!({"files": [], "error": format!("Request failed: {e}")})),
+        Ok(resp) => {
+            Json(json!({"files": [], "error": format!("HuggingFace returned {}", resp.status())}))
+        }
+        Err(e) => Json(json!({"files": [], "error": format!("Request failed: {e}")})),
     }
 }
 
@@ -2370,32 +2666,46 @@ async fn download_model_from_url(
 ) -> (StatusCode, Json<Value>) {
     let Json(body) = match body {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid JSON body"}))),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid JSON body"})),
+            )
+        }
     };
-    let url      = body["url"].as_str().unwrap_or("").to_string();
+    let url = body["url"].as_str().unwrap_or("").to_string();
     let category = body["category"].as_str().unwrap_or("gguf").to_string();
     let filename = body["filename"].as_str().unwrap_or("").to_string();
 
     if url.is_empty() || filename.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "url and filename are required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "url and filename are required"})),
+        );
     }
     if !url.starts_with("https://") {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "only https URLs are accepted"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "only https URLs are accepted"})),
+        );
     }
 
     let Some(data_dir) = state.data_dir.clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "data_dir not configured"})));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "data_dir not configured"})),
+        );
     };
 
     let dest = match category.as_str() {
-        "whisper"   => data_dir.join("models").join(&filename),
+        "whisper" => data_dir.join("models").join(&filename),
         "llamafile" => data_dir.join("models").join("llm").join(&filename),
-        "gguf"      => data_dir.join("models").join("gguf").join(&filename),
-        "tts"       => data_dir.join("models").join("tts").join(&filename),
-        _           => data_dir.join("models").join(&filename),
+        "gguf" => data_dir.join("models").join("gguf").join(&filename),
+        "tts" => data_dir.join("models").join("tts").join(&filename),
+        _ => data_dir.join("models").join(&filename),
     };
 
-    let tracker       = Arc::clone(&state.download_tracker);
+    let tracker = Arc::clone(&state.download_tracker);
     let resp_filename = filename.clone();
     let resp_category = category.clone();
 
@@ -2404,34 +2714,44 @@ async fn download_model_from_url(
         spawn_tracked_download(url, dest, filename, category, tracker, dl_client, async {}).await;
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"status": "downloading", "filename": resp_filename, "category": resp_category})))
+    (
+        StatusCode::ACCEPTED,
+        Json(
+            json!({"status": "downloading", "filename": resp_filename, "category": resp_category}),
+        ),
+    )
 }
 
 /// Shared streaming download with progress tracking.
 /// Streams the URL to `dest`, updating `tracker` as each chunk arrives.
 /// Calls `on_done` (an async closure) when the download completes successfully.
 async fn spawn_tracked_download<F>(
-    url:      String,
-    dest:     std::path::PathBuf,
+    url: String,
+    dest: std::path::PathBuf,
     filename: String,
     category: String,
-    tracker:  Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
-    client:   reqwest::Client,
-    on_done:  F,
-) where F: std::future::Future<Output = ()> + Send {
+    tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    client: reqwest::Client,
+    on_done: F,
+) where
+    F: std::future::Future<Output = ()> + Send,
+{
     use tokio::io::AsyncWriteExt;
 
     // Register as in-progress
     {
         let mut t = tracker.write().await;
-        t.insert(filename.clone(), DownloadEntry {
-            filename:         filename.clone(),
-            category:         category.clone(),
-            downloaded_bytes: 0,
-            total_bytes:      None,
-            status:           "downloading".to_string(),
-            finished_at:      None,
-        });
+        t.insert(
+            filename.clone(),
+            DownloadEntry {
+                filename: filename.clone(),
+                category: category.clone(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                status: "downloading".to_string(),
+                finished_at: None,
+            },
+        );
     }
 
     if let Some(parent) = dest.parent() {
@@ -2441,8 +2761,7 @@ async fn spawn_tracked_download<F>(
     tracing::info!("Downloading {} from {}", filename, url);
 
     let result: Result<(), String> = async {
-        let resp = client.get(&url).send().await
-            .map_err(|e| e.to_string())?;
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -2455,7 +2774,8 @@ async fn spawn_tracked_download<F>(
             }
         }
 
-        let mut file = tokio::fs::File::create(&dest).await
+        let mut file = tokio::fs::File::create(&dest)
+            .await
             .map_err(|e| e.to_string())?;
 
         let mut downloaded: u64 = 0;
@@ -2470,7 +2790,8 @@ async fn spawn_tracked_download<F>(
         }
         file.flush().await.map_err(|e| e.to_string())?;
         Ok(())
-    }.await;
+    }
+    .await;
 
     match result {
         Ok(()) => {
@@ -2495,25 +2816,29 @@ async fn spawn_tracked_download<F>(
     }
 }
 
-
 // ── Profile handlers ──────────────────────────────────────────────────────────
 
 async fn list_profiles(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let profiles = state.profile_repo.list().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     let list: Vec<Value> = profiles
         .iter()
-        .map(|p| json!({
-            "id":           p.id,
-            "display_name": p.display_name,
-            "avatar_emoji": p.avatar_emoji,
-            "preferences":  p.preferences,
-            "created_at":   p.created_at.to_rfc3339(),
-            "updated_at":   p.updated_at.to_rfc3339(),
-        }))
+        .map(|p| {
+            json!({
+                "id":           p.id,
+                "display_name": p.display_name,
+                "avatar_emoji": p.avatar_emoji,
+                "preferences":  p.preferences,
+                "created_at":   p.created_at.to_rfc3339(),
+                "updated_at":   p.updated_at.to_rfc3339(),
+            })
+        })
         .collect();
     Ok(Json(json!({ "profiles": list })))
 }
@@ -2523,19 +2848,28 @@ async fn create_profile(
     body: Result<Json<CreateProfileRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
     let profile = state.profile_repo.create(req).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
-    Ok((StatusCode::CREATED, Json(json!({
-        "id":           profile.id,
-        "display_name": profile.display_name,
-        "avatar_emoji": profile.avatar_emoji,
-        "preferences":  profile.preferences,
-        "created_at":   profile.created_at.to_rfc3339(),
-        "updated_at":   profile.updated_at.to_rfc3339(),
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id":           profile.id,
+            "display_name": profile.display_name,
+            "avatar_emoji": profile.avatar_emoji,
+            "preferences":  profile.preferences,
+            "created_at":   profile.created_at.to_rfc3339(),
+            "updated_at":   profile.updated_at.to_rfc3339(),
+        })),
+    ))
 }
 
 async fn get_profile(
@@ -2543,7 +2877,10 @@ async fn get_profile(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let profile = state.profile_repo.get(&id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     match profile {
         Some(p) => Ok(Json(json!({
@@ -2554,7 +2891,10 @@ async fn get_profile(
             "created_at":   p.created_at.to_rfc3339(),
             "updated_at":   p.updated_at.to_rfc3339(),
         }))),
-        None => Err((StatusCode::NOT_FOUND, Json(json!({"error": "profile not found"})))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "profile not found"})),
+        )),
     }
 }
 
@@ -2569,7 +2909,10 @@ async fn update_profile_prefs(
     body: Result<Json<UpdatePrefsRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
     let profile = state
         .profile_repo
@@ -2596,7 +2939,10 @@ async fn delete_profile(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     state.profile_repo.delete(&id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2605,10 +2951,10 @@ async fn delete_profile(
 
 #[derive(serde::Deserialize)]
 struct SensorReadingRequest {
-    device_id:   String,
+    device_id: String,
     sensor_type: String,
-    value:       f64,
-    unit:        String,
+    value: f64,
+    unit: String,
 }
 
 async fn record_sensor(
@@ -2616,17 +2962,23 @@ async fn record_sensor(
     body: Result<Json<SensorReadingRequest>, JsonRejection>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
     let reading = SensorReading {
-        device_id:   req.device_id,
+        device_id: req.device_id,
         sensor_type: req.sensor_type,
-        value:       req.value,
-        unit:        req.unit,
+        value: req.value,
+        unit: req.unit,
         recorded_at: chrono::Utc::now(),
     };
     state.sensor_storage.record(reading).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     Ok(StatusCode::CREATED)
 }
@@ -2646,16 +2998,23 @@ async fn get_recent_sensors(
         .sensor_storage
         .get_recent(&device_id, limit)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     let list: Vec<Value> = readings
         .iter()
-        .map(|r| json!({
-            "device_id":   r.device_id,
-            "sensor_type": r.sensor_type,
-            "value":       r.value,
-            "unit":        r.unit,
-            "recorded_at": r.recorded_at.to_rfc3339(),
-        }))
+        .map(|r| {
+            json!({
+                "device_id":   r.device_id,
+                "sensor_type": r.sensor_type,
+                "value":       r.value,
+                "unit":        r.unit,
+                "recorded_at": r.recorded_at.to_rfc3339(),
+            })
+        })
         .collect();
     Ok(Json(json!({ "readings": list })))
 }
@@ -2664,17 +3023,17 @@ async fn get_recent_sensors(
 
 #[derive(serde::Deserialize)]
 struct CameraEventRequest {
-    camera_id:     String,
-    event_type:    String,
-    confidence:    Option<f64>,
+    camera_id: String,
+    event_type: String,
+    confidence: Option<f64>,
     snapshot_path: Option<String>,
-    metadata:      Option<String>,
+    metadata: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct CameraQueryParams {
     camera_id: Option<String>,
-    limit:     Option<usize>,
+    limit: Option<usize>,
 }
 
 async fn record_camera_event(
@@ -2682,21 +3041,31 @@ async fn record_camera_event(
     body: Result<Json<CameraEventRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let Json(req) = body.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Invalid request: {}", e)})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
     })?;
     let event = CameraEvent {
-        id:            None,
-        camera_id:     req.camera_id,
-        event_type:    req.event_type,
-        confidence:    req.confidence,
+        id: None,
+        camera_id: req.camera_id,
+        event_type: req.event_type,
+        confidence: req.confidence,
         snapshot_path: req.snapshot_path,
-        metadata:      req.metadata,
-        acknowledged:  false,
-        created_at:    chrono::Utc::now(),
+        metadata: req.metadata,
+        acknowledged: false,
+        created_at: chrono::Utc::now(),
     };
-    let id = state.camera_storage.record_event(event).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
-    })?;
+    let id = state
+        .camera_storage
+        .record_event(event)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 
@@ -2710,18 +3079,25 @@ async fn list_camera_events(
         .camera_storage
         .list_events(camera_id, limit)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     let list: Vec<Value> = events
         .iter()
-        .map(|e| json!({
-            "id":             e.id,
-            "camera_id":      e.camera_id,
-            "event_type":     e.event_type,
-            "confidence":     e.confidence,
-            "snapshot_path":  e.snapshot_path,
-            "acknowledged":   e.acknowledged,
-            "created_at":     e.created_at.to_rfc3339(),
-        }))
+        .map(|e| {
+            json!({
+                "id":             e.id,
+                "camera_id":      e.camera_id,
+                "event_type":     e.event_type,
+                "confidence":     e.confidence,
+                "snapshot_path":  e.snapshot_path,
+                "acknowledged":   e.acknowledged,
+                "created_at":     e.created_at.to_rfc3339(),
+            })
+        })
         .collect();
     Ok(Json(json!({ "events": list })))
 }
@@ -2731,7 +3107,10 @@ async fn acknowledge_camera_event(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.camera_storage.acknowledge(id).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
     })?;
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -2758,14 +3137,8 @@ async fn transcribe(
         )
     })? {
         if field.name() == Some("audio") {
-            filename = field
-                .file_name()
-                .unwrap_or("audio.bin")
-                .to_string();
-            content_type = field
-                .content_type()
-                .unwrap_or("audio/wav")
-                .to_string();
+            filename = field.file_name().unwrap_or("audio.bin").to_string();
+            content_type = field.content_type().unwrap_or("audio/wav").to_string();
             let bytes = field.bytes().await.map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -2815,10 +3188,7 @@ async fn transcribe(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         tracing::warn!("whisper returned {}: {}", status, body);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": body})),
-        ));
+        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": body}))));
     }
 
     let json: Value = resp.json().await.map_err(|e| {
@@ -2866,20 +3236,29 @@ async fn calibrate_wake_word(
     let mut content_type = "audio/wav".to_string();
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("multipart error: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("multipart error: {e}")})),
+        )
     })? {
         if field.name() == Some("audio") {
             filename = field.file_name().unwrap_or("audio.wav").to_string();
             content_type = field.content_type().unwrap_or("audio/wav").to_string();
             let bytes = field.bytes().await.map_err(|e| {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": format!("read error: {e}")})))
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("read error: {e}")})),
+                )
             })?;
             audio_bytes = Some(bytes.to_vec());
         }
     }
 
     let bytes = audio_bytes.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'audio' field in multipart body"})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing 'audio' field in multipart body"})),
+        )
     })?;
 
     // ── Transcribe via whisper.cpp ───────────────────────────────────────────
@@ -2887,14 +3266,28 @@ async fn calibrate_wake_word(
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename)
         .mime_str(&content_type)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("MIME error: {e}")}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("MIME error: {e}")})),
+            )
+        })?;
     let form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("response_format", "json");
 
-    let resp = state.http_client.post(&whisper_url).multipart(form).send().await.map_err(|e| {
-        (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("whisper server unreachable: {e}")})))
-    })?;
+    let resp = state
+        .http_client
+        .post(&whisper_url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("whisper server unreachable: {e}")})),
+            )
+        })?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -2902,12 +3295,22 @@ async fn calibrate_wake_word(
     }
 
     let whisper_json: Value = resp.json().await.map_err(|e| {
-        (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("whisper parse error: {e}")})))
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("whisper parse error: {e}")})),
+        )
     })?;
 
-    let raw_transcript = whisper_json["text"].as_str().unwrap_or("").trim().to_string();
+    let raw_transcript = whisper_json["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if raw_transcript.is_empty() {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "no speech detected in recording"}))));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "no speech detected in recording"})),
+        ));
     }
 
     // Normalize: strip punctuation, collapse whitespace, lowercase — same as detector.
@@ -2922,20 +3325,31 @@ async fn calibrate_wake_word(
 
     // ── Load settings, append variant, save ─────────────────────────────────
     let mut settings = state.settings_repo.get().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings load failed: {e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("settings load failed: {e}")})),
+        )
     })?;
 
     // Append only if this normalized variant is not already present.
-    if !settings.voice_wake_word_transcriptions.contains(&normalized) {
-        settings.voice_wake_word_transcriptions.push(normalized.clone());
+    if !settings
+        .voice_wake_word_transcriptions
+        .contains(&normalized)
+    {
+        settings
+            .voice_wake_word_transcriptions
+            .push(normalized.clone());
     }
 
     let all_variants = settings.voice_wake_word_transcriptions.clone();
     let sample_count = all_variants.len();
-    let complete     = sample_count >= TARGET_SAMPLES;
+    let complete = sample_count >= TARGET_SAMPLES;
 
     state.settings_repo.update(&settings).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings save failed: {e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("settings save failed: {e}")})),
+        )
     })?;
 
     Ok(Json(json!({
@@ -2956,16 +3370,24 @@ async fn reset_wake_word_calibration(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut settings = state.settings_repo.get().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings load failed: {e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("settings load failed: {e}")})),
+        )
     })?;
 
     settings.voice_wake_word_transcriptions.clear();
 
     state.settings_repo.update(&settings).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("settings save failed: {e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("settings save failed: {e}")})),
+        )
     })?;
 
-    Ok(Json(json!({"cleared": true, "message": "Wake-word calibration data cleared"})))
+    Ok(Json(
+        json!({"cleared": true, "message": "Wake-word calibration data cleared"}),
+    ))
 }
 
 // ── Service connectivity test ─────────────────────────────────────────────────
@@ -4083,7 +4505,12 @@ async fn create_schedule(
     };
     let Json(api_req) = match result {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
     };
 
     // Resolve task kind: explicit `kind` > `prompt` field > legacy `payload`.
@@ -4093,18 +4520,30 @@ async fn create_schedule(
         TaskKind::AgentPrompt { prompt }
     } else if let Some(payload) = &api_req.payload {
         if let Some(url) = payload.get("webhook_url").and_then(|v| v.as_str()) {
-            TaskKind::Webhook { webhook_url: url.to_string() }
+            TaskKind::Webhook {
+                webhook_url: url.to_string(),
+            }
         } else if let Some(p) = payload.get("prompt").and_then(|v| v.as_str()) {
-            TaskKind::AgentPrompt { prompt: p.to_string() }
+            TaskKind::AgentPrompt {
+                prompt: p.to_string(),
+            }
         } else {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'prompt', 'kind', or 'payload.webhook_url'"})));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing 'prompt', 'kind', or 'payload.webhook_url'"})),
+            );
         }
     } else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing 'prompt' or 'kind'"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing 'prompt' or 'kind'"})),
+        );
     };
 
     let req = CreateScheduleRequest {
-        id: api_req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        id: api_req
+            .id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         label: api_req.name,
         cron: api_req.cron,
         timezone: api_req.timezone.unwrap_or_else(|| "UTC".to_string()),
@@ -4271,9 +4710,7 @@ async fn schedule_events_sse(
 ///
 /// Returns a flat array of `{ extension, name, description }` objects.
 /// Returns an empty array when no extension manager is active (no-crash fallback).
-async fn list_agent_tools(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+async fn list_agent_tools(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(manager) = &state.extension_manager else {
         return Json(json!([])).into_response();
@@ -4308,21 +4745,29 @@ async fn agent_chat_stream(
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    use futures::stream::StreamExt;
     use pond_core::domain::agent::AgentRequest;
     use pond_core::ports::agent::AgentStreamEvent;
-    use futures::stream::StreamExt;
 
     let permit = match state.sse_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Too many concurrent streams"}))).into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Too many concurrent streams"})),
+            )
+                .into_response();
         }
     };
 
     let body = match body {
         Ok(b) => b.0,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
 
@@ -4453,7 +4898,8 @@ async fn list_logs(
         return Json(json!([])).into_response();
     };
 
-    let limit = params.get("limit")
+    let limit = params
+        .get("limit")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(200)
         .min(2000);
@@ -4464,16 +4910,15 @@ async fn list_logs(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
 /// `GET /api/v1/logs/export` — download the event log as a CSV file.
 ///
 /// Returns up to 10,000 rows across all severity levels.
-async fn export_logs_csv(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+async fn export_logs_csv(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let Some(repo) = &state.event_log_repo else {
@@ -4510,7 +4955,10 @@ async fn export_logs_csv(
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/csv; charset=utf-8")
-        .header("Content-Disposition", "attachment; filename=\"pond-logs.csv\"")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"pond-logs.csv\"",
+        )
         .body(Body::from(csv))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -4518,9 +4966,7 @@ async fn export_logs_csv(
 // ── Extension management handlers ─────────────────────────────────────────────
 
 /// `GET /api/v1/extensions` — list all active Goose/MCP extensions.
-async fn list_extensions_handler(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(manager) = &state.extension_manager else {
         return (
@@ -4530,7 +4976,38 @@ async fn list_extensions_handler(
             .into_response();
     };
     match manager.list_extensions().await {
-        Ok(exts) => Json(json!({"extensions": exts})).into_response(),
+        Ok(mut exts) => {
+            // Merge in persisted-but-disabled extensions so the UI sees them
+            if let Some(repo) = &state.mcp_server_repo {
+                if let Ok(persisted) = repo.list().await {
+                    let live_names: std::collections::HashSet<String> =
+                        exts.iter().map(|e| e.name.clone()).collect();
+                    for srv in persisted {
+                        if !live_names.contains(&srv.name) {
+                            // This extension is persisted but not live — disabled or failed
+                            exts.push(ExtensionInfo {
+                                name: srv.name,
+                                kind: srv.kind,
+                                description: srv.description,
+                                tools: vec![],
+                                enabled: srv.enabled,
+                                status: if srv.enabled {
+                                    "error".to_string()
+                                } else {
+                                    "disabled".to_string()
+                                },
+                                last_error: if srv.enabled {
+                                    Some("Extension failed to load".to_string())
+                                } else {
+                                    None
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            Json(json!({"extensions": exts})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -4557,19 +5034,38 @@ async fn add_extension_handler(
             // Persist so the server reconnects on restart.
             if let Some(repo) = &state.mcp_server_repo {
                 let cfg = pond_core::ports::mcp_server::McpServerConfig {
-                    id:          uuid::Uuid::new_v4().to_string(),
-                    name:        req.name.clone(),
-                    kind:        req.kind.clone(),
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: req.name.clone(),
+                    kind: req.kind.clone(),
                     description: req.description.clone(),
-                    command:     req.command.clone(),
-                    args:        req.args.clone(),
-                    env:         req.env.clone(),
-                    uri:         req.uri.clone(),
-                    enabled:     true,
-                    created_at:  chrono::Utc::now().to_rfc3339(),
+                    command: req.command.clone(),
+                    args: req.args.clone(),
+                    env: req.env.clone(),
+                    uri: req.uri.clone(),
+                    enabled: true,
+                    created_at: chrono::Utc::now().to_rfc3339(),
                 };
                 if let Err(e) = repo.save(&cfg).await {
                     tracing::warn!("Failed to persist MCP server '{}': {e}", req.name);
+                }
+            }
+            // Sync discovered tools into the tool registry
+            if let Some(registry) = &state.tool_registry {
+                if let Ok(all_tools) = manager.list_tools().await {
+                    let prefix = format!("{}__", req.name);
+                    let ext_tools: Vec<(String, String)> = all_tools
+                        .iter()
+                        .filter(|t| t.starts_with(&prefix))
+                        .map(|t| {
+                            let tool_name = t.strip_prefix(&prefix).unwrap_or(t).to_string();
+                            (tool_name, String::new())
+                        })
+                        .collect();
+                    if !ext_tools.is_empty() {
+                        registry
+                            .register_extension_tools(&req.name, ext_tools)
+                            .await;
+                    }
                 }
             }
             (StatusCode::CREATED, Json(info)).into_response()
@@ -4602,13 +5098,13 @@ async fn remove_extension_handler(
                     tracing::warn!("Failed to remove persisted MCP server '{name}': {e}");
                 }
             }
+            // Remove extension tools from the registry
+            if let Some(registry) = &state.tool_registry {
+                registry.deregister_extension(&name).await;
+            }
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -4626,25 +5122,782 @@ async fn toggle_extension_handler(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "Extension manager not available"})),
-        ).into_response();
+        )
+            .into_response();
     };
 
     let body = match body {
         Ok(b) => b.0,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
 
     let enabled = body["enabled"].as_bool().unwrap_or(true);
 
     match manager.set_enabled(&name, enabled).await {
-        Ok(()) => Json(json!({"name": name, "enabled": enabled})).into_response(),
+        Ok(()) => {
+            if let Some(repo) = &state.mcp_server_repo {
+                if let Err(e) = repo.set_enabled(&name, enabled).await {
+                    tracing::warn!("Failed to persist enabled state for '{}': {e}", name);
+                }
+            }
+            // Sync tool registry: re-register on enable, deregister on disable
+            if let Some(registry) = &state.tool_registry {
+                if enabled {
+                    if let Ok(all_tools) = manager.list_tools().await {
+                        let prefix = format!("{}__", name);
+                        let ext_tools: Vec<(String, String)> = all_tools
+                            .iter()
+                            .filter(|t| t.starts_with(&prefix))
+                            .map(|t| {
+                                let tool_name = t.strip_prefix(&prefix).unwrap_or(t).to_string();
+                                (tool_name, String::new())
+                            })
+                            .collect();
+                        if !ext_tools.is_empty() {
+                            registry.register_extension_tools(&name, ext_tools).await;
+                        }
+                    }
+                } else {
+                    registry.deregister_extension(&name).await;
+                }
+            }
+            Json(json!({"name": name, "enabled": enabled})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
+}
+
+// ── Extension Marketplace ────────────────────────────────────────────────────
+
+/// `GET /api/v1/marketplace` — list available extensions from the curated registry.
+async fn list_marketplace_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(mp) = &state.marketplace else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Marketplace not available"})),
+        )
+            .into_response();
+    };
+    match mp.list_available().await {
+        Ok(exts) => Json(json!({"extensions": exts})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/marketplace/{id}/install` — install a marketplace extension.
+///
+/// Looks up the extension by ID in the marketplace catalogue, converts it to
+/// an `AddExtensionRequest`, and delegates to the extension manager. The
+/// server configuration is persisted so the extension reconnects on restart.
+///
+/// Accepts an optional JSON body `{ "secrets": { "KEY": "value", ... } }` to
+/// supply required secrets at install time. Missing required secrets cause a
+/// 428 Precondition Required response listing what is needed.
+async fn install_marketplace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(mp) = &state.marketplace else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Marketplace not available"})),
+        )
+            .into_response();
+    };
+    let Some(manager) = &state.extension_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Extension manager not available"})),
+        )
+            .into_response();
+    };
+
+    let ext = match mp.get_by_id(&id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Extension '{}' not found", id)})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    // Extract secrets from the optional request body.
+    let secrets: std::collections::HashMap<String, String> = body
+        .and_then(|b| {
+            b.0.get("secrets")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+        })
+        .unwrap_or_default();
+
+    // Check that all required (non-OAuth) secrets are provided or already stored.
+    if !ext.required_secrets.is_empty() {
+        let mut missing = Vec::new();
+        for sr in &ext.required_secrets {
+            if !sr.required || sr.kind == pond_core::domain::secret::SecretKind::OAuthFlow {
+                continue;
+            }
+            if secrets.contains_key(&sr.key) {
+                continue;
+            }
+            // Check if already stored in the secret repository.
+            let already_stored = if let Some(repo) = &state.secret_repo {
+                repo.has(&sr.key).await.unwrap_or(false)
+            } else {
+                false
+            };
+            if !already_stored {
+                missing.push(sr);
+            }
+        }
+        if !missing.is_empty() {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({
+                    "error": "Missing required secrets",
+                    "missing": missing.iter().map(|s| json!({
+                        "key": s.key,
+                        "display_name": s.display_name,
+                        "description": s.description,
+                        "kind": s.kind,
+                    })).collect::<Vec<_>>()
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Store any provided secrets.
+    if let Some(repo) = &state.secret_repo {
+        for (key, value) in &secrets {
+            if let Err(e) = repo.set(key, value).await {
+                tracing::warn!("Failed to store secret '{}': {e}", key);
+            }
+        }
+    }
+
+    // Build the env map: start with provided secrets, then fill in any
+    // already-stored secrets that weren't explicitly provided.
+    let mut env = secrets;
+    if let Some(repo) = &state.secret_repo {
+        for sr in &ext.required_secrets {
+            if !env.contains_key(&sr.key) {
+                if let Ok(Some(val)) = repo.get(&sr.key).await {
+                    env.insert(sr.key.clone(), val);
+                }
+            }
+        }
+    }
+
+    let req = pond_core::ports::extension_manager::AddExtensionRequest {
+        name: ext.id.clone(),
+        kind: ext.kind.clone(),
+        description: ext.description.clone(),
+        command: ext.command.clone(),
+        args: ext.args.clone(),
+        env: env.clone(),
+        uri: ext.uri.clone(),
+    };
+
+    match manager.add_extension(req.clone()).await {
+        Ok(info) => {
+            // Persist so the extension reconnects on restart
+            if let Some(repo) = &state.mcp_server_repo {
+                let cfg = pond_core::ports::mcp_server::McpServerConfig {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: ext.id.clone(),
+                    kind: ext.kind,
+                    description: ext.description,
+                    command: ext.command,
+                    args: ext.args,
+                    env,
+                    uri: ext.uri,
+                    enabled: true,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = repo.save(&cfg).await {
+                    tracing::warn!("Failed to persist marketplace extension '{}': {e}", ext.id);
+                }
+            }
+            // Sync tool registry
+            if let Some(registry) = &state.tool_registry {
+                if let Ok(all_tools) = manager.list_tools().await {
+                    let prefix = format!("{}__", req.name);
+                    let ext_tools: Vec<(String, String)> = all_tools
+                        .iter()
+                        .filter(|t| t.starts_with(&prefix))
+                        .map(|t| {
+                            let tool_name = t.strip_prefix(&prefix).unwrap_or(t).to_string();
+                            (tool_name, String::new())
+                        })
+                        .collect();
+                    if !ext_tools.is_empty() {
+                        registry
+                            .register_extension_tools(&req.name, ext_tools)
+                            .await;
+                    }
+                }
+            }
+            (StatusCode::CREATED, Json(json!(info))).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Secret management handlers ────────────────────────────────────────────────
+
+/// `GET /api/v1/secrets` — list stored secret key names (never values).
+async fn list_secrets_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+    match repo.list_keys().await {
+        Ok(keys) => Json(json!({"keys": keys})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/secrets/{key}/exists` — check if a secret is set.
+async fn check_secret_handler(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+    match repo.has(&key).await {
+        Ok(exists) => Json(json!({"key": key, "exists": exists})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/secrets/{key}` — set a secret value.
+///
+/// Body: `{ "value": "secret-value-here" }`
+async fn set_secret_handler(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+    let Some(value) = body["value"].as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Missing 'value' field"})),
+        )
+            .into_response();
+    };
+    match repo.set(&key, value).await {
+        Ok(()) => Json(json!({"key": key, "stored": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/secrets/{key}` — delete a secret.
+async fn delete_secret_handler(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+    match repo.delete(&key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/extensions/{name}/secrets` — get secret requirements and fulfillment status.
+///
+/// Looks up the extension by name in the marketplace registry, returns its
+/// `required_secrets` along with a `fulfilled` map indicating which keys are
+/// already stored in the secret repository.
+async fn get_extension_secrets_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(mp) = &state.marketplace else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Marketplace not available"})),
+        )
+            .into_response();
+    };
+
+    let ext = match mp.get_by_id(&name).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Extension not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut fulfilled = std::collections::HashMap::new();
+    if let Some(repo) = &state.secret_repo {
+        for sr in &ext.required_secrets {
+            fulfilled.insert(sr.key.clone(), repo.has(&sr.key).await.unwrap_or(false));
+        }
+    }
+
+    Json(json!({
+        "requirements": ext.required_secrets,
+        "fulfilled": fulfilled,
+    }))
+    .into_response()
+}
+
+/// `POST /api/v1/extensions/{name}/secrets` — set secrets for an extension in bulk.
+///
+/// Accepts a JSON object `{ "KEY": "value", ... }` and stores each entry in the
+/// secret repository. The extension name is used for validation (must exist in
+/// the marketplace) but secrets are stored globally by key name.
+async fn set_extension_secrets_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+
+    // Validate the extension exists in the marketplace.
+    if let Some(mp) = &state.marketplace {
+        match mp.get_by_id(&name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "Extension not found"})),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let secrets: std::collections::HashMap<String, String> = match serde_json::from_value(body) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+
+    for (key, value) in &secrets {
+        if let Err(e) = repo.set(key, value).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to store '{}': {}", key, e)})),
+            )
+                .into_response();
+        }
+    }
+
+    Json(json!({"stored": secrets.len()})).into_response()
+}
+
+// ── OAuth PKCE handlers ──────────────────────────────────────────────────────
+
+/// `POST /api/v1/oauth/authorize` — Start an OAuth PKCE authorization flow.
+///
+/// Body: `{ "provider": "spotify", "extension_id": "music" }`
+///
+/// Returns `{ "auth_url": "https://...", "state": "nonce" }`.
+/// The client should open `auth_url` in the user's default browser.
+async fn oauth_authorize_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use crate::oauth_callback;
+    use axum::response::IntoResponse;
+
+    let provider_id = body["provider"].as_str().unwrap_or("").to_string();
+    let extension_id = body["extension_id"].as_str().map(String::from);
+
+    // Find provider config
+    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let provider = match providers.iter().find(|p| p.id == provider_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Unknown OAuth provider: {}", provider_id)})),
+            )
+                .into_response()
+        }
+    };
+
+    // Check if user has their own client ID in the secret store
+    let client_id = if let Some(repo) = &state.secret_repo {
+        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        repo.get(&key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| provider.bundled_client_id.clone())
+    } else {
+        provider.bundled_client_id.clone()
+    };
+
+    let (code_verifier, code_challenge) = oauth_callback::generate_pkce();
+    let state_nonce = oauth_callback::generate_state();
+
+    // Store PKCE session
+    {
+        let mut sessions = state.oauth_state.write().await;
+        sessions.insert(
+            state_nonce.clone(),
+            oauth_callback::PkceSession {
+                provider_id: provider_id.clone(),
+                code_verifier,
+                extension_id,
+                created_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    let redirect_uri = "http://localhost:4000/api/v1/oauth/callback";
+    let scopes = provider.scopes.join(" ");
+
+    let auth_url = format!(
+        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        provider.authorize_url,
+        urlencoding::encode(&client_id),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(&scopes),
+        urlencoding::encode(&state_nonce),
+        urlencoding::encode(&code_challenge),
+    );
+
+    Json(json!({"auth_url": auth_url, "state": state_nonce})).into_response()
+}
+
+/// `GET /api/v1/oauth/callback` — Handle the OAuth provider's redirect.
+///
+/// Query: `?code=...&state=...`
+///
+/// Exchanges the authorization code for tokens using the stored PKCE
+/// verifier, persists access/refresh tokens in the secret store, and
+/// returns a success HTML page the user can close.
+async fn oauth_callback_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::{Html, IntoResponse};
+
+    let code = params.get("code").cloned().unwrap_or_default();
+    let state_nonce = params.get("state").cloned().unwrap_or_default();
+
+    // Look up and consume the PKCE session
+    let session = {
+        let mut sessions = state.oauth_state.write().await;
+        sessions.remove(&state_nonce)
+    };
+
+    let session = match session {
+        Some(s) => s,
+        None => {
+            return Html(
+                "<h1>Authorization failed</h1>\
+                 <p>Invalid or expired state. Please try again.</p>"
+                    .to_string(),
+            )
+            .into_response()
+        }
+    };
+
+    // Find provider config
+    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let provider = match providers.iter().find(|p| p.id == session.provider_id) {
+        Some(p) => p,
+        None => {
+            return Html("<h1>Authorization failed</h1><p>Unknown provider.</p>".to_string())
+                .into_response()
+        }
+    };
+
+    // Resolve client ID (user override or bundled)
+    let client_id = if let Some(repo) = &state.secret_repo {
+        let key = format!("{}_CLIENT_ID", session.provider_id.to_uppercase());
+        repo.get(&key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| provider.bundled_client_id.clone())
+    } else {
+        provider.bundled_client_id.clone()
+    };
+
+    // Exchange authorization code for tokens
+    let redirect_uri = "http://localhost:4000/api/v1/oauth/callback";
+    let token_response = state
+        .http_client
+        .post(&provider.token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id.as_str()),
+            ("code_verifier", session.code_verifier.as_str()),
+        ])
+        .send()
+        .await;
+
+    match token_response {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+            // Store tokens in the secret repository
+            if let Some(repo) = &state.secret_repo {
+                if let Some(access_token) = body["access_token"].as_str() {
+                    let _ = repo.set(&provider.token_key, access_token).await;
+                }
+                if let Some(refresh_token) = body["refresh_token"].as_str() {
+                    let _ = repo.set(&provider.refresh_key, refresh_token).await;
+                }
+            }
+
+            tracing::info!(provider = %provider.id, "OAuth token exchange succeeded");
+
+            Html(format!(
+                r#"<!DOCTYPE html>
+<html><head><title>Authorization Successful</title>
+<style>body{{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8f9fa}}
+.card{{text-align:center;padding:2rem;border-radius:12px;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.1)}}
+h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
+<body><div class="card"><h1>Connected to {}</h1><p>You can close this window and return to Goose in a Pond.</p></div></body></html>"#,
+                provider.display_name
+            ))
+            .into_response()
+        }
+        Ok(resp) => {
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::warn!(provider = %provider.id, error = %error_body, "OAuth token exchange failed");
+            Html(format!(
+                "<h1>Authorization failed</h1>\
+                 <p>Token exchange error. Please try again.</p>\
+                 <pre>{}</pre>",
+                error_body
+            ))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(provider = %provider.id, error = %e, "OAuth token exchange network error");
+            Html(format!(
+                "<h1>Authorization failed</h1><p>Network error: {}</p>",
+                e
+            ))
+            .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/oauth/refresh` — Refresh an expired OAuth access token.
+///
+/// Body: `{ "provider": "spotify" }`
+///
+/// Uses the stored refresh token to obtain a new access token.
+async fn oauth_refresh_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let provider_id = body["provider"].as_str().unwrap_or("").to_string();
+    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let provider = match providers.iter().find(|p| p.id == provider_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Unknown provider"})),
+            )
+                .into_response()
+        }
+    };
+
+    let Some(repo) = &state.secret_repo else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Secret storage not available"})),
+        )
+            .into_response();
+    };
+
+    let refresh_token = match repo.get(&provider.refresh_key).await {
+        Ok(Some(t)) => t,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "No refresh token stored"})),
+            )
+                .into_response()
+        }
+    };
+
+    let client_id = {
+        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        repo.get(&key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| provider.bundled_client_id.clone())
+    };
+
+    match state
+        .http_client
+        .post(&provider.token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if let Some(access_token) = body["access_token"].as_str() {
+                let _ = repo.set(&provider.token_key, access_token).await;
+            }
+            // Some providers rotate refresh tokens
+            if let Some(new_refresh) = body["refresh_token"].as_str() {
+                let _ = repo.set(&provider.refresh_key, new_refresh).await;
+            }
+            tracing::info!(provider = %provider_id, "OAuth token refresh succeeded");
+            Json(json!({"refreshed": true})).into_response()
+        }
+        Ok(resp) => {
+            let err = resp.text().await.unwrap_or_default();
+            tracing::warn!(provider = %provider_id, error = %err, "OAuth token refresh failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Refresh failed: {}", err)})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(provider = %provider_id, error = %e, "OAuth refresh network error");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/oauth/providers` — List supported OAuth providers.
+///
+/// Returns `{ "providers": [{ "id": "spotify", "display_name": "Spotify", "scopes": [...] }] }`.
+async fn oauth_providers_handler(
+    State(_state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let list: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "display_name": p.display_name,
+                "scopes": p.scopes,
+            })
+        })
+        .collect();
+    Json(json!({"providers": list}))
 }
 
 // ── Prompt Templates ─────────────────────────────────────────────────────────
@@ -4654,11 +5907,21 @@ async fn list_prompt_templates(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_template_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt template repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.list().await {
         Ok(templates) => Json(json!(templates)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4668,12 +5931,26 @@ async fn get_prompt_template(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_template_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt template repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.get(&name).await {
         Ok(Some(t)) => Json(json!(t)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "Template not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Template not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4691,11 +5968,23 @@ async fn upsert_prompt_template(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_template_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt template repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let template = PromptTemplate {
         name: name.clone(),
@@ -4706,7 +5995,11 @@ async fn upsert_prompt_template(
     };
     match repo.upsert(&template).await {
         Ok(()) => Json(json!({"name": name, "status": "ok"})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4716,17 +6009,31 @@ async fn delete_prompt_template(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_template_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt template repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt template repository not configured"})),
+            )
+                .into_response()
+        }
     };
     // Don't allow deletion of system templates
     if let Ok(Some(t)) = repo.get(&name).await {
         if t.is_system {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": "Cannot delete built-in system templates"}))).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Cannot delete built-in system templates"})),
+            )
+                .into_response();
         }
     }
     match repo.delete(&name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4737,11 +6044,21 @@ async fn list_prompt_extras(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_extra_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt extra repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.list_all().await {
         Ok(extras) => Json(json!(extras)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4755,7 +6072,9 @@ struct UpsertExtraRequest {
     sort_order: i32,
 }
 
-fn bool_true() -> bool { true }
+fn bool_true() -> bool {
+    true
+}
 
 async fn upsert_prompt_extra(
     State(state): State<Arc<AppState>>,
@@ -4763,16 +6082,37 @@ async fn upsert_prompt_extra(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_extra_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt extra repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
-    let extra = PromptExtra { key: req.key.clone(), instruction: req.instruction, active: req.active, sort_order: req.sort_order };
+    let extra = PromptExtra {
+        key: req.key.clone(),
+        instruction: req.instruction,
+        active: req.active,
+        sort_order: req.sort_order,
+    };
     match repo.upsert(&extra).await {
         Ok(()) => Json(json!({"key": req.key, "status": "ok"})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4782,22 +6122,34 @@ async fn delete_prompt_extra(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.prompt_extra_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Prompt extra repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt extra repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.delete(&key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // ── Memories ──────────────────────────────────────────────────────────────────
 
-async fn list_memories(
-    State(state): State<Arc<AppState>>,
-) -> impl axum::response::IntoResponse {
+async fn list_memories(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     match state.memory_repo.search_recent(None, 50).await {
         Ok(memories) => Json(json!(memories)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4815,7 +6167,9 @@ struct SaveMemoryRequest {
     #[serde(default)]
     tier: Option<pond_core::domain::memory::MemoryTier>,
 }
-fn default_source() -> String { "api".to_string() }
+fn default_source() -> String {
+    "api".to_string()
+}
 
 async fn save_memory(
     State(state): State<Arc<AppState>>,
@@ -4823,15 +6177,29 @@ async fn save_memory(
 ) -> impl axum::response::IntoResponse {
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     // Derive defaults from segment if provided
-    let decay_rate = req.tier.as_ref()
+    let decay_rate = req
+        .tier
+        .as_ref()
         .map(|t| t.default_decay_rate())
-        .or_else(|| req.segment.as_ref().map(|s| s.default_tier().default_decay_rate()));
-    let importance = req.importance
+        .or_else(|| {
+            req.segment
+                .as_ref()
+                .map(|s| s.default_tier().default_decay_rate())
+        });
+    let importance = req
+        .importance
         .or_else(|| req.segment.as_ref().map(|s| s.default_importance()));
-    let tier = req.tier
+    let tier = req
+        .tier
         .or_else(|| req.segment.as_ref().map(|s| s.default_tier()));
 
     let fragment = MemoryFragment {
@@ -4854,7 +6222,11 @@ async fn save_memory(
     };
     match state.memory_repo.add(fragment.clone()).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(fragment))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4864,22 +6236,34 @@ async fn delete_memory(
 ) -> impl axum::response::IntoResponse {
     match state.memory_repo.delete(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // ── Skills ────────────────────────────────────────────────────────────────────
 
-async fn list_skills(
-    State(state): State<Arc<AppState>>,
-) -> impl axum::response::IntoResponse {
+async fn list_skills(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     let repo = match &state.skill_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Skill repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.list_all().await {
         Ok(skills) => Json(json!(skills)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4895,11 +6279,23 @@ async fn create_skill(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.skill_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Skill repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let skill = UserSkill {
         id: Uuid::new_v4().to_string(),
@@ -4910,7 +6306,11 @@ async fn create_skill(
     };
     match repo.create(&skill).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(skill))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4927,16 +6327,40 @@ async fn update_skill(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.skill_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Skill repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let existing = match repo.get(&id).await {
         Ok(Some(s)) => s,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Skill not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Skill not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let updated = UserSkill {
         id: existing.id,
@@ -4947,7 +6371,11 @@ async fn update_skill(
     };
     match repo.update(&updated).await {
         Ok(()) => Json(json!(updated)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4957,26 +6385,44 @@ async fn delete_skill(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.skill_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Skill repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Skill repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.delete(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // ── Recipes ───────────────────────────────────────────────────────────────────
 
-async fn list_recipes(
-    State(state): State<Arc<AppState>>,
-) -> impl axum::response::IntoResponse {
+async fn list_recipes(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     let repo = match &state.recipe_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Recipe repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.list().await {
         Ok(recipes) => Json(json!(recipes)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4994,11 +6440,23 @@ async fn create_recipe(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.recipe_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Recipe repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let recipe = AgentRecipe {
         id: Uuid::new_v4().to_string(),
@@ -5010,7 +6468,11 @@ async fn create_recipe(
     };
     match repo.upsert(&recipe).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(recipe))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -5028,16 +6490,40 @@ async fn update_recipe(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.recipe_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Recipe repository not configured"})),
+            )
+                .into_response()
+        }
     };
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let existing = match repo.get_by_id(&id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Recipe not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Recipe not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     let updated = AgentRecipe {
         id: existing.id,
@@ -5049,7 +6535,11 @@ async fn update_recipe(
     };
     match repo.upsert(&updated).await {
         Ok(()) => Json(json!(updated)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -5059,11 +6549,21 @@ async fn delete_recipe(
 ) -> impl axum::response::IntoResponse {
     let repo = match &state.recipe_repo {
         Some(r) => r,
-        None => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "Recipe repository not configured"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Recipe repository not configured"})),
+            )
+                .into_response()
+        }
     };
     match repo.delete(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -5174,7 +6674,10 @@ async fn register_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
 
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
     let profile_id = profile_id.ok_or_else(|| {
@@ -5201,12 +6704,15 @@ async fn register_face_handler(
         }
     }
 
-    let stored = face.register_face(&profile_id, &image, bbox).await.map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
+    let stored = face
+        .register_face(&profile_id, &image, bbox)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
 
     Ok(Json(json!({
         "id":         stored.id,
@@ -5224,7 +6730,10 @@ async fn identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {
@@ -5250,7 +6759,10 @@ async fn list_face_enrollments(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let rows = face.list_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5287,9 +6799,7 @@ async fn list_face_enrollments(
 /// can show "ready / fallback / missing" per slot.  Returns
 /// `feature_enabled: false` when pond-server was built without the
 /// `face-onnx` feature.
-async fn list_face_models_handler(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
+async fn list_face_models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let feature_enabled = state.face_recognition.is_some();
     let dir = state
         .data_dir
@@ -5298,7 +6808,12 @@ async fn list_face_models_handler(
 
     let dir_clone = dir.clone();
     let entries = tokio::task::spawn_blocking(move || {
-        let describe = |dir: &Option<std::path::PathBuf>, name: &str, label: &str, expected_mb: u64, role: &str| -> Value {
+        let describe = |dir: &Option<std::path::PathBuf>,
+                        name: &str,
+                        label: &str,
+                        expected_mb: u64,
+                        role: &str|
+         -> Value {
             let path = dir.as_ref().map(|d| d.join(name));
             let (downloaded, size_mb) = match &path {
                 Some(p) => match std::fs::metadata(p) {
@@ -5320,16 +6835,54 @@ async fn list_face_models_handler(
 
         vec![
             // Embedder slot — preferred + fallback.
-            describe(&dir_clone, "adaface_ir101.onnx", "AdaFace IR-101 (preferred)", 250, "embedding"),
-            describe(&dir_clone, "w600k_r50.onnx",     "ArcFace R50 (fallback)",     174, "embedding"),
+            describe(
+                &dir_clone,
+                "adaface_ir101.onnx",
+                "AdaFace IR-101 (preferred)",
+                250,
+                "embedding",
+            ),
+            describe(
+                &dir_clone,
+                "w600k_r50.onnx",
+                "ArcFace R50 (fallback)",
+                174,
+                "embedding",
+            ),
             // Detector slot — preferred + fallback.
-            describe(&dir_clone, "scrfd_34g.onnx",     "SCRFD 34G (preferred)",      140, "detector"),
-            describe(&dir_clone, "scrfd.onnx",         "SCRFD 10G (fallback)",        17, "detector"),
+            describe(
+                &dir_clone,
+                "scrfd_34g.onnx",
+                "SCRFD 34G (preferred)",
+                140,
+                "detector",
+            ),
+            describe(
+                &dir_clone,
+                "scrfd.onnx",
+                "SCRFD 10G (fallback)",
+                17,
+                "detector",
+            ),
             // Anti-spoof ensemble.
-            describe(&dir_clone, "antispoof.onnx",     "Silent-Face V2 (primary PAD)",  2, "antispoof"),
-            describe(&dir_clone, "OULU_Protocol_2_model_0_0.onnx", "DeepPixBis OULU-NPU (secondary PAD)", 13, "antispoof"),
+            describe(
+                &dir_clone,
+                "antispoof.onnx",
+                "Silent-Face V2 (primary PAD)",
+                2,
+                "antispoof",
+            ),
+            describe(
+                &dir_clone,
+                "OULU_Protocol_2_model_0_0.onnx",
+                "DeepPixBis OULU-NPU (secondary PAD)",
+                13,
+                "antispoof",
+            ),
         ]
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
 
     Json(json!({
         "feature_enabled": feature_enabled,
@@ -5352,7 +6905,10 @@ async fn list_face_models_handler(
 async fn face_pairwise_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5361,13 +6917,33 @@ async fn face_pairwise_debug(
     })?;
 
     // Compute same-profile vs cross-profile summary stats.
-    let same: Vec<f32> = pairs.iter().filter(|p| p.same_profile).map(|p| p.similarity).collect();
-    let cross: Vec<f32> = pairs.iter().filter(|p| !p.same_profile).map(|p| p.similarity).collect();
+    let same: Vec<f32> = pairs
+        .iter()
+        .filter(|p| p.same_profile)
+        .map(|p| p.similarity)
+        .collect();
+    let cross: Vec<f32> = pairs
+        .iter()
+        .filter(|p| !p.same_profile)
+        .map(|p| p.similarity)
+        .collect();
     let mean = |v: &[f32]| -> Option<f32> {
-        if v.is_empty() { None } else { Some(v.iter().sum::<f32>() / v.len() as f32) }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().sum::<f32>() / v.len() as f32)
+        }
     };
-    let max = |v: &[f32]| -> Option<f32> { v.iter().copied().fold(None, |acc, x| Some(acc.map_or(x, |a: f32| a.max(x)))) };
-    let min = |v: &[f32]| -> Option<f32> { v.iter().copied().fold(None, |acc, x| Some(acc.map_or(x, |a: f32| a.min(x)))) };
+    let max = |v: &[f32]| -> Option<f32> {
+        v.iter()
+            .copied()
+            .fold(None, |acc, x| Some(acc.map_or(x, |a: f32| a.max(x))))
+    };
+    let min = |v: &[f32]| -> Option<f32> {
+        v.iter()
+            .copied()
+            .fold(None, |acc, x| Some(acc.map_or(x, |a: f32| a.min(x))))
+    };
 
     let verdict = if pairs.len() < 1 {
         "no_data"
@@ -5381,14 +6957,16 @@ async fn face_pairwise_debug(
 
     let items: Vec<Value> = pairs
         .iter()
-        .map(|p| json!({
-            "id_a":        p.id_a,
-            "id_b":        p.id_b,
-            "profile_a":   p.profile_a,
-            "profile_b":   p.profile_b,
-            "similarity":  p.similarity,
-            "same_profile": p.same_profile,
-        }))
+        .map(|p| {
+            json!({
+                "id_a":        p.id_a,
+                "id_b":        p.id_b,
+                "profile_a":   p.profile_a,
+                "profile_b":   p.profile_b,
+                "similarity":  p.similarity,
+                "same_profile": p.same_profile,
+            })
+        })
         .collect();
 
     Ok(Json(json!({
@@ -5419,7 +6997,10 @@ async fn face_pairwise_debug(
 async fn face_eval_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5427,8 +7008,16 @@ async fn face_eval_debug(
         )
     })?;
 
-    let same: Vec<f32> = pairs.iter().filter(|p| p.same_profile).map(|p| p.similarity).collect();
-    let cross: Vec<f32> = pairs.iter().filter(|p| !p.same_profile).map(|p| p.similarity).collect();
+    let same: Vec<f32> = pairs
+        .iter()
+        .filter(|p| p.same_profile)
+        .map(|p| p.similarity)
+        .collect();
+    let cross: Vec<f32> = pairs
+        .iter()
+        .filter(|p| !p.same_profile)
+        .map(|p| p.similarity)
+        .collect();
 
     if same.is_empty() || cross.is_empty() {
         return Ok(Json(json!({
@@ -5442,7 +7031,7 @@ async fn face_eval_debug(
     // Sweep thresholds.  At each threshold:
     //   FAR = fraction of cross pairs with sim ≥ t  (should be LOW)
     //   FRR = fraction of same  pairs with sim <  t  (should be LOW)
-    let n_same  = same.len() as f32;
+    let n_same = same.len() as f32;
     let n_cross = cross.len() as f32;
     let mut curve: Vec<(f32, f32, f32)> = Vec::new(); // (t, FAR, FRR)
     let mut best_sum = f32::MAX;
@@ -5452,7 +7041,7 @@ async fn face_eval_debug(
     for step in 0..=130 {
         let t = 0.30 + (step as f32) * 0.005; // 0.30 .. 0.95 in 0.005 steps
         let far = cross.iter().filter(|&&s| s >= t).count() as f32 / n_cross;
-        let frr = same.iter().filter(|&&s| s <  t).count() as f32 / n_same;
+        let frr = same.iter().filter(|&&s| s < t).count() as f32 / n_same;
         let sum = far + frr;
         if sum < best_sum {
             best_sum = sum;
@@ -5465,7 +7054,10 @@ async fn face_eval_debug(
                 // Sign flip in (FAR - FRR) between consecutive samples.
                 let prev_diff = prev.1 - prev.2;
                 let cur_diff = far - frr;
-                if prev_diff.signum() != cur_diff.signum() && prev_diff.is_finite() && cur_diff.is_finite() {
+                if prev_diff.signum() != cur_diff.signum()
+                    && prev_diff.is_finite()
+                    && cur_diff.is_finite()
+                {
                     crossover = Some((t, (far + frr) / 2.0));
                 }
             }
@@ -5604,15 +7196,17 @@ async fn burst_identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let (frames, bbox) = read_face_multipart_burst(multipart).await?;
     let n = frames.len();
 
     // Per-frame results (kept for the response so a UI can surface per-frame
     // diagnostics — useful when the consensus fails to explain *why*).
     let mut per_frame: Vec<Value> = Vec::with_capacity(n);
-    let mut votes: std::collections::HashMap<String, (u32, f32)> =
-        std::collections::HashMap::new(); // profile_id → (count, sum_confidence)
+    let mut votes: std::collections::HashMap<String, (u32, f32)> = std::collections::HashMap::new(); // profile_id → (count, sum_confidence)
     let mut no_face_count = 0_u32;
 
     // Liveness side-channels: we accumulate the per-frame embedding and
@@ -5745,33 +7339,52 @@ async fn burst_identify_face_handler(
     // photos don't.  If you swap in a different embedder with tighter
     // calibration, lower these via env vars.
     let single_frame_margin = env_or("POND_FACE_BURST_FRAME_MARGIN", 0.10_f32);
-    let mean_margin         = env_or("POND_FACE_BURST_MEAN_MARGIN",  0.12_f32);
-    let suspicious_extra    = env_or("POND_FACE_BURST_SUSPICIOUS_MARGIN", 0.05_f32);
-    let no_face_budget      = env_or("POND_FACE_BURST_NOFACE_BUDGET", 0.20_f32);
+    let mean_margin = env_or("POND_FACE_BURST_MEAN_MARGIN", 0.12_f32);
+    let suspicious_extra = env_or("POND_FACE_BURST_SUSPICIOUS_MARGIN", 0.05_f32);
+    let no_face_budget = env_or("POND_FACE_BURST_NOFACE_BUDGET", 0.20_f32);
 
-    let frame_floor = threshold + single_frame_margin
-        + if suspicious { suspicious_extra } else { 0.0 };
-    let mean_floor  = threshold + mean_margin
-        + if suspicious { suspicious_extra } else { 0.0 };
+    let frame_floor =
+        threshold + single_frame_margin + if suspicious { suspicious_extra } else { 0.0 };
+    let mean_floor = threshold + mean_margin + if suspicious { suspicious_extra } else { 0.0 };
 
     // Required vote count.  Single-frame bursts degrade to single-shot.
     // For n ≥ 3 we require **all face-bearing frames** to agree — which
     // after the no-face budget check below is effectively (n - no_face).
     let face_bearing = n as u32 - no_face_count;
-    let no_face_ratio = if n == 0 { 1.0 } else { no_face_count as f32 / n as f32 };
+    let no_face_ratio = if n == 0 {
+        1.0
+    } else {
+        no_face_count as f32 / n as f32
+    };
 
     // Extract per-frame confidences for the winning profile so we can
     // enforce (b) the individual-frame floor.
     let winner_pid_opt = winner.as_ref().map(|(p, _, _)| p.clone());
-    let winner_frame_confs: Vec<f32> = winner_pid_opt.as_ref().map(|target| {
-        per_frame.iter().filter_map(|pf| {
-            let pid = pf.get("profile_id").and_then(|v| v.as_str())?;
-            let conf = pf.get("confidence").and_then(|v| v.as_f64())?;
-            let identified = pf.get("identified").and_then(|v| v.as_bool()).unwrap_or(false);
-            if identified && pid == target { Some(conf as f32) } else { None }
-        }).collect()
-    }).unwrap_or_default();
-    let min_winner_conf = winner_frame_confs.iter().cloned().fold(f32::INFINITY, f32::min);
+    let winner_frame_confs: Vec<f32> = winner_pid_opt
+        .as_ref()
+        .map(|target| {
+            per_frame
+                .iter()
+                .filter_map(|pf| {
+                    let pid = pf.get("profile_id").and_then(|v| v.as_str())?;
+                    let conf = pf.get("confidence").and_then(|v| v.as_f64())?;
+                    let identified = pf
+                        .get("identified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if identified && pid == target {
+                        Some(conf as f32)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let min_winner_conf = winner_frame_confs
+        .iter()
+        .cloned()
+        .fold(f32::INFINITY, f32::min);
 
     let required: u32 = if n == 1 { 1 } else { face_bearing.max(2) };
 
@@ -5835,11 +7448,11 @@ async fn burst_identify_face_handler(
 /// close enough to the spoof floor that we want to require tighter
 /// consensus before trusting it.
 struct LivenessReport {
-    hard_reject:       bool,
-    suspicious:        bool,
-    mean_inter_cos:    f32,
-    landmark_motion:   f32,
-    eye_ratio_spread:  f32,
+    hard_reject: bool,
+    suspicious: bool,
+    mean_inter_cos: f32,
+    landmark_motion: f32,
+    eye_ratio_spread: f32,
     /// Mean **non-rigid** per-landmark displacement in pixels across
     /// consecutive frame pairs.  A moving photo produces pure rigid
     /// translation (all five landmarks shift by the same vector), so
@@ -5897,7 +7510,11 @@ fn compute_liveness_report(
                 count += 1;
             }
         }
-        if count == 0 { 0.0 } else { sum / count as f32 }
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f32
+        }
     } else {
         0.0
     };
@@ -5935,7 +7552,11 @@ fn compute_liveness_report(
             total += var.sqrt();
             pts += 1;
         }
-        if pts == 0 { 0.0 } else { total / pts as f32 }
+        if pts == 0 {
+            0.0
+        } else {
+            total / pts as f32
+        }
     } else {
         0.0
     };
@@ -5965,7 +7586,11 @@ fn compute_liveness_report(
             let min = ratios.iter().cloned().fold(f32::INFINITY, f32::min);
             let max = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
-            if mean > 0.0 { (max - min) / mean } else { 0.0 }
+            if mean > 0.0 {
+                (max - min) / mean
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -6010,12 +7635,18 @@ fn compute_liveness_report(
         let mut pairs = 0_u32;
         for w in landmarks.windows(2) {
             let pts_a = [
-                w[0].left_eye, w[0].right_eye, w[0].nose,
-                w[0].left_mouth, w[0].right_mouth,
+                w[0].left_eye,
+                w[0].right_eye,
+                w[0].nose,
+                w[0].left_mouth,
+                w[0].right_mouth,
             ];
             let pts_b = [
-                w[1].left_eye, w[1].right_eye, w[1].nose,
-                w[1].left_mouth, w[1].right_mouth,
+                w[1].left_eye,
+                w[1].right_eye,
+                w[1].nose,
+                w[1].left_mouth,
+                w[1].right_mouth,
             ];
             // Per-landmark displacement.
             let disps: [(f32, f32); 5] = [
@@ -6029,15 +7660,23 @@ fn compute_liveness_report(
             let mean_dx = disps.iter().map(|d| d.0).sum::<f32>() / 5.0;
             let mean_dy = disps.iter().map(|d| d.1).sum::<f32>() / 5.0;
             // Mean magnitude of residual (non-rigid) displacement.
-            let residual = disps.iter().map(|d| {
-                let rx = d.0 - mean_dx;
-                let ry = d.1 - mean_dy;
-                (rx * rx + ry * ry).sqrt()
-            }).sum::<f32>() / 5.0;
+            let residual = disps
+                .iter()
+                .map(|d| {
+                    let rx = d.0 - mean_dx;
+                    let ry = d.1 - mean_dy;
+                    (rx * rx + ry * ry).sqrt()
+                })
+                .sum::<f32>()
+                / 5.0;
             sum += residual;
             pairs += 1;
         }
-        if pairs == 0 { 0.0 } else { sum / pairs as f32 }
+        if pairs == 0 {
+            0.0
+        } else {
+            sum / pairs as f32
+        }
     } else {
         0.0
     };
@@ -6051,18 +7690,25 @@ fn compute_liveness_report(
     // slight hand jitter passing the existing motion floor but staying
     // dimensionally rigid.
     let face_size_spread = if landmarks.len() >= 2 {
-        let dists: Vec<f32> = landmarks.iter().map(|lm| {
-            let dx = lm.right_eye.0 - lm.left_eye.0;
-            let dy = lm.right_eye.1 - lm.left_eye.1;
-            (dx * dx + dy * dy).sqrt()
-        }).collect();
+        let dists: Vec<f32> = landmarks
+            .iter()
+            .map(|lm| {
+                let dx = lm.right_eye.0 - lm.left_eye.0;
+                let dy = lm.right_eye.1 - lm.left_eye.1;
+                (dx * dx + dy * dy).sqrt()
+            })
+            .collect();
         let mean = dists.iter().sum::<f32>() / dists.len() as f32;
         if mean > 1e-3 {
             let min = dists.iter().cloned().fold(f32::INFINITY, f32::min);
             let max = dists.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             (max - min) / mean
-        } else { 0.0 }
-    } else { 0.0 };
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
 
     // Gates.
     //
@@ -6080,21 +7726,31 @@ fn compute_liveness_report(
     //                                         cosine because the same pixels
     //                                         are re-imaged each frame)
     let diff_floor = std::env::var("POND_FACE_LIVENESS_DIFF_MOTION_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.60);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.60);
     let motion_floor = std::env::var("POND_FACE_LIVENESS_MOTION_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.5);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5);
     let eye_floor = std::env::var("POND_FACE_LIVENESS_EYE_SPREAD_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.003);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.003);
     let size_floor = std::env::var("POND_FACE_LIVENESS_SIZE_SPREAD_MIN")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.012);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.012);
     let cos_ceiling = std::env::var("POND_FACE_LIVENESS_INTER_COS_MAX")
-        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.9994);
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.9994);
 
-    let barely_moving     = landmark_motion < motion_floor && landmarks.len() >= 3;
-    let flat_eye_ratio    = eye_ratio_spread < eye_floor;
-    let rigid_motion      = differential_motion < diff_floor && landmarks.len() >= 3;
+    let barely_moving = landmark_motion < motion_floor && landmarks.len() >= 3;
+    let flat_eye_ratio = eye_ratio_spread < eye_floor;
+    let rigid_motion = differential_motion < diff_floor && landmarks.len() >= 3;
     let dimensionally_rigid = face_size_spread < size_floor && landmarks.len() >= 3;
-    let frozen_embedding  = mean_inter_cos > cos_ceiling && embeddings.len() >= 3;
+    let frozen_embedding = mean_inter_cos > cos_ceiling && embeddings.len() >= 3;
 
     // Hard reject on **any two** photo-like signals.  Previously we required
     // (flat_eye_ratio) to be one of them, which let a phone-screen photo with
@@ -6109,7 +7765,10 @@ fn compute_liveness_report(
         rigid_motion,
         dimensionally_rigid,
         frozen_embedding,
-    ].iter().filter(|x| **x).count();
+    ]
+    .iter()
+    .filter(|x| **x)
+    .count();
     let hard_reject = photo_like >= 2;
 
     // Soft suspicious tightens consensus on a single failed axis.
@@ -6144,7 +7803,10 @@ async fn enroll_quality_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     // Uses `identify_with_diagnostics` so we can get the embedding back and
@@ -6193,7 +7855,11 @@ async fn enroll_quality_handler(
                 }
             }
         }
-        if count == 0 { None } else { Some(sum / count as f32) }
+        if count == 0 {
+            None
+        } else {
+            Some(sum / count as f32)
+        }
     } else {
         None
     };
@@ -6292,7 +7958,10 @@ async fn get_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let override_t = face.get_profile_threshold(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6315,7 +7984,10 @@ async fn put_profile_threshold_handler(
     Path(profile_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let threshold = body
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -6355,13 +8027,18 @@ async fn delete_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
-    face.set_profile_threshold(&profile_id, None, None).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
+    face.set_profile_threshold(&profile_id, None, None)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     Ok(Json(json!({ "profile_id": profile_id, "threshold": null })))
 }
 
@@ -6372,7 +8049,10 @@ async fn delete_user_biometrics(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let deleted = face.delete_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6401,7 +8081,10 @@ async fn identify_session_user_handler(
     Path(session_id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state.face_recognition.as_ref().ok_or_else(face_unavailable)?;
+    let face = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {

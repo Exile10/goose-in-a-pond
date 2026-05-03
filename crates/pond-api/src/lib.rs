@@ -37,6 +37,7 @@
 //! All clients are rate limited to 600 requests per 60 seconds (10 req/s burst).
 
 pub mod middleware;
+pub mod oauth_callback;
 pub mod routes;
 pub mod thought_filter;
 pub mod tool_context;
@@ -73,29 +74,29 @@ pub trait LlamafileManager: Send + Sync {
 }
 
 use axum::{middleware::Next, Router};
-use tower_http::cors::{Any, CorsLayer};
 use pond_core::ports::agent::Agent;
-use pond_core::ports::handshake::Handshake;
-use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::ports::provider::LlmProvider;
-use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::camera_storage::CameraStorage;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::ports::extension_manager::ExtensionManagerPort;
+use pond_core::ports::extension_marketplace::ExtensionMarketplace;
 use pond_core::ports::face_recognition::FaceRecognition;
+use pond_core::ports::handshake::Handshake;
 use pond_core::ports::mcp_memory::McpMemoryPort;
+use pond_core::ports::mcp_server::McpServerRepository;
+use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
 use pond_core::ports::model_repository::ModelRepository;
 use pond_core::ports::model_scheduler::ModelScheduler;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::extension_manager::ExtensionManagerPort;
-use pond_core::ports::mcp_server::McpServerRepository;
+use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::ports::profile::ProfileRepository;
 use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
+use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::recipe::AgentRecipeRepository;
 use pond_core::ports::scheduler::SchedulerPort;
 use pond_core::ports::sensor_storage::SensorStorage;
+use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
 use pond_core::ports::telemetry::TelemetryPort;
@@ -103,6 +104,7 @@ use pond_core::ports::voice_output::VoiceOutput;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 
 /// Shared application state available to all route handlers.
 pub struct AppState {
@@ -164,9 +166,17 @@ pub struct AppState {
     /// Persistent storage for configured external MCP server connections.
     /// Loaded at startup to auto-connect saved servers.
     pub mcp_server_repo: Option<Arc<dyn McpServerRepository>>,
+    /// Dynamic tool registry — unified view of all built-in + extension tools.
+    /// Used by route handlers to sync the registry when extensions are added/removed.
+    pub tool_registry: Option<Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>>,
+    /// Extension marketplace — curated registry of installable MCP extensions.
+    pub marketplace: Option<Arc<dyn ExtensionMarketplace>>,
+    /// Secure secret storage for extension API keys and OAuth tokens.
+    pub secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>>,
 
     /// Tracks in-progress model downloads so the UI can show progress bars.
-    pub download_tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    pub download_tracker:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
     /// Port the Piper HTTP TTS server is listening on.
     /// Set at startup by `piper_http::start()`. `None` if Piper is not running.
     pub piper_http_port: Option<u16>,
@@ -209,8 +219,7 @@ pub struct AppState {
     /// profile's name into the system prompt so the agent greets the right
     /// household member by name.  Entries are transient (cleared on server
     /// restart); re-identification is cheap enough to redo each session.
-    pub session_user_bindings:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    pub session_user_bindings: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// Limits concurrent SSE streams to prevent unbounded memory use from
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
@@ -225,50 +234,54 @@ pub struct AppState {
     /// `None` when `memory_extraction_enabled` is false.
     pub memory_extractor: Option<Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor>>,
     /// Shared extraction service instance (rate limiter + dedup state).
-    pub memory_extraction_service: Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
+    pub memory_extraction_service:
+        Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
     /// Inference pool — concurrent LLM task submission with provider-aware
     /// semaphore (3 for HTTP providers, 1 for GGUF). Used for parallel
     /// post-processing (review + extraction can run concurrently on HTTP providers).
     pub inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>>,
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
-    pub schedule_result_tx: tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
+    pub schedule_result_tx:
+        tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
     /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
     pub telemetry: Option<Arc<dyn TelemetryPort>>,
     /// Context growth monitor — tracks context window fill rate per session
     /// and emits warnings before the "context cliff" where quality degrades.
     pub context_monitor: Arc<pond_core::services::context_monitor::ContextMonitor>,
+    /// In-memory OAuth PKCE sessions (state nonce -> verifier + provider).
+    pub oauth_state: crate::oauth_callback::OAuthState,
 }
 
 /// State of a single in-progress (or recently completed) model download.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadEntry {
-    pub filename:         String,
-    pub category:         String,
+    pub filename: String,
+    pub category: String,
     pub downloaded_bytes: u64,
-    pub total_bytes:      Option<u64>,
+    pub total_bytes: Option<u64>,
     /// "downloading" | "done" | "error"
-    pub status:           String,
+    pub status: String,
     /// When the download finished (status became "done" or "error").
     /// `None` while still downloading. Used to evict stale entries.
     #[serde(skip)]
-    pub finished_at:      Option<std::time::Instant>,
+    pub finished_at: Option<std::time::Instant>,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStatusEntry {
-    pub category:    String,
-    pub name:        String,
+    pub category: String,
+    pub name: String,
     pub description: String,
-    pub size_mb:     u64,
+    pub size_mb: u64,
     /// True if the model file exists on disk (or for HTTP TTS, always true).
-    pub downloaded:  bool,
+    pub downloaded: bool,
     /// True if this is the currently active model for its category.
-    pub active:      bool,
+    pub active: bool,
     /// Download URL — None for HTTP TTS entries that have no downloadable file.
-    pub url:      Option<String>,
+    pub url: Option<String>,
     /// HuggingFace model spec (GGUF only): "author/repo:quantization"
-    pub hf_id:    Option<String>,
+    pub hf_id: Option<String>,
     /// Filename on disk (used by the download route to determine the save path)
     pub filename: Option<String>,
     /// Approximate RAM required at runtime in MB. None for models without estimates.

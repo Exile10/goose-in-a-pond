@@ -207,7 +207,7 @@ Tag stripping layers (defense-in-depth):
 ### Databases
 
 Two SQLite databases in `$DATA_DIR` (macOS default: `~/Library/Application Support/goose-in-a-pond/`):
-- `pond_system.db` — settings, sessions, devices, onboarding, profiles, memory, skills
+- `pond_system.db` — settings, sessions, devices, onboarding, profiles, memory, skills, MCP server configs
 - `pond_logs.db` — sensor readings, camera events, telemetry
 
 Migrations live in `crates/pond-infra/migrations/system/` and `migrations/logs/`, applied automatically via `sqlx::migrate!()` on startup. Cross-compile requires `SQLX_OFFLINE=true`.
@@ -232,10 +232,50 @@ Cron-based automation engine in `pond-infra-scheduler`. Tasks fire at cron inter
 - **Port**: `SchedulerPort` in `pond-core/src/ports/scheduler.rs` — create, list, delete, pause, resume, run_now, get_runs, list_upcoming
 - **Executor**: `ScheduleExecutor` port → `AgentScheduleExecutor` creates ephemeral sessions (prefix `sched-`) and calls `agent.chat()`. `DeferredExecutor` breaks the circular init dependency (scheduler → agent → scheduler).
 - **Adapter**: `CronSchedulerAdapter` in `pond-infra-scheduler/src/cron_scheduler.rs` — tokio-cron-scheduler, JSON persistence, `JsonRunHistory` for execution logs
-- **MCP Tools** (7): `list_schedules`, `create_schedule`, `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs`
+- **MCP Tools (schedule)**: `list_schedules`, `create_schedule`, `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs`
 - **Natural language**: Tool classifier routes "schedule to get weather at 10am" → `create_schedule` → keyword parser extracts cron + prompt
 - **Result delivery**: `ScheduleResultEvent` broadcast via `tokio::sync::broadcast` → SSE at `GET /api/v1/schedules/events` → desktop notification
 - **Settings**: `schedule_result_notify` (default true)
+
+### MCP Extension System & Marketplace
+
+Extensions add tools to the agent at runtime via the Model Context Protocol. GIAP manages them through a layered architecture:
+
+- **Port**: `ExtensionManagerPort` in `pond-core/src/ports/extension_manager.rs` — list, add, remove, toggle extensions
+- **Adapter**: `GiapGooseExtensionManager` in `pond-adapters-goose/src/extension_manager.rs` — wraps Goose's native MCP client. Tracks extension status and errors in memory, validates commands before connecting.
+- **Persistence**: `McpServerRepository` in `pond-infra/src/sqlite_mcp_servers.rs` — configs stored in `mcp_servers` table (name, kind, command, args, env, uri, enabled). Enabled extensions auto-reconnect on server restart.
+- **Tool Registry**: `ToolRegistryPort` in `pond-core/src/ports/tool_registry.rs` — unified view of built-in + extension tools. Synced automatically when extensions are added/removed/toggled. Wired into `AppState.tool_registry`.
+- **Marketplace**: `ExtensionMarketplace` port → `BundledMarketplace` service parses `crates/pond-core/src/extensions/marketplace_registry.json` (embedded at compile time via `include_str!`). 8 curated extensions: Filesystem, GitHub, SQLite, Brave Search, Memory, Puppeteer, Fetch, Slack.
+
+Extension types: **stdio** (subprocess, stdin/stdout) · **streamable_http** (remote HTTP) · **builtin** (GIAP's native tools).
+
+API endpoints:
+- `GET /api/v1/extensions` — lists live + persisted-but-disabled extensions (merged view)
+- `POST /api/v1/extensions` — register new extension (validates command/URI first)
+- `DELETE /api/v1/extensions/{name}` — remove and delete persisted config
+- `PATCH /api/v1/extensions/{name}` — toggle enabled/disabled (persisted to SQLite)
+- `GET /api/v1/marketplace` — curated extensions from bundled registry
+- `POST /api/v1/marketplace/{id}/install` — one-click install with persistence and tool registry sync
+
+`ExtensionInfo` includes `status` ("connected" | "error" | "loading" | "disabled") and `last_error` for UI feedback. Desktop UI has "Installed" and "Browse" tabs.
+
+Extension templates for building custom MCP servers: `templates/extensions/python/`, `templates/extensions/typescript/`, `templates/extensions/rust/`. Full developer guide at `docs/developer/extensions.md`.
+
+MCP protocol compliance, version tracking, and authorization model documented in `docs/architecture/mcp-compliance.md`.
+
+### Built-in MCP Tools
+
+All tools defined in `crates/pond-mcp-server/src/giap_server.rs` using the `rmcp` `#[tool]` macro. Tool definitions for the system prompt in `crates/pond-core/src/prompts.rs` (`giap_tool_definitions()`).
+
+- **Schedule** (7): `list_schedules`, `create_schedule`, `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs`
+- **Memory** (3): `save_memory`, `recall_memories`, `forget_memory`
+- **Knowledge** (2): `search_wikipedia`, `wikipedia_get_article`
+- **System** (6): `get_current_time`, `get_system_info` (via `sysinfo` crate), `send_notification` (via `notify-rust`), `run_shell_command` (sandboxed allow-list), `read_file`, `write_file`
+- **Other** (4): `get_current_weather`, `list_registered_devices`, `get_current_profile`, `get_model_config`
+
+`run_shell_command` only allows: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. 10-second timeout.
+
+`read_file`/`write_file` reject path traversal (`..`) and require absolute paths.
 
 ### Memory System (Enhanced)
 

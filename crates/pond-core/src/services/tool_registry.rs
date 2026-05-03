@@ -163,9 +163,9 @@ mod tests {
             .register_extension_tools(
                 "filesystem",
                 vec![
-                    ("read_file".to_string(), "Read a file from disk".to_string()),
+                    ("fs_read".to_string(), "Read a file from disk".to_string()),
                     (
-                        "write_file".to_string(),
+                        "fs_write".to_string(),
                         "Write content to a file".to_string(),
                     ),
                 ],
@@ -185,12 +185,12 @@ mod tests {
         registry
             .register_extension_tools(
                 "filesystem",
-                vec![("read_file".to_string(), "Read a file".to_string())],
+                vec![("fs_read".to_string(), "Read a file".to_string())],
             )
             .await;
 
         // Verify it's there
-        assert!(registry.resolve_extension("read_file").await.is_some());
+        assert!(registry.resolve_extension("fs_read").await.is_some());
 
         // Deregister
         registry.deregister_extension("filesystem").await;
@@ -198,7 +198,7 @@ mod tests {
         let all = registry.all_tools().await;
         let external: Vec<_> = all.iter().filter(|t| !t.is_builtin).collect();
         assert_eq!(external.len(), 0);
-        assert!(registry.resolve_extension("read_file").await.is_none());
+        assert!(registry.resolve_extension("fs_read").await.is_none());
     }
 
     #[tokio::test]
@@ -207,7 +207,7 @@ mod tests {
         registry
             .register_extension_tools(
                 "filesystem",
-                vec![("read_file".to_string(), "Read a file from disk".to_string())],
+                vec![("fs_read".to_string(), "Read a file from disk".to_string())],
             )
             .await;
 
@@ -227,7 +227,7 @@ mod tests {
         // External lines use "ext/tool_name -- desc" format
         let last = &lines[lines.len() - 1];
         assert!(
-            last.starts_with("filesystem/read_file"),
+            last.starts_with("filesystem/fs_read"),
             "external tool should have extension prefix: {last}"
         );
     }
@@ -268,7 +268,7 @@ mod tests {
         registry
             .register_extension_tools(
                 "filesystem",
-                vec![("read_file".to_string(), "Read a file".to_string())],
+                vec![("fs_read".to_string(), "Read a file".to_string())],
             )
             .await;
 
@@ -284,7 +284,7 @@ mod tests {
 
         // External tool
         assert_eq!(
-            registry.resolve_extension("read_file").await,
+            registry.resolve_extension("fs_read").await,
             Some("filesystem".to_string())
         );
 
