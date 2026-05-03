@@ -22,6 +22,7 @@ pub enum SecretKind {
     /// Manual paste (GitHub token, Brave API key)
     ApiKey,
     /// One-click "Sign in with X" — GIAP handles the entire OAuth PKCE flow
+    #[serde(rename = "oauth_flow")]
     OAuthFlow,
     /// Free-form text input
     Generic,

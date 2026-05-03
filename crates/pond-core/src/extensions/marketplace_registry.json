@@ -117,7 +117,7 @@
           "display_name": "Spotify",
           "description": "Sign in to control playback and manage playlists",
           "required": true,
-          "kind": "o_auth_flow"
+          "kind": "oauth_flow"
         }
       ]
     }
