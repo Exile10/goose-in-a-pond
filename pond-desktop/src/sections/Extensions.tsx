@@ -133,9 +133,10 @@ function OAuthBlock({
   onAuthorized: () => void;
   disabled: boolean;
 }) {
-  const [oauthState, setOauthState] = useState<"idle" | "polling" | "done">("idle");
+  const [oauthState, setOauthState] = useState<"idle" | "polling" | "done" | "reconnecting">("idle");
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function stopPoll() {
     if (pollRef.current !== null) {
@@ -144,7 +145,12 @@ function OAuthBlock({
     }
   }
 
-  useEffect(() => () => stopPoll(), []);
+  useEffect(() => () => {
+    stopPoll();
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+    }
+  }, []);
 
   async function handleSignIn() {
     setError(null);
@@ -161,6 +167,10 @@ function OAuthBlock({
             stopPoll();
             setOauthState("done");
             onAuthorized();
+            // Show "Reconnecting..." for 1.5s then signal complete
+            reconnectTimerRef.current = setTimeout(() => {
+              setOauthState("reconnecting");
+            }, 800);
           }
         } catch {
           // ignore transient check failures, keep polling
@@ -219,6 +229,13 @@ function OAuthBlock({
         </div>
       )}
 
+      {oauthState === "reconnecting" && (
+        <div className="secret-modal__reconnecting">
+          <div className="secret-modal__oauth-spinner" />
+          <span>Reconnecting extension…</span>
+        </div>
+      )}
+
       {error && <p className="secret-modal__field-error">{error}</p>}
     </div>
   );
@@ -241,11 +258,35 @@ function SecretConfigModal({
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   // Track which oauth secrets are now authorised (checked by poll)
   const [oauthDone, setOauthDone] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(oauthReqs.map((r) => [r.key, fulfilledMap[r.key] ?? false])),
   );
+
+  // When all oauth-only requirements are fulfilled and there are no api key fields,
+  // auto-close after a reconnect delay
+  const onlyOauth = apiKeyReqs.length === 0 && oauthReqs.length > 0;
+  const allOauthDone = oauthReqs.length > 0 && oauthReqs.every((r) => oauthDone[r.key]);
+
+  const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (onlyOauth && allOauthDone && !reconnecting) {
+      setReconnecting(true);
+      autoCloseTimerRef.current = setTimeout(() => {
+        onComplete({}).catch(() => {});
+      }, 1500);
+    }
+    return () => {
+      if (autoCloseTimerRef.current !== null) {
+        clearTimeout(autoCloseTimerRef.current);
+      }
+    };
+    // We want this to fire when oauthDone changes — eslint exhaustive deps can be ignored here
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allOauthDone, onlyOauth]);
 
   function setValue(key: string, val: string) {
     setValues((prev) => ({ ...prev, [key]: val }));
@@ -396,26 +437,36 @@ function SecretConfigModal({
           )}
         </div>
 
-        {/* Footer actions */}
-        <div className="secret-modal__actions">
-          <button
-            type="button"
-            className="secret-modal__cancel-btn"
-            onClick={onClose}
-            disabled={saving}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="secret-modal__save-btn"
-            onClick={handleSave}
-            disabled={saving}
-          >
-            {saving && <span className="secret-modal__save-spinner" />}
-            {mode === "edit" ? "Save Changes" : "Save & Install"}
-          </button>
-        </div>
+        {/* Reconnecting overlay — shown when all oauth is done and we're auto-closing */}
+        {reconnecting && (
+          <div className="secret-modal__reconnect-banner">
+            <div className="secret-modal__oauth-spinner" />
+            <span>Reconnecting extension…</span>
+          </div>
+        )}
+
+        {/* Footer actions — hidden when reconnecting in oauth-only mode */}
+        {!reconnecting && (
+          <div className="secret-modal__actions">
+            <button
+              type="button"
+              className="secret-modal__cancel-btn"
+              onClick={onClose}
+              disabled={saving}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="secret-modal__save-btn"
+              onClick={handleSave}
+              disabled={saving}
+            >
+              {saving && <span className="secret-modal__save-spinner" />}
+              {mode === "edit" ? "Save Changes" : "Save & Install"}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -429,6 +480,7 @@ function ExtensionCard({
   onDelete,
   onConfigureSecrets,
   hasSecrets,
+  secretStatus,
   disabled,
 }: {
   ext: Extension;
@@ -436,6 +488,7 @@ function ExtensionCard({
   onDelete: (name: string) => void;
   onConfigureSecrets?: (name: string) => void;
   hasSecrets?: boolean;
+  secretStatus?: "configured" | "missing" | "unknown";
   disabled: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -468,6 +521,24 @@ function ExtensionCard({
               <span className="ext-card__tool-count">
                 {ext.tools.length} {ext.tools.length === 1 ? "tool" : "tools"}
               </span>
+            )}
+            {/* Auth status badge — only shown for extensions that have required secrets */}
+            {hasSecrets && secretStatus === "configured" && (
+              <span className="ext-card__auth-badge ext-card__auth-badge--ok" title="All credentials configured">
+                <Check size={9} strokeWidth={2.5} />
+                Authorised
+              </span>
+            )}
+            {hasSecrets && secretStatus === "missing" && (
+              <button
+                type="button"
+                className="ext-card__auth-badge ext-card__auth-badge--warn"
+                onClick={onConfigureSecrets ? () => onConfigureSecrets(ext.name) : undefined}
+                title="Credentials required — click to configure"
+              >
+                <AlertCircle size={9} strokeWidth={2.5} />
+                Setup required
+              </button>
             )}
           </div>
           {ext.description && (
@@ -966,6 +1037,7 @@ export function Extensions() {
   // For edit-mode secret modal on installed extensions
   const [marketplaceCache, setMarketplaceCache] = useState<MarketplaceExtension[]>([]);
   const [secretEditState, setSecretEditState] = useState<SecretEditState | null>(null);
+  const [secretStatus, setSecretStatus] = useState<Record<string, "configured" | "missing" | "unknown">>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1029,6 +1101,37 @@ export function Extensions() {
     }
   }, [marketplaceCache.length]);
 
+  // Once marketplace data is available, check auth status for each installed extension with secrets
+  useEffect(() => {
+    if (marketplaceCache.length === 0 || extensions.length === 0) return;
+
+    const extsWithSecrets = extensions.filter((ext) => {
+      const mktEntry = marketplaceCache.find(
+        (m) => m.name.toLowerCase() === ext.name.toLowerCase() || m.id.toLowerCase() === ext.name.toLowerCase(),
+      );
+      return (mktEntry?.required_secrets?.length ?? 0) > 0;
+    });
+
+    if (extsWithSecrets.length === 0) return;
+
+    // Fire parallel checks — non-blocking, update state as results arrive
+    for (const ext of extsWithSecrets) {
+      api.getExtensionSecrets(ext.name)
+        .then((res) => {
+          const allFulfilled = Object.values(res.fulfilled).length > 0 && Object.values(res.fulfilled).every(Boolean);
+          setSecretStatus((prev) => ({
+            ...prev,
+            [ext.name]: allFulfilled ? "configured" : "missing",
+          }));
+        })
+        .catch(() => {
+          setSecretStatus((prev) => ({ ...prev, [ext.name]: "unknown" }));
+        });
+    }
+  // Run whenever extensions list or marketplace cache changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extensions.length, marketplaceCache.length]);
+
   async function handleConfigureSecrets(extName: string) {
     // Find matching marketplace entry by name
     const mktExt = marketplaceCache.find(
@@ -1054,8 +1157,19 @@ export function Extensions() {
     if (Object.keys(secrets).length > 0) {
       await api.setExtensionSecrets(secretEditState.extName, secrets);
     }
-    flash(`Credentials updated for ${secretEditState.extName}.`);
+    const extName = secretEditState.extName;
+    flash(`Credentials updated for ${extName}.`);
     setSecretEditState(null);
+    // Refresh the auth status badge for this extension
+    api.getExtensionSecrets(extName)
+      .then((res) => {
+        const allFulfilled = Object.values(res.fulfilled).length > 0 && Object.values(res.fulfilled).every(Boolean);
+        setSecretStatus((prev) => ({
+          ...prev,
+          [extName]: allFulfilled ? "configured" : "missing",
+        }));
+      })
+      .catch(() => {});
   }
 
   function handleInstallFromMarketplace(ext: Extension) {
@@ -1183,6 +1297,7 @@ export function Extensions() {
                         onDelete={handleDelete}
                         onConfigureSecrets={hasSecrets ? handleConfigureSecrets : undefined}
                         hasSecrets={hasSecrets}
+                        secretStatus={hasSecrets ? (secretStatus[ext.name] ?? "unknown") : undefined}
                         disabled={!state.serverOnline}
                       />
                     );

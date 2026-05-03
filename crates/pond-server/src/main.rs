@@ -1511,6 +1511,29 @@ async fn run_server(
         tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
     }
 
+    // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
+    // Initialized before MCP auto-connect so startup can resolve OAuth tokens.
+    let secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>> = {
+        match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
+            Ok(repo) => {
+                tracing::info!(
+                    "secret repository initialized at {}/secrets.json",
+                    data_dir.display()
+                );
+                Some(Arc::new(repo))
+            }
+            Err(e) => {
+                tracing::warn!("failed to initialize secret repository: {e}");
+                None
+            }
+        }
+    };
+
+    // Marketplace — curated registry of installable extensions.
+    // Initialized before MCP auto-connect so startup can look up required_secrets.
+    let marketplace: Arc<dyn pond_core::ports::extension_marketplace::ExtensionMarketplace> =
+        Arc::new(pond_core::services::marketplace::BundledMarketplace::new());
+
     // MCP client — load persisted server configs and auto-connect enabled ones.
     let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
         let repo = Arc::new(SqliteMcpServerRepository::new(db.system.clone()));
@@ -1523,13 +1546,31 @@ async fn run_server(
                         .filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled)
                     {
                         use pond_core::ports::extension_manager::AddExtensionRequest;
+
+                        // Start with persisted env, then resolve any secrets
+                        // from the secret repo that aren't already present.
+                        // This ensures OAuth tokens (stored in secrets.json,
+                        // not in mcp_servers.env) are injected at startup.
+                        let mut env = srv.env.clone();
+                        if let Some(sr) = &secret_repo {
+                            if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
+                                for secret_req in &ext.required_secrets {
+                                    if !env.contains_key(&secret_req.key) {
+                                        if let Ok(Some(val)) = sr.get(&secret_req.key).await {
+                                            env.insert(secret_req.key.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         let req = AddExtensionRequest {
                             name: srv.name.clone(),
                             kind: srv.kind.clone(),
                             description: srv.description.clone(),
                             command: srv.command.clone(),
                             args: srv.args.clone(),
-                            env: srv.env.clone(),
+                            env,
                             uri: srv.uri.clone(),
                         };
                         match mgr.add_extension(req).await {
@@ -1575,22 +1616,10 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
-    // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
-    let secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>> = {
-        match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
-            Ok(repo) => {
-                tracing::info!(
-                    "secret repository initialized at {}/secrets.json",
-                    data_dir.display()
-                );
-                Some(Arc::new(repo))
-            }
-            Err(e) => {
-                tracing::warn!("failed to initialize secret repository: {e}");
-                None
-            }
-        }
-    };
+    // Bind the API port early so we can thread it into AppState (needed for
+    // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
+    // consumes the listener happens further below.
+    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
 
     let state = Arc::new(AppState {
         db,
@@ -1620,9 +1649,7 @@ async fn run_server(
         extension_manager,
         mcp_server_repo,
         tool_registry: Some(tool_registry),
-        marketplace: Some(Arc::new(
-            pond_core::services::marketplace::BundledMarketplace::new(),
-        )),
+        marketplace: Some(marketplace),
         secret_repo,
         download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),
@@ -1657,6 +1684,7 @@ async fn run_server(
         )),
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port,
     });
 
     // Warn if static assets haven't been built yet
@@ -1680,7 +1708,6 @@ async fn run_server(
         .unwrap_or(&hostname)
         .to_string();
 
-    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
     let display_url = if api_port == 80 {
         format!("http://pond.{}.local", hostname)
     } else {
