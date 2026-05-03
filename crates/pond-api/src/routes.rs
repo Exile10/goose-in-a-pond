@@ -5607,9 +5607,12 @@ async fn oauth_authorize_handler(
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
     let extension_id = body["extension_id"].as_str().map(String::from);
 
-    // Find provider config
+    // Find provider config by ID or by token_key (frontend may send the secret key name)
     let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
-    let provider = match providers.iter().find(|p| p.id == provider_id) {
+    let provider = match providers
+        .iter()
+        .find(|p| p.id == provider_id || p.token_key == provider_id)
+    {
         Some(p) => p,
         None => {
             return (
