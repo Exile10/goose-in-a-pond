@@ -938,6 +938,84 @@ impl GooseAdapter {
         }
         drop(user_exts);
 
+        // ── 6b. Extension tool discovery ─────────────────────────────────────
+        // Query all tools registered with Goose, group by extension prefix
+        // (format: "ext_name__tool_name"), and inject external extension
+        // descriptions into the system prompt so the LLM knows about MCP tools.
+        // This also builds the `allowed_tools` set used later to filter
+        // hallucinated tool calls.
+        let all_tools = self.agent.list_tools(&goose_sid, None).await;
+
+        let allowed_tools: std::collections::HashSet<String> =
+            all_tools.iter().map(|t| t.name.to_string()).collect();
+
+        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
+
+        // Group tools by extension prefix and inject external extension
+        // descriptions so the agent knows about MCP tools (music, filesystem, etc.).
+        {
+            let mut ext_map: HashMap<String, Vec<String>> = HashMap::new();
+            for tool in &all_tools {
+                let name = tool.name.as_ref();
+                if let Some(sep) = name.find("__") {
+                    let ext_name = &name[..sep];
+                    let tool_name = &name[sep + 2..];
+                    ext_map
+                        .entry(ext_name.to_string())
+                        .or_default()
+                        .push(tool_name.to_string());
+                }
+            }
+
+            // Filter out built-in GIAP extensions (already covered by the
+            // available_tools section in the prompt) and Goose defaults.
+            const BUILTIN_EXTENSIONS: &[&str] = &[
+                "giap",
+                "default",
+                "developer",
+                "computercontroller",
+                "extensionmanager",
+                "todo",
+                "apps",
+                "analyze",
+                "summon",
+                "summarize",
+                "orchestrator",
+                "tom",
+            ];
+
+            let external_extensions: Vec<(String, Vec<String>)> = ext_map
+                .into_iter()
+                .filter(|(name, _)| !BUILTIN_EXTENSIONS.contains(&name.as_str()))
+                .collect();
+
+            if !external_extensions.is_empty() {
+                let mut desc_lines = Vec::with_capacity(external_extensions.len() * 3);
+                desc_lines.push("# MCP Extensions".to_string());
+                desc_lines.push(
+                    "The following extensions are loaded and their tools are available for use."
+                        .to_string(),
+                );
+
+                for (ext_name, tools) in &external_extensions {
+                    desc_lines.push(format!("\n## {}", ext_name));
+                    desc_lines.push(format!("  Tools: {}", tools.join(", ")));
+                }
+
+                let ext_description = desc_lines.join("\n");
+
+                tracing::info!(
+                    extensions = external_extensions.len(),
+                    "Injecting {} external extension(s) into system prompt",
+                    external_extensions.len(),
+                );
+
+                self.agent
+                    .extend_system_prompt("extensions".to_string(), ext_description)
+                    .await;
+            }
+        }
+
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;
         self.agent
@@ -959,18 +1037,6 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
-
-        // Build the set of valid tool names before the stream starts.
-        // Any ToolCall event whose name isn't in this set is a hallucination
-        // and must be suppressed before it reaches the UI / SSE serialiser.
-        let allowed_tools: std::collections::HashSet<String> = agent_clone
-            .list_tools(&goose_sid, None)
-            .await
-            .into_iter()
-            .map(|t| t.name.to_string())
-            .collect();
-
-        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         let user_msg_len = request.message.len();
 
