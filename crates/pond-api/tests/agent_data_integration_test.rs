@@ -148,6 +148,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
 
     (
@@ -350,6 +351,7 @@ async fn prompt_template_delete_system_returns_403() {
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -702,6 +704,7 @@ async fn returns_501_when_repos_not_configured() {
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
