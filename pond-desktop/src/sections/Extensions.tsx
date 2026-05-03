@@ -29,6 +29,16 @@ import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement } from "../api/types";
 
+/** Open a URL in the system browser. Uses Tauri shell plugin when available, falls back to window.open. */
+async function openExternal(url: string) {
+  try {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+  } catch {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
 // ── Secret Config Modal ───────────────────────────────────────
 
 type SecretModalMode = "install" | "edit";
@@ -141,7 +151,7 @@ function OAuthBlock({
     setOauthState("polling");
     try {
       const { auth_url } = await api.initiateOAuth(req.key, extensionId);
-      window.open(auth_url, "_blank", "noopener,noreferrer");
+      openExternal(auth_url);
 
       // Poll checkSecret every 2s until the token appears
       pollRef.current = setInterval(async () => {
