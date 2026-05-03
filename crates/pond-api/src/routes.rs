@@ -5652,10 +5652,7 @@ async fn oauth_authorize_handler(
         );
     }
 
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/api/v1/oauth/callback",
-        state.api_port
-    );
+    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let scopes = provider.scopes.join(" ");
 
     let auth_url = format!(
@@ -5736,10 +5733,7 @@ async fn oauth_callback_handler(
 
     // Exchange authorization code for tokens.
     // The redirect_uri MUST exactly match the one sent in the authorize request.
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/api/v1/oauth/callback",
-        state.api_port
-    );
+    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let token_response = state
         .http_client
         .post(&provider.token_url)
@@ -5772,9 +5766,11 @@ async fn oauth_callback_handler(
             // If this OAuth flow was triggered by an extension install, restart
             // the extension so the child process picks up the new tokens.
             if let Some(ext_id) = &session.extension_id {
-                if let (Some(mgr), Some(mp), Some(secret_repo)) =
-                    (&state.extension_manager, &state.marketplace, &state.secret_repo)
-                {
+                if let (Some(mgr), Some(mp), Some(secret_repo)) = (
+                    &state.extension_manager,
+                    &state.marketplace,
+                    &state.secret_repo,
+                ) {
                     if let Ok(Some(ext)) = mp.get_by_id(ext_id).await {
                         // Build env map with all resolved secrets
                         let mut env = std::collections::HashMap::new();
@@ -5918,6 +5914,55 @@ async fn oauth_refresh_handler(
                 let _ = repo.set(&provider.refresh_key, new_refresh).await;
             }
             tracing::info!(provider = %provider_id, "OAuth token refresh succeeded");
+
+            // Restart any running extensions that use this provider's token
+            // so they pick up the refreshed credentials.
+            if let (Some(mgr), Some(mp), Some(secret_repo)) = (
+                &state.extension_manager,
+                &state.marketplace,
+                &state.secret_repo,
+            ) {
+                if let Ok(available) = mp.list_available().await {
+                    for ext in available {
+                        let uses_token = ext
+                            .required_secrets
+                            .iter()
+                            .any(|s| s.key == provider.token_key);
+                        if uses_token {
+                            let mut env = std::collections::HashMap::new();
+                            for sr in &ext.required_secrets {
+                                if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
+                                    env.insert(sr.key.clone(), val);
+                                }
+                            }
+                            let _ = mgr.remove_extension(&ext.id).await;
+                            let req = pond_core::ports::extension_manager::AddExtensionRequest {
+                                name: ext.id.clone(),
+                                kind: ext.kind.clone(),
+                                description: ext.description.clone(),
+                                command: ext.command.clone(),
+                                args: ext.args.clone(),
+                                env,
+                                uri: ext.uri.clone(),
+                            };
+                            match mgr.add_extension(req).await {
+                                Ok(_) => tracing::info!(
+                                    extension = %ext.id,
+                                    provider = %provider_id,
+                                    "restarted extension with refreshed OAuth tokens"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    extension = %ext.id,
+                                    provider = %provider_id,
+                                    error = %e,
+                                    "failed to restart extension after OAuth refresh"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+
             Json(json!({"refreshed": true})).into_response()
         }
         Ok(resp) => {

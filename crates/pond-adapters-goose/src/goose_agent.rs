@@ -954,16 +954,21 @@ impl GooseAdapter {
         // Group tools by extension prefix and inject external extension
         // descriptions so the agent knows about MCP tools (music, filesystem, etc.).
         {
-            let mut ext_map: HashMap<String, Vec<String>> = HashMap::new();
+            let mut ext_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
             for tool in &all_tools {
                 let name = tool.name.as_ref();
                 if let Some(sep) = name.find("__") {
                     let ext_name = &name[..sep];
                     let tool_name = &name[sep + 2..];
+                    let desc = tool
+                        .description
+                        .as_deref()
+                        .unwrap_or("No description")
+                        .to_string();
                     ext_map
                         .entry(ext_name.to_string())
                         .or_default()
-                        .push(tool_name.to_string());
+                        .push((tool_name.to_string(), desc));
                 }
             }
 
@@ -984,22 +989,24 @@ impl GooseAdapter {
                 "tom",
             ];
 
-            let external_extensions: Vec<(String, Vec<String>)> = ext_map
+            let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
                 .into_iter()
                 .filter(|(name, _)| !BUILTIN_EXTENSIONS.contains(&name.as_str()))
                 .collect();
 
             if !external_extensions.is_empty() {
-                let mut desc_lines = Vec::with_capacity(external_extensions.len() * 3);
+                let mut desc_lines = Vec::with_capacity(external_extensions.len() * 6);
                 desc_lines.push("# MCP Extensions".to_string());
                 desc_lines.push(
-                    "The following extensions are loaded and their tools are available for use."
+                    "The following MCP extensions are loaded. Use their tools when the user's request matches."
                         .to_string(),
                 );
 
                 for (ext_name, tools) in &external_extensions {
                     desc_lines.push(format!("\n## {}", ext_name));
-                    desc_lines.push(format!("  Tools: {}", tools.join(", ")));
+                    for (tool_name, tool_desc) in tools {
+                        desc_lines.push(format!("  - {}: {}", tool_name, tool_desc));
+                    }
                 }
 
                 let ext_description = desc_lines.join("\n");

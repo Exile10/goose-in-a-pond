@@ -1687,6 +1687,88 @@ async fn run_server(
         api_port,
     });
 
+    // Spawn OAuth token auto-refresh worker.
+    // Proactively refreshes tokens every 45 minutes so extensions don't hit
+    // 401 errors mid-conversation. This worker only updates the secret store;
+    // it does NOT restart extensions (avoids disrupting active tool calls).
+    // Extensions get restarted on the next 401 retry or server restart.
+    {
+        let refresh_secret_repo = state.secret_repo.clone();
+        let refresh_http_client = reqwest::Client::new();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
+            interval.tick().await; // skip the initial immediate tick
+            loop {
+                interval.tick().await;
+                let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+                for provider in &providers {
+                    let Some(repo) = &refresh_secret_repo else {
+                        continue;
+                    };
+
+                    // Only refresh if we have a refresh token stored
+                    let has_refresh = repo.has(&provider.refresh_key).await.unwrap_or(false);
+                    if !has_refresh {
+                        continue;
+                    }
+
+                    let refresh_token = match repo.get(&provider.refresh_key).await {
+                        Ok(Some(t)) => t,
+                        _ => continue,
+                    };
+
+                    let client_id = repo
+                        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| provider.bundled_client_id.clone());
+
+                    match refresh_http_client
+                        .post(&provider.token_url)
+                        .form(&[
+                            ("grant_type", "refresh_token"),
+                            ("refresh_token", refresh_token.as_str()),
+                            ("client_id", client_id.as_str()),
+                        ])
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(at) = body["access_token"].as_str() {
+                                    let _ = repo.set(&provider.token_key, at).await;
+                                }
+                                if let Some(rt) = body["refresh_token"].as_str() {
+                                    let _ = repo.set(&provider.refresh_key, rt).await;
+                                }
+                                tracing::info!(
+                                    provider = %provider.id,
+                                    "auto-refreshed OAuth token"
+                                );
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                status = %resp.status(),
+                                "OAuth auto-refresh failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                error = %e,
+                                "OAuth auto-refresh error"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
+    }
+
     // Warn if static assets haven't been built yet
     if !static_dir.exists() {
         tracing::warn!(

@@ -147,6 +147,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),
