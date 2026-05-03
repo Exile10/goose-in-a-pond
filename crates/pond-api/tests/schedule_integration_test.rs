@@ -38,9 +38,15 @@ struct CompletedOnboarding;
 
 #[async_trait::async_trait]
 impl OnboardingRepository for CompletedOnboarding {
-    async fn get_current_step(&self) -> Option<OnboardingStep> { Some(OnboardingStep::Completed) }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn get_current_step(&self) -> Option<OnboardingStep> {
+        Some(OnboardingStep::Completed)
+    }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -49,15 +55,29 @@ struct NoDevices;
 impl DeviceRegistry for NoDevices {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".to_string(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01T00:00:00Z".to_string(), last_seen: None, is_online: false,
+            id: "mock".to_string(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── In-memory mock scheduler ──────────────────────────────────────────────────
@@ -68,7 +88,9 @@ struct InMemoryScheduler {
 
 impl InMemoryScheduler {
     fn new() -> Self {
-        Self { tasks: Mutex::new(HashMap::new()) }
+        Self {
+            tasks: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -101,26 +123,34 @@ impl SchedulerPort for InMemoryScheduler {
 
     async fn delete_task(&self, id: &str) -> anyhow::Result<()> {
         let mut guard = self.tasks.lock().await;
-        guard.remove(id).map(|_| ()).ok_or_else(|| anyhow::anyhow!("not found"))
+        guard
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
     async fn pause_task(&self, id: &str) -> anyhow::Result<()> {
         let mut guard = self.tasks.lock().await;
-        guard.get_mut(id)
+        guard
+            .get_mut(id)
             .map(|t| t.paused = true)
             .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
     async fn resume_task(&self, id: &str) -> anyhow::Result<()> {
         let mut guard = self.tasks.lock().await;
-        guard.get_mut(id)
+        guard
+            .get_mut(id)
             .map(|t| t.paused = false)
             .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
     async fn run_now(&self, id: &str) -> anyhow::Result<()> {
         let guard = self.tasks.lock().await;
-        guard.get(id).map(|_| ()).ok_or_else(|| anyhow::anyhow!("not found"))
+        guard
+            .get(id)
+            .map(|_| ())
+            .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
     async fn get_runs(&self, _schedule_id: &str, _limit: u32) -> anyhow::Result<Vec<ScheduleRun>> {
@@ -149,8 +179,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
-    let scheduler: Option<Arc<dyn SchedulerPort>> =
-        Some(Arc::new(InMemoryScheduler::new()));
+    let scheduler: Option<Arc<dyn SchedulerPort>> = Some(Arc::new(InMemoryScheduler::new()));
 
     let state = Arc::new(AppState {
         db: Arc::new(db),
@@ -179,6 +208,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -195,12 +227,17 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 fn auth_get(uri: &str) -> Request<Body> {
@@ -232,7 +269,9 @@ fn auth_delete(uri: &str) -> Request<Body> {
 }
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -273,8 +312,14 @@ async fn create_schedule_returns_created_task() {
     let json = json_body(resp).await;
     // ID is auto-generated.
     assert!(json.get("id").and_then(|v| v.as_str()).is_some());
-    assert_eq!(json.get("label").and_then(|v| v.as_str()), Some("Daily Summary"));
-    assert_eq!(json.get("timezone").and_then(|v| v.as_str()), Some("Africa/Nairobi"));
+    assert_eq!(
+        json.get("label").and_then(|v| v.as_str()),
+        Some("Daily Summary")
+    );
+    assert_eq!(
+        json.get("timezone").and_then(|v| v.as_str()),
+        Some("Africa/Nairobi")
+    );
     assert_eq!(json.get("paused").and_then(|v| v.as_bool()), Some(false));
 }
 
@@ -321,7 +366,9 @@ async fn created_schedule_appears_in_list() {
     let json = json_body(list_resp).await;
     let tasks = json.as_array().unwrap();
     assert!(
-        tasks.iter().any(|t| t.get("id").and_then(|v| v.as_str()) == Some("weather-check")),
+        tasks
+            .iter()
+            .any(|t| t.get("id").and_then(|v| v.as_str()) == Some("weather-check")),
         "created task not found in list: {tasks:?}"
     );
 }
@@ -352,7 +399,9 @@ async fn delete_schedule_removes_it() {
     let json = json_body(list_resp).await;
     let tasks = json.as_array().unwrap();
     assert!(
-        !tasks.iter().any(|t| t.get("id").and_then(|v| v.as_str()) == Some("to-delete")),
+        !tasks
+            .iter()
+            .any(|t| t.get("id").and_then(|v| v.as_str()) == Some("to-delete")),
         "deleted task still in list: {tasks:?}"
     );
 }
@@ -375,15 +424,24 @@ async fn pause_and_resume_schedule() {
     // Pause
     let pause_resp = app
         .clone()
-        .oneshot(auth_post("/api/v1/schedules/pausable/pause", serde_json::json!({})))
+        .oneshot(auth_post(
+            "/api/v1/schedules/pausable/pause",
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(pause_resp.status(), StatusCode::OK);
 
     // Verify paused
-    let list_resp = app.clone().oneshot(auth_get("/api/v1/schedules")).await.unwrap();
+    let list_resp = app
+        .clone()
+        .oneshot(auth_get("/api/v1/schedules"))
+        .await
+        .unwrap();
     let json = json_body(list_resp).await;
-    let task = json.as_array().unwrap()
+    let task = json
+        .as_array()
+        .unwrap()
         .iter()
         .find(|t| t.get("id").and_then(|v| v.as_str()) == Some("pausable"))
         .expect("task not found");
@@ -392,7 +450,10 @@ async fn pause_and_resume_schedule() {
     // Resume
     let resume_resp = app
         .clone()
-        .oneshot(auth_post("/api/v1/schedules/pausable/resume", serde_json::json!({})))
+        .oneshot(auth_post(
+            "/api/v1/schedules/pausable/resume",
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(resume_resp.status(), StatusCode::OK);
@@ -400,7 +461,9 @@ async fn pause_and_resume_schedule() {
     // Verify unpaused
     let list_resp2 = app.oneshot(auth_get("/api/v1/schedules")).await.unwrap();
     let json2 = json_body(list_resp2).await;
-    let task2 = json2.as_array().unwrap()
+    let task2 = json2
+        .as_array()
+        .unwrap()
         .iter()
         .find(|t| t.get("id").and_then(|v| v.as_str()) == Some("pausable"))
         .expect("task not found after resume");
@@ -423,7 +486,10 @@ async fn run_now_returns_accepted() {
         .unwrap();
 
     let run_resp = app
-        .oneshot(auth_post("/api/v1/schedules/run-now-task/run-now", serde_json::json!({})))
+        .oneshot(auth_post(
+            "/api/v1/schedules/run-now-task/run-now",
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(run_resp.status(), StatusCode::ACCEPTED);
@@ -455,7 +521,10 @@ async fn get_runs_returns_empty_for_new_schedule() {
         .await
         .unwrap();
 
-    let resp = app.oneshot(auth_get("/api/v1/schedules/has-no-runs/runs")).await.unwrap();
+    let resp = app
+        .oneshot(auth_get("/api/v1/schedules/has-no-runs/runs"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = json_body(resp).await;
@@ -478,13 +547,18 @@ async fn upcoming_returns_active_schedules() {
         .await
         .unwrap();
 
-    let resp = app.oneshot(auth_get("/api/v1/schedules/upcoming")).await.unwrap();
+    let resp = app
+        .oneshot(auth_get("/api/v1/schedules/upcoming"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = json_body(resp).await;
     let tasks = json.as_array().unwrap();
     assert!(
-        tasks.iter().any(|t| t.get("id").and_then(|v| v.as_str()) == Some("upcoming-task")),
+        tasks
+            .iter()
+            .any(|t| t.get("id").and_then(|v| v.as_str()) == Some("upcoming-task")),
         "upcoming task not found: {tasks:?}"
     );
 }

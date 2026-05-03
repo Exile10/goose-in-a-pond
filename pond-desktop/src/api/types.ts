@@ -345,6 +345,10 @@ export interface Extension {
   description: string;
   tools: string[];
   enabled: boolean;
+  /** Extension connection status: "connected", "error", or "loading" */
+  status?: string;
+  /** Last error message if status is "error" */
+  last_error?: string | null;
 }
 
 export interface AddExtensionRequest {
@@ -355,6 +359,29 @@ export interface AddExtensionRequest {
   description?: string;
   args?: string[];
   env?: Record<string, string>;
+}
+
+export interface SecretRequirement {
+  key: string;
+  display_name: string;
+  description: string;
+  required: boolean;
+  kind: 'api_key' | 'oauth_flow' | 'generic';
+}
+
+export interface MarketplaceExtension {
+  id: string;
+  name: string;
+  description: string;
+  kind: string;
+  command?: string;
+  args: string[];
+  uri?: string;
+  category: string;
+  author: string;
+  tools: string[];
+  featured: boolean;
+  required_secrets: SecretRequirement[];
 }
 
 // ── Logs / Telemetry ─────────────────────────────────────────

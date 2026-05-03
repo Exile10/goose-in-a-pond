@@ -20,9 +20,15 @@ use std::sync::Arc;
 struct CompletedOnboarding;
 #[async_trait::async_trait]
 impl OnboardingRepository for CompletedOnboarding {
-    async fn get_current_step(&self) -> Option<OnboardingStep> { Some(OnboardingStep::Completed) }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn get_current_step(&self) -> Option<OnboardingStep> {
+        Some(OnboardingStep::Completed)
+    }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -30,15 +36,29 @@ struct NoDevices;
 impl DeviceRegistry for NoDevices {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".into(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01T00:00:00Z".into(), last_seen: None, is_online: false,
+            id: "mock".into(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01T00:00:00Z".into(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Direct DB Tests ──────────────────────────────────────────────────────────
@@ -52,10 +72,16 @@ async fn increment_usage_accumulates_tokens() {
     storage.create_session("sess-1".into()).await.unwrap();
 
     // First response: 100 prompt, 50 completion
-    storage.increment_usage("sess-1", 100, 50, Some("gemma-4")).await.unwrap();
+    storage
+        .increment_usage("sess-1", 100, 50, Some("gemma-4"))
+        .await
+        .unwrap();
 
     // Second response: 120 prompt, 80 completion
-    storage.increment_usage("sess-1", 120, 80, Some("gemma-4")).await.unwrap();
+    storage
+        .increment_usage("sess-1", 120, 80, Some("gemma-4"))
+        .await
+        .unwrap();
 
     let session = storage.get_session("sess-1").await.unwrap();
     assert_eq!(session.total_prompt_tokens, 220);
@@ -71,12 +97,18 @@ async fn increment_usage_updates_model_name() {
 
     storage.create_session("sess-2".into()).await.unwrap();
 
-    storage.increment_usage("sess-2", 50, 30, Some("gemma-2b")).await.unwrap();
+    storage
+        .increment_usage("sess-2", 50, 30, Some("gemma-2b"))
+        .await
+        .unwrap();
     let s1 = storage.get_session("sess-2").await.unwrap();
     assert_eq!(s1.model_name, Some("gemma-2b".to_string()));
 
     // Switch model mid-session
-    storage.increment_usage("sess-2", 50, 30, Some("qwen-3b")).await.unwrap();
+    storage
+        .increment_usage("sess-2", 50, 30, Some("qwen-3b"))
+        .await
+        .unwrap();
     let s2 = storage.get_session("sess-2").await.unwrap();
     assert_eq!(s2.model_name, Some("qwen-3b".to_string()));
     assert_eq!(s2.total_prompt_tokens, 100);
@@ -91,8 +123,14 @@ async fn list_sessions_includes_usage_fields() {
     storage.create_session("a".into()).await.unwrap();
     storage.create_session("b".into()).await.unwrap();
 
-    storage.increment_usage("a", 200, 100, Some("model-a")).await.unwrap();
-    storage.increment_usage("b", 500, 300, Some("model-b")).await.unwrap();
+    storage
+        .increment_usage("a", 200, 100, Some("model-a"))
+        .await
+        .unwrap();
+    storage
+        .increment_usage("b", 500, 300, Some("model-b"))
+        .await
+        .unwrap();
 
     let sessions = storage.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 2);
@@ -166,6 +204,9 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -182,24 +223,34 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         tool_agent: None,
         answer_reviewer: None,
         memory_extractor: None,
-        memory_extraction_service: None, inference_pool: None,
+        memory_extraction_service: None,
+        inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
     });
 
-    (build_router(state, std::path::PathBuf::from("web/dist")), session_storage, tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        session_storage,
+        tmp,
+    )
 }
 
 fn auth_get(uri: &str) -> Request<Body> {
     Request::builder()
-        .method("GET").uri(uri)
+        .method("GET")
+        .uri(uri)
         .header("Authorization", "Bearer test-token")
-        .body(Body::empty()).unwrap()
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -210,10 +261,19 @@ async fn api_usage_summary_aggregates_sessions() {
     // Create sessions and add tokens directly
     storage.create_session("s1".into()).await.unwrap();
     storage.create_session("s2".into()).await.unwrap();
-    storage.increment_usage("s1", 1000, 500, Some("gemma")).await.unwrap();
-    storage.increment_usage("s2", 2000, 1500, Some("qwen")).await.unwrap();
+    storage
+        .increment_usage("s1", 1000, 500, Some("gemma"))
+        .await
+        .unwrap();
+    storage
+        .increment_usage("s2", 2000, 1500, Some("qwen"))
+        .await
+        .unwrap();
 
-    let resp = app.oneshot(auth_get("/api/v1/usage/summary")).await.unwrap();
+    let resp = app
+        .oneshot(auth_get("/api/v1/usage/summary"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = json_body(resp).await;
@@ -228,7 +288,10 @@ async fn api_list_sessions_includes_tokens() {
     let (app, storage, _tmp) = make_app().await;
 
     storage.create_session("tk-1".into()).await.unwrap();
-    storage.increment_usage("tk-1", 300, 150, Some("model-x")).await.unwrap();
+    storage
+        .increment_usage("tk-1", 300, 150, Some("model-x"))
+        .await
+        .unwrap();
 
     let resp = app.oneshot(auth_get("/api/v1/sessions")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

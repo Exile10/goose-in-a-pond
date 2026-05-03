@@ -1,0 +1,9 @@
+[project]
+name = "giap-extension-example"
+version = "0.1.0"
+description = "Example MCP extension for Goose in a Pond"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"

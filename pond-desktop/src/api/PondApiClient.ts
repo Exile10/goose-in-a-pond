@@ -15,6 +15,7 @@ import {
   type HfModelFile,
   type LlamafileRelease,
   type LogEntry,
+  type MarketplaceExtension,
   type MemoryFragment,
   type ModelActiveRoles,
   type ModelEntry,
@@ -24,6 +25,7 @@ import {
   type PromptTemplate,
   type Schedule,
   type ScheduleRun,
+  type SecretRequirement,
   type SessionMessage,
   type SessionSummary,
   type Settings,
@@ -635,6 +637,46 @@ export class PondApiClient {
     return this.del(`/api/v1/extensions/${encodeURIComponent(name)}`);
   }
 
+  // ── Marketplace ─────────────────────────────────────────
+
+  async listMarketplace(): Promise<MarketplaceExtension[]> {
+    const res = await this.get<{ extensions: MarketplaceExtension[] }>("/api/v1/marketplace");
+    return res.extensions;
+  }
+
+  async installMarketplaceExtension(id: string, secrets?: Record<string, string>): Promise<Extension> {
+    const body = secrets ? { secrets } : undefined;
+    return this.post<Extension>(`/api/v1/marketplace/${encodeURIComponent(id)}/install`, body);
+  }
+
+  async getExtensionSecrets(name: string): Promise<{ requirements: SecretRequirement[]; fulfilled: Record<string, boolean> }> {
+    return this.get(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`);
+  }
+
+  async setExtensionSecrets(name: string, secrets: Record<string, string>): Promise<void> {
+    await this.post(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`, secrets);
+  }
+
+  // ── Secrets ──────────────────────────────────────────────
+
+  async listSecretKeys(): Promise<string[]> {
+    const res = await this.get<{ keys: string[] }>("/api/v1/secrets");
+    return res.keys;
+  }
+
+  async checkSecret(key: string): Promise<boolean> {
+    const res = await this.get<{ exists: boolean }>(`/api/v1/secrets/${encodeURIComponent(key)}/exists`);
+    return res.exists;
+  }
+
+  async setSecret(key: string, value: string): Promise<void> {
+    await this.put(`/api/v1/secrets/${encodeURIComponent(key)}`, { value });
+  }
+
+  async deleteSecret(key: string): Promise<void> {
+    await this.del(`/api/v1/secrets/${encodeURIComponent(key)}`);
+  }
+
   // ── Logs ─────────────────────────────────────────────────
 
   listLogs(params?: { limit?: number; level?: string }): Promise<LogEntry[]> {
@@ -702,6 +744,24 @@ export class PondApiClient {
   /** Clear all calibration data. Detector reverts to raw wake-word phrase. */
   async resetWakeWordCalibration(): Promise<void> {
     await this.del("/api/v1/voice/calibrate");
+  }
+
+  // ── OAuth PKCE ──────────────────────────────────────────────
+
+  /** Start an OAuth PKCE flow. Returns the authorization URL to open in a browser. */
+  async initiateOAuth(provider: string, extensionId?: string): Promise<{ auth_url: string; state: string }> {
+    return this.post("/api/v1/oauth/authorize", { provider, extension_id: extensionId });
+  }
+
+  /** Refresh an expired OAuth access token. */
+  async refreshOAuth(provider: string): Promise<void> {
+    await this.post("/api/v1/oauth/refresh", { provider });
+  }
+
+  /** List supported OAuth providers. */
+  async listOAuthProviders(): Promise<{ id: string; display_name: string; scopes: string[] }[]> {
+    const res = await this.get<{ providers: { id: string; display_name: string; scopes: string[] }[] }>("/api/v1/oauth/providers");
+    return res.providers;
   }
 }
 

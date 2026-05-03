@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::registry::GiapServiceHandles;
 use pond_core::domain::memory::MemoryFragment;
 use pond_core::domain::schedule::TaskKind;
 use pond_core::ports::scheduler::CreateScheduleRequest;
@@ -13,7 +13,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use crate::registry::GiapServiceHandles;
+use std::sync::Arc;
 
 // ── Parameter structs for tools that accept arguments ────────────────────────
 
@@ -96,6 +96,56 @@ pub struct GetScheduleRunsParams {
     pub limit: Option<u32>,
 }
 
+// ── System / filesystem / shell parameter structs ──────────────────────────
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SystemInfoParams {
+    /// What info to get: "all", "memory", "disk", or "os" (default: "all")
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct NotifyParams {
+    /// Notification title
+    pub title: String,
+    /// Notification body text
+    pub body: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ShellCommandParams {
+    /// The command to execute. Only safe commands are allowed: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv
+    pub command: String,
+    /// Arguments to pass to the command
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ReadFileParams {
+    /// Absolute path to the file to read
+    pub path: String,
+    /// Maximum number of lines to read (default: 100)
+    pub max_lines: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct WriteFileParams {
+    /// Absolute path to the file to write
+    pub path: String,
+    /// Content to write
+    pub content: String,
+    /// If true, append to file instead of overwriting (default: false)
+    #[serde(default)]
+    pub append: bool,
+}
+
+/// Allow-list of safe shell commands for `run_shell_command`.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "echo", "date", "uptime", "df", "free", "whoami", "hostname", "pwd", "wc", "head",
+    "tail", "sort", "uniq", "grep", "find", "which", "env", "printenv",
+];
+
 // ── MCP server ───────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -170,7 +220,9 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "List all scheduled tasks on this GIAP instance, including their cron schedule, timezone, type, and status.")]
+    #[tool(
+        description = "List all scheduled tasks on this GIAP instance, including their cron schedule, timezone, type, and status."
+    )]
     async fn list_schedules(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -218,9 +270,11 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "Create a new scheduled task that runs the given prompt against the agent \
+    #[tool(
+        description = "Create a new scheduled task that runs the given prompt against the agent \
         at the specified cron interval. The cron is 6-field format: sec min hr dom mon dow. \
-        Example: '0 0 8 * * *' = daily at 8:00 AM. Use the user's timezone unless they specify otherwise.")]
+        Example: '0 0 8 * * *' = daily at 8:00 AM. Use the user's timezone unless they specify otherwise."
+    )]
     async fn create_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -228,22 +282,23 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured. Inform the user directly.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured. Inform the user directly.",
+                )]))
+            }
         };
 
         // Default timezone to user's setting if not provided.
         let timezone = match &params.0.timezone {
             Some(tz) if !tz.is_empty() => tz.clone(),
-            _ => {
-                self.services
-                    .settings_repo
-                    .get()
-                    .await
-                    .map(|s| s.timezone.clone())
-                    .unwrap_or_else(|_| "UTC".to_string())
-            }
+            _ => self
+                .services
+                .settings_repo
+                .get()
+                .await
+                .map(|s| s.timezone.clone())
+                .unwrap_or_else(|_| "UTC".to_string()),
         };
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -278,9 +333,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured.",
+                )]))
+            }
         };
 
         match scheduler.delete_task(&params.0.id).await {
@@ -304,9 +361,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured.",
+                )]))
+            }
         };
 
         match scheduler.pause_task(&params.0.id).await {
@@ -330,9 +389,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured.",
+                )]))
+            }
         };
 
         match scheduler.resume_task(&params.0.id).await {
@@ -348,7 +409,9 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "Trigger a scheduled task to run immediately, regardless of its cron schedule.")]
+    #[tool(
+        description = "Trigger a scheduled task to run immediately, regardless of its cron schedule."
+    )]
     async fn run_schedule_now(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -356,9 +419,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured.",
+                )]))
+            }
         };
 
         match scheduler.run_now(&params.0.id).await {
@@ -374,7 +439,9 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "Get the execution history for a scheduled task — shows recent runs with status, result, and duration.")]
+    #[tool(
+        description = "Get the execution history for a scheduled task — shows recent runs with status, result, and duration."
+    )]
     async fn get_schedule_runs(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -382,9 +449,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scheduler = match &self.services.scheduler {
             Some(s) => s,
-            None => return Ok(CallToolResult::success(vec![Content::text(
-                "The scheduler service is not configured.",
-            )])),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "The scheduler service is not configured.",
+                )]))
+            }
         };
 
         let limit = params.0.limit.unwrap_or(10);
@@ -433,13 +502,19 @@ impl GiapMcpServer {
         }
     }
 
-    #[tool(description = "Get the current user profile: name, assistant name, timezone, and location.")]
+    #[tool(
+        description = "Get the current user profile: name, assistant name, timezone, and location."
+    )]
     async fn get_user_profile(
         &self,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let settings = self.services.settings_repo.get().await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Settings error: {}", e), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Settings error: {}", e),
+                None,
+            )
         })?;
         let location = if settings.weather_location_name.is_empty() {
             "not configured".to_string()
@@ -453,13 +528,19 @@ impl GiapMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Get the current model configuration: which LLM and tool-calling model are active.")]
+    #[tool(
+        description = "Get the current model configuration: which LLM and tool-calling model are active."
+    )]
     async fn get_model_assignments(
         &self,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let s = self.services.settings_repo.get().await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Settings error: {}", e), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Settings error: {}", e),
+                None,
+            )
         })?;
         let tool = s.tool_model.as_deref().unwrap_or("(none)");
         let text = format!(
@@ -469,22 +550,35 @@ impl GiapMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Recall recent memories, optionally filtered by a keyword. Returns memories \
-        with their segment (identity, preference, etc.) and importance score.")]
+    #[tool(
+        description = "Recall recent memories, optionally filtered by a keyword. Returns memories \
+        with their segment (identity, preference, etc.) and importance score."
+    )]
     async fn recall_memories(
         &self,
         _ctx: RequestContext<RoleServer>,
         params: Parameters<RecallMemoriesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let limit = params.0.limit.unwrap_or(10) as usize;
-        let fragments = self.services.memory_repo
+        let fragments = self
+            .services
+            .memory_repo
             .search_recent(None, limit)
             .await
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Memory error: {}", e), None))?;
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Memory error: {}", e),
+                    None,
+                )
+            })?;
 
         let filtered: Vec<_> = if let Some(ref q) = params.0.query {
             let q_lower = q.to_lowercase();
-            fragments.into_iter().filter(|f| f.content.to_lowercase().contains(&q_lower)).collect()
+            fragments
+                .into_iter()
+                .filter(|f| f.content.to_lowercase().contains(&q_lower))
+                .collect()
         } else {
             fragments
         };
@@ -497,15 +591,25 @@ impl GiapMcpServer {
         let text = if filtered.is_empty() {
             "No memories found.".to_string()
         } else {
-            filtered.iter()
+            filtered
+                .iter()
                 .map(|f| {
-                    let seg = f.segment.as_ref()
+                    let seg = f
+                        .segment
+                        .as_ref()
                         .map(|s| format!("{:?}", s).to_lowercase())
                         .unwrap_or_else(|| "—".to_string());
-                    let imp = f.importance
+                    let imp = f
+                        .importance
                         .map(|i| format!("{:.1}", i))
                         .unwrap_or_else(|| "—".to_string());
-                    format!("[{}] [{}, {}] {}", f.created_at.format("%Y-%m-%d"), seg, imp, f.content)
+                    format!(
+                        "[{}] [{}, {}] {}",
+                        f.created_at.format("%Y-%m-%d"),
+                        seg,
+                        imp,
+                        f.content
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -513,10 +617,12 @@ impl GiapMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Save a new memory fragment for future recall. Supports optional segment \
+    #[tool(
+        description = "Save a new memory fragment for future recall. Supports optional segment \
         (identity, preference, correction, relationship, project, knowledge, context), importance \
         (0-1), and tier (short, long, permanent). If segment is omitted, it is auto-classified \
-        from the content.")]
+        from the content."
+    )]
     async fn save_memory(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -526,7 +632,9 @@ impl GiapMcpServer {
 
         let id = uuid::Uuid::new_v4().to_string();
         let content = params.0.content.clone();
-        let tag_list: Vec<String> = params.0.tags
+        let tag_list: Vec<String> = params
+            .0
+            .tags
             .unwrap_or_default()
             .split(',')
             .map(|t| t.trim().to_string())
@@ -534,16 +642,22 @@ impl GiapMcpServer {
             .collect();
 
         // Resolve segment: explicit > auto-classify from content
-        let segment = params.0.segment
+        let segment = params
+            .0
+            .segment
             .as_deref()
             .and_then(parse_memory_segment)
             .unwrap_or_else(|| auto_classify_segment(&content));
 
-        let importance = params.0.importance
+        let importance = params
+            .0
+            .importance
             .map(|i| i.clamp(0.0, 1.0))
             .unwrap_or_else(|| segment.default_importance());
 
-        let tier = params.0.tier
+        let tier = params
+            .0
+            .tier
             .as_deref()
             .and_then(parse_memory_tier)
             .unwrap_or_else(|| segment.default_tier());
@@ -570,7 +684,11 @@ impl GiapMcpServer {
         };
 
         self.services.memory_repo.add(fragment).await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to save memory: {}", e), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to save memory: {}", e),
+                None,
+            )
         })?;
 
         let seg_label = format!("{:?}", segment).to_lowercase();
@@ -588,7 +706,11 @@ impl GiapMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(id) = &params.0.id {
             self.services.memory_repo.delete(id).await.map_err(|e| {
-                ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to delete: {}", e), None)
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to delete: {}", e),
+                    None,
+                )
             })?;
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "Memory {id} deleted."
@@ -596,7 +718,9 @@ impl GiapMcpServer {
         }
 
         if let Some(content) = &params.0.content {
-            let memories = self.services.memory_repo
+            let memories = self
+                .services
+                .memory_repo
                 .search_recent(None, 100)
                 .await
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
@@ -605,20 +729,25 @@ impl GiapMcpServer {
             if let Some(found) = memories.iter().find(|m| m.content.to_lowercase() == lower) {
                 let id = found.id.clone();
                 self.services.memory_repo.delete(&id).await.map_err(|e| {
-                    ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to delete: {}", e), None)
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to delete: {}", e),
+                        None,
+                    )
                 })?;
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Memory deleted: {}", found.content
+                    "Memory deleted: {}",
+                    found.content
                 ))]));
             }
 
             return Ok(CallToolResult::success(vec![Content::text(
-                "No memory found with that exact content.".to_string()
+                "No memory found with that exact content.".to_string(),
             )]));
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            "Provide either an 'id' or 'content' to identify the memory to forget.".to_string()
+            "Provide either an 'id' or 'content' to identify the memory to forget.".to_string(),
         )]))
     }
 
@@ -628,12 +757,17 @@ impl GiapMcpServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let skills = self.services.skill_repo.list_active().await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Skills error: {}", e), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Skills error: {}", e),
+                None,
+            )
         })?;
         let text = if skills.is_empty() {
             "No active skills.".to_string()
         } else {
-            skills.iter()
+            skills
+                .iter()
                 .map(|s| format!("- {} ({})", s.name, s.id))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -647,17 +781,342 @@ impl GiapMcpServer {
         _ctx: RequestContext<RoleServer>,
         params: Parameters<GetRecipeParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let recipe = self.services.recipe_repo.get_by_name(&params.0.name).await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Recipe error: {}", e), None)
-        })?;
+        let recipe = self
+            .services
+            .recipe_repo
+            .get_by_name(&params.0.name)
+            .await
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Recipe error: {}", e),
+                    None,
+                )
+            })?;
         match recipe {
-            None => Ok(CallToolResult::success(vec![Content::text(
-                format!("Recipe '{}' not found.", params.0.name),
-            )])),
-            Some(r) => Ok(CallToolResult::success(vec![Content::text(
-                format!("Recipe: {}\n{}\n\n{}", r.name, r.description, r.yaml),
-            )])),
+            None => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Recipe '{}' not found.",
+                params.0.name
+            ))])),
+            Some(r) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Recipe: {}\n{}\n\n{}",
+                r.name, r.description, r.yaml
+            ))])),
         }
+    }
+
+    // ── Time / system / notification / shell / file tools ──────────────────
+
+    #[tool(
+        description = "Get the current date, time, and timezone. Use when asked about the current time or date."
+    )]
+    async fn get_current_time(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let now = chrono::Local::now();
+        let text = format!(
+            "Current time: {}\nDate: {}\nTimezone: {}",
+            now.format("%H:%M:%S"),
+            now.format("%A, %B %d, %Y"),
+            now.format("%Z (UTC%:z)")
+        );
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Get system information: OS, hostname, memory usage, and disk usage. \
+        Use when the user asks about their system, available memory, disk space, or hardware."
+    )]
+    async fn get_system_info(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<SystemInfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use sysinfo::{Disks, System};
+
+        let category = params.0.category.as_deref().unwrap_or("all");
+        let mut sections: Vec<String> = Vec::new();
+
+        let show_os = category == "all" || category == "os";
+        let show_memory = category == "all" || category == "memory";
+        let show_disk = category == "all" || category == "disk";
+
+        if show_os {
+            let host = System::host_name().unwrap_or_else(|| "unknown".to_string());
+            let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
+            let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
+            let kernel = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
+            let arch = System::cpu_arch();
+            let uptime_secs = System::uptime();
+            let hours = uptime_secs / 3600;
+            let minutes = (uptime_secs % 3600) / 60;
+            sections.push(format!(
+                "OS: {} {}\nKernel: {}\nArchitecture: {}\nHostname: {}\nUptime: {}h {}m",
+                os_name, os_version, kernel, arch, host, hours, minutes,
+            ));
+        }
+
+        if show_memory {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            let total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
+            let used_gb = sys.used_memory() as f64 / 1_073_741_824.0;
+            let available_gb = sys.available_memory() as f64 / 1_073_741_824.0;
+            sections.push(format!(
+                "Memory: {:.1} GB used / {:.1} GB total ({:.1} GB available)",
+                used_gb, total_gb, available_gb,
+            ));
+        }
+
+        if show_disk {
+            let disks = Disks::new_with_refreshed_list();
+            let mut disk_lines: Vec<String> = Vec::new();
+            for disk in disks.list() {
+                let mount = disk.mount_point().to_string_lossy();
+                let total_gb = disk.total_space() as f64 / 1_073_741_824.0;
+                let avail_gb = disk.available_space() as f64 / 1_073_741_824.0;
+                let used_gb = total_gb - avail_gb;
+                disk_lines.push(format!(
+                    "  {} — {:.1} GB used / {:.1} GB total ({:.1} GB free)",
+                    mount, used_gb, total_gb, avail_gb,
+                ));
+            }
+            if disk_lines.is_empty() {
+                disk_lines.push("  No disks detected.".to_string());
+            }
+            sections.push(format!("Disks:\n{}", disk_lines.join("\n")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            sections.join("\n\n"),
+        )]))
+    }
+
+    #[tool(
+        description = "Send a desktop notification to the user. Use when the user asks to be \
+        notified, alerted, or reminded with a popup message."
+    )]
+    async fn send_notification(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<NotifyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        notify_rust::Notification::new()
+            .summary(&params.0.title)
+            .body(&params.0.body)
+            .appname("Goose in a Pond")
+            .show()
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to send notification: {}", e),
+                    None,
+                )
+            })?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Notification sent: \"{}\" — {}",
+            params.0.title, params.0.body,
+        ))]))
+    }
+
+    #[tool(
+        description = "Execute a safe shell command. Only allow-listed commands are permitted: \
+        ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, \
+        grep, find, which, env, printenv. Times out after 10 seconds."
+    )]
+    async fn run_shell_command(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ShellCommandParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cmd = params.0.command.trim().to_string();
+
+        if !ALLOWED_COMMANDS.contains(&cmd.as_str()) {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "Command '{}' is not in the allow-list. Allowed: {}",
+                    cmd,
+                    ALLOWED_COMMANDS.join(", "),
+                ),
+                None,
+            ));
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(&cmd)
+                .args(&params.0.args)
+                .output(),
+        )
+        .await;
+
+        match result {
+            Err(_elapsed) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Command '{}' timed out after 10 seconds.", cmd),
+                None,
+            )),
+            Ok(Err(e)) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to execute '{}': {}", cmd, e),
+                None,
+            )),
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut text = String::new();
+                if !stdout.is_empty() {
+                    text.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n--- stderr ---\n");
+                    }
+                    text.push_str(&stderr);
+                }
+                if text.is_empty() {
+                    text.push_str("(no output)");
+                }
+                if !output.status.success() {
+                    text.push_str(&format!("\nExit code: {}", output.status));
+                }
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Read the contents of a local file. Returns up to max_lines lines (default 100). \
+        Use when the user asks to read, view, or inspect a file on their system."
+    )]
+    async fn read_file(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ReadFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = params.0.path.trim();
+
+        if path.contains("..") {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path traversal ('..') is not allowed.",
+                None,
+            ));
+        }
+
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path must be absolute.",
+                None,
+            ));
+        }
+
+        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to read '{}': {}", path, e),
+                None,
+            )
+        })?;
+
+        let max_lines = params.0.max_lines.unwrap_or(100);
+        let lines: Vec<&str> = content.lines().take(max_lines).collect();
+        let total_lines = content.lines().count();
+        let truncated = total_lines > max_lines;
+        let mut text = lines.join("\n");
+        if truncated {
+            text.push_str(&format!(
+                "\n\n[Showing {}/{} lines. Use max_lines to read more.]",
+                max_lines, total_lines,
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Write content to a local file. Can overwrite or append. Creates parent \
+        directories if needed. Use when the user asks to write, save, or create a file."
+    )]
+    async fn write_file(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<WriteFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = params.0.path.trim();
+
+        if path.contains("..") {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path traversal ('..') is not allowed.",
+                None,
+            ));
+        }
+
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path must be absolute.",
+                None,
+            ));
+        }
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to create directories for '{}': {}", path, e),
+                    None,
+                )
+            })?;
+        }
+
+        let bytes_written = params.0.content.len();
+
+        if params.0.append {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to open '{}' for appending: {}", path, e),
+                        None,
+                    )
+                })?;
+            file.write_all(params.0.content.as_bytes())
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to append to '{}': {}", path, e),
+                        None,
+                    )
+                })?;
+        } else {
+            tokio::fs::write(path, &params.0.content)
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to write '{}': {}", path, e),
+                        None,
+                    )
+                })?;
+        }
+
+        let mode = if params.0.append { "Appended" } else { "Wrote" };
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} {} bytes to '{}'.",
+            mode, bytes_written, path,
+        ))]))
     }
 
     // ── Wikipedia tools ──────────────────────────────────────────────────────
@@ -676,7 +1135,11 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         println!("[wikipedia] search_wikipedia called: query={:?}", query);
 
         if query.is_empty() {
-            return Err(ErrorData::new(ErrorCode::INVALID_PARAMS, "A topic is required.".to_string(), None));
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "A topic is required.".to_string(),
+                None,
+            ));
         }
         let limit = params.0.limit.unwrap_or(5).min(10);
 
@@ -687,7 +1150,9 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self.services.http_client
+        let resp = self
+            .services
+            .http_client
             .get(&url)
             .header("user-agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(10))
@@ -695,7 +1160,11 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
             .await
             .map_err(|e| {
                 println!("[wikipedia] search request failed: {e}");
-                ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Wikipedia request failed: {e}"), None)
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Wikipedia request failed: {e}"),
+                    None,
+                )
             })?;
 
         println!("[wikipedia] search response status: {}", resp.status());
@@ -711,7 +1180,11 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
 
         let body: serde_json::Value = resp.json().await.map_err(|e| {
             println!("[wikipedia] failed to parse search response: {e}");
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to parse response: {e}"), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to parse response: {e}"),
+                None,
+            )
         })?;
 
         let results = body["query"]["search"].as_array();
@@ -719,24 +1192,26 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         println!("[wikipedia] search returned {} results", result_count);
 
         let text = match results {
-            Some(arr) if !arr.is_empty() => {
-                arr.iter()
-                    .filter_map(|item| {
-                        let title = item["title"].as_str()?;
-                        let snippet = item["snippet"].as_str().unwrap_or("");
-                        let clean = snippet
-                            .replace("<span class=\"searchmatch\">", "")
-                            .replace("</span>", "")
-                            .replace("&quot;", "\"")
-                            .replace("&amp;", "&");
-                        Some(format!("- **{}**: {}", title, clean))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            Some(arr) if !arr.is_empty() => arr
+                .iter()
+                .filter_map(|item| {
+                    let title = item["title"].as_str()?;
+                    let snippet = item["snippet"].as_str().unwrap_or("");
+                    let clean = snippet
+                        .replace("<span class=\"searchmatch\">", "")
+                        .replace("</span>", "")
+                        .replace("&quot;", "\"")
+                        .replace("&amp;", "&");
+                    Some(format!("- **{}**: {}", title, clean))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             _ => format!("No Wikipedia articles found for '{}'.", query),
         };
-        println!("[wikipedia] search_wikipedia done, returning {} chars", text.len());
+        println!(
+            "[wikipedia] search_wikipedia done, returning {} chars",
+            text.len()
+        );
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
@@ -753,7 +1228,10 @@ verbatim. In voice mode keep it to 1–3 sentences.")]
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let topic = extract_topic(&params.0, &self.services).await;
-        println!("[wikipedia] get_wikipedia_article called: topic={:?}", topic);
+        println!(
+            "[wikipedia] get_wikipedia_article called: topic={:?}",
+            topic
+        );
 
         if topic.is_empty() {
             println!("[wikipedia] empty topic, returning INVALID_PARAMS");
@@ -769,7 +1247,10 @@ verbatim. In voice mode keep it to 1–3 sentences.")]
             Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
             Err(WikiFetchError::NotFound) => {
                 // Auto-fallback: search for the topic and fetch the top result
-                println!("[wikipedia] exact title not found, searching for '{}'", topic);
+                println!(
+                    "[wikipedia] exact title not found, searching for '{}'",
+                    topic
+                );
                 match self.search_and_fetch_best(&topic).await {
                     Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
                     Err(e) => Err(e),
@@ -782,7 +1263,8 @@ verbatim. In voice mode keep it to 1–3 sentences.")]
 
 // ── Wikipedia helpers (outside the #[tool_router] block) ─────────────────────
 
-const WIKI_UA: &str = "goose-in-a-pond/0.1 (GIAP MCP; https://github.com/jarida-io/goose-in-a-pond)";
+const WIKI_UA: &str =
+    "goose-in-a-pond/0.1 (GIAP MCP; https://github.com/jarida-io/goose-in-a-pond)";
 
 /// Extract the search topic from params.
 ///
@@ -796,17 +1278,25 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
     if let Some(ref t) = params.topic {
         let trimmed = t.trim();
         if !trimmed.is_empty() {
-            println!("[wikipedia] extract_topic: found in 'topic' field: {:?}", trimmed);
+            println!(
+                "[wikipedia] extract_topic: found in 'topic' field: {:?}",
+                trimmed
+            );
             return trimmed.to_string();
         }
     }
     // 2. Scan extras — try common names first, then any string value
-    for key in &["query", "title", "search", "q", "term", "input", "name", "article", "text", "subject"] {
+    for key in &[
+        "query", "title", "search", "q", "term", "input", "name", "article", "text", "subject",
+    ] {
         if let Some(val) = params.extra.get(*key) {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!("[wikipedia] extract_topic: found in '{}' field: {:?}", key, trimmed);
+                    println!(
+                        "[wikipedia] extract_topic: found in '{}' field: {:?}",
+                        key, trimmed
+                    );
                     return trimmed.to_string();
                 }
             }
@@ -817,7 +1307,10 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
         if let Some(s) = val.as_str() {
             let trimmed = s.trim();
             if !trimmed.is_empty() {
-                println!("[wikipedia] extract_topic: found in unknown '{}' field: {:?}", key, trimmed);
+                println!(
+                    "[wikipedia] extract_topic: found in unknown '{}' field: {:?}",
+                    key, trimmed
+                );
                 return trimmed.to_string();
             }
         }
@@ -828,17 +1321,29 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
         let schema = r#"{"topic": "string — the topic, person, place, or concept to look up"}"#;
         let query = user_msg.trim();
         if !query.is_empty() {
-            println!("[wikipedia] extract_topic: invoking tool-caller specialist for {:?}", query);
-            match tool_caller.generate_tool_call("get_wikipedia_article", schema, query).await {
+            println!(
+                "[wikipedia] extract_topic: invoking tool-caller specialist for {:?}",
+                query
+            );
+            match tool_caller
+                .generate_tool_call("get_wikipedia_article", schema, query)
+                .await
+            {
                 Ok(args) => {
                     if let Some(t) = args.get("topic").and_then(|v| v.as_str()) {
                         let trimmed = t.trim();
                         if !trimmed.is_empty() {
-                            println!("[wikipedia] extract_topic: specialist returned: {:?}", trimmed);
+                            println!(
+                                "[wikipedia] extract_topic: specialist returned: {:?}",
+                                trimmed
+                            );
                             return trimmed.to_string();
                         }
                     }
-                    println!("[wikipedia] extract_topic: specialist returned args without 'topic': {:?}", args);
+                    println!(
+                        "[wikipedia] extract_topic: specialist returned args without 'topic': {:?}",
+                        args
+                    );
                 }
                 Err(e) => {
                     println!("[wikipedia] extract_topic: specialist failed: {e}");
@@ -849,10 +1354,16 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
     // 5. Last resort — extract topic from user message with query cleaning
     let cleaned = clean_query_for_search(&user_msg);
     if !cleaned.is_empty() {
-        println!("[wikipedia] extract_topic: cleaned user message: {:?}", cleaned);
+        println!(
+            "[wikipedia] extract_topic: cleaned user message: {:?}",
+            cleaned
+        );
         return cleaned;
     }
-    println!("[wikipedia] extract_topic: no topic found in params: {:?}", params);
+    println!(
+        "[wikipedia] extract_topic: no topic found in params: {:?}",
+        params
+    );
     String::new()
 }
 
@@ -862,7 +1373,11 @@ async fn extract_topic(params: &WikipediaQueryParams, services: &GiapServiceHand
 /// "tell me about black holes" → "black holes"
 /// "Nairobi" → "Nairobi" (unchanged)
 pub fn clean_query_for_search(raw: &str) -> String {
-    let stripped = raw.trim().trim_end_matches('?').trim_end_matches('.').trim();
+    let stripped = raw
+        .trim()
+        .trim_end_matches('?')
+        .trim_end_matches('.')
+        .trim();
     let lower = stripped.to_lowercase();
     // Ordered longest-first so more specific prefixes match before short ones.
     let prefixes = [
@@ -874,17 +1389,38 @@ pub fn clean_query_for_search(raw: &str) -> String {
         "i'd like to know about ",
         "what do you know about ",
         "what can you tell me about ",
-        "would you recommend ", "do you recommend ",
-        "should i ", "how about ",
-        "who is ", "who was ", "who are ",
-        "what is ", "what are ", "what was ", "what were ",
-        "what is the ", "what are the ",
-        "where is ", "where are ",
-        "when was ", "when did ", "when is ",
-        "how does ", "how do ", "how did ", "how is ",
-        "why does ", "why do ", "why is ", "why did ",
-        "explain ", "describe ",
-        "look up ", "search for ", "search ", "find ",
+        "would you recommend ",
+        "do you recommend ",
+        "should i ",
+        "how about ",
+        "who is ",
+        "who was ",
+        "who are ",
+        "what is ",
+        "what are ",
+        "what was ",
+        "what were ",
+        "what is the ",
+        "what are the ",
+        "where is ",
+        "where are ",
+        "when was ",
+        "when did ",
+        "when is ",
+        "how does ",
+        "how do ",
+        "how did ",
+        "how is ",
+        "why does ",
+        "why do ",
+        "why is ",
+        "why did ",
+        "explain ",
+        "describe ",
+        "look up ",
+        "search for ",
+        "search ",
+        "find ",
         "define ",
     ];
     for prefix in prefixes {
@@ -1025,7 +1561,9 @@ impl GiapMcpServer {
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self.services.http_client
+        let resp = self
+            .services
+            .http_client
             .get(&url)
             .header("user-agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(15))
@@ -1043,7 +1581,10 @@ impl GiapMcpServer {
         println!("[wikipedia] article response status: {}", resp.status());
 
         if !resp.status().is_success() {
-            println!("[wikipedia] article fetch failed with HTTP {}", resp.status());
+            println!(
+                "[wikipedia] article fetch failed with HTTP {}",
+                resp.status()
+            );
             return Err(WikiFetchError::Mcp(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Wikipedia returned HTTP {}", resp.status()),
@@ -1062,8 +1603,7 @@ impl GiapMcpServer {
 
         // MediaWiki returns pages as { "query": { "pages": { "<id>": { ... } } } }
         let pages = &body["query"]["pages"];
-        let page = pages.as_object()
-            .and_then(|m| m.values().next());
+        let page = pages.as_object().and_then(|m| m.values().next());
 
         let page = match page {
             Some(p) if p.get("missing").is_none() => p,
@@ -1072,7 +1612,10 @@ impl GiapMcpServer {
 
         let display_title = page["title"].as_str().unwrap_or(title);
         let extract = page["extract"].as_str().unwrap_or("");
-        let fallback_url = format!("https://en.wikipedia.org/wiki/{}", urlencoding::encode(title));
+        let fallback_url = format!(
+            "https://en.wikipedia.org/wiki/{}",
+            urlencoding::encode(title)
+        );
         let page_url = page["fullurl"].as_str().unwrap_or(&fallback_url);
 
         if extract.is_empty() {
@@ -1082,13 +1625,22 @@ impl GiapMcpServer {
         // Cap at ~8000 chars to stay within model context limits
         let truncated = if extract.len() > 8000 {
             let mut cut = 8000;
-            while cut > 0 && !extract.is_char_boundary(cut) { cut -= 1; }
-            format!("{}...\n\n[Article truncated — full article at source]", &extract[..cut])
+            while cut > 0 && !extract.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!(
+                "{}...\n\n[Article truncated — full article at source]",
+                &extract[..cut]
+            )
         } else {
             extract.to_string()
         };
 
-        println!("[wikipedia] article fetched: title={:?}, extract_len={}", display_title, extract.len());
+        println!(
+            "[wikipedia] article fetched: title={:?}, extract_len={}",
+            display_title,
+            extract.len()
+        );
 
         Ok(format!(
             "# {}\n\n{}\n\nSource: {}",
@@ -1104,7 +1656,9 @@ impl GiapMcpServer {
         );
         println!("[wikipedia] fallback search: GET {}", search_url);
 
-        let resp = self.services.http_client
+        let resp = self
+            .services
+            .http_client
             .get(&search_url)
             .header("user-agent", WIKI_UA)
             .timeout(std::time::Duration::from_secs(10))
@@ -1112,7 +1666,11 @@ impl GiapMcpServer {
             .await
             .map_err(|e| {
                 println!("[wikipedia] fallback search request failed: {e}");
-                ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Wikipedia search failed: {e}"), None)
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Wikipedia search failed: {e}"),
+                    None,
+                )
             })?;
 
         if !resp.status().is_success() {
@@ -1124,7 +1682,11 @@ impl GiapMcpServer {
         }
 
         let body: serde_json::Value = resp.json().await.map_err(|e| {
-            ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Failed to parse search: {e}"), None)
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to parse search: {e}"),
+                None,
+            )
         })?;
 
         let best_title = body["query"]["search"]
@@ -1137,14 +1699,18 @@ impl GiapMcpServer {
                 println!("[wikipedia] fallback found: '{}'", found);
                 match self.fetch_article_summary(found).await {
                     Ok(text) => Ok(text),
-                    Err(WikiFetchError::NotFound) => {
-                        Ok(format!("Wikipedia search matched '{}' but the article could not be loaded.", found))
-                    }
+                    Err(WikiFetchError::NotFound) => Ok(format!(
+                        "Wikipedia search matched '{}' but the article could not be loaded.",
+                        found
+                    )),
                     Err(WikiFetchError::Mcp(e)) => Err(e),
                 }
             }
             None => {
-                println!("[wikipedia] fallback search returned no results for '{}'", query);
+                println!(
+                    "[wikipedia] fallback search returned no results for '{}'",
+                    query
+                );
                 Ok(format!("No Wikipedia articles found for '{}'.", query))
             }
         }
@@ -1162,8 +1728,9 @@ impl ServerHandler for GiapMcpServer {
             ))
             .with_instructions(
                 "GIAP (Goose In A Pond) MCP server — your primary interface for the local home \
-                 environment and factual knowledge retrieval.\n\n\
-                 Tools: weather, device registry, memories, skills, Wikipedia.\n\n\
+                 environment, system utilities, and factual knowledge retrieval.\n\n\
+                 Tools: weather, device registry, memories, skills, Wikipedia, time, system info, \
+                 notifications, shell commands (sandboxed), file read/write.\n\n\
                  IMPORTANT — Wikipedia usage guidelines:\n\
                  • Prefer get_wikipedia_article for any factual question. It accepts plain topics \
                    (\"black holes\", \"Marie Curie\") — no need to guess exact titles.\n\
@@ -1184,6 +1751,7 @@ impl ServerHandler for GiapMcpServer {
 mod tests {
     use super::*;
     use crate::registry::GiapServiceHandles;
+    use async_trait::async_trait;
     use pond_core::domain::memory::MemoryFragment;
     use pond_core::domain::recipe::AgentRecipe;
     use pond_core::domain::settings::Settings;
@@ -1193,7 +1761,6 @@ mod tests {
     use pond_core::ports::recipe::AgentRecipeRepository;
     use pond_core::ports::settings::SettingsRepository;
     use pond_core::ports::skill::UserSkillRepository;
-    use async_trait::async_trait;
     use std::sync::Arc;
 
     // ── Minimal stubs — only http_client is exercised by Wikipedia tools ──
@@ -1201,50 +1768,107 @@ mod tests {
     struct StubDeviceRegistry;
     #[async_trait]
     impl DeviceRegistry for StubDeviceRegistry {
-        async fn register(&self, _: RegisterDeviceRequest) -> anyhow::Result<Device> { unimplemented!() }
-        async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-        async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-        async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn register(&self, _: RegisterDeviceRequest) -> anyhow::Result<Device> {
+            unimplemented!()
+        }
+        async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+            Ok(vec![])
+        }
+        async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+            Ok(None)
+        }
+        async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct StubSettings;
     #[async_trait]
     impl SettingsRepository for StubSettings {
-        async fn get(&self) -> anyhow::Result<Settings> { Ok(Settings::default()) }
-        async fn update(&self, _: &Settings) -> anyhow::Result<()> { Ok(()) }
-        async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> { Ok(None) }
-        async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> { Ok(()) }
+        async fn get(&self) -> anyhow::Result<Settings> {
+            Ok(Settings::default())
+        }
+        async fn update(&self, _: &Settings) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct StubMemory;
     #[async_trait]
     impl MemoryRepository for StubMemory {
-        async fn add(&self, _: MemoryFragment) -> anyhow::Result<()> { Ok(()) }
-        async fn search_recent(&self, _: Option<&str>, _: usize) -> anyhow::Result<Vec<MemoryFragment>> { Ok(vec![]) }
-        async fn search_similar(&self, _: &[f32], _: Option<&str>, _: usize) -> anyhow::Result<Vec<MemoryFragment>> { Ok(vec![]) }
-        async fn delete(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn add(&self, _: MemoryFragment) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn search_recent(
+            &self,
+            _: Option<&str>,
+            _: usize,
+        ) -> anyhow::Result<Vec<MemoryFragment>> {
+            Ok(vec![])
+        }
+        async fn search_similar(
+            &self,
+            _: &[f32],
+            _: Option<&str>,
+            _: usize,
+        ) -> anyhow::Result<Vec<MemoryFragment>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct StubSkills;
     #[async_trait]
     impl UserSkillRepository for StubSkills {
-        async fn list_active(&self) -> anyhow::Result<Vec<UserSkill>> { Ok(vec![]) }
-        async fn list_all(&self) -> anyhow::Result<Vec<UserSkill>> { Ok(vec![]) }
-        async fn get(&self, _: &str) -> anyhow::Result<Option<UserSkill>> { Ok(None) }
-        async fn create(&self, _: &UserSkill) -> anyhow::Result<()> { Ok(()) }
-        async fn update(&self, _: &UserSkill) -> anyhow::Result<()> { Ok(()) }
-        async fn delete(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list_active(&self) -> anyhow::Result<Vec<UserSkill>> {
+            Ok(vec![])
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<UserSkill>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<UserSkill>> {
+            Ok(None)
+        }
+        async fn create(&self, _: &UserSkill) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update(&self, _: &UserSkill) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct StubRecipes;
     #[async_trait]
     impl AgentRecipeRepository for StubRecipes {
-        async fn list(&self) -> anyhow::Result<Vec<AgentRecipe>> { Ok(vec![]) }
-        async fn get_by_name(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> { Ok(None) }
-        async fn get_by_id(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> { Ok(None) }
-        async fn upsert(&self, _: &AgentRecipe) -> anyhow::Result<()> { Ok(()) }
-        async fn delete(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+        async fn list(&self) -> anyhow::Result<Vec<AgentRecipe>> {
+            Ok(vec![])
+        }
+        async fn get_by_name(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> {
+            Ok(None)
+        }
+        async fn get_by_id(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> {
+            Ok(None)
+        }
+        async fn upsert(&self, _: &AgentRecipe) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_server() -> GiapMcpServer {
@@ -1272,7 +1896,10 @@ mod tests {
         let text = server.fetch_article_summary("Nairobi").await.unwrap();
         println!("{}", text);
         assert!(text.contains("Nairobi"), "extract should mention Nairobi");
-        assert!(text.contains("Kenya"), "Nairobi article should mention Kenya");
+        assert!(
+            text.contains("Kenya"),
+            "Nairobi article should mention Kenya"
+        );
         assert!(text.contains("Source:"), "should include source URL");
     }
 
@@ -1284,8 +1911,10 @@ mod tests {
         // "black holes" is not an exact Wikipedia title — "Black hole" is.
         let text = server.search_and_fetch_best("black holes").await.unwrap();
         println!("{}", text);
-        assert!(text.contains("black hole") || text.contains("Black hole"),
-            "should find the Black hole article");
+        assert!(
+            text.contains("black hole") || text.contains("Black hole"),
+            "should find the Black hole article"
+        );
     }
 
     /// The full get_wikipedia_article flow: vague input → 404 → search → fetch.
@@ -1298,8 +1927,10 @@ mod tests {
         // relevant article (Volcano, Volcanology, etc.).
         let text = server.search_and_fetch_best("volcanoes").await.unwrap();
         println!("{}", text);
-        assert!(text.to_lowercase().contains("volcan"),
-            "should resolve to a volcano-related article");
+        assert!(
+            text.to_lowercase().contains("volcan"),
+            "should resolve to a volcano-related article"
+        );
     }
 
     /// Completely nonsensical query returns a graceful "not found" message.
@@ -1307,10 +1938,15 @@ mod tests {
     #[ignore] // requires internet
     async fn live_nonsense_query_returns_not_found() {
         let server = test_server();
-        let text = server.search_and_fetch_best("xyzzy99foobar_nonexistent").await.unwrap();
+        let text = server
+            .search_and_fetch_best("xyzzy99foobar_nonexistent")
+            .await
+            .unwrap();
         println!("{}", text);
-        assert!(text.contains("No Wikipedia articles found"),
-            "should report no results for nonsense query");
+        assert!(
+            text.contains("No Wikipedia articles found"),
+            "should report no results for nonsense query"
+        );
     }
 
     /// Misspelled topic still finds a relevant article via search.
@@ -1319,10 +1955,17 @@ mod tests {
     async fn live_misspelled_topic_resolved() {
         let server = test_server();
         // "Albert Einsten" is a common misspelling — Wikipedia search handles it.
-        let text = server.search_and_fetch_best("Albert Einsten").await.unwrap();
+        let text = server
+            .search_and_fetch_best("Albert Einsten")
+            .await
+            .unwrap();
         println!("{}", text);
         let lower = text.to_lowercase();
-        assert!(lower.contains("einstein") || lower.contains("physicist") || lower.contains("relativity"),
-            "should resolve misspelled 'Albert Einsten' to Einstein article");
+        assert!(
+            lower.contains("einstein")
+                || lower.contains("physicist")
+                || lower.contains("relativity"),
+            "should resolve misspelled 'Albert Einsten' to Einstein article"
+        );
     }
 }

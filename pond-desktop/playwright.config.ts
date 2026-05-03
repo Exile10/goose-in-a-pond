@@ -35,8 +35,10 @@ export default defineConfig({
     },
   ],
   // Automatically start the Vite dev server before running tests.
+  // Use dev:vite (Vite only) rather than dev (Vite + pond-server) so that
+  // the --port flag is not forwarded to pond-server, which rejects it.
   webServer: {
-    command: "npm run dev -- --port 5173",
+    command: "npm run dev:vite -- --port 5173",
     url: "http://localhost:5173",
     reuseExistingServer: !process.env["CI"],
     timeout: 60_000,

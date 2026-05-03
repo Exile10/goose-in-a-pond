@@ -95,6 +95,9 @@ All errors return JSON:
 | GET | /extensions | Protected | List loaded MCP extensions |
 | POST | /extensions | Protected | Add an MCP extension |
 | DELETE | /extensions/{name} | Protected | Remove an MCP extension |
+| PATCH | /extensions/{name} | Protected | Enable or disable an MCP extension |
+| GET | /marketplace | Protected | List marketplace extensions |
+| POST | /marketplace/{id}/install | Protected | Install a marketplace extension |
 | GET | /prompts | Protected | List prompt templates |
 | GET | /prompts/{name} | Protected | Get a prompt template |
 | PUT | /prompts/{name} | Protected | Create or update a prompt template |
@@ -1256,6 +1259,74 @@ Removes the extension and deletes its persisted config so it won't reconnect on 
 |------|---------|
 | 404 | Extension not found |
 | 503 | Extension manager not available |
+
+---
+
+### PATCH /extensions/{name}
+
+Enables or disables an extension without removing its persisted config. Disabled extensions are excluded from future Goose agent sessions but keep their registration so they can be re-enabled later.
+
+**Request**
+```json
+{ "enabled": false }
+```
+
+**Response 200**
+```json
+{ "name": "my-ext", "enabled": false }
+```
+
+| Code | Meaning |
+|------|---------|
+| 404 | Extension not found |
+| 503 | Extension manager not available |
+
+---
+
+## Marketplace
+
+The marketplace provides a curated registry of popular MCP extensions for one-click installation.
+
+### GET /marketplace
+
+Lists all available extensions in the curated registry.
+
+**Response 200**
+```json
+{
+  "extensions": [
+    {
+      "id": "filesystem",
+      "name": "Filesystem",
+      "description": "Read, write, and search files on the local filesystem.",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"],
+      "category": "productivity",
+      "author": "Anthropic",
+      "tools": ["read_file", "write_file", "list_directory"],
+      "featured": true
+    }
+  ]
+}
+```
+
+| Code | Meaning |
+|------|---------|
+| 503 | Marketplace not configured |
+
+---
+
+### POST /marketplace/{id}/install
+
+Installs a marketplace extension by its registry ID. Looks up the extension in the catalogue, converts it to an `AddExtensionRequest`, registers it with the extension manager, and persists the config so it reconnects on restart.
+
+**Response 201** — extension info object (same shape as `POST /extensions` response)
+
+| Code | Meaning |
+|------|---------|
+| 404 | Extension ID not found in marketplace |
+| 503 | Marketplace or extension manager not available |
 
 ---
 

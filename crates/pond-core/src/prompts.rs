@@ -86,6 +86,12 @@ pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
         ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
         ("schedules", "List scheduled tasks and automations. Use when the user asks about their schedules, reminders, or timed tasks."),
         ("create_schedule", "Create a new scheduled automation that runs a prompt at a recurring time. Use when the user wants to schedule something, set up a recurring task, or says 'every morning', 'every day at', 'schedule to', 'remind me every', 'at 10 am do'."),
+        ("time", "Get the current date, time, and timezone. Use when the user asks 'what time is it', 'what's today's date', or needs the current time/date for any reason."),
+        ("system_info", "Get system information including OS, hostname, memory usage, and disk space. Use when the user asks about their system, available RAM, disk usage, hardware info, or system specs."),
+        ("notification", "Send a desktop notification popup to the user. Use when the user asks to be notified, alerted, or wants a popup reminder."),
+        ("shell_command", "Execute a safe, sandboxed shell command. Only allow-listed commands: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. Use when the user asks to run a command or check system state via CLI."),
+        ("read_file", "Read the contents of a local file. Use when the user asks to read, view, show, or inspect a file on their system."),
+        ("write_file", "Write content to a local file. Can overwrite or append. Use when the user asks to write, save, or create a file on their system."),
     ]
 }
 
@@ -114,7 +120,8 @@ pub fn build_classifier_prompt() -> String {
 
 fn build_classifier_prompt_inner() -> String {
     let tools = giap_tool_definitions();
-    let tool_lines: Vec<String> = tools.iter()
+    let tool_lines: Vec<String> = tools
+        .iter()
         .enumerate()
         .map(|(i, (name, desc))| format!("{}. {} — {}", i + 1, name, desc))
         .collect();
@@ -178,11 +185,25 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32 {
 
     // Complex indicators — planning, analysis, comparison, detailed explanation
     const COMPLEX_KEYWORDS: &[&str] = &[
-        "explain", "analyze", "analyse", "compare", "plan", "design",
-        "write a", "describe in detail", "step by step", "in depth",
-        "how does", "why does", "what are the differences",
-        "break down", "elaborate", "comprehensive", "thorough",
-        "pros and cons", "advantages and disadvantages",
+        "explain",
+        "analyze",
+        "analyse",
+        "compare",
+        "plan",
+        "design",
+        "write a",
+        "describe in detail",
+        "step by step",
+        "in depth",
+        "how does",
+        "why does",
+        "what are the differences",
+        "break down",
+        "elaborate",
+        "comprehensive",
+        "thorough",
+        "pros and cons",
+        "advantages and disadvantages",
     ];
 
     let is_complex = COMPLEX_KEYWORDS.iter().any(|k| lower.contains(k));
@@ -191,11 +212,11 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32 {
     let is_short = message.len() < 25 && !is_complex;
 
     if is_short {
-        (base_max_tokens / 2).max(1024)   // 2048 for quick replies
+        (base_max_tokens / 2).max(1024) // 2048 for quick replies
     } else if is_complex {
-        base_max_tokens.saturating_mul(2)  // 8192 for deep analysis
+        base_max_tokens.saturating_mul(2) // 8192 for deep analysis
     } else {
-        base_max_tokens                     // 4096 default
+        base_max_tokens // 4096 default
     }
 }
 
@@ -513,7 +534,10 @@ pub fn sanitize_field(s: &str, max_len: usize) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let collapsed = decontrolled.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = decontrolled
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     collapsed.chars().take(max_len).collect()
 }
 
@@ -558,22 +582,25 @@ pub fn render_jinja_template(
     state: Option<&PromptState>,
     profile: Option<&ProfileContext>,
 ) -> String {
-    let name    = sanitize_field(&settings.assistant_name, 50);
-    let user    = sanitize_field(&settings.user_name, 50);
+    let name = sanitize_field(&settings.assistant_name, 50);
+    let user = sanitize_field(&settings.user_name, 50);
     let persona = sanitize_field(&settings.assistant_personality, 200);
-    let tz      = sanitize_field(&settings.timezone, 50);
+    let tz = sanitize_field(&settings.timezone, 50);
     let location = if settings.weather_location_name.is_empty() {
         String::new()
     } else {
-        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
+        format!(
+            "\nLocation: {}.",
+            sanitize_field(&settings.weather_location_name, 100)
+        )
     };
 
     let mut ctx = tera::Context::new();
     ctx.insert("assistant_name", &name);
-    ctx.insert("user_name",      &user);
-    ctx.insert("personality",    &persona);
-    ctx.insert("timezone",       &tz);
-    ctx.insert("location",       &location);
+    ctx.insert("user_name", &user);
+    ctx.insert("personality", &persona);
+    ctx.insert("timezone", &tz);
+    ctx.insert("location", &location);
 
     // Runtime state — defaults to empty/zero when not provided
     let (current_date, current_time, device_count, has_home, online_names) = state
@@ -588,26 +615,30 @@ pub fn render_jinja_template(
         })
         .unwrap_or(("", "", 0, false, ""));
 
-    ctx.insert("current_date",        current_date);
-    ctx.insert("current_time",        current_time);
-    ctx.insert("device_count",        &device_count);
-    ctx.insert("has_home_devices",    &has_home);
+    ctx.insert("current_date", current_date);
+    ctx.insert("current_time", current_time);
+    ctx.insert("device_count", &device_count);
+    ctx.insert("has_home_devices", &has_home);
     ctx.insert("online_device_names", online_names);
-    ctx.insert("voice_mode",          &state.map(|s| s.voice_mode).unwrap_or(false));
+    ctx.insert("voice_mode", &state.map(|s| s.voice_mode).unwrap_or(false));
 
     // Available tools — rendered into the prompt so the model knows its capabilities
-    let tools: Vec<String> = state
-        .map(|s| s.available_tools.clone())
-        .unwrap_or_default();
+    let tools: Vec<String> = state.map(|s| s.available_tools.clone()).unwrap_or_default();
     ctx.insert("has_tools", &!tools.is_empty());
     ctx.insert("tools", &tools);
 
     // Thinking mode — enables deep reasoning instructions in the prompt
-    ctx.insert("thinking_enabled", &state.map(|s| s.thinking_enabled).unwrap_or(false));
+    ctx.insert(
+        "thinking_enabled",
+        &state.map(|s| s.thinking_enabled).unwrap_or(false),
+    );
 
     // Compact prompt — when true, templates should skip verbose sections to
     // save tokens on small-context platforms (Jetson 3K, macOS Metal 8K).
-    ctx.insert("compact_prompt", &state.map(|s| s.compact_prompt).unwrap_or(false));
+    ctx.insert(
+        "compact_prompt",
+        &state.map(|s| s.compact_prompt).unwrap_or(false),
+    );
 
     // Profile context
     ctx.insert(
@@ -621,10 +652,10 @@ pub fn render_jinja_template(
             tracing::warn!("Tera render failed — falling back to render_template(): {e}");
             let vars: &[(&str, &str)] = &[
                 ("assistant_name", name.as_str()),
-                ("user_name",      user.as_str()),
-                ("personality",    persona.as_str()),
-                ("timezone",       tz.as_str()),
-                ("location",       location.as_str()),
+                ("user_name", user.as_str()),
+                ("personality", persona.as_str()),
+                ("timezone", tz.as_str()),
+                ("location", location.as_str()),
             ];
             render_template(template, vars)
         }
@@ -647,15 +678,18 @@ pub fn build_system_prompt(settings: &Settings) -> String {
 }
 
 /// Full version — also injects per-user `ProfileContext` into the prompt.
-pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&ProfileContext>) -> String {
+pub fn build_system_prompt_with_profile(
+    settings: &Settings,
+    profile: Option<&ProfileContext>,
+) -> String {
     let tmpl = if let Some(ref custom) = settings.custom_system_prompt {
         sanitize_field(custom, 4000)
     } else {
         match settings.prompt_style.as_str() {
-            "concise"   => PROMPT_CONCISE.to_string(),
+            "concise" => PROMPT_CONCISE.to_string(),
             "technical" => PROMPT_TECHNICAL.to_string(),
-            "warm"      => PROMPT_WARM.to_string(),
-            _           => PROMPT_BALANCED.to_string(),
+            "warm" => PROMPT_WARM.to_string(),
+            _ => PROMPT_BALANCED.to_string(),
         }
     };
 
@@ -678,16 +712,16 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
             let lang = sanitize_field(lang, 20);
             if !lang.is_empty() && lang != "en" {
                 let lang_label = match lang.as_str() {
-                    "fr"    => "French",
-                    "es"    => "Spanish",
-                    "de"    => "German",
-                    "sw"    => "Swahili",
-                    "ar"    => "Arabic",
-                    "pt"    => "Portuguese",
-                    "zh"    => "Chinese",
-                    "ja"    => "Japanese",
-                    "ko"    => "Korean",
-                    other   => other,
+                    "fr" => "French",
+                    "es" => "Spanish",
+                    "de" => "German",
+                    "sw" => "Swahili",
+                    "ar" => "Arabic",
+                    "pt" => "Portuguese",
+                    "zh" => "Chinese",
+                    "ja" => "Japanese",
+                    "ko" => "Korean",
+                    other => other,
                 };
                 profile_lines.push(format!("Always respond in {}.", lang_label));
             }
@@ -703,7 +737,8 @@ pub fn build_system_prompt_with_profile(settings: &Settings, profile: Option<&Pr
         if ctx.atypical_speech {
             profile_lines.push(
                 "The user may have atypical speech — be patient, never correct speech patterns, \
-                 and interpret incomplete sentences charitably.".to_string()
+                 and interpret incomplete sentences charitably."
+                    .to_string(),
             );
         }
     }
@@ -769,9 +804,15 @@ pub fn build_system_prompt_from_template_full(
             let lang = sanitize_field(lang, 20);
             if !lang.is_empty() && lang != "en" {
                 let lang_label = match lang.as_str() {
-                    "fr" => "French", "es" => "Spanish", "de" => "German",
-                    "sw" => "Swahili", "ar" => "Arabic", "pt" => "Portuguese",
-                    "zh" => "Chinese", "ja" => "Japanese", "ko" => "Korean",
+                    "fr" => "French",
+                    "es" => "Spanish",
+                    "de" => "German",
+                    "sw" => "Swahili",
+                    "ar" => "Arabic",
+                    "pt" => "Portuguese",
+                    "zh" => "Chinese",
+                    "ja" => "Japanese",
+                    "ko" => "Korean",
                     other => other,
                 };
                 profile_lines.push(format!("Always respond in {}.", lang_label));
@@ -786,7 +827,8 @@ pub fn build_system_prompt_from_template_full(
         if ctx.atypical_speech {
             profile_lines.push(
                 "The user may have atypical speech — be patient, never correct speech \
-                 patterns, and interpret incomplete sentences charitably.".to_string()
+                 patterns, and interpret incomplete sentences charitably."
+                    .to_string(),
             );
         }
     }
@@ -812,7 +854,10 @@ mod tests {
 
     #[test]
     fn sanitize_strips_newlines() {
-        assert_eq!(sanitize_field("friendly\nand concise", 200), "friendly and concise");
+        assert_eq!(
+            sanitize_field("friendly\nand concise", 200),
+            "friendly and concise"
+        );
     }
 
     #[test]
@@ -822,7 +867,10 @@ mod tests {
 
     #[test]
     fn sanitize_collapses_whitespace() {
-        assert_eq!(sanitize_field("  too   many   spaces  ", 200), "too many spaces");
+        assert_eq!(
+            sanitize_field("  too   many   spaces  ", 200),
+            "too many spaces"
+        );
     }
 
     #[test]
@@ -851,7 +899,10 @@ mod tests {
     #[test]
     fn render_template_unknown_placeholder_unchanged() {
         let tmpl = "Hello {{unknown}}.";
-        assert_eq!(render_template(tmpl, &[("other", "X")]), "Hello {{unknown}}.");
+        assert_eq!(
+            render_template(tmpl, &[("other", "X")]),
+            "Hello {{unknown}}."
+        );
     }
 
     #[test]
@@ -938,8 +989,14 @@ mod tests {
         let mut s = Settings::default();
         s.assistant_name = "Duck\nAttacker:".to_string();
         let p = build_system_prompt(&s);
-        assert!(p.contains("Duck Attacker:"), "control chars in name must be collapsed to space");
-        assert!(!p.contains("Duck\nAttacker:"), "raw newline from injection must not survive");
+        assert!(
+            p.contains("Duck Attacker:"),
+            "control chars in name must be collapsed to space"
+        );
+        assert!(
+            !p.contains("Duck\nAttacker:"),
+            "raw newline from injection must not survive"
+        );
     }
 
     #[test]
@@ -1007,7 +1064,8 @@ mod tests {
     fn build_system_prompt_custom_template_used() {
         let mut s = Settings::default();
         s.assistant_name = "Pond".to_string();
-        s.custom_system_prompt = Some("I am {{assistant_name}} and I serve {{user_name}}.".to_string());
+        s.custom_system_prompt =
+            Some("I am {{assistant_name}} and I serve {{user_name}}.".to_string());
         let p = build_system_prompt(&s);
         assert_eq!(p, "I am Pond and I serve Friend.");
     }
@@ -1068,7 +1126,8 @@ mod tests {
         let s = Settings::default();
         // No devices — home section must be absent
         let state_none = PromptState::default();
-        let out = build_system_prompt_from_template_full(&s, None, Some(&state_none), PROMPT_BALANCED);
+        let out =
+            build_system_prompt_from_template_full(&s, None, Some(&state_none), PROMPT_BALANCED);
         assert!(!out.contains("Connected Devices"));
 
         // With devices — home section must appear
@@ -1078,7 +1137,8 @@ mod tests {
             online_device_names: "Hub".to_string(),
             ..Default::default()
         };
-        let out2 = build_system_prompt_from_template_full(&s, None, Some(&state_with), PROMPT_BALANCED);
+        let out2 =
+            build_system_prompt_from_template_full(&s, None, Some(&state_with), PROMPT_BALANCED);
         assert!(out2.contains("Connected Devices"));
         assert!(out2.contains("Hub"));
     }
@@ -1099,13 +1159,23 @@ mod tests {
 
     #[test]
     fn estimate_response_budget_complex_message() {
-        assert!(estimate_response_budget("explain how photosynthesis works step by step", 4096) > 4096);
-        assert!(estimate_response_budget("compare these two approaches and analyze the trade-offs", 4096) > 4096);
+        assert!(
+            estimate_response_budget("explain how photosynthesis works step by step", 4096) > 4096
+        );
+        assert!(
+            estimate_response_budget(
+                "compare these two approaches and analyze the trade-offs",
+                4096
+            ) > 4096
+        );
     }
 
     #[test]
     fn estimate_response_budget_normal_message() {
-        assert_eq!(estimate_response_budget("What's the weather like today?", 4096), 4096);
+        assert_eq!(
+            estimate_response_budget("What's the weather like today?", 4096),
+            4096
+        );
     }
 
     #[test]
