@@ -5652,17 +5652,27 @@ async fn oauth_authorize_handler(
         );
     }
 
-    let redirect_uri = "http://localhost:4000/api/v1/oauth/callback";
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/api/v1/oauth/callback",
+        state.api_port
+    );
     let scopes = provider.scopes.join(" ");
 
     let auth_url = format!(
         "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         provider.authorize_url,
         urlencoding::encode(&client_id),
-        urlencoding::encode(redirect_uri),
+        urlencoding::encode(&redirect_uri),
         urlencoding::encode(&scopes),
         urlencoding::encode(&state_nonce),
         urlencoding::encode(&code_challenge),
+    );
+
+    tracing::info!(
+        provider = %provider_id,
+        redirect_uri = %redirect_uri,
+        "OAuth authorize URL: {}",
+        auth_url
     );
 
     Json(json!({"auth_url": auth_url, "state": state_nonce})).into_response()
@@ -5724,15 +5734,19 @@ async fn oauth_callback_handler(
         provider.bundled_client_id.clone()
     };
 
-    // Exchange authorization code for tokens
-    let redirect_uri = "http://localhost:4000/api/v1/oauth/callback";
+    // Exchange authorization code for tokens.
+    // The redirect_uri MUST exactly match the one sent in the authorize request.
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/api/v1/oauth/callback",
+        state.api_port
+    );
     let token_response = state
         .http_client
         .post(&provider.token_url)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", redirect_uri),
+            ("redirect_uri", redirect_uri.as_str()),
             ("client_id", client_id.as_str()),
             ("code_verifier", session.code_verifier.as_str()),
         ])
