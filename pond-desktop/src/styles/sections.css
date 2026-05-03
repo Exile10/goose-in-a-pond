@@ -2456,6 +2456,63 @@
   border-color: var(--purple-200);
 }
 
+/* Auth status badges on ExtensionCard */
+.ext-card__auth-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  padding: 1px 7px;
+  border-radius: 20px;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+  cursor: default;
+  text-decoration: none;
+}
+
+.ext-card__auth-badge--ok {
+  background: rgba(52, 199, 89, 0.10);
+  color: #1a8a3a;
+  border-color: rgba(52, 199, 89, 0.25);
+}
+
+.ext-card__auth-badge--warn {
+  background: rgba(255, 159, 10, 0.10);
+  color: #a05f00;
+  border-color: rgba(255, 159, 10, 0.25);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.ext-card__auth-badge--warn:hover {
+  background: rgba(255, 159, 10, 0.18);
+  border-color: rgba(255, 159, 10, 0.45);
+}
+
+/* Reconnecting banner shown in SecretConfigModal footer area */
+.secret-modal__reconnect-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--grey-100);
+  font-size: var(--text-sm);
+  color: var(--grey-600);
+  font-weight: var(--weight-medium);
+}
+
+/* Reconnecting state inside OAuthBlock */
+.secret-modal__reconnecting {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-sm);
+  color: var(--grey-500);
+}
+
 /* ─── Agent ─── */
 .agent-tabs { background: var(--grey-100); border-radius: 12px; padding: 4px; }
 .agent-tab { font-weight: var(--weight-semibold); }

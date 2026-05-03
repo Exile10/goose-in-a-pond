@@ -5769,6 +5769,49 @@ async fn oauth_callback_handler(
 
             tracing::info!(provider = %provider.id, "OAuth token exchange succeeded");
 
+            // If this OAuth flow was triggered by an extension install, restart
+            // the extension so the child process picks up the new tokens.
+            if let Some(ext_id) = &session.extension_id {
+                if let (Some(mgr), Some(mp), Some(secret_repo)) =
+                    (&state.extension_manager, &state.marketplace, &state.secret_repo)
+                {
+                    if let Ok(Some(ext)) = mp.get_by_id(ext_id).await {
+                        // Build env map with all resolved secrets
+                        let mut env = std::collections::HashMap::new();
+                        for sr in &ext.required_secrets {
+                            if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
+                                env.insert(sr.key.clone(), val);
+                            }
+                        }
+
+                        // Remove the running extension and re-add with new env
+                        let _ = mgr.remove_extension(ext_id).await;
+
+                        let req = pond_core::ports::extension_manager::AddExtensionRequest {
+                            name: ext.id.clone(),
+                            kind: ext.kind.clone(),
+                            description: ext.description.clone(),
+                            command: ext.command.clone(),
+                            args: ext.args.clone(),
+                            env,
+                            uri: ext.uri.clone(),
+                        };
+
+                        match mgr.add_extension(req).await {
+                            Ok(_) => tracing::info!(
+                                extension = %ext_id,
+                                "restarted extension with OAuth tokens"
+                            ),
+                            Err(e) => tracing::warn!(
+                                extension = %ext_id,
+                                error = %e,
+                                "failed to restart extension after OAuth"
+                            ),
+                        }
+                    }
+                }
+            }
+
             Html(format!(
                 r#"<!DOCTYPE html>
 <html><head><title>Authorization Successful</title>
