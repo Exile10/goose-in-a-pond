@@ -1073,7 +1073,11 @@ async fn chat_stream(
         // If the LLM's response contains a natural language tool request
         // (e.g. "Let me look up X for you"), execute the tool via the
         // ToolAgent, then re-generate the response with tool data injected.
-        if settings.tool_request_detection {
+        // Skip when a domain filter is active (e.g. Music domain) — the LLM
+        // shouldn't be calling Wikipedia when only music tools are allowed.
+        let domain = pond_core::services::domain_classifier::classify_domain(&req.message);
+        let skip_tool_request = !matches!(domain, pond_core::services::domain_classifier::ToolDomain::General | pond_core::services::domain_classifier::ToolDomain::Knowledge);
+        if settings.tool_request_detection && !skip_tool_request {
             if let Some(tool_req) = pond_core::services::tool_request_detector::detect_tool_request(&full_text) {
                 tracing::info!(
                     target: "giap::tool_request",
