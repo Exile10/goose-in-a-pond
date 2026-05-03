@@ -22,7 +22,7 @@ pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {
             "playlist-modify-public".to_string(),
             "playlist-modify-private".to_string(),
         ],
-        bundled_client_id: "PLACEHOLDER_SPOTIFY_CLIENT_ID".to_string(),
+        bundled_client_id: "9aa8d81a57624c87b392bf242c872224".to_string(),
         token_key: "SPOTIFY_ACCESS_TOKEN".to_string(),
         refresh_key: "SPOTIFY_REFRESH_TOKEN".to_string(),
     }]
