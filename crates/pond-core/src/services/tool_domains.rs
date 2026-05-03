@@ -23,20 +23,9 @@ use super::domain_classifier::ToolDomain;
 pub fn tool_filter_for_domain(domain: ToolDomain) -> Option<Vec<&'static str>> {
     match domain {
         ToolDomain::Music => Some(vec![
-            "music__now_playing",
             "music__play",
-            "music__pause",
-            "music__next",
-            "music__previous",
-            "music__search_tracks",
-            "music__search_albums",
-            "music__get_playlists",
-            "music__get_playlist_tracks",
-            "music__create_playlist",
-            "music__add_to_playlist",
-            "music__get_queue",
-            "music__set_volume",
-            "music__set_shuffle",
+            "music__status",
+            "music__control",
         ]),
         // Other domains: no filter for now (all tools available).
         // Refine as domain-specific MCP servers are added.
@@ -53,10 +42,11 @@ pub fn tool_filter_for_domain(domain: ToolDomain) -> Option<Vec<&'static str>> {
 pub fn domain_hint(domain: ToolDomain) -> &'static str {
     match domain {
         ToolDomain::Music => "\
-CURRENT TASK: Music playback request.\n\
-Use the music extension tools to handle this request.\n\
-For 'play X': 1) call search_tracks to find the song, 2) call play with the result URI.\n\
-Do NOT use wikipedia or other knowledge tools for music requests.",
+CURRENT TASK: Music request. Use ONLY the music tools.\n\
+- play: pass the song/artist name as 'query' — it searches and plays automatically\n\
+- status: check what is currently playing\n\
+- control: pause, resume, next, previous, volume, shuffle\n\
+Do NOT use wikipedia or any other tools.",
 
         ToolDomain::Knowledge => "\
 CURRENT TASK: Knowledge/information query.\n\
