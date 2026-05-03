@@ -5644,7 +5644,7 @@ async fn oauth_authorize_handler(
         sessions.insert(
             state_nonce.clone(),
             oauth_callback::PkceSession {
-                provider_id: provider_id.clone(),
+                provider_id: provider.id.clone(),
                 code_verifier,
                 extension_id,
                 created_at: std::time::Instant::now(),
