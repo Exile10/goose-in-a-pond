@@ -15,7 +15,9 @@ use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
 use pond_core::ports::tool_registry::ToolRegistryPort;
 use pond_core::prompts::PromptState;
+use pond_core::services::domain_classifier::classify_domain;
 use pond_core::services::prompt_builder::build_prompt_partition;
+use pond_core::services::tool_domains::{domain_hint, tool_filter_for_domain};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -610,6 +612,16 @@ impl GooseAdapter {
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
 
+        // ── 0. Domain classification (pure, zero-cost) ──────────────────────
+        // Classify the user message into a tool domain BEFORE building the
+        // system prompt. This determines which tools and hints the LLM sees.
+        let domain = classify_domain(&request.message);
+        tracing::info!(
+            domain = ?domain,
+            message = %request.message,
+            "Domain classified for tool routing"
+        );
+
         // ── 1-4. System prompt, extras, skills, memory — fetched in parallel ─
         let memory_limit = if settings.agent_memory_inject {
             Some(settings.agent_memory_limit as usize)
@@ -818,6 +830,18 @@ impl GooseAdapter {
             }
         }
 
+        // ── Domain hint injection ───────────────────────────────────────
+        // Inject a domain-specific hint into the system prompt so the LLM
+        // knows which tools to prefer for this request. The hint is keyed
+        // as "domain_hint" so it's replaced (not accumulated) each turn.
+        let hint = domain_hint(domain);
+        if !hint.is_empty() {
+            self.agent
+                .extend_system_prompt("domain_hint".to_string(), hint.to_string())
+                .await;
+            tracing::debug!(domain = ?domain, "Injected domain hint into system prompt");
+        }
+
         // ── Token-budgeted memory injection ──────────────────────────────
         //
         // Derive a CompactionProfile from the effective context window so
@@ -946,13 +970,35 @@ impl GooseAdapter {
         // hallucinated tool calls.
         let all_tools = self.agent.list_tools(&goose_sid, None).await;
 
-        let allowed_tools: std::collections::HashSet<String> =
+        let mut allowed_tools: std::collections::HashSet<String> =
             all_tools.iter().map(|t| t.name.to_string()).collect();
+
+        let all_tool_count = allowed_tools.len();
+
+        // Apply domain-based tool filtering: narrow the allowed set to only
+        // tools relevant to the classified domain. General domain skips this
+        // (tool_filter_for_domain returns None), preserving all tools.
+        if let Some(filter) = tool_filter_for_domain(domain) {
+            let filter_set: HashSet<String> = filter.iter().map(|s| s.to_string()).collect();
+            allowed_tools.retain(|t| filter_set.contains(t));
+            tracing::info!(
+                domain = ?domain,
+                filtered = allowed_tools.len(),
+                total = all_tool_count,
+                "Domain filter applied: {} -> {} tools",
+                all_tool_count,
+                allowed_tools.len(),
+            );
+        }
 
         tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         // Group tools by extension prefix and inject external extension
         // descriptions so the agent knows about MCP tools (music, filesystem, etc.).
+        //
+        // When a domain filter is active (non-General), only include extensions
+        // whose tools are in the allowed set. This prevents the LLM from seeing
+        // tool descriptions for domains it shouldn't touch.
         {
             let mut ext_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
             for tool in &all_tools {
@@ -989,9 +1035,32 @@ impl GooseAdapter {
                 "tom",
             ];
 
+            // When a domain filter is active, derive the set of allowed
+            // extension prefixes from the filtered tool names. Only extensions
+            // with at least one tool in the allowed set will be described.
+            let domain_has_filter = tool_filter_for_domain(domain).is_some();
+            let allowed_ext_prefixes: HashSet<String> = if domain_has_filter {
+                allowed_tools
+                    .iter()
+                    .filter_map(|t| t.split("__").next().map(|s| s.to_string()))
+                    .collect()
+            } else {
+                HashSet::new() // empty = no prefix filtering (show all)
+            };
+
             let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
                 .into_iter()
-                .filter(|(name, _)| !BUILTIN_EXTENSIONS.contains(&name.as_str()))
+                .filter(|(name, _)| {
+                    // Always filter out builtins
+                    if BUILTIN_EXTENSIONS.contains(&name.as_str()) {
+                        return false;
+                    }
+                    // When domain filter is active, only include extensions in the domain
+                    if domain_has_filter && !allowed_ext_prefixes.contains(name) {
+                        return false;
+                    }
+                    true
+                })
                 .collect();
 
             if !external_extensions.is_empty() {
@@ -1013,6 +1082,7 @@ impl GooseAdapter {
 
                 tracing::info!(
                     extensions = external_extensions.len(),
+                    domain = ?domain,
                     "Injecting {} external extension(s) into system prompt",
                     external_extensions.len(),
                 );

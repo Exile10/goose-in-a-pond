@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod compact_encoding;
 pub mod context_budget;
+pub mod domain_classifier;
 pub mod context_compactor;
 pub mod context_monitor;
 pub mod fallback_provider;
@@ -39,6 +40,7 @@ pub mod thought_filter;
 pub mod tool_cache;
 pub mod tool_call_schemas;
 pub mod tool_call_validator;
+pub mod tool_domains;
 pub mod tool_output_compactor;
 pub mod tool_registry;
 pub mod tool_request_detector;
