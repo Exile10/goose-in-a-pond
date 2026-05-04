@@ -1616,6 +1616,44 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
+    // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
+    let embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    > = {
+        use pond_core::ports::embedding::EmbeddingProvider as _;
+        if settings.embedding_provider == "none" {
+            tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
+            None
+        } else {
+            let emb_model = if settings.active_embedding_model.is_empty() {
+                "all-MiniLM-L6-v2"
+            } else {
+                &settings.active_embedding_model
+            };
+            let cache_dir = data_dir.join("models").join("embedding");
+            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                emb_model,
+                Some(cache_dir),
+            ) {
+                Ok(provider) => {
+                    tracing::info!(
+                        model = provider.model_name(),
+                        dims = provider.dimensions(),
+                        "embedding provider ready"
+                    );
+                    Some(Arc::new(provider)
+                        as Arc<
+                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
+                        >)
+                }
+                Err(e) => {
+                    tracing::warn!("embedding provider failed to init: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1636,7 +1674,7 @@ async fn run_server(
         profile_repo,
         device_registry,
         memory_repo,
-        embedding_provider: None,
+        embedding_provider,
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
