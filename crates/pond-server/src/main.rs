@@ -4029,6 +4029,11 @@ async fn sync_assignments_to_settings(
                     }
                 }
             }
+            "embedding" => {
+                let _ = settings_repo
+                    .set_key("active_embedding_model", model_name.to_string())
+                    .await;
+            }
             other => {
                 tracing::debug!("sync_assignments_to_settings: unknown role '{other}', skipping");
             }
@@ -4063,7 +4068,7 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 match ModelCategory::from_str(cat_str) {
                     Some(cat) => repo.list_by_category(&cat).await?,
                     None => {
-                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama");
+                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama, embedding");
                         std::process::exit(1);
                     }
                 }

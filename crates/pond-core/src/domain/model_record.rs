@@ -1,8 +1,9 @@
 //! Model catalog domain types.
 //!
 //! `ModelRecord` is the single source of truth for a model's metadata,
-//! covering all four families: LLM (gguf/llamafile/ollama), ASR (whisper),
-//! and TTS (piper/http). Family-specific fields are `Option<_>`.
+//! covering all five families: LLM (gguf/llamafile/ollama), ASR (whisper),
+//! TTS (piper/http), and Embedding (ONNX sentence encoders).
+//! Family-specific fields are `Option<_>`.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,29 +25,33 @@ pub enum ModelCategory {
     TtsPiper,
     /// HTTP TTS server (OpenAI-compatible /v1/audio/speech).
     TtsHttp,
+    /// Sentence embedding model (ONNX, e.g. all-MiniLM-L6-v2 via fastembed).
+    Embedding,
 }
 
 impl ModelCategory {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Gguf      => "gguf",
+            Self::Gguf => "gguf",
             Self::Llamafile => "llamafile",
-            Self::Ollama    => "ollama",
-            Self::Whisper   => "whisper",
-            Self::TtsPiper  => "tts_piper",
-            Self::TtsHttp   => "tts_http",
+            Self::Ollama => "ollama",
+            Self::Whisper => "whisper",
+            Self::TtsPiper => "tts_piper",
+            Self::TtsHttp => "tts_http",
+            Self::Embedding => "embedding",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "gguf"      => Some(Self::Gguf),
+            "gguf" => Some(Self::Gguf),
             "llamafile" => Some(Self::Llamafile),
-            "ollama"    => Some(Self::Ollama),
-            "whisper"   => Some(Self::Whisper),
+            "ollama" => Some(Self::Ollama),
+            "whisper" => Some(Self::Whisper),
             "tts_piper" | "tts" => Some(Self::TtsPiper),
-            "tts_http"  => Some(Self::TtsHttp),
-            _           => None,
+            "tts_http" => Some(Self::TtsHttp),
+            "embedding" => Some(Self::Embedding),
+            _ => None,
         }
     }
 
@@ -63,6 +68,11 @@ impl ModelCategory {
     /// True for text-to-speech models.
     pub fn is_tts(&self) -> bool {
         matches!(self, Self::TtsPiper | Self::TtsHttp)
+    }
+
+    /// True for sentence embedding models.
+    pub fn is_embedding(&self) -> bool {
+        matches!(self, Self::Embedding)
     }
 }
 
@@ -159,17 +169,29 @@ impl BinaryRecord {
 
     pub fn current_platform_key() -> &'static str {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        { "macos-arm64" }
+        {
+            "macos-arm64"
+        }
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        { "macos-x86_64" }
+        {
+            "macos-x86_64"
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        { "linux-x86_64" }
+        {
+            "linux-x86_64"
+        }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        { "linux-aarch64" }
+        {
+            "linux-aarch64"
+        }
         #[cfg(target_os = "windows")]
-        { "windows-x86_64" }
+        {
+            "windows-x86_64"
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        { "unknown" }
+        {
+            "unknown"
+        }
     }
 }
 
@@ -177,7 +199,7 @@ impl BinaryRecord {
 
 /// Records which model is assigned to a given role.
 ///
-/// Valid roles: `"chat"` | `"think"` | `"task"` | `"asr"` | `"tts"`.
+/// Valid roles: `"chat"` | `"think"` | `"task"` | `"asr"` | `"tts"` | `"embedding"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRoleAssignment {
     pub role: String,
@@ -189,9 +211,10 @@ impl ModelRoleAssignment {
     pub fn category_matches_role(category: &ModelCategory, role: &str) -> bool {
         match role {
             "chat" | "think" | "task" => category.is_llm(),
-            "asr"                     => category.is_asr(),
-            "tts"                     => category.is_tts(),
-            _                         => false,
+            "asr" => category.is_asr(),
+            "tts" => category.is_tts(),
+            "embedding" => category.is_embedding(),
+            _ => false,
         }
     }
 }
@@ -211,6 +234,7 @@ mod tests {
             ModelCategory::Whisper,
             ModelCategory::TtsPiper,
             ModelCategory::TtsHttp,
+            ModelCategory::Embedding,
         ];
         for cat in &cats {
             let s = cat.as_str();
@@ -230,6 +254,11 @@ mod tests {
         assert!(ModelCategory::TtsPiper.is_tts());
         assert!(ModelCategory::TtsHttp.is_tts());
         assert!(!ModelCategory::Gguf.is_tts());
+        assert!(ModelCategory::Embedding.is_embedding());
+        assert!(!ModelCategory::Gguf.is_embedding());
+        assert!(!ModelCategory::Embedding.is_llm());
+        assert!(!ModelCategory::Embedding.is_asr());
+        assert!(!ModelCategory::Embedding.is_tts());
     }
 
     #[test]
@@ -246,21 +275,66 @@ mod tests {
 
     #[test]
     fn category_matches_role() {
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::Gguf, "chat"));
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::Llamafile, "think"));
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::Ollama, "task"));
-        assert!(!ModelRoleAssignment::category_matches_role(&ModelCategory::Whisper, "chat"));
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::Whisper, "asr"));
-        assert!(!ModelRoleAssignment::category_matches_role(&ModelCategory::Gguf, "asr"));
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::TtsPiper, "tts"));
-        assert!(ModelRoleAssignment::category_matches_role(&ModelCategory::TtsHttp, "tts"));
-        assert!(!ModelRoleAssignment::category_matches_role(&ModelCategory::Gguf, "tts"));
-        assert!(!ModelRoleAssignment::category_matches_role(&ModelCategory::Gguf, "unknown"));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "chat"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Llamafile,
+            "think"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Ollama,
+            "task"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Whisper,
+            "chat"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Whisper,
+            "asr"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "asr"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::TtsPiper,
+            "tts"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::TtsHttp,
+            "tts"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "tts"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Embedding,
+            "embedding"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "embedding"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Embedding,
+            "chat"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "unknown"
+        ));
     }
 
     #[test]
     fn tts_legacy_alias() {
         // "tts" string in old registry.json maps to TtsPiper
-        assert_eq!(ModelCategory::from_str("tts"), Some(ModelCategory::TtsPiper));
+        assert_eq!(
+            ModelCategory::from_str("tts"),
+            Some(ModelCategory::TtsPiper)
+        );
     }
 }
