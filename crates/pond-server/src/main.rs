@@ -3091,7 +3091,7 @@ async fn run_status() -> Result<()> {
 // v1.21.0 is the latest release with pre-built tarballs for all four
 // platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
 // Bump this when upgrading — the archive layout is stable across releases.
-const ORT_VERSION: &str = "1.21.0";
+const ORT_VERSION: &str = "1.22.0";
 
 /// Approximate size of the platform library in MB (for the progress message).
 const ORT_APPROX_SIZE_MB: u64 = 30;
