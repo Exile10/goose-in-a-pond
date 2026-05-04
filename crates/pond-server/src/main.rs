@@ -1663,6 +1663,28 @@ async fn run_server(
         }
     };
 
+    // ── Embedding-based domain classifier ─────────────────────────────────────
+    // Pre-compute domain description embeddings for fast cosine-similarity
+    // classification (~10ms per query vs ~2s for LLM classification).
+    let embedding_classifier = if let Some(ref emb) = embedding_provider {
+        match pond_core::services::embedding_classifier::EmbeddingClassifier::new(emb.as_ref())
+            .await
+        {
+            Ok(c) => {
+                tracing::info!("embedding classifier ready — semantic domain routing enabled");
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "embedding classifier init failed: {e} — falling back to keyword routing"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1684,6 +1706,7 @@ async fn run_server(
         device_registry,
         memory_repo,
         embedding_provider,
+        embedding_classifier,
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -2605,6 +2628,8 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         let tool = if text.contains("weather") {
             "weather"
+        } else if text.contains("time") || text.contains("date") || text.contains("clock") {
+            "time"
         } else if text.contains("save_memory") {
             "save_memory"
         } else if text.contains("recall_memory") {
@@ -2620,6 +2645,22 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
         };
 
         println!("[tool-agent] tool={}, executing...", tool);
+
+        // ── Time/date — instant, no network call ─────────────────────────
+        if matches!(tool, "time" | "date" | "clock") {
+            let now = chrono::Local::now();
+            let result = format!(
+                "Current time: {}. Today is {}.",
+                now.format("%H:%M:%S %p"),
+                now.format("%A, %B %d, %Y")
+            );
+            return Ok(Some(pond_api::tool_context::format_tool_context(
+                "time",
+                "current time",
+                message,
+                &result,
+            )));
+        }
 
         // Extract the cleaned query for tool attribution (e.g. "John Cena" from "who is John Cena?")
         let query = pond_mcp_server::clean_query_for_search(message);
@@ -4679,6 +4720,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 model_role,
                 images: Vec::new(),
                 voice_mode: false,
+                domain: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -4738,6 +4780,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     model_role,
                     images: Vec::new(),
                     voice_mode: false,
+                    domain: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

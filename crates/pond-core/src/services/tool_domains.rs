@@ -22,13 +22,13 @@ use super::domain_classifier::ToolDomain;
 /// as MCP tool sets grow.
 pub fn tool_filter_for_domain(domain: ToolDomain) -> Option<Vec<&'static str>> {
     match domain {
-        ToolDomain::Music => Some(vec![
-            "music__play",
-            "music__status",
-            "music__control",
+        ToolDomain::Music => Some(vec!["music__play", "music__status", "music__control"]),
+        ToolDomain::Weather => Some(vec!["giap__get_current_weather"]),
+        ToolDomain::Knowledge => Some(vec![
+            "giap__search_wikipedia",
+            "giap__wikipedia_get_article",
         ]),
-        // Other domains: no filter for now (all tools available).
-        // Refine as domain-specific MCP servers are added.
+        // No filter — all tools remain available.
         ToolDomain::General => None,
         _ => None,
     }
@@ -41,20 +41,26 @@ pub fn tool_filter_for_domain(domain: ToolDomain) -> Option<Vec<&'static str>> {
 /// agent processes the request.
 pub fn domain_hint(domain: ToolDomain) -> &'static str {
     match domain {
-        ToolDomain::Music => "\
+        ToolDomain::Music => {
+            "\
 CURRENT TASK: Music request. Use ONLY the music tools.\n\
 - play: pass the song/artist name as 'query' — it searches and plays automatically\n\
 - status: check what is currently playing\n\
 - control: pause, resume, next, previous, volume, shuffle\n\
-Do NOT use wikipedia or any other tools.",
+Do NOT use wikipedia or any other tools."
+        }
 
-        ToolDomain::Knowledge => "\
+        ToolDomain::Knowledge => {
+            "\
 CURRENT TASK: Knowledge/information query.\n\
-Use search_wikipedia or wikipedia_get_article to find information.",
+Use search_wikipedia or wikipedia_get_article to find information."
+        }
 
-        ToolDomain::Weather => "\
+        ToolDomain::Weather => {
+            "\
 CURRENT TASK: Weather query.\n\
-Use get_current_weather to get weather information.",
+Use get_current_weather to get weather information."
+        }
 
         _ => "",
     }
@@ -70,9 +76,27 @@ mod tests {
         assert!(filter.is_some());
         let names = filter.unwrap();
         assert!(names.contains(&"music__play"));
-        assert!(names.contains(&"music__search_tracks"));
-        assert!(names.contains(&"music__pause"));
-        assert!(names.contains(&"music__now_playing"));
+        assert!(names.contains(&"music__status"));
+        assert!(names.contains(&"music__control"));
+    }
+
+    #[test]
+    fn weather_has_tool_filter() {
+        let filter = tool_filter_for_domain(ToolDomain::Weather);
+        assert!(filter.is_some());
+        let names = filter.unwrap();
+        assert!(names.contains(&"giap__get_current_weather"));
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn knowledge_has_tool_filter() {
+        let filter = tool_filter_for_domain(ToolDomain::Knowledge);
+        assert!(filter.is_some());
+        let names = filter.unwrap();
+        assert!(names.contains(&"giap__search_wikipedia"));
+        assert!(names.contains(&"giap__wikipedia_get_article"));
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
@@ -81,9 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn non_music_domains_have_no_filter() {
-        assert!(tool_filter_for_domain(ToolDomain::Knowledge).is_none());
-        assert!(tool_filter_for_domain(ToolDomain::Weather).is_none());
+    fn non_specialized_domains_have_no_filter() {
         assert!(tool_filter_for_domain(ToolDomain::Home).is_none());
         assert!(tool_filter_for_domain(ToolDomain::Schedule).is_none());
         assert!(tool_filter_for_domain(ToolDomain::Memory).is_none());

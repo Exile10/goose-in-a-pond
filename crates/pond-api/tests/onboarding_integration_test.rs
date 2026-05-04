@@ -111,6 +111,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         device_registry: Arc::new(MockDeviceRegistry),
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
+        embedding_classifier: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
