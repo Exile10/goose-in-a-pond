@@ -303,10 +303,11 @@ export class PondApiClient {
         return null;
       }
       return {
-        chat:  normalize(raw.chat),
-        tool:  raw.tool ?? null,
-        asr:   normalize(raw.asr),
-        tts:   normalize(raw.tts),
+        chat:      normalize(raw.chat),
+        tool:      raw.tool ?? null,
+        asr:       normalize(raw.asr),
+        tts:       normalize(raw.tts),
+        embedding: normalize(raw.embedding),
       } as ModelActiveRoles;
     });
   }

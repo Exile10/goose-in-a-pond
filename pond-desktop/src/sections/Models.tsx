@@ -73,6 +73,25 @@ const ROLE_CHIP_VARIANT: Record<string, string> = {
   chat: "secondary", tool: "success", asr: "primary", tts: "danger", embedding: "accent",
 };
 
+/** Infer embedding dimension from well-known model names. */
+function inferEmbeddingDimension(modelName: string): string | null {
+  const n = modelName.toLowerCase();
+  if (n.includes("minilm-l6") || n.includes("minilm_l6")) return "384d";
+  if (n.includes("minilm-l12") || n.includes("minilm_l12")) return "384d";
+  if (n.includes("bge-small") || n.includes("bge_small")) return "384d";
+  if (n.includes("bge-base") || n.includes("bge_base")) return "768d";
+  if (n.includes("bge-large") || n.includes("bge_large")) return "1024d";
+  if (n.includes("e5-small") || n.includes("e5_small")) return "384d";
+  if (n.includes("e5-base") || n.includes("e5_base")) return "768d";
+  if (n.includes("e5-large") || n.includes("e5_large")) return "1024d";
+  if (n.includes("multilingual-e5")) return "768d";
+  if (n.includes("nomic-embed")) return "768d";
+  if (n.includes("gte-small") || n.includes("gte_small")) return "384d";
+  if (n.includes("gte-base") || n.includes("gte_base")) return "768d";
+  if (n.includes("gte-large") || n.includes("gte_large")) return "1024d";
+  return null;
+}
+
 function ActiveRolesBanner({
   roles,
   memoryStatus,
@@ -110,6 +129,57 @@ function ActiveRolesBanner({
           const a = roles?.[key];
           const isSet = !!(a?.provider && a?.model);
           const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
+
+          // Embedding chip: show model name + dimension + green Active indicator
+          if (key === "embedding") {
+            const dim = isSet ? inferEmbeddingDimension(a!.model) : null;
+            return (
+              <div
+                key={key}
+                className={`role-chip role-chip--${variant}${isSet ? " is-set" : ""}`}
+                onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
+                style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
+                title={!isSet ? `Click to set ${label} model` : undefined}
+              >
+                <div className="role-chip__bar" />
+                <div className="role-chip__body">
+                  <div className="role-chip__head">
+                    {icon}
+                    <span className="role-chip__role">{label}</span>
+                    {isSet && (
+                      <span style={{
+                        marginLeft: "auto",
+                        display: "flex", alignItems: "center", gap: 3,
+                        fontSize: "var(--text-xs)", fontWeight: 600,
+                        color: "var(--color-success)",
+                      }}>
+                        <CheckCircle size={10} strokeWidth={2.5} />
+                        Active
+                      </span>
+                    )}
+                  </div>
+                  <span className={`role-chip__value ${isSet ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+                    {isSet
+                      ? <>
+                          {a!.model}
+                          {dim && (
+                            <span style={{
+                              marginLeft: 5,
+                              fontSize: "var(--text-xs)",
+                              color: "var(--color-text-secondary)",
+                              fontFamily: "var(--font-mono)",
+                            }}>
+                              {dim}
+                            </span>
+                          )}
+                        </>
+                      : "---"}
+                  </span>
+                </div>
+              </div>
+            );
+          }
+
           return (
             <div
               key={key}
@@ -1230,9 +1300,11 @@ function EmbeddingCatalogPanel({
   const state = useAppState();
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [dlMsg, setDlMsg] = useState<string | null>(null);
+  // Track models that returned "ready" immediately — treated as installed
+  const [readyModels, setReadyModels] = useState<Set<string>>(new Set());
 
-  const downloaded = models.filter((m) => m.downloaded !== false);
-  const available  = models.filter((m) => m.downloaded === false);
+  const downloaded = models.filter((m) => m.downloaded !== false || readyModels.has(m.name));
+  const available  = models.filter((m) => m.downloaded === false && !readyModels.has(m.name));
 
   const activeEmbedding = activeRoles?.embedding;
 
@@ -1240,8 +1312,17 @@ function EmbeddingCatalogPanel({
     setDownloadingModel(m.name); setDlMsg(null);
     try {
       const res = await api.downloadModel("embedding", m.name);
-      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
-      onDownloadStarted();
+      if (res.status === "ready") {
+        // fastembed auto-downloads on first use — mark as installed immediately
+        setReadyModels((prev) => new Set([...prev, m.name]));
+        setDlMsg(`${m.name} is ready — downloads automatically on first use.`);
+      } else if (res.status === "already_downloaded") {
+        setDlMsg(`${m.name} already downloaded.`);
+        onDownloadStarted();
+      } else {
+        setDlMsg(`Download started: ${m.name}`);
+        onDownloadStarted();
+      }
     } catch (e) { setDlMsg(`Error: ${String(e)}`); }
     finally { setDownloadingModel(null); }
   }
@@ -1251,6 +1332,14 @@ function EmbeddingCatalogPanel({
       <div className="seg-banner" style={{ borderColor: `${CAT_COLOR.embedding}33`, background: `${CAT_COLOR.embedding}0d` }}>
         <Cpu size={14} style={{ color: CAT_COLOR.embedding, flexShrink: 0 }} />
         <span>Embedding models help the agent understand your intent and route queries to the right tools</span>
+      </div>
+
+      {/* First-use note */}
+      <div className="seg-banner" style={{ borderColor: "var(--color-border)", background: "var(--grey-50)" }}>
+        <Download size={13} style={{ color: "var(--grey-500)", flexShrink: 0 }} />
+        <span style={{ color: "var(--grey-600)", fontSize: "var(--text-sm)" }}>
+          First-time setup: the model downloads 23-86 MB on first use. Check server logs for progress.
+        </span>
       </div>
 
       {dlMsg && (
@@ -1271,7 +1360,7 @@ function EmbeddingCatalogPanel({
         </p>
       )}
 
-      {/* Downloaded models */}
+      {/* Downloaded / ready models */}
       {downloaded.length > 0 && (
         <>
           <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>

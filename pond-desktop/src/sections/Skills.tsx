@@ -47,7 +47,8 @@ export function Skills() {
     }
   }
 
-  async function remove(id: string) {
+  async function remove(id: string, skillName: string) {
+    if (!confirm(`Delete skill "${skillName}"? This cannot be undone.`)) return;
     try {
       await api.removeSkill(id);
       load();
@@ -172,7 +173,7 @@ export function Skills() {
                   variant="light"
                   color="danger"
                   isIconOnly
-                  onPress={() => remove(s.id)}
+                  onPress={() => remove(s.id, s.name)}
                   aria-label={`Delete ${s.name}`}
                 >
                   <Trash2 size={14} />

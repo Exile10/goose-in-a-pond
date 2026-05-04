@@ -767,6 +767,7 @@ export function Memory() {
   }
 
   async function handleDelete(id: string) {
+    if (!confirm("Delete this memory? This cannot be undone.")) return;
     try {
       await api.deleteMemory(id);
       setItems((prev) => prev.filter((m) => m.id !== id));
@@ -779,6 +780,19 @@ export function Memory() {
   const visibleItems = items.filter(
     (m) => !m.lifecycle || m.lifecycle === "active",
   );
+
+  async function handleDeleteAll() {
+    const count = visibleItems.length;
+    if (!count) return;
+    if (!confirm(`Delete all ${count} memories? This cannot be undone.`)) return;
+    const errs: string[] = [];
+    for (const m of visibleItems) {
+      try { await api.deleteMemory(m.id); }
+      catch (e) { errs.push(String(e)); }
+    }
+    load();
+    if (errs.length) setError(`${errs.length} deletion(s) failed.`);
+  }
 
   // Segment counts for filter row
   const segCounts = SEGMENT_ORDER.reduce<Partial<Record<MemorySegment, number>>>((acc, seg) => {
@@ -806,6 +820,12 @@ export function Memory() {
             <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
             Refresh
           </Button>
+          {!loading && visibleItems.length > 0 && (
+            <Button size="sm" variant="ghost" color="danger" onPress={handleDeleteAll}>
+              <Trash2 size={14} strokeWidth={1.8} />
+              Delete All
+            </Button>
+          )}
           <Button size="sm" color="secondary" onPress={() => setShowAddModal(true)}>
             <Plus size={14} strokeWidth={2} />
             Add Memory
