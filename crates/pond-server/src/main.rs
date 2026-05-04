@@ -614,6 +614,10 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
+    // Step 6: ONNX Runtime — detect or auto-download
+    println!("\n  [6/7] Checking ONNX Runtime...");
+    ensure_onnx_runtime();
+
     // Step 7 (face-onnx feature only): face recognition models
     #[cfg(feature = "face-onnx")]
     {
@@ -778,10 +782,15 @@ async fn run_server(
     );
     println!("  ╚═══════════════════════════════════════╝");
 
+    // Ensure the ONNX Runtime shared library is available — check system
+    // paths first, then auto-download from GitHub Releases if needed.
+    // Must run before any ONNX-dependent init (face recognition, embeddings).
+    ensure_onnx_runtime();
+
     // Bake in the face-recognition runtime defaults so the server Just Works
-    // on a fresh macOS install without the operator having to remember a
-    // four-line env-var incantation.  Every var stays overridable — we only
-    // set it when it is currently *unset*.
+    // on a fresh install without the operator having to remember a four-line
+    // env-var incantation.  Every var stays overridable — we only set it
+    // when it is currently *unset*.
     apply_face_recognition_defaults();
 
     // Initialize databases
@@ -3077,20 +3086,259 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
-/// Populate the face-recognition env vars with values that are known to
-/// work end-to-end on a fresh macOS dev install, so the operator no longer
-/// has to remember:
+// ── ONNX Runtime version pinned for auto-download ────────────────────────────
+//
+// v1.21.0 is the latest release with pre-built tarballs for all four
+// platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
+// Bump this when upgrading — the archive layout is stable across releases.
+const ORT_VERSION: &str = "1.21.0";
+
+/// Approximate size of the platform library in MB (for the progress message).
+const ORT_APPROX_SIZE_MB: u64 = 30;
+
+/// Ensure that `ORT_DYLIB_PATH` points at a usable ONNX Runtime shared
+/// library.  Resolution order:
 ///
-/// ```bash
-/// ORT_DYLIB_PATH=… POND_FACE_ANTISPOOF_PATH=… \
-/// POND_FACE_ANTISPOOF_LIVE_INDEX=2 \
-/// POND_FACE_ANTISPOOF_PIXEL_SCALE=unit \
-/// cargo run … serve
+///   1. Explicit env var — operator knows best; skip everything.
+///   2. Well-known system paths (Homebrew, system `/usr/lib`).
+///   3. Previously-downloaded local copy in `$DATA_DIR/lib/`.
+///   4. Auto-download from GitHub Releases into `$DATA_DIR/lib/`.
+///
+/// Runs synchronously before tokio starts, so it shells out to `curl`+`tar`
+/// instead of using async I/O.  Failures are non-fatal — the server starts
+/// without ONNX-dependent features (face recognition, embeddings).
+fn ensure_onnx_runtime() {
+    // ── 1. Explicit env var ──────────────────────────────────────────────
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+
+    // ── 2. Well-known system locations ───────────────────────────────────
+    let system_candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/lib/libonnxruntime.dylib",
+            "/usr/local/lib/libonnxruntime.dylib",
+        ]
+    } else {
+        &[
+            "/usr/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            "/usr/lib/aarch64-linux-gnu/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+        ]
+    };
+
+    for p in system_candidates {
+        if std::path::Path::new(p).exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+            return;
+        }
+    }
+
+    // ── 3. Previously-downloaded local copy ──────────────────────────────
+    let data_dir = default_data_dir();
+    let (lib_name, versioned_name) = ort_lib_names();
+    let lib_dir = data_dir.join("lib");
+    let local_versioned = lib_dir.join(versioned_name);
+    let local_unversioned = lib_dir.join(lib_name);
+
+    // Prefer the versioned file (it is the real binary); fall back to the
+    // unversioned name in case someone placed it there manually.
+    for candidate in [&local_versioned, &local_unversioned] {
+        if candidate.exists() {
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", candidate) };
+            return;
+        }
+    }
+
+    // ── 4. Auto-download ─────────────────────────────────────────────────
+    let (os_tag, arch_tag) = match ort_platform_tags() {
+        Some(tags) => tags,
+        None => {
+            eprintln!(
+                "  ⚠  ONNX Runtime auto-download: unsupported platform \
+                 (not macOS/Linux, or unsupported arch)"
+            );
+            return;
+        }
+    };
+
+    let archive_stem = format!("onnxruntime-{os_tag}-{arch_tag}-{ORT_VERSION}");
+    let url = format!(
+        "https://github.com/microsoft/onnxruntime/releases/download/\
+         v{ORT_VERSION}/{archive_stem}.tgz"
+    );
+
+    println!(
+        "  ⬇  ONNX Runtime v{ORT_VERSION} not found — downloading (~{ORT_APPROX_SIZE_MB} MB)..."
+    );
+
+    match download_and_extract_ort(&url, &lib_dir, &archive_stem) {
+        Ok(lib_path) => {
+            println!("  ✅ ONNX Runtime installed to {}", lib_path.display());
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib_path) };
+        }
+        Err(e) => {
+            eprintln!("  ⚠  Failed to download ONNX Runtime: {e}");
+            eprintln!("     Embedding models and face recognition will be unavailable.");
+            eprintln!("     Install manually: brew install onnxruntime");
+        }
+    }
+}
+
+/// Returns `(lib_name, versioned_name)` for the current platform.
+///
+/// - macOS: `("libonnxruntime.dylib", "libonnxruntime.{ver}.dylib")`
+/// - Linux: `("libonnxruntime.so",    "libonnxruntime.so.{ver}")`
+fn ort_lib_names() -> (&'static str, String) {
+    if cfg!(target_os = "macos") {
+        (
+            "libonnxruntime.dylib",
+            format!("libonnxruntime.{ORT_VERSION}.dylib"),
+        )
+    } else {
+        (
+            "libonnxruntime.so",
+            format!("libonnxruntime.so.{ORT_VERSION}"),
+        )
+    }
+}
+
+/// Returns `(os_tag, arch_tag)` matching the GitHub release archive naming
+/// convention, e.g. `("osx", "arm64")` or `("linux", "x64")`.
+fn ort_platform_tags() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "osx"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return None;
+    };
+
+    let arch = if cfg!(target_arch = "aarch64") {
+        if cfg!(target_os = "macos") {
+            "arm64"
+        } else {
+            "aarch64"
+        }
+    } else if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "macos") {
+            "x86_64"
+        } else {
+            "x64"
+        }
+    } else {
+        return None;
+    };
+
+    Some((os, arch))
+}
+
+/// Download an ONNX Runtime release tarball and extract the shared library
+/// into `lib_dir`.  Uses `curl` + `tar` which are available on both macOS
+/// and Linux without pulling in extra Rust dependencies.
+///
+/// Archive layout (stable across ORT releases):
+/// ```text
+/// onnxruntime-{os}-{arch}-{ver}/
+///   lib/
+///     libonnxruntime.{ver}.dylib   ← real file  (macOS)
+///     libonnxruntime.dylib         ← symlink     (macOS)
+///     libonnxruntime.so.{ver}      ← real file  (Linux)
+///     libonnxruntime.so.1          ← symlink     (Linux)
+///     libonnxruntime.so            ← symlink     (Linux)
 /// ```
 ///
+/// We extract only the `lib/` subtree with `--strip-components=1`, which
+/// places the files directly into `lib_dir/lib/…` → we then just point at
+/// the versioned file.
+fn download_and_extract_ort(
+    url: &str,
+    lib_dir: &std::path::Path,
+    archive_stem: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::process::Command;
+
+    // Ensure the target directory exists.
+    std::fs::create_dir_all(lib_dir)?;
+
+    let tmp_dir = std::env::temp_dir().join("giap-ort-download");
+    // Clean up any leftover from a previous failed attempt.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let tgz = tmp_dir.join("ort.tgz");
+
+    // ── Download ─────────────────────────────────────────────────────────
+    let status = Command::new("curl")
+        .args([
+            "-fSL",           // fail on HTTP errors, show errors, follow redirects
+            "--progress-bar", // minimal progress indicator
+            url,
+            "-o",
+        ])
+        .arg(&tgz)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run curl: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("curl exited with status {status} for {url}");
+    }
+
+    // ── Extract lib/ subtree directly into lib_dir ───────────────────────
+    // `--strip-components=1` removes the top-level `onnxruntime-{os}-…/`
+    // prefix, so `lib/libonnxruntime.*` lands at `{lib_dir}/lib/…`.
+    //
+    // We use `--include` (GNU tar) / `--include` (bsdtar, macOS default) to
+    // extract only the library files, skipping headers and pkgconfig.
+    let status = Command::new("tar")
+        .args(["xzf"])
+        .arg(&tgz)
+        .args(["-C"])
+        .arg(&tmp_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("tar extraction failed with status {status}");
+    }
+
+    // ── Copy the library files into lib_dir ──────────────────────────────
+    let extracted_lib_dir = tmp_dir.join(archive_stem).join("lib");
+    let (_, versioned_name) = ort_lib_names();
+
+    let src = extracted_lib_dir.join(&versioned_name);
+    if !src.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "{versioned_name} not found in extracted archive at {}",
+            extracted_lib_dir.display()
+        );
+    }
+
+    let dest = lib_dir.join(&versioned_name);
+    std::fs::copy(&src, &dest).map_err(|e| {
+        anyhow::anyhow!("failed to copy {} → {}: {e}", src.display(), dest.display())
+    })?;
+
+    // Clean up the temp directory.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    Ok(dest)
+}
+
+/// Populate the face-recognition-specific env vars with values that are
+/// known to work end-to-end on a fresh install.
+///
+/// **Does not touch `ORT_DYLIB_PATH`** — that is handled by
+/// `ensure_onnx_runtime()`, which must run first.
+///
 /// Each var is only set when currently **unset** — explicit values from
-/// the operator's shell keep taking precedence, so nothing a power user
-/// has configured gets clobbered.
+/// the operator's shell keep taking precedence.
 ///
 /// The anti-spoof tuning (`LIVE_INDEX=2`, `PIXEL_SCALE=unit`) reflects the
 /// specific 3-class Silent-Face ONNX file we shipped install instructions
@@ -3098,22 +3346,6 @@ async fn run_status() -> Result<()> {
 /// expects `[0, 1]` pixels.  Other exports need different values; override
 /// at the shell if you swap the model file.
 fn apply_face_recognition_defaults() {
-    // ONNX Runtime dylib — Homebrew installs to /opt/homebrew on Apple
-    // Silicon and /usr/local on Intel.  Try both.
-    let ort_candidates = [
-        "/opt/homebrew/lib/libonnxruntime.dylib",
-        "/usr/local/lib/libonnxruntime.dylib",
-    ];
-    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-        for p in ort_candidates {
-            if std::path::Path::new(p).exists() {
-                // SAFETY: single-threaded setup, before any worker spawns.
-                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
-                break;
-            }
-        }
-    }
-
     // Anti-spoof ONNX model — default to the canonical location under the
     // platform data dir so users who followed the README land here too.
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
