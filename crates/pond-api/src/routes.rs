@@ -2455,6 +2455,14 @@ async fn activate_model(
                 .set_key("active_tts_model", name.clone())
                 .await;
         }
+        "embedding" => {
+            let _ = settings_repo
+                .set_key("active_embedding_model", name.clone())
+                .await;
+            let _ = settings_repo
+                .set_key("embedding_provider", provider.to_string())
+                .await;
+        }
         _ => {}
     }
 
