@@ -2177,6 +2177,13 @@ async fn download_model(
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
     }
+
+    // Embedding models are auto-downloaded by fastembed on first use.
+    // No URL fetch needed — just confirm readiness.
+    if cat == ModelCategory::Embedding {
+        return Ok(Json(json!({"status": "ready", "name": name, "note": "Embedding model will download automatically on first use"})));
+    }
+
     let url = m.url.clone().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
