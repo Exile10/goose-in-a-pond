@@ -48,11 +48,7 @@ impl ScheduleExecutor for AgentScheduleExecutor {
 
         match kind {
             TaskKind::AgentPrompt { prompt } => {
-                let session_id = format!(
-                    "sched-{}-{}",
-                    task_id,
-                    chrono::Utc::now().timestamp()
-                );
+                let session_id = format!("sched-{}-{}", task_id, chrono::Utc::now().timestamp());
                 // Create an ephemeral session for this run.
                 let _ = self
                     .session_storage
@@ -65,6 +61,7 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                     model_role: "task".to_string(),
                     images: vec![],
                     voice_mode: false,
+                    domain: None,
                 };
 
                 tracing::info!("[scheduler] executing prompt for task {task_id}");
@@ -82,9 +79,7 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                     .post(webhook_url)
                     .send()
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("task {task_id}: webhook POST failed: {e}")
-                    })?;
+                    .map_err(|e| anyhow::anyhow!("task {task_id}: webhook POST failed: {e}"))?;
 
                 let status = resp.status();
                 if !status.is_success() {

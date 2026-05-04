@@ -214,8 +214,7 @@ pub fn classify_domain(message: &str) -> ToolDomain {
         "history of",
         "meaning of",
     ];
-    if KNOWLEDGE_PREFIXES.iter().any(|k| stripped.starts_with(k))
-        || stripped.contains("wikipedia")
+    if KNOWLEDGE_PREFIXES.iter().any(|k| stripped.starts_with(k)) || stripped.contains("wikipedia")
     {
         return ToolDomain::Knowledge;
     }
@@ -236,10 +235,7 @@ mod tests {
             ToolDomain::Music,
         );
         assert_eq!(classify_domain("Play some jazz"), ToolDomain::Music);
-        assert_eq!(
-            classify_domain("play bohemian rhapsody"),
-            ToolDomain::Music,
-        );
+        assert_eq!(classify_domain("play bohemian rhapsody"), ToolDomain::Music,);
     }
 
     #[test]
@@ -272,18 +268,9 @@ mod tests {
 
     #[test]
     fn music_contains_keywords() {
-        assert_eq!(
-            classify_domain("open my spotify"),
-            ToolDomain::Music,
-        );
-        assert_eq!(
-            classify_domain("check this album out"),
-            ToolDomain::Music,
-        );
-        assert_eq!(
-            classify_domain("what track is this"),
-            ToolDomain::Music,
-        );
+        assert_eq!(classify_domain("open my spotify"), ToolDomain::Music,);
+        assert_eq!(classify_domain("check this album out"), ToolDomain::Music,);
+        assert_eq!(classify_domain("what track is this"), ToolDomain::Music,);
     }
 
     // ── Knowledge domain ───────────────────────────────────────────
@@ -292,10 +279,7 @@ mod tests {
     fn who_is_routes_to_knowledge_not_music() {
         // "who is Drake" should NOT be Music even though Drake is a musician
         assert_eq!(classify_domain("who is Drake"), ToolDomain::Knowledge);
-        assert_eq!(
-            classify_domain("who was Beethoven"),
-            ToolDomain::Knowledge,
-        );
+        assert_eq!(classify_domain("who was Beethoven"), ToolDomain::Knowledge,);
     }
 
     #[test]
@@ -320,10 +304,7 @@ mod tests {
             classify_domain("explain quantum entanglement"),
             ToolDomain::Knowledge,
         );
-        assert_eq!(
-            classify_domain("define democracy"),
-            ToolDomain::Knowledge,
-        );
+        assert_eq!(classify_domain("define democracy"), ToolDomain::Knowledge,);
         assert_eq!(
             classify_domain("tell me about black holes"),
             ToolDomain::Knowledge,
@@ -346,10 +327,7 @@ mod tests {
 
     #[test]
     fn weather_keywords() {
-        assert_eq!(
-            classify_domain("what's the weather"),
-            ToolDomain::Weather,
-        );
+        assert_eq!(classify_domain("what's the weather"), ToolDomain::Weather,);
         assert_eq!(
             classify_domain("what is the temperature"),
             ToolDomain::Weather,
@@ -358,82 +336,43 @@ mod tests {
             classify_domain("will it rain tomorrow"),
             ToolDomain::Weather,
         );
-        assert_eq!(
-            classify_domain("is it sunny outside"),
-            ToolDomain::Weather,
-        );
-        assert_eq!(
-            classify_domain("how's the humidity"),
-            ToolDomain::Weather,
-        );
-        assert_eq!(
-            classify_domain("check the forecast"),
-            ToolDomain::Weather,
-        );
+        assert_eq!(classify_domain("is it sunny outside"), ToolDomain::Weather,);
+        assert_eq!(classify_domain("how's the humidity"), ToolDomain::Weather,);
+        assert_eq!(classify_domain("check the forecast"), ToolDomain::Weather,);
     }
 
     // ── Home domain ────────────────────────────────────────────────
 
     #[test]
     fn home_prefix_patterns() {
-        assert_eq!(
-            classify_domain("turn on the lights"),
-            ToolDomain::Home,
-        );
-        assert_eq!(
-            classify_domain("turn off the TV"),
-            ToolDomain::Home,
-        );
-        assert_eq!(
-            classify_domain("lock the front door"),
-            ToolDomain::Home,
-        );
-        assert_eq!(
-            classify_domain("list devices"),
-            ToolDomain::Home,
-        );
+        assert_eq!(classify_domain("turn on the lights"), ToolDomain::Home,);
+        assert_eq!(classify_domain("turn off the TV"), ToolDomain::Home,);
+        assert_eq!(classify_domain("lock the front door"), ToolDomain::Home,);
+        assert_eq!(classify_domain("list devices"), ToolDomain::Home,);
     }
 
     #[test]
     fn home_contains_patterns() {
-        assert_eq!(
-            classify_domain("dim the lights to 50%"),
-            ToolDomain::Home,
-        );
+        assert_eq!(classify_domain("dim the lights to 50%"), ToolDomain::Home,);
         assert_eq!(
             classify_domain("set the thermostat to 72"),
             ToolDomain::Home,
         );
-        assert_eq!(
-            classify_domain("is the garage open"),
-            ToolDomain::Home,
-        );
+        assert_eq!(classify_domain("is the garage open"), ToolDomain::Home,);
     }
 
     // ── Schedule domain ────────────────────────────────────────────
 
     #[test]
     fn schedule_patterns() {
-        assert_eq!(
-            classify_domain("remind me at 5pm"),
-            ToolDomain::Schedule,
-        );
-        assert_eq!(
-            classify_domain("schedule a meeting"),
-            ToolDomain::Schedule,
-        );
+        assert_eq!(classify_domain("remind me at 5pm"), ToolDomain::Schedule,);
+        assert_eq!(classify_domain("schedule a meeting"), ToolDomain::Schedule,);
         assert_eq!(
             classify_domain("set an alarm for 7am"),
             ToolDomain::Schedule,
         );
-        assert_eq!(
-            classify_domain("what's on my timer"),
-            ToolDomain::Schedule,
-        );
-        assert_eq!(
-            classify_domain("delete schedule 3"),
-            ToolDomain::Schedule,
-        );
+        assert_eq!(classify_domain("what's on my timer"), ToolDomain::Schedule,);
+        assert_eq!(classify_domain("delete schedule 3"), ToolDomain::Schedule,);
     }
 
     // ── Memory domain ──────────────────────────────────────────────
@@ -452,14 +391,8 @@ mod tests {
             classify_domain("forget what I told you"),
             ToolDomain::Memory,
         );
-        assert_eq!(
-            classify_domain("i prefer dark mode"),
-            ToolDomain::Memory,
-        );
-        assert_eq!(
-            classify_domain("my name is Jerry"),
-            ToolDomain::Memory,
-        );
+        assert_eq!(classify_domain("i prefer dark mode"), ToolDomain::Memory,);
+        assert_eq!(classify_domain("my name is Jerry"), ToolDomain::Memory,);
     }
 
     // ── FileSystem domain ──────────────────────────────────────────
@@ -484,10 +417,7 @@ mod tests {
 
     #[test]
     fn system_patterns() {
-        assert_eq!(
-            classify_domain("show system info"),
-            ToolDomain::System,
-        );
+        assert_eq!(classify_domain("show system info"), ToolDomain::System,);
         assert_eq!(
             classify_domain("how much disk space is left"),
             ToolDomain::System,
@@ -496,10 +426,7 @@ mod tests {
             classify_domain("send notification test"),
             ToolDomain::System,
         );
-        assert_eq!(
-            classify_domain("run command ls -la"),
-            ToolDomain::System,
-        );
+        assert_eq!(classify_domain("run command ls -la"), ToolDomain::System,);
     }
 
     // ── General (fallback) ─────────────────────────────────────────
@@ -526,10 +453,7 @@ mod tests {
 
     #[test]
     fn wake_word_stripped_before_classification() {
-        assert_eq!(
-            classify_domain("Goose, play some music"),
-            ToolDomain::Music,
-        );
+        assert_eq!(classify_domain("Goose, play some music"), ToolDomain::Music,);
         assert_eq!(
             classify_domain("Hey goose, what's the weather"),
             ToolDomain::Weather,
@@ -542,18 +466,9 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(
-            classify_domain("PLAY SOME JAZZ"),
-            ToolDomain::Music,
-        );
-        assert_eq!(
-            classify_domain("WHAT'S THE WEATHER"),
-            ToolDomain::Weather,
-        );
-        assert_eq!(
-            classify_domain("WHO IS Einstein"),
-            ToolDomain::Knowledge,
-        );
+        assert_eq!(classify_domain("PLAY SOME JAZZ"), ToolDomain::Music,);
+        assert_eq!(classify_domain("WHAT'S THE WEATHER"), ToolDomain::Weather,);
+        assert_eq!(classify_domain("WHO IS Einstein"), ToolDomain::Knowledge,);
     }
 
     #[test]

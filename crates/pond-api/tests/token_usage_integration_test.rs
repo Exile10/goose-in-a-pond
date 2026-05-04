@@ -193,6 +193,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         device_registry: Arc::new(NoDevices),
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
+        embedding_classifier: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

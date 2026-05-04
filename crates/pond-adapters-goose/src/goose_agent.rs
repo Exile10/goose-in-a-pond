@@ -612,14 +612,17 @@ impl GooseAdapter {
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
 
-        // ── 0. Domain classification (pure, zero-cost) ──────────────────────
-        // Classify the user message into a tool domain BEFORE building the
-        // system prompt. This determines which tools and hints the LLM sees.
-        let domain = classify_domain(&request.message);
+        // ── 0. Domain classification ────────────────────────────────────────
+        // Use the pre-classified domain from the route handler (embedding
+        // classifier or keyword fallback). Only re-classify locally if the
+        // route handler didn't provide one (e.g. direct API calls).
+        let domain = request
+            .domain
+            .unwrap_or_else(|| classify_domain(&request.message));
         tracing::info!(
             domain = ?domain,
             message = %request.message,
-            "Domain classified for tool routing"
+            "Domain for tool routing"
         );
 
         // ── 1-4. System prompt, extras, skills, memory — fetched in parallel ─
@@ -1300,6 +1303,7 @@ mod tests {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            domain: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

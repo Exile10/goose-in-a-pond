@@ -765,12 +765,37 @@ async fn chat_stream(
 
         let model_role = "chat";
 
+        // ── Domain classification (original message, before augmentation) ──
+        // Prefer embedding classifier (~10ms) when available; fall back to keyword
+        // classifier. Classify early so we can (a) skip ToolAgent for domains
+        // where it adds no value and (b) pass the domain through AgentRequest.
+        let domain = if let (Some(classifier), Some(emb_provider)) =
+            (&state.embedding_classifier, &state.embedding_provider)
+        {
+            classifier
+                .classify(&req.message, emb_provider.as_ref())
+                .await
+        } else {
+            pond_core::services::domain_classifier::classify_domain(&req.message)
+        };
+        let skip_tool_agent = matches!(
+            domain,
+            pond_core::services::domain_classifier::ToolDomain::Music
+                | pond_core::services::domain_classifier::ToolDomain::Home
+                | pond_core::services::domain_classifier::ToolDomain::FileSystem
+                | pond_core::services::domain_classifier::ToolDomain::System
+        );
+
         // ── Parallel Prep: LLM classification + user message persist ────────
         // The ToolAgent runs LLM classification on a concurrent thread while
         // message persistence happens in parallel. On HTTP providers (Ollama/
         // llamafile), the classifier LLM call runs on a separate connection,
         // truly parallel. On GGUF, it serializes behind the model mutex but
         // the DB persist still runs concurrently.
+        //
+        // When skip_tool_agent is true (Music, Home, FileSystem, System domains),
+        // we skip the ToolAgent entirely — it can't help and would waste an LLM
+        // classify call.
         let tool_agent_ref = state.tool_agent.clone();
         let msg_for_tool = req.message.clone();
         let multi_tool_enabled = settings.multi_tool_enabled;
@@ -782,8 +807,8 @@ async fn chat_stream(
         // Both branches produce an Option<String> tool_context.
         let (tool_result, multi_tool_result, persist_result) = tokio::join!(
             async {
-                if multi_tool_enabled {
-                    // Multi-tool path — skip the single-tool dispatch.
+                if skip_tool_agent || multi_tool_enabled {
+                    // Skip — either domain doesn't need tools or multi-tool path handles it.
                     Ok(None)
                 } else {
                     match &tool_agent_ref {
@@ -793,13 +818,14 @@ async fn chat_stream(
                 }
             },
             async {
-                if multi_tool_enabled {
+                if skip_tool_agent || !multi_tool_enabled {
+                    // Skip — either domain doesn't need tools or single-tool path handles it.
+                    Ok(vec![])
+                } else {
                     match &tool_agent_ref {
                         Some(ta) => ta.process_multi(&msg_for_tool).await,
                         None => Ok(vec![]),
                     }
-                } else {
-                    Ok(vec![])
                 }
             },
             async {
@@ -898,6 +924,7 @@ async fn chat_stream(
         let model_name_for_done = settings.chat_model.clone();
 
         use pond_core::domain::agent::AgentRequest;
+
         // Keep a reference to tool context for the reviewer (needs it to evaluate answer quality)
         let tool_context_for_review = tool_context.clone();
         let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
@@ -907,6 +934,7 @@ async fn chat_stream(
             model_role: model_role.to_string(),
             images: req.images.clone(),
             voice_mode: req.voice_mode,
+            domain: Some(domain),
         };
 
         let mut full_text = String::new();
@@ -1075,7 +1103,7 @@ async fn chat_stream(
         // ToolAgent, then re-generate the response with tool data injected.
         // Skip when a domain filter is active (e.g. Music domain) — the LLM
         // shouldn't be calling Wikipedia when only music tools are allowed.
-        let domain = pond_core::services::domain_classifier::classify_domain(&req.message);
+        // Reuses `domain` classified earlier from the original `req.message`.
         let skip_tool_request = !matches!(domain, pond_core::services::domain_classifier::ToolDomain::General | pond_core::services::domain_classifier::ToolDomain::Knowledge);
         if settings.tool_request_detection && !skip_tool_request {
             if let Some(tool_req) = pond_core::services::tool_request_detector::detect_tool_request(&full_text) {
@@ -2181,7 +2209,9 @@ async fn download_model(
     // Embedding models are auto-downloaded by fastembed on first use.
     // No URL fetch needed — just confirm readiness.
     if cat == ModelCategory::Embedding {
-        return Ok(Json(json!({"status": "ready", "name": name, "note": "Embedding model will download automatically on first use"})));
+        return Ok(Json(
+            json!({"status": "ready", "name": name, "note": "Embedding model will download automatically on first use"}),
+        ));
     }
 
     let url = m.url.clone().ok_or_else(|| {
@@ -4816,6 +4846,7 @@ async fn agent_chat_stream(
             model_role: "task".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            domain: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {

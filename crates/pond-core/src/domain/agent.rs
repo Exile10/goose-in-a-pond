@@ -13,6 +13,11 @@ pub struct AgentRequest {
     /// disable thinking, keep responses concise, and avoid formatting.
     #[serde(default)]
     pub voice_mode: bool,
+    /// Pre-classified tool domain from the embedding classifier (or keyword
+    /// fallback). Set by the route handler from the ORIGINAL message before
+    /// any tool augmentation. Adapters use this instead of re-classifying.
+    #[serde(skip)]
+    pub domain: Option<crate::services::domain_classifier::ToolDomain>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

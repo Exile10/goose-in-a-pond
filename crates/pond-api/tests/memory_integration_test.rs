@@ -109,6 +109,7 @@ async fn make_app_with_real_memory(
         device_registry: Arc::new(NoDevices),
         memory_repo: memory_repo.clone(),
         embedding_provider: None,
+        embedding_classifier: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

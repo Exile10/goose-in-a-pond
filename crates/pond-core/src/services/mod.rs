@@ -1,9 +1,10 @@
 pub mod chat;
 pub mod compact_encoding;
 pub mod context_budget;
-pub mod domain_classifier;
 pub mod context_compactor;
 pub mod context_monitor;
+pub mod domain_classifier;
+pub mod embedding_classifier;
 pub mod fallback_provider;
 pub mod fallback_voice_output;
 pub mod fast_responder;

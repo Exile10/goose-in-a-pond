@@ -1,12 +1,12 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use futures::StreamExt;
+use pond_adapters_goose::GooseAdapter;
 use pond_core::domain::agent::AgentRequest;
 use pond_core::domain::agent::AgentStreamEvent;
 use pond_core::domain::settings::Settings;
 use pond_core::ports::settings::SettingsRepository;
-use pond_adapters_goose::GooseAdapter;
-use futures::StreamExt;
 use std::sync::Arc;
-use async_trait::async_trait;
-use anyhow::Result;
 
 struct TestSettingsRepo {
     provider: String,
@@ -23,15 +23,22 @@ impl SettingsRepository for TestSettingsRepo {
         Ok(s)
     }
 
-    async fn update(&self, _settings: &Settings) -> Result<()> { Ok(()) }
-    async fn get_key(&self, _key: &str) -> Result<Option<String>> { Ok(None) }
-    async fn set_key(&self, _key: &str, _value: String) -> Result<()> { Ok(()) }
+    async fn update(&self, _settings: &Settings) -> Result<()> {
+        Ok(())
+    }
+    async fn get_key(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    async fn set_key(&self, _key: &str, _value: String) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires live Ollama agent at GIAP_OLLAMA_URL"]
 async fn live_action_loop_ollama_executes_tool_call() {
-    let url = std::env::var("GIAP_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let url =
+        std::env::var("GIAP_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     std::env::set_var("OLLAMA_HOST", &url);
 
     let settings_repo = Arc::new(TestSettingsRepo {
@@ -41,7 +48,9 @@ async fn live_action_loop_ollama_executes_tool_call() {
 
     let adapter = GooseAdapter::new(
         settings_repo,
-        Arc::new(pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default()),
+        Arc::new(
+            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+        ),
         Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
@@ -49,7 +58,9 @@ async fn live_action_loop_ollama_executes_tool_call() {
         url,
         None,
         None, // tool_registry
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let request = AgentRequest {
         message: "List registered devices".to_string(),
@@ -57,6 +68,7 @@ async fn live_action_loop_ollama_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
+        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -92,7 +104,8 @@ async fn live_action_loop_ollama_executes_tool_call() {
 #[tokio::test]
 #[ignore = "requires live Llamafile agent at GIAP_LLAMAFILE_URL"]
 async fn live_action_loop_llamafile_executes_tool_call() {
-    let url = std::env::var("GIAP_LLAMAFILE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let url =
+        std::env::var("GIAP_LLAMAFILE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     std::env::set_var("OLLAMA_HOST", &url);
 
     let settings_repo = Arc::new(TestSettingsRepo {
@@ -102,7 +115,9 @@ async fn live_action_loop_llamafile_executes_tool_call() {
 
     let adapter = GooseAdapter::new(
         settings_repo,
-        Arc::new(pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default()),
+        Arc::new(
+            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+        ),
         Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
@@ -110,7 +125,9 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         url,
         None,
         None, // tool_registry
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let request = AgentRequest {
         message: "List registered devices".to_string(),
@@ -118,6 +135,7 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
+        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -160,7 +178,9 @@ async fn live_action_loop_local_executes_tool_call() {
 
     let adapter = GooseAdapter::new(
         settings_repo,
-        Arc::new(pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default()),
+        Arc::new(
+            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+        ),
         Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
@@ -168,7 +188,9 @@ async fn live_action_loop_local_executes_tool_call() {
         url,
         None,
         None, // tool_registry
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let request = AgentRequest {
         message: "List registered devices".to_string(),
@@ -176,6 +198,7 @@ async fn live_action_loop_local_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
+        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
