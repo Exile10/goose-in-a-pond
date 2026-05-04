@@ -1845,6 +1845,11 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
         },
         "asr": { "model_id": assignments.get("asr") },
         "tts": { "model_id": assignments.get("tts") },
+        "embedding": {
+            "model_id": assignments.get("embedding"),
+            "model": settings.active_embedding_model,
+            "provider": settings.embedding_provider,
+        },
         "router_name": state.llm_provider.read().await
             .as_ref()
             .map(|p| p.model_name())
@@ -2016,6 +2021,7 @@ async fn list_models(
     let mut llamafile = vec![];
     let mut tts = vec![];
     let mut gguf = vec![];
+    let mut embedding = vec![];
 
     for m in &records {
         let v = serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default();
@@ -2024,11 +2030,12 @@ async fn list_models(
             ModelCategory::Llamafile => llamafile.push(v),
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => tts.push(v),
             ModelCategory::Gguf | ModelCategory::Ollama => gguf.push(v),
+            ModelCategory::Embedding => embedding.push(v),
         }
     }
 
     Ok(Json(
-        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf}),
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "embedding": embedding}),
     ))
 }
 
@@ -2192,6 +2199,7 @@ async fn download_model(
             data_dir.join("models").join("tts").join(&filename)
         }
         ModelCategory::Ollama => data_dir.join("models").join(&filename),
+        ModelCategory::Embedding => data_dir.join("models").join("embedding").join(&filename),
     };
 
     let tracker = Arc::clone(&state.download_tracker);
@@ -2300,6 +2308,7 @@ async fn delete_model(
                 data_dir.join("models").join("tts").join(filename)
             }
             ModelCategory::Ollama => data_dir.join("models").join(filename),
+            ModelCategory::Embedding => data_dir.join("models").join("embedding").join(filename),
         };
         if path.exists() {
             tokio::fs::remove_file(&path).await.map_err(|e| {
@@ -2410,6 +2419,7 @@ async fn activate_model(
         ModelCategory::Whisper => "asr",
         ModelCategory::TtsPiper => "tts",
         ModelCategory::TtsHttp => "tts",
+        ModelCategory::Embedding => "embedding",
     };
 
     // Persist assignment

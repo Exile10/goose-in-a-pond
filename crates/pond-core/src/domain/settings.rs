@@ -149,6 +149,14 @@ pub struct Settings {
     #[serde(default = "Settings::default_active_tts_model")]
     pub active_tts_model: String,
 
+    /// Active embedding model name from the registry (e.g. "all-MiniLM-L6-v2")
+    #[serde(default)]
+    pub active_embedding_model: String,
+
+    /// Embedding provider: "fastembed" (default, local ONNX) or "none"
+    #[serde(default = "Settings::default_embedding_provider")]
+    pub embedding_provider: String,
+
     // ── Weather ────────────────────────────────────────────────────────────
     /// Whether to fetch live weather and inject it into the LLM system prompt.
     #[serde(default = "Settings::default_weather_enabled")]
@@ -270,7 +278,6 @@ pub struct Settings {
     pub schedule_result_notify: bool,
 
     // ── Memory tuning ────────────────────────────────────────────────────────
-
     /// Memory decay: effective score below this → prune (delete). Default 0.05.
     #[serde(default = "Settings::default_memory_prune_threshold")]
     pub memory_prune_threshold: f32,
@@ -300,7 +307,6 @@ pub struct Settings {
     pub memory_extraction_interval_secs: u32,
 
     // ── Scheduling tuning ────────────────────────────────────────────────────
-
     /// Max concurrent scheduled task executions. Default 2.
     #[serde(default = "Settings::default_schedule_max_concurrent")]
     pub schedule_max_concurrent: u32,
@@ -310,14 +316,12 @@ pub struct Settings {
     pub schedule_max_runs_per_task: u32,
 
     // ── Context monitoring ─────────────────────────────────────────────────
-
     /// When true, tracks context window fill rate per session and emits
     /// warnings before the context window saturates. Default true.
     #[serde(default = "Settings::default_context_monitor_enabled")]
     pub context_monitor_enabled: bool,
 
     // ── Cost comparison ──────────────────────────────────────────────────────
-
     /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
     #[serde(default = "Settings::default_cloud_input_price_per_million")]
     pub cloud_input_price_per_million: f64,
@@ -327,7 +331,6 @@ pub struct Settings {
     pub cloud_output_price_per_million: f64,
 
     // ── Tool cache ──────────────────────────────────────────────────────────
-
     /// When true, deterministic tool results (weather, Wikipedia, devices, schedules)
     /// are cached in memory with per-tool TTLs to avoid redundant API calls.
     #[serde(default = "Settings::default_tool_cache_enabled")]
@@ -340,7 +343,6 @@ pub struct Settings {
     pub telemetry_enabled: bool,
 
     // ── Compact encoding ────────────────────────────────────────────────────
-
     /// When true, structured data injected into LLM prompts (memories, tool
     /// results) uses a compact TOON-style encoding that reduces token count
     /// by 30-60%. Default: true.
@@ -348,14 +350,12 @@ pub struct Settings {
     pub compact_encoding: bool,
 
     // ── Experimental ────────────────────────────────────────────────────────
-
     /// When true, the ToolAgent detects multiple tool intents per message
     /// and dispatches them concurrently via `tokio::join_all`.
     /// Experimental — off by default.
     #[serde(default)]
     pub multi_tool_enabled: bool,
     // ── Tool call validation ────────────────────────────────────────────────
-
     /// When true, LLM tool call outputs are validated and repaired before
     /// execution. Catches common JSON formatting errors from small local models
     /// (3B-4B). Disable if tool calls are already reliable or handled upstream.
@@ -363,7 +363,6 @@ pub struct Settings {
     pub tool_call_validation: bool,
 
     // ── Post-inference tool request detection ──────────────────────────
-
     /// When true, the LLM's response is scanned for natural language tool
     /// requests (e.g. "Let me look up X"). If detected, the tool is executed
     /// and the response is revised with the tool data.
@@ -374,142 +373,262 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            primary_profile_id:              None,
-            assistant_name:                  Self::default_assistant_name(),
-            assistant_personality:           Self::default_assistant_personality(),
-            user_name:                       Self::default_user_name(),
-            timezone:                        Self::default_timezone(),
-            prompt_style:                    Self::default_prompt_style(),
-            custom_system_prompt:            None,
-            prompt_addendum:                 Self::default_prompt_addendum(),
-            fast_path_enabled:               Self::default_fast_path_enabled(),
-            chat_provider:                   Self::default_llm_provider(),
-            chat_model:                      Self::default_active_llm_model(),
-            tool_model:                      None,
-            llm_max_tokens:                  Self::default_max_tokens(),
-            llm_temperature:                 Self::default_temperature(),
-            llm_provider:                    Self::default_llm_provider(),
-            voice_wake_word:                      Self::default_wake_word(),
-            voice_kws_whisper_url:                None,
-            voice_kws_energy_threshold:           Self::default_kws_energy_threshold(),
-            voice_kws_post_trigger_silence_ms:    Self::default_kws_post_trigger_silence_ms(),
-            voice_kws_cooldown_ms:                Self::default_kws_cooldown_ms(),
-            voice_wake_word_transcriptions:       Vec::new(),
-            voice_tts_voice:                      Self::default_tts_voice(),
-            voice_recording_duration_secs:   Self::default_recording_duration(),
-            voice_whisper_url:               Self::default_whisper_url(),
-            active_llm_model:                Self::default_active_llm_model(),
-            active_whisper_model:            Self::default_active_whisper_model(),
-            active_tts_model:                Self::default_active_tts_model(),
-            weather_enabled:                 Self::default_weather_enabled(),
-            weather_latitude:                Self::default_weather_latitude(),
-            weather_longitude:               Self::default_weather_longitude(),
-            weather_location_name:           Self::default_weather_location_name(),
-            retention_event_log_days:        Self::default_event_log_days(),
-            retention_sensor_days:           Self::default_sensor_days(),
+            primary_profile_id: None,
+            assistant_name: Self::default_assistant_name(),
+            assistant_personality: Self::default_assistant_personality(),
+            user_name: Self::default_user_name(),
+            timezone: Self::default_timezone(),
+            prompt_style: Self::default_prompt_style(),
+            custom_system_prompt: None,
+            prompt_addendum: Self::default_prompt_addendum(),
+            fast_path_enabled: Self::default_fast_path_enabled(),
+            chat_provider: Self::default_llm_provider(),
+            chat_model: Self::default_active_llm_model(),
+            tool_model: None,
+            llm_max_tokens: Self::default_max_tokens(),
+            llm_temperature: Self::default_temperature(),
+            llm_provider: Self::default_llm_provider(),
+            voice_wake_word: Self::default_wake_word(),
+            voice_kws_whisper_url: None,
+            voice_kws_energy_threshold: Self::default_kws_energy_threshold(),
+            voice_kws_post_trigger_silence_ms: Self::default_kws_post_trigger_silence_ms(),
+            voice_kws_cooldown_ms: Self::default_kws_cooldown_ms(),
+            voice_wake_word_transcriptions: Vec::new(),
+            voice_tts_voice: Self::default_tts_voice(),
+            voice_recording_duration_secs: Self::default_recording_duration(),
+            voice_whisper_url: Self::default_whisper_url(),
+            active_llm_model: Self::default_active_llm_model(),
+            active_whisper_model: Self::default_active_whisper_model(),
+            active_tts_model: Self::default_active_tts_model(),
+            active_embedding_model: String::new(),
+            embedding_provider: Self::default_embedding_provider(),
+            weather_enabled: Self::default_weather_enabled(),
+            weather_latitude: Self::default_weather_latitude(),
+            weather_longitude: Self::default_weather_longitude(),
+            weather_location_name: Self::default_weather_location_name(),
+            retention_event_log_days: Self::default_event_log_days(),
+            retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
-            thinking_mode:                   Self::default_thinking_mode(),
-            show_thinking:                   false,
-            review_mode:                     Self::default_review_mode(),
-            review_max_rounds:               Self::default_review_max_rounds(),
-            review_pass_threshold:           Self::default_review_pass_threshold(),
-            context_window_override:         0,
-            agent_goose_mode:                Self::default_agent_goose_mode(),
-            agent_max_turns:                 Self::default_agent_max_turns(),
-            prefix_cache_prompt:             Self::default_prefix_cache_prompt(),
-            agent_memory_inject:             Self::default_agent_memory_inject(),
-            agent_memory_limit:              Self::default_agent_memory_limit(),
-            tool_output_compaction:          Self::default_tool_output_compaction(),
-            memory_extraction_enabled:       true,
-            memory_cleanup_enabled:          true,
-            memory_consolidation_enabled:    false, // requires enough memories to be useful
-            memory_graph_enabled:            false, // experimental causal graph retrieval
-            schedule_result_notify:          Self::default_schedule_result_notify(),
-            memory_prune_threshold:          Self::default_memory_prune_threshold(),
-            memory_archive_threshold:        Self::default_memory_archive_threshold(),
-            memory_cleanup_interval_hours:   Self::default_memory_cleanup_interval_hours(),
-            memory_consolidation_interval_hours: Self::default_memory_consolidation_interval_hours(),
+            thinking_mode: Self::default_thinking_mode(),
+            show_thinking: false,
+            review_mode: Self::default_review_mode(),
+            review_max_rounds: Self::default_review_max_rounds(),
+            review_pass_threshold: Self::default_review_pass_threshold(),
+            context_window_override: 0,
+            agent_goose_mode: Self::default_agent_goose_mode(),
+            agent_max_turns: Self::default_agent_max_turns(),
+            prefix_cache_prompt: Self::default_prefix_cache_prompt(),
+            agent_memory_inject: Self::default_agent_memory_inject(),
+            agent_memory_limit: Self::default_agent_memory_limit(),
+            tool_output_compaction: Self::default_tool_output_compaction(),
+            memory_extraction_enabled: true,
+            memory_cleanup_enabled: true,
+            memory_consolidation_enabled: false, // requires enough memories to be useful
+            memory_graph_enabled: false,         // experimental causal graph retrieval
+            schedule_result_notify: Self::default_schedule_result_notify(),
+            memory_prune_threshold: Self::default_memory_prune_threshold(),
+            memory_archive_threshold: Self::default_memory_archive_threshold(),
+            memory_cleanup_interval_hours: Self::default_memory_cleanup_interval_hours(),
+            memory_consolidation_interval_hours: Self::default_memory_consolidation_interval_hours(
+            ),
             memory_consolidation_batch_size: Self::default_memory_consolidation_batch_size(),
-            memory_extraction_max_facts:     Self::default_memory_extraction_max_facts(),
+            memory_extraction_max_facts: Self::default_memory_extraction_max_facts(),
             memory_extraction_interval_secs: Self::default_memory_extraction_interval_secs(),
-            schedule_max_concurrent:         Self::default_schedule_max_concurrent(),
-            schedule_max_runs_per_task:      Self::default_schedule_max_runs_per_task(),
-            context_monitor_enabled:         Self::default_context_monitor_enabled(),
-            cloud_input_price_per_million:   Self::default_cloud_input_price_per_million(),
-            cloud_output_price_per_million:  Self::default_cloud_output_price_per_million(),
-            tool_cache_enabled:             Self::default_tool_cache_enabled(),
-            telemetry_enabled:              Self::default_telemetry_enabled(),
-            compact_encoding:                Self::default_compact_encoding(),
-            multi_tool_enabled:             false,
-            tool_call_validation:            Self::default_tool_call_validation(),
-            tool_request_detection:          Self::default_tool_request_detection(),
+            schedule_max_concurrent: Self::default_schedule_max_concurrent(),
+            schedule_max_runs_per_task: Self::default_schedule_max_runs_per_task(),
+            context_monitor_enabled: Self::default_context_monitor_enabled(),
+            cloud_input_price_per_million: Self::default_cloud_input_price_per_million(),
+            cloud_output_price_per_million: Self::default_cloud_output_price_per_million(),
+            tool_cache_enabled: Self::default_tool_cache_enabled(),
+            telemetry_enabled: Self::default_telemetry_enabled(),
+            compact_encoding: Self::default_compact_encoding(),
+            multi_tool_enabled: false,
+            tool_call_validation: Self::default_tool_call_validation(),
+            tool_request_detection: Self::default_tool_request_detection(),
         }
     }
 }
 
 impl Settings {
-    fn default_fast_path_enabled()           -> bool   { true }
-    fn default_prompt_style()                -> String { "balanced".to_string() }
-    fn default_prompt_addendum()             -> String { "".to_string() }
-    fn default_assistant_name()             -> String { "Goose".to_string() }
-    fn default_assistant_personality()      -> String { "friendly and concise".to_string() }
-    fn default_user_name()                  -> String { "Friend".to_string() }
-    fn default_timezone()                   -> String { "UTC".to_string() }
+    fn default_fast_path_enabled() -> bool {
+        true
+    }
+    fn default_prompt_style() -> String {
+        "balanced".to_string()
+    }
+    fn default_prompt_addendum() -> String {
+        "".to_string()
+    }
+    fn default_assistant_name() -> String {
+        "Goose".to_string()
+    }
+    fn default_assistant_personality() -> String {
+        "friendly and concise".to_string()
+    }
+    fn default_user_name() -> String {
+        "Friend".to_string()
+    }
+    fn default_timezone() -> String {
+        "UTC".to_string()
+    }
     // 4096 covers most practical assistant replies.  The previous 1024 cap
     // truncated long answers mid-sentence — especially for Harmony-channel
     // models (Gemma 4 / gpt-oss) whose internal `<|channel>thought ...
     // <channel|>` reasoning preamble already eats hundreds of tokens before
     // the visible reply even starts, so 1024 left only ~500 for the answer.
-    fn default_max_tokens()                 -> u32    { 4096 }
-    fn default_temperature()                -> f32    { 0.7 }
-    fn default_llm_provider()               -> String { "".to_string() }
-    fn default_wake_word()                  -> String { "goose".to_string() }
-    fn default_kws_energy_threshold()       -> f32    { 0.003 }
-    fn default_kws_post_trigger_silence_ms() -> u64   { 400 }
-    fn default_kws_cooldown_ms()            -> u64    { 2000 }
-    fn default_tts_voice()                  -> String { "".to_string() }
-    fn default_recording_duration()         -> u32    { 3 }
-    fn default_whisper_url()                -> String { "http://127.0.0.1:9000".to_string() }
-    fn default_active_llm_model()           -> String { "".to_string() }
-    fn default_active_whisper_model()       -> String { "".to_string() }
-    fn default_active_tts_model()           -> String { "".to_string() }
-    fn default_weather_enabled()             -> bool   { false }
-    fn default_weather_latitude()            -> f64    { 0.0 }
-    fn default_weather_longitude()           -> f64    { 0.0 }
-    fn default_weather_location_name()       -> String { "".to_string() }
-    fn default_event_log_days()              -> u32    { 30 }
-    fn default_sensor_days()                -> u32    { 7 }
-    fn default_session_messages_keep()      -> u32    { 500 }
-    fn default_thinking_mode()              -> String { "auto".to_string() }
-    fn default_review_mode()               -> String { "off".to_string() }
-    fn default_review_max_rounds()         -> u32    { 1 }
-    fn default_review_pass_threshold()     -> u8     { 3 }
-    fn default_agent_goose_mode()           -> String { "auto".to_string() }
-    fn default_agent_max_turns()            -> u32    { 20 }
-    fn default_prefix_cache_prompt()         -> bool   { true }
-    fn default_agent_memory_inject()        -> bool   { true }
-    fn default_agent_memory_limit()         -> u32    { 5 }
-    fn default_schedule_result_notify()     -> bool   { true }
-    fn default_memory_prune_threshold()     -> f32    { 0.05 }
-    fn default_memory_archive_threshold()   -> f32    { 0.15 }
-    fn default_tool_output_compaction()        -> bool  { true }
-    fn default_memory_extraction_enabled()    -> bool  { true }
-    fn default_memory_cleanup_enabled()       -> bool  { true }
-    fn default_memory_cleanup_interval_hours() -> u32 { 6 }
-    fn default_memory_consolidation_interval_hours() -> u32 { 24 }
-    fn default_memory_consolidation_batch_size() -> u32 { 20 }
-    fn default_memory_extraction_max_facts() -> u32   { 3 }
-    fn default_memory_extraction_interval_secs() -> u32 { 10 }
-    fn default_schedule_max_concurrent()    -> u32    { 2 }
-    fn default_schedule_max_runs_per_task() -> u32    { 50 }
-    fn default_context_monitor_enabled()       -> bool { true }
-    fn default_cloud_input_price_per_million() -> f64 { 2.50 }
-    fn default_cloud_output_price_per_million() -> f64 { 10.00 }
-    fn default_tool_cache_enabled()            -> bool { true }
-    fn default_telemetry_enabled()             -> bool { true }
-    fn default_compact_encoding()              -> bool { true }
-    fn default_tool_call_validation()         -> bool  { true }
-    fn default_tool_request_detection()       -> bool  { true }
+    fn default_max_tokens() -> u32 {
+        4096
+    }
+    fn default_temperature() -> f32 {
+        0.7
+    }
+    fn default_llm_provider() -> String {
+        "".to_string()
+    }
+    fn default_wake_word() -> String {
+        "goose".to_string()
+    }
+    fn default_kws_energy_threshold() -> f32 {
+        0.003
+    }
+    fn default_kws_post_trigger_silence_ms() -> u64 {
+        400
+    }
+    fn default_kws_cooldown_ms() -> u64 {
+        2000
+    }
+    fn default_tts_voice() -> String {
+        "".to_string()
+    }
+    fn default_recording_duration() -> u32 {
+        3
+    }
+    fn default_whisper_url() -> String {
+        "http://127.0.0.1:9000".to_string()
+    }
+    fn default_active_llm_model() -> String {
+        "".to_string()
+    }
+    fn default_active_whisper_model() -> String {
+        "".to_string()
+    }
+    fn default_active_tts_model() -> String {
+        "".to_string()
+    }
+    fn default_embedding_provider() -> String {
+        "fastembed".to_string()
+    }
+    fn default_weather_enabled() -> bool {
+        false
+    }
+    fn default_weather_latitude() -> f64 {
+        0.0
+    }
+    fn default_weather_longitude() -> f64 {
+        0.0
+    }
+    fn default_weather_location_name() -> String {
+        "".to_string()
+    }
+    fn default_event_log_days() -> u32 {
+        30
+    }
+    fn default_sensor_days() -> u32 {
+        7
+    }
+    fn default_session_messages_keep() -> u32 {
+        500
+    }
+    fn default_thinking_mode() -> String {
+        "auto".to_string()
+    }
+    fn default_review_mode() -> String {
+        "off".to_string()
+    }
+    fn default_review_max_rounds() -> u32 {
+        1
+    }
+    fn default_review_pass_threshold() -> u8 {
+        3
+    }
+    fn default_agent_goose_mode() -> String {
+        "auto".to_string()
+    }
+    fn default_agent_max_turns() -> u32 {
+        20
+    }
+    fn default_prefix_cache_prompt() -> bool {
+        true
+    }
+    fn default_agent_memory_inject() -> bool {
+        true
+    }
+    fn default_agent_memory_limit() -> u32 {
+        5
+    }
+    fn default_schedule_result_notify() -> bool {
+        true
+    }
+    fn default_memory_prune_threshold() -> f32 {
+        0.05
+    }
+    fn default_memory_archive_threshold() -> f32 {
+        0.15
+    }
+    fn default_tool_output_compaction() -> bool {
+        true
+    }
+    fn default_memory_extraction_enabled() -> bool {
+        true
+    }
+    fn default_memory_cleanup_enabled() -> bool {
+        true
+    }
+    fn default_memory_cleanup_interval_hours() -> u32 {
+        6
+    }
+    fn default_memory_consolidation_interval_hours() -> u32 {
+        24
+    }
+    fn default_memory_consolidation_batch_size() -> u32 {
+        20
+    }
+    fn default_memory_extraction_max_facts() -> u32 {
+        3
+    }
+    fn default_memory_extraction_interval_secs() -> u32 {
+        10
+    }
+    fn default_schedule_max_concurrent() -> u32 {
+        2
+    }
+    fn default_schedule_max_runs_per_task() -> u32 {
+        50
+    }
+    fn default_context_monitor_enabled() -> bool {
+        true
+    }
+    fn default_cloud_input_price_per_million() -> f64 {
+        2.50
+    }
+    fn default_cloud_output_price_per_million() -> f64 {
+        10.00
+    }
+    fn default_tool_cache_enabled() -> bool {
+        true
+    }
+    fn default_telemetry_enabled() -> bool {
+        true
+    }
+    fn default_compact_encoding() -> bool {
+        true
+    }
+    fn default_tool_call_validation() -> bool {
+        true
+    }
+    fn default_tool_request_detection() -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -561,7 +680,10 @@ mod tests {
     fn custom_system_prompt_roundtrips() {
         let json = r#"{"custom_system_prompt":"You are {{assistant_name}}."}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.custom_system_prompt, Some("You are {{assistant_name}}.".to_string()));
+        assert_eq!(
+            s.custom_system_prompt,
+            Some("You are {{assistant_name}}.".to_string())
+        );
         let json2 = serde_json::to_string(&s).unwrap();
         let s2: Settings = serde_json::from_str(&json2).unwrap();
         assert_eq!(s2.custom_system_prompt, s.custom_system_prompt);
@@ -573,7 +695,7 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.assistant_name, "Pond");
         assert_eq!(s.llm_max_tokens, 4096); // bumped from 1024 to fit Harmony preambles + long replies
-        assert_eq!(s.timezone, "UTC");       // default
+        assert_eq!(s.timezone, "UTC"); // default
     }
 
     #[test]

@@ -259,10 +259,11 @@ export interface ModelRoleAssignment {
 }
 
 export interface ModelActiveRoles {
-  chat:  ModelRoleAssignment | null;
-  tool:  { model: string | null } | null;
-  asr:   ModelRoleAssignment | null;
-  tts:   ModelRoleAssignment | null;
+  chat:       ModelRoleAssignment | null;
+  tool:       { model: string | null } | null;
+  asr:        ModelRoleAssignment | null;
+  tts:        ModelRoleAssignment | null;
+  embedding:  ModelRoleAssignment | null;
 }
 
 // ── Sessions ──────────────────────────────────────────────────
