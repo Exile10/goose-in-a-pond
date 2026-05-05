@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Steps in the onboarding wizard.
@@ -35,16 +35,16 @@ pub enum OnboardingStep {
 impl OnboardingStep {
     pub fn next(self) -> Self {
         match self {
-            Self::Welcome      => Self::Basics,
-            Self::Basics       => Self::Location,
-            Self::Location     => Self::Accessibility,
+            Self::Welcome => Self::Basics,
+            Self::Basics => Self::Location,
+            Self::Location => Self::Accessibility,
             Self::Accessibility => Self::Personality,
-            Self::Personality  => Self::GooseIdentity,
+            Self::Personality => Self::GooseIdentity,
             Self::GooseIdentity => Self::WakeWord,
-            Self::WakeWord     => Self::Model,
-            Self::Model        => Self::Extensions,
-            Self::Extensions   => Self::Completed,
-            Self::Completed    => Self::Completed,
+            Self::WakeWord => Self::Model,
+            Self::Model => Self::Extensions,
+            Self::Extensions => Self::Completed,
+            Self::Completed => Self::Completed,
         }
     }
 
@@ -64,16 +64,16 @@ impl FromStr for OnboardingStep {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "Welcome"       => Ok(Self::Welcome),
-            "Basics"        => Ok(Self::Basics),
-            "Location"      => Ok(Self::Location),
+            "Welcome" => Ok(Self::Welcome),
+            "Basics" => Ok(Self::Basics),
+            "Location" => Ok(Self::Location),
             "Accessibility" => Ok(Self::Accessibility),
-            "Personality"   => Ok(Self::Personality),
+            "Personality" => Ok(Self::Personality),
             "GooseIdentity" => Ok(Self::GooseIdentity),
-            "WakeWord"      => Ok(Self::WakeWord),
-            "Model"         => Ok(Self::Model),
-            "Extensions"    => Ok(Self::Extensions),
-            "Completed"     => Ok(Self::Completed),
+            "WakeWord" => Ok(Self::WakeWord),
+            "Model" => Ok(Self::Model),
+            "Extensions" => Ok(Self::Extensions),
+            "Completed" => Ok(Self::Completed),
             _ => Err(()),
         }
     }
@@ -85,15 +85,27 @@ mod tests {
 
     #[test]
     fn step_progression_order() {
-        assert_eq!(OnboardingStep::Welcome.next(),       OnboardingStep::Basics);
-        assert_eq!(OnboardingStep::Basics.next(),        OnboardingStep::Location);
-        assert_eq!(OnboardingStep::Location.next(),      OnboardingStep::Accessibility);
-        assert_eq!(OnboardingStep::Accessibility.next(), OnboardingStep::Personality);
-        assert_eq!(OnboardingStep::Personality.next(),   OnboardingStep::GooseIdentity);
-        assert_eq!(OnboardingStep::GooseIdentity.next(), OnboardingStep::WakeWord);
-        assert_eq!(OnboardingStep::WakeWord.next(),      OnboardingStep::Model);
-        assert_eq!(OnboardingStep::Model.next(),         OnboardingStep::Extensions);
-        assert_eq!(OnboardingStep::Extensions.next(),    OnboardingStep::Completed);
+        assert_eq!(OnboardingStep::Welcome.next(), OnboardingStep::Basics);
+        assert_eq!(OnboardingStep::Basics.next(), OnboardingStep::Location);
+        assert_eq!(
+            OnboardingStep::Location.next(),
+            OnboardingStep::Accessibility
+        );
+        assert_eq!(
+            OnboardingStep::Accessibility.next(),
+            OnboardingStep::Personality
+        );
+        assert_eq!(
+            OnboardingStep::Personality.next(),
+            OnboardingStep::GooseIdentity
+        );
+        assert_eq!(
+            OnboardingStep::GooseIdentity.next(),
+            OnboardingStep::WakeWord
+        );
+        assert_eq!(OnboardingStep::WakeWord.next(), OnboardingStep::Model);
+        assert_eq!(OnboardingStep::Model.next(), OnboardingStep::Extensions);
+        assert_eq!(OnboardingStep::Extensions.next(), OnboardingStep::Completed);
     }
 
     #[test]

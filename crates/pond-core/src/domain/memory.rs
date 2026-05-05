@@ -34,23 +34,23 @@ impl MemorySegment {
     /// Default importance for this segment (0.0–1.0).
     pub fn default_importance(&self) -> f32 {
         match self {
-            Self::Correction   => 0.9,
-            Self::Identity     => 0.8,
-            Self::Preference   => 0.7,
+            Self::Correction => 0.9,
+            Self::Identity => 0.8,
+            Self::Preference => 0.7,
             Self::Relationship => 0.7,
-            Self::Project      => 0.6,
-            Self::Knowledge    => 0.5,
-            Self::Context      => 0.3,
+            Self::Project => 0.6,
+            Self::Knowledge => 0.5,
+            Self::Context => 0.3,
         }
     }
 
     /// Default tier for this segment.
     pub fn default_tier(&self) -> MemoryTier {
         match self {
-            Self::Identity   => MemoryTier::Permanent,
+            Self::Identity => MemoryTier::Permanent,
             Self::Correction => MemoryTier::Long,
-            Self::Context    => MemoryTier::Short,
-            _                => MemoryTier::Long,
+            Self::Context => MemoryTier::Short,
+            _ => MemoryTier::Long,
         }
     }
 }
@@ -71,8 +71,8 @@ impl MemoryTier {
     /// Default decay rate (lambda) for this tier.
     pub fn default_decay_rate(&self) -> f32 {
         match self {
-            Self::Short     => 0.10,
-            Self::Long      => 0.01,
+            Self::Short => 0.10,
+            Self::Long => 0.01,
             Self::Permanent => 0.00,
         }
     }
@@ -308,7 +308,10 @@ mod tests {
     fn segment_defaults() {
         assert_eq!(MemorySegment::Correction.default_importance(), 0.9);
         assert_eq!(MemorySegment::Context.default_importance(), 0.3);
-        assert_eq!(MemorySegment::Identity.default_tier(), MemoryTier::Permanent);
+        assert_eq!(
+            MemorySegment::Identity.default_tier(),
+            MemoryTier::Permanent
+        );
         assert_eq!(MemorySegment::Context.default_tier(), MemoryTier::Short);
     }
 

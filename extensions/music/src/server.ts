@@ -164,6 +164,11 @@ async function handleControl(args: Record<string, unknown>): Promise<string> {
   }
 }
 
+// ── Debug logging (goes to stderr, not stdout) ───────────────
+function debug(...args: unknown[]) {
+  console.error(`[music-ext]`, ...args);
+}
+
 // ── MCP JSON-RPC server ───────────────────────────────────────
 
 interface JsonRpcRequest {
@@ -178,8 +183,11 @@ async function handleRequest(
 ): Promise<Record<string, unknown> | null> {
   const { method, id, params } = request;
 
+  debug(`<-- ${method}`, params ? JSON.stringify(params).slice(0, 200) : "");
+
   switch (method) {
     case "initialize":
+      debug("initializing");
       return {
         jsonrpc: "2.0",
         id,
@@ -191,9 +199,11 @@ async function handleRequest(
       };
 
     case "notifications/initialized":
+      debug("initialized OK");
       return null;
 
     case "tools/list":
+      debug(`listing ${TOOLS.length} tools`);
       return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
 
     case "tools/call": {
@@ -204,19 +214,25 @@ async function handleRequest(
           unknown
         >) ?? {};
 
+      debug(`tool call: ${toolName}`, JSON.stringify(args));
+
       try {
         let text: string;
         switch (toolName) {
           case "play":
+            debug("play →", args.query || args.uri || "(resume)");
             text = await handlePlay(args);
             break;
           case "status":
+            debug("status → checking now playing");
             text = await handleStatus();
             break;
           case "control":
+            debug("control →", args.action, args.volume ?? "");
             text = await handleControl(args);
             break;
           default:
+            debug("unknown tool:", toolName);
             return {
               jsonrpc: "2.0",
               id,
@@ -224,6 +240,7 @@ async function handleRequest(
             };
         }
 
+        debug(`result (${text.length} chars):`, text.slice(0, 120));
         return {
           jsonrpc: "2.0",
           id,
@@ -231,6 +248,7 @@ async function handleRequest(
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        debug("ERROR:", msg);
         return {
           jsonrpc: "2.0",
           id,

@@ -11,7 +11,9 @@ pub struct MockDeviceRegistry;
 #[async_trait]
 impl DeviceRegistry for MockDeviceRegistry {
     async fn register(&self, _: RegisterDeviceRequest) -> Result<Device> {
-        Err(anyhow::anyhow!("MockDeviceRegistry: register not implemented"))
+        Err(anyhow::anyhow!(
+            "MockDeviceRegistry: register not implemented"
+        ))
     }
 
     async fn list_devices(&self) -> Result<Vec<Device>> {

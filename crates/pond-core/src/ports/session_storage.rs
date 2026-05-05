@@ -36,7 +36,10 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<SessionMessage, SessionStorageError>;
 
     /// Get all messages for a session.
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError>;
+    async fn get_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError>;
 
     /// Update the title of a session.
     async fn update_title(

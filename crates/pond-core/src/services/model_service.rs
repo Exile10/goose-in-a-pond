@@ -26,20 +26,25 @@ use crate::ports::model_repository::ModelRepository;
 use crate::ports::model_storage::ModelStorage;
 
 pub struct ModelService {
-    repo:       Arc<dyn ModelRepository>,
-    catalog:    Arc<dyn ModelCatalogProvider>,
+    repo: Arc<dyn ModelRepository>,
+    catalog: Arc<dyn ModelCatalogProvider>,
     downloader: Arc<dyn ModelDownloader>,
-    storage:    Arc<dyn ModelStorage>,
+    storage: Arc<dyn ModelStorage>,
 }
 
 impl ModelService {
     pub fn new(
-        repo:       Arc<dyn ModelRepository>,
-        catalog:    Arc<dyn ModelCatalogProvider>,
+        repo: Arc<dyn ModelRepository>,
+        catalog: Arc<dyn ModelCatalogProvider>,
         downloader: Arc<dyn ModelDownloader>,
-        storage:    Arc<dyn ModelStorage>,
+        storage: Arc<dyn ModelStorage>,
     ) -> Self {
-        Self { repo, catalog, downloader, storage }
+        Self {
+            repo,
+            catalog,
+            downloader,
+            storage,
+        }
     }
 
     // ── Catalog ───────────────────────────────────────────────────────────────
@@ -99,7 +104,7 @@ impl ModelService {
     pub async fn model_for_role(&self, role: &str) -> Result<Option<ModelRecord>> {
         let assignment = self.repo.get_assignment(role).await?;
         match assignment {
-            None    => Ok(None),
+            None => Ok(None),
             Some(a) => self.repo.get_by_id(&a.model_id).await,
         }
     }
@@ -114,13 +119,17 @@ impl ModelService {
     /// Validates that the model's category is compatible with the role
     /// (e.g. only LLM models can be assigned to "chat"/"think"/"task").
     pub async fn assign_role(&self, role: &str, model_id: &str) -> Result<()> {
-        let record = self.repo.get_by_id(model_id).await?
+        let record = self
+            .repo
+            .get_by_id(model_id)
+            .await?
             .ok_or_else(|| anyhow!("Model '{}' not found in catalog", model_id))?;
 
         if !ModelRoleAssignment::category_matches_role(&record.category, role) {
             return Err(anyhow!(
                 "Model category '{}' is not valid for role '{}'",
-                record.category.as_str(), role
+                record.category.as_str(),
+                role
             ));
         }
 
@@ -140,17 +149,26 @@ impl ModelService {
     /// - If the record has a `url`, downloads to the storage path.
     /// - If neither condition holds, returns an error.
     pub async fn ensure_downloaded(&self, model_id: &str) -> Result<PathBuf> {
-        let record = self.repo.get_by_id(model_id).await?
+        let record = self
+            .repo
+            .get_by_id(model_id)
+            .await?
             .ok_or_else(|| anyhow!("Model '{}' not found in catalog", model_id))?;
 
-        let path = self.storage.path_for(&record)
-            .ok_or_else(|| anyhow!("Model '{}' has no local file path (it is server-side only)", model_id))?;
+        let path = self.storage.path_for(&record).ok_or_else(|| {
+            anyhow!(
+                "Model '{}' has no local file path (it is server-side only)",
+                model_id
+            )
+        })?;
 
         if path.exists() {
             return Ok(path);
         }
 
-        let url = record.url.as_deref()
+        let url = record
+            .url
+            .as_deref()
             .ok_or_else(|| anyhow!("Model '{}' has no download URL in the catalog", model_id))?;
 
         // Create parent directory
@@ -171,12 +189,13 @@ impl ModelService {
             return Ok(path);
         }
 
-        let url = record.url_for_current_platform()
-            .ok_or_else(|| anyhow!(
+        let url = record.url_for_current_platform().ok_or_else(|| {
+            anyhow!(
                 "Binary '{}' has no download URL for platform '{}'",
                 record.name,
                 BinaryRecord::current_platform_key()
-            ))?;
+            )
+        })?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -243,7 +262,9 @@ mod tests {
 
     impl MockModelRepository {
         fn new() -> Self {
-            Self { records: Mutex::new(HashMap::new()) }
+            Self {
+                records: Mutex::new(HashMap::new()),
+            }
         }
     }
 
@@ -255,14 +276,23 @@ mod tests {
             Ok(v)
         }
         async fn list_by_category(&self, cat: &ModelCategory) -> Result<Vec<ModelRecord>> {
-            Ok(self.records.lock().unwrap().values()
-                .filter(|r| &r.category == cat).cloned().collect())
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| &r.category == cat)
+                .cloned()
+                .collect())
         }
         async fn get_by_id(&self, id: &str) -> Result<Option<ModelRecord>> {
             Ok(self.records.lock().unwrap().get(id).cloned())
         }
         async fn upsert(&self, model: &ModelRecord) -> Result<()> {
-            self.records.lock().unwrap().insert(model.id.clone(), model.clone());
+            self.records
+                .lock()
+                .unwrap()
+                .insert(model.id.clone(), model.clone());
             Ok(())
         }
         async fn set_downloaded(&self, id: &str, downloaded: bool) -> Result<()> {
@@ -271,10 +301,18 @@ mod tests {
             }
             Ok(())
         }
-        async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> { Ok(vec![]) }
-        async fn get_assignment(&self, _: &str) -> Result<Option<ModelRoleAssignment>> { Ok(None) }
-        async fn set_assignment(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn clear_assignment(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> {
+            Ok(vec![])
+        }
+        async fn get_assignment(&self, _: &str) -> Result<Option<ModelRoleAssignment>> {
+            Ok(None)
+        }
+        async fn set_assignment(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_assignment(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
     }
 
     // ── Mock ModelCatalogProvider ─────────────────────────────────────────
@@ -293,7 +331,11 @@ mod tests {
         called_urls: Mutex<Vec<String>>,
     }
     impl MockDownloader {
-        fn new() -> Self { Self { called_urls: Mutex::new(vec![]) } }
+        fn new() -> Self {
+            Self {
+                called_urls: Mutex::new(vec![]),
+            }
+        }
     }
     #[async_trait]
     impl ModelDownloader for MockDownloader {
@@ -309,12 +351,13 @@ mod tests {
         base: PathBuf,
     }
     impl MockStorage {
-        fn new(base: PathBuf) -> Self { Self { base } }
+        fn new(base: PathBuf) -> Self {
+            Self { base }
+        }
     }
     impl ModelStorage for MockStorage {
         fn path_for(&self, record: &ModelRecord) -> Option<PathBuf> {
-            record.filename.as_ref()
-                .map(|f| self.base.join(f))
+            record.filename.as_ref().map(|f| self.base.join(f))
         }
         fn binary_path(&self, _record: &BinaryRecord) -> PathBuf {
             self.base.join("bin")
@@ -373,7 +416,12 @@ mod tests {
         let svc = make_service(repo.clone(), dl.clone(), tmp.path());
 
         // Seed a model with a URL, not yet on disk
-        let m = stub_model("llamafile/qwen", "qwen.llamafile", false, Some("https://example.com/qwen.llamafile"));
+        let m = stub_model(
+            "llamafile/qwen",
+            "qwen.llamafile",
+            false,
+            Some("https://example.com/qwen.llamafile"),
+        );
         repo.upsert(&m).await.unwrap();
 
         // ensure_downloaded should call the downloader
@@ -387,7 +435,10 @@ mod tests {
 
         // Verify DB flag was updated
         let record = repo.get_by_id("llamafile/qwen").await.unwrap().unwrap();
-        assert!(record.downloaded, "downloaded flag should be true after download");
+        assert!(
+            record.downloaded,
+            "downloaded flag should be true after download"
+        );
     }
 
     #[tokio::test]
@@ -401,7 +452,12 @@ mod tests {
         let model_path = tmp.path().join("existing.llamafile");
         std::fs::File::create(&model_path).unwrap();
 
-        let m = stub_model("llamafile/existing", "existing.llamafile", true, Some("https://example.com/existing.llamafile"));
+        let m = stub_model(
+            "llamafile/existing",
+            "existing.llamafile",
+            true,
+            Some("https://example.com/existing.llamafile"),
+        );
         repo.upsert(&m).await.unwrap();
 
         // ensure_downloaded should NOT call the downloader
@@ -409,7 +465,11 @@ mod tests {
         assert_eq!(path, model_path);
 
         let urls = dl.called_urls.lock().unwrap();
-        assert!(urls.is_empty(), "downloader should not have been called, but got: {:?}", *urls);
+        assert!(
+            urls.is_empty(),
+            "downloader should not have been called, but got: {:?}",
+            *urls
+        );
     }
 
     #[tokio::test]
@@ -435,35 +495,48 @@ mod tests {
         repo.upsert(&m).await.unwrap();
 
         let result = svc.ensure_downloaded("llamafile/no-url").await;
-        assert!(result.is_err(), "should error when model has no download URL");
+        assert!(
+            result.is_err(),
+            "should error when model has no download URL"
+        );
     }
 
     /// Validate that the shared mock infrastructure from services/ integrates
     /// correctly with ModelService — these mocks are the ones used in integration tests.
     mod shared_mocks {
+        use crate::domain::model_record::{ModelCategory, ModelRecord};
+        use crate::ports::{model_repository::ModelRepository, model_storage::ModelStorage};
         use crate::services::mock_model_catalog_provider::MockModelCatalogProvider;
         use crate::services::mock_model_downloader::MockModelDownloader;
         use crate::services::mock_model_repository::MockModelRepository as SharedMockRepo;
         use crate::services::mock_model_storage::MockModelStorage;
         use crate::services::model_service::ModelService;
-        use crate::domain::model_record::{ModelCategory, ModelRecord};
-        use crate::ports::{model_repository::ModelRepository, model_storage::ModelStorage};
         use std::sync::Arc;
 
         fn gguf(name: &str, downloaded: bool, url: Option<&str>) -> ModelRecord {
             ModelRecord {
-                id:               format!("gguf/{name}"),
-                category:         ModelCategory::Gguf,
-                name:             name.to_string(),
-                filename:         Some(format!("{name}.gguf")),
-                description:      String::new(),
-                size_mb:          10,
-                url:              url.map(str::to_string),
-                hf_id:            None, ram_estimate_mb: None, recommended_role: None,
-                context_length:   None, quantization: None, asr_language: None,
-                asr_size:         None, tts_engine: None, tts_voice_name: None,
-                config_filename:  None, config_url: None, tts_url: None,
-                sample_rate:      None, downloaded, is_custom: false,
+                id: format!("gguf/{name}"),
+                category: ModelCategory::Gguf,
+                name: name.to_string(),
+                filename: Some(format!("{name}.gguf")),
+                description: String::new(),
+                size_mb: 10,
+                url: url.map(str::to_string),
+                hf_id: None,
+                ram_estimate_mb: None,
+                recommended_role: None,
+                context_length: None,
+                quantization: None,
+                asr_language: None,
+                asr_size: None,
+                tts_engine: None,
+                tts_voice_name: None,
+                config_filename: None,
+                config_url: None,
+                tts_url: None,
+                sample_rate: None,
+                downloaded,
+                is_custom: false,
             }
         }
 
@@ -471,9 +544,10 @@ mod tests {
         async fn shared_never_present_forces_download() {
             let tmp = tempfile::tempdir().unwrap();
             let repo = Arc::new(SharedMockRepo::new());
-            let dl   = Arc::new(MockModelDownloader::new(true)); // write placeholder
-            let storage: Arc<dyn ModelStorage> =
-                Arc::new(MockModelStorage::file_system_backed(tmp.path().to_path_buf()));
+            let dl = Arc::new(MockModelDownloader::new(true)); // write placeholder
+            let storage: Arc<dyn ModelStorage> = Arc::new(MockModelStorage::file_system_backed(
+                tmp.path().to_path_buf(),
+            ));
             let svc = ModelService::new(
                 repo.clone() as Arc<dyn ModelRepository>,
                 Arc::new(MockModelCatalogProvider::default()),
@@ -486,16 +560,23 @@ mod tests {
 
             svc.ensure_downloaded("gguf/llama3").await.unwrap();
             assert!(dl.was_downloaded_any().await);
-            assert!(repo.get_by_id("gguf/llama3").await.unwrap().unwrap().downloaded);
+            assert!(
+                repo.get_by_id("gguf/llama3")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .downloaded
+            );
         }
 
         #[tokio::test]
         async fn shared_file_present_skips_download() {
             let tmp = tempfile::tempdir().unwrap();
             let repo = Arc::new(SharedMockRepo::new());
-            let dl   = Arc::new(MockModelDownloader::new(false));
-            let storage: Arc<dyn ModelStorage> =
-                Arc::new(MockModelStorage::file_system_backed(tmp.path().to_path_buf()));
+            let dl = Arc::new(MockModelDownloader::new(false));
+            let storage: Arc<dyn ModelStorage> = Arc::new(MockModelStorage::file_system_backed(
+                tmp.path().to_path_buf(),
+            ));
             let svc = ModelService::new(
                 repo.clone() as Arc<dyn ModelRepository>,
                 Arc::new(MockModelCatalogProvider::default()),
@@ -512,7 +593,10 @@ mod tests {
             repo.upsert(&m).await.unwrap();
 
             svc.ensure_downloaded("gguf/llama3").await.unwrap();
-            assert!(!dl.was_downloaded_any().await, "should not download when file already present");
+            assert!(
+                !dl.was_downloaded_any().await,
+                "should not download when file already present"
+            );
         }
     }
 
@@ -525,17 +609,25 @@ mod tests {
 
         // model_a: file exists on disk, but DB says downloaded=false
         std::fs::File::create(tmp.path().join("a.llamafile")).unwrap();
-        repo.upsert(&stub_model("a", "a.llamafile", false, None)).await.unwrap();
+        repo.upsert(&stub_model("a", "a.llamafile", false, None))
+            .await
+            .unwrap();
 
         // model_b: file does NOT exist, but DB says downloaded=true
-        repo.upsert(&stub_model("b", "b.llamafile", true, None)).await.unwrap();
+        repo.upsert(&stub_model("b", "b.llamafile", true, None))
+            .await
+            .unwrap();
 
         let changed = svc.sync_disk_flags().await.unwrap();
         assert_eq!(changed, 2, "both records should have been corrected");
 
-        assert!(repo.get_by_id("a").await.unwrap().unwrap().downloaded,
-            "model_a should now be downloaded=true");
-        assert!(!repo.get_by_id("b").await.unwrap().unwrap().downloaded,
-            "model_b should now be downloaded=false");
+        assert!(
+            repo.get_by_id("a").await.unwrap().unwrap().downloaded,
+            "model_a should now be downloaded=true"
+        );
+        assert!(
+            !repo.get_by_id("b").await.unwrap().unwrap().downloaded,
+            "model_b should now be downloaded=false"
+        );
     }
 }

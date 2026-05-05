@@ -20,12 +20,12 @@ impl SqlxOnboardingRepository {
 impl OnboardingRepository for SqlxOnboardingRepository {
     async fn get_current_step(&self) -> Option<OnboardingStep> {
         let row = sqlx::query_as::<_, (String,)>(
-            "SELECT current_step FROM onboarding_state WHERE id = 1"
+            "SELECT current_step FROM onboarding_state WHERE id = 1",
         )
-            .fetch_optional(&self.pool)
-            .await
-            .ok()??;
-        
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
         OnboardingStep::from_str(row.0.as_str()).ok()
     }
 
@@ -40,11 +40,11 @@ impl OnboardingRepository for SqlxOnboardingRepository {
             DO UPDATE SET
                 current_step = excluded.current_step,
                 updated_at = datetime('now')
-            "#
+            "#,
         )
-            .bind(step_str)
-            .execute(&self.pool)
-            .await?;
+        .bind(step_str)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -69,10 +69,8 @@ mod tests {
         let db = Database::init(tmp.path()).await.unwrap();
 
         let repo = SqlxOnboardingRepository::new(db.system.clone());
-        
-        repo.save_step(OnboardingStep::Basics)
-            .await
-            .unwrap();
+
+        repo.save_step(OnboardingStep::Basics).await.unwrap();
 
         let step = repo.get_current_step().await;
 

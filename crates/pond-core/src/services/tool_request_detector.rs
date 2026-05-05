@@ -140,7 +140,13 @@ fn extract_topic(after: &str) -> String {
     // Find the end boundary: period, comma, exclamation, question mark,
     // newline, or connecting phrases like "for you", "right now"
     let end_markers = ['.', ',', '!', '?', '\n', '\r'];
-    let connecting = [" for you", " right now", " real quick", " quickly", " first"];
+    let connecting = [
+        " for you",
+        " right now",
+        " real quick",
+        " quickly",
+        " first",
+    ];
 
     let mut end = trimmed.len();
 
@@ -164,7 +170,11 @@ fn extract_topic(after: &str) -> String {
 
     // Remove surrounding quotes if present
     let result = result.trim();
-    let result = result.trim_matches('"').trim_matches('\'').trim_matches('"').trim_matches('"');
+    let result = result
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('"')
+        .trim_matches('"');
 
     result.to_string()
 }
@@ -176,28 +186,37 @@ mod tests {
     #[test]
     fn detect_wikipedia_let_me_look_up() {
         let r = detect_tool_request("Let me look up quantum physics for you.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "wikipedia".into(),
-            query: "quantum physics".into(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "wikipedia".into(),
+                query: "quantum physics".into(),
+            })
+        );
     }
 
     #[test]
     fn detect_wikipedia_ill_look_up() {
         let r = detect_tool_request("I'll look up John Cena.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "wikipedia".into(),
-            query: "John Cena".into(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "wikipedia".into(),
+                query: "John Cena".into(),
+            })
+        );
     }
 
     #[test]
     fn detect_wikipedia_with_quotes() {
         let r = detect_tool_request("Let me look up \"black holes\" for you.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "wikipedia".into(),
-            query: "black holes".into(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "wikipedia".into(),
+                query: "black holes".into(),
+            })
+        );
     }
 
     #[test]
@@ -205,60 +224,81 @@ mod tests {
         let r = detect_tool_request(
             "That's a great question! Let me look up photosynthesis for you. I want to make sure I give you accurate information."
         );
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "wikipedia".into(),
-            query: "photosynthesis".into(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "wikipedia".into(),
+                query: "photosynthesis".into(),
+            })
+        );
     }
 
     #[test]
     fn detect_weather() {
         let r = detect_tool_request("Let me check the weather for you.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "weather".into(),
-            query: String::new(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "weather".into(),
+                query: String::new(),
+            })
+        );
     }
 
     #[test]
     fn detect_save_memory() {
         let r = detect_tool_request("Got it! I'll save that to memory.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "save_memory".into(),
-            query: String::new(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "save_memory".into(),
+                query: String::new(),
+            })
+        );
     }
 
     #[test]
     fn detect_recall_memory() {
         let r = detect_tool_request("Let me check what I remember about that.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "recall_memory".into(),
-            query: String::new(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "recall_memory".into(),
+                query: String::new(),
+            })
+        );
     }
 
     #[test]
     fn detect_schedules() {
         let r = detect_tool_request("Sure, let me check your schedules.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "schedules".into(),
-            query: String::new(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "schedules".into(),
+                query: String::new(),
+            })
+        );
     }
 
     #[test]
     fn detect_devices() {
         let r = detect_tool_request("I'll check your devices to see what's online.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "devices".into(),
-            query: String::new(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "devices".into(),
+                query: String::new(),
+            })
+        );
     }
 
     #[test]
     fn no_detection_for_normal_response() {
-        assert_eq!(detect_tool_request("Hello! How can I help you today?"), None);
+        assert_eq!(
+            detect_tool_request("Hello! How can I help you today?"),
+            None
+        );
     }
 
     #[test]
@@ -269,7 +309,10 @@ mod tests {
     #[test]
     fn no_detection_for_past_tense() {
         // "I looked up" is past tense — the tool was already called, don't re-trigger
-        assert_eq!(detect_tool_request("I looked up the information earlier."), None);
+        assert_eq!(
+            detect_tool_request("I looked up the information earlier."),
+            None
+        );
     }
 
     #[test]
@@ -279,7 +322,10 @@ mod tests {
 
     #[test]
     fn extract_topic_stops_at_period() {
-        assert_eq!(extract_topic("Mars. I think you'll find it interesting."), "Mars");
+        assert_eq!(
+            extract_topic("Mars. I think you'll find it interesting."),
+            "Mars"
+        );
     }
 
     #[test]
@@ -290,9 +336,12 @@ mod tests {
     #[test]
     fn case_insensitive_detection() {
         let r = detect_tool_request("LET ME LOOK UP the solar system.");
-        assert_eq!(r, Some(ToolRequest {
-            tool_name: "wikipedia".into(),
-            query: "the solar system".into(),
-        }));
+        assert_eq!(
+            r,
+            Some(ToolRequest {
+                tool_name: "wikipedia".into(),
+                query: "the solar system".into(),
+            })
+        );
     }
 }

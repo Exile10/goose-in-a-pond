@@ -89,10 +89,7 @@ impl GooseMcpMemoryAdapter {
 
     /// Write a map of entries back to the category file.
     fn write_category(path: &Path, entries: &HashMap<String, Vec<String>>) -> Result<()> {
-        let mut parts: Vec<String> = entries
-            .values()
-            .map(|lines| lines.join("\n"))
-            .collect();
+        let mut parts: Vec<String> = entries.values().map(|lines| lines.join("\n")).collect();
         parts.sort(); // stable order
         let content = parts.join("\n\n");
         std::fs::write(path, content).context("failed to write memory file")
@@ -197,8 +194,7 @@ impl McpMemoryPort for GooseMcpMemoryAdapter {
                 for cat in cats {
                     let path = adapter.category_path(&cat);
                     if path.exists() {
-                        std::fs::remove_file(&path)
-                            .context("failed to remove memory file")?;
+                        std::fs::remove_file(&path).context("failed to remove memory file")?;
                     }
                 }
                 return Ok(());
@@ -215,12 +211,7 @@ impl McpMemoryPort for GooseMcpMemoryAdapter {
         Ok(())
     }
 
-    async fn remove_specific(
-        &self,
-        category: &str,
-        content: &str,
-        _global: bool,
-    ) -> Result<()> {
+    async fn remove_specific(&self, category: &str, content: &str, _global: bool) -> Result<()> {
         let adapter = self.clone();
         let category = category.to_string();
         let content = content.to_string();
@@ -296,7 +287,12 @@ mod tests {
 
         let result = adapter.retrieve("devices", false).await.unwrap();
         assert!(!result.is_empty());
-        let all_text: String = result.values().flatten().cloned().collect::<Vec<_>>().join(" ");
+        let all_text: String = result
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(all_text.contains("Sony"));
     }
 
@@ -306,10 +302,18 @@ mod tests {
         let adapter = make_adapter(&tmp);
 
         adapter.remember("devices", "TV", &[], false).await.unwrap();
-        adapter.remember("preferences", "dark mode", &[], false).await.unwrap();
+        adapter
+            .remember("preferences", "dark mode", &[], false)
+            .await
+            .unwrap();
 
         let all = adapter.retrieve("*", false).await.unwrap();
-        let all_text: String = all.values().flatten().cloned().collect::<Vec<_>>().join(" ");
+        let all_text: String = all
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(all_text.contains("TV"));
         assert!(all_text.contains("dark mode"));
     }
@@ -331,12 +335,26 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let adapter = make_adapter(&tmp);
 
-        adapter.remember("facts", "user likes coffee", &[], false).await.unwrap();
-        adapter.remember("facts", "user has a dog named Max", &[], false).await.unwrap();
-        adapter.remove_specific("facts", "coffee", false).await.unwrap();
+        adapter
+            .remember("facts", "user likes coffee", &[], false)
+            .await
+            .unwrap();
+        adapter
+            .remember("facts", "user has a dog named Max", &[], false)
+            .await
+            .unwrap();
+        adapter
+            .remove_specific("facts", "coffee", false)
+            .await
+            .unwrap();
 
         let result = adapter.retrieve("facts", false).await.unwrap();
-        let all_text: String = result.values().flatten().cloned().collect::<Vec<_>>().join(" ");
+        let all_text: String = result
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(!all_text.contains("coffee"));
         assert!(all_text.contains("Max"));
     }
@@ -346,9 +364,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let adapter = make_adapter(&tmp);
 
-        assert!(adapter.instructions().is_empty(), "no memories → empty instructions");
+        assert!(
+            adapter.instructions().is_empty(),
+            "no memories → empty instructions"
+        );
 
-        adapter.remember("preferences", "prefers Celsius", &[], false).await.unwrap();
+        adapter
+            .remember("preferences", "prefers Celsius", &[], false)
+            .await
+            .unwrap();
         let instr = adapter.instructions();
         assert!(instr.contains("Remembered Context"));
         assert!(instr.contains("Celsius"));
@@ -360,12 +384,20 @@ mod tests {
         let adapter = make_adapter(&tmp);
 
         adapter
-            .remember("devices", "smart bulb in kitchen", &["iot".to_string()], false)
+            .remember(
+                "devices",
+                "smart bulb in kitchen",
+                &["iot".to_string()],
+                false,
+            )
             .await
             .unwrap();
 
         let instr = adapter.instructions();
         assert!(instr.contains("smart bulb"));
-        assert!(!instr.contains("#iot"), "tag lines should not appear in instructions");
+        assert!(
+            !instr.contains("#iot"),
+            "tag lines should not appear in instructions"
+        );
     }
 }

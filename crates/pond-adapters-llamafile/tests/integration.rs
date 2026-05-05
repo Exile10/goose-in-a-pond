@@ -60,10 +60,9 @@ async fn complete_returns_assistant_message_on_success() {
 
 #[tokio::test]
 async fn complete_returns_error_on_non_200() {
-    let err =
-        complete_with_mock(ResponseTemplate::new(500).set_body_string("internal error"))
-            .await
-            .unwrap_err();
+    let err = complete_with_mock(ResponseTemplate::new(500).set_body_string("internal error"))
+        .await
+        .unwrap_err();
 
     assert!(err.to_string().contains("500"), "unexpected error: {err}");
 }
@@ -180,8 +179,7 @@ async fn complete_request_body_includes_temperature_and_max_tokens() {
 async fn complete_strips_stop_tokens_from_response() {
     // Models like Gemma append <end_of_turn> — should be stripped
     let reply = complete_with_mock(
-        ResponseTemplate::new(200)
-            .set_body_json(success_body("Hello there<end_of_turn>")),
+        ResponseTemplate::new(200).set_body_json(success_body("Hello there<end_of_turn>")),
     )
     .await
     .unwrap();
@@ -218,7 +216,7 @@ async fn stream_tokens(server: &MockServer, messages: Vec<ChatMessage>) -> Vec<S
     while let Some(result) = stream.next().await {
         match result {
             Ok(StreamToken::Text(tok)) => tokens.push(tok),
-            Ok(StreamToken::Usage(_))  => {} // ignore usage items
+            Ok(StreamToken::Usage(_)) => {} // ignore usage items
             Err(e) => panic!("unexpected stream error: {e}"),
         }
     }
@@ -377,7 +375,7 @@ async fn stream_complete_skips_deltas_with_no_content_field() {
     let sse = [
         r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#, // no content → skip
         r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
-        r#"data: {"choices":[{"delta":{}}]}"#,                   // empty delta → skip
+        r#"data: {"choices":[{"delta":{}}]}"#, // empty delta → skip
         r#"data: {"choices":[{"delta":{"content":" there"}}]}"#,
         "data: [DONE]",
     ]
@@ -452,7 +450,10 @@ async fn stream_complete_request_includes_temperature_and_max_tokens() {
     let requests = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     let temp = body["temperature"].as_f64().unwrap();
-    assert!((temp - 0.1).abs() < 1e-6, "temperature should be ~0.1, got {temp}");
+    assert!(
+        (temp - 0.1).abs() < 1e-6,
+        "temperature should be ~0.1, got {temp}"
+    );
     assert_eq!(body["max_tokens"], 256);
     assert_eq!(body["stream"], true);
 }
@@ -521,7 +522,9 @@ async fn task_role_stream_complete_yields_action_tokens() {
     use pond_core::ports::provider::StreamToken;
     let mut tokens = Vec::new();
     while let Some(Ok(item)) = stream.next().await {
-        if let StreamToken::Text(tok) = item { tokens.push(tok); }
+        if let StreamToken::Text(tok) = item {
+            tokens.push(tok);
+        }
     }
 
     assert_eq!(tokens.join(""), "Scheduling reminder for 9am.");
@@ -564,7 +567,9 @@ async fn think_role_stream_complete_handles_long_reasoning_response() {
     use pond_core::ports::provider::StreamToken;
     let mut tokens = Vec::new();
     while let Some(Ok(item)) = stream.next().await {
-        if let StreamToken::Text(tok) = item { tokens.push(tok); }
+        if let StreamToken::Text(tok) = item {
+            tokens.push(tok);
+        }
     }
 
     let full = tokens.join("");
@@ -582,11 +587,9 @@ async fn think_role_complete_multi_turn_reasoning() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(success_body(
-                "Building on my previous point: entropy increases.",
-            )),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_body(
+            "Building on my previous point: entropy increases.",
+        )))
         .mount(&server)
         .await;
 
@@ -609,7 +612,10 @@ async fn think_role_complete_multi_turn_reasoning() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4); // system + 3 turns
-    assert_eq!(messages[2]["content"], "Step 1: Energy cannot be created or destroyed.");
+    assert_eq!(
+        messages[2]["content"],
+        "Step 1: Energy cannot be created or destroyed."
+    );
     assert_eq!(messages[3]["content"], "continue");
 }
 
@@ -650,9 +656,9 @@ async fn stream_complete_parses_usage_from_final_chunk() {
     let mut usage_opt = None;
     while let Some(result) = stream.next().await {
         match result {
-            Ok(StreamToken::Text(t))   => texts.push(t),
-            Ok(StreamToken::Usage(u))  => usage_opt = Some(u),
-            Err(e)                     => panic!("unexpected error: {e}"),
+            Ok(StreamToken::Text(t)) => texts.push(t),
+            Ok(StreamToken::Usage(u)) => usage_opt = Some(u),
+            Err(e) => panic!("unexpected error: {e}"),
         }
     }
 
@@ -684,8 +690,13 @@ async fn stream_complete_no_usage_when_chunk_omits_it() {
 
     let mut has_usage = false;
     while let Some(Ok(item)) = stream.next().await {
-        if let StreamToken::Usage(_) = item { has_usage = true; }
+        if let StreamToken::Usage(_) = item {
+            has_usage = true;
+        }
     }
 
-    assert!(!has_usage, "expected no Usage token when the SSE body omits usage");
+    assert!(
+        !has_usage,
+        "expected no Usage token when the SSE body omits usage"
+    );
 }

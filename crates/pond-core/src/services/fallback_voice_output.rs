@@ -11,13 +11,13 @@
 //! ));
 //! ```
 
-use std::sync::Arc;
+use crate::ports::voice_output::VoiceOutput;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::ports::voice_output::VoiceOutput;
+use std::sync::Arc;
 
 pub struct FallbackVoiceOutput {
-    primary:  Arc<dyn VoiceOutput>,
+    primary: Arc<dyn VoiceOutput>,
     fallback: Arc<dyn VoiceOutput>,
 }
 
@@ -74,8 +74,14 @@ mod tests {
         );
 
         tts.speak("hello").await.unwrap();
-        assert!(primary_called.load(Ordering::SeqCst), "primary should have been called");
-        assert!(!fallback_called.load(Ordering::SeqCst), "fallback should NOT have been called");
+        assert!(
+            primary_called.load(Ordering::SeqCst),
+            "primary should have been called"
+        );
+        assert!(
+            !fallback_called.load(Ordering::SeqCst),
+            "fallback should NOT have been called"
+        );
     }
 
     #[tokio::test]
@@ -88,15 +94,15 @@ mod tests {
         );
 
         tts.speak("hello").await.unwrap();
-        assert!(fallback_called.load(Ordering::SeqCst), "fallback should have been called");
+        assert!(
+            fallback_called.load(Ordering::SeqCst),
+            "fallback should have been called"
+        );
     }
 
     #[tokio::test]
     async fn returns_error_when_both_fail() {
-        let tts = FallbackVoiceOutput::new(
-            Arc::new(FailingTts),
-            Arc::new(FailingTts),
-        );
+        let tts = FallbackVoiceOutput::new(Arc::new(FailingTts), Arc::new(FailingTts));
         let err = tts.speak("hello").await.unwrap_err();
         assert!(err.to_string().contains("TTS server offline"));
     }

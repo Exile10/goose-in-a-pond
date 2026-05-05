@@ -51,16 +51,20 @@ impl ModelCapabilities {
         let mut caps = Self::default();
 
         // Thinking-capable model families
-        if lower.contains("gemma-4") || lower.contains("gemma4")
+        if lower.contains("gemma-4")
+            || lower.contains("gemma4")
             || lower.contains("gemma_4")
-            || lower.contains("qwen3") || lower.contains("qwq")
-            || lower.contains("deepseek-r1") || lower.contains("deepseek_r1")
+            || lower.contains("qwen3")
+            || lower.contains("qwq")
+            || lower.contains("deepseek-r1")
+            || lower.contains("deepseek_r1")
         {
             caps.thinking = true;
         }
 
         // Vision-capable model families
-        if lower.contains("gemma-4") || lower.contains("gemma4")
+        if lower.contains("gemma-4")
+            || lower.contains("gemma4")
             || lower.contains("gemma_4")
             || lower.contains("llava")
             || lower.contains("bakllava")
@@ -93,8 +97,11 @@ impl ModelCapabilities {
         }
 
         // Structured output — all local GGUF models support GBNF via llama.cpp
-        if lower.contains(".gguf") || lower.contains("q4_k") || lower.contains("q5_k")
-            || lower.contains("q8_0") || lower.contains("q6_k")
+        if lower.contains(".gguf")
+            || lower.contains("q4_k")
+            || lower.contains("q5_k")
+            || lower.contains("q8_0")
+            || lower.contains("q6_k")
         {
             caps.structured_output = true;
         }

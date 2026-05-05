@@ -21,10 +21,10 @@ impl SqliteSkillRepository {
 
 fn row_to_skill(row: &sqlx::sqlite::SqliteRow) -> Result<UserSkill> {
     Ok(UserSkill {
-        id:         row.try_get("id")?,
-        name:       row.try_get("name")?,
-        content:    row.try_get("content")?,
-        active:     row.try_get::<i64, _>("active")? != 0,
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        content: row.try_get("content")?,
+        active: row.try_get::<i64, _>("active")? != 0,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -80,15 +80,13 @@ impl UserSkillRepository for SqliteSkillRepository {
     }
 
     async fn update(&self, skill: &UserSkill) -> Result<()> {
-        sqlx::query(
-            "UPDATE user_skills SET name = ?, content = ?, active = ? WHERE id = ?",
-        )
-        .bind(&skill.name)
-        .bind(&skill.content)
-        .bind(skill.active as i64)
-        .bind(&skill.id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE user_skills SET name = ?, content = ?, active = ? WHERE id = ?")
+            .bind(&skill.name)
+            .bind(&skill.content)
+            .bind(skill.active as i64)
+            .bind(&skill.id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
