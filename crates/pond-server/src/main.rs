@@ -4322,6 +4322,11 @@ async fn sync_assignments_to_settings(
                     .set_key("task_model", model_name.to_string())
                     .await;
             }
+            "tool" => {
+                let _ = settings_repo
+                    .set_key("tool_model", model_name.to_string())
+                    .await;
+            }
             "asr" => {
                 let _ = settings_repo
                     .set_key("active_whisper_model", model_name.to_string())
@@ -5355,10 +5360,95 @@ mod tests {
 
         sync_assignments_to_settings(&repo, &settings_repo).await;
 
-        let settings = settings_repo.get().await.unwrap();
-        assert_eq!(settings.think_provider.as_deref(), Some("ollama"));
-        assert_eq!(settings.think_model.as_deref(), Some("gemma2"));
-        assert_eq!(settings.task_provider.as_deref(), Some("ollama"));
-        assert_eq!(settings.task_model.as_deref(), Some("gemma2"));
+        // think_provider/think_model and task_provider/task_model are KV-only
+        // (not first-class fields on Settings), so read via get_key().
+        assert_eq!(
+            settings_repo
+                .get_key("think_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("think_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_tool_assignment_updates_settings() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id: "ollama/gemma3:4b".to_string(),
+            category: ModelCategory::Ollama,
+            name: "gemma3:4b".to_string(),
+            filename: None,
+            description: String::new(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("tool", "ollama/gemma3:4b")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        assert_eq!(
+            settings_repo
+                .get_key("tool_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma3:4b"),
+            "tool_model should be synced from tool role assignment"
+        );
     }
 }

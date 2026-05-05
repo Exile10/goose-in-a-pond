@@ -2049,6 +2049,7 @@ async fn list_models(
     let mut llamafile = vec![];
     let mut tts = vec![];
     let mut gguf = vec![];
+    let mut ollama = vec![];
     let mut embedding = vec![];
 
     for m in &records {
@@ -2057,13 +2058,14 @@ async fn list_models(
             ModelCategory::Whisper => whisper.push(v),
             ModelCategory::Llamafile => llamafile.push(v),
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => tts.push(v),
-            ModelCategory::Gguf | ModelCategory::Ollama => gguf.push(v),
+            ModelCategory::Gguf => gguf.push(v),
+            ModelCategory::Ollama => ollama.push(v),
             ModelCategory::Embedding => embedding.push(v),
         }
     }
 
     Ok(Json(
-        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "embedding": embedding}),
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "ollama": ollama, "embedding": embedding}),
     ))
 }
 
