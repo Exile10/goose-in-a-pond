@@ -27,12 +27,12 @@ impl SqliteProfileRepository {
 
 #[derive(sqlx::FromRow)]
 struct ProfileRow {
-    id:           String,
+    id: String,
     display_name: String,
     avatar_emoji: String,
-    preferences:  String,
-    created_at:   String,
-    updated_at:   String,
+    preferences: String,
+    created_at: String,
+    updated_at: String,
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -42,15 +42,14 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
 }
 
 fn row_to_profile(row: ProfileRow) -> Profile {
-    let prefs: HashMap<String, String> =
-        serde_json::from_str(&row.preferences).unwrap_or_default();
+    let prefs: HashMap<String, String> = serde_json::from_str(&row.preferences).unwrap_or_default();
     Profile {
-        id:           row.id,
+        id: row.id,
         display_name: row.display_name,
         avatar_emoji: row.avatar_emoji,
-        preferences:  prefs,
-        created_at:   parse_dt(&row.created_at),
-        updated_at:   parse_dt(&row.updated_at),
+        preferences: prefs,
+        created_at: parse_dt(&row.created_at),
+        updated_at: parse_dt(&row.updated_at),
     }
 }
 
@@ -77,9 +76,9 @@ impl ProfileRepository for SqliteProfileRepository {
             id,
             display_name: request.display_name,
             avatar_emoji: request.avatar_emoji,
-            preferences:  HashMap::new(),
-            created_at:   now,
-            updated_at:   now,
+            preferences: HashMap::new(),
+            created_at: now,
+            updated_at: now,
         })
     }
 
@@ -108,14 +107,13 @@ impl ProfileRepository for SqliteProfileRepository {
         let prefs_json = serde_json::to_string(&prefs)?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let result = sqlx::query(
-            "UPDATE profiles SET preferences = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&prefs_json)
-        .bind(&now_str)
-        .bind(profile_id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("UPDATE profiles SET preferences = ?, updated_at = ? WHERE id = ?")
+                .bind(&prefs_json)
+                .bind(&now_str)
+                .bind(profile_id)
+                .execute(&self.pool)
+                .await?;
 
         if result.rows_affected() == 0 {
             return Err(anyhow!("profile not found: {}", profile_id));
@@ -167,8 +165,18 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all() {
         let (repo, _tmp) = make_repo().await;
-        repo.create(CreateProfileRequest { display_name: "A".to_string(), avatar_emoji: "A".to_string() }).await.unwrap();
-        repo.create(CreateProfileRequest { display_name: "B".to_string(), avatar_emoji: "B".to_string() }).await.unwrap();
+        repo.create(CreateProfileRequest {
+            display_name: "A".to_string(),
+            avatar_emoji: "A".to_string(),
+        })
+        .await
+        .unwrap();
+        repo.create(CreateProfileRequest {
+            display_name: "B".to_string(),
+            avatar_emoji: "B".to_string(),
+        })
+        .await
+        .unwrap();
         assert_eq!(repo.list().await.unwrap().len(), 2);
     }
 
@@ -176,20 +184,29 @@ mod tests {
     async fn update_preferences_persists() {
         let (repo, _tmp) = make_repo().await;
         let profile = repo
-            .create(CreateProfileRequest { display_name: "Jerry".to_string(), avatar_emoji: "X".to_string() })
+            .create(CreateProfileRequest {
+                display_name: "Jerry".to_string(),
+                avatar_emoji: "X".to_string(),
+            })
             .await
             .unwrap();
         let mut prefs = HashMap::new();
         prefs.insert("language".to_string(), "sw".to_string());
         let updated = repo.update_preferences(&profile.id, prefs).await.unwrap();
-        assert_eq!(updated.preferences.get("language").map(|s| s.as_str()), Some("sw"));
+        assert_eq!(
+            updated.preferences.get("language").map(|s| s.as_str()),
+            Some("sw")
+        );
     }
 
     #[tokio::test]
     async fn delete_removes_profile() {
         let (repo, _tmp) = make_repo().await;
         let profile = repo
-            .create(CreateProfileRequest { display_name: "Temp".to_string(), avatar_emoji: "T".to_string() })
+            .create(CreateProfileRequest {
+                display_name: "Temp".to_string(),
+                avatar_emoji: "T".to_string(),
+            })
             .await
             .unwrap();
         repo.delete(&profile.id).await.unwrap();

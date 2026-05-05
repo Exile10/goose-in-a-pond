@@ -34,13 +34,13 @@ use image::RgbImage;
 #[derive(Debug, Clone, Copy)]
 pub struct AntispoofReport {
     /// Scalar in \[0, 1\].  Higher = more likely to be a presentation attack.
-    pub spoof_score:      f32,
+    pub spoof_score: f32,
     /// Variance of the HSV saturation channel (raw diagnostic).
-    pub saturation_var:   f32,
+    pub saturation_var: f32,
     /// Fraction of pixels that look like skin specular highlights.
     pub highlight_density: f32,
     /// |h_gradient_mag - v_gradient_mag| / (h + v).  0 = isotropic; near 1 = strongly banded.
-    pub gradient_skew:    f32,
+    pub gradient_skew: f32,
 }
 
 /// Runs the passive anti-spoof heuristics on an aligned 112×112 RGB crop.
@@ -50,17 +50,19 @@ pub fn analyse(img: &RgbImage) -> AntispoofReport {
 
     // Accumulate saturation moments and highlight counts.
     let mut sat_sum = 0.0_f64;
-    let mut sat_sq  = 0.0_f64;
+    let mut sat_sq = 0.0_f64;
     let mut hl_count: u32 = 0;
     for px in img.pixels() {
         let [r, g, b] = px.0;
         let (_, s, v) = rgb_to_hsv(r, g, b);
         sat_sum += s as f64;
-        sat_sq  += (s * s) as f64;
-        if v > 0.85 && s < 0.20 { hl_count += 1; }
+        sat_sq += (s * s) as f64;
+        if v > 0.85 && s < 0.20 {
+            hl_count += 1;
+        }
     }
     let sat_mean = sat_sum / n;
-    let sat_var  = ((sat_sq / n) - sat_mean * sat_mean).max(0.0) as f32;
+    let sat_var = ((sat_sq / n) - sat_mean * sat_mean).max(0.0) as f32;
     let hl_density = hl_count as f32 / n as f32;
 
     // Sobel-style horizontal vs vertical gradient magnitude (luma).
@@ -89,19 +91,18 @@ pub fn analyse(img: &RgbImage) -> AntispoofReport {
     // Thresholds picked empirically; loosened slightly to avoid hair-trigger
     // rejection of real users in poor lighting.
     let sat_component = (0.012 - sat_var).max(0.0) / 0.012;
-    let hl_component  = (0.004 - hl_density).max(0.0) / 0.004;
+    let hl_component = (0.004 - hl_density).max(0.0) / 0.004;
     let skew_component = (gradient_skew - 0.12).max(0.0) / 0.30;
     let skew_component = skew_component.min(1.0);
 
     // Weighted combination.  Saturation variance is the strongest signal
     // across our failure cases, so it gets the largest weight.
-    let spoof_score = (0.5 * sat_component
-                     + 0.3 * hl_component
-                     + 0.2 * skew_component).clamp(0.0, 1.0);
+    let spoof_score =
+        (0.5 * sat_component + 0.3 * hl_component + 0.2 * skew_component).clamp(0.0, 1.0);
 
     AntispoofReport {
         spoof_score,
-        saturation_var:    sat_var,
+        saturation_var: sat_var,
         highlight_density: hl_density,
         gradient_skew,
     }
@@ -140,7 +141,11 @@ mod tests {
         // → spoof_score should be high.
         let img = RgbImage::from_pixel(40, 40, Rgb([128, 128, 128]));
         let r = analyse(&img);
-        assert!(r.spoof_score > 0.6, "spoof_score was {} for flat grey", r.spoof_score);
+        assert!(
+            r.spoof_score > 0.6,
+            "spoof_score was {} for flat grey",
+            r.spoof_score
+        );
     }
 
     #[test]
@@ -156,7 +161,11 @@ mod tests {
             }
         }
         let r = analyse(&img);
-        assert!(r.spoof_score < 0.5, "spoof_score was {} for noisy", r.spoof_score);
+        assert!(
+            r.spoof_score < 0.5,
+            "spoof_score was {} for noisy",
+            r.spoof_score
+        );
     }
 
     #[test]

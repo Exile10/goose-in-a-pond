@@ -22,18 +22,21 @@
 /// — we don't expect nesting in practice.
 const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
-    ("<|tool_call>",      "<tool_call|>"),
-    ("<think>",           "</think>"),
-    ("<thought>",         "</thought>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
 ];
 
 /// Standalone sentinels that get silently dropped wherever they appear in
 /// the stream. Some models (Gemma-family especially) keep emitting `<eos>`
 /// after the real reply ends; the chat UI then renders them literally.
 const STANDALONE_SENTINELS: &[&str] = &[
-    "<eos>", "<|eos|>", "<end_of_turn>",
+    "<eos>",
+    "<|eos|>",
+    "<end_of_turn>",
     // Orphaned close tags (model emitted close without a matching open):
-    "</think>", "</thought>",
+    "</think>",
+    "</thought>",
 ];
 
 /// Maximum tag length across PAIRED_TAGS (open + close) and STANDALONE_SENTINELS.
@@ -146,8 +149,10 @@ impl ThoughtFilter {
                         } else if self.capture_thinking {
                             // Thinking block — capture for SSE thinking events
                             let body = std::mem::take(&mut self.block_body);
-                            let trimmed = body.trim()
-                                .strip_prefix("thought").unwrap_or(body.trim())
+                            let trimmed = body
+                                .trim()
+                                .strip_prefix("thought")
+                                .unwrap_or(body.trim())
                                 .trim();
                             if !trimmed.is_empty() {
                                 self.captured_thinking.push(trimmed.to_string());
@@ -222,7 +227,9 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
         if !name.is_empty() {
             // Lift {} out of () wrapping if present.
             let raw_args = &s[open_idx..];
-            let args = if let Some(stripped) = raw_args.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+            let args = if let Some(stripped) =
+                raw_args.strip_prefix('(').and_then(|x| x.strip_suffix(')'))
+            {
                 stripped.to_string()
             } else {
                 raw_args.to_string()
@@ -234,7 +241,9 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
     // Form 4: full JSON object with `name` + `arguments`.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         if let (Some(name), args) = (v.get("name").and_then(|n| n.as_str()), v.get("arguments")) {
-            let args_str = args.map(|a| a.to_string()).unwrap_or_else(|| "{}".to_string());
+            let args_str = args
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "{}".to_string());
             return Some((name.to_string(), args_str));
         }
     }
@@ -246,7 +255,11 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
 /// ≥ longest standalone sentinel so neither can be missed when split.
 fn max_normal_lookahead() -> usize {
     let opens = PAIRED_TAGS.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
-    let stand = STANDALONE_SENTINELS.iter().map(|s| s.len()).max().unwrap_or(0);
+    let stand = STANDALONE_SENTINELS
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
     opens.max(stand)
 }
 
@@ -303,7 +316,14 @@ mod tests {
 
     #[test]
     fn strips_thought_split_across_chunks() {
-        let chunks = &["<|chan", "nel>thought ", "reason", "<chan", "nel|>", "Hello!"];
+        let chunks = &[
+            "<|chan",
+            "nel>thought ",
+            "reason",
+            "<chan",
+            "nel|>",
+            "Hello!",
+        ];
         assert_eq!(run(chunks), "Hello!");
     }
 

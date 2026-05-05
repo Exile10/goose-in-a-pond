@@ -27,8 +27,7 @@ async fn speak_returns_err_for_nonexistent_binary() {
     );
     let err = tts.speak("hello").await.unwrap_err();
     assert!(
-        err.to_string().to_lowercase().contains("piper")
-            || err.to_string().contains("nonexistent"),
+        err.to_string().to_lowercase().contains("piper") || err.to_string().contains("nonexistent"),
         "expected error referencing missing binary; got: {}",
         err
     );
@@ -42,10 +41,7 @@ async fn speak_returns_err_for_nonexistent_binary() {
 #[tokio::test]
 #[cfg(unix)]
 async fn speak_returns_err_when_subprocess_exits_nonzero() {
-    let tts = PiperOutput::new(
-        PathBuf::from("/usr/bin/false"),
-        PathBuf::from("model.onnx"),
-    );
+    let tts = PiperOutput::new(PathBuf::from("/usr/bin/false"), PathBuf::from("model.onnx"));
     let err = tts.speak("hello").await.unwrap_err();
     assert!(
         err.to_string().contains("piper exited"),

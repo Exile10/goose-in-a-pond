@@ -66,13 +66,15 @@ fn antispoof_onnx() -> Option<&'static OnnxAntispoof> {
 
 fn antispoof_onnx_2() -> Option<&'static OnnxAntispoof> {
     ONNX_ANTISPOOF_2
-        .get_or_init(|| match OnnxAntispoof::try_from_env_var("POND_FACE_ANTISPOOF_PATH_2") {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!("Silent-Face secondary anti-spoof load failed ({e:#})");
-                None
-            }
-        })
+        .get_or_init(
+            || match OnnxAntispoof::try_from_env_var("POND_FACE_ANTISPOOF_PATH_2") {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!("Silent-Face secondary anti-spoof load failed ({e:#})");
+                    None
+                }
+            },
+        )
         .as_ref()
 }
 
@@ -188,7 +190,9 @@ pub(crate) fn auto_exposure_enabled() -> bool {
 /// Mean luminance of an RGB image, in [0, 1].  Rec.709 weights.
 pub(crate) fn mean_luminance(img: &RgbImage) -> f32 {
     let n = (img.width() as u64) * (img.height() as u64);
-    if n == 0 { return 0.0; }
+    if n == 0 {
+        return 0.0;
+    }
     let mut acc: f64 = 0.0;
     for p in img.pixels() {
         let y = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
@@ -216,7 +220,7 @@ pub(crate) fn stretch_histogram_2_98(img: &mut RgbImage) {
     //     slightly more visible noise on uniformly-dim frames.
     match auto_exposure_mode().as_str() {
         "clahe" => clahe_per_channel(img, 8, 4.0),
-        _       => stretch_histogram_2_98_linear(img),
+        _ => stretch_histogram_2_98_linear(img),
     }
 }
 
@@ -232,7 +236,9 @@ fn auto_exposure_mode() -> String {
 /// when this beats CLAHE and vice-versa.
 fn stretch_histogram_2_98_linear(img: &mut RgbImage) {
     let n = (img.width() * img.height()) as usize;
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     let mut hists: [[u32; 256]; 3] = [[0; 256], [0; 256], [0; 256]];
     for p in img.pixels() {
         for c in 0..3 {
@@ -247,15 +253,23 @@ fn stretch_histogram_2_98_linear(img: &mut RgbImage) {
         let mut acc: u32 = 0;
         for v in 0..256 {
             acc += hists[c][v];
-            if acc >= lo_count { lo[c] = v as u8; break; }
+            if acc >= lo_count {
+                lo[c] = v as u8;
+                break;
+            }
         }
         let mut acc: u32 = 0;
         for v in 0..256 {
             acc += hists[c][v];
-            if acc >= hi_count { hi[c] = v as u8; break; }
+            if acc >= hi_count {
+                hi[c] = v as u8;
+                break;
+            }
         }
         // Avoid div-by-zero on degenerate channels (uniform colour).
-        if hi[c] <= lo[c] { hi[c] = lo[c].saturating_add(1); }
+        if hi[c] <= lo[c] {
+            hi[c] = lo[c].saturating_add(1);
+        }
     }
     for p in img.pixels_mut() {
         for c in 0..3 {
@@ -281,9 +295,13 @@ fn stretch_histogram_2_98_linear(img: &mut RgbImage) {
 /// face recognition that's fine — the embedder is colour-agnostic).
 fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
     let (w, h) = img.dimensions();
-    if w == 0 || h == 0 { return; }
+    if w == 0 || h == 0 {
+        return;
+    }
     let n_tiles = tiles_per_axis as usize;
-    if n_tiles < 2 { return; }
+    if n_tiles < 2 {
+        return;
+    }
 
     let tile_w = (w as f32 / tiles_per_axis as f32).ceil() as u32;
     let tile_h = (h as f32 / tiles_per_axis as f32).ceil() as u32;
@@ -301,12 +319,16 @@ fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
             let x1 = ((tx as u32 + 1) * tile_w).min(w);
             let y1 = ((ty as u32 + 1) * tile_h).min(h);
             let tile_pixels = ((x1 - x0) as usize) * ((y1 - y0) as usize);
-            if tile_pixels == 0 { continue; }
+            if tile_pixels == 0 {
+                continue;
+            }
             let mut hist: [[u32; 256]; 3] = [[0; 256], [0; 256], [0; 256]];
             for y in y0..y1 {
                 for x in x0..x1 {
                     let p = img.get_pixel(x, y).0;
-                    for c in 0..3 { hist[c][p[c] as usize] += 1; }
+                    for c in 0..3 {
+                        hist[c][p[c] as usize] += 1;
+                    }
                 }
             }
             // Clip + redistribute excess uniformly across all 256 bins.
@@ -322,14 +344,18 @@ fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
                 let mut leftover = (excess - add * 256) as usize;
                 for b in 0..256 {
                     hist[c][b] += add;
-                    if leftover > 0 { hist[c][b] += 1; leftover -= 1; }
+                    if leftover > 0 {
+                        hist[c][b] += 1;
+                        leftover -= 1;
+                    }
                 }
                 // CDF → 0..=255 lookup.
                 let mut cum: u32 = 0;
                 let cdf_scale = 255.0 / tile_pixels as f32;
                 for b in 0..256 {
                     cum += hist[c][b];
-                    cdfs[ty * n_tiles + tx][c][b] = (cum as f32 * cdf_scale).round().min(255.0) as u8;
+                    cdfs[ty * n_tiles + tx][c][b] =
+                        (cum as f32 * cdf_scale).round().min(255.0) as u8;
                 }
             }
         }
@@ -482,7 +508,8 @@ fn preprocess(
             let before = mean_pre;
             stretch_histogram_2_98(&mut resized);
             info!(
-                before, after = mean_luminance(&resized),
+                before,
+                after = mean_luminance(&resized),
                 "preprocess: applied low-light auto-exposure to dim crop",
             );
         }
@@ -526,14 +553,17 @@ fn preprocess(
         // enabling the whole `--debug` firehose.  Same treatment for the
         // other three gates below.
         info!(
-            variance, threshold = MIN_CONTENT_VARIANCE,
+            variance,
+            threshold = MIN_CONTENT_VARIANCE,
             "preprocess: rejecting low-variance frame (blank / solid colour)"
         );
         return Ok(None);
     }
     if !(MIN_MEAN_BRIGHTNESS..=MAX_MEAN_BRIGHTNESS).contains(&mean) {
         info!(
-            mean, min = MIN_MEAN_BRIGHTNESS, max = MAX_MEAN_BRIGHTNESS,
+            mean,
+            min = MIN_MEAN_BRIGHTNESS,
+            max = MAX_MEAN_BRIGHTNESS,
             "preprocess: rejecting extreme-brightness frame (too dark or too bright)"
         );
         return Ok(None);
@@ -543,7 +573,8 @@ fn preprocess(
     let lap_var_x1000 = laplacian_variance_luma(&resized) * 1000.0;
     if lap_var_x1000 < MIN_LAPLACIAN_VAR_X1000 {
         info!(
-            lap_var_x1000, threshold = MIN_LAPLACIAN_VAR_X1000,
+            lap_var_x1000,
+            threshold = MIN_LAPLACIAN_VAR_X1000,
             "preprocess: rejecting blurry frame (camera autofocus hunting?)"
         );
         return Ok(None);
@@ -576,7 +607,9 @@ fn preprocess(
                 let primary = match model.analyse(&loose) {
                     Ok(r) => r,
                     Err(e) => {
-                        warn!("Silent-Face inference failed ({e:#}); using heuristic for this frame");
+                        warn!(
+                            "Silent-Face inference failed ({e:#}); using heuristic for this frame"
+                        );
                         antispoof::analyse(&resized)
                     }
                 };
@@ -615,7 +648,8 @@ fn preprocess(
         if report.spoof_score >= threshold {
             info!(
                 score = report.spoof_score,
-                threshold, is_onnx,
+                threshold,
+                is_onnx,
                 sat_var = report.saturation_var,
                 hl_density = report.highlight_density,
                 skew = report.gradient_skew,
@@ -648,22 +682,30 @@ fn loose_antispoof_crop(
 
     // Prefer the caller-supplied bbox; otherwise synthesise a tight bbox
     // from the 5 landmark points.
-    let base: Option<(u32, u32, u32, u32)> = bbox
-        .and_then(|b| clamp_bbox(b, img_w, img_h))
-        .or_else(|| landmarks.map(|lms| {
-            let pts = lms.as_array();
-            let (mut xmin, mut ymin) = (f32::INFINITY, f32::INFINITY);
-            let (mut xmax, mut ymax) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-            for (x, y) in pts {
-                xmin = xmin.min(x); ymin = ymin.min(y);
-                xmax = xmax.max(x); ymax = ymax.max(y);
-            }
-            let x = xmin.max(0.0) as u32;
-            let y = ymin.max(0.0) as u32;
-            let w = (xmax - xmin).max(1.0) as u32;
-            let h = (ymax - ymin).max(1.0) as u32;
-            (x, y, w.min(img_w.saturating_sub(x)), h.min(img_h.saturating_sub(y)))
-        }));
+    let base: Option<(u32, u32, u32, u32)> =
+        bbox.and_then(|b| clamp_bbox(b, img_w, img_h)).or_else(|| {
+            landmarks.map(|lms| {
+                let pts = lms.as_array();
+                let (mut xmin, mut ymin) = (f32::INFINITY, f32::INFINITY);
+                let (mut xmax, mut ymax) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for (x, y) in pts {
+                    xmin = xmin.min(x);
+                    ymin = ymin.min(y);
+                    xmax = xmax.max(x);
+                    ymax = ymax.max(y);
+                }
+                let x = xmin.max(0.0) as u32;
+                let y = ymin.max(0.0) as u32;
+                let w = (xmax - xmin).max(1.0) as u32;
+                let h = (ymax - ymin).max(1.0) as u32;
+                (
+                    x,
+                    y,
+                    w.min(img_w.saturating_sub(x)),
+                    h.min(img_h.saturating_sub(y)),
+                )
+            })
+        });
 
     let (x, y, w, h) = match base {
         Some(b) => b,
@@ -711,7 +753,11 @@ fn antispoof_threshold(is_onnx: bool) -> f32 {
     //   * The heuristic score uses ad-hoc saturation / highlight / skew
     //     features, and the empirical split to avoid false-rejecting real
     //     users under LED ring lights sits closer to 0.65.
-    if is_onnx { 0.40 } else { 0.65 }
+    if is_onnx {
+        0.40
+    } else {
+        0.65
+    }
 }
 
 /// Compute the variance of a 3×3 Laplacian kernel applied to the BT.601
@@ -719,7 +765,9 @@ fn antispoof_threshold(is_onnx: bool) -> f32 {
 /// Used as a no-reference blur metric.
 fn laplacian_variance_luma(img: &image::RgbImage) -> f32 {
     let (w, h) = img.dimensions();
-    if w < 3 || h < 3 { return 0.0; }
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
     let luma = |x: u32, y: u32| -> f32 {
         let [r, g, b] = img.get_pixel(x, y).0;
         (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
@@ -751,7 +799,9 @@ fn postprocess(raw: &[f32], expected_dims: u32) -> Result<Vec<f32>> {
     }
     let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
     if norm == 0.0 {
-        return Err(anyhow!("embedding has zero norm — likely a degenerate input"));
+        return Err(anyhow!(
+            "embedding has zero norm — likely a degenerate input"
+        ));
     }
     Ok(raw.iter().map(|v| v / norm).collect())
 }
@@ -779,8 +829,7 @@ impl FaceEmbeddingExtractor for OnnxFaceEmbeddingExtractor {
                 Some(t) => t,
                 None => return Ok(None),
             };
-            let input =
-                Tensor::from_array(tensor).context("failed to wrap input as ort tensor")?;
+            let input = Tensor::from_array(tensor).context("failed to wrap input as ort tensor")?;
 
             let mut session = session
                 .lock()
@@ -804,7 +853,10 @@ impl FaceEmbeddingExtractor for OnnxFaceEmbeddingExtractor {
         if embedding.is_none() {
             warn!("face embedding rejected by quality gate");
         }
-        debug!(dims = embedding.as_ref().map(|e| e.len()).unwrap_or(0), "face embedding result");
+        debug!(
+            dims = embedding.as_ref().map(|e| e.len()).unwrap_or(0),
+            "face embedding result"
+        );
         Ok(embedding)
     }
 
@@ -833,7 +885,7 @@ mod tests {
     fn histogram_stretch_brightens_dim_image() {
         // 32×32 image with all values in [10, 30] — heavily underexposed.
         let mut img = RgbImage::from_fn(32, 32, |x, y| {
-            let v = ((x + y) % 21 + 10) as u8;   // 10..=30
+            let v = ((x + y) % 21 + 10) as u8; // 10..=30
             image::Rgb([v, v, v])
         });
         let mean_before = mean_luminance(&img);
@@ -860,7 +912,10 @@ mod tests {
         stretch_histogram_2_98(&mut img);
         let mean_after = mean_luminance(&img);
         let drift = (mean_after - mean_before).abs();
-        assert!(drift < 0.1, "well-exposed image should not drift much: {mean_before} -> {mean_after}");
+        assert!(
+            drift < 0.1,
+            "well-exposed image should not drift much: {mean_before} -> {mean_after}"
+        );
     }
 
     #[test]
@@ -886,9 +941,13 @@ mod tests {
         // dim quarter much because the bright quarter dominates the
         // global histogram; CLAHE handles each tile independently.
         let mut img = RgbImage::from_fn(64, 64, |x, y| {
-            let v = if x < 32 && y < 32 { 200u8 }
-                else if x >= 32 && y >= 32 { 20u8 }
-                else { 110u8 };
+            let v = if x < 32 && y < 32 {
+                200u8
+            } else if x >= 32 && y >= 32 {
+                20u8
+            } else {
+                110u8
+            };
             image::Rgb([v, v, v])
         });
         // Sample the dim quarter's mean before/after.
@@ -898,7 +957,8 @@ mod tests {
             for y in 32..64u32 {
                 for x in 32..64u32 {
                     let p = im.get_pixel(x, y).0;
-                    s += p[0] as u32; n += 1;
+                    s += p[0] as u32;
+                    n += 1;
                 }
             }
             s as f32 / n as f32 / 255.0
@@ -960,7 +1020,10 @@ mod tests {
         }
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         bytes
     }
@@ -969,7 +1032,10 @@ mod tests {
         let img = image::RgbImage::from_pixel(w, h, image::Rgb(px));
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         bytes
     }
@@ -1007,22 +1073,39 @@ mod tests {
 
     #[test]
     fn clamp_bbox_trims_to_image_bounds() {
-        let bbox = BoundingBox { x: 90, y: 90, width: 50, height: 50 };
+        let bbox = BoundingBox {
+            x: 90,
+            y: 90,
+            width: 50,
+            height: 50,
+        };
         assert_eq!(clamp_bbox(bbox, 100, 100), Some((90, 90, 10, 10)));
     }
 
     #[test]
     fn clamp_bbox_rejects_out_of_bounds_origin() {
-        let bbox = BoundingBox { x: 150, y: 0, width: 10, height: 10 };
+        let bbox = BoundingBox {
+            x: 150,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
         assert!(clamp_bbox(bbox, 100, 100).is_none());
     }
 
     #[test]
     fn clamp_bbox_rejects_zero_area() {
         assert!(clamp_bbox(
-            BoundingBox { x: 10, y: 10, width: 0, height: 20 },
-            100, 100
-        ).is_none());
+            BoundingBox {
+                x: 10,
+                y: 10,
+                width: 0,
+                height: 20
+            },
+            100,
+            100
+        )
+        .is_none());
     }
 
     #[test]
@@ -1032,10 +1115,10 @@ mod tests {
         // the right shape — warp correctness is covered in alignment::tests.
         let bytes = noisy_png(200, 200);
         let lms = FaceLandmarks {
-            left_eye:    (70.0, 80.0),
-            right_eye:   (130.0, 80.0),
-            nose:        (100.0, 110.0),
-            left_mouth:  (80.0, 150.0),
+            left_eye: (70.0, 80.0),
+            right_eye: (130.0, 80.0),
+            nose: (100.0, 110.0),
+            left_mouth: (80.0, 150.0),
             right_mouth: (120.0, 150.0),
         };
         let tensor = preprocess(&bytes, EmbeddingModel::ArcFace512, None, Some(lms))

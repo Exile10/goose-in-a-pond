@@ -141,9 +141,9 @@ impl LlmProvider for LlamafileProvider {
         for m in &messages {
             oai.push(OaiMessage {
                 role: match m.role {
-                    Role::User      => "user",
+                    Role::User => "user",
                     Role::Assistant => "assistant",
-                    Role::System    => "system",
+                    Role::System => "system",
                 },
                 content: &m.content,
             });
@@ -199,11 +199,11 @@ impl LlmProvider for LlamafileProvider {
         messages: Vec<ChatMessage>,
     ) -> TokenStream<'a> {
         // Clone everything needed into owned values so the stream is self-contained.
-        let client   = self.client.clone();
+        let client = self.client.clone();
         let endpoint = self.endpoint.clone();
-        let model    = self.model.clone();
+        let model = self.model.clone();
         let temperature = self.temperature;
-        let max_tokens  = self.max_tokens;
+        let max_tokens = self.max_tokens;
         let oai_messages = Self::build_oai_messages(system_prompt, &messages);
 
         Box::pin(async_stream::stream! {

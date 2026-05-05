@@ -36,10 +36,7 @@ impl SessionStorage for InMemorySessionStorage {
             .write()
             .await
             .insert(session_id.clone(), session.clone());
-        self.messages
-            .write()
-            .await
-            .insert(session_id, Vec::new());
+        self.messages.write().await.insert(session_id, Vec::new());
         Ok(session)
     }
 
@@ -71,7 +68,10 @@ impl SessionStorage for InMemorySessionStorage {
         Ok(message)
     }
 
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError> {
+    async fn get_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
         // Ensure session exists
         self._get_session(session_id).await?;
 
@@ -160,14 +160,20 @@ mod tests {
     #[tokio::test]
     async fn test_create_session() {
         let storage = InMemorySessionStorage::new();
-        let session = storage.create_session("session-1".to_string()).await.unwrap();
+        let session = storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
         assert_eq!(session.id, "session-1");
     }
 
     #[tokio::test]
     async fn test_get_session() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
         let retrieved = storage.get_session("session-1").await.unwrap();
         assert_eq!(retrieved.id, "session-1");
     }
@@ -182,14 +188,14 @@ mod tests {
     #[tokio::test]
     async fn test_add_message() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
 
         let message = ChatMessage::user("Hello");
-        let session_message = SessionMessage::new(
-            "msg-1".to_string(),
-            "session-1".to_string(),
-            message,
-        );
+        let session_message =
+            SessionMessage::new("msg-1".to_string(), "session-1".to_string(), message);
 
         let result = storage
             .add_message("session-1".to_string(), session_message.clone())
@@ -200,21 +206,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_messages() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
 
         let msg1 = ChatMessage::user("Hello");
-        let session_msg1 = SessionMessage::new(
-            "msg-1".to_string(),
-            "session-1".to_string(),
-            msg1,
-        );
+        let session_msg1 = SessionMessage::new("msg-1".to_string(), "session-1".to_string(), msg1);
 
         let msg2 = ChatMessage::assistant("Hi there");
-        let session_msg2 = SessionMessage::new(
-            "msg-2".to_string(),
-            "session-1".to_string(),
-            msg2,
-        );
+        let session_msg2 = SessionMessage::new("msg-2".to_string(), "session-1".to_string(), msg2);
 
         storage
             .add_message("session-1".to_string(), session_msg1)
@@ -234,7 +235,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
 
         let result = storage.delete_session("session-1").await;
         assert!(result.is_ok());
@@ -246,8 +250,14 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
-        storage.create_session("session-2".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
+        storage
+            .create_session("session-2".to_string())
+            .await
+            .unwrap();
 
         let sessions = storage.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 2);
@@ -261,11 +271,7 @@ mod tests {
 
         for i in 0..10 {
             let msg = ChatMessage::user(format!("Message {}", i));
-            let session_msg = SessionMessage::new(
-                format!("msg-{}", i),
-                session_id.clone(),
-                msg,
-            );
+            let session_msg = SessionMessage::new(format!("msg-{}", i), session_id.clone(), msg);
             storage
                 .add_message(session_id.clone(), session_msg)
                 .await
@@ -273,37 +279,54 @@ mod tests {
         }
 
         // Get first 3 messages
-        let page1 = storage.get_messages_paginated(&session_id, 3, 0).await.unwrap();
+        let page1 = storage
+            .get_messages_paginated(&session_id, 3, 0)
+            .await
+            .unwrap();
         assert_eq!(page1.len(), 3);
         assert_eq!(page1[0].message.content, "Message 0");
         assert_eq!(page1[2].message.content, "Message 2");
 
         // Get next 3 messages
-        let page2 = storage.get_messages_paginated(&session_id, 3, 3).await.unwrap();
+        let page2 = storage
+            .get_messages_paginated(&session_id, 3, 3)
+            .await
+            .unwrap();
         assert_eq!(page2.len(), 3);
         assert_eq!(page2[0].message.content, "Message 3");
 
         // Offset past end
-        let empty = storage.get_messages_paginated(&session_id, 3, 100).await.unwrap();
+        let empty = storage
+            .get_messages_paginated(&session_id, 3, 100)
+            .await
+            .unwrap();
         assert!(empty.is_empty());
     }
 
     #[tokio::test]
     async fn test_update_title() {
         let storage = InMemorySessionStorage::new();
-        storage.create_session("session-1".to_string()).await.unwrap();
+        storage
+            .create_session("session-1".to_string())
+            .await
+            .unwrap();
 
         // Title starts as None
         let session = storage.get_session("session-1").await.unwrap();
         assert_eq!(session.title, None);
 
         // Update title
-        storage.update_title("session-1", "My Chat".to_string()).await.unwrap();
+        storage
+            .update_title("session-1", "My Chat".to_string())
+            .await
+            .unwrap();
         let session = storage.get_session("session-1").await.unwrap();
         assert_eq!(session.title, Some("My Chat".to_string()));
 
         // Update title on nonexistent session fails
-        let result = storage.update_title("nonexistent", "Nope".to_string()).await;
+        let result = storage
+            .update_title("nonexistent", "Nope".to_string())
+            .await;
         assert!(result.is_err());
     }
 
@@ -315,11 +338,7 @@ mod tests {
 
         // First iteration: add a user message
         let user_msg = ChatMessage::user("First message");
-        let session_msg1 = SessionMessage::new(
-            "msg-1".to_string(),
-            session_id.clone(),
-            user_msg,
-        );
+        let session_msg1 = SessionMessage::new("msg-1".to_string(), session_id.clone(), user_msg);
         storage
             .add_message(session_id.clone(), session_msg1)
             .await
@@ -327,11 +346,8 @@ mod tests {
 
         // Second iteration: add an assistant response
         let assistant_msg = ChatMessage::assistant("First response");
-        let session_msg2 = SessionMessage::new(
-            "msg-2".to_string(),
-            session_id.clone(),
-            assistant_msg,
-        );
+        let session_msg2 =
+            SessionMessage::new("msg-2".to_string(), session_id.clone(), assistant_msg);
         storage
             .add_message(session_id.clone(), session_msg2)
             .await

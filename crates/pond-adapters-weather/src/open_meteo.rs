@@ -30,30 +30,30 @@ struct ApiResponse {
 
 #[derive(serde::Deserialize)]
 struct CurrentFields {
-    temperature_2m:          f64,
-    relative_humidity_2m:    u32,
-    apparent_temperature:    f64,
-    precipitation:           f64,
-    weather_code:            u32,
-    wind_speed_10m:          f64,
-    wind_direction_10m:      u32,
+    temperature_2m: f64,
+    relative_humidity_2m: u32,
+    apparent_temperature: f64,
+    precipitation: f64,
+    weather_code: u32,
+    wind_speed_10m: f64,
+    wind_direction_10m: u32,
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 struct CacheEntry {
-    data:     WeatherData,
-    fetched:  Instant,
+    data: WeatherData,
+    fetched: Instant,
 }
 
 pub struct OpenMeteoWeatherAdapter {
-    client:        reqwest::Client,
-    latitude:      f64,
-    longitude:     f64,
+    client: reqwest::Client,
+    latitude: f64,
+    longitude: f64,
     location_name: String,
-    base_url:      String,
-    cache_ttl:     Duration,
-    cache:         Mutex<Option<CacheEntry>>,
+    base_url: String,
+    cache_ttl: Duration,
+    cache: Mutex<Option<CacheEntry>>,
 }
 
 impl OpenMeteoWeatherAdapter {
@@ -94,7 +94,7 @@ impl OpenMeteoWeatherAdapter {
              &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm",
             self.base_url, self.latitude, self.longitude,
         );
-       println!("Fetching {}", &url);
+        println!("Fetching {}", &url);
         let resp = self
             .client
             .get(&url)
@@ -105,19 +105,22 @@ impl OpenMeteoWeatherAdapter {
             .error_for_status()
             .context("weather API returned error status")?;
 
-        let api: ApiResponse = resp.json().await.context("failed to parse weather response")?;
+        let api: ApiResponse = resp
+            .json()
+            .await
+            .context("failed to parse weather response")?;
         let c = api.current;
 
         Ok(WeatherData {
-            temperature_c:      c.temperature_2m,
-            feels_like_c:       c.apparent_temperature,
-            humidity_pct:       c.relative_humidity_2m,
-            description:        wmo::describe(c.weather_code).to_string(),
-            wind_speed_kmh:     c.wind_speed_10m,
+            temperature_c: c.temperature_2m,
+            feels_like_c: c.apparent_temperature,
+            humidity_pct: c.relative_humidity_2m,
+            description: wmo::describe(c.weather_code).to_string(),
+            wind_speed_kmh: c.wind_speed_10m,
             wind_direction_deg: c.wind_direction_10m,
-            precipitation_mm:   c.precipitation,
-            location_name:      self.location_name.clone(),
-            fetched_at:         Utc::now(),
+            precipitation_mm: c.precipitation,
+            location_name: self.location_name.clone(),
+            fetched_at: Utc::now(),
         })
     }
 }
@@ -138,16 +141,26 @@ impl WeatherProvider for OpenMeteoWeatherAdapter {
         };
 
         if let Some(data) = cached {
-            tracing::debug!("weather: serving from cache (location={})", self.location_name);
+            tracing::debug!(
+                "weather: serving from cache (location={})",
+                self.location_name
+            );
             return Ok(data);
         }
 
-        tracing::debug!("weather: fetching from Open-Meteo (lat={}, lon={})", self.latitude, self.longitude);
+        tracing::debug!(
+            "weather: fetching from Open-Meteo (lat={}, lon={})",
+            self.latitude,
+            self.longitude
+        );
         let data = self.fetch_fresh().await?;
 
         {
             let mut guard = self.cache.lock().unwrap();
-            *guard = Some(CacheEntry { data: data.clone(), fetched: Instant::now() });
+            *guard = Some(CacheEntry {
+                data: data.clone(),
+                fetched: Instant::now(),
+            });
         }
 
         Ok(data)
@@ -249,22 +262,15 @@ mod tests {
 }
 
 #[tokio::test]
-
 #[ignore] // 👈 IMPORTANT: prevents running in CI
 
 async fn live_weather_fetch() {
+    let adapter = OpenMeteoWeatherAdapter::new(-1.286, 36.817, "Nairobi, KE");
 
-    let adapter = OpenMeteoWeatherAdapter::new(
-
-        -1.286,
-
-        36.817,
-
-        "Nairobi, KE"
-
-    );
-
-    let data = adapter.current().await.expect("failed to fetch live weather");
+    let data = adapter
+        .current()
+        .await
+        .expect("failed to fetch live weather");
 
     println!("{:#?}", data);
 
@@ -275,5 +281,4 @@ async fn live_weather_fetch() {
     assert!(data.humidity_pct <= 100);
 
     assert!(!data.description.is_empty());
-
 }

@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use goose::conversation::message::Message;
 use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
-use goose::conversation::message::Message;
 use pond_core::ports::tool_caller::ToolCaller;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +43,8 @@ impl ToolCallerEngine {
         };
 
         println!("[tool_caller] loading specialist model: {}", model_id);
-        let provider = LocalInferenceProvider::from_env(model_config.clone(), vec![]).await
+        let provider = LocalInferenceProvider::from_env(model_config.clone(), vec![])
+            .await
             .map_err(|e| anyhow!("Failed to load tool-caller model '{}': {e}", model_id))?;
         println!("[tool_caller] specialist model loaded: {}", model_id);
 
@@ -65,7 +66,8 @@ impl ToolCaller for ToolCallerEngine {
     ) -> Result<serde_json::Map<String, serde_json::Value>> {
         use rmcp::model::Tool;
 
-        let system = "You are a tool-calling assistant. Call the appropriate tool for the user's request.";
+        let system =
+            "You are a tool-calling assistant. Call the appropriate tool for the user's request.";
 
         // Build a proper rmcp Tool so the GGUF chat template renders it via
         // its native tool-calling path (Gemma's <tool_call> format, etc.).
@@ -76,20 +78,32 @@ impl ToolCaller for ToolCallerEngine {
             "description": format!("Look up information about a topic using {}", tool_name),
             "inputSchema": serde_json::from_str::<serde_json::Value>(tool_schema_json)
                 .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}})),
-        })).unwrap_or_else(|_| {
+        }))
+        .unwrap_or_else(|_| {
             // Fallback: construct minimal tool manually
             serde_json::from_value(serde_json::json!({
                 "name": tool_name,
                 "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}}},
-            })).expect("hardcoded tool schema must parse")
+            }))
+            .expect("hardcoded tool schema must parse")
         });
 
         let prompt = format!("User request: {user_query}");
-        println!("[tool_caller] generating args for tool={}, query={:?}", tool_name, user_query);
+        println!(
+            "[tool_caller] generating args for tool={}, query={:?}",
+            tool_name, user_query
+        );
 
         let messages = vec![Message::user().with_text(&prompt)];
-        let (response, _usage) = self.provider
-            .complete(&self.model_config, &self.session_id, system, &messages, &[tool])
+        let (response, _usage) = self
+            .provider
+            .complete(
+                &self.model_config,
+                &self.session_id,
+                system,
+                &messages,
+                &[tool],
+            )
             .await
             .map_err(|e| anyhow!("Tool-caller inference failed: {e}"))?;
 
@@ -113,9 +127,12 @@ fn parse_tool_call_json(
     // Strip markdown code fences if present
     let cleaned = text
         .trim()
-        .strip_prefix("```json").unwrap_or(text.trim())
-        .strip_prefix("```").unwrap_or(text.trim())
-        .strip_suffix("```").unwrap_or(text.trim())
+        .strip_prefix("```json")
+        .unwrap_or(text.trim())
+        .strip_prefix("```")
+        .unwrap_or(text.trim())
+        .strip_suffix("```")
+        .unwrap_or(text.trim())
         .trim();
 
     // Find the first '{' and last '}' to extract JSON even with surrounding text
@@ -123,7 +140,12 @@ fn parse_tool_call_json(
     let end = cleaned.rfind('}');
     let json_str = match (start, end) {
         (Some(s), Some(e)) if s < e => &cleaned[s..=e],
-        _ => return Err(anyhow!("No JSON object found in tool-caller response: {:?}", text)),
+        _ => {
+            return Err(anyhow!(
+                "No JSON object found in tool-caller response: {:?}",
+                text
+            ))
+        }
     };
 
     let value: serde_json::Value = serde_json::from_str(json_str)
@@ -132,7 +154,10 @@ fn parse_tool_call_json(
     // Case 1: {"name": "tool_name", "arguments": {...}}
     if let Some(args) = value.get("arguments") {
         if let Some(map) = args.as_object() {
-            println!("[tool_caller] parsed arguments from 'arguments' field: {:?}", map);
+            println!(
+                "[tool_caller] parsed arguments from 'arguments' field: {:?}",
+                map
+            );
             return Ok(map.clone());
         }
     }
@@ -140,7 +165,8 @@ fn parse_tool_call_json(
     // Case 2: {"key": "value"} — bare arguments (no "name" wrapper)
     if let Some(map) = value.as_object() {
         // Filter out "name" if present (it's the tool name, not an argument)
-        let args: serde_json::Map<String, serde_json::Value> = map.iter()
+        let args: serde_json::Map<String, serde_json::Value> = map
+            .iter()
             .filter(|(k, _)| k.as_str() != "name")
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -152,7 +178,8 @@ fn parse_tool_call_json(
 
     Err(anyhow!(
         "Tool-caller produced no usable arguments for '{}': {:?}",
-        tool_name, text
+        tool_name,
+        text
     ))
 }
 
@@ -193,7 +220,9 @@ fn register_tool_model(model_id: &str, data_dir: &Path) {
                 };
                 match registry.add_model(entry) {
                     Ok(_) => println!("[tool_caller] registered GGUF '{}' in model registry", stem),
-                    Err(e) => tracing::warn!("Could not register tool-caller model '{}': {}", stem, e),
+                    Err(e) => {
+                        tracing::warn!("Could not register tool-caller model '{}': {}", stem, e)
+                    }
                 }
             }
         }

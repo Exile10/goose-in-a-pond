@@ -124,10 +124,7 @@ pub async fn try_start(data_dir: &Path, model_path: &Path) -> (Option<WhisperPro
     let port = match crate::ports::find_free_port(base_port).await {
         Some(p) => p,
         None => {
-            println!(
-                "  ⚠  No free port found near {} for whisper.cpp",
-                base_port
-            );
+            println!("  ⚠  No free port found near {} for whisper.cpp", base_port);
             return (None, base_port);
         }
     };

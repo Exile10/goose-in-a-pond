@@ -15,12 +15,16 @@ pub struct MockSensorStorage {
 
 impl MockSensorStorage {
     pub fn new() -> Self {
-        Self { readings: Arc::new(RwLock::new(Vec::new())) }
+        Self {
+            readings: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 }
 
 impl Default for MockSensorStorage {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
@@ -30,7 +34,11 @@ impl SensorStorage for MockSensorStorage {
         Ok(())
     }
 
-    async fn get_latest(&self, device_id: &str, sensor_type: &str) -> Result<Option<SensorReading>> {
+    async fn get_latest(
+        &self,
+        device_id: &str,
+        sensor_type: &str,
+    ) -> Result<Option<SensorReading>> {
         let readings = self.readings.read().await;
         Ok(readings
             .iter()
@@ -67,7 +75,9 @@ impl MockCameraStorage {
 }
 
 impl Default for MockCameraStorage {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
@@ -133,8 +143,14 @@ mod tests {
     #[tokio::test]
     async fn sensor_record_and_get_latest() {
         let storage = MockSensorStorage::new();
-        storage.record(reading("room1", "temperature", 21.0)).await.unwrap();
-        storage.record(reading("room1", "temperature", 22.5)).await.unwrap();
+        storage
+            .record(reading("room1", "temperature", 21.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("room1", "temperature", 22.5))
+            .await
+            .unwrap();
         let latest = storage.get_latest("room1", "temperature").await.unwrap();
         assert!(latest.is_some());
     }

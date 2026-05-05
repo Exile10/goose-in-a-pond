@@ -26,32 +26,37 @@ impl SqliteModelRepository {
 fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<ModelRecord> {
     use sqlx::Row;
     let category_str: String = row.try_get("category")?;
-    let category = ModelCategory::from_str(&category_str)
-        .unwrap_or(ModelCategory::Gguf); // fallback; shouldn't happen for clean data
+    let category = ModelCategory::from_str(&category_str).unwrap_or(ModelCategory::Gguf); // fallback; shouldn't happen for clean data
 
     Ok(ModelRecord {
-        id:              row.try_get("id")?,
+        id: row.try_get("id")?,
         category,
-        name:            row.try_get("name")?,
-        filename:        row.try_get("filename")?,
-        description:     row.try_get("description")?,
-        size_mb:         row.try_get::<i64, _>("size_mb")? as u64,
-        url:             row.try_get("url")?,
-        hf_id:           row.try_get("hf_id")?,
-        ram_estimate_mb: row.try_get::<Option<i64>, _>("ram_estimate_mb")?.map(|v| v as u64),
+        name: row.try_get("name")?,
+        filename: row.try_get("filename")?,
+        description: row.try_get("description")?,
+        size_mb: row.try_get::<i64, _>("size_mb")? as u64,
+        url: row.try_get("url")?,
+        hf_id: row.try_get("hf_id")?,
+        ram_estimate_mb: row
+            .try_get::<Option<i64>, _>("ram_estimate_mb")?
+            .map(|v| v as u64),
         recommended_role: row.try_get("recommended_role")?,
-        context_length:  row.try_get::<Option<i64>, _>("context_length")?.map(|v| v as u32),
-        quantization:    row.try_get("quantization")?,
-        asr_language:    row.try_get("asr_language")?,
-        asr_size:        row.try_get("asr_size")?,
-        tts_engine:      row.try_get("tts_engine")?,
-        tts_voice_name:  row.try_get("tts_voice_name")?,
+        context_length: row
+            .try_get::<Option<i64>, _>("context_length")?
+            .map(|v| v as u32),
+        quantization: row.try_get("quantization")?,
+        asr_language: row.try_get("asr_language")?,
+        asr_size: row.try_get("asr_size")?,
+        tts_engine: row.try_get("tts_engine")?,
+        tts_voice_name: row.try_get("tts_voice_name")?,
         config_filename: row.try_get("config_filename")?,
-        config_url:      row.try_get("config_url")?,
-        tts_url:         row.try_get("tts_url")?,
-        sample_rate:     row.try_get::<Option<i64>, _>("sample_rate")?.map(|v| v as u32),
-        downloaded:      row.try_get::<i64, _>("downloaded")? != 0,
-        is_custom:       row.try_get::<i64, _>("is_custom")? != 0,
+        config_url: row.try_get("config_url")?,
+        tts_url: row.try_get("tts_url")?,
+        sample_rate: row
+            .try_get::<Option<i64>, _>("sample_rate")?
+            .map(|v| v as u32),
+        downloaded: row.try_get::<i64, _>("downloaded")? != 0,
+        is_custom: row.try_get::<i64, _>("is_custom")? != 0,
     })
 }
 
@@ -60,22 +65,18 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<ModelRecord> {
 #[async_trait]
 impl ModelRepository for SqliteModelRepository {
     async fn list_all(&self) -> Result<Vec<ModelRecord>> {
-        let rows = sqlx::query(
-            "SELECT * FROM models ORDER BY category, name"
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT * FROM models ORDER BY category, name")
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.iter().map(row_to_record).collect()
     }
 
     async fn list_by_category(&self, category: &ModelCategory) -> Result<Vec<ModelRecord>> {
-        let rows = sqlx::query(
-            "SELECT * FROM models WHERE category = ? ORDER BY name"
-        )
-        .bind(category.as_str())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT * FROM models WHERE category = ? ORDER BY name")
+            .bind(category.as_str())
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.iter().map(row_to_record).collect()
     }
@@ -162,13 +163,11 @@ impl ModelRepository for SqliteModelRepository {
     }
 
     async fn set_downloaded(&self, id: &str, downloaded: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE models SET downloaded = ?, updated_at = datetime('now') WHERE id = ?"
-        )
-        .bind(downloaded as i64)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE models SET downloaded = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(downloaded as i64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -177,16 +176,14 @@ impl ModelRepository for SqliteModelRepository {
 
     async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> {
         use sqlx::Row;
-        let rows = sqlx::query(
-            "SELECT role, model_id FROM model_role_assignments ORDER BY role"
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT role, model_id FROM model_role_assignments ORDER BY role")
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .iter()
             .map(|r| ModelRoleAssignment {
-                role:     r.get("role"),
+                role: r.get("role"),
                 model_id: r.get("model_id"),
             })
             .collect())
@@ -194,15 +191,13 @@ impl ModelRepository for SqliteModelRepository {
 
     async fn get_assignment(&self, role: &str) -> Result<Option<ModelRoleAssignment>> {
         use sqlx::Row;
-        let row = sqlx::query(
-            "SELECT role, model_id FROM model_role_assignments WHERE role = ?"
-        )
-        .bind(role)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT role, model_id FROM model_role_assignments WHERE role = ?")
+            .bind(role)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ModelRoleAssignment {
-            role:     r.get("role"),
+            role: r.get("role"),
             model_id: r.get("model_id"),
         }))
     }
@@ -252,55 +247,55 @@ mod tests {
 
     fn gguf_record(name: &str) -> ModelRecord {
         ModelRecord {
-            id:              ModelRecord::id_for(&ModelCategory::Gguf, name),
-            category:        ModelCategory::Gguf,
-            name:            name.to_string(),
-            filename:        Some(format!("{name}.gguf")),
-            description:     format!("{name} model"),
-            size_mb:         2000,
-            url:             Some("https://example.com/model.gguf".to_string()),
-            hf_id:           Some("owner/repo:Q4_K_M".to_string()),
+            id: ModelRecord::id_for(&ModelCategory::Gguf, name),
+            category: ModelCategory::Gguf,
+            name: name.to_string(),
+            filename: Some(format!("{name}.gguf")),
+            description: format!("{name} model"),
+            size_mb: 2000,
+            url: Some("https://example.com/model.gguf".to_string()),
+            hf_id: Some("owner/repo:Q4_K_M".to_string()),
             ram_estimate_mb: Some(2500),
             recommended_role: Some("chat".to_string()),
-            context_length:  Some(4096),
-            quantization:    Some("Q4_K_M".to_string()),
-            asr_language:    None,
-            asr_size:        None,
-            tts_engine:      None,
-            tts_voice_name:  None,
+            context_length: Some(4096),
+            quantization: Some("Q4_K_M".to_string()),
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
             config_filename: None,
-            config_url:      None,
-            tts_url:         None,
-            sample_rate:     None,
-            downloaded:      false,
-            is_custom:       false,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
         }
     }
 
     fn whisper_record(size: &str) -> ModelRecord {
         ModelRecord {
-            id:              ModelRecord::id_for(&ModelCategory::Whisper, size),
-            category:        ModelCategory::Whisper,
-            name:            size.to_string(),
-            filename:        Some(format!("ggml-{size}.en.bin")),
-            description:     format!("Whisper {size}"),
-            size_mb:         74,
-            url:             None,
-            hf_id:           None,
+            id: ModelRecord::id_for(&ModelCategory::Whisper, size),
+            category: ModelCategory::Whisper,
+            name: size.to_string(),
+            filename: Some(format!("ggml-{size}.en.bin")),
+            description: format!("Whisper {size}"),
+            size_mb: 74,
+            url: None,
+            hf_id: None,
             ram_estimate_mb: None,
             recommended_role: None,
-            context_length:  None,
-            quantization:    None,
-            asr_language:    Some("en".to_string()),
-            asr_size:        Some(size.to_string()),
-            tts_engine:      None,
-            tts_voice_name:  None,
+            context_length: None,
+            quantization: None,
+            asr_language: Some("en".to_string()),
+            asr_size: Some(size.to_string()),
+            tts_engine: None,
+            tts_voice_name: None,
             config_filename: None,
-            config_url:      None,
-            tts_url:         None,
-            sample_rate:     None,
-            downloaded:      false,
-            is_custom:       false,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
         }
     }
 
@@ -346,7 +341,10 @@ mod tests {
         assert_eq!(gguf_list.len(), 2);
         assert!(gguf_list.iter().all(|m| m.category == ModelCategory::Gguf));
 
-        let whisper_list = repo.list_by_category(&ModelCategory::Whisper).await.unwrap();
+        let whisper_list = repo
+            .list_by_category(&ModelCategory::Whisper)
+            .await
+            .unwrap();
         assert_eq!(whisper_list.len(), 1);
         assert_eq!(whisper_list[0].asr_language, Some("en".to_string()));
         assert_eq!(whisper_list[0].asr_size, Some("base".to_string()));

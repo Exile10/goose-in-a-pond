@@ -21,11 +21,11 @@ impl SqlitePromptTemplateRepository {
 
 fn row_to_template(row: &sqlx::sqlite::SqliteRow) -> Result<PromptTemplate> {
     Ok(PromptTemplate {
-        name:        row.try_get("name")?,
-        content:     row.try_get("content")?,
+        name: row.try_get("name")?,
+        content: row.try_get("content")?,
         description: row.try_get("description")?,
-        is_system:   row.try_get::<i64, _>("is_system")? != 0,
-        updated_at:  row.try_get("updated_at")?,
+        is_system: row.try_get::<i64, _>("is_system")? != 0,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

@@ -47,7 +47,10 @@ impl MemoryExtractor for LlmMemoryExtractor {
     ) -> Result<Vec<ExtractedFact>> {
         let provider = {
             let guard = self.live_provider.read().await;
-            guard.as_ref().cloned().ok_or_else(|| anyhow!("no LLM provider available"))?
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("no LLM provider available"))?
         };
 
         // Build the user message for extraction
@@ -58,9 +61,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
             assistant_response.to_string()
         };
 
-        let input = format!(
-            "User: {user_message}\nAssistant: {asst_truncated}"
-        );
+        let input = format!("User: {user_message}\nAssistant: {asst_truncated}");
 
         let messages = vec![ChatMessage::user(input)];
         let response = provider.complete(EXTRACTION_PROMPT, messages).await?;
@@ -124,7 +125,10 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
 
     // Skip if already exists
     let lower = content.to_lowercase();
-    if existing.iter().any(|e| e.contains(&lower) || lower.contains(e.as_str())) {
+    if existing
+        .iter()
+        .any(|e| e.contains(&lower) || lower.contains(e.as_str()))
+    {
         return None;
     }
 
@@ -225,7 +229,8 @@ mod tests {
     #[test]
     fn dedup_skips_existing() {
         let existing = vec!["user's name is jerry".to_string()];
-        let json = r#"[{"fact": "User's name is Jerry", "segment": "identity", "importance": 0.85}]"#;
+        let json =
+            r#"[{"fact": "User's name is Jerry", "segment": "identity", "importance": 0.85}]"#;
         let facts = parse_extraction_response(json, &existing, 3).unwrap();
         assert!(facts.is_empty());
     }
@@ -246,7 +251,10 @@ mod tests {
     fn strip_thinking_tokens() {
         let text = "<think>reasoning here</think>[{\"fact\": \"Test fact\", \"segment\": \"knowledge\", \"importance\": 0.5}]";
         let stripped = strip_thinking(text);
-        assert!(stripped.contains("[{"), "stripped should contain JSON, got: {stripped:?}");
+        assert!(
+            stripped.contains("[{"),
+            "stripped should contain JSON, got: {stripped:?}"
+        );
         let facts = parse_extraction_response(text, &[], 3).unwrap();
         assert_eq!(facts.len(), 1);
     }

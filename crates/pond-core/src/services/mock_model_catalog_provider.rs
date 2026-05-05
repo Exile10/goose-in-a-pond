@@ -8,20 +8,28 @@ use crate::ports::model_catalog_provider::ModelCatalogProvider;
 
 /// Returns a fixed set of models and binaries, or always fails.
 pub struct MockModelCatalogProvider {
-    models:   Vec<ModelRecord>,
+    models: Vec<ModelRecord>,
     binaries: Vec<BinaryRecord>,
-    fail:     bool,
+    fail: bool,
 }
 
 impl MockModelCatalogProvider {
     /// Provider that returns the given model list (no binaries).
     pub fn with_models(models: Vec<ModelRecord>) -> Self {
-        Self { models, binaries: vec![], fail: false }
+        Self {
+            models,
+            binaries: vec![],
+            fail: false,
+        }
     }
 
     /// Provider that always returns an error.
     pub fn failing() -> Self {
-        Self { models: vec![], binaries: vec![], fail: true }
+        Self {
+            models: vec![],
+            binaries: vec![],
+            fail: true,
+        }
     }
 }
 

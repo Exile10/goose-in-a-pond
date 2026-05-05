@@ -49,12 +49,12 @@ impl EventLogRepository for SqliteEventLogRepository {
         Ok(rows
             .iter()
             .map(|r| LogEntry {
-                id:        r.get("id"),
+                id: r.get("id"),
                 timestamp: r.get("timestamp"),
-                level:     r.get("level"),
-                source:    r.get("source"),
-                message:   r.get("message"),
-                metadata:  r.get("metadata"),
+                level: r.get("level"),
+                source: r.get("source"),
+                message: r.get("message"),
+                metadata: r.get("metadata"),
             })
             .collect())
     }
@@ -66,15 +66,13 @@ impl EventLogRepository for SqliteEventLogRepository {
         message: &str,
         metadata: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO event_log (level, source, message, metadata) VALUES (?, ?, ?, ?)",
-        )
-        .bind(level)
-        .bind(source)
-        .bind(message)
-        .bind(metadata)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO event_log (level, source, message, metadata) VALUES (?, ?, ?, ?)")
+            .bind(level)
+            .bind(source)
+            .bind(message)
+            .bind(metadata)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

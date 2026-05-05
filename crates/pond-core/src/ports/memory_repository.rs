@@ -1,6 +1,8 @@
 //! MemoryRepository port — driven port for semantic memory persistence.
 
-use crate::domain::memory::{MemoryEdge, MemoryFragment, MemoryGraph, MemoryLifecycle, MemorySegment};
+use crate::domain::memory::{
+    MemoryEdge, MemoryFragment, MemoryGraph, MemoryLifecycle, MemorySegment,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -74,18 +76,12 @@ pub trait MemoryRepository: Send + Sync {
 
     /// Retrieve all active memories that have decay fields for scoring.
     /// Used by the cleanup service to find archive/prune candidates.
-    async fn search_scoreable(
-        &self,
-        profile_id: Option<&str>,
-    ) -> Result<Vec<MemoryFragment>> {
+    async fn search_scoreable(&self, profile_id: Option<&str>) -> Result<Vec<MemoryFragment>> {
         self.search_recent(profile_id, 1000).await
     }
 
     /// Batch update lifecycle for multiple memories at once.
-    async fn batch_update_lifecycle(
-        &self,
-        _updates: &[(String, MemoryLifecycle)],
-    ) -> Result<()> {
+    async fn batch_update_lifecycle(&self, _updates: &[(String, MemoryLifecycle)]) -> Result<()> {
         Ok(())
     }
 
