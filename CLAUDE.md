@@ -16,14 +16,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## First-Time Installation
 
 ```bash
-# One-command setup: submodule init → deps → build → DB → models → verify
+# One-command setup: detects platform, installs everything
 bash scripts/install.sh
 
 # Options:
-bash scripts/install.sh --desktop        # also install desktop app
-bash scripts/install.sh --ollama         # pull LLM via Ollama
-bash scripts/install.sh --llamafile      # download llamafile binary
-bash scripts/install.sh --no-models      # skip model downloads (faster)
+bash scripts/install.sh --desktop        # also build desktop app
+bash scripts/install.sh --production     # Linux: systemd + mDNS + auto-start
+bash scripts/install.sh --jetson         # Jetson Orin Nano (CUDA auto-detect)
+bash scripts/install.sh --minimal        # fastest: server + DB only, no models
+bash scripts/install.sh --ollama         # force Ollama as LLM provider
+bash scripts/install.sh --llamafile      # force llamafile as LLM provider
+bash scripts/install.sh --no-models      # skip all model downloads
 bash scripts/install.sh --full           # build entire workspace (10+ min)
 ```
 
