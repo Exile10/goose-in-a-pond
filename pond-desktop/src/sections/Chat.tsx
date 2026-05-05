@@ -90,12 +90,33 @@ export function Chat() {
     api.listSessions().then(setSessions).catch(() => {});
   }, []);
 
-  // Fetch available models when the selector is opened
+  // Fetch available models when the selector is opened.
+  // Merges GGUF/llamafile models from /api/v1/models with Ollama models
+  // from /api/v1/models/ollama so all LLM backends appear in the list.
   const openModelSelector = useCallback(() => {
     setShowModelSelector(true);
-    api.listModels()
-      .then(setAvailableModels)
-      .catch(() => {});
+    Promise.all([api.listModels(), api.listOllamaModels()])
+      .then(([localModels, { models: ollamaModels }]) => {
+        const ollamaEntries: ModelEntry[] = (ollamaModels ?? []).map((m) => {
+          const sizeMb = m.size ? Math.round(m.size / (1024 * 1024)) : undefined;
+          return {
+            id: `ollama/${m.name}`,
+            provider: "ollama",
+            name: m.name,
+            display_name: m.name,
+            is_active: false,
+            ram_estimate_mb: sizeMb,
+            size_mb: sizeMb,
+            category: "ollama",
+            downloaded: true,
+          };
+        });
+        setAvailableModels([...localModels, ...ollamaEntries]);
+      })
+      .catch(() => {
+        // If Ollama request fails (e.g. not running), fall back to local models only
+        api.listModels().then(setAvailableModels).catch(() => {});
+      });
   }, []);
 
   // Filter to only downloaded LLM-capable models

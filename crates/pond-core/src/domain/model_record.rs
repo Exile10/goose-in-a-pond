@@ -210,7 +210,7 @@ impl ModelRoleAssignment {
     /// Returns true if `model_category` is a legal match for `role`.
     pub fn category_matches_role(category: &ModelCategory, role: &str) -> bool {
         match role {
-            "chat" | "think" | "task" => category.is_llm(),
+            "chat" | "think" | "task" | "tool" => category.is_llm(),
             "asr" => category.is_asr(),
             "tts" => category.is_tts(),
             "embedding" => category.is_embedding(),
@@ -326,6 +326,27 @@ mod tests {
         assert!(!ModelRoleAssignment::category_matches_role(
             &ModelCategory::Gguf,
             "unknown"
+        ));
+        // Tool role is valid for all LLM categories
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Gguf,
+            "tool"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Llamafile,
+            "tool"
+        ));
+        assert!(ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Ollama,
+            "tool"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Whisper,
+            "tool"
+        ));
+        assert!(!ModelRoleAssignment::category_matches_role(
+            &ModelCategory::Embedding,
+            "tool"
         ));
     }
 

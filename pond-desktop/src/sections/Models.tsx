@@ -764,7 +764,7 @@ function OllamaPanel({
         loading={modelsLoading && ollamaLoading}
         error={modelsError}
         activeRoles={activeRoles}
-        availableRoles={["chat"]}
+        availableRoles={["chat", "tool"]}
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
@@ -935,7 +935,7 @@ function LlmTab({
                 loading={modelsLoading}
                 error={modelsError}
                 activeRoles={activeRoles}
-                availableRoles={["chat"]}
+                availableRoles={["chat", "tool"]}
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
