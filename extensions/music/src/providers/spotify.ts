@@ -156,15 +156,17 @@ export class SpotifyProvider implements MusicProvider {
       item: SpotifyTrack | null;
       is_playing: boolean;
       progress_ms: number;
+      device?: { volume_percent: number };
     }
 
     try {
-      const data = await this.api<PlayerState>('GET', '/me/player/currently-playing');
+      const data = await this.api<PlayerState>('GET', '/me/player');
       if (!data || !data.item) return null;
 
       const track = this.parseTrack(data.item);
       track.is_playing = data.is_playing;
       track.progress_ms = data.progress_ms;
+      track.volume_percent = data.device?.volume_percent;
       return track;
     } catch {
       return null;

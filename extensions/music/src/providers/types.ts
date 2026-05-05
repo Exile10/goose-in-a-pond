@@ -7,6 +7,7 @@ export interface TrackInfo {
   uri: string;
   is_playing?: boolean;
   progress_ms?: number;
+  volume_percent?: number;
 }
 
 export interface PlaylistInfo {

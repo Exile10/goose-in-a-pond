@@ -838,10 +838,11 @@ impl GooseAdapter {
         // knows which tools to prefer for this request. The hint is keyed
         // as "domain_hint" so it's replaced (not accumulated) each turn.
         let hint = domain_hint(domain);
+        // Always set — even empty — to clear stale hints from previous turns.
+        self.agent
+            .extend_system_prompt("domain_hint".to_string(), hint.to_string())
+            .await;
         if !hint.is_empty() {
-            self.agent
-                .extend_system_prompt("domain_hint".to_string(), hint.to_string())
-                .await;
             tracing::debug!(domain = ?domain, "Injected domain hint into system prompt");
         }
 
