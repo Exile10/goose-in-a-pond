@@ -109,7 +109,7 @@ download_llm() {
     llamafile) _download_llm_llamafile ;;
     none|"")
       warn "No LLM model installed."
-      log "Install Ollama (https://ollama.com) and run: ollama pull gemma3:4b"
+      log "Install Ollama (https://ollama.com) and run: ollama pull gemma4:e2b"
       log "Or re-run: bash scripts/install.sh --ollama"
       S_LLM="not installed"
       ;;
@@ -134,12 +134,12 @@ _download_llm_ollama() {
   _ensure_ollama_running
 
   # Pull default model
-  log "Pulling gemma3:4b via Ollama (~2.6 GB)..."
-  if ollama pull gemma3:4b 2>&1; then
-    success "LLM model: gemma3:4b (Ollama)"
+  log "Pulling gemma4:e2b via Ollama (~1.6 GB)..."
+  if ollama pull gemma4:e2b 2>&1; then
+    success "LLM model: gemma4:e2b (Ollama)"
     S_LLM="ok (ollama)"
   else
-    warn "Ollama pull failed -- you can pull manually: ollama pull gemma3:4b"
+    warn "Ollama pull failed -- you can pull manually: ollama pull gemma4:e2b"
     S_LLM="failed"
   fi
 }
@@ -231,21 +231,21 @@ download_piper_voice() {
   local voice_dir="${DATA_DIR}/models/tts"
   mkdir -p "$voice_dir"
 
-  local voice_file="${voice_dir}/en_US-lessac-medium.onnx"
-  local config_file="${voice_dir}/en_US-lessac-medium.onnx.json"
+  local voice_file="${voice_dir}/en_US-ryan-high.onnx"
+  local config_file="${voice_dir}/en_US-ryan-high.onnx.json"
 
   if [ -f "$voice_file" ] && [ -f "$config_file" ]; then
-    success "TTS voice already present: en_US-lessac-medium"
+    success "TTS voice already present: en_US-ryan-high"
     return
   fi
 
-  local base_url="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
-  log "Downloading en_US-lessac-medium voice model (~63 MB)..."
-  curl -L --progress-bar "${base_url}/en_US-lessac-medium.onnx" -o "$voice_file" 2>&1 || true
-  curl -sL "${base_url}/en_US-lessac-medium.onnx.json" -o "$config_file" 2>&1 || true
+  local base_url="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high"
+  log "Downloading en_US-ryan-high voice model (~100 MB)..."
+  curl -L --progress-bar "${base_url}/en_US-ryan-high.onnx" -o "$voice_file" 2>&1 || true
+  curl -sL "${base_url}/en_US-ryan-high.onnx.json" -o "$config_file" 2>&1 || true
 
-  if [ -f "$voice_file" ] && [ -s "$voice_file" ]; then
-    success "TTS voice: en_US-lessac-medium"
+  if [ -f "$voice_file" ] && [ -s "$voice_file" ] && [ -f "$config_file" ]; then
+    success "TTS voice: en_US-ryan-high"
   else
     warn "Voice download failed -- TTS will be text-only until manually installed"
   fi
