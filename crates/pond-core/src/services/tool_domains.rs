@@ -26,7 +26,7 @@ pub fn tool_filter_for_domain(domain: ToolDomain) -> Option<Vec<&'static str>> {
         ToolDomain::Weather => Some(vec!["giap__get_current_weather"]),
         ToolDomain::Knowledge => Some(vec![
             "giap__search_wikipedia",
-            "giap__wikipedia_get_article",
+            "giap__get_wikipedia_article",
         ]),
         // No filter — all tools remain available.
         ToolDomain::General => None,
@@ -95,7 +95,7 @@ mod tests {
         assert!(filter.is_some());
         let names = filter.unwrap();
         assert!(names.contains(&"giap__search_wikipedia"));
-        assert!(names.contains(&"giap__wikipedia_get_article"));
+        assert!(names.contains(&"giap__get_wikipedia_article"));
         assert_eq!(names.len(), 2);
     }
 

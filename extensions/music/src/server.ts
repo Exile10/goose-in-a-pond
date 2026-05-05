@@ -55,6 +55,7 @@ const TOOLS = [
             "previous",
             "volume_up",
             "volume_down",
+            "set_volume",
             "shuffle_on",
             "shuffle_off",
           ],
@@ -62,7 +63,7 @@ const TOOLS = [
         },
         volume: {
           type: "number",
-          description: "Set exact volume (0-100). Only used when action is not provided.",
+          description: "Exact volume level (0-100). Required when action is 'set_volume'.",
         },
       },
       required: ["action"],
@@ -148,18 +149,23 @@ async function handleControl(args: Record<string, unknown>): Promise<string> {
       return provider.next();
     case "previous":
       return provider.previous();
-    case "volume_up":
-      return provider.setVolume(Math.min(100, (volume ?? 50) + 10));
-    case "volume_down":
-      return provider.setVolume(Math.max(0, (volume ?? 50) - 10));
+    case "volume_up": {
+      const now = await provider.getNowPlaying();
+      const cur = now?.volume_percent ?? 50;
+      return provider.setVolume(Math.min(100, cur + 10));
+    }
+    case "volume_down": {
+      const now = await provider.getNowPlaying();
+      const cur = now?.volume_percent ?? 50;
+      return provider.setVolume(Math.max(0, cur - 10));
+    }
+    case "set_volume":
+      return provider.setVolume(volume ?? 50);
     case "shuffle_on":
       return provider.setShuffle(true);
     case "shuffle_off":
       return provider.setShuffle(false);
     default:
-      if (volume !== undefined) {
-        return provider.setVolume(volume);
-      }
       return `Unknown action: ${action}`;
   }
 }

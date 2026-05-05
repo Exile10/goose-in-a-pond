@@ -14,8 +14,8 @@ use pond_core::domain::tool_result::ToolResult;
 /// re-calling. If no mapping exists, falls back to the raw tool name.
 fn mcp_tool_names(tool: &str) -> &'static str {
     match tool {
-        "weather" => "giap__get_current_weather, giap__get_forecast",
-        "wikipedia" => "giap__search_wikipedia",
+        "weather" => "giap__get_current_weather",
+        "wikipedia" => "giap__search_wikipedia, giap__get_wikipedia_article",
         "recall_memory" => "giap__recall_memories",
         "save_memory" => "giap__save_memory",
         "create_schedule" => "giap__create_schedule",
@@ -27,7 +27,7 @@ fn mcp_tool_names(tool: &str) -> &'static str {
 
 /// Build the dedup hint line for the pre-fetched result block.
 ///
-/// Example: `"(do not call giap__get_current_weather, giap__get_forecast again for this query)"`
+/// Example: `"(do not call giap__get_current_weather again for this query)"`
 fn dedup_hint(tool: &str) -> String {
     let mcp_names = mcp_tool_names(tool);
     if mcp_names.is_empty() {
@@ -198,9 +198,9 @@ mod tests {
     fn mcp_tool_names_known_tools() {
         assert_eq!(
             mcp_tool_names("weather"),
-            "giap__get_current_weather, giap__get_forecast"
+            "giap__get_current_weather"
         );
-        assert_eq!(mcp_tool_names("wikipedia"), "giap__search_wikipedia");
+        assert_eq!(mcp_tool_names("wikipedia"), "giap__search_wikipedia, giap__get_wikipedia_article");
         assert_eq!(mcp_tool_names("recall_memory"), "giap__recall_memories");
         assert_eq!(mcp_tool_names("save_memory"), "giap__save_memory");
     }
@@ -214,7 +214,7 @@ mod tests {
     fn dedup_hint_known_tool() {
         let hint = dedup_hint("weather");
         assert!(hint.contains("giap__get_current_weather"));
-        assert!(hint.contains("giap__get_forecast"));
+        assert!(!hint.contains("giap__get_forecast"));
         assert!(hint.contains("do not call"));
     }
 
@@ -238,7 +238,7 @@ mod tests {
         assert!(output.contains("He is a wrestler."));
         assert!(output.contains("who is John Cena?"));
         assert!(output.contains("Pre-fetched result"));
-        assert!(output.contains("do not call giap__search_wikipedia again"));
+        assert!(output.contains("do not call giap__search_wikipedia, giap__get_wikipedia_article again"));
     }
 
     #[test]
