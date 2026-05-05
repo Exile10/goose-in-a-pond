@@ -212,7 +212,12 @@ mod tests {
 
         cache.put("weather", "q1", "w1".to_string(), Duration::from_secs(300));
         cache.put("weather", "q2", "w2".to_string(), Duration::from_secs(300));
-        cache.put("wikipedia", "q3", "wp1".to_string(), Duration::from_secs(3600));
+        cache.put(
+            "wikipedia",
+            "q3",
+            "wp1".to_string(),
+            Duration::from_secs(3600),
+        );
 
         // Invalidate weather
         cache.invalidate("weather");
@@ -230,7 +235,12 @@ mod tests {
         let cache = InMemoryToolCache::new();
 
         cache.put("weather", "q1", "w1".to_string(), Duration::from_secs(300));
-        cache.put("wikipedia", "q2", "wp1".to_string(), Duration::from_secs(3600));
+        cache.put(
+            "wikipedia",
+            "q2",
+            "wp1".to_string(),
+            Duration::from_secs(3600),
+        );
 
         cache.clear();
 
@@ -269,8 +279,18 @@ mod tests {
     fn different_tools_same_query_cached_separately() {
         let cache = InMemoryToolCache::new();
 
-        cache.put("weather", "test", "sunny".to_string(), Duration::from_secs(300));
-        cache.put("wikipedia", "test", "article".to_string(), Duration::from_secs(3600));
+        cache.put(
+            "weather",
+            "test",
+            "sunny".to_string(),
+            Duration::from_secs(300),
+        );
+        cache.put(
+            "wikipedia",
+            "test",
+            "article".to_string(),
+            Duration::from_secs(3600),
+        );
 
         assert_eq!(cache.get("weather", "test"), Some("sunny".to_string()));
         assert_eq!(cache.get("wikipedia", "test"), Some("article".to_string()));

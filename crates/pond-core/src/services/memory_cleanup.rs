@@ -85,9 +85,7 @@ pub async fn run_cleanup(
 
     let scanned = memories.len();
     if pruned > 0 || archived > 0 {
-        tracing::info!(
-            "[memory-cleanup] scanned={scanned}, archived={archived}, pruned={pruned}"
-        );
+        tracing::info!("[memory-cleanup] scanned={scanned}, archived={archived}, pruned={pruned}");
     }
 
     Ok((scanned, archived, pruned))
@@ -98,7 +96,13 @@ mod tests {
     use super::*;
     use crate::domain::memory::{MemorySegment, MemoryTier};
 
-    fn make_memory(importance: f32, decay_rate: f32, days_old: f64, access_count: u32, tier: MemoryTier) -> MemoryFragment {
+    fn make_memory(
+        importance: f32,
+        decay_rate: f32,
+        days_old: f64,
+        access_count: u32,
+        tier: MemoryTier,
+    ) -> MemoryFragment {
         let created = chrono::Utc::now() - chrono::Duration::seconds((days_old * 86400.0) as i64);
         MemoryFragment {
             id: "test".to_string(),
@@ -124,7 +128,10 @@ mod tests {
     fn permanent_never_decays() {
         let mem = make_memory(0.8, 0.0, 365.0, 0, MemoryTier::Permanent);
         let score = effective_score(&mem);
-        assert!((score - 0.8).abs() < 0.01, "permanent score should be raw importance, got {score}");
+        assert!(
+            (score - 0.8).abs() < 0.01,
+            "permanent score should be raw importance, got {score}"
+        );
     }
 
     #[test]
@@ -140,7 +147,10 @@ mod tests {
         let mem = make_memory(0.7, 0.01, 30.0, 0, MemoryTier::Long);
         let score = effective_score(&mem);
         // 0.7 * exp(-0.01 * 30) ≈ 0.7 * 0.74 ≈ 0.52
-        assert!(score > 0.4, "long-tier 30-day memory should still be strong, got {score}");
+        assert!(
+            score > 0.4,
+            "long-tier 30-day memory should still be strong, got {score}"
+        );
     }
 
     #[test]
@@ -149,13 +159,19 @@ mod tests {
         let mem_accessed = make_memory(0.5, 0.05, 20.0, 10, MemoryTier::Long);
         let score_no = effective_score(&mem_no_access);
         let score_yes = effective_score(&mem_accessed);
-        assert!(score_yes > score_no, "accessed memory should score higher: {score_yes} vs {score_no}");
+        assert!(
+            score_yes > score_no,
+            "accessed memory should score higher: {score_yes} vs {score_no}"
+        );
     }
 
     #[test]
     fn fresh_memory_high_score() {
         let mem = make_memory(0.8, 0.01, 0.0, 0, MemoryTier::Long);
         let score = effective_score(&mem);
-        assert!(score > 0.7, "fresh memory should have high score, got {score}");
+        assert!(
+            score > 0.7,
+            "fresh memory should have high score, got {score}"
+        );
     }
 }

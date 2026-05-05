@@ -64,7 +64,8 @@ pub struct CronSchedulerAdapter {
     executor: Arc<dyn ScheduleExecutor>,
     run_history: Arc<JsonRunHistory>,
     /// Optional broadcast sender for schedule result events (SSE delivery).
-    result_tx: Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
+    result_tx:
+        Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
 }
 
 impl CronSchedulerAdapter {
@@ -86,12 +87,13 @@ impl CronSchedulerAdapter {
         persist_path: PathBuf,
         runs_path: PathBuf,
         executor: Arc<dyn ScheduleExecutor>,
-        result_tx: Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
+        result_tx: Option<
+            tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
+        >,
         max_runs_per_task: u32,
     ) -> Result<Self> {
         let scheduler = JobScheduler::new().await?;
-        let tasks: Arc<Mutex<HashMap<String, TaskEntry>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let tasks: Arc<Mutex<HashMap<String, TaskEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let run_history = Arc::new(JsonRunHistory::new(runs_path, max_runs_per_task).await?);
 
         let adapter = Self {
@@ -115,8 +117,7 @@ impl CronSchedulerAdapter {
 
     async fn save(&self) -> Result<()> {
         let guard = self.tasks.lock().await;
-        let records: Vec<PersistedTask> =
-            guard.values().map(|e| e.persisted.clone()).collect();
+        let records: Vec<PersistedTask> = guard.values().map(|e| e.persisted.clone()).collect();
         drop(guard);
 
         let json = serde_json::to_string_pretty(&records)?;
@@ -214,7 +215,10 @@ impl CronSchedulerAdapter {
                 // Get label for the event
                 let label = {
                     let guard = tasks.lock().await;
-                    guard.get(&id).map(|e| e.persisted.label.clone()).unwrap_or_default()
+                    guard
+                        .get(&id)
+                        .map(|e| e.persisted.label.clone())
+                        .unwrap_or_default()
                 };
 
                 // Mark running
@@ -237,24 +241,14 @@ impl CronSchedulerAdapter {
                 let (status, result_text, error_text) = match &result {
                     Ok(text) => {
                         run_history
-                            .record_finish(
-                                &run_id,
-                                RunStatus::Completed,
-                                Some(text.clone()),
-                                None,
-                            )
+                            .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
                             .await;
                         (RunStatus::Completed, Some(text.clone()), None)
                     }
                     Err(e) => {
                         tracing::error!("Scheduled task {id} failed: {e}");
                         run_history
-                            .record_finish(
-                                &run_id,
-                                RunStatus::Failed,
-                                None,
-                                Some(e.to_string()),
-                            )
+                            .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
                             .await;
                         (RunStatus::Failed, None, Some(e.to_string()))
                     }
@@ -584,22 +578,17 @@ impl SchedulerPort for CronSchedulerAdapter {
             .map(Self::to_schedule)
             .collect();
         // Sort by next fire time (soonest first); schedules without next_run sort last.
-        schedules.sort_by(|a, b| {
-            match (&a.next_run, &b.next_run) {
-                (Some(a_next), Some(b_next)) => a_next.cmp(b_next),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.created_at.cmp(&b.created_at),
-            }
+        schedules.sort_by(|a, b| match (&a.next_run, &b.next_run) {
+            (Some(a_next), Some(b_next)) => a_next.cmp(b_next),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.created_at.cmp(&b.created_at),
         });
         schedules.truncate(limit as usize);
         Ok(schedules)
     }
 
-    async fn set_executor(
-        &self,
-        _executor: Arc<dyn ScheduleExecutor>,
-    ) -> Result<()> {
+    async fn set_executor(&self, _executor: Arc<dyn ScheduleExecutor>) -> Result<()> {
         // The executor is injected at construction time via `DeferredExecutor`.
         // This method exists on the trait for flexibility but is a no-op here.
         Ok(())

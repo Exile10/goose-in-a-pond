@@ -23,7 +23,9 @@ pub struct FilesystemModelStorage {
 
 impl FilesystemModelStorage {
     pub fn new(data_dir: &Path) -> Self {
-        Self { data_dir: data_dir.to_path_buf() }
+        Self {
+            data_dir: data_dir.to_path_buf(),
+        }
     }
 }
 
@@ -31,16 +33,21 @@ impl ModelStorage for FilesystemModelStorage {
     fn path_for(&self, record: &ModelRecord) -> Option<PathBuf> {
         let filename = record.filename.as_deref()?;
         let path = match record.category {
-            ModelCategory::Whisper   => self.data_dir.join("models").join(filename),
+            ModelCategory::Whisper => self.data_dir.join("models").join(filename),
             ModelCategory::Llamafile => {
                 let base = self.data_dir.join("models").join("llm").join(filename);
                 #[cfg(windows)]
                 let base = PathBuf::from(format!("{}.exe", base.display()));
                 base
             }
-            ModelCategory::Gguf      => self.data_dir.join("models").join("gguf").join(filename),
-            ModelCategory::TtsPiper  => self.data_dir.join("models").join("tts").join(filename),
-            // Server-side: no local file
+            ModelCategory::Gguf => self.data_dir.join("models").join("gguf").join(filename),
+            ModelCategory::TtsPiper => self.data_dir.join("models").join("tts").join(filename),
+            ModelCategory::Embedding => self
+                .data_dir
+                .join("models")
+                .join("embedding")
+                .join(filename),
+            // Server-side or auto-downloaded: no local file to manage
             ModelCategory::TtsHttp | ModelCategory::Ollama => return None,
         };
         Some(path)

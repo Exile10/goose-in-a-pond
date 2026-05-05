@@ -60,10 +60,7 @@ fn pond_role_to_goose_message(role: &Role, content: &str) -> GooseMessage {
     }
 }
 
-fn goose_message_to_pond(
-    msg: &GooseMessage,
-    session_id: &str,
-) -> SessionMessage {
+fn goose_message_to_pond(msg: &GooseMessage, session_id: &str) -> SessionMessage {
     let role = match msg.role {
         GooseRole::User => Role::User,
         GooseRole::Assistant => Role::Assistant,
@@ -73,12 +70,13 @@ fn goose_message_to_pond(
         DateTime::from_timestamp(msg.created, 0).unwrap_or_else(Utc::now);
 
     SessionMessage {
-        id: msg
-            .id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        id: msg.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()),
         session_id: session_id.to_string(),
-        message: ChatMessage { role, content, images: Vec::new() },
+        message: ChatMessage {
+            role,
+            content,
+            images: Vec::new(),
+        },
         created_at,
     }
 }
@@ -96,24 +94,22 @@ fn to_storage_err(e: anyhow::Error) -> SessionStorageError {
 
 #[async_trait::async_trait]
 impl SessionStorage for GooseSessionAdapter {
-    async fn create_session(
-        &self,
-        session_id: String,
-    ) -> Result<Session, SessionStorageError> {
-        let working_dir =
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    async fn create_session(&self, session_id: String) -> Result<Session, SessionStorageError> {
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let gs = self
             .manager
-            .create_session(working_dir, session_id, SessionType::User, GooseMode::default())
+            .create_session(
+                working_dir,
+                session_id,
+                SessionType::User,
+                GooseMode::default(),
+            )
             .await
             .map_err(to_storage_err)?;
         Ok(goose_session_to_pond(&gs))
     }
 
-    async fn get_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Session, SessionStorageError> {
+    async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let gs = self
             .manager
             .get_session(session_id, false)
@@ -127,8 +123,7 @@ impl SessionStorage for GooseSessionAdapter {
         session_id: String,
         message: SessionMessage,
     ) -> Result<SessionMessage, SessionStorageError> {
-        let goose_msg =
-            pond_role_to_goose_message(&message.message.role, &message.message.content);
+        let goose_msg = pond_role_to_goose_message(&message.message.role, &message.message.content);
         self.manager
             .add_message(&session_id, &goose_msg)
             .await
@@ -174,10 +169,7 @@ impl SessionStorage for GooseSessionAdapter {
         Ok(())
     }
 
-    async fn delete_session(
-        &self,
-        session_id: &str,
-    ) -> Result<(), SessionStorageError> {
+    async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
         self.manager
             .delete_session(session_id)
             .await
@@ -186,11 +178,7 @@ impl SessionStorage for GooseSessionAdapter {
     }
 
     async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
-        let goose_sessions = self
-            .manager
-            .list_sessions()
-            .await
-            .map_err(to_storage_err)?;
+        let goose_sessions = self.manager.list_sessions().await.map_err(to_storage_err)?;
         Ok(goose_sessions.iter().map(goose_session_to_pond).collect())
     }
 
@@ -200,7 +188,14 @@ impl SessionStorage for GooseSessionAdapter {
         limit: usize,
     ) -> Result<Vec<SessionMessage>, SessionStorageError> {
         let all = self.get_messages(session_id).await?;
-        let recent = all.into_iter().rev().take(limit).collect::<Vec<_>>().into_iter().rev().collect();
+        let recent = all
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         Ok(recent)
     }
 

@@ -1,231 +1,181 @@
 #!/usr/bin/env node
-import * as readline from 'readline';
-import { SpotifyProvider } from './providers/spotify.js';
+/**
+ * GIAP Music Extension — MCP server for Spotify playback.
+ *
+ * 3 focused tools (not 14):
+ *   play     — search by name and play, or resume/play by URI
+ *   status   — what's currently playing + queue
+ *   control  — pause, resume, next, previous, volume, shuffle
+ */
+import * as readline from "readline";
+import { SpotifyProvider } from "./providers/spotify.js";
 
 const provider = new SpotifyProvider();
 
-const SERVER_INFO = {
-  name: 'giap-music',
-  version: '0.1.0',
-};
-
-interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
-}
-
-const TOOLS: ToolDefinition[] = [
+const TOOLS = [
   {
-    name: 'now_playing',
+    name: "play",
     description:
-      'Get info about the currently playing track including title, artist, album, and playback progress.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'play',
-    description:
-      'Start or resume playback. Optionally play a specific track, album, or playlist by Spotify URI.',
+      "Play music. Give a song name, artist, or album and it will search Spotify and start playing the best match. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'.",
     inputSchema: {
-      type: 'object',
+      type: "object",
       properties: {
+        query: {
+          type: "string",
+          description:
+            "What to play — song name, artist, album, or mood (e.g. 'Marvin\\'s Room by Drake', 'jazz playlist', 'Kendrick Lamar').",
+        },
         uri: {
-          type: 'string',
+          type: "string",
           description:
-            'Spotify URI (e.g. spotify:track:..., spotify:album:..., spotify:playlist:...). Omit to resume current playback.',
+            "Spotify URI to play directly (spotify:track:..., spotify:album:..., spotify:playlist:...). Use this only if you already have a URI. Otherwise use query.",
         },
       },
     },
   },
   {
-    name: 'pause',
-    description: 'Pause the current playback.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'next',
-    description: 'Skip to the next track in the queue.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'previous',
-    description: 'Go back to the previous track.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'search_tracks',
+    name: "status",
     description:
-      'Search for tracks on Spotify by name, artist, or any keyword. Returns matching tracks with URIs.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Search query (e.g. "Bohemian Rhapsody", "Drake", "chill vibes").',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of results (1-50, default 10).',
-        },
-      },
-      required: ['query'],
-    },
+      "Get what is currently playing on Spotify — track name, artist, album, progress, and upcoming queue.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
-    name: 'search_albums',
+    name: "control",
     description:
-      'Search for albums on Spotify by name, artist, or keyword. Returns matching albums with URIs.',
+      "Control Spotify playback: pause, resume, next, previous, set volume, or toggle shuffle.",
     inputSchema: {
-      type: 'object',
+      type: "object",
       properties: {
-        query: {
-          type: 'string',
-          description: 'Search query (e.g. "Abbey Road", "Kendrick Lamar").',
+        action: {
+          type: "string",
+          enum: [
+            "pause",
+            "resume",
+            "next",
+            "previous",
+            "volume_up",
+            "volume_down",
+            "set_volume",
+            "shuffle_on",
+            "shuffle_off",
+          ],
+          description: "The playback action to perform.",
         },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of results (1-50, default 10).',
+        volume: {
+          type: "number",
+          description: "Exact volume level (0-100). Required when action is 'set_volume'.",
         },
       },
-      required: ['query'],
-    },
-  },
-  {
-    name: 'get_playlists',
-    description: "Get the user's saved playlists from Spotify.",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: {
-          type: 'number',
-          description: 'Maximum number of playlists to return (1-50, default 20).',
-        },
-      },
-    },
-  },
-  {
-    name: 'get_playlist_tracks',
-    description: 'Get all tracks in a specific playlist.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        playlist_id: {
-          type: 'string',
-          description: 'The Spotify playlist ID.',
-        },
-      },
-      required: ['playlist_id'],
-    },
-  },
-  {
-    name: 'create_playlist',
-    description: "Create a new playlist in the user's Spotify library.",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: {
-          type: 'string',
-          description: 'Name for the new playlist.',
-        },
-        description: {
-          type: 'string',
-          description: 'Optional description for the playlist.',
-        },
-      },
-      required: ['name'],
-    },
-  },
-  {
-    name: 'add_to_playlist',
-    description: 'Add one or more tracks to an existing playlist.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        playlist_id: {
-          type: 'string',
-          description: 'The Spotify playlist ID to add tracks to.',
-        },
-        track_uris: {
-          type: 'array',
-          items: { type: 'string' },
-          description:
-            'Array of Spotify track URIs (e.g. ["spotify:track:4iV5W9uYEdYUVa79Axb7Rh"]).',
-        },
-      },
-      required: ['playlist_id', 'track_uris'],
-    },
-  },
-  {
-    name: 'get_queue',
-    description:
-      'Get the current playback queue including the currently playing track and upcoming tracks.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'set_volume',
-    description: 'Set the playback volume (0-100).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        percent: {
-          type: 'number',
-          description: 'Volume level from 0 (mute) to 100 (max).',
-        },
-      },
-      required: ['percent'],
-    },
-  },
-  {
-    name: 'set_shuffle',
-    description: 'Enable or disable shuffle mode.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        enabled: {
-          type: 'boolean',
-          description: 'True to enable shuffle, false to disable.',
-        },
-      },
-      required: ['enabled'],
+      required: ["action"],
     },
   },
 ];
 
-function formatTrack(track: {
-  name: string;
-  artist: string;
-  album: string;
-  duration_ms: number;
-  uri: string;
-  is_playing?: boolean;
-  progress_ms?: number;
-}): string {
-  const mins = Math.floor(track.duration_ms / 60000);
-  const secs = Math.floor((track.duration_ms % 60000) / 1000)
-    .toString()
-    .padStart(2, '0');
-  let line = `${track.name} - ${track.artist} (${track.album}) [${mins}:${secs}]`;
+// ── Tool handlers ─────────────────────────────────────────────
 
-  if (track.progress_ms != null) {
-    const pMins = Math.floor(track.progress_ms / 60000);
-    const pSecs = Math.floor((track.progress_ms % 60000) / 1000)
-      .toString()
-      .padStart(2, '0');
-    line += ` ${pMins}:${pSecs}/${mins}:${secs}`;
-    if (track.is_playing) {
-      line += ' (playing)';
-    } else {
-      line += ' (paused)';
-    }
+async function handlePlay(args: Record<string, unknown>): Promise<string> {
+  const query = args.query as string | undefined;
+  const uri = args.uri as string | undefined;
+
+  // Direct URI play
+  if (uri) {
+    const result = await provider.play(uri);
+    return result;
   }
 
-  line += `\n  URI: ${track.uri}`;
-  return line;
+  // Search and play
+  if (query) {
+    const tracks = await provider.searchTracks(query, 5);
+    if (tracks.length === 0) {
+      return `No results found for "${query}". Try a different search.`;
+    }
+
+    const top = tracks[0];
+    await provider.play(top.uri);
+
+    const others = tracks.slice(1, 4);
+    let text = `Now playing: ${top.name} by ${top.artist} (${top.album})`;
+    if (others.length > 0) {
+      text +=
+        "\n\nOther matches:\n" +
+        others.map((t, i) => `${i + 2}. ${t.name} by ${t.artist}`).join("\n");
+    }
+    return text;
+  }
+
+  // No query, no URI — resume
+  const result = await provider.play();
+  return result;
 }
+
+async function handleStatus(): Promise<string> {
+  const now = await provider.getNowPlaying();
+  if (!now) {
+    return "Nothing is currently playing on Spotify.";
+  }
+
+  const progress = now.progress_ms
+    ? `${Math.floor(now.progress_ms / 60000)}:${String(Math.floor((now.progress_ms % 60000) / 1000)).padStart(2, "0")}`
+    : "0:00";
+  const duration = `${Math.floor(now.duration_ms / 60000)}:${String(Math.floor((now.duration_ms % 60000) / 1000)).padStart(2, "0")}`;
+
+  let text = `${now.is_playing ? "Playing" : "Paused"}: ${now.name} by ${now.artist}\nAlbum: ${now.album}\nProgress: ${progress} / ${duration}`;
+
+  try {
+    const queue = await provider.getQueue();
+    const upcoming = queue.slice(1, 4);
+    if (upcoming.length > 0) {
+      text +=
+        "\n\nUp next:\n" +
+        upcoming.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n");
+    }
+  } catch {
+    // Queue not available — that's fine
+  }
+
+  return text;
+}
+
+async function handleControl(args: Record<string, unknown>): Promise<string> {
+  const action = args.action as string;
+  const volume = args.volume as number | undefined;
+
+  switch (action) {
+    case "pause":
+      return provider.pause();
+    case "resume":
+      return provider.play();
+    case "next":
+      return provider.next();
+    case "previous":
+      return provider.previous();
+    case "volume_up": {
+      const now = await provider.getNowPlaying();
+      const cur = now?.volume_percent ?? 50;
+      return provider.setVolume(Math.min(100, cur + 10));
+    }
+    case "volume_down": {
+      const now = await provider.getNowPlaying();
+      const cur = now?.volume_percent ?? 50;
+      return provider.setVolume(Math.max(0, cur - 10));
+    }
+    case "set_volume":
+      return provider.setVolume(volume ?? 50);
+    case "shuffle_on":
+      return provider.setShuffle(true);
+    case "shuffle_off":
+      return provider.setShuffle(false);
+    default:
+      return `Unknown action: ${action}`;
+  }
+}
+
+// ── Debug logging (goes to stderr, not stdout) ───────────────
+function debug(...args: unknown[]) {
+  console.error(`[music-ext]`, ...args);
+}
+
+// ── MCP JSON-RPC server ───────────────────────────────────────
 
 interface JsonRpcRequest {
   jsonrpc: string;
@@ -234,217 +184,106 @@ interface JsonRpcRequest {
   params?: Record<string, unknown>;
 }
 
-interface CallToolResult {
-  content: Array<{ type: string; text: string }>;
-  isError?: boolean;
-}
-
-function textResult(text: string): CallToolResult {
-  return { content: [{ type: 'text', text }] };
-}
-
-function errorResult(message: string): CallToolResult {
-  return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
-}
-
-async function callTool(
-  name: string,
-  args: Record<string, unknown>
-): Promise<CallToolResult> {
-  try {
-    switch (name) {
-      case 'now_playing': {
-        const track = await provider.getNowPlaying();
-        if (!track) return textResult('Nothing is currently playing.');
-        return textResult(formatTrack(track));
-      }
-
-      case 'play': {
-        const uri = args.uri as string | undefined;
-        const result = await provider.play(uri);
-        return textResult(result);
-      }
-
-      case 'pause': {
-        const result = await provider.pause();
-        return textResult(result);
-      }
-
-      case 'next': {
-        const result = await provider.next();
-        return textResult(result);
-      }
-
-      case 'previous': {
-        const result = await provider.previous();
-        return textResult(result);
-      }
-
-      case 'search_tracks': {
-        const query = args.query as string;
-        const limit = args.limit as number | undefined;
-        if (!query) return errorResult('query is required');
-        const tracks = await provider.searchTracks(query, limit);
-        if (tracks.length === 0) return textResult(`No tracks found for "${query}".`);
-        const lines = tracks.map((t, i) => `${i + 1}. ${formatTrack(t)}`);
-        return textResult(lines.join('\n'));
-      }
-
-      case 'search_albums': {
-        const query = args.query as string;
-        const limit = args.limit as number | undefined;
-        if (!query) return errorResult('query is required');
-        const albums = await provider.searchAlbums(query, limit);
-        if (albums.length === 0) return textResult(`No albums found for "${query}".`);
-        const lines = albums.map(
-          (a, i) =>
-            `${i + 1}. ${a.name} - ${a.artist} (${a.release_date}, ${a.total_tracks} tracks)\n  URI: ${a.uri}`
-        );
-        return textResult(lines.join('\n'));
-      }
-
-      case 'get_playlists': {
-        const limit = args.limit as number | undefined;
-        const playlists = await provider.getPlaylists(limit);
-        if (playlists.length === 0) return textResult('No playlists found.');
-        const lines = playlists.map(
-          (p, i) =>
-            `${i + 1}. ${p.name} (${p.track_count} tracks)${p.description ? ' - ' + p.description : ''}\n  ID: ${p.id} | URI: ${p.uri}`
-        );
-        return textResult(lines.join('\n'));
-      }
-
-      case 'get_playlist_tracks': {
-        const playlistId = args.playlist_id as string;
-        if (!playlistId) return errorResult('playlist_id is required');
-        const tracks = await provider.getPlaylistTracks(playlistId);
-        if (tracks.length === 0) return textResult('Playlist is empty.');
-        const lines = tracks.map((t, i) => `${i + 1}. ${formatTrack(t)}`);
-        return textResult(lines.join('\n'));
-      }
-
-      case 'create_playlist': {
-        const name = args.name as string;
-        const description = args.description as string | undefined;
-        if (!name) return errorResult('name is required');
-        const playlist = await provider.createPlaylist(name, description);
-        return textResult(
-          `Created playlist "${playlist.name}" (${playlist.id})\nURI: ${playlist.uri}`
-        );
-      }
-
-      case 'add_to_playlist': {
-        const playlistId = args.playlist_id as string;
-        const trackUris = args.track_uris as string[];
-        if (!playlistId) return errorResult('playlist_id is required');
-        if (!trackUris || trackUris.length === 0)
-          return errorResult('track_uris is required and must not be empty');
-        const result = await provider.addToPlaylist(playlistId, trackUris);
-        return textResult(result);
-      }
-
-      case 'get_queue': {
-        const queue = await provider.getQueue();
-        if (queue.length === 0) return textResult('Queue is empty.');
-        const lines = queue.map((t, i) => {
-          const prefix = i === 0 && t.is_playing ? 'Now playing' : `${i}`;
-          return `${prefix}. ${formatTrack(t)}`;
-        });
-        return textResult(lines.join('\n'));
-      }
-
-      case 'set_volume': {
-        const percent = args.percent as number;
-        if (percent == null) return errorResult('percent is required');
-        const result = await provider.setVolume(percent);
-        return textResult(result);
-      }
-
-      case 'set_shuffle': {
-        const enabled = args.enabled as boolean;
-        if (enabled == null) return errorResult('enabled is required');
-        const result = await provider.setShuffle(enabled);
-        return textResult(result);
-      }
-
-      default:
-        return errorResult(`Unknown tool: ${name}`);
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return errorResult(message);
-  }
-}
-
 async function handleRequest(
   request: JsonRpcRequest
 ): Promise<Record<string, unknown> | null> {
-  const { id, method, params } = request;
+  const { method, id, params } = request;
+
+  debug(`<-- ${method}`, params ? JSON.stringify(params).slice(0, 200) : "");
 
   switch (method) {
-    case 'initialize':
+    case "initialize":
+      debug("initializing");
       return {
-        jsonrpc: '2.0',
+        jsonrpc: "2.0",
         id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: SERVER_INFO,
+          serverInfo: { name: "giap-music", version: "0.2.0" },
         },
       };
 
-    case 'notifications/initialized':
-      // Notification -- no response required
+    case "notifications/initialized":
+      debug("initialized OK");
       return null;
 
-    case 'tools/list':
-      return {
-        jsonrpc: '2.0',
-        id,
-        result: { tools: TOOLS },
-      };
+    case "tools/list":
+      debug(`listing ${TOOLS.length} tools`);
+      return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
 
-    case 'tools/call': {
+    case "tools/call": {
       const toolName = (params as Record<string, unknown>)?.name as string;
-      const toolArgs =
-        ((params as Record<string, unknown>)?.arguments as Record<string, unknown>) || {};
+      const args =
+        ((params as Record<string, unknown>)?.arguments as Record<
+          string,
+          unknown
+        >) ?? {};
 
-      if (!toolName) {
+      debug(`tool call: ${toolName}`, JSON.stringify(args));
+
+      try {
+        let text: string;
+        switch (toolName) {
+          case "play":
+            debug("play →", args.query || args.uri || "(resume)");
+            text = await handlePlay(args);
+            break;
+          case "status":
+            debug("status → checking now playing");
+            text = await handleStatus();
+            break;
+          case "control":
+            debug("control →", args.action, args.volume ?? "");
+            text = await handleControl(args);
+            break;
+          default:
+            debug("unknown tool:", toolName);
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32601, message: `Unknown tool: ${toolName}` },
+            };
+        }
+
+        debug(`result (${text.length} chars):`, text.slice(0, 120));
         return {
-          jsonrpc: '2.0',
+          jsonrpc: "2.0",
           id,
-          error: { code: -32602, message: 'Missing tool name in params' },
+          result: { content: [{ type: "text", text }] },
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        debug("ERROR:", msg);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: `Error: ${msg}` }],
+            isError: true,
+          },
         };
       }
-
-      const result = await callTool(toolName, toolArgs);
-      return {
-        jsonrpc: '2.0',
-        id,
-        result,
-      };
     }
 
     default:
       return {
-        jsonrpc: '2.0',
+        jsonrpc: "2.0",
         id,
         error: { code: -32601, message: `Method not found: ${method}` },
       };
   }
 }
 
-// --- stdio transport ---
 const rl = readline.createInterface({ input: process.stdin });
-
-rl.on('line', async (line: string) => {
+rl.on("line", async (line: string) => {
   try {
     const request = JSON.parse(line) as JsonRpcRequest;
     const response = await handleRequest(request);
     if (response) {
-      process.stdout.write(JSON.stringify(response) + '\n');
+      process.stdout.write(JSON.stringify(response) + "\n");
     }
   } catch {
-    // Ignore malformed JSON lines
+    // ignore malformed JSON
   }
 });

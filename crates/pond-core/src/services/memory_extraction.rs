@@ -62,7 +62,10 @@ impl MemoryExtractionService {
             .collect();
 
         // Extract facts
-        let facts = match extractor.extract(user_message, assistant_response, &existing).await {
+        let facts = match extractor
+            .extract(user_message, assistant_response, &existing)
+            .await
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::debug!("[memory-extraction] extraction failed: {e}");
@@ -80,7 +83,10 @@ impl MemoryExtractionService {
         for fact in facts {
             // Skip if content already exists (case-insensitive substring match)
             let lower = fact.content.to_lowercase();
-            if existing.iter().any(|e| e.contains(&lower) || lower.contains(e.as_str())) {
+            if existing
+                .iter()
+                .any(|e| e.contains(&lower) || lower.contains(e.as_str()))
+            {
                 tracing::debug!("[memory-extraction] dedup skipped: {:?}", fact.content);
                 continue;
             }
@@ -106,4 +112,3 @@ impl MemoryExtractionService {
         }
     }
 }
-

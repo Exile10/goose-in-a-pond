@@ -25,8 +25,8 @@
 
 use crate::domain::settings::Settings;
 use crate::prompts::{
-    render_jinja_template, sanitize_field, ProfileContext, PromptState,
-    PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
+    render_jinja_template, sanitize_field, ProfileContext, PromptState, PROMPT_BALANCED,
+    PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -115,22 +115,22 @@ pub fn build_prompt_partition(
     // ── Dynamic suffix: temporal context + profile lines + addendum ──────
     let mut dynamic_parts: Vec<String> = Vec::with_capacity(8);
 
-    // Temporal context
+    // Temporal context — placed prominently so the model answers time/date
+    // questions directly without calling tools.
     if !state.current_date.is_empty() || !state.current_time.is_empty() {
-        let mut temporal = String::with_capacity(80);
+        let mut temporal = String::with_capacity(120);
+        temporal.push_str("CURRENT CONTEXT: ");
         if !state.current_date.is_empty() {
             temporal.push_str("Today is ");
             temporal.push_str(&state.current_date);
             temporal.push('.');
         }
         if !state.current_time.is_empty() {
-            if !temporal.is_empty() {
-                temporal.push(' ');
-            }
-            temporal.push_str("Current time: ");
+            temporal.push_str(" The time is ");
             temporal.push_str(&state.current_time);
             temporal.push('.');
         }
+        temporal.push_str(" Answer time/date questions directly from this — no tools needed.");
         dynamic_parts.push(temporal);
     }
 
@@ -470,11 +470,15 @@ mod tests {
         let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
         assert!(
-            partition.dynamic_suffix.contains("Always respond in French."),
+            partition
+                .dynamic_suffix
+                .contains("Always respond in French."),
             "Addendum must be in dynamic suffix"
         );
         assert!(
-            !partition.static_prefix.contains("Always respond in French."),
+            !partition
+                .static_prefix
+                .contains("Always respond in French."),
             "Addendum must NOT be in static prefix"
         );
     }
@@ -542,7 +546,10 @@ mod tests {
         let combined = if partition.dynamic_suffix.is_empty() {
             partition.static_prefix.clone()
         } else {
-            format!("{}\n\n{}", partition.static_prefix, partition.dynamic_suffix)
+            format!(
+                "{}\n\n{}",
+                partition.static_prefix, partition.dynamic_suffix
+            )
         };
 
         // The combined output should contain identity
@@ -570,7 +577,8 @@ mod tests {
         assert!(resolve_builtin_template(&s).contains("Hey there"));
 
         s.prompt_style = "nonexistent".to_string();
-        assert!(resolve_builtin_template(&s).contains("intelligent AI copilot")); // fallback to balanced
+        assert!(resolve_builtin_template(&s).contains("intelligent AI copilot"));
+        // fallback to balanced
     }
 
     #[test]

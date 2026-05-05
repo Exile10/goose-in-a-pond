@@ -3,7 +3,7 @@ import { Button, Tabs, Chip } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
-  ScanFace, Loader2, Puzzle,
+  ScanFace, Loader2, Puzzle, Cpu,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
@@ -59,18 +59,38 @@ function CapabilityBadges({ name }: { name: string }) {
 // ── Design constants ──────────────────────────────────────────
 
 const CAT_COLOR = {
-  llm:  "var(--color-role-chat)",
-  asr:  "var(--color-role-asr)",
-  tts:  "var(--color-role-tts)",
-  face: "#3b82f6",
+  llm:       "var(--color-role-chat)",
+  asr:       "var(--color-role-asr)",
+  tts:       "var(--color-role-tts)",
+  face:      "#3b82f6",
+  embedding: "#8b5cf6",
 } as const;
 
 // ── Active Roles Banner ───────────────────────────────────────
 
 /** Maps role keys to role-chip CSS modifier classes */
 const ROLE_CHIP_VARIANT: Record<string, string> = {
-  chat: "secondary", tool: "success", asr: "primary", tts: "danger",
+  chat: "secondary", tool: "success", asr: "primary", tts: "danger", embedding: "accent",
 };
+
+/** Infer embedding dimension from well-known model names. */
+function inferEmbeddingDimension(modelName: string): string | null {
+  const n = modelName.toLowerCase();
+  if (n.includes("minilm-l6") || n.includes("minilm_l6")) return "384d";
+  if (n.includes("minilm-l12") || n.includes("minilm_l12")) return "384d";
+  if (n.includes("bge-small") || n.includes("bge_small")) return "384d";
+  if (n.includes("bge-base") || n.includes("bge_base")) return "768d";
+  if (n.includes("bge-large") || n.includes("bge_large")) return "1024d";
+  if (n.includes("e5-small") || n.includes("e5_small")) return "384d";
+  if (n.includes("e5-base") || n.includes("e5_base")) return "768d";
+  if (n.includes("e5-large") || n.includes("e5_large")) return "1024d";
+  if (n.includes("multilingual-e5")) return "768d";
+  if (n.includes("nomic-embed")) return "768d";
+  if (n.includes("gte-small") || n.includes("gte_small")) return "384d";
+  if (n.includes("gte-base") || n.includes("gte_base")) return "768d";
+  if (n.includes("gte-large") || n.includes("gte_large")) return "1024d";
+  return null;
+}
 
 function ActiveRolesBanner({
   roles,
@@ -85,12 +105,13 @@ function ActiveRolesBanner({
   capabilities: ModelCapabilities | null;
   onRefresh: () => void;
   loading: boolean;
-  onNavigate?: (category: "llm" | "asr" | "tts") => void;
+  onNavigate?: (category: "llm" | "asr" | "tts" | "embedding") => void;
 }) {
-  const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" }> = [
-    { key: "chat", label: "Main LLM", icon: <MessageSquare size={12} strokeWidth={1.8} />, category: "llm" },
-    { key: "asr",  label: "ASR",      icon: <Mic size={12} strokeWidth={1.8} />,           category: "asr" },
-    { key: "tts",  label: "TTS",      icon: <Volume2 size={12} strokeWidth={1.8} />,       category: "tts" },
+  const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts" | "embedding"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" | "embedding" }> = [
+    { key: "chat",      label: "Main LLM",  icon: <MessageSquare size={12} strokeWidth={1.8} />, category: "llm" },
+    { key: "asr",       label: "ASR",       icon: <Mic size={12} strokeWidth={1.8} />,           category: "asr" },
+    { key: "tts",       label: "TTS",       icon: <Volume2 size={12} strokeWidth={1.8} />,        category: "tts" },
+    { key: "embedding", label: "Embedding", icon: <Cpu size={12} strokeWidth={1.8} />,            category: "embedding" },
   ];
   const toolModel = roles?.tool?.model;
 
@@ -108,6 +129,57 @@ function ActiveRolesBanner({
           const a = roles?.[key];
           const isSet = !!(a?.provider && a?.model);
           const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
+
+          // Embedding chip: show model name + dimension + green Active indicator
+          if (key === "embedding") {
+            const dim = isSet ? inferEmbeddingDimension(a!.model) : null;
+            return (
+              <div
+                key={key}
+                className={`role-chip role-chip--${variant}${isSet ? " is-set" : ""}`}
+                onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
+                style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
+                title={!isSet ? `Click to set ${label} model` : undefined}
+              >
+                <div className="role-chip__bar" />
+                <div className="role-chip__body">
+                  <div className="role-chip__head">
+                    {icon}
+                    <span className="role-chip__role">{label}</span>
+                    {isSet && (
+                      <span style={{
+                        marginLeft: "auto",
+                        display: "flex", alignItems: "center", gap: 3,
+                        fontSize: "var(--text-xs)", fontWeight: 600,
+                        color: "var(--color-success)",
+                      }}>
+                        <CheckCircle size={10} strokeWidth={2.5} />
+                        Active
+                      </span>
+                    )}
+                  </div>
+                  <span className={`role-chip__value ${isSet ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+                    {isSet
+                      ? <>
+                          {a!.model}
+                          {dim && (
+                            <span style={{
+                              marginLeft: 5,
+                              fontSize: "var(--text-xs)",
+                              color: "var(--color-text-secondary)",
+                              fontFamily: "var(--font-mono)",
+                            }}>
+                              {dim}
+                            </span>
+                          )}
+                        </>
+                      : "---"}
+                  </span>
+                </div>
+              </div>
+            );
+          }
+
           return (
             <div
               key={key}
@@ -220,10 +292,10 @@ function DownloadProgress({ downloads, onScanModels }: { downloads: DownloadEntr
 
 // ── Shared ModelList ──────────────────────────────────────────
 
-type RoleKey = "chat" | "tool" | "asr" | "tts";
+type RoleKey = "chat" | "tool" | "asr" | "tts" | "embedding";
 
 const ROLE_LABELS: Record<RoleKey, string> = {
-  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS",
+  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS", embedding: "Embedding",
 };
 
 function ModelList({
@@ -692,7 +764,7 @@ function OllamaPanel({
         loading={modelsLoading && ollamaLoading}
         error={modelsError}
         activeRoles={activeRoles}
-        availableRoles={["chat"]}
+        availableRoles={["chat", "tool"]}
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
@@ -863,7 +935,7 @@ function LlmTab({
                 loading={modelsLoading}
                 error={modelsError}
                 activeRoles={activeRoles}
-                availableRoles={["chat"]}
+                availableRoles={["chat", "tool"]}
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
@@ -927,13 +999,14 @@ function LlmTab({
 
 // ── Category Tabs ─────────────────────────────────────────────
 
-type Category = "llm" | "asr" | "tts" | "face";
+type Category = "llm" | "asr" | "tts" | "face" | "embedding";
 
 const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; color: string }> = [
-  { key: "llm", label: "LLM", icon: <Brain size={14} strokeWidth={1.8} />, color: CAT_COLOR.llm },
-  { key: "asr", label: "ASR", icon: <Mic size={14} strokeWidth={1.8} />, color: CAT_COLOR.asr },
-  { key: "tts", label: "TTS", icon: <Volume2 size={14} strokeWidth={1.8} />, color: CAT_COLOR.tts },
-  { key: "face", label: "Face", icon: <ScanFace size={14} strokeWidth={1.8} />, color: "#3b82f6" },
+  { key: "llm",       label: "LLM",       icon: <Brain size={14} strokeWidth={1.8} />,   color: CAT_COLOR.llm },
+  { key: "asr",       label: "ASR",       icon: <Mic size={14} strokeWidth={1.8} />,     color: CAT_COLOR.asr },
+  { key: "tts",       label: "TTS",       icon: <Volume2 size={14} strokeWidth={1.8} />, color: CAT_COLOR.tts },
+  { key: "embedding", label: "Embedding", icon: <Cpu size={14} strokeWidth={1.8} />,     color: CAT_COLOR.embedding },
+  { key: "face",      label: "Face",      icon: <ScanFace size={14} strokeWidth={1.8} />, color: "#3b82f6" },
 ];
 
 // ── Face Recognition Panel ───────────────────────────────────
@@ -1205,6 +1278,149 @@ function AsrCatalogPanel({
   );
 }
 
+// ── Embedding Catalog Panel ───────────────────────────────────
+
+function EmbeddingCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+  // Track models that returned "ready" immediately — treated as installed
+  const [readyModels, setReadyModels] = useState<Set<string>>(new Set());
+
+  const downloaded = models.filter((m) => m.downloaded !== false || readyModels.has(m.name));
+  const available  = models.filter((m) => m.downloaded === false && !readyModels.has(m.name));
+
+  const activeEmbedding = activeRoles?.embedding;
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("embedding", m.name);
+      if (res.status === "ready") {
+        // fastembed auto-downloads on first use — mark as installed immediately
+        setReadyModels((prev) => new Set([...prev, m.name]));
+        setDlMsg(`${m.name} is ready — downloads automatically on first use.`);
+      } else if (res.status === "already_downloaded") {
+        setDlMsg(`${m.name} already downloaded.`);
+        onDownloadStarted();
+      } else {
+        setDlMsg(`Download started: ${m.name}`);
+        onDownloadStarted();
+      }
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner" style={{ borderColor: `${CAT_COLOR.embedding}33`, background: `${CAT_COLOR.embedding}0d` }}>
+        <Cpu size={14} style={{ color: CAT_COLOR.embedding, flexShrink: 0 }} />
+        <span>Embedding models help the agent understand your intent and route queries to the right tools</span>
+      </div>
+
+      {/* First-use note */}
+      <div className="seg-banner" style={{ borderColor: "var(--color-border)", background: "var(--grey-50)" }}>
+        <Download size={13} style={{ color: "var(--grey-500)", flexShrink: 0 }} />
+        <span style={{ color: "var(--grey-600)", fontSize: "var(--text-sm)" }}>
+          First-time setup: the model downloads 23-86 MB on first use. Check server logs for progress.
+        </span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {!activeEmbedding && !modelsLoading && downloaded.length === 0 && models.length === 0 && (
+        <p style={{ ...hint, fontStyle: "italic" }}>
+          No embedding models found. Download one below to enable better tool routing.
+        </p>
+      )}
+
+      {!activeEmbedding && !modelsLoading && downloaded.length > 0 && (
+        <p style={{ ...hint, fontStyle: "italic" }}>
+          Set a default embedding model for better tool routing.
+        </p>
+      )}
+
+      {/* Downloaded / ready models */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["embedding"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="models-list">
+            {available.map((m) => (
+              <div key={m.id} className="giap-model-row always-actions">
+                <div>
+                  <div className="giap-model-row__title-row">
+                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
+                  </div>
+                  {m.description && (
+                    <div className="giap-model-row__file"><code>{m.description}</code></div>
+                  )}
+                </div>
+                <div className="giap-model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No embedding models found in catalog. Try refreshing the registry.</p>
+      )}
+    </div>
+  );
+}
+
 // ── TTS Catalog Panel ────────────────────────────────────────
 
 function TtsCatalogPanel({
@@ -1423,10 +1639,12 @@ export function Models() {
     } catch (e) { flash(String(e), false); }
   }
 
-  const asrModels = models.filter((m) => m.provider === "whisper");
-  const ttsModels = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
+  const asrModels       = models.filter((m) => m.provider === "whisper");
+  const ttsModels       = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
+  const embeddingModels = models.filter((m) => m.provider === "embedding" || m.category === "embedding");
 
-  const llmCount = models.filter((m) => m.provider !== "whisper" && m.provider !== "tts" && m.provider !== "tts_piper" && m.provider !== "tts_http").length;
+  const NON_LLM_PROVIDERS = new Set(["whisper", "tts", "tts_piper", "tts_http", "embedding"]);
+  const llmCount = models.filter((m) => !NON_LLM_PROVIDERS.has(m.provider) && m.category !== "embedding").length;
 
   return (
     <div className="screen">
@@ -1469,7 +1687,11 @@ export function Models() {
           <Tabs.ListContainer>
             <Tabs.List aria-label="Model categories" className="models-toolbar__tabs">
               {CATEGORIES.map(({ key, label, icon }) => {
-                const count = key === "llm" ? llmCount : key === "asr" ? asrModels.length : key === "tts" ? ttsModels.length : 0;
+                const count =
+                  key === "llm" ? llmCount :
+                  key === "asr" ? asrModels.length :
+                  key === "tts" ? ttsModels.length :
+                  key === "embedding" ? embeddingModels.length : 0;
                 return (
                   <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
                     <Tabs.Indicator />
@@ -1534,6 +1756,18 @@ export function Models() {
       {category === "tts" && (
         <TtsCatalogPanel
           models={ttsModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
+      )}
+
+      {category === "embedding" && (
+        <EmbeddingCatalogPanel
+          models={embeddingModels}
           modelsLoading={modelsLoading}
           modelsError={modelsError}
           activeRoles={activeRoles}

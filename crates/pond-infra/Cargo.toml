@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 hostname = { workspace = true }
 tracing = { workspace = true }
 reqwest = {workspace = true}
+fastembed = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

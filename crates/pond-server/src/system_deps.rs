@@ -26,13 +26,18 @@ use std::process::Stdio;
 // ── Required packages per package manager ────────────────────────────────────
 
 #[cfg(not(windows))]
-const APT_PACKAGES:    &[&str] = &["libasound2-dev", "pkg-config", "libssl-dev", "build-essential"];
+const APT_PACKAGES: &[&str] = &[
+    "libasound2-dev",
+    "pkg-config",
+    "libssl-dev",
+    "build-essential",
+];
 #[cfg(not(windows))]
-const DNF_PACKAGES:    &[&str] = &["alsa-lib-devel", "pkg-config", "openssl-devel", "gcc"];
+const DNF_PACKAGES: &[&str] = &["alsa-lib-devel", "pkg-config", "openssl-devel", "gcc"];
 #[cfg(not(windows))]
 const PACMAN_PACKAGES: &[&str] = &["alsa-lib", "pkg-config", "openssl", "base-devel"];
 #[cfg(not(windows))]
-const BREW_PACKAGES:   &[&str] = &["pkg-config", "openssl"];  // ALSA is not used on macOS
+const BREW_PACKAGES: &[&str] = &["pkg-config", "openssl"]; // ALSA is not used on macOS
 
 // ── Package manager detection ─────────────────────────────────────────────────
 
@@ -50,9 +55,9 @@ fn detect_package_manager() -> Option<PackageManager> {
     // Linux managers first, then macOS
     for (bin, pm) in &[
         ("apt-get", PackageManager::Apt),
-        ("dnf",     PackageManager::Dnf),
-        ("pacman",  PackageManager::Pacman),
-        ("brew",    PackageManager::Brew),
+        ("dnf", PackageManager::Dnf),
+        ("pacman", PackageManager::Pacman),
+        ("brew", PackageManager::Brew),
     ] {
         if which_bin(bin) {
             return Some(*pm);
@@ -124,26 +129,10 @@ fn missing_deps() -> Vec<&'static str> {
 #[cfg(not(windows))]
 async fn install_packages(pm: PackageManager) -> bool {
     let (cmd, sudo, args, packages): (&str, bool, &[&str], &[&str]) = match pm {
-        PackageManager::Apt => (
-            "apt-get", true,
-            &["install", "-y"],
-            APT_PACKAGES,
-        ),
-        PackageManager::Dnf => (
-            "dnf", true,
-            &["install", "-y"],
-            DNF_PACKAGES,
-        ),
-        PackageManager::Pacman => (
-            "pacman", true,
-            &["-Sy", "--noconfirm"],
-            PACMAN_PACKAGES,
-        ),
-        PackageManager::Brew => (
-            "brew", false,
-            &["install"],
-            BREW_PACKAGES,
-        ),
+        PackageManager::Apt => ("apt-get", true, &["install", "-y"], APT_PACKAGES),
+        PackageManager::Dnf => ("dnf", true, &["install", "-y"], DNF_PACKAGES),
+        PackageManager::Pacman => ("pacman", true, &["-Sy", "--noconfirm"], PACMAN_PACKAGES),
+        PackageManager::Brew => ("brew", false, &["install"], BREW_PACKAGES),
     };
 
     let mut full_args: Vec<&str> = args.to_vec();

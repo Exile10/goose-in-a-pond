@@ -123,20 +123,11 @@ mod tests {
         let telemetry = InMemoryTelemetry::new();
 
         // Turn 1: ttft=210, completion=50, ctx=31.0
-        telemetry
-            .record_turn(make_turn("sess-1", 1))
-            .await
-            .unwrap();
+        telemetry.record_turn(make_turn("sess-1", 1)).await.unwrap();
         // Turn 2: ttft=220, completion=100, ctx=32.0
-        telemetry
-            .record_turn(make_turn("sess-1", 2))
-            .await
-            .unwrap();
+        telemetry.record_turn(make_turn("sess-1", 2)).await.unwrap();
         // Turn 3: ttft=230, completion=150, ctx=33.0
-        telemetry
-            .record_turn(make_turn("sess-1", 3))
-            .await
-            .unwrap();
+        telemetry.record_turn(make_turn("sess-1", 3)).await.unwrap();
 
         let summary = telemetry.get_summary("sess-1").await.unwrap();
         assert_eq!(summary.total_turns, 3);
@@ -152,18 +143,9 @@ mod tests {
     async fn sessions_are_isolated() {
         let telemetry = InMemoryTelemetry::new();
 
-        telemetry
-            .record_turn(make_turn("sess-a", 1))
-            .await
-            .unwrap();
-        telemetry
-            .record_turn(make_turn("sess-a", 2))
-            .await
-            .unwrap();
-        telemetry
-            .record_turn(make_turn("sess-b", 1))
-            .await
-            .unwrap();
+        telemetry.record_turn(make_turn("sess-a", 1)).await.unwrap();
+        telemetry.record_turn(make_turn("sess-a", 2)).await.unwrap();
+        telemetry.record_turn(make_turn("sess-b", 1)).await.unwrap();
 
         let turns_a = telemetry.get_turns("sess-a").await.unwrap();
         let turns_b = telemetry.get_turns("sess-b").await.unwrap();
@@ -194,18 +176,9 @@ mod tests {
         let telemetry = InMemoryTelemetry::new();
 
         // Insert out of order
-        telemetry
-            .record_turn(make_turn("sess-1", 3))
-            .await
-            .unwrap();
-        telemetry
-            .record_turn(make_turn("sess-1", 1))
-            .await
-            .unwrap();
-        telemetry
-            .record_turn(make_turn("sess-1", 2))
-            .await
-            .unwrap();
+        telemetry.record_turn(make_turn("sess-1", 3)).await.unwrap();
+        telemetry.record_turn(make_turn("sess-1", 1)).await.unwrap();
+        telemetry.record_turn(make_turn("sess-1", 2)).await.unwrap();
 
         let turns = telemetry.get_turns("sess-1").await.unwrap();
         assert_eq!(turns[0].turn_number, 1);

@@ -28,7 +28,10 @@ impl Default for MockPromptExtraRepository {
 #[async_trait]
 impl PromptExtraRepository for MockPromptExtraRepository {
     async fn list_active(&self) -> Result<Vec<PromptExtra>> {
-        let mut v: Vec<PromptExtra> = self.extras.read().await
+        let mut v: Vec<PromptExtra> = self
+            .extras
+            .read()
+            .await
             .iter()
             .filter(|e| e.active)
             .cloned()

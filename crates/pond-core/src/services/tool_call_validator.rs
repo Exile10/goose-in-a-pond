@@ -488,7 +488,10 @@ mod tests {
         let input = r#"{"tool": "weather", "arguments": {"location": "Nairobi"}}"#;
         let result = validate_and_repair_tool_call(input);
         assert!(result.is_valid);
-        assert!(result.repaired.is_none(), "valid JSON should not be repaired");
+        assert!(
+            result.repaired.is_none(),
+            "valid JSON should not be repaired"
+        );
         assert!(result.errors.is_empty());
     }
 
@@ -504,7 +507,8 @@ mod tests {
 
     #[test]
     fn json_in_markdown_code_block() {
-        let input = "```json\n{\"tool\": \"weather\", \"arguments\": {\"location\": \"Nairobi\"}}\n```";
+        let input =
+            "```json\n{\"tool\": \"weather\", \"arguments\": {\"location\": \"Nairobi\"}}\n```";
         let result = validate_and_repair_tool_call(input);
         assert!(result.is_valid);
         assert!(result.repaired.is_some());
@@ -713,7 +717,11 @@ mod tests {
         let result = validate_and_repair_tool_call(input);
         assert!(result.is_valid);
         assert!(result.repaired.is_some());
-        assert!(result.errors.len() >= 2, "expected multiple repairs: {:?}", result.errors);
+        assert!(
+            result.errors.len() >= 2,
+            "expected multiple repairs: {:?}",
+            result.errors
+        );
     }
 
     #[test]

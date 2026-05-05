@@ -1,4 +1,5 @@
 pub mod db;
+pub mod fastembed_embedding;
 pub mod keyring_secret_repository;
 pub mod mock_handshake;
 pub mod onboarding;

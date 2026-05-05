@@ -71,8 +71,11 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   await page.route("**/api/v1/models/download/progress", (route) =>
     route.fulfill({ json: { downloads: [] } }),
   );
+  await page.route("**/api/v1/models/ollama", (route) =>
+    route.fulfill({ json: { models: [] } }),
+  );
   await page.route("**/api/v1/models", (route) =>
-    route.fulfill({ json: { whisper: [], llamafile: [], tts: [], gguf: [] } }),
+    route.fulfill({ json: { whisper: [], llamafile: [], tts: [], gguf: [], ollama: [], embedding: [] } }),
   );
   await page.route("**/api/v1/models/**", (route) =>
     route.fulfill({ json: { status: "ok" } }),

@@ -50,7 +50,9 @@ pub fn encode_memories_compact(memories: &[MemoryFragment]) -> String {
     sorted.sort_by(|a, b| {
         let imp_a = a.importance.unwrap_or(0.0);
         let imp_b = b.importance.unwrap_or(0.0);
-        imp_b.partial_cmp(&imp_a).unwrap_or(std::cmp::Ordering::Equal)
+        imp_b
+            .partial_cmp(&imp_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut buf = String::with_capacity(sorted.len() * 60);
@@ -250,7 +252,13 @@ fn parse_json_object(input: &str) -> Option<Vec<(String, String)>> {
 
     while pos < bytes.len() {
         // Skip whitespace and commas
-        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b',' || bytes[pos] == b'\n' || bytes[pos] == b'\r' || bytes[pos] == b'\t') {
+        while pos < bytes.len()
+            && (bytes[pos] == b' '
+                || bytes[pos] == b','
+                || bytes[pos] == b'\n'
+                || bytes[pos] == b'\r'
+                || bytes[pos] == b'\t')
+        {
             pos += 1;
         }
         if pos >= bytes.len() {
@@ -302,7 +310,7 @@ fn parse_quoted_string(input: &str, pos: &mut usize) -> Option<String> {
         } else if bytes[*pos] == b'"' {
             let s = &input[start..*pos];
             *pos += 1; // skip closing quote
-            // Basic unescape: \" → ", \\ → \, \n → newline
+                       // Basic unescape: \" → ", \\ → \, \n → newline
             let unescaped = s
                 .replace("\\\"", "\"")
                 .replace("\\\\", "\\")
@@ -380,7 +388,11 @@ mod tests {
     use super::*;
     use crate::domain::memory::{MemoryFragment, MemorySegment};
 
-    fn make_memory(content: &str, segment: Option<MemorySegment>, importance: Option<f32>) -> MemoryFragment {
+    fn make_memory(
+        content: &str,
+        segment: Option<MemorySegment>,
+        importance: Option<f32>,
+    ) -> MemoryFragment {
         let mut m = MemoryFragment::from_chat(
             format!("mem-{}", content.len()),
             None,
@@ -401,7 +413,11 @@ mod tests {
 
     #[test]
     fn single_memory_with_segment_and_importance() {
-        let m = make_memory("User is a data scientist", Some(MemorySegment::Identity), Some(0.8));
+        let m = make_memory(
+            "User is a data scientist",
+            Some(MemorySegment::Identity),
+            Some(0.8),
+        );
         let result = encode_memories_compact(&[m]);
         assert_eq!(result, "[identity:0.80] User is a data scientist");
     }
@@ -424,8 +440,16 @@ mod tests {
     fn memories_sorted_by_importance_descending() {
         let memories = vec![
             make_memory("Low importance", Some(MemorySegment::Context), Some(0.3)),
-            make_memory("High importance", Some(MemorySegment::Correction), Some(0.9)),
-            make_memory("Medium importance", Some(MemorySegment::Preference), Some(0.7)),
+            make_memory(
+                "High importance",
+                Some(MemorySegment::Correction),
+                Some(0.9),
+            ),
+            make_memory(
+                "Medium importance",
+                Some(MemorySegment::Preference),
+                Some(0.7),
+            ),
         ];
         let result = encode_memories_compact(&memories);
         let lines: Vec<&str> = result.lines().collect();
@@ -437,7 +461,11 @@ mod tests {
 
     #[test]
     fn memory_content_is_trimmed() {
-        let m = make_memory("  extra whitespace  ", Some(MemorySegment::Knowledge), Some(0.5));
+        let m = make_memory(
+            "  extra whitespace  ",
+            Some(MemorySegment::Knowledge),
+            Some(0.5),
+        );
         let result = encode_memories_compact(&[m]);
         assert!(result.ends_with("] extra whitespace"));
     }
@@ -445,11 +473,31 @@ mod tests {
     #[test]
     fn compact_memories_shorter_than_verbose() {
         let memories = vec![
-            make_memory("User is a data scientist", Some(MemorySegment::Identity), Some(0.8)),
-            make_memory("Prefers dark mode", Some(MemorySegment::Preference), Some(0.7)),
-            make_memory("Works at Acme Corp", Some(MemorySegment::Project), Some(0.6)),
-            make_memory("My name is Jerry", Some(MemorySegment::Identity), Some(0.85)),
-            make_memory("Uses Rust and Python", Some(MemorySegment::Knowledge), Some(0.5)),
+            make_memory(
+                "User is a data scientist",
+                Some(MemorySegment::Identity),
+                Some(0.8),
+            ),
+            make_memory(
+                "Prefers dark mode",
+                Some(MemorySegment::Preference),
+                Some(0.7),
+            ),
+            make_memory(
+                "Works at Acme Corp",
+                Some(MemorySegment::Project),
+                Some(0.6),
+            ),
+            make_memory(
+                "My name is Jerry",
+                Some(MemorySegment::Identity),
+                Some(0.85),
+            ),
+            make_memory(
+                "Uses Rust and Python",
+                Some(MemorySegment::Knowledge),
+                Some(0.5),
+            ),
         ];
 
         let compact = encode_memories_compact(&memories);
@@ -458,7 +506,9 @@ mod tests {
         let verbose = memories
             .iter()
             .map(|m| {
-                let seg = m.segment.as_ref()
+                let seg = m
+                    .segment
+                    .as_ref()
                     .map(|s| format!("{:?}", s).to_lowercase())
                     .unwrap_or_default();
                 format!("- [{}] {}", seg, m.content)
@@ -488,7 +538,10 @@ mod tests {
     fn json_object_encoded_as_kv() {
         let json = r#"{"name":"Living Room Light","status":"on","brightness":"80%"}"#;
         let result = encode_tool_result_compact("device", json);
-        assert_eq!(result, "# device\nname:Living Room Light\nstatus:on\nbrightness:80%");
+        assert_eq!(
+            result,
+            "# device\nname:Living Room Light\nstatus:on\nbrightness:80%"
+        );
     }
 
     #[test]
@@ -584,9 +637,21 @@ mod tests {
     #[test]
     fn compact_memory_format_is_human_readable() {
         let memories = vec![
-            make_memory("User's name is Jerry", Some(MemorySegment::Identity), Some(0.85)),
-            make_memory("Prefers concise responses", Some(MemorySegment::Preference), Some(0.7)),
-            make_memory("Working on GIAP project", Some(MemorySegment::Project), Some(0.6)),
+            make_memory(
+                "User's name is Jerry",
+                Some(MemorySegment::Identity),
+                Some(0.85),
+            ),
+            make_memory(
+                "Prefers concise responses",
+                Some(MemorySegment::Preference),
+                Some(0.7),
+            ),
+            make_memory(
+                "Working on GIAP project",
+                Some(MemorySegment::Project),
+                Some(0.6),
+            ),
         ];
         let result = encode_memories_compact(&memories);
 

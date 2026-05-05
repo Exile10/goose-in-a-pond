@@ -58,7 +58,10 @@ mod tests {
             ChatMessage::user("What's the weather?"),
         ];
 
-        let response = provider.complete("You are helpful.", messages).await.unwrap();
+        let response = provider
+            .complete("You are helpful.", messages)
+            .await
+            .unwrap();
 
         assert_eq!(response.role, Role::Assistant);
         assert_eq!(response.content, "Mock response to: What's the weather?");

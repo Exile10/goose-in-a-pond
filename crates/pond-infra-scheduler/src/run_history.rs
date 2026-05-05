@@ -105,8 +105,7 @@ impl JsonRunHistory {
         runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
         // Group by schedule_id, keep only the newest MAX_RUNS_PER_SCHEDULE each.
-        let mut counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         runs.retain(|r| {
             let count = counts.entry(r.schedule_id.clone()).or_insert(0);

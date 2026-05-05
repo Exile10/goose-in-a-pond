@@ -765,12 +765,37 @@ async fn chat_stream(
 
         let model_role = "chat";
 
+        // ── Domain classification (original message, before augmentation) ──
+        // Prefer embedding classifier (~10ms) when available; fall back to keyword
+        // classifier. Classify early so we can (a) skip ToolAgent for domains
+        // where it adds no value and (b) pass the domain through AgentRequest.
+        let domain = if let (Some(classifier), Some(emb_provider)) =
+            (&state.embedding_classifier, &state.embedding_provider)
+        {
+            classifier
+                .classify(&req.message, emb_provider.as_ref())
+                .await
+        } else {
+            pond_core::services::domain_classifier::classify_domain(&req.message)
+        };
+        let skip_tool_agent = matches!(
+            domain,
+            pond_core::services::domain_classifier::ToolDomain::Music
+                | pond_core::services::domain_classifier::ToolDomain::Home
+                | pond_core::services::domain_classifier::ToolDomain::FileSystem
+                | pond_core::services::domain_classifier::ToolDomain::System
+        );
+
         // ── Parallel Prep: LLM classification + user message persist ────────
         // The ToolAgent runs LLM classification on a concurrent thread while
         // message persistence happens in parallel. On HTTP providers (Ollama/
         // llamafile), the classifier LLM call runs on a separate connection,
         // truly parallel. On GGUF, it serializes behind the model mutex but
         // the DB persist still runs concurrently.
+        //
+        // When skip_tool_agent is true (Music, Home, FileSystem, System domains),
+        // we skip the ToolAgent entirely — it can't help and would waste an LLM
+        // classify call.
         let tool_agent_ref = state.tool_agent.clone();
         let msg_for_tool = req.message.clone();
         let multi_tool_enabled = settings.multi_tool_enabled;
@@ -782,8 +807,8 @@ async fn chat_stream(
         // Both branches produce an Option<String> tool_context.
         let (tool_result, multi_tool_result, persist_result) = tokio::join!(
             async {
-                if multi_tool_enabled {
-                    // Multi-tool path — skip the single-tool dispatch.
+                if skip_tool_agent || multi_tool_enabled {
+                    // Skip — either domain doesn't need tools or multi-tool path handles it.
                     Ok(None)
                 } else {
                     match &tool_agent_ref {
@@ -793,13 +818,14 @@ async fn chat_stream(
                 }
             },
             async {
-                if multi_tool_enabled {
+                if skip_tool_agent || !multi_tool_enabled {
+                    // Skip — either domain doesn't need tools or single-tool path handles it.
+                    Ok(vec![])
+                } else {
                     match &tool_agent_ref {
                         Some(ta) => ta.process_multi(&msg_for_tool).await,
                         None => Ok(vec![]),
                     }
-                } else {
-                    Ok(vec![])
                 }
             },
             async {
@@ -898,6 +924,7 @@ async fn chat_stream(
         let model_name_for_done = settings.chat_model.clone();
 
         use pond_core::domain::agent::AgentRequest;
+
         // Keep a reference to tool context for the reviewer (needs it to evaluate answer quality)
         let tool_context_for_review = tool_context.clone();
         let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
@@ -907,6 +934,7 @@ async fn chat_stream(
             model_role: model_role.to_string(),
             images: req.images.clone(),
             voice_mode: req.voice_mode,
+            domain: Some(domain),
         };
 
         let mut full_text = String::new();
@@ -1073,7 +1101,11 @@ async fn chat_stream(
         // If the LLM's response contains a natural language tool request
         // (e.g. "Let me look up X for you"), execute the tool via the
         // ToolAgent, then re-generate the response with tool data injected.
-        if settings.tool_request_detection {
+        // Skip when a domain filter is active (e.g. Music domain) — the LLM
+        // shouldn't be calling Wikipedia when only music tools are allowed.
+        // Reuses `domain` classified earlier from the original `req.message`.
+        let skip_tool_request = !matches!(domain, pond_core::services::domain_classifier::ToolDomain::General | pond_core::services::domain_classifier::ToolDomain::Knowledge);
+        if settings.tool_request_detection && !skip_tool_request {
             if let Some(tool_req) = pond_core::services::tool_request_detector::detect_tool_request(&full_text) {
                 tracing::info!(
                     target: "giap::tool_request",
@@ -1841,6 +1873,11 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
         },
         "asr": { "model_id": assignments.get("asr") },
         "tts": { "model_id": assignments.get("tts") },
+        "embedding": {
+            "model_id": assignments.get("embedding"),
+            "model": settings.active_embedding_model,
+            "provider": settings.embedding_provider,
+        },
         "router_name": state.llm_provider.read().await
             .as_ref()
             .map(|p| p.model_name())
@@ -2012,6 +2049,8 @@ async fn list_models(
     let mut llamafile = vec![];
     let mut tts = vec![];
     let mut gguf = vec![];
+    let mut ollama = vec![];
+    let mut embedding = vec![];
 
     for m in &records {
         let v = serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default();
@@ -2019,12 +2058,14 @@ async fn list_models(
             ModelCategory::Whisper => whisper.push(v),
             ModelCategory::Llamafile => llamafile.push(v),
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => tts.push(v),
-            ModelCategory::Gguf | ModelCategory::Ollama => gguf.push(v),
+            ModelCategory::Gguf => gguf.push(v),
+            ModelCategory::Ollama => ollama.push(v),
+            ModelCategory::Embedding => embedding.push(v),
         }
     }
 
     Ok(Json(
-        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf}),
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "ollama": ollama, "embedding": embedding}),
     ))
 }
 
@@ -2166,6 +2207,15 @@ async fn download_model(
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
     }
+
+    // Embedding models are auto-downloaded by fastembed on first use.
+    // No URL fetch needed — just confirm readiness.
+    if cat == ModelCategory::Embedding {
+        return Ok(Json(
+            json!({"status": "ready", "name": name, "note": "Embedding model will download automatically on first use"}),
+        ));
+    }
+
     let url = m.url.clone().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -2188,6 +2238,7 @@ async fn download_model(
             data_dir.join("models").join("tts").join(&filename)
         }
         ModelCategory::Ollama => data_dir.join("models").join(&filename),
+        ModelCategory::Embedding => data_dir.join("models").join("embedding").join(&filename),
     };
 
     let tracker = Arc::clone(&state.download_tracker);
@@ -2296,6 +2347,7 @@ async fn delete_model(
                 data_dir.join("models").join("tts").join(filename)
             }
             ModelCategory::Ollama => data_dir.join("models").join(filename),
+            ModelCategory::Embedding => data_dir.join("models").join("embedding").join(filename),
         };
         if path.exists() {
             tokio::fs::remove_file(&path).await.map_err(|e| {
@@ -2406,6 +2458,7 @@ async fn activate_model(
         ModelCategory::Whisper => "asr",
         ModelCategory::TtsPiper => "tts",
         ModelCategory::TtsHttp => "tts",
+        ModelCategory::Embedding => "embedding",
     };
 
     // Persist assignment
@@ -2439,6 +2492,14 @@ async fn activate_model(
         "tts" => {
             let _ = settings_repo
                 .set_key("active_tts_model", name.clone())
+                .await;
+        }
+        "embedding" => {
+            let _ = settings_repo
+                .set_key("active_embedding_model", name.clone())
+                .await;
+            let _ = settings_repo
+                .set_key("embedding_provider", provider.to_string())
                 .await;
         }
         _ => {}
@@ -4787,6 +4848,7 @@ async fn agent_chat_stream(
             model_role: "task".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            domain: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -5652,10 +5714,7 @@ async fn oauth_authorize_handler(
         );
     }
 
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/api/v1/oauth/callback",
-        state.api_port
-    );
+    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let scopes = provider.scopes.join(" ");
 
     let auth_url = format!(
@@ -5736,10 +5795,7 @@ async fn oauth_callback_handler(
 
     // Exchange authorization code for tokens.
     // The redirect_uri MUST exactly match the one sent in the authorize request.
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/api/v1/oauth/callback",
-        state.api_port
-    );
+    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let token_response = state
         .http_client
         .post(&provider.token_url)
@@ -5772,9 +5828,11 @@ async fn oauth_callback_handler(
             // If this OAuth flow was triggered by an extension install, restart
             // the extension so the child process picks up the new tokens.
             if let Some(ext_id) = &session.extension_id {
-                if let (Some(mgr), Some(mp), Some(secret_repo)) =
-                    (&state.extension_manager, &state.marketplace, &state.secret_repo)
-                {
+                if let (Some(mgr), Some(mp), Some(secret_repo)) = (
+                    &state.extension_manager,
+                    &state.marketplace,
+                    &state.secret_repo,
+                ) {
                     if let Ok(Some(ext)) = mp.get_by_id(ext_id).await {
                         // Build env map with all resolved secrets
                         let mut env = std::collections::HashMap::new();
@@ -5918,6 +5976,55 @@ async fn oauth_refresh_handler(
                 let _ = repo.set(&provider.refresh_key, new_refresh).await;
             }
             tracing::info!(provider = %provider_id, "OAuth token refresh succeeded");
+
+            // Restart any running extensions that use this provider's token
+            // so they pick up the refreshed credentials.
+            if let (Some(mgr), Some(mp), Some(secret_repo)) = (
+                &state.extension_manager,
+                &state.marketplace,
+                &state.secret_repo,
+            ) {
+                if let Ok(available) = mp.list_available().await {
+                    for ext in available {
+                        let uses_token = ext
+                            .required_secrets
+                            .iter()
+                            .any(|s| s.key == provider.token_key);
+                        if uses_token {
+                            let mut env = std::collections::HashMap::new();
+                            for sr in &ext.required_secrets {
+                                if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
+                                    env.insert(sr.key.clone(), val);
+                                }
+                            }
+                            let _ = mgr.remove_extension(&ext.id).await;
+                            let req = pond_core::ports::extension_manager::AddExtensionRequest {
+                                name: ext.id.clone(),
+                                kind: ext.kind.clone(),
+                                description: ext.description.clone(),
+                                command: ext.command.clone(),
+                                args: ext.args.clone(),
+                                env,
+                                uri: ext.uri.clone(),
+                            };
+                            match mgr.add_extension(req).await {
+                                Ok(_) => tracing::info!(
+                                    extension = %ext.id,
+                                    provider = %provider_id,
+                                    "restarted extension with refreshed OAuth tokens"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    extension = %ext.id,
+                                    provider = %provider_id,
+                                    error = %e,
+                                    "failed to restart extension after OAuth refresh"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+
             Json(json!({"refreshed": true})).into_response()
         }
         Ok(resp) => {

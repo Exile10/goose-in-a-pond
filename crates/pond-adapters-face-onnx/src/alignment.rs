@@ -85,10 +85,7 @@ impl Similarity2D {
 ///
 /// Implements Umeyama (1991) — closed form; no iterative solver required.
 /// This is what InsightFace / SCRFD use in Python via `skimage.transform`.
-pub fn umeyama_similarity(
-    src: &[(f32, f32); 5],
-    dst: &[(f32, f32); 5],
-) -> Similarity2D {
+pub fn umeyama_similarity(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> Similarity2D {
     let n = src.len() as f32;
 
     // Centroids.
@@ -99,7 +96,10 @@ pub fn umeyama_similarity(
         dx += dst[i].0;
         dy += dst[i].1;
     }
-    sx /= n; sy /= n; dx /= n; dy /= n;
+    sx /= n;
+    sy /= n;
+    dx /= n;
+    dy /= n;
 
     // Centred coordinates + cross-covariance + source variance.
     let mut sig_xx = 0.0_f32;
@@ -118,7 +118,10 @@ pub fn umeyama_similarity(
         sig_yy += ey * cy;
         var_s += cx * cx + cy * cy;
     }
-    sig_xx /= n; sig_xy /= n; sig_yx /= n; sig_yy /= n;
+    sig_xx /= n;
+    sig_xy /= n;
+    sig_yx /= n;
+    sig_yy /= n;
     var_s /= n;
 
     // 2×2 SVD closed form.  For a 2×2 matrix A = [[a b] [c d]]:
@@ -281,17 +284,29 @@ mod tests {
         // Any point should map to itself (up to FP).
         for &(x, y) in pts.iter() {
             let (u, v) = t.apply(x, y);
-            assert!((u - x).abs() < 1e-4 && (v - y).abs() < 1e-4, "identity broken at ({x},{y})");
+            assert!(
+                (u - x).abs() < 1e-4 && (v - y).abs() < 1e-4,
+                "identity broken at ({x},{y})"
+            );
         }
     }
 
     #[test]
     fn similarity_translation_only() {
         let src = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)];
-        let dst = [(5.0, -3.0), (6.0, -3.0), (5.0, -2.0), (6.0, -2.0), (5.5, -2.5)];
+        let dst = [
+            (5.0, -3.0),
+            (6.0, -3.0),
+            (5.0, -2.0),
+            (6.0, -2.0),
+            (5.5, -2.5),
+        ];
         let t = umeyama_similarity(&src, &dst);
         let (u, v) = t.apply(0.0, 0.0);
-        assert!((u - 5.0).abs() < 1e-3 && (v + 3.0).abs() < 1e-3, "got ({u},{v})");
+        assert!(
+            (u - 5.0).abs() < 1e-3 && (v + 3.0).abs() < 1e-3,
+            "got ({u},{v})"
+        );
     }
 
     #[test]
@@ -299,16 +314,29 @@ mod tests {
         // Rotate 90° CCW and scale by 2: (x,y) → (-2y, 2x)
         let src = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 1.0)];
         let dst: [(f32, f32); 5] = [
-            (-0.0, 2.0), (-2.0, 0.0), (0.0, -2.0), (2.0, 0.0), (-2.0, 2.0),
+            (-0.0, 2.0),
+            (-2.0, 0.0),
+            (0.0, -2.0),
+            (2.0, 0.0),
+            (-2.0, 2.0),
         ];
         let t = umeyama_similarity(&src, &dst);
         let (u, v) = t.apply(2.0, 0.0);
-        assert!((u - 0.0).abs() < 1e-3 && (v - 4.0).abs() < 1e-3, "got ({u},{v})");
+        assert!(
+            (u - 0.0).abs() < 1e-3 && (v - 4.0).abs() < 1e-3,
+            "got ({u},{v})"
+        );
     }
 
     #[test]
     fn inverse_cancels_forward() {
-        let src = [(10.0, 20.0), (30.0, 20.0), (20.0, 30.0), (15.0, 40.0), (25.0, 40.0)];
+        let src = [
+            (10.0, 20.0),
+            (30.0, 20.0),
+            (20.0, 30.0),
+            (15.0, 40.0),
+            (25.0, 40.0),
+        ];
         let dst: [(f32, f32); 5] = [
             (38.2946, 51.6963),
             (73.5318, 51.5014),
@@ -322,7 +350,10 @@ mod tests {
         for &(x, y) in src.iter() {
             let (u, v) = t.apply(x, y);
             let (x2, y2) = inv.apply(u, v);
-            assert!((x2 - x).abs() < 1e-2 && (y2 - y).abs() < 1e-2, "round trip failed ({x},{y})→({x2},{y2})");
+            assert!(
+                (x2 - x).abs() < 1e-2 && (y2 - y).abs() < 1e-2,
+                "round trip failed ({x},{y})→({x2},{y2})"
+            );
         }
     }
 
@@ -330,10 +361,10 @@ mod tests {
     fn align_produces_112_square() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(200, 200, Rgb([128, 128, 128])));
         let lms = FaceLandmarks {
-            left_eye:    (70.0, 80.0),
-            right_eye:   (130.0, 80.0),
-            nose:        (100.0, 110.0),
-            left_mouth:  (80.0, 150.0),
+            left_eye: (70.0, 80.0),
+            right_eye: (130.0, 80.0),
+            nose: (100.0, 110.0),
+            left_mouth: (80.0, 150.0),
             right_mouth: (120.0, 150.0),
         };
         let warped = align_to_canonical_112(&img, &lms, 112);

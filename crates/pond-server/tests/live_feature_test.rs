@@ -26,16 +26,20 @@ use tokio::sync::RwLock;
 
 // ── Env var helpers ──────────────────────────────────────────────────────────
 
-fn ollama_url() -> Option<String> { std::env::var("GIAP_OLLAMA_URL").ok() }
-fn ollama_model() -> String { std::env::var("GIAP_OLLAMA_MODEL").unwrap_or_else(|_| "gemma3:4b".into()) }
-fn llamafile_url() -> Option<String> { std::env::var("GIAP_LLAMAFILE_URL").ok() }
+fn ollama_url() -> Option<String> {
+    std::env::var("GIAP_OLLAMA_URL").ok()
+}
+fn ollama_model() -> String {
+    std::env::var("GIAP_OLLAMA_MODEL").unwrap_or_else(|_| "gemma3:4b".into())
+}
+fn llamafile_url() -> Option<String> {
+    std::env::var("GIAP_LLAMAFILE_URL").ok()
+}
 
 /// Build a real LLM provider from env vars (Ollama or llamafile).
 async fn build_provider() -> Option<Arc<dyn LlmProvider>> {
     if let Some(url) = ollama_url() {
-        let provider = pond_adapters_ollama::OllamaProvider::new(
-            Some(&url), Some(&ollama_model()),
-        );
+        let provider = pond_adapters_ollama::OllamaProvider::new(Some(&url), Some(&ollama_model()));
         return Some(Arc::new(provider));
     }
     if let Some(url) = llamafile_url() {
@@ -58,23 +62,33 @@ async fn live_memory_extraction_from_conversation() {
 
     let extractor = pond_server::llm_memory_extractor::LlmMemoryExtractor::new(live, 3);
 
-    let facts = extractor.extract(
-        "My name is Jerry and I live in Nairobi. I'm a software engineer.",
-        "Nice to meet you Jerry! Nairobi is a wonderful city.",
-        &[],
-    ).await;
+    let facts = extractor
+        .extract(
+            "My name is Jerry and I live in Nairobi. I'm a software engineer.",
+            "Nice to meet you Jerry! Nairobi is a wonderful city.",
+            &[],
+        )
+        .await;
 
     match facts {
         Ok(extracted) => {
             println!("[live-test] extracted {} facts:", extracted.len());
             for f in &extracted {
-                println!("  [{:?}] (imp={:.2}) {}", f.segment, f.importance, f.content);
+                println!(
+                    "  [{:?}] (imp={:.2}) {}",
+                    f.segment, f.importance, f.content
+                );
             }
             // Should extract at least 1 fact (name, location, or profession)
-            assert!(!extracted.is_empty(), "should extract at least one fact from rich input");
+            assert!(
+                !extracted.is_empty(),
+                "should extract at least one fact from rich input"
+            );
 
             // At least one should be Identity segment
-            let has_identity = extracted.iter().any(|f| f.segment == MemorySegment::Identity);
+            let has_identity = extracted
+                .iter()
+                .any(|f| f.segment == MemorySegment::Identity);
             println!("[live-test] has identity fact: {has_identity}");
         }
         Err(e) => {
@@ -95,17 +109,21 @@ async fn live_memory_extraction_skips_trivial_input() {
 
     let extractor = pond_server::llm_memory_extractor::LlmMemoryExtractor::new(live, 3);
 
-    let facts = extractor.extract(
-        "Hello!",
-        "Hi there! How can I help you?",
-        &[],
-    ).await;
+    let facts = extractor
+        .extract("Hello!", "Hi there! How can I help you?", &[])
+        .await;
 
     match facts {
         Ok(extracted) => {
-            println!("[live-test] trivial input extracted {} facts", extracted.len());
+            println!(
+                "[live-test] trivial input extracted {} facts",
+                extracted.len()
+            );
             // Greetings should produce 0 or very few facts
-            assert!(extracted.len() <= 1, "trivial greeting should not produce many facts");
+            assert!(
+                extracted.len() <= 1,
+                "trivial greeting should not produce many facts"
+            );
         }
         Err(e) => {
             println!("[live-test] extraction error on trivial input: {e}");
@@ -129,33 +147,50 @@ async fn live_extraction_stores_to_sqlite() {
     let repo = SqliteMemoryRepository::new(db.system);
     let extractor = pond_server::llm_memory_extractor::LlmMemoryExtractor::new(live, 3);
 
-    let extraction_service = pond_core::services::memory_extraction::MemoryExtractionService::new(1);
+    let extraction_service =
+        pond_core::services::memory_extraction::MemoryExtractionService::new(1);
 
-    extraction_service.run(
-        &extractor,
-        &repo,
-        "I prefer dark mode and I'm allergic to peanuts",
-        "I'll remember that! Dark mode it is, and I'll keep the peanut allergy in mind.",
-        Some("test-session"),
-    ).await;
+    extraction_service
+        .run(
+            &extractor,
+            &repo,
+            "I prefer dark mode and I'm allergic to peanuts",
+            "I'll remember that! Dark mode it is, and I'll keep the peanut allergy in mind.",
+            Some("test-session"),
+        )
+        .await;
 
     let memories = repo.search_recent(None, 20).await.unwrap();
     println!("[live-test] stored {} memories in SQLite:", memories.len());
     for m in &memories {
-        println!("  [{:?}] (imp={:.2}) {}",
-            m.segment.as_ref().map(|s| format!("{:?}", s)).unwrap_or("none".into()),
+        println!(
+            "  [{:?}] (imp={:.2}) {}",
+            m.segment
+                .as_ref()
+                .map(|s| format!("{:?}", s))
+                .unwrap_or("none".into()),
             m.importance.unwrap_or(0.0),
             m.content
         );
     }
 
     // Should have stored at least 1 memory
-    assert!(!memories.is_empty(), "extraction should store at least one memory");
+    assert!(
+        !memories.is_empty(),
+        "extraction should store at least one memory"
+    );
 
     // All stored memories should have segment metadata
     for m in &memories {
-        assert!(m.segment.is_some(), "stored memory should have segment: {:?}", m.content);
-        assert!(m.importance.is_some(), "stored memory should have importance");
+        assert!(
+            m.segment.is_some(),
+            "stored memory should have segment: {:?}",
+            m.content
+        );
+        assert!(
+            m.importance.is_some(),
+            "stored memory should have importance"
+        );
         assert_eq!(m.source, "extraction");
     }
 }
@@ -178,23 +213,32 @@ async fn live_extraction_then_cleanup_cycle() {
     let service = pond_core::services::memory_extraction::MemoryExtractionService::new(1);
 
     // Extract from a conversation
-    service.run(
-        &extractor, &repo,
-        "My birthday is March 5th and my favorite color is blue",
-        "Got it! I'll remember your birthday and color preference.",
-        Some("test-sess"),
-    ).await;
+    service
+        .run(
+            &extractor,
+            &repo,
+            "My birthday is March 5th and my favorite color is blue",
+            "Got it! I'll remember your birthday and color preference.",
+            Some("test-sess"),
+        )
+        .await;
 
     let before = repo.search_recent(None, 20).await.unwrap();
     println!("[live-test] before cleanup: {} memories", before.len());
 
     // Run cleanup — fresh memories should NOT be pruned
     let (scanned, archived, pruned) =
-        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15).await.unwrap();
+        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15)
+            .await
+            .unwrap();
     println!("[live-test] cleanup: scanned={scanned}, archived={archived}, pruned={pruned}");
 
     let after = repo.search_recent(None, 20).await.unwrap();
-    assert_eq!(before.len(), after.len(), "fresh memories should survive cleanup");
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "fresh memories should survive cleanup"
+    );
 }
 
 // ── Live Consolidation Test ──────────────────────────────────────────────────
@@ -221,24 +265,36 @@ async fn live_consolidation_merges_duplicates() {
         ("d5", "User likes dark mode"),
     ] {
         repo.add(MemoryFragment::from_extraction(
-            id.into(), None, content.into(),
-            MemorySegment::Identity, 0.8,
-        )).await.unwrap();
+            id.into(),
+            None,
+            content.into(),
+            MemorySegment::Identity,
+            0.8,
+        ))
+        .await
+        .unwrap();
     }
 
     let consolidator = pond_server::llm_memory_consolidator::LlmMemoryConsolidator::new(live);
 
     let before = repo.search_scoreable(None).await.unwrap();
-    println!("[live-test] before consolidation: {} memories", before.len());
+    println!(
+        "[live-test] before consolidation: {} memories",
+        before.len()
+    );
 
-    let (merged, pruned) = pond_core::services::memory_consolidation::run_consolidation(
-        &consolidator, &repo,
-    ).await.unwrap();
+    let (merged, pruned) =
+        pond_core::services::memory_consolidation::run_consolidation(&consolidator, &repo)
+            .await
+            .unwrap();
 
     println!("[live-test] consolidation: merged={merged}, pruned={pruned}");
 
     let after = repo.search_recent(None, 20).await.unwrap();
-    println!("[live-test] after consolidation: {} active memories", after.len());
+    println!(
+        "[live-test] after consolidation: {} active memories",
+        after.len()
+    );
     for m in &after {
         println!("  [{}] {}", m.id, m.content);
     }
@@ -248,7 +304,9 @@ async fn live_consolidation_merges_duplicates() {
     if merged > 0 || pruned > 0 {
         assert!(after.len() < 5, "consolidation should reduce memory count");
     } else {
-        println!("[live-test] model did not propose consolidation actions (acceptable for small models)");
+        println!(
+            "[live-test] model did not propose consolidation actions (acceptable for small models)"
+        );
     }
 }
 
@@ -262,16 +320,30 @@ async fn live_chat_produces_nonzero_token_estimate() {
         None => return,
     };
 
-    let response = provider.complete(
-        "You are a helpful assistant.",
-        vec![pond_core::domain::message::ChatMessage::user("What is 2 + 2?".to_string())],
-    ).await.unwrap();
+    let response = provider
+        .complete(
+            "You are a helpful assistant.",
+            vec![pond_core::domain::message::ChatMessage::user(
+                "What is 2 + 2?".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
 
-    println!("[live-test] response: {:?}", &response.content[..response.content.len().min(200)]);
-    assert!(!response.content.is_empty(), "model should produce a response");
+    println!(
+        "[live-test] response: {:?}",
+        &response.content[..response.content.len().min(200)]
+    );
+    assert!(
+        !response.content.is_empty(),
+        "model should produce a response"
+    );
 
     // The chars/4 estimate would give us:
     let est_completion = response.content.len() / 4;
     println!("[live-test] estimated completion tokens: {est_completion}");
-    assert!(est_completion > 0, "response should produce nonzero token estimate");
+    assert!(
+        est_completion > 0,
+        "response should produce nonzero token estimate"
+    );
 }

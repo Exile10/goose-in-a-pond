@@ -138,12 +138,8 @@ mod tests {
 
     /// Helper: create a minimal MemoryFragment with given id and importance.
     fn mem(id: &str, importance: f32) -> MemoryFragment {
-        let mut frag = MemoryFragment::from_chat(
-            id.to_string(),
-            None,
-            None,
-            format!("content of {id}"),
-        );
+        let mut frag =
+            MemoryFragment::from_chat(id.to_string(), None, None, format!("content of {id}"));
         frag.importance = Some(importance);
         frag
     }
@@ -230,7 +226,10 @@ mod tests {
         let ids: Vec<&str> = result.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"A"));
         assert!(ids.contains(&"B"));
-        assert!(!ids.contains(&"X"), "X is disconnected and should be excluded");
+        assert!(
+            !ids.contains(&"X"),
+            "X is disconnected and should be excluded"
+        );
     }
 
     #[test]
@@ -280,23 +279,13 @@ mod tests {
     #[test]
     fn multiple_roots_expand_search() {
         // A -> B, C -> D (two disconnected subgraphs, both rooted)
-        let memories = vec![
-            mem("A", 0.5),
-            mem("B", 0.5),
-            mem("C", 0.5),
-            mem("D", 0.5),
-        ];
+        let memories = vec![mem("A", 0.5), mem("B", 0.5), mem("C", 0.5), mem("D", 0.5)];
         let edges = vec![
             edge("A", "B", EdgeRelation::Caused),
             edge("C", "D", EdgeRelation::Referenced),
         ];
 
-        let result = retrieve_relevant_memories(
-            &memories,
-            &edges,
-            &["A".into(), "C".into()],
-            10,
-        );
+        let result = retrieve_relevant_memories(&memories, &edges, &["A".into(), "C".into()], 10);
         assert_eq!(result.len(), 4);
     }
 
@@ -321,23 +310,14 @@ mod tests {
     #[test]
     fn nonexistent_root_ids_are_ignored() {
         let memories = vec![mem("A", 0.5)];
-        let result = retrieve_relevant_memories(
-            &memories,
-            &[],
-            &["nonexistent".into()],
-            10,
-        );
+        let result = retrieve_relevant_memories(&memories, &[], &["nonexistent".into()], 10);
         assert!(result.is_empty());
     }
 
     #[test]
     fn default_importance_used_when_none() {
-        let mut frag = MemoryFragment::from_chat(
-            "A".to_string(),
-            None,
-            None,
-            "no importance set".to_string(),
-        );
+        let mut frag =
+            MemoryFragment::from_chat("A".to_string(), None, None, "no importance set".to_string());
         frag.importance = None; // explicitly None
 
         let result = retrieve_relevant_memories(&[frag], &[], &["A".into()], 10);

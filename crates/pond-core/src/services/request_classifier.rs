@@ -12,7 +12,12 @@ use crate::domain::model_role::ModelRole;
 
 /// Common wake-word prefixes to strip before keyword matching.
 const WAKE_PREFIXES: &[&str] = &[
-    "goose, ", "goose ", "hey goose, ", "hey goose ", "ok computer, ", "ok computer ",
+    "goose, ",
+    "goose ",
+    "hey goose, ",
+    "hey goose ",
+    "ok computer, ",
+    "ok computer ",
 ];
 
 /// Keywords that indicate a request needs deeper reasoning.
@@ -144,21 +149,48 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
 
     // ── CreateSchedule (highest action priority) ────────────────────
     const SCHEDULE_CREATE_PATTERNS: &[&str] = &[
-        "schedule to ", "schedule a ", "schedule me ",
-        "every day at", "every morning", "every evening", "every night",
-        "every hour", "every week",
-        "remind me every", "remind me at ", "remind me to ",
-        "at 1", "at 2", "at 3", "at 4", "at 5", "at 6", "at 7",
-        "at 8", "at 9", "at 10", "at 11", "at 12",  // "at N am/pm"
-        "set alarm", "set a timer", "set a reminder",
+        "schedule to ",
+        "schedule a ",
+        "schedule me ",
+        "every day at",
+        "every morning",
+        "every evening",
+        "every night",
+        "every hour",
+        "every week",
+        "remind me every",
+        "remind me at ",
+        "remind me to ",
+        "at 1",
+        "at 2",
+        "at 3",
+        "at 4",
+        "at 5",
+        "at 6",
+        "at 7",
+        "at 8",
+        "at 9",
+        "at 10",
+        "at 11",
+        "at 12", // "at N am/pm"
+        "set alarm",
+        "set a timer",
+        "set a reminder",
     ];
-    if SCHEDULE_CREATE_PATTERNS.iter().any(|p| stripped.contains(p)) {
+    if SCHEDULE_CREATE_PATTERNS
+        .iter()
+        .any(|p| stripped.contains(p))
+    {
         // Disambiguate: "at 3" alone is too broad — require "am", "pm", or
         // another scheduling word nearby.
-        let has_time_marker = stripped.contains("am") || stripped.contains("pm")
-            || stripped.contains("every") || stripped.contains("schedule")
-            || stripped.contains("remind") || stripped.contains("alarm")
-            || stripped.contains("timer") || stripped.contains("daily")
+        let has_time_marker = stripped.contains("am")
+            || stripped.contains("pm")
+            || stripped.contains("every")
+            || stripped.contains("schedule")
+            || stripped.contains("remind")
+            || stripped.contains("alarm")
+            || stripped.contains("timer")
+            || stripped.contains("daily")
             || stripped.contains("o'clock");
         if has_time_marker {
             return ToolRouting::CreateSchedule;
@@ -168,13 +200,20 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
     // ── RecallMemory (before SaveMemory — recall queries often contain
     //    save-like words, e.g. "do you remember what food I like?") ───
     const RECALL_MEMORY_PATTERNS: &[&str] = &[
-        "do you remember", "do you recall",
-        "what did i tell you", "what did i say",
-        "what do you know about me", "what do you remember",
-        "what's my name", "what is my name",
-        "what's my ", "what is my ",
-        "did i mention", "did i tell you",
-        "recall my", "recall what",
+        "do you remember",
+        "do you recall",
+        "what did i tell you",
+        "what did i say",
+        "what do you know about me",
+        "what do you remember",
+        "what's my name",
+        "what is my name",
+        "what's my ",
+        "what is my ",
+        "did i mention",
+        "did i tell you",
+        "recall my",
+        "recall what",
     ];
     if RECALL_MEMORY_PATTERNS.iter().any(|p| stripped.contains(p)) {
         return ToolRouting::RecallMemory;
@@ -182,34 +221,63 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
 
     // ── SaveMemory ──────────────────────────────────────────────────
     const SAVE_MEMORY_PATTERNS: &[&str] = &[
-        "remember that", "remember this", "remember my", "remember i ",
-        "don't forget", "do not forget",
-        "save this", "save that", "note that", "note this",
-        "keep in mind", "make a note",
-        "my name is", "i am called", "call me ",
-        "i live in", "i'm from", "i am from",
-        "my birthday is", "my email is", "my phone",
-        "i prefer", "i like", "i love", "i hate", "i dislike",
-        "i'm allergic", "i am allergic",
+        "remember that",
+        "remember this",
+        "remember my",
+        "remember i ",
+        "don't forget",
+        "do not forget",
+        "save this",
+        "save that",
+        "note that",
+        "note this",
+        "keep in mind",
+        "make a note",
+        "my name is",
+        "i am called",
+        "call me ",
+        "i live in",
+        "i'm from",
+        "i am from",
+        "my birthday is",
+        "my email is",
+        "my phone",
+        "i prefer",
+        "i like",
+        "i love",
+        "i hate",
+        "i dislike",
+        "i'm allergic",
+        "i am allergic",
     ];
     if SAVE_MEMORY_PATTERNS.iter().any(|p| stripped.contains(p)) {
         return ToolRouting::SaveMemory;
     }
 
     // ── Weather ─────────────────────────────────────────────────────
-    if stripped.contains("weather") || stripped.contains("temperature outside")
-        || stripped.contains("forecast") || stripped.starts_with("how cold")
-        || stripped.starts_with("how hot") || stripped.starts_with("how warm")
-        || stripped.starts_with("is it raining") || stripped.starts_with("will it rain")
+    if stripped.contains("weather")
+        || stripped.contains("temperature outside")
+        || stripped.contains("forecast")
+        || stripped.starts_with("how cold")
+        || stripped.starts_with("how hot")
+        || stripped.starts_with("how warm")
+        || stripped.starts_with("is it raining")
+        || stripped.starts_with("will it rain")
     {
         return ToolRouting::Weather;
     }
 
     // ── Devices ─────────────────────────────────────────────────────
     const DEVICE_PATTERNS: &[&str] = &[
-        "list devices", "my devices", "what devices",
-        "connected devices", "online devices",
-        "turn on the", "turn off the", "switch on", "switch off",
+        "list devices",
+        "my devices",
+        "what devices",
+        "connected devices",
+        "online devices",
+        "turn on the",
+        "turn off the",
+        "switch on",
+        "switch off",
     ];
     if DEVICE_PATTERNS.iter().any(|p| stripped.contains(p)) {
         return ToolRouting::Devices;
@@ -217,10 +285,15 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
 
     // ── Schedules (list) ────────────────────────────────────────────
     const SCHEDULE_LIST_PATTERNS: &[&str] = &[
-        "list schedules", "my schedules", "what schedules",
-        "show schedules", "show my schedule",
-        "what's scheduled", "what is scheduled",
-        "upcoming tasks", "upcoming schedules",
+        "list schedules",
+        "my schedules",
+        "what schedules",
+        "show schedules",
+        "show my schedule",
+        "what's scheduled",
+        "what is scheduled",
+        "upcoming tasks",
+        "upcoming schedules",
     ];
     if SCHEDULE_LIST_PATTERNS.iter().any(|p| stripped.contains(p)) {
         return ToolRouting::Schedules;
@@ -228,17 +301,32 @@ pub fn route_to_tool(message: &str) -> ToolRouting {
 
     // ── Wikipedia / Knowledge ───────────────────────────────────────
     const KNOWLEDGE_PREFIXES: &[&str] = &[
-        "who is", "who was", "who are",
-        "what is", "what are", "what was", "what were",
-        "where is", "where are", "where was",
-        "when was", "when did", "when is",
-        "tell me about", "explain ", "describe ",
-        "how does", "how do", "how did",
-        "look up", "search for", "search ", "define ",
+        "who is",
+        "who was",
+        "who are",
+        "what is",
+        "what are",
+        "what was",
+        "what were",
+        "where is",
+        "where are",
+        "where was",
+        "when was",
+        "when did",
+        "when is",
+        "tell me about",
+        "explain ",
+        "describe ",
+        "how does",
+        "how do",
+        "how did",
+        "look up",
+        "search for",
+        "search ",
+        "define ",
         "can you tell me about",
     ];
-    if KNOWLEDGE_PREFIXES.iter().any(|p| stripped.starts_with(p))
-        || stripped.contains("wikipedia")
+    if KNOWLEDGE_PREFIXES.iter().any(|p| stripped.starts_with(p)) || stripped.contains("wikipedia")
     {
         return ToolRouting::Wikipedia;
     }
@@ -267,19 +355,46 @@ pub fn route_to_tools(message: &str) -> Vec<ToolRouting> {
 
     // ── CreateSchedule ──────────────────────────────────────────────
     const SCHEDULE_CREATE_PATTERNS_MULTI: &[&str] = &[
-        "schedule to ", "schedule a ", "schedule me ",
-        "every day at", "every morning", "every evening", "every night",
-        "every hour", "every week",
-        "remind me every", "remind me at ", "remind me to ",
-        "at 1", "at 2", "at 3", "at 4", "at 5", "at 6", "at 7",
-        "at 8", "at 9", "at 10", "at 11", "at 12",
-        "set alarm", "set a timer", "set a reminder",
+        "schedule to ",
+        "schedule a ",
+        "schedule me ",
+        "every day at",
+        "every morning",
+        "every evening",
+        "every night",
+        "every hour",
+        "every week",
+        "remind me every",
+        "remind me at ",
+        "remind me to ",
+        "at 1",
+        "at 2",
+        "at 3",
+        "at 4",
+        "at 5",
+        "at 6",
+        "at 7",
+        "at 8",
+        "at 9",
+        "at 10",
+        "at 11",
+        "at 12",
+        "set alarm",
+        "set a timer",
+        "set a reminder",
     ];
-    if SCHEDULE_CREATE_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
-        let has_time_marker = stripped.contains("am") || stripped.contains("pm")
-            || stripped.contains("every") || stripped.contains("schedule")
-            || stripped.contains("remind") || stripped.contains("alarm")
-            || stripped.contains("timer") || stripped.contains("daily")
+    if SCHEDULE_CREATE_PATTERNS_MULTI
+        .iter()
+        .any(|p| stripped.contains(p))
+    {
+        let has_time_marker = stripped.contains("am")
+            || stripped.contains("pm")
+            || stripped.contains("every")
+            || stripped.contains("schedule")
+            || stripped.contains("remind")
+            || stripped.contains("alarm")
+            || stripped.contains("timer")
+            || stripped.contains("daily")
             || stripped.contains("o'clock");
         if has_time_marker {
             results.push(ToolRouting::CreateSchedule);
@@ -288,50 +403,91 @@ pub fn route_to_tools(message: &str) -> Vec<ToolRouting> {
 
     // ── RecallMemory ────────────────────────────────────────────────
     const RECALL_MEMORY_PATTERNS_MULTI: &[&str] = &[
-        "do you remember", "do you recall",
-        "what did i tell you", "what did i say",
-        "what do you know about me", "what do you remember",
-        "what's my name", "what is my name",
-        "what's my ", "what is my ",
-        "did i mention", "did i tell you",
-        "recall my", "recall what",
+        "do you remember",
+        "do you recall",
+        "what did i tell you",
+        "what did i say",
+        "what do you know about me",
+        "what do you remember",
+        "what's my name",
+        "what is my name",
+        "what's my ",
+        "what is my ",
+        "did i mention",
+        "did i tell you",
+        "recall my",
+        "recall what",
     ];
-    if RECALL_MEMORY_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
+    if RECALL_MEMORY_PATTERNS_MULTI
+        .iter()
+        .any(|p| stripped.contains(p))
+    {
         results.push(ToolRouting::RecallMemory);
     }
 
     // ── SaveMemory ──────────────────────────────────────────────────
     const SAVE_MEMORY_PATTERNS_MULTI: &[&str] = &[
-        "remember that", "remember this", "remember my", "remember i ",
-        "don't forget", "do not forget",
-        "save this", "save that", "note that", "note this",
-        "keep in mind", "make a note",
-        "my name is", "i am called", "call me ",
-        "i live in", "i'm from", "i am from",
-        "my birthday is", "my email is", "my phone",
-        "i prefer", "i like", "i love", "i hate", "i dislike",
-        "i'm allergic", "i am allergic",
+        "remember that",
+        "remember this",
+        "remember my",
+        "remember i ",
+        "don't forget",
+        "do not forget",
+        "save this",
+        "save that",
+        "note that",
+        "note this",
+        "keep in mind",
+        "make a note",
+        "my name is",
+        "i am called",
+        "call me ",
+        "i live in",
+        "i'm from",
+        "i am from",
+        "my birthday is",
+        "my email is",
+        "my phone",
+        "i prefer",
+        "i like",
+        "i love",
+        "i hate",
+        "i dislike",
+        "i'm allergic",
+        "i am allergic",
     ];
     if !results.contains(&ToolRouting::RecallMemory)
-        && SAVE_MEMORY_PATTERNS_MULTI.iter().any(|p| stripped.contains(p))
+        && SAVE_MEMORY_PATTERNS_MULTI
+            .iter()
+            .any(|p| stripped.contains(p))
     {
         results.push(ToolRouting::SaveMemory);
     }
 
     // ── Weather ─────────────────────────────────────────────────────
-    if stripped.contains("weather") || stripped.contains("temperature outside")
-        || stripped.contains("forecast") || stripped.starts_with("how cold")
-        || stripped.starts_with("how hot") || stripped.starts_with("how warm")
-        || stripped.starts_with("is it raining") || stripped.starts_with("will it rain")
+    if stripped.contains("weather")
+        || stripped.contains("temperature outside")
+        || stripped.contains("forecast")
+        || stripped.starts_with("how cold")
+        || stripped.starts_with("how hot")
+        || stripped.starts_with("how warm")
+        || stripped.starts_with("is it raining")
+        || stripped.starts_with("will it rain")
     {
         results.push(ToolRouting::Weather);
     }
 
     // ── Devices ─────────────────────────────────────────────────────
     const DEVICE_PATTERNS_MULTI: &[&str] = &[
-        "list devices", "my devices", "what devices",
-        "connected devices", "online devices",
-        "turn on the", "turn off the", "switch on", "switch off",
+        "list devices",
+        "my devices",
+        "what devices",
+        "connected devices",
+        "online devices",
+        "turn on the",
+        "turn off the",
+        "switch on",
+        "switch off",
     ];
     if DEVICE_PATTERNS_MULTI.iter().any(|p| stripped.contains(p)) {
         results.push(ToolRouting::Devices);
@@ -339,30 +495,55 @@ pub fn route_to_tools(message: &str) -> Vec<ToolRouting> {
 
     // ── Schedules (list) ────────────────────────────────────────────
     const SCHEDULE_LIST_PATTERNS_MULTI: &[&str] = &[
-        "list schedules", "my schedules", "what schedules",
-        "show schedules", "show my schedule",
-        "what's scheduled", "what is scheduled",
-        "upcoming tasks", "upcoming schedules",
+        "list schedules",
+        "my schedules",
+        "what schedules",
+        "show schedules",
+        "show my schedule",
+        "what's scheduled",
+        "what is scheduled",
+        "upcoming tasks",
+        "upcoming schedules",
     ];
     // Only match Schedules (list) if we haven't already matched CreateSchedule
     if !results.contains(&ToolRouting::CreateSchedule)
-        && SCHEDULE_LIST_PATTERNS_MULTI.iter().any(|p| stripped.contains(p))
+        && SCHEDULE_LIST_PATTERNS_MULTI
+            .iter()
+            .any(|p| stripped.contains(p))
     {
         results.push(ToolRouting::Schedules);
     }
 
     // ── Wikipedia / Knowledge ───────────────────────────────────────
     const KNOWLEDGE_PREFIXES_MULTI: &[&str] = &[
-        "who is", "who was", "who are",
-        "what is", "what are", "what was", "what were",
-        "where is", "where are", "where was",
-        "when was", "when did", "when is",
-        "tell me about", "explain ", "describe ",
-        "how does", "how do", "how did",
-        "look up", "search for", "search ", "define ",
+        "who is",
+        "who was",
+        "who are",
+        "what is",
+        "what are",
+        "what was",
+        "what were",
+        "where is",
+        "where are",
+        "where was",
+        "when was",
+        "when did",
+        "when is",
+        "tell me about",
+        "explain ",
+        "describe ",
+        "how does",
+        "how do",
+        "how did",
+        "look up",
+        "search for",
+        "search ",
+        "define ",
         "can you tell me about",
     ];
-    if KNOWLEDGE_PREFIXES_MULTI.iter().any(|p| stripped.starts_with(p))
+    if KNOWLEDGE_PREFIXES_MULTI
+        .iter()
+        .any(|p| stripped.starts_with(p))
         || stripped.contains("wikipedia")
     {
         results.push(ToolRouting::Wikipedia);
@@ -390,36 +571,75 @@ mod tests {
 
     #[test]
     fn think_keywords_route_to_think() {
-        assert_eq!(classify_request("explain why the sky is blue"), ModelRole::Think);
+        assert_eq!(
+            classify_request("explain why the sky is blue"),
+            ModelRole::Think
+        );
         assert_eq!(classify_request("analyze this situation"), ModelRole::Think);
-        assert_eq!(classify_request("compare these two options"), ModelRole::Think);
+        assert_eq!(
+            classify_request("compare these two options"),
+            ModelRole::Think
+        );
         assert_eq!(classify_request("what causes inflation"), ModelRole::Think);
-        assert_eq!(classify_request("pros and cons of remote work"), ModelRole::Think);
-        assert_eq!(classify_request("step by step how to bake bread"), ModelRole::Think);
+        assert_eq!(
+            classify_request("pros and cons of remote work"),
+            ModelRole::Think
+        );
+        assert_eq!(
+            classify_request("step by step how to bake bread"),
+            ModelRole::Think
+        );
     }
 
     #[test]
     fn think_prefix_overrides_all() {
         // Even if task keywords are present, "think about" prefix wins
-        assert_eq!(classify_request("think about scheduling my week"), ModelRole::Think);
-        assert_eq!(classify_request("Goose, think about why I'm busy"), ModelRole::Think);
+        assert_eq!(
+            classify_request("think about scheduling my week"),
+            ModelRole::Think
+        );
+        assert_eq!(
+            classify_request("Goose, think about why I'm busy"),
+            ModelRole::Think
+        );
     }
 
     #[test]
     fn task_keywords_route_to_task() {
-        assert_eq!(classify_request("remind me to take my meds at 9am"), ModelRole::Task);
-        assert_eq!(classify_request("schedule a meeting tomorrow"), ModelRole::Task);
-        assert_eq!(classify_request("turn on the living room lights"), ModelRole::Task);
+        assert_eq!(
+            classify_request("remind me to take my meds at 9am"),
+            ModelRole::Task
+        );
+        assert_eq!(
+            classify_request("schedule a meeting tomorrow"),
+            ModelRole::Task
+        );
+        assert_eq!(
+            classify_request("turn on the living room lights"),
+            ModelRole::Task
+        );
         assert_eq!(classify_request("set alarm for 7am"), ModelRole::Task);
-        assert_eq!(classify_request("search for the latest news"), ModelRole::Task);
+        assert_eq!(
+            classify_request("search for the latest news"),
+            ModelRole::Task
+        );
         assert_eq!(classify_request("list devices"), ModelRole::Task);
     }
 
     #[test]
     fn wake_word_prefix_is_stripped() {
-        assert_eq!(classify_request("Goose, explain why we sleep"), ModelRole::Think);
-        assert_eq!(classify_request("hey goose, remind me at noon"), ModelRole::Task);
-        assert_eq!(classify_request("Hey Goose, what is the weather"), ModelRole::Chat);
+        assert_eq!(
+            classify_request("Goose, explain why we sleep"),
+            ModelRole::Think
+        );
+        assert_eq!(
+            classify_request("hey goose, remind me at noon"),
+            ModelRole::Task
+        );
+        assert_eq!(
+            classify_request("Hey Goose, what is the weather"),
+            ModelRole::Chat
+        );
     }
 
     #[test]
@@ -441,58 +661,115 @@ mod tests {
 
     #[test]
     fn route_weather() {
-        assert_eq!(route_to_tool("What's the weather like?"), ToolRouting::Weather);
-        assert_eq!(route_to_tool("How's the temperature outside?"), ToolRouting::Weather);
-        assert_eq!(route_to_tool("Will it rain tomorrow?"), ToolRouting::Weather);
+        assert_eq!(
+            route_to_tool("What's the weather like?"),
+            ToolRouting::Weather
+        );
+        assert_eq!(
+            route_to_tool("How's the temperature outside?"),
+            ToolRouting::Weather
+        );
+        assert_eq!(
+            route_to_tool("Will it rain tomorrow?"),
+            ToolRouting::Weather
+        );
         assert_eq!(route_to_tool("Is it raining?"), ToolRouting::Weather);
     }
 
     #[test]
     fn route_wikipedia() {
-        assert_eq!(route_to_tool("Who is Albert Einstein?"), ToolRouting::Wikipedia);
-        assert_eq!(route_to_tool("What is photosynthesis?"), ToolRouting::Wikipedia);
-        assert_eq!(route_to_tool("Tell me about black holes"), ToolRouting::Wikipedia);
+        assert_eq!(
+            route_to_tool("Who is Albert Einstein?"),
+            ToolRouting::Wikipedia
+        );
+        assert_eq!(
+            route_to_tool("What is photosynthesis?"),
+            ToolRouting::Wikipedia
+        );
+        assert_eq!(
+            route_to_tool("Tell me about black holes"),
+            ToolRouting::Wikipedia
+        );
         assert_eq!(route_to_tool("Define osmosis"), ToolRouting::Wikipedia);
     }
 
     #[test]
     fn route_save_memory() {
-        assert_eq!(route_to_tool("Remember that I love pizza"), ToolRouting::SaveMemory);
-        assert_eq!(route_to_tool("Don't forget my birthday is March 5"), ToolRouting::SaveMemory);
+        assert_eq!(
+            route_to_tool("Remember that I love pizza"),
+            ToolRouting::SaveMemory
+        );
+        assert_eq!(
+            route_to_tool("Don't forget my birthday is March 5"),
+            ToolRouting::SaveMemory
+        );
         assert_eq!(route_to_tool("My name is Jerry"), ToolRouting::SaveMemory);
         assert_eq!(route_to_tool("I prefer dark mode"), ToolRouting::SaveMemory);
-        assert_eq!(route_to_tool("I'm allergic to peanuts"), ToolRouting::SaveMemory);
+        assert_eq!(
+            route_to_tool("I'm allergic to peanuts"),
+            ToolRouting::SaveMemory
+        );
         assert_eq!(route_to_tool("I live in Nairobi"), ToolRouting::SaveMemory);
     }
 
     #[test]
     fn route_recall_memory() {
-        assert_eq!(route_to_tool("Do you remember what food I like?"), ToolRouting::RecallMemory);
+        assert_eq!(
+            route_to_tool("Do you remember what food I like?"),
+            ToolRouting::RecallMemory
+        );
         assert_eq!(route_to_tool("What's my name?"), ToolRouting::RecallMemory);
-        assert_eq!(route_to_tool("What did I tell you about my job?"), ToolRouting::RecallMemory);
-        assert_eq!(route_to_tool("What do you know about me?"), ToolRouting::RecallMemory);
+        assert_eq!(
+            route_to_tool("What did I tell you about my job?"),
+            ToolRouting::RecallMemory
+        );
+        assert_eq!(
+            route_to_tool("What do you know about me?"),
+            ToolRouting::RecallMemory
+        );
     }
 
     #[test]
     fn route_devices() {
         assert_eq!(route_to_tool("List devices"), ToolRouting::Devices);
-        assert_eq!(route_to_tool("What devices are connected?"), ToolRouting::Devices);
-        assert_eq!(route_to_tool("Turn on the living room lights"), ToolRouting::Devices);
+        assert_eq!(
+            route_to_tool("What devices are connected?"),
+            ToolRouting::Devices
+        );
+        assert_eq!(
+            route_to_tool("Turn on the living room lights"),
+            ToolRouting::Devices
+        );
     }
 
     #[test]
     fn route_schedules() {
         assert_eq!(route_to_tool("Show my schedules"), ToolRouting::Schedules);
-        assert_eq!(route_to_tool("What's scheduled for today?"), ToolRouting::Schedules);
+        assert_eq!(
+            route_to_tool("What's scheduled for today?"),
+            ToolRouting::Schedules
+        );
         assert_eq!(route_to_tool("List schedules"), ToolRouting::Schedules);
     }
 
     #[test]
     fn route_create_schedule() {
-        assert_eq!(route_to_tool("Schedule to get the weather at 10 am"), ToolRouting::CreateSchedule);
-        assert_eq!(route_to_tool("Every day at 8 AM, give me a briefing"), ToolRouting::CreateSchedule);
-        assert_eq!(route_to_tool("Remind me every morning to stretch"), ToolRouting::CreateSchedule);
-        assert_eq!(route_to_tool("Set alarm for 7am"), ToolRouting::CreateSchedule);
+        assert_eq!(
+            route_to_tool("Schedule to get the weather at 10 am"),
+            ToolRouting::CreateSchedule
+        );
+        assert_eq!(
+            route_to_tool("Every day at 8 AM, give me a briefing"),
+            ToolRouting::CreateSchedule
+        );
+        assert_eq!(
+            route_to_tool("Remind me every morning to stretch"),
+            ToolRouting::CreateSchedule
+        );
+        assert_eq!(
+            route_to_tool("Set alarm for 7am"),
+            ToolRouting::CreateSchedule
+        );
     }
 
     #[test]
@@ -500,15 +777,24 @@ mod tests {
         assert_eq!(route_to_tool("Hello!"), ToolRouting::None);
         assert_eq!(route_to_tool("Tell me a joke"), ToolRouting::None);
         assert_eq!(route_to_tool("Thanks"), ToolRouting::None);
-        assert_eq!(route_to_tool("Would you recommend drinking milk?"), ToolRouting::None);
+        assert_eq!(
+            route_to_tool("Would you recommend drinking milk?"),
+            ToolRouting::None
+        );
         assert_eq!(route_to_tool("Help me debug this code"), ToolRouting::None);
         assert_eq!(route_to_tool("Write me a poem"), ToolRouting::None);
     }
 
     #[test]
     fn route_with_wake_word() {
-        assert_eq!(route_to_tool("Goose, what's the weather?"), ToolRouting::Weather);
-        assert_eq!(route_to_tool("Hey goose, remember I like sushi"), ToolRouting::SaveMemory);
+        assert_eq!(
+            route_to_tool("Goose, what's the weather?"),
+            ToolRouting::Weather
+        );
+        assert_eq!(
+            route_to_tool("Hey goose, remember I like sushi"),
+            ToolRouting::SaveMemory
+        );
     }
 
     #[test]
