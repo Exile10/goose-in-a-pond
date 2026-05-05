@@ -31,16 +31,32 @@ impl CompactionLimits {
     fn from_context_tokens(ctx: usize) -> Self {
         if ctx <= 4096 {
             // Jetson-class: 3K-4K tokens — aggressive
-            Self { wiki_max_sentences: 3, wiki_max_chars: 500, fallback_max_chars: 200 }
+            Self {
+                wiki_max_sentences: 3,
+                wiki_max_chars: 500,
+                fallback_max_chars: 200,
+            }
         } else if ctx <= 12288 {
             // macOS Metal default: 8K-12K — balanced
-            Self { wiki_max_sentences: 8, wiki_max_chars: 1500, fallback_max_chars: 500 }
+            Self {
+                wiki_max_sentences: 8,
+                wiki_max_chars: 1500,
+                fallback_max_chars: 500,
+            }
         } else if ctx <= 65536 {
             // Medium context: 32K-64K — generous
-            Self { wiki_max_sentences: 15, wiki_max_chars: 3000, fallback_max_chars: 1000 }
+            Self {
+                wiki_max_sentences: 15,
+                wiki_max_chars: 3000,
+                fallback_max_chars: 1000,
+            }
         } else {
             // Large context: 128K+ — minimal compaction
-            Self { wiki_max_sentences: 30, wiki_max_chars: 6000, fallback_max_chars: 2000 }
+            Self {
+                wiki_max_sentences: 30,
+                wiki_max_chars: 6000,
+                fallback_max_chars: 2000,
+            }
         }
     }
 }
@@ -159,7 +175,9 @@ fn compact_schedule_line(line: &str) -> Option<String> {
     let status = after_id
         .rfind('(')
         .and_then(|start| {
-            after_id[start..].strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+            after_id[start..]
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
         })
         .and_then(|inner| {
             // inner is "agent, active" — extract the status part
@@ -204,8 +222,12 @@ fn humanize_cron(cron_with_tz: &str) -> String {
     // Build time string
     let time = format!(
         "{}:{}",
-        hour.parse::<u32>().map(|h| format!("{:02}", h)).unwrap_or_else(|_| hour.to_string()),
-        min.parse::<u32>().map(|m| format!("{:02}", m)).unwrap_or_else(|_| min.to_string()),
+        hour.parse::<u32>()
+            .map(|h| format!("{:02}", h))
+            .unwrap_or_else(|_| hour.to_string()),
+        min.parse::<u32>()
+            .map(|m| format!("{:02}", m))
+            .unwrap_or_else(|_| min.to_string()),
     );
 
     // Daily: specific hour, all days
@@ -445,7 +467,9 @@ mod tests {
 
         // Should keep first 3 sentences
         assert!(result.contains("Albert Einstein was a German-born theoretical physicist."));
-        assert!(result.contains("He is widely held to be one of the greatest physicists of all time."));
+        assert!(
+            result.contains("He is widely held to be one of the greatest physicists of all time.")
+        );
         assert!(result.contains("Einstein is best known for developing the theory of relativity."));
 
         // Should NOT include later sentences
@@ -481,7 +505,8 @@ mod tests {
 
     #[test]
     fn schedule_compaction_preserves_names_and_times() {
-        let schedules = "- Morning briefing [abc-123]: 0 30 8 * * * Africa/Nairobi (agent, active)\n\
+        let schedules =
+            "- Morning briefing [abc-123]: 0 30 8 * * * Africa/Nairobi (agent, active)\n\
                          - Weather check [def-456]: 0 0 * * * * UTC (agent, active)";
         let result = compact_tool_output("schedules", schedules, 4096);
 
@@ -609,14 +634,20 @@ mod tests {
         let large = compact_tool_output("wikipedia", &article, 32768);
 
         // M4 should preserve more than Jetson
-        assert!(m4.len() > jetson.len(),
+        assert!(
+            m4.len() > jetson.len(),
             "8K context ({} chars) should preserve more than 3K ({} chars)",
-            m4.len(), jetson.len());
+            m4.len(),
+            jetson.len()
+        );
 
         // Large should preserve more than M4
-        assert!(large.len() > m4.len(),
+        assert!(
+            large.len() > m4.len(),
             "32K context ({} chars) should preserve more than 8K ({} chars)",
-            large.len(), m4.len());
+            large.len(),
+            m4.len()
+        );
     }
 
     #[test]
@@ -626,9 +657,12 @@ mod tests {
         let jetson = compact_tool_output("unknown_tool", &long, 3072);
         let m4 = compact_tool_output("unknown_tool", &long, 8192);
 
-        assert!(m4.len() > jetson.len(),
+        assert!(
+            m4.len() > jetson.len(),
             "8K fallback ({} chars) should preserve more than 3K ({} chars)",
-            m4.len(), jetson.len());
+            m4.len(),
+            jetson.len()
+        );
     }
 
     // ── Sentence extraction ─────────────────────────────────────────────

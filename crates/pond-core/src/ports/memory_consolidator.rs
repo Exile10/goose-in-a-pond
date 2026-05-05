@@ -25,8 +25,5 @@ pub enum ConsolidationAction {
 #[async_trait]
 pub trait MemoryConsolidator: Send + Sync {
     /// Analyse a batch of memories and propose consolidation actions.
-    async fn consolidate(
-        &self,
-        memories: &[MemoryFragment],
-    ) -> Result<Vec<ConsolidationAction>>;
+    async fn consolidate(&self, memories: &[MemoryFragment]) -> Result<Vec<ConsolidationAction>>;
 }

@@ -32,19 +32,18 @@ impl SqliteDeviceRegistry {
 
 #[derive(sqlx::FromRow)]
 struct DeviceRow {
-    id:           String,
-    name:         String,
-    hostname:     Option<String>,
-    device_type:  String,
-    ip_address:   Option<String>,
+    id: String,
+    name: String,
+    hostname: Option<String>,
+    device_type: String,
+    ip_address: Option<String>,
     capabilities: String,
-    created_at:   String,
-    last_seen:    Option<String>,
+    created_at: String,
+    last_seen: Option<String>,
 }
 
 fn row_to_device(row: DeviceRow) -> Device {
-    let capabilities: Vec<String> =
-        serde_json::from_str(&row.capabilities).unwrap_or_default();
+    let capabilities: Vec<String> = serde_json::from_str(&row.capabilities).unwrap_or_default();
 
     // Compute is_online by comparing last_seen to now - threshold
     let is_online = row
@@ -59,14 +58,14 @@ fn row_to_device(row: DeviceRow) -> Device {
         .unwrap_or(false);
 
     Device {
-        id:            row.id,
-        name:          row.name,
-        device_type:   row.device_type,
-        hostname:      row.hostname,
-        ip_address:    row.ip_address,
+        id: row.id,
+        name: row.name,
+        device_type: row.device_type,
+        hostname: row.hostname,
+        ip_address: row.ip_address,
         capabilities,
         registered_at: row.created_at,
-        last_seen:     row.last_seen,
+        last_seen: row.last_seen,
         is_online,
     }
 }
@@ -96,14 +95,14 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
         Ok(Device {
             id,
-            name:          request.name,
-            device_type:   request.device_type,
-            hostname:      request.hostname,
-            ip_address:    None,
-            capabilities:  request.capabilities,
+            name: request.name,
+            device_type: request.device_type,
+            hostname: request.hostname,
+            ip_address: None,
+            capabilities: request.capabilities,
             registered_at: now_str.clone(),
-            last_seen:     Some(now_str),
-            is_online:     true,
+            last_seen: Some(now_str),
+            is_online: true,
         })
     }
 
@@ -138,14 +137,12 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
     async fn heartbeat(&self, device_id: &str) -> Result<()> {
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        sqlx::query(
-            "UPDATE devices SET last_seen = ?, is_online = 1, updated_at = ? WHERE id = ?",
-        )
-        .bind(&now_str)
-        .bind(&now_str)
-        .bind(device_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE devices SET last_seen = ?, is_online = 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(&now_str)
+            .bind(device_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -164,9 +161,9 @@ mod tests {
 
     fn req(name: &str) -> RegisterDeviceRequest {
         RegisterDeviceRequest {
-            name:         name.to_string(),
-            device_type:  "gotg".to_string(),
-            hostname:     Some("phone.local".to_string()),
+            name: name.to_string(),
+            device_type: "gotg".to_string(),
+            hostname: Some("phone.local".to_string()),
             capabilities: vec!["chat".to_string(), "tts".to_string()],
         }
     }

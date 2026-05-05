@@ -1,6 +1,6 @@
+use crate::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
 
@@ -59,6 +59,7 @@ mod tests {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            domain: None,
         };
         let response = agent.chat(request).await.unwrap();
         assert_eq!(response.text, "Echo: Hello, Pond!");
@@ -74,6 +75,7 @@ mod tests {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            domain: None,
         };
         let mut stream = agent.chat_stream(request).await.unwrap();
 

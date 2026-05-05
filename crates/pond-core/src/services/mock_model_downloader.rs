@@ -27,7 +27,7 @@ impl MockModelDownloader {
     /// after the download (e.g. for `ModelService::ensure_downloaded`).
     pub fn new(write_placeholder: bool) -> Self {
         Self {
-            downloads:         Arc::new(RwLock::new(Vec::new())),
+            downloads: Arc::new(RwLock::new(Vec::new())),
             write_placeholder,
         }
     }
@@ -78,7 +78,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dest = tmp.path().join("model.gguf");
         let dl = MockModelDownloader::new(false);
-        dl.download("https://example.com/model.gguf", &dest, 0).await.unwrap();
+        dl.download("https://example.com/model.gguf", &dest, 0)
+            .await
+            .unwrap();
         assert!(dl.was_downloaded("https://example.com/model.gguf").await);
         assert!(dl.was_downloaded_any().await);
     }
@@ -88,7 +90,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dest = tmp.path().join("model.gguf");
         let dl = MockModelDownloader::new(true);
-        dl.download("https://example.com/model.gguf", &dest, 100).await.unwrap();
+        dl.download("https://example.com/model.gguf", &dest, 100)
+            .await
+            .unwrap();
         assert!(dest.exists(), "placeholder file should be created");
     }
 
@@ -99,7 +103,9 @@ mod tests {
         tokio::fs::write(&dest, b"existing").await.unwrap();
 
         let dl = MockModelDownloader::new(true);
-        dl.download("https://example.com/model.gguf", &dest, 0).await.unwrap();
+        dl.download("https://example.com/model.gguf", &dest, 0)
+            .await
+            .unwrap();
         // Should be a no-op — not recorded
         assert_eq!(dl.download_count().await, 0);
     }

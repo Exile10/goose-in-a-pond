@@ -101,6 +101,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         device_registry: Arc::new(NoDevices),
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
+        embedding_classifier: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
@@ -137,6 +138,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),

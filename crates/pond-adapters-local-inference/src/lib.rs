@@ -29,7 +29,9 @@
 
 pub mod scheduler;
 pub mod tool_caller;
-pub use scheduler::{NoopScheduler, ResourceAwareModelScheduler, LLM_BUDGET_MB, JETSON_TOTAL_RAM_MB};
+pub use scheduler::{
+    NoopScheduler, ResourceAwareModelScheduler, JETSON_TOTAL_RAM_MB, LLM_BUDGET_MB,
+};
 pub use tool_caller::ToolCallerEngine;
 
 use anyhow::Result;
@@ -85,12 +87,18 @@ impl LocalInferenceLlmAdapter {
         #[cfg(not(feature = "cuda"))]
         Self::apply_platform_settings(model_id);
 
-        tracing::info!("initialising LocalInferenceProvider for model: {}", model_id);
+        tracing::info!(
+            "initialising LocalInferenceProvider for model: {}",
+            model_id
+        );
         let provider = LocalInferenceProvider::from_env(model_config, vec![]).await?;
         let session_id = uuid::Uuid::new_v4().to_string();
 
         Ok(Self {
-            inner: GooseProviderAdapter::new(Arc::new(provider) as Arc<dyn GooseProvider>, session_id),
+            inner: GooseProviderAdapter::new(
+                Arc::new(provider) as Arc<dyn GooseProvider>,
+                session_id,
+            ),
         })
     }
 
@@ -106,7 +114,7 @@ impl LocalInferenceLlmAdapter {
     /// - Raw filename: `"gemma-4-E2B-it-Q4_K_M.gguf"` (file must exist in `$data_dir/models/gguf/`)
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, ModelSettings, model_id_from_repo,
+            get_registry, model_id_from_repo, LocalModelEntry, ModelSettings,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -117,17 +125,18 @@ impl LocalInferenceLlmAdapter {
         // disk is {stem}.gguf in the gguf directory.  Normalise by appending
         // ".gguf" and falling through to the raw filename path below.
         let owned_with_ext;
-        let model_id = if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
-            let candidate = gguf_dir.join(format!("{}.gguf", model_id));
-            if candidate.exists() {
-                owned_with_ext = format!("{}.gguf", model_id);
-                owned_with_ext.as_str()
+        let model_id =
+            if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
+                let candidate = gguf_dir.join(format!("{}.gguf", model_id));
+                if candidate.exists() {
+                    owned_with_ext = format!("{}.gguf", model_id);
+                    owned_with_ext.as_str()
+                } else {
+                    model_id // not a local stem — fall through to HF path
+                }
             } else {
-                model_id // not a local stem — fall through to HF path
-            }
-        } else {
-            model_id
-        };
+                model_id
+            };
 
         // ── Raw filename (e.g. "gemma-4-E2B-it-Q4_K_M.gguf") ────────────────
         // Detected when: no ':' separator and ends with ".gguf".
@@ -155,14 +164,14 @@ impl LocalInferenceLlmAdapter {
                             let mut settings = ModelSettings::default();
                             settings.native_tool_calling = true;
                             let entry = LocalModelEntry {
-                                id:           stem.clone(),
-                                repo_id:      format!("local/{}", stem),
-                                filename:     filename.clone(),
+                                id: stem.clone(),
+                                repo_id: format!("local/{}", stem),
+                                filename: filename.clone(),
                                 quantization: String::new(),
                                 local_path,
-                                source_url:   String::new(),
+                                source_url: String::new(),
                                 settings,
-                                size_bytes:   0,
+                                size_bytes: 0,
                             };
                             if let Err(e) = registry.add_model(entry) {
                                 tracing::warn!("Could not register GGUF model '{}': {}", stem, e);
@@ -184,16 +193,14 @@ impl LocalInferenceLlmAdapter {
 
         // ── HuggingFace format ("repo_id:quantization") ───────────────────────
         // Parse "repo_id:quantization" — e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
-        let (repo_id, quantization) = model_id
-            .rsplit_once(':')
-            .unwrap_or((model_id, "Q4_K_M"));
+        let (repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
 
         let id = model_id_from_repo(repo_id, quantization);
 
         // Derive filename: strip "-GGUF" suffix from the repo name, append "-{quant}.gguf"
         let model_name = repo_id.split('/').last().unwrap_or(repo_id);
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         let local_path = gguf_dir.join(&filename);
         let source_url = format!(
@@ -210,14 +217,14 @@ impl LocalInferenceLlmAdapter {
                         let mut settings = ModelSettings::default();
                         settings.native_tool_calling = true;
                         let entry = LocalModelEntry {
-                            id:           id.clone(),
-                            repo_id:      repo_id.to_string(),
-                            filename:     filename.clone(),
+                            id: id.clone(),
+                            repo_id: repo_id.to_string(),
+                            filename: filename.clone(),
                             quantization: quantization.to_string(),
                             local_path,
                             source_url,
                             settings,
-                            size_bytes:   0,
+                            size_bytes: 0,
                         };
                         if let Err(e) = registry.add_model(entry) {
                             tracing::warn!("Could not register GGUF model '{}': {}", id, e);
@@ -271,7 +278,8 @@ impl LocalInferenceLlmAdapter {
                 if let Err(e) = registry.update_model_settings(model_id, settings) {
                     tracing::debug!(
                         "Platform settings not applied to '{}' (model not yet registered): {}",
-                        model_id, e
+                        model_id,
+                        e
                     );
                 } else {
                     tracing::info!(
@@ -281,7 +289,10 @@ impl LocalInferenceLlmAdapter {
                 }
             }
             Err(e) => {
-                tracing::warn!("Could not acquire model registry lock for platform settings: {}", e);
+                tracing::warn!(
+                    "Could not acquire model registry lock for platform settings: {}",
+                    e
+                );
             }
         }
     }
@@ -325,7 +336,8 @@ impl LocalInferenceLlmAdapter {
                 if let Err(e) = registry.update_model_settings(model_id, jetson_settings) {
                     tracing::debug!(
                         "Jetson settings not applied to '{}' (model not yet registered): {}",
-                        model_id, e
+                        model_id,
+                        e
                     );
                 } else {
                     tracing::info!(
@@ -335,7 +347,10 @@ impl LocalInferenceLlmAdapter {
                 }
             }
             Err(e) => {
-                tracing::warn!("Could not acquire model registry lock for Jetson settings: {}", e);
+                tracing::warn!(
+                    "Could not acquire model registry lock for Jetson settings: {}",
+                    e
+                );
             }
         }
     }
@@ -418,11 +433,7 @@ impl LlmProvider for LocalInferenceLlmAdapter {
         pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
     }
 
-    async fn complete(
-        &self,
-        system: &str,
-        messages: Vec<ChatMessage>,
-    ) -> Result<ChatMessage> {
+    async fn complete(&self, system: &str, messages: Vec<ChatMessage>) -> Result<ChatMessage> {
         let mut msg = self.inner.complete(system, messages).await?;
         msg.content = strip_thinking_tokens(&msg.content);
         Ok(msg)
@@ -499,8 +510,8 @@ mod tests {
         let model_id = "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M";
         let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
         let model_name = repo_id.split('/').last().unwrap();
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         assert_eq!(filename, "Llama-3.2-3B-Instruct-Q4_K_M.gguf");
     }
@@ -510,8 +521,8 @@ mod tests {
         let model_id = "bartowski/SomeModel:Q8_0";
         let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
         let model_name = repo_id.split('/').last().unwrap();
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         assert_eq!(filename, "SomeModel-Q8_0.gguf");
     }
@@ -594,9 +605,7 @@ mod tests {
         // When no ':' quantization suffix is present, rsplit_once returns None
         // and the fallback "Q4_K_M" is used.
         let model_id = "some-model-without-quant";
-        let (_repo_id, quantization) = model_id
-            .rsplit_once(':')
-            .unwrap_or((model_id, "Q4_K_M"));
+        let (_repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
         assert_eq!(quantization, "Q4_K_M");
     }
 }

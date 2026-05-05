@@ -22,7 +22,7 @@
 //! );
 //! ```
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use pond_core::ports::voice_output::VoiceOutput;
 use std::io::Write as _;
@@ -144,16 +144,19 @@ impl VoiceOutput for PiperOutput {
     }
 
     fn stop_thinking_tone(&self) {
-        self.thinking_active.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.thinking_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn stop_speaking(&self) {
-        self.speech_interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.speech_interrupted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn speak(&self, text: &str) -> Result<()> {
         // Clear interrupt flag before this utterance
-        self.speech_interrupted.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speech_interrupted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let bin = self.piper_bin.clone();
         let model = self.model.clone();
         let sample_rate = self.sample_rate;
@@ -163,8 +166,11 @@ impl VoiceOutput for PiperOutput {
 
         // Synthesize then play with interrupt support
         tokio::task::spawn_blocking(move || {
-            let wav = synthesize_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)?;
-            if wav.is_empty() { return Ok(()); }
+            let wav =
+                synthesize_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)?;
+            if wav.is_empty() {
+                return Ok(());
+            }
             play_wav_interruptible(wav, &flag)
         })
         .await
@@ -186,12 +192,17 @@ impl VoiceOutput for PiperOutput {
         .await
         .context("piper synthesize task panicked")??;
 
-        if wav.is_empty() { Ok(None) } else { Ok(Some(wav)) }
+        if wav.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(wav))
+        }
     }
 
     async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
         // Clear the interrupt flag before playback starts
-        self.speech_interrupted.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speech_interrupted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let flag = self.speech_interrupted.clone();
         tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag))
             .await
@@ -245,7 +256,7 @@ fn synthesize_blocking(
 
     let mut cmd = Command::new(piper_bin);
     cmd.args(["--model", &model.to_string_lossy()])
-       .args(["--output-raw", "--quiet"]);
+        .args(["--output-raw", "--quiet"]);
     if let Some(d) = espeak_data {
         cmd.args(["--espeak_data", &d.to_string_lossy()]);
     }
@@ -257,11 +268,18 @@ fn synthesize_blocking(
         .with_context(|| format!("Failed to spawn piper at {}", piper_bin.display()))?;
 
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("piper stdin unavailable"))?;
-        stdin.write_all(text.as_bytes()).context("Failed to write text to piper stdin")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("piper stdin unavailable"))?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("Failed to write text to piper stdin")?;
     }
 
-    let output = child.wait_with_output().context("Failed to wait for piper")?;
+    let output = child
+        .wait_with_output()
+        .context("Failed to wait for piper")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -269,7 +287,11 @@ fn synthesize_blocking(
         if stderr.is_empty() {
             return Err(anyhow!("piper exited with status {}", output.status));
         }
-        return Err(anyhow!("piper exited with status {}: {}", output.status, stderr));
+        return Err(anyhow!(
+            "piper exited with status {}: {}",
+            output.status,
+            stderr
+        ));
     }
 
     let pcm = output.stdout;
@@ -294,7 +316,7 @@ fn speak_blocking(
     // in the error message if piper exits non-zero.
     let mut cmd = Command::new(piper_bin);
     cmd.args(["--model", &model.to_string_lossy()])
-       .args(["--output-raw", "--quiet"]);
+        .args(["--output-raw", "--quiet"]);
     if let Some(d) = espeak_data {
         cmd.args(["--espeak_data", &d.to_string_lossy()]);
     }
@@ -307,7 +329,10 @@ fn speak_blocking(
 
     // Write text to stdin and close it so piper knows there is no more input.
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("piper stdin unavailable"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("piper stdin unavailable"))?;
         stdin
             .write_all(text.as_bytes())
             .context("Failed to write text to piper stdin")?;
@@ -315,7 +340,9 @@ fn speak_blocking(
     }
 
     // Read all raw PCM from stdout.
-    let output = child.wait_with_output().context("Failed to wait for piper")?;
+    let output = child
+        .wait_with_output()
+        .context("Failed to wait for piper")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -323,7 +350,11 @@ fn speak_blocking(
         if stderr.is_empty() {
             return Err(anyhow!("piper exited with status {}", output.status));
         }
-        return Err(anyhow!("piper exited with status {}: {}", output.status, stderr));
+        return Err(anyhow!(
+            "piper exited with status {}: {}",
+            output.status,
+            stderr
+        ));
     }
 
     let pcm = output.stdout;
@@ -357,8 +388,8 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     wav.extend_from_slice(b"WAVE");
     // fmt  sub-chunk
     wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());          // chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes());           // PCM format
+    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
     wav.extend_from_slice(&channels.to_le_bytes());
     wav.extend_from_slice(&sample_rate.to_le_bytes());
     wav.extend_from_slice(&byte_rate.to_le_bytes());

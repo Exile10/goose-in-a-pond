@@ -138,6 +138,11 @@ pub struct AppState {
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    /// Embedding-based domain classifier for fast tool routing (~10ms).
+    /// Initialized at startup when `embedding_provider` is available.
+    /// Falls back to keyword classifier when `None`.
+    pub embedding_classifier:
+        Option<Arc<pond_core::services::embedding_classifier::EmbeddingClassifier>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).
@@ -250,6 +255,10 @@ pub struct AppState {
     pub context_monitor: Arc<pond_core::services::context_monitor::ContextMonitor>,
     /// In-memory OAuth PKCE sessions (state nonce -> verifier + provider).
     pub oauth_state: crate::oauth_callback::OAuthState,
+    /// The port the API server is actually listening on.
+    /// Used to construct OAuth redirect URIs dynamically (the server may bind
+    /// to a port other than 4000 if that port is already in use).
+    pub api_port: u16,
 }
 
 /// State of a single in-progress (or recently completed) model download.

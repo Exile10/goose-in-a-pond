@@ -1,5 +1,8 @@
 pub mod giap_server;
 pub mod registry;
 
-pub use giap_server::{GiapMcpServer, clean_query_for_search};
-pub use registry::{init_giap_services, set_last_user_message, spawn_giap_server, try_tool_agent, try_wikipedia_lookup, GiapServiceHandles};
+pub use giap_server::{clean_query_for_search, GiapMcpServer};
+pub use registry::{
+    init_giap_services, set_last_user_message, spawn_giap_server, try_tool_agent,
+    try_wikipedia_lookup, GiapServiceHandles,
+};

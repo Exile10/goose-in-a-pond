@@ -18,9 +18,7 @@ pub trait ModelStorage: Send + Sync {
 
     /// True when `path_for(record)` exists on disk.
     fn is_present(&self, record: &ModelRecord) -> bool {
-        self.path_for(record)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.path_for(record).map(|p| p.exists()).unwrap_or(false)
     }
 
     /// On-disk path for a tool binary (e.g. `whisper-server`, `piper`).

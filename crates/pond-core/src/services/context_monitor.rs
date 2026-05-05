@@ -79,14 +79,19 @@ impl ContextMonitor {
     ///
     /// Calculates the per-turn growth delta and stores it in the rolling window.
     pub fn record_turn(&self, session_id: &str, estimated_tokens: u32, context_limit: u32) {
-        let mut sessions = self.session_contexts.lock().expect("context monitor lock poisoned");
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
 
-        let state = sessions.entry(session_id.to_string()).or_insert_with(|| ContextState {
-            estimated_tokens: 0,
-            turns: 0,
-            context_limit,
-            growth_rates: Vec::with_capacity(MAX_GROWTH_SAMPLES),
-        });
+        let state = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| ContextState {
+                estimated_tokens: 0,
+                turns: 0,
+                context_limit,
+                growth_rates: Vec::with_capacity(MAX_GROWTH_SAMPLES),
+            });
 
         // Calculate growth delta (tokens added this turn)
         let growth = estimated_tokens.saturating_sub(state.estimated_tokens);
@@ -109,7 +114,10 @@ impl ContextMonitor {
     /// and compaction/warning flags. Returns a zero-state health check if the
     /// session has no recorded turns.
     pub fn check_context_health(&self, session_id: &str) -> ContextHealth {
-        let sessions = self.session_contexts.lock().expect("context monitor lock poisoned");
+        let sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
 
         let state = match sessions.get(session_id) {
             Some(s) => s,
@@ -177,7 +185,10 @@ impl ContextMonitor {
     /// Call this after compaction resets the context window, so the monitor
     /// starts fresh with accurate measurements.
     pub fn reset_session(&self, session_id: &str) {
-        let mut sessions = self.session_contexts.lock().expect("context monitor lock poisoned");
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
         sessions.remove(session_id);
     }
 }
@@ -259,14 +270,22 @@ mod tests {
         // 2000/8192 = ~24.4% — well below 75%
         // avg growth = 400, remaining = (8192-2000)/400 = 15 turns — well above 3
         assert!(h1.utilization_pct < 75.0, "util={}", h1.utilization_pct);
-        assert!(!h1.should_compact, "should not compact at {}%", h1.utilization_pct);
+        assert!(
+            !h1.should_compact,
+            "should not compact at {}%",
+            h1.utilization_pct
+        );
 
         // Jump to above 75%
         monitor.record_turn("s1", 6200, 8192);
         let h2 = monitor.check_context_health("s1");
         // 6200/8192 = ~75.7%
         assert!(h2.utilization_pct > 75.0, "util={}", h2.utilization_pct);
-        assert!(h2.should_compact, "should compact at {}%", h2.utilization_pct);
+        assert!(
+            h2.should_compact,
+            "should compact at {}%",
+            h2.utilization_pct
+        );
     }
 
     #[test]

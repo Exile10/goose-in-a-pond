@@ -90,14 +90,18 @@ mod tests {
 
     #[test]
     fn wakeword_activation_no_audio_field_is_none() {
-        let a = WakeWordActivation { captured_audio: None };
+        let a = WakeWordActivation {
+            captured_audio: None,
+        };
         assert!(a.captured_audio.is_none());
     }
 
     #[test]
     fn wakeword_activation_with_audio_carries_bytes() {
         let wav = vec![b'R', b'I', b'F', b'F'];
-        let a = WakeWordActivation { captured_audio: Some(wav.clone()) };
+        let a = WakeWordActivation {
+            captured_audio: Some(wav.clone()),
+        };
         assert_eq!(a.captured_audio.unwrap(), wav);
     }
 

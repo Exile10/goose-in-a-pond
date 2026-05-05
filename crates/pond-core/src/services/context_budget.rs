@@ -123,7 +123,10 @@ fn truncate_at_byte_budget(content: &str, max_bytes: usize) -> String {
     content[..end].to_string()
 }
 
-fn trim_to_char_budget(messages: Vec<ChatMessage>, usable_history_chars: usize) -> Vec<ChatMessage> {
+fn trim_to_char_budget(
+    messages: Vec<ChatMessage>,
+    usable_history_chars: usize,
+) -> Vec<ChatMessage> {
     let mut kept: Vec<ChatMessage> = Vec::new();
     let mut remaining = usable_history_chars;
 
@@ -138,7 +141,10 @@ fn trim_to_char_budget(messages: Vec<ChatMessage>, usable_history_chars: usize) 
         } else if kept.is_empty() {
             // First (most recent) message exceeds budget — truncate rather than drop.
             let truncated = truncate_at_byte_budget(&msg.content, remaining);
-            kept.push(ChatMessage { content: truncated, ..msg });
+            kept.push(ChatMessage {
+                content: truncated,
+                ..msg
+            });
             break;
         } else {
             // Later messages don't fit — stop here.
@@ -186,7 +192,10 @@ pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 ///
 /// The token limit is converted to an approximate char budget via 4 chars/token,
 /// with [`RESERVE_FOR_RESPONSE_CHARS`] held back for model generation.
-pub fn trim_to_budget_with_limit(messages: Vec<ChatMessage>, context_limit_tokens: usize) -> Vec<ChatMessage> {
+pub fn trim_to_budget_with_limit(
+    messages: Vec<ChatMessage>,
+    context_limit_tokens: usize,
+) -> Vec<ChatMessage> {
     let usable_history_chars = context_limit_tokens
         .saturating_mul(CHARS_PER_TOKEN)
         .saturating_sub(RESERVE_FOR_RESPONSE_CHARS)
@@ -235,7 +244,11 @@ mod tests {
     use crate::domain::message::Role;
 
     fn msg(content: &str) -> ChatMessage {
-        ChatMessage { role: Role::User, content: content.to_string(), images: Vec::new() }
+        ChatMessage {
+            role: Role::User,
+            content: content.to_string(),
+            images: Vec::new(),
+        }
     }
 
     fn total_chars(msgs: &[ChatMessage]) -> usize {
@@ -259,8 +272,7 @@ mod tests {
     #[test]
     fn large_history_is_trimmed_to_budget() {
         // 200 messages × 200 chars each = 40_000 chars >> USABLE_HISTORY_CHARS (9_952)
-        let messages: Vec<ChatMessage> =
-            (0..200).map(|_| msg(&"x".repeat(200))).collect();
+        let messages: Vec<ChatMessage> = (0..200).map(|_| msg(&"x".repeat(200))).collect();
         let result = trim_to_budget(messages);
         assert!(total_chars(&result) <= USABLE_HISTORY_CHARS);
         // Should keep at least 1 message
@@ -270,8 +282,7 @@ mod tests {
     #[test]
     fn most_recent_messages_are_preserved() {
         // Fill budget with old junk, then add a recent message that fits
-        let mut messages: Vec<ChatMessage> =
-            (0..60).map(|_| msg(&"a".repeat(200))).collect();
+        let mut messages: Vec<ChatMessage> = (0..60).map(|_| msg(&"a".repeat(200))).collect();
         messages.push(msg("final important message"));
 
         let result = trim_to_budget(messages);
@@ -294,8 +305,18 @@ mod tests {
         let result = trim_to_budget(messages);
         // Result must be in original order (oldest first)
         for w in result.windows(2) {
-            let a: u32 = w[0].content.strip_prefix("message-").unwrap().parse().unwrap();
-            let b: u32 = w[1].content.strip_prefix("message-").unwrap().parse().unwrap();
+            let a: u32 = w[0]
+                .content
+                .strip_prefix("message-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let b: u32 = w[1]
+                .content
+                .strip_prefix("message-")
+                .unwrap()
+                .parse()
+                .unwrap();
             assert!(a < b, "messages out of order: {} >= {}", a, b);
         }
     }
@@ -321,7 +342,14 @@ mod tests {
     #[test]
     fn truncate_tool_outputs_truncates_large_assistant_payloads() {
         let messages = vec![
-            ChatMessage { role: Role::Assistant, content: format!("{{\"tool\":\"weather\",\"result\":\"{}\"}}", "x".repeat(TOOL_RESULT_MAX_CHARS + 300)), images: Vec::new() },
+            ChatMessage {
+                role: Role::Assistant,
+                content: format!(
+                    "{{\"tool\":\"weather\",\"result\":\"{}\"}}",
+                    "x".repeat(TOOL_RESULT_MAX_CHARS + 300)
+                ),
+                images: Vec::new(),
+            },
             msg("normal user message"),
         ];
 

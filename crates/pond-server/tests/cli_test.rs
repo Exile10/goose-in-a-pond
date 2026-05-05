@@ -148,7 +148,10 @@ fn prompts_reset_creates_template() {
 fn prompts_show_after_reset() {
     let tmp = TempDir::new().unwrap();
 
-    pond(&tmp).args(["prompts", "reset", "balanced"]).assert().success();
+    pond(&tmp)
+        .args(["prompts", "reset", "balanced"])
+        .assert()
+        .success();
 
     pond(&tmp)
         .args(["prompts", "show", "balanced"])
@@ -163,7 +166,10 @@ fn prompts_list_shows_seeded_template() {
 
     // Seed all four built-ins.
     for name in &["balanced", "concise", "technical", "warm"] {
-        pond(&tmp).args(["prompts", "reset", name]).assert().success();
+        pond(&tmp)
+            .args(["prompts", "reset", name])
+            .assert()
+            .success();
     }
 
     pond(&tmp)
@@ -212,8 +218,13 @@ fn skills_full_crud_cycle() {
 
     // ── Add ──────────────────────────────────────────────────────────────────
     pond(&tmp)
-        .args(["skills", "add", "morning_brief", "--content",
-               "When asked for a briefing, call giap__get_current_weather first."])
+        .args([
+            "skills",
+            "add",
+            "morning_brief",
+            "--content",
+            "When asked for a briefing, call giap__get_current_weather first.",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("morning_brief").and(predicate::str::contains("created")));
@@ -232,7 +243,10 @@ fn skills_full_crud_cycle() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let uuid = extract_first_col(&stdout, "morning_brief");
-    assert!(!uuid.is_empty(), "Expected UUID in first column, got:\n{stdout}");
+    assert!(
+        !uuid.is_empty(),
+        "Expected UUID in first column, got:\n{stdout}"
+    );
 
     // ── Toggle (disable) ─────────────────────────────────────────────────────
     pond(&tmp)
@@ -292,10 +306,12 @@ fn skills_multiple_entries_all_listed() {
 
     pond(&tmp)
         .args(["skills", "add", "skill_one", "--content", "First skill"])
-        .assert().success();
+        .assert()
+        .success();
     pond(&tmp)
         .args(["skills", "add", "skill_two", "--content", "Second skill"])
-        .assert().success();
+        .assert()
+        .success();
 
     pond(&tmp)
         .args(["skills", "list"])
@@ -327,8 +343,14 @@ fn memories_full_crud_cycle() {
         .output()
         .unwrap();
     let add_stdout = String::from_utf8_lossy(&add_out.stdout);
-    assert!(add_out.status.success(), "memories add failed: {add_stdout}");
-    assert!(add_stdout.contains("Memory saved"), "Unexpected: {add_stdout}");
+    assert!(
+        add_out.status.success(),
+        "memories add failed: {add_stdout}"
+    );
+    assert!(
+        add_stdout.contains("Memory saved"),
+        "Unexpected: {add_stdout}"
+    );
 
     // Parse UUID from "✓ Memory saved (id: <uuid>)."
     let uuid = add_stdout
@@ -373,9 +395,18 @@ fn memories_full_crud_cycle() {
 fn memories_add_multiple_and_list() {
     let tmp = TempDir::new().unwrap();
 
-    pond(&tmp).args(["memories", "add", "First memory"]).assert().success();
-    pond(&tmp).args(["memories", "add", "Second memory"]).assert().success();
-    pond(&tmp).args(["memories", "add", "Third memory"]).assert().success();
+    pond(&tmp)
+        .args(["memories", "add", "First memory"])
+        .assert()
+        .success();
+    pond(&tmp)
+        .args(["memories", "add", "Second memory"])
+        .assert()
+        .success();
+    pond(&tmp)
+        .args(["memories", "add", "Third memory"])
+        .assert()
+        .success();
 
     pond(&tmp)
         .args(["memories", "list"])
@@ -391,10 +422,11 @@ fn memories_add_multiple_and_list() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let count = stdout.lines()
-        .filter(|l| l.contains("memory"))
-        .count();
-    assert!(count <= 2, "Expected at most 2 entries with --limit 2, got {count}: {stdout}");
+    let count = stdout.lines().filter(|l| l.contains("memory")).count();
+    assert!(
+        count <= 2,
+        "Expected at most 2 entries with --limit 2, got {count}: {stdout}"
+    );
 }
 
 // ── Group 5: Recipes ──────────────────────────────────────────────────────────
@@ -415,24 +447,33 @@ fn recipes_full_crud_cycle() {
 
     // Create a minimal Goose recipe YAML file.
     let recipe_yaml = tmp.path().join("morning_brief.yaml");
-    std::fs::write(&recipe_yaml, indoc::indoc! {r#"
+    std::fs::write(
+        &recipe_yaml,
+        indoc::indoc! {r#"
         version: 1
         title: "Morning Brief"
         description: "Daily briefing automation"
         instructions: |
           Fetch the current weather and summarise it briefly.
-    "#}).unwrap();
+    "#},
+    )
+    .unwrap();
 
     // ── Import ────────────────────────────────────────────────────────────────
     pond(&tmp)
         .args([
-            "recipes", "import", "morning_brief",
+            "recipes",
+            "import",
+            "morning_brief",
             recipe_yaml.to_str().unwrap(),
-            "--description", "Daily morning briefing",
+            "--description",
+            "Daily morning briefing",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("morning_brief").and(predicate::str::contains("imported")));
+        .stdout(
+            predicate::str::contains("morning_brief").and(predicate::str::contains("imported")),
+        );
 
     // ── List shows it ─────────────────────────────────────────────────────────
     pond(&tmp)
@@ -476,7 +517,12 @@ fn recipes_show_unknown_name_exits_nonzero() {
 fn recipes_import_nonexistent_file_exits_nonzero() {
     let tmp = TempDir::new().unwrap();
     pond(&tmp)
-        .args(["recipes", "import", "bad", "/tmp/does_not_exist_pond_test.yaml"])
+        .args([
+            "recipes",
+            "import",
+            "bad",
+            "/tmp/does_not_exist_pond_test.yaml",
+        ])
         .assert()
         .failure();
 }
@@ -491,10 +537,7 @@ fn models_list_empty_catalog() {
         .assert()
         .success()
         // Either shows the header row or the "catalog empty" message
-        .stdout(
-            predicate::str::contains("Category")
-                .or(predicate::str::contains("catalog empty"))
-        );
+        .stdout(predicate::str::contains("Category").or(predicate::str::contains("catalog empty")));
 }
 
 #[test]

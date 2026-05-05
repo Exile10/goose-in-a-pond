@@ -210,7 +210,8 @@ mod tests {
         assert!(
             status.available_for_llm_mb <= LLM_BUDGET_MB,
             "available should not exceed budget: {} > {}",
-            status.available_for_llm_mb, LLM_BUDGET_MB
+            status.available_for_llm_mb,
+            LLM_BUDGET_MB
         );
     }
 

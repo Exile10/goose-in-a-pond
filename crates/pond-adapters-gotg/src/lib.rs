@@ -31,6 +31,6 @@
 //! - [ ] Define the GOTG ↔ GIAP wire protocol (JSON over HTTP)
 //! - [ ] Add mDNS/Bonjour discovery so GOTG can find the pond on LAN
 
-pub mod handshake_adapter;
 pub mod device_adapter;
+pub mod handshake_adapter;
 pub mod notification_adapter;

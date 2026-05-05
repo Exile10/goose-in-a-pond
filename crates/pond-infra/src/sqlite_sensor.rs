@@ -27,11 +27,11 @@ impl SqliteSensorStorage {
 
 #[derive(sqlx::FromRow)]
 struct SensorRow {
-    device_id:   String,
+    device_id: String,
     sensor_type: String,
-    value:       f64,
-    unit:        String,
-    created_at:  String,
+    value: f64,
+    unit: String,
+    created_at: String,
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -42,10 +42,10 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
 
 fn sensor_row_to_reading(row: SensorRow) -> SensorReading {
     SensorReading {
-        device_id:   row.device_id,
+        device_id: row.device_id,
         sensor_type: row.sensor_type,
-        value:       row.value,
-        unit:        row.unit,
+        value: row.value,
+        unit: row.unit,
         recorded_at: parse_dt(&row.created_at),
     }
 }
@@ -115,26 +115,26 @@ impl SqliteCameraStorage {
 
 #[derive(sqlx::FromRow)]
 struct CameraRow {
-    id:            i64,
-    camera_id:     String,
-    event_type:    String,
-    confidence:    Option<f64>,
+    id: i64,
+    camera_id: String,
+    event_type: String,
+    confidence: Option<f64>,
     snapshot_path: Option<String>,
-    metadata:      Option<String>,
-    acknowledged:  i64,
-    created_at:    String,
+    metadata: Option<String>,
+    acknowledged: i64,
+    created_at: String,
 }
 
 fn camera_row_to_event(row: CameraRow) -> CameraEvent {
     CameraEvent {
-        id:            Some(row.id),
-        camera_id:     row.camera_id,
-        event_type:    row.event_type,
-        confidence:    row.confidence,
+        id: Some(row.id),
+        camera_id: row.camera_id,
+        event_type: row.event_type,
+        confidence: row.confidence,
         snapshot_path: row.snapshot_path,
-        metadata:      row.metadata,
-        acknowledged:  row.acknowledged != 0,
-        created_at:    parse_dt(&row.created_at),
+        metadata: row.metadata,
+        acknowledged: row.acknowledged != 0,
+        created_at: parse_dt(&row.created_at),
     }
 }
 
@@ -194,24 +194,24 @@ mod tests {
 
     fn reading(device_id: &str, t: &str, v: f64) -> SensorReading {
         SensorReading {
-            device_id:   device_id.to_string(),
+            device_id: device_id.to_string(),
             sensor_type: t.to_string(),
-            value:       v,
-            unit:        "C".to_string(),
+            value: v,
+            unit: "C".to_string(),
             recorded_at: Utc::now(),
         }
     }
 
     fn cam_event(camera_id: &str) -> CameraEvent {
         CameraEvent {
-            id:            None,
-            camera_id:     camera_id.to_string(),
-            event_type:    "motion".to_string(),
-            confidence:    Some(0.95),
+            id: None,
+            camera_id: camera_id.to_string(),
+            event_type: "motion".to_string(),
+            confidence: Some(0.95),
             snapshot_path: None,
-            metadata:      None,
-            acknowledged:  false,
-            created_at:    Utc::now(),
+            metadata: None,
+            acknowledged: false,
+            created_at: Utc::now(),
         }
     }
 
@@ -219,8 +219,14 @@ mod tests {
     async fn sensor_record_and_get_latest() {
         let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
-        storage.record(reading("room1", "temperature", 21.0)).await.unwrap();
-        storage.record(reading("room1", "temperature", 22.5)).await.unwrap();
+        storage
+            .record(reading("room1", "temperature", 21.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("room1", "temperature", 22.5))
+            .await
+            .unwrap();
         let latest = storage.get_latest("room1", "temperature").await.unwrap();
         assert!(latest.is_some());
         assert_eq!(latest.unwrap().value, 22.5);
@@ -231,7 +237,10 @@ mod tests {
         let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
         for i in 0..5 {
-            storage.record(reading("dev1", "humidity", i as f64)).await.unwrap();
+            storage
+                .record(reading("dev1", "humidity", i as f64))
+                .await
+                .unwrap();
         }
         let recent = storage.get_recent("dev1", 3).await.unwrap();
         assert_eq!(recent.len(), 3);

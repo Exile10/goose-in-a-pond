@@ -38,6 +38,9 @@ export class SpotifyProvider implements MusicProvider {
     return t;
   }
 
+  /** GIAP server URL for OAuth refresh requests. */
+  private readonly giapUrl = process.env.GIAP_SERVER_URL || 'http://127.0.0.1:4000';
+
   private async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     const resp = await fetch(`${this.baseUrl}${path}`, {
       method,
@@ -47,6 +50,20 @@ export class SpotifyProvider implements MusicProvider {
       },
       body: body ? JSON.stringify(body) : undefined,
     });
+
+    if (resp.status === 401) {
+      // Token expired — ask GIAP to refresh and restart us with new env vars.
+      try {
+        await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: 'spotify' }),
+        });
+      } catch { /* ignore refresh errors — GIAP may be unreachable */ }
+      throw new Error(
+        'Spotify token expired. Refreshing — please try again in a moment.'
+      );
+    }
 
     if (resp.status === 204) {
       return {} as T;
@@ -139,15 +156,17 @@ export class SpotifyProvider implements MusicProvider {
       item: SpotifyTrack | null;
       is_playing: boolean;
       progress_ms: number;
+      device?: { volume_percent: number };
     }
 
     try {
-      const data = await this.api<PlayerState>('GET', '/me/player/currently-playing');
+      const data = await this.api<PlayerState>('GET', '/me/player');
       if (!data || !data.item) return null;
 
       const track = this.parseTrack(data.item);
       track.is_playing = data.is_playing;
       track.progress_ms = data.progress_ms;
+      track.volume_percent = data.device?.volume_percent;
       return track;
     } catch {
       return null;

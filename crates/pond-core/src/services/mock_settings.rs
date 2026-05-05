@@ -30,25 +30,69 @@ impl Default for MockSettingsRepository {
 /// Overlay stored string values onto a default Settings struct.
 fn build_settings(store: &HashMap<String, String>) -> Settings {
     let mut s = Settings::default();
-    if let Some(v) = store.get("assistant_name")                  { s.assistant_name = v.clone(); }
-    if let Some(v) = store.get("assistant_personality")           { s.assistant_personality = v.clone(); }
-    if let Some(v) = store.get("user_name")                      { s.user_name = v.clone(); }
-    if let Some(v) = store.get("timezone")                       { s.timezone = v.clone(); }
-    if let Some(v) = store.get("llm_max_tokens")                 { if let Ok(n) = v.parse() { s.llm_max_tokens = n; } }
-    if let Some(v) = store.get("llm_temperature")                { if let Ok(n) = v.parse() { s.llm_temperature = n; } }
-    if let Some(v) = store.get("llm_provider")                   { s.llm_provider = v.clone(); }
-    if let Some(v) = store.get("voice_wake_word")                { s.voice_wake_word = v.clone(); }
-    if let Some(v) = store.get("voice_tts_voice")                { s.voice_tts_voice = v.clone(); }
-    if let Some(v) = store.get("voice_recording_duration_secs")  { if let Ok(n) = v.parse() { s.voice_recording_duration_secs = n; } }
-    if let Some(v) = store.get("voice_whisper_url")              { s.voice_whisper_url = v.clone(); }
-    if let Some(v) = store.get("retention_event_log_days")       { if let Ok(n) = v.parse() { s.retention_event_log_days = n; } }
-    if let Some(v) = store.get("retention_sensor_days")          { if let Ok(n) = v.parse() { s.retention_sensor_days = n; } }
-    if let Some(v) = store.get("retention_session_messages_keep"){ if let Ok(n) = v.parse() { s.retention_session_messages_keep = n; } }
-    if let Some(v) = store.get("prompt_style")         { s.prompt_style = v.clone(); }
+    if let Some(v) = store.get("assistant_name") {
+        s.assistant_name = v.clone();
+    }
+    if let Some(v) = store.get("assistant_personality") {
+        s.assistant_personality = v.clone();
+    }
+    if let Some(v) = store.get("user_name") {
+        s.user_name = v.clone();
+    }
+    if let Some(v) = store.get("timezone") {
+        s.timezone = v.clone();
+    }
+    if let Some(v) = store.get("llm_max_tokens") {
+        if let Ok(n) = v.parse() {
+            s.llm_max_tokens = n;
+        }
+    }
+    if let Some(v) = store.get("llm_temperature") {
+        if let Ok(n) = v.parse() {
+            s.llm_temperature = n;
+        }
+    }
+    if let Some(v) = store.get("llm_provider") {
+        s.llm_provider = v.clone();
+    }
+    if let Some(v) = store.get("voice_wake_word") {
+        s.voice_wake_word = v.clone();
+    }
+    if let Some(v) = store.get("voice_tts_voice") {
+        s.voice_tts_voice = v.clone();
+    }
+    if let Some(v) = store.get("voice_recording_duration_secs") {
+        if let Ok(n) = v.parse() {
+            s.voice_recording_duration_secs = n;
+        }
+    }
+    if let Some(v) = store.get("voice_whisper_url") {
+        s.voice_whisper_url = v.clone();
+    }
+    if let Some(v) = store.get("retention_event_log_days") {
+        if let Ok(n) = v.parse() {
+            s.retention_event_log_days = n;
+        }
+    }
+    if let Some(v) = store.get("retention_sensor_days") {
+        if let Ok(n) = v.parse() {
+            s.retention_sensor_days = n;
+        }
+    }
+    if let Some(v) = store.get("retention_session_messages_keep") {
+        if let Ok(n) = v.parse() {
+            s.retention_session_messages_keep = n;
+        }
+    }
+    if let Some(v) = store.get("prompt_style") {
+        s.prompt_style = v.clone();
+    }
     if let Some(v) = store.get("custom_system_prompt") {
         s.custom_system_prompt = if v.is_empty() { None } else { Some(v.clone()) };
     }
-    if let Some(v) = store.get("prompt_addendum")      { s.prompt_addendum = v.clone(); }
+    if let Some(v) = store.get("prompt_addendum") {
+        s.prompt_addendum = v.clone();
+    }
     s
 }
 
@@ -61,23 +105,51 @@ impl SettingsRepository for MockSettingsRepository {
 
     async fn update(&self, settings: &Settings) -> Result<()> {
         let mut store = self.store.write().await;
-        store.insert("assistant_name".into(),                  settings.assistant_name.clone());
-        store.insert("assistant_personality".into(),           settings.assistant_personality.clone());
-        store.insert("user_name".into(),                       settings.user_name.clone());
-        store.insert("timezone".into(),                        settings.timezone.clone());
-        store.insert("llm_max_tokens".into(),                  settings.llm_max_tokens.to_string());
-        store.insert("llm_temperature".into(),                 settings.llm_temperature.to_string());
-        store.insert("llm_provider".into(),                    settings.llm_provider.clone());
-        store.insert("voice_wake_word".into(),                 settings.voice_wake_word.clone());
-        store.insert("voice_tts_voice".into(),                 settings.voice_tts_voice.clone());
-        store.insert("voice_recording_duration_secs".into(),   settings.voice_recording_duration_secs.to_string());
-        store.insert("voice_whisper_url".into(),               settings.voice_whisper_url.clone());
-        store.insert("retention_event_log_days".into(),        settings.retention_event_log_days.to_string());
-        store.insert("retention_sensor_days".into(),           settings.retention_sensor_days.to_string());
-        store.insert("retention_session_messages_keep".into(), settings.retention_session_messages_keep.to_string());
-        store.insert("prompt_style".into(),         settings.prompt_style.clone());
-        store.insert("custom_system_prompt".into(), settings.custom_system_prompt.as_deref().unwrap_or("").to_string());
-        store.insert("prompt_addendum".into(),      settings.prompt_addendum.clone());
+        store.insert("assistant_name".into(), settings.assistant_name.clone());
+        store.insert(
+            "assistant_personality".into(),
+            settings.assistant_personality.clone(),
+        );
+        store.insert("user_name".into(), settings.user_name.clone());
+        store.insert("timezone".into(), settings.timezone.clone());
+        store.insert("llm_max_tokens".into(), settings.llm_max_tokens.to_string());
+        store.insert(
+            "llm_temperature".into(),
+            settings.llm_temperature.to_string(),
+        );
+        store.insert("llm_provider".into(), settings.llm_provider.clone());
+        store.insert("voice_wake_word".into(), settings.voice_wake_word.clone());
+        store.insert("voice_tts_voice".into(), settings.voice_tts_voice.clone());
+        store.insert(
+            "voice_recording_duration_secs".into(),
+            settings.voice_recording_duration_secs.to_string(),
+        );
+        store.insert(
+            "voice_whisper_url".into(),
+            settings.voice_whisper_url.clone(),
+        );
+        store.insert(
+            "retention_event_log_days".into(),
+            settings.retention_event_log_days.to_string(),
+        );
+        store.insert(
+            "retention_sensor_days".into(),
+            settings.retention_sensor_days.to_string(),
+        );
+        store.insert(
+            "retention_session_messages_keep".into(),
+            settings.retention_session_messages_keep.to_string(),
+        );
+        store.insert("prompt_style".into(), settings.prompt_style.clone());
+        store.insert(
+            "custom_system_prompt".into(),
+            settings
+                .custom_system_prompt
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+        );
+        store.insert("prompt_addendum".into(), settings.prompt_addendum.clone());
         Ok(())
     }
 
@@ -121,7 +193,9 @@ mod tests {
     async fn get_key_and_set_key() {
         let repo = MockSettingsRepository::new();
         assert!(repo.get_key("assistant_name").await.unwrap().is_none());
-        repo.set_key("assistant_name", "Pond".to_string()).await.unwrap();
+        repo.set_key("assistant_name", "Pond".to_string())
+            .await
+            .unwrap();
         assert_eq!(
             repo.get_key("assistant_name").await.unwrap(),
             Some("Pond".to_string())
@@ -131,7 +205,9 @@ mod tests {
     #[tokio::test]
     async fn set_key_reflected_in_get() {
         let repo = MockSettingsRepository::new();
-        repo.set_key("user_name", "Jerry".to_string()).await.unwrap();
+        repo.set_key("user_name", "Jerry".to_string())
+            .await
+            .unwrap();
         let s = repo.get().await.unwrap();
         assert_eq!(s.user_name, "Jerry");
     }

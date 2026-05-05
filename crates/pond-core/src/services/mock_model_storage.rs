@@ -48,11 +48,13 @@ impl ModelStorage for MockModelStorage {
             }
             Self::FileSystemBacked { base } => {
                 let subdir = match record.category {
-                    ModelCategory::Whisper   => "models",
+                    ModelCategory::Whisper => "models",
                     ModelCategory::Llamafile => "models/llm",
-                    ModelCategory::Gguf      => "models/gguf",
-                    ModelCategory::TtsPiper  => "models/tts",
-                    ModelCategory::Ollama | ModelCategory::TtsHttp => return None,
+                    ModelCategory::Gguf => "models/gguf",
+                    ModelCategory::TtsPiper => "models/tts",
+                    ModelCategory::Ollama | ModelCategory::TtsHttp | ModelCategory::Embedding => {
+                        return None
+                    }
                 };
                 Some(base.join(subdir).join(filename))
             }
@@ -62,7 +64,7 @@ impl ModelStorage for MockModelStorage {
     fn is_present(&self, record: &ModelRecord) -> bool {
         match self {
             Self::AlwaysPresent => true,
-            Self::NeverPresent  => false,
+            Self::NeverPresent => false,
             Self::FileSystemBacked { .. } => {
                 self.path_for(record).map(|p| p.exists()).unwrap_or(false)
             }
@@ -87,28 +89,28 @@ mod tests {
 
     fn gguf_record(name: &str) -> ModelRecord {
         ModelRecord {
-            id:               format!("gguf/{name}"),
-            category:         ModelCategory::Gguf,
-            name:             name.to_string(),
-            filename:         Some(format!("{name}.gguf")),
-            description:      "test".to_string(),
-            size_mb:          0,
-            url:              None,
-            hf_id:            None,
-            ram_estimate_mb:  None,
+            id: format!("gguf/{name}"),
+            category: ModelCategory::Gguf,
+            name: name.to_string(),
+            filename: Some(format!("{name}.gguf")),
+            description: "test".to_string(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
             recommended_role: None,
-            context_length:   None,
-            quantization:     None,
-            asr_language:     None,
-            asr_size:         None,
-            tts_engine:       None,
-            tts_voice_name:   None,
-            config_filename:  None,
-            config_url:       None,
-            tts_url:          None,
-            sample_rate:      None,
-            downloaded:       false,
-            is_custom:        false,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
         }
     }
 
@@ -127,7 +129,9 @@ mod tests {
     #[test]
     fn file_system_backed_checks_disk() {
         let tmp = tempdir().unwrap();
-        let storage = MockModelStorage::FileSystemBacked { base: tmp.path().to_path_buf() };
+        let storage = MockModelStorage::FileSystemBacked {
+            base: tmp.path().to_path_buf(),
+        };
 
         let record = gguf_record("llama3");
         assert!(!storage.is_present(&record), "file not yet created");

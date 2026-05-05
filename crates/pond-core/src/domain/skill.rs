@@ -30,7 +30,8 @@ impl UserSkill {
         if self.content.len() > Self::MAX_CONTENT_LEN {
             return Err(format!(
                 "Skill content exceeds {} bytes (got {})",
-                Self::MAX_CONTENT_LEN, self.content.len()
+                Self::MAX_CONTENT_LEN,
+                self.content.len()
             ));
         }
         Ok(())

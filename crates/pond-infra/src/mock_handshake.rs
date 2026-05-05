@@ -28,7 +28,10 @@ impl MockHandshake {
 
     /// Revoke a token for testing
     pub async fn revoke_token_for_testing(&self, token: &str) {
-        self.valid_tokens.write().await.insert(token.to_string(), false);
+        self.valid_tokens
+            .write()
+            .await
+            .insert(token.to_string(), false);
     }
 }
 

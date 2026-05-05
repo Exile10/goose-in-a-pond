@@ -614,6 +614,10 @@ async fn run_setup(model: &str) -> Result<()> {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
 
+    // Step 6: ONNX Runtime — detect or auto-download
+    println!("\n  [6/7] Checking ONNX Runtime...");
+    ensure_onnx_runtime();
+
     // Step 7 (face-onnx feature only): face recognition models
     #[cfg(feature = "face-onnx")]
     {
@@ -778,10 +782,15 @@ async fn run_server(
     );
     println!("  ╚═══════════════════════════════════════╝");
 
+    // Ensure the ONNX Runtime shared library is available — check system
+    // paths first, then auto-download from GitHub Releases if needed.
+    // Must run before any ONNX-dependent init (face recognition, embeddings).
+    ensure_onnx_runtime();
+
     // Bake in the face-recognition runtime defaults so the server Just Works
-    // on a fresh macOS install without the operator having to remember a
-    // four-line env-var incantation.  Every var stays overridable — we only
-    // set it when it is currently *unset*.
+    // on a fresh install without the operator having to remember a four-line
+    // env-var incantation.  Every var stays overridable — we only set it
+    // when it is currently *unset*.
     apply_face_recognition_defaults();
 
     // Initialize databases
@@ -1616,6 +1625,66 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
+    // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
+    let embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    > = {
+        use pond_core::ports::embedding::EmbeddingProvider as _;
+        if settings.embedding_provider == "none" {
+            tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
+            None
+        } else {
+            let emb_model = if settings.active_embedding_model.is_empty() {
+                "all-MiniLM-L6-v2"
+            } else {
+                &settings.active_embedding_model
+            };
+            let cache_dir = data_dir.join("models").join("embedding");
+            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                emb_model,
+                Some(cache_dir),
+            ) {
+                Ok(provider) => {
+                    tracing::info!(
+                        model = provider.model_name(),
+                        dims = provider.dimensions(),
+                        "embedding provider ready"
+                    );
+                    Some(Arc::new(provider)
+                        as Arc<
+                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
+                        >)
+                }
+                Err(e) => {
+                    tracing::warn!("embedding provider failed to init: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+
+    // ── Embedding-based domain classifier ─────────────────────────────────────
+    // Pre-compute domain description embeddings for fast cosine-similarity
+    // classification (~10ms per query vs ~2s for LLM classification).
+    let embedding_classifier = if let Some(ref emb) = embedding_provider {
+        match pond_core::services::embedding_classifier::EmbeddingClassifier::new(emb.as_ref())
+            .await
+        {
+            Ok(c) => {
+                tracing::info!("embedding classifier ready — semantic domain routing enabled");
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "embedding classifier init failed: {e} — falling back to keyword routing"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1636,7 +1705,8 @@ async fn run_server(
         profile_repo,
         device_registry,
         memory_repo,
-        embedding_provider: None,
+        embedding_provider,
+        embedding_classifier,
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -1686,6 +1756,88 @@ async fn run_server(
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port,
     });
+
+    // Spawn OAuth token auto-refresh worker.
+    // Proactively refreshes tokens every 45 minutes so extensions don't hit
+    // 401 errors mid-conversation. This worker only updates the secret store;
+    // it does NOT restart extensions (avoids disrupting active tool calls).
+    // Extensions get restarted on the next 401 retry or server restart.
+    {
+        let refresh_secret_repo = state.secret_repo.clone();
+        let refresh_http_client = reqwest::Client::new();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
+            interval.tick().await; // skip the initial immediate tick
+            loop {
+                interval.tick().await;
+                let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+                for provider in &providers {
+                    let Some(repo) = &refresh_secret_repo else {
+                        continue;
+                    };
+
+                    // Only refresh if we have a refresh token stored
+                    let has_refresh = repo.has(&provider.refresh_key).await.unwrap_or(false);
+                    if !has_refresh {
+                        continue;
+                    }
+
+                    let refresh_token = match repo.get(&provider.refresh_key).await {
+                        Ok(Some(t)) => t,
+                        _ => continue,
+                    };
+
+                    let client_id = repo
+                        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| provider.bundled_client_id.clone());
+
+                    match refresh_http_client
+                        .post(&provider.token_url)
+                        .form(&[
+                            ("grant_type", "refresh_token"),
+                            ("refresh_token", refresh_token.as_str()),
+                            ("client_id", client_id.as_str()),
+                        ])
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(at) = body["access_token"].as_str() {
+                                    let _ = repo.set(&provider.token_key, at).await;
+                                }
+                                if let Some(rt) = body["refresh_token"].as_str() {
+                                    let _ = repo.set(&provider.refresh_key, rt).await;
+                                }
+                                tracing::info!(
+                                    provider = %provider.id,
+                                    "auto-refreshed OAuth token"
+                                );
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                status = %resp.status(),
+                                "OAuth auto-refresh failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                error = %e,
+                                "OAuth auto-refresh error"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
+    }
 
     // Warn if static assets haven't been built yet
     if !static_dir.exists() {
@@ -2476,6 +2628,8 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 
         let tool = if text.contains("weather") {
             "weather"
+        } else if text.contains("time") || text.contains("date") || text.contains("clock") {
+            "time"
         } else if text.contains("save_memory") {
             "save_memory"
         } else if text.contains("recall_memory") {
@@ -2491,6 +2645,22 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
         };
 
         println!("[tool-agent] tool={}, executing...", tool);
+
+        // ── Time/date — instant, no network call ─────────────────────────
+        if matches!(tool, "time" | "date" | "clock") {
+            let now = chrono::Local::now();
+            let result = format!(
+                "Current time: {}. Today is {}.",
+                now.format("%H:%M:%S %p"),
+                now.format("%A, %B %d, %Y")
+            );
+            return Ok(Some(pond_api::tool_context::format_tool_context(
+                "time",
+                "current time",
+                message,
+                &result,
+            )));
+        }
 
         // Extract the cleaned query for tool attribution (e.g. "John Cena" from "who is John Cena?")
         let query = pond_mcp_server::clean_query_for_search(message);
@@ -2957,20 +3127,259 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
-/// Populate the face-recognition env vars with values that are known to
-/// work end-to-end on a fresh macOS dev install, so the operator no longer
-/// has to remember:
+// ── ONNX Runtime version pinned for auto-download ────────────────────────────
+//
+// v1.21.0 is the latest release with pre-built tarballs for all four
+// platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
+// Bump this when upgrading — the archive layout is stable across releases.
+const ORT_VERSION: &str = "1.22.0";
+
+/// Approximate size of the platform library in MB (for the progress message).
+const ORT_APPROX_SIZE_MB: u64 = 30;
+
+/// Ensure that `ORT_DYLIB_PATH` points at a usable ONNX Runtime shared
+/// library.  Resolution order:
 ///
-/// ```bash
-/// ORT_DYLIB_PATH=… POND_FACE_ANTISPOOF_PATH=… \
-/// POND_FACE_ANTISPOOF_LIVE_INDEX=2 \
-/// POND_FACE_ANTISPOOF_PIXEL_SCALE=unit \
-/// cargo run … serve
+///   1. Explicit env var — operator knows best; skip everything.
+///   2. Well-known system paths (Homebrew, system `/usr/lib`).
+///   3. Previously-downloaded local copy in `$DATA_DIR/lib/`.
+///   4. Auto-download from GitHub Releases into `$DATA_DIR/lib/`.
+///
+/// Runs synchronously before tokio starts, so it shells out to `curl`+`tar`
+/// instead of using async I/O.  Failures are non-fatal — the server starts
+/// without ONNX-dependent features (face recognition, embeddings).
+fn ensure_onnx_runtime() {
+    // ── 1. Explicit env var ──────────────────────────────────────────────
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+
+    // ── 2. Well-known system locations ───────────────────────────────────
+    let system_candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/lib/libonnxruntime.dylib",
+            "/usr/local/lib/libonnxruntime.dylib",
+        ]
+    } else {
+        &[
+            "/usr/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            "/usr/lib/aarch64-linux-gnu/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+        ]
+    };
+
+    for p in system_candidates {
+        if std::path::Path::new(p).exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+            return;
+        }
+    }
+
+    // ── 3. Previously-downloaded local copy ──────────────────────────────
+    let data_dir = default_data_dir();
+    let (lib_name, versioned_name) = ort_lib_names();
+    let lib_dir = data_dir.join("lib");
+    let local_versioned = lib_dir.join(versioned_name);
+    let local_unversioned = lib_dir.join(lib_name);
+
+    // Prefer the versioned file (it is the real binary); fall back to the
+    // unversioned name in case someone placed it there manually.
+    for candidate in [&local_versioned, &local_unversioned] {
+        if candidate.exists() {
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", candidate) };
+            return;
+        }
+    }
+
+    // ── 4. Auto-download ─────────────────────────────────────────────────
+    let (os_tag, arch_tag) = match ort_platform_tags() {
+        Some(tags) => tags,
+        None => {
+            eprintln!(
+                "  ⚠  ONNX Runtime auto-download: unsupported platform \
+                 (not macOS/Linux, or unsupported arch)"
+            );
+            return;
+        }
+    };
+
+    let archive_stem = format!("onnxruntime-{os_tag}-{arch_tag}-{ORT_VERSION}");
+    let url = format!(
+        "https://github.com/microsoft/onnxruntime/releases/download/\
+         v{ORT_VERSION}/{archive_stem}.tgz"
+    );
+
+    println!(
+        "  ⬇  ONNX Runtime v{ORT_VERSION} not found — downloading (~{ORT_APPROX_SIZE_MB} MB)..."
+    );
+
+    match download_and_extract_ort(&url, &lib_dir, &archive_stem) {
+        Ok(lib_path) => {
+            println!("  ✅ ONNX Runtime installed to {}", lib_path.display());
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib_path) };
+        }
+        Err(e) => {
+            eprintln!("  ⚠  Failed to download ONNX Runtime: {e}");
+            eprintln!("     Embedding models and face recognition will be unavailable.");
+            eprintln!("     Install manually: brew install onnxruntime");
+        }
+    }
+}
+
+/// Returns `(lib_name, versioned_name)` for the current platform.
+///
+/// - macOS: `("libonnxruntime.dylib", "libonnxruntime.{ver}.dylib")`
+/// - Linux: `("libonnxruntime.so",    "libonnxruntime.so.{ver}")`
+fn ort_lib_names() -> (&'static str, String) {
+    if cfg!(target_os = "macos") {
+        (
+            "libonnxruntime.dylib",
+            format!("libonnxruntime.{ORT_VERSION}.dylib"),
+        )
+    } else {
+        (
+            "libonnxruntime.so",
+            format!("libonnxruntime.so.{ORT_VERSION}"),
+        )
+    }
+}
+
+/// Returns `(os_tag, arch_tag)` matching the GitHub release archive naming
+/// convention, e.g. `("osx", "arm64")` or `("linux", "x64")`.
+fn ort_platform_tags() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "osx"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return None;
+    };
+
+    let arch = if cfg!(target_arch = "aarch64") {
+        if cfg!(target_os = "macos") {
+            "arm64"
+        } else {
+            "aarch64"
+        }
+    } else if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "macos") {
+            "x86_64"
+        } else {
+            "x64"
+        }
+    } else {
+        return None;
+    };
+
+    Some((os, arch))
+}
+
+/// Download an ONNX Runtime release tarball and extract the shared library
+/// into `lib_dir`.  Uses `curl` + `tar` which are available on both macOS
+/// and Linux without pulling in extra Rust dependencies.
+///
+/// Archive layout (stable across ORT releases):
+/// ```text
+/// onnxruntime-{os}-{arch}-{ver}/
+///   lib/
+///     libonnxruntime.{ver}.dylib   ← real file  (macOS)
+///     libonnxruntime.dylib         ← symlink     (macOS)
+///     libonnxruntime.so.{ver}      ← real file  (Linux)
+///     libonnxruntime.so.1          ← symlink     (Linux)
+///     libonnxruntime.so            ← symlink     (Linux)
 /// ```
 ///
+/// We extract only the `lib/` subtree with `--strip-components=1`, which
+/// places the files directly into `lib_dir/lib/…` → we then just point at
+/// the versioned file.
+fn download_and_extract_ort(
+    url: &str,
+    lib_dir: &std::path::Path,
+    archive_stem: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::process::Command;
+
+    // Ensure the target directory exists.
+    std::fs::create_dir_all(lib_dir)?;
+
+    let tmp_dir = std::env::temp_dir().join("giap-ort-download");
+    // Clean up any leftover from a previous failed attempt.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let tgz = tmp_dir.join("ort.tgz");
+
+    // ── Download ─────────────────────────────────────────────────────────
+    let status = Command::new("curl")
+        .args([
+            "-fSL",           // fail on HTTP errors, show errors, follow redirects
+            "--progress-bar", // minimal progress indicator
+            url,
+            "-o",
+        ])
+        .arg(&tgz)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run curl: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("curl exited with status {status} for {url}");
+    }
+
+    // ── Extract lib/ subtree directly into lib_dir ───────────────────────
+    // `--strip-components=1` removes the top-level `onnxruntime-{os}-…/`
+    // prefix, so `lib/libonnxruntime.*` lands at `{lib_dir}/lib/…`.
+    //
+    // We use `--include` (GNU tar) / `--include` (bsdtar, macOS default) to
+    // extract only the library files, skipping headers and pkgconfig.
+    let status = Command::new("tar")
+        .args(["xzf"])
+        .arg(&tgz)
+        .args(["-C"])
+        .arg(&tmp_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("tar extraction failed with status {status}");
+    }
+
+    // ── Copy the library files into lib_dir ──────────────────────────────
+    let extracted_lib_dir = tmp_dir.join(archive_stem).join("lib");
+    let (_, versioned_name) = ort_lib_names();
+
+    let src = extracted_lib_dir.join(&versioned_name);
+    if !src.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "{versioned_name} not found in extracted archive at {}",
+            extracted_lib_dir.display()
+        );
+    }
+
+    let dest = lib_dir.join(&versioned_name);
+    std::fs::copy(&src, &dest).map_err(|e| {
+        anyhow::anyhow!("failed to copy {} → {}: {e}", src.display(), dest.display())
+    })?;
+
+    // Clean up the temp directory.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    Ok(dest)
+}
+
+/// Populate the face-recognition-specific env vars with values that are
+/// known to work end-to-end on a fresh install.
+///
+/// **Does not touch `ORT_DYLIB_PATH`** — that is handled by
+/// `ensure_onnx_runtime()`, which must run first.
+///
 /// Each var is only set when currently **unset** — explicit values from
-/// the operator's shell keep taking precedence, so nothing a power user
-/// has configured gets clobbered.
+/// the operator's shell keep taking precedence.
 ///
 /// The anti-spoof tuning (`LIVE_INDEX=2`, `PIXEL_SCALE=unit`) reflects the
 /// specific 3-class Silent-Face ONNX file we shipped install instructions
@@ -2978,22 +3387,6 @@ async fn run_status() -> Result<()> {
 /// expects `[0, 1]` pixels.  Other exports need different values; override
 /// at the shell if you swap the model file.
 fn apply_face_recognition_defaults() {
-    // ONNX Runtime dylib — Homebrew installs to /opt/homebrew on Apple
-    // Silicon and /usr/local on Intel.  Try both.
-    let ort_candidates = [
-        "/opt/homebrew/lib/libonnxruntime.dylib",
-        "/usr/local/lib/libonnxruntime.dylib",
-    ];
-    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-        for p in ort_candidates {
-            if std::path::Path::new(p).exists() {
-                // SAFETY: single-threaded setup, before any worker spawns.
-                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
-                break;
-            }
-        }
-    }
-
     // Anti-spoof ONNX model — default to the canonical location under the
     // platform data dir so users who followed the README land here too.
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
@@ -3929,6 +4322,11 @@ async fn sync_assignments_to_settings(
                     .set_key("task_model", model_name.to_string())
                     .await;
             }
+            "tool" => {
+                let _ = settings_repo
+                    .set_key("tool_model", model_name.to_string())
+                    .await;
+            }
             "asr" => {
                 let _ = settings_repo
                     .set_key("active_whisper_model", model_name.to_string())
@@ -3946,6 +4344,11 @@ async fn sync_assignments_to_settings(
                         }
                     }
                 }
+            }
+            "embedding" => {
+                let _ = settings_repo
+                    .set_key("active_embedding_model", model_name.to_string())
+                    .await;
             }
             other => {
                 tracing::debug!("sync_assignments_to_settings: unknown role '{other}', skipping");
@@ -3981,7 +4384,7 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 match ModelCategory::from_str(cat_str) {
                     Some(cat) => repo.list_by_category(&cat).await?,
                     None => {
-                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama");
+                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama, embedding");
                         std::process::exit(1);
                     }
                 }
@@ -4322,6 +4725,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 model_role,
                 images: Vec::new(),
                 voice_mode: false,
+                domain: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -4381,6 +4785,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     model_role,
                     images: Vec::new(),
                     voice_mode: false,
+                    domain: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -4955,10 +5360,95 @@ mod tests {
 
         sync_assignments_to_settings(&repo, &settings_repo).await;
 
-        let settings = settings_repo.get().await.unwrap();
-        assert_eq!(settings.think_provider.as_deref(), Some("ollama"));
-        assert_eq!(settings.think_model.as_deref(), Some("gemma2"));
-        assert_eq!(settings.task_provider.as_deref(), Some("ollama"));
-        assert_eq!(settings.task_model.as_deref(), Some("gemma2"));
+        // think_provider/think_model and task_provider/task_model are KV-only
+        // (not first-class fields on Settings), so read via get_key().
+        assert_eq!(
+            settings_repo
+                .get_key("think_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("think_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_tool_assignment_updates_settings() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id: "ollama/gemma3:4b".to_string(),
+            category: ModelCategory::Ollama,
+            name: "gemma3:4b".to_string(),
+            filename: None,
+            description: String::new(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("tool", "ollama/gemma3:4b")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        assert_eq!(
+            settings_repo
+                .get_key("tool_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma3:4b"),
+            "tool_model should be synced from tool role assignment"
+        );
     }
 }

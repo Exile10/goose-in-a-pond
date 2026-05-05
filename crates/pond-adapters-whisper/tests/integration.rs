@@ -19,9 +19,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Load the jfk.wav fixture from the workspace-level tests/blobs/ directory.
 fn load_jfk_wav() -> Vec<u8> {
-    let wav_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/blobs/jfk.wav");
-    std::fs::read(&wav_path).expect("tests/blobs/jfk.wav not found — run `cargo test` from workspace root")
+    let wav_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");
+    std::fs::read(&wav_path)
+        .expect("tests/blobs/jfk.wav not found — run `cargo test` from workspace root")
 }
 
 // ── Core response parsing ─────────────────────────────────────────────────────
@@ -54,9 +55,7 @@ async fn transcribe_wav_returns_none_for_empty_text() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/inference"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "" })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "" })))
         .mount(&server)
         .await;
 
@@ -78,7 +77,10 @@ async fn transcribe_wav_returns_none_for_whitespace_only_text() {
 
     let whisper = WhisperInput::new(Some(&server.uri()));
     let result = whisper.transcribe_wav(load_jfk_wav()).await.unwrap();
-    assert!(result.is_none(), "expected None for whitespace-only transcript");
+    assert!(
+        result.is_none(),
+        "expected None for whitespace-only transcript"
+    );
 }
 
 // ── Error handling ────────────────────────────────────────────────────────────
@@ -96,7 +98,11 @@ async fn transcribe_wav_errors_on_server_500() {
     let result = whisper.transcribe_wav(load_jfk_wav()).await;
     assert!(result.is_err(), "expected Err on HTTP 500");
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("500"), "error message should mention status: {}", msg);
+    assert!(
+        msg.contains("500"),
+        "error message should mention status: {}",
+        msg
+    );
 }
 
 #[tokio::test]
@@ -119,9 +125,7 @@ async fn transcribe_wav_posts_to_correct_path() {
     // Only mount on the exact path — any deviation returns 404
     Mock::given(method("POST"))
         .and(path("/inference"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "ok" })))
         .expect(1)
         .mount(&server)
         .await;
@@ -163,7 +167,10 @@ use pond_core::ports::wake_word::WakeWordDetector;
 fn wake_word_detector_prompt_mentions_goose() {
     let detector = WhisperKeywordDetector::new(None, "goose");
     assert!(
-        detector.activation_prompt().to_lowercase().contains("goose"),
+        detector
+            .activation_prompt()
+            .to_lowercase()
+            .contains("goose"),
         "expected 'goose' in prompt: {}",
         detector.activation_prompt()
     );
@@ -174,8 +181,7 @@ fn wake_word_detector_prompt_mentions_goose() {
 #[test]
 fn wake_word_detector_is_wake_word_detector_trait_object() {
     use std::sync::Arc;
-    let _: Arc<dyn WakeWordDetector> =
-        Arc::new(WhisperKeywordDetector::new(None, "goose"));
+    let _: Arc<dyn WakeWordDetector> = Arc::new(WhisperKeywordDetector::new(None, "goose"));
 }
 
 /// Run with: `cargo test -p pond-adapters-whisper -- --ignored live_wake_word`
