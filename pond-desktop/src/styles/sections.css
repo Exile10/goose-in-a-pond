@@ -2841,6 +2841,74 @@
 .tool-call--running { border-color: var(--purple-500); background: rgba(140,75,255,0.06); }
 .tool-call__status { color: var(--grey-500); font-size: 10.5px; margin-left: 2px; }
 
+/* ─── Tool call chips — chat bubble inline indicators ─── */
+.tool-call-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 6px;
+}
+
+/* Chip variant: interactive, shows expand chevron */
+.tool-call--chip {
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease, border-color 120ms ease;
+  /* Override the inline-flex from .tool-call so the expanded result
+     can stretch full-width below the chip row */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: 100%;
+}
+.tool-call--chip > *:not(.tool-call-result) {
+  /* Keep the icon + name + chevron on one row */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Re-establish top-row layout for chip children */
+.tool-call--chip {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.tool-call--chip.tool-call--expanded {
+  flex-direction: column;
+  align-items: flex-start;
+}
+.tool-call--chip .tool-call__name {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.tool-call--chip:hover {
+  background: var(--grey-100);
+  border-color: var(--grey-400);
+}
+.tool-call--chip:focus-visible {
+  outline: 2px solid var(--fg-brand);
+  outline-offset: 1px;
+}
+
+/* Expanded result panel */
+.tool-call-result {
+  margin-top: 6px;
+  padding: 7px 10px;
+  background: var(--grey-50);
+  border-radius: 6px;
+  border: 1px solid var(--grey-200);
+  font-size: 11.5px;
+  font-family: var(--font-body);
+  color: var(--grey-700);
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  width: 100%;
+  box-sizing: border-box;
+}
+
 /* ─── HeroUI compound Tabs overrides ─── */
 [role="tablist"] {
   display: flex; gap: 2px;
