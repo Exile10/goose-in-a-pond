@@ -218,7 +218,9 @@ export interface ChatEvent {
   type: ChatEventType;
   content?: string;         // for "text" events
   token?: string;           // legacy backend alias for content
-  tool?: string;            // for "tool_call" events
+  tool?: string;            // for "tool_call" and "tool_result" events
+  id?: string;              // tool call ID — for matching tool_call to tool_result
+  input?: unknown;          // for "tool_call" events — model's tool call arguments
   result?: unknown;         // for "tool_call" events
   error?: string;           // for "error" events
   done?: boolean;

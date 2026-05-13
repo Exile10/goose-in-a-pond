@@ -231,6 +231,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Maximum seconds for an entire agent turn (stream start to done).
+    /// When exceeded, the stream emits a timeout error and stops.
+    /// Default: 300 (5 minutes). Set to 0 to disable.
+    #[serde(default = "Settings::default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+
     /// When true, the system prompt is partitioned into a stable static prefix
     /// and a dynamic suffix. The static prefix is only rebuilt when settings,
     /// capabilities, or device state change — allowing local inference providers
@@ -368,6 +374,33 @@ pub struct Settings {
     /// and the response is revised with the tool data.
     #[serde(default = "Settings::default_tool_request_detection")]
     pub tool_request_detection: bool,
+
+    // ── Extension toggles ───────────────────────────────────────────────
+    // Controls which builtin MCP tool modules are registered at startup.
+    // External extensions are managed separately via the MCP server repository.
+    /// Enable the memory tools module (recall, save, forget).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_memory_enabled: bool,
+
+    /// Enable the scheduling tools module (create, delete, pause, resume, list, run_now, get_runs).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_schedule_enabled: bool,
+
+    /// Enable the weather tool module.
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_weather_enabled: bool,
+
+    /// Enable the knowledge tools module (Wikipedia search, article fetch).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_knowledge_enabled: bool,
+
+    /// Enable the system tools module (shell, files, system info, notifications).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_system_enabled: bool,
+
+    /// Enable the device/profile tools module (devices, profile, model config).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_device_enabled: bool,
 }
 
 impl Default for Settings {
@@ -417,6 +450,7 @@ impl Default for Settings {
             context_window_override: 0,
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
+            agent_timeout_secs: Self::default_agent_timeout_secs(),
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
             agent_memory_inject: Self::default_agent_memory_inject(),
             agent_memory_limit: Self::default_agent_memory_limit(),
@@ -445,6 +479,12 @@ impl Default for Settings {
             multi_tool_enabled: false,
             tool_call_validation: Self::default_tool_call_validation(),
             tool_request_detection: Self::default_tool_request_detection(),
+            ext_memory_enabled: true,
+            ext_schedule_enabled: true,
+            ext_weather_enabled: true,
+            ext_knowledge_enabled: true,
+            ext_system_enabled: true,
+            ext_device_enabled: true,
         }
     }
 }
@@ -557,6 +597,9 @@ impl Settings {
     fn default_agent_max_turns() -> u32 {
         20
     }
+    fn default_agent_timeout_secs() -> u64 {
+        300
+    }
     fn default_prefix_cache_prompt() -> bool {
         true
     }
@@ -627,6 +670,9 @@ impl Settings {
         true
     }
     fn default_tool_request_detection() -> bool {
+        true
+    }
+    fn default_ext_enabled() -> bool {
         true
     }
 }
@@ -705,5 +751,29 @@ mod tests {
         assert!(!s.tool_call_validation);
         // Other fields keep defaults
         assert!(s.memory_extraction_enabled);
+    }
+
+    #[test]
+    fn extension_toggles_default_to_true() {
+        let s = Settings::default();
+        assert!(s.ext_memory_enabled);
+        assert!(s.ext_schedule_enabled);
+        assert!(s.ext_weather_enabled);
+        assert!(s.ext_knowledge_enabled);
+        assert!(s.ext_system_enabled);
+        assert!(s.ext_device_enabled);
+    }
+
+    #[test]
+    fn extension_toggles_deserialize_from_partial_json() {
+        let json = r#"{"ext_memory_enabled": false, "ext_weather_enabled": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.ext_memory_enabled);
+        assert!(!s.ext_weather_enabled);
+        // Non-specified fields keep defaults
+        assert!(s.ext_schedule_enabled);
+        assert!(s.ext_knowledge_enabled);
+        assert!(s.ext_system_enabled);
+        assert!(s.ext_device_enabled);
     }
 }

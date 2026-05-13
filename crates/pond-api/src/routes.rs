@@ -32,12 +32,11 @@ use pond_core::prompts::{
 };
 use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
-use tower_http::services::ServeDir;
-// Tool classification is handled by the ToolAgent port (injected via AppState).
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use pond_core::domain::memory::MemoryFragment;
@@ -614,68 +613,6 @@ async fn chat_stream(
 
         let settings = state.settings_repo.get().await.unwrap_or_default();
 
-        // ── Fast-path: deterministic response for trivial messages ─────
-        // Greetings, farewells, thanks, acknowledgments are answered in
-        // <10ms without invoking the LLM, tool agent, or any I/O beyond
-        // session persistence.
-        if settings.fast_path_enabled {
-            if let Some(fast_result) = pond_core::services::fast_responder::try_fast_path(&req.message) {
-                tracing::debug!(
-                    target: "giap::fast_path",
-                    category = ?fast_result.category,
-                    "fast-path match — skipping LLM pipeline"
-                );
-
-                // Persist user message
-                {
-                    use pond_core::domain::message::ChatMessage;
-                    use pond_core::domain::session::SessionMessage;
-                    let user_msg = ChatMessage::user(req.message.clone());
-                    let sm = SessionMessage::new(
-                        Uuid::new_v4().to_string(),
-                        session_id.clone(),
-                        user_msg,
-                    );
-                    let _ = storage.add_message(session_id.clone(), sm).await;
-                }
-
-                // Emit text event
-                let text_data = json!({
-                    "type": "text",
-                    "content": fast_result.response,
-                    "token": fast_result.response,
-                }).to_string();
-                yield Ok(Event::default().data(text_data));
-
-                // Persist assistant response
-                {
-                    use pond_core::domain::message::ChatMessage;
-                    use pond_core::domain::session::SessionMessage;
-                    let assistant_msg = ChatMessage::assistant(fast_result.response);
-                    let sm = SessionMessage::new(
-                        Uuid::new_v4().to_string(),
-                        session_id.clone(),
-                        assistant_msg,
-                    );
-                    let _ = storage.add_message(session_id.clone(), sm).await;
-                }
-
-                // Done event (zero token usage — no LLM was invoked)
-                let done_data = json!({
-                    "done": true,
-                    "session_id": session_id,
-                    "model_role": "chat",
-                    "model_name": settings.chat_model,
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                    }
-                }).to_string();
-                yield Ok(Event::default().data(done_data));
-                return;
-            }
-        }
-
         // Build the system prompt
         let system_prompt = {
             let profile_ctx: Option<ProfileContext> = if let Some(ref pid) = settings.primary_profile_id {
@@ -765,122 +702,22 @@ async fn chat_stream(
 
         let model_role = "chat";
 
-        // ── Domain classification (original message, before augmentation) ──
-        // Prefer embedding classifier (~10ms) when available; fall back to keyword
-        // classifier. Classify early so we can (a) skip ToolAgent for domains
-        // where it adds no value and (b) pass the domain through AgentRequest.
-        let domain = if let (Some(classifier), Some(emb_provider)) =
-            (&state.embedding_classifier, &state.embedding_provider)
+        // ── Persist user message ────────────────────────────────────────────
         {
-            classifier
-                .classify(&req.message, emb_provider.as_ref())
-                .await
-        } else {
-            pond_core::services::domain_classifier::classify_domain(&req.message)
-        };
-        let skip_tool_agent = matches!(
-            domain,
-            pond_core::services::domain_classifier::ToolDomain::Music
-                | pond_core::services::domain_classifier::ToolDomain::Home
-                | pond_core::services::domain_classifier::ToolDomain::FileSystem
-                | pond_core::services::domain_classifier::ToolDomain::System
-        );
-
-        // ── Parallel Prep: LLM classification + user message persist ────────
-        // The ToolAgent runs LLM classification on a concurrent thread while
-        // message persistence happens in parallel. On HTTP providers (Ollama/
-        // llamafile), the classifier LLM call runs on a separate connection,
-        // truly parallel. On GGUF, it serializes behind the model mutex but
-        // the DB persist still runs concurrently.
-        //
-        // When skip_tool_agent is true (Music, Home, FileSystem, System domains),
-        // we skip the ToolAgent entirely — it can't help and would waste an LLM
-        // classify call.
-        let tool_agent_ref = state.tool_agent.clone();
-        let msg_for_tool = req.message.clone();
-        let multi_tool_enabled = settings.multi_tool_enabled;
-        let msg_for_persist = req.message.clone();
-        let sid_for_persist = session_id.clone();
-        let storage_ref = storage.clone();
-
-        // Choose single-tool or multi-tool dispatch based on settings.
-        // Both branches produce an Option<String> tool_context.
-        let (tool_result, multi_tool_result, persist_result) = tokio::join!(
-            async {
-                if skip_tool_agent || multi_tool_enabled {
-                    // Skip — either domain doesn't need tools or multi-tool path handles it.
-                    Ok(None)
-                } else {
-                    match &tool_agent_ref {
-                        Some(ta) => ta.process(&msg_for_tool).await,
-                        None => Ok(None),
-                    }
-                }
-            },
-            async {
-                if skip_tool_agent || !multi_tool_enabled {
-                    // Skip — either domain doesn't need tools or single-tool path handles it.
-                    Ok(vec![])
-                } else {
-                    match &tool_agent_ref {
-                        Some(ta) => ta.process_multi(&msg_for_tool).await,
-                        None => Ok(vec![]),
-                    }
-                }
-            },
-            async {
-                use pond_core::domain::message::ChatMessage;
-                use pond_core::domain::session::SessionMessage;
-                let user_msg = ChatMessage::user(msg_for_persist);
-                let sm = SessionMessage::new(
-                    Uuid::new_v4().to_string(),
-                    sid_for_persist,
-                    user_msg,
-                );
-                storage_ref.add_message(session_id.clone(), sm).await
-            },
-        );
-
-        // Check persist result
-        if let Err(e) = persist_result {
-            let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
-            yield Ok(Event::default().data(data));
-            return;
+            use pond_core::domain::message::ChatMessage;
+            use pond_core::domain::session::SessionMessage;
+            let user_msg = ChatMessage::user(req.message.clone());
+            let sm = SessionMessage::new(
+                Uuid::new_v4().to_string(),
+                session_id.clone(),
+                user_msg,
+            );
+            if let Err(e) = storage.add_message(session_id.clone(), sm).await {
+                let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+                yield Ok(Event::default().data(data));
+                return;
+            }
         }
-
-        // Extract tool context — from multi-tool or single-tool path.
-        let tool_context: Option<String> = if multi_tool_enabled {
-            match multi_tool_result {
-                Ok(results) if !results.is_empty() => {
-                    tracing::debug!(
-                        target: "giap::tool_agent",
-                        "multi-tool: {} results injected",
-                        results.len()
-                    );
-                    let ctx = crate::tool_context::format_multi_tool_context(
-                        &req.message, &results,
-                    );
-                    Some(ctx)
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::debug!(target: "giap::tool_agent", "multi-tool agent error: {e}");
-                    None
-                }
-            }
-        } else {
-            match tool_result {
-                Ok(Some(augmented)) => {
-                    tracing::debug!(target: "giap::tool_agent", "tool result injected ({} chars)", augmented.len());
-                    Some(augmented)
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::debug!(target: "giap::tool_agent", "tool agent error: {e}");
-                    None
-                }
-            }
-        };
 
         // ── On-demand llamafile startup ─────────────────────────────────────
         // If any role uses llamafile and the process is not responding, emit a
@@ -925,16 +762,12 @@ async fn chat_stream(
 
         use pond_core::domain::agent::AgentRequest;
 
-        // Keep a reference to tool context for the reviewer (needs it to evaluate answer quality)
-        let tool_context_for_review = tool_context.clone();
-        let agent_message = tool_context.unwrap_or_else(|| req.message.clone());
         let agent_req = AgentRequest {
-            message: agent_message,
+            message: req.message.clone(),
             session_id: session_id.clone(),
             model_role: model_role.to_string(),
             images: req.images.clone(),
             voice_mode: req.voice_mode,
-            domain: Some(domain),
         };
 
         let mut full_text = String::new();
@@ -957,121 +790,146 @@ async fn chat_stream(
             }
         };
 
-        while let Some(event_result) = agent_stream.next().await {
-            match event_result {
-                Ok(event) => {
-                    let maybe_data = match event {
-                        AgentStreamEvent::Status { content } => {
-                            Some(json!({"type": "status", "content": content}).to_string())
-                        }
-                        AgentStreamEvent::Thinking { content } => {
-                            Some(json!({"type": "thinking", "content": content}).to_string())
-                        }
-                        AgentStreamEvent::ToolCall { tool, id, input } => {
-                            Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
-                        }
-                        AgentStreamEvent::ToolResult { tool, id, content } => {
-                            Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
-                        }
-                        AgentStreamEvent::Text { content } => {
-                            let visible = thought.push(&content);
-                            if visible.is_empty() {
-                                None
-                            } else {
-                                if ttft_instant.is_none() {
-                                    ttft_instant = Some(std::time::Instant::now());
+        // ── Agent turn timeout ─────────────────────────────────────────
+        // Compute an absolute deadline for the entire stream consumption.
+        // When agent_timeout_secs is 0, the timeout is effectively disabled
+        // (set to a very large value so the code path stays uniform).
+        let timeout_secs = settings.agent_timeout_secs;
+        let deadline = tokio::time::Instant::now()
+            + if timeout_secs == 0 {
+                std::time::Duration::from_secs(86_400) // 24h — effectively disabled
+            } else {
+                std::time::Duration::from_secs(timeout_secs)
+            };
+        let mut timed_out = false;
+
+        loop {
+            match tokio::time::timeout_at(deadline, agent_stream.next()).await {
+                Ok(Some(event_result)) => {
+                    match event_result {
+                        Ok(event) => {
+                            let maybe_data = match event {
+                                AgentStreamEvent::Status { content } => {
+                                    Some(json!({"type": "status", "content": content}).to_string())
                                 }
-                                full_text.push_str(&visible);
-                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
+                                AgentStreamEvent::Thinking { content } => {
+                                    Some(json!({"type": "thinking", "content": content}).to_string())
+                                }
+                                AgentStreamEvent::ToolCall { tool, id, input } => {
+                                    Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
+                                }
+                                AgentStreamEvent::ToolResult { tool, id, content } => {
+                                    Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
+                                }
+                                AgentStreamEvent::Text { content } => {
+                                    let visible = thought.push(&content);
+                                    if visible.is_empty() {
+                                        None
+                                    } else {
+                                        if ttft_instant.is_none() {
+                                            ttft_instant = Some(std::time::Instant::now());
+                                        }
+                                        full_text.push_str(&visible);
+                                        Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
+                                    }
+                                }
+                                AgentStreamEvent::ReviewStatus { content } => {
+                                    Some(json!({"type": "review_status", "content": content}).to_string())
+                                }
+                                AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+                                    Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
+                                }
+                                AgentStreamEvent::Done { usage, .. } => {
+                                    if let Some(u) = usage {
+                                        usage_prompt_tokens = u.prompt_tokens;
+                                        usage_completion_tokens = u.completion_tokens;
+                                    }
+                                    continue;
+                                }
+                                AgentStreamEvent::Error { content } => {
+                                    Some(json!({"error": content}).to_string())
+                                }
+                            };
+                            if let Some(data) = maybe_data {
+                                yield Ok(Event::default().data(data));
+                            }
+                            // Emit captured thinking blocks as SSE events (when show_thinking is on)
+                            for thinking_content in thought.take_thinking() {
+                                let data = json!({"type": "thinking", "content": thinking_content}).to_string();
+                                yield Ok(Event::default().data(data));
+                            }
+                            // After every push the filter may have captured a complete
+                            // tool-call envelope (`<|tool_call> ... <tool_call|>`).
+                            // Surface those as a visible note so the user understands
+                            // why the action they asked for produced nothing — the
+                            // model emitted Harmony text markup instead of using the
+                            // structured tool-call protocol Goose actually invokes.
+                            for body in thought.take_tool_calls() {
+                                let notice = match crate::thought_filter::parse_tool_envelope(&body) {
+                                    Some((name, args)) => format!(
+                                        "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
+                                    ),
+                                    None => format!(
+                                        "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
+                                    ),
+                                };
+                                full_text.push_str(&notice);
+                                let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
+                                yield Ok(Event::default().data(data));
                             }
                         }
-                        AgentStreamEvent::ReviewStatus { content } => {
-                            Some(json!({"type": "review_status", "content": content}).to_string())
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            let data = json!({"error": err_msg}).to_string();
+                            yield Ok(Event::default().data(data));
+                            return;
                         }
-                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
-                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
-                        }
-                        AgentStreamEvent::Done { usage, .. } => {
-                            if let Some(u) = usage {
-                                usage_prompt_tokens = u.prompt_tokens;
-                                usage_completion_tokens = u.completion_tokens;
-                            }
-                            continue;
-                        }
-                        AgentStreamEvent::Error { content } => {
-                            Some(json!({"error": content}).to_string())
-                        }
-                    };
-                    if let Some(data) = maybe_data {
-                        yield Ok(Event::default().data(data));
-                    }
-                    // Emit captured thinking blocks as SSE events (when show_thinking is on)
-                    for thinking_content in thought.take_thinking() {
-                        let data = json!({"type": "thinking", "content": thinking_content}).to_string();
-                        yield Ok(Event::default().data(data));
-                    }
-                    // After every push the filter may have captured a complete
-                    // tool-call envelope (`<|tool_call> ... <tool_call|>`).
-                    // Surface those as a visible note so the user understands
-                    // why the action they asked for produced nothing — the
-                    // model emitted Harmony text markup instead of using the
-                    // structured tool-call protocol Goose actually invokes.
-                    for body in thought.take_tool_calls() {
-                        let notice = match crate::thought_filter::parse_tool_envelope(&body) {
-                            Some((name, args)) => format!(
-                                "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
-                            ),
-                            None => format!(
-                                "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
-                            ),
-                        };
-                        full_text.push_str(&notice);
-                        let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
-                        yield Ok(Event::default().data(data));
                     }
                 }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    let data = json!({"error": err_msg}).to_string();
+                Ok(None) => {
+                    // Stream ended normally
+                    break;
+                }
+                Err(_elapsed) => {
+                    // Deadline exceeded — emit timeout error
+                    timed_out = true;
+                    tracing::warn!(
+                        session_id = %session_id,
+                        timeout_secs = timeout_secs,
+                        "Agent turn timed out"
+                    );
+                    let data = json!({"error": "Agent timed out. Try a shorter message or start a new session."}).to_string();
                     yield Ok(Event::default().data(data));
-                    return;
+                    break;
                 }
             }
         }
 
         // Flush any tail buffered by the thought filter (e.g. text after the
         // last `<channel|>` that had not yet exceeded the safe-emit threshold).
-        let tail = thought.flush();
-        if !tail.is_empty() {
-            full_text.push_str(&tail);
-            let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
-            yield Ok(Event::default().data(data));
+        if !timed_out {
+            let tail = thought.flush();
+            if !tail.is_empty() {
+                full_text.push_str(&tail);
+                let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
+                yield Ok(Event::default().data(data));
+            }
         }
 
         // ── Adversarial answer review (post-inference) ───────────────
-        // When review_mode is "on" or "auto", evaluate the answer before
-        // persisting. If the reviewer rejects it, revise and emit a
-        // review_revision event that the frontend uses to replace the text.
+        // When review_mode is "on", evaluate the answer before persisting.
+        // If the reviewer rejects it, revise and emit a review_revision
+        // event that the frontend uses to replace the text.
+        // Skipped when the agent timed out — no point reviewing a partial answer.
         {
-            let should_review = match settings.review_mode.as_str() {
-                "on" => true,
-                "auto" => {
-                    // Review factual/analytical questions or tool-augmented answers
-                    use pond_core::services::request_classifier::classify_request;
-                    use pond_core::domain::model_role::ModelRole;
-                    let role = classify_request(&req.message);
-                    role == ModelRole::Think || tool_context_for_review.is_some()
-                }
-                _ => false,
-            };
+            let should_review = !timed_out && settings.review_mode == "on";
 
             if should_review {
                 if let Some(ref reviewer) = state.answer_reviewer {
                     let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
                     yield Ok(Event::default().data(status));
 
-                    let tool_ctx = tool_context_for_review.as_deref();
-                    match reviewer.review(&req.message, &full_text, tool_ctx).await {
+                    match reviewer.review(&req.message, &full_text, None).await {
                         Ok(result) if result.was_revised => {
                             full_text = result.final_answer.clone();
                             let data = json!({
@@ -1091,65 +949,6 @@ async fn chat_stream(
                         }
                         Err(e) => {
                             tracing::warn!("Answer review failed (non-fatal): {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Post-inference tool request detection ─────────────────────
-        // If the LLM's response contains a natural language tool request
-        // (e.g. "Let me look up X for you"), execute the tool via the
-        // ToolAgent, then re-generate the response with tool data injected.
-        // Skip when a domain filter is active (e.g. Music domain) — the LLM
-        // shouldn't be calling Wikipedia when only music tools are allowed.
-        // Reuses `domain` classified earlier from the original `req.message`.
-        let skip_tool_request = !matches!(domain, pond_core::services::domain_classifier::ToolDomain::General | pond_core::services::domain_classifier::ToolDomain::Knowledge);
-        if settings.tool_request_detection && !skip_tool_request {
-            if let Some(tool_req) = pond_core::services::tool_request_detector::detect_tool_request(&full_text) {
-                tracing::info!(
-                    target: "giap::tool_request",
-                    tool = %tool_req.tool_name,
-                    query = %tool_req.query,
-                    "LLM requested tool via natural language"
-                );
-
-                // Use the ToolAgent to execute — it handles caching, compaction, etc.
-                if let Some(ref ta) = state.tool_agent {
-                    // Build a synthetic message for the tool agent that looks like a tool query
-                    let synthetic_msg = if tool_req.query.is_empty() {
-                        tool_req.tool_name.clone()
-                    } else {
-                        tool_req.query.clone()
-                    };
-
-                    if let Ok(Some(tool_context)) = ta.process(&synthetic_msg).await {
-                        // Re-generate with tool data
-                        let provider_guard = state.llm_provider.read().await;
-                        if let Some(ref provider) = *provider_guard {
-                            let msgs = vec![pond_core::domain::message::ChatMessage::user(tool_context)];
-                            match provider.complete(&_system_prompt, msgs).await {
-                                Ok(revision) => {
-                                    full_text = revision.content.clone();
-                                    let data = json!({
-                                        "type": "tool_revision",
-                                        "content": full_text,
-                                        "tool": tool_req.tool_name,
-                                    }).to_string();
-                                    yield Ok(Event::default().data(data));
-                                    tracing::info!(
-                                        target: "giap::tool_request",
-                                        "Revised response with {} tool data ({} chars)",
-                                        tool_req.tool_name, full_text.len()
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        target: "giap::tool_request",
-                                        "Revision failed: {e}"
-                                    );
-                                }
-                            }
                         }
                     }
                 }
@@ -4848,7 +4647,6 @@ async fn agent_chat_stream(
             model_role: "task".to_string(),
             images: Vec::new(),
             voice_mode: false,
-            domain: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {

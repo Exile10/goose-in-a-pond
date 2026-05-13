@@ -6973,6 +6973,7 @@ dependencies = [
  "chrono",
  "futures",
  "goose",
+ "pond-adapters-weather",
  "pond-core",
  "pond-mcp-server",
  "reqwest 0.13.2",

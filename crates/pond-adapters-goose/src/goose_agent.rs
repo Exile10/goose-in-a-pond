@@ -15,9 +15,7 @@ use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
 use pond_core::ports::tool_registry::ToolRegistryPort;
 use pond_core::prompts::PromptState;
-use pond_core::services::domain_classifier::classify_domain;
 use pond_core::services::prompt_builder::build_prompt_partition;
-use pond_core::services::tool_domains::{domain_hint, tool_filter_for_domain};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -26,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::extension_manager::GiapGooseExtensionManager;
+use crate::giap_registration::registered_extensions;
 
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
@@ -35,7 +34,18 @@ const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local
      No Markdown. Never emit pipeline control tokens. \
      IMPORTANT: Only use tools listed in your schema. \
      Never use shell, bash, python, curl, or any execution tool. \
-     If a service is unavailable, tell the user directly.";
+     If a service is unavailable, tell the user directly.\n\n\
+     ## Tools\n\
+     You have tools for weather, scheduling, memory, device management, knowledge lookup, \
+     and system operations. Tool schemas describe each one. Use them when the user's request \
+     matches — do not guess answers that tools could provide accurately.\n\n\
+     ## Memory\n\
+     When the user shares personal information, save it immediately with save_memory. \
+     Check recall_memories before knowledge lookups. \
+     Corrections are highest priority.\n\n\
+     ## Output Quality\n\
+     Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know. \
+     Keep responses concise. Synthesize tool results — do not parrot raw output.";
 
 /// Adapter: GooseAdapter
 ///
@@ -47,7 +57,7 @@ const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local
 /// 3. Injects active `PromptExtra` records and user `Skill` content as keyed extras.
 /// 4. Optionally injects recent memory fragments when `agent_memory_inject = true`.
 /// 5. Hot-swaps the Goose provider when `chat_provider` / `chat_model` changes.
-/// 6. Auto-loads the `"giap"` builtin MCP extension (once per session).
+/// 6. Auto-loads the `"giap-*"` builtin MCP extensions (once per session).
 /// 7. Runs Goose's full agentic loop and returns aggregated text + tool-call metadata.
 pub struct GooseAdapter {
     agent: Arc<GooseAgent>,
@@ -67,10 +77,11 @@ pub struct GooseAdapter {
     extension_manager: Arc<GiapGooseExtensionManager>,
     /// Tracks the last "chat_provider:chat_model" key we wired into Goose.
     last_provider_key: Mutex<String>,
-    /// Sessions that have already had the "giap" builtin extension loaded.
-    loaded_extensions: Mutex<HashSet<String>>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
+    /// Goose sessions that have already had GIAP builtin extensions loaded.
+    /// Extensions are loaded once per session on first use.
+    loaded_sessions: Mutex<HashSet<String>>,
     /// Dynamic tool registry — provides tool descriptions for the system prompt.
     /// When `None`, falls back to the static `giap_tool_description_lines()`.
     tool_registry: Option<Arc<dyn ToolRegistryPort>>,
@@ -161,8 +172,8 @@ impl GooseAdapter {
             data_dir,
             extension_manager,
             last_provider_key: Mutex::new(String::new()),
-            loaded_extensions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
+            loaded_sessions: Mutex::new(HashSet::new()),
             tool_registry,
             user_extensions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             voice_mode: std::sync::atomic::AtomicBool::new(false),
@@ -302,27 +313,30 @@ impl GooseAdapter {
         }
     }
 
-    /// Determine the effective context window (in tokens) for this provider+model.
+    /// Determine the context limit for Goose's compaction logic.
     ///
-    /// For local/GGUF inference, the KV-cache size is hard-limited by the
-    /// platform settings (8K macOS Metal, 3K Jetson CUDA). The model's native
-    /// context window is irrelevant — llama-cpp will hit ContextLengthExceeded
-    /// at the KV-cache limit regardless of what the model card says.
+    /// For local/GGUF: returns a generous ceiling. The actual KV-cache allocation
+    /// is dynamically sized per-request by `estimate_max_context_for_memory()`
+    /// inside Goose's inference engine, based on available RAM and the model's
+    /// KV cache cost per token. This value just prevents Goose from targeting
+    /// its default 128K compaction threshold (unreachable on local models).
     ///
-    /// For HTTP providers (Ollama, llamafile), we use the model's reported
-    /// context window from capabilities (which comes from model name heuristics).
+    /// For HTTP providers (Ollama, llamafile): uses the model's reported context
+    /// window from capabilities (model name heuristics).
     fn effective_context_window(provider: &str, model: &str) -> usize {
         match provider {
             "local" | "gguf" => {
-                // Must match the context_size set in apply_platform_settings /
-                // apply_jetson_settings in pond-adapters-local-inference.
+                // Generous ceiling — the actual allocation is constrained by
+                // available memory at inference time, not this value.
+                // Jetson (8GB): memory estimation yields ~3-6K depending on model.
+                // macOS M4 (18GB): yields ~16-40K depending on model.
                 #[cfg(feature = "cuda")]
                 {
-                    3072
+                    8192 // conservative ceiling for 8GB Jetson
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    8192
+                    32768 // generous ceiling — memory estimation constrains further
                 }
             }
             _ => {
@@ -609,21 +623,43 @@ impl GooseAdapter {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
 
+        // Stash the user message so MCP tools can fall back to it when the
+        // model calls the right tool but sends empty params (common with small models).
+        pond_mcp_server::set_last_user_message(&request.message);
+
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
 
-        // ── 0. Domain classification ────────────────────────────────────────
-        // Use the pre-classified domain from the route handler (embedding
-        // classifier or keyword fallback). Only re-classify locally if the
-        // route handler didn't provide one (e.g. direct API calls).
-        let domain = request
-            .domain
-            .unwrap_or_else(|| classify_domain(&request.message));
-        tracing::info!(
-            domain = ?domain,
-            message = %request.message,
-            "Domain for tool routing"
-        );
+        // ── 0. Load GIAP builtin MCP extensions (once per session) ────────────
+        {
+            let needs_load = !self.loaded_sessions.lock().unwrap().contains(&goose_sid);
+            if needs_load {
+                let extensions = registered_extensions();
+                println!(
+                    "[goose-adapter] Loading {} GIAP extensions into session {}",
+                    extensions.len(),
+                    goose_sid
+                );
+                for ext_name in extensions {
+                    println!("[goose-adapter] Loading extension: {ext_name}");
+                    match self.add_builtin_extension(ext_name, &goose_sid).await {
+                        Ok(()) => println!("[goose-adapter]   ✓ {ext_name} loaded"),
+                        Err(e) => println!("[goose-adapter]   ✗ {ext_name} FAILED: {e}"),
+                    }
+                }
+                self.loaded_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(goose_sid.clone());
+
+                // List discovered tools to verify extensions are working
+                let tools = self.agent.list_tools(&goose_sid, None).await;
+                println!("[goose-adapter] Discovered {} tools:", tools.len());
+                for t in &tools {
+                    println!("[goose-adapter]   - {}", t.name);
+                }
+            }
+        }
 
         // ── 1-4. System prompt, extras, skills, memory — fetched in parallel ─
         let memory_limit = if settings.agent_memory_inject {
@@ -833,19 +869,6 @@ impl GooseAdapter {
             }
         }
 
-        // ── Domain hint injection ───────────────────────────────────────
-        // Inject a domain-specific hint into the system prompt so the LLM
-        // knows which tools to prefer for this request. The hint is keyed
-        // as "domain_hint" so it's replaced (not accumulated) each turn.
-        let hint = domain_hint(domain);
-        // Always set — even empty — to clear stale hints from previous turns.
-        self.agent
-            .extend_system_prompt("domain_hint".to_string(), hint.to_string())
-            .await;
-        if !hint.is_empty() {
-            tracing::debug!(domain = ?domain, "Injected domain hint into system prompt");
-        }
-
         // ── Token-budgeted memory injection ──────────────────────────────
         //
         // Derive a CompactionProfile from the effective context window so
@@ -928,13 +951,8 @@ impl GooseAdapter {
         }
 
         // ── 4b. Upcoming schedules context ──────────────────────────────────
-        if let Some(sched_context) =
-            pond_mcp_server::registry::try_upcoming_schedules_context().await
-        {
-            self.agent
-                .extend_system_prompt("upcoming_schedules".to_string(), sched_context)
-                .await;
-        }
+        // TODO: inject schedule context once GooseAdapter has a SchedulerPort ref.
+        // The old global-state path (registry.rs) has been removed.
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
         if let Err(e) = self.ensure_provider_current(&settings, &goose_sid).await {
@@ -942,13 +960,10 @@ impl GooseAdapter {
         }
 
         // ── 6. Extension cleanup ──────────────────────────────────────────────
-        // GIAP built-in tools (Wikipedia, weather, etc.) are handled by the
-        // Tool Agent pre-processor in routes.rs BEFORE the main LLM runs.
-        // Strip Goose default extensions that would pollute the prompt, but
-        // PRESERVE user-added MCP extensions so Goose can invoke their tools.
-        let user_exts = self.user_extensions.read().await;
-        for ext in &[
-            "giap",
+        // Strip Goose default extensions that would pollute the prompt.
+        // PRESERVE GIAP builtin extensions (they ARE the tool interface now)
+        // and user-added MCP extensions (music, filesystem, etc.).
+        let strip_list: &[&str] = &[
             "developer",
             "computercontroller",
             "extensionmanager",
@@ -959,7 +974,9 @@ impl GooseAdapter {
             "summarize",
             "orchestrator",
             "tom",
-        ] {
+        ];
+        let user_exts = self.user_extensions.read().await;
+        for ext in strip_list {
             if !user_exts.contains(*ext) {
                 self.agent.remove_extension(ext, &goose_sid).await.ok();
             }
@@ -974,35 +991,13 @@ impl GooseAdapter {
         // hallucinated tool calls.
         let all_tools = self.agent.list_tools(&goose_sid, None).await;
 
-        let mut allowed_tools: std::collections::HashSet<String> =
+        let allowed_tools: std::collections::HashSet<String> =
             all_tools.iter().map(|t| t.name.to_string()).collect();
-
-        let all_tool_count = allowed_tools.len();
-
-        // Apply domain-based tool filtering: narrow the allowed set to only
-        // tools relevant to the classified domain. General domain skips this
-        // (tool_filter_for_domain returns None), preserving all tools.
-        if let Some(filter) = tool_filter_for_domain(domain) {
-            let filter_set: HashSet<String> = filter.iter().map(|s| s.to_string()).collect();
-            allowed_tools.retain(|t| filter_set.contains(t));
-            tracing::info!(
-                domain = ?domain,
-                filtered = allowed_tools.len(),
-                total = all_tool_count,
-                "Domain filter applied: {} -> {} tools",
-                all_tool_count,
-                allowed_tools.len(),
-            );
-        }
 
         tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         // Group tools by extension prefix and inject external extension
         // descriptions so the agent knows about MCP tools (music, filesystem, etc.).
-        //
-        // When a domain filter is active (non-General), only include extensions
-        // whose tools are in the allowed set. This prevents the LLM from seeing
-        // tool descriptions for domains it shouldn't touch.
         {
             let mut ext_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
             for tool in &all_tools {
@@ -1024,47 +1019,28 @@ impl GooseAdapter {
 
             // Filter out built-in GIAP extensions (already covered by the
             // available_tools section in the prompt) and Goose defaults.
-            const BUILTIN_EXTENSIONS: &[&str] = &[
-                "giap",
-                "default",
-                "developer",
-                "computercontroller",
-                "extensionmanager",
-                "todo",
-                "apps",
-                "analyze",
-                "summon",
-                "summarize",
-                "orchestrator",
-                "tom",
-            ];
-
-            // When a domain filter is active, derive the set of allowed
-            // extension prefixes from the filtered tool names. Only extensions
-            // with at least one tool in the allowed set will be described.
-            let domain_has_filter = tool_filter_for_domain(domain).is_some();
-            let allowed_ext_prefixes: HashSet<String> = if domain_has_filter {
-                allowed_tools
-                    .iter()
-                    .filter_map(|t| t.split("__").next().map(|s| s.to_string()))
-                    .collect()
-            } else {
-                HashSet::new() // empty = no prefix filtering (show all)
+            let is_builtin = |name: &str| {
+                registered_extensions().iter().any(|e| e == name)
+                    || matches!(
+                        name,
+                        "default"
+                            | "developer"
+                            | "computercontroller"
+                            | "extensionmanager"
+                            | "todo"
+                            | "apps"
+                            | "analyze"
+                            | "summon"
+                            | "summarize"
+                            | "orchestrator"
+                            | "tom"
+                            | "suggestions"
+                    )
             };
 
             let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
                 .into_iter()
-                .filter(|(name, _)| {
-                    // Always filter out builtins
-                    if BUILTIN_EXTENSIONS.contains(&name.as_str()) {
-                        return false;
-                    }
-                    // When domain filter is active, only include extensions in the domain
-                    if domain_has_filter && !allowed_ext_prefixes.contains(name) {
-                        return false;
-                    }
-                    true
-                })
+                .filter(|(name, _)| !is_builtin(name.as_str()))
                 .collect();
 
             if !external_extensions.is_empty() {
@@ -1086,7 +1062,6 @@ impl GooseAdapter {
 
                 tracing::info!(
                     extensions = external_extensions.len(),
-                    domain = ?domain,
                     "Injecting {} external extension(s) into system prompt",
                     external_extensions.len(),
                 );
@@ -1105,10 +1080,6 @@ impl GooseAdapter {
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
-        // Stash the user message so MCP tools can use it as fallback when the
-        // model calls a tool with empty parameters (common with small local models).
-        pond_mcp_server::set_last_user_message(&request.message).await;
-
         let user_msg = Message::user().with_text(&request.message);
         let session_cfg = goose::agents::types::SessionConfig {
             id: goose_sid.clone(),
@@ -1304,7 +1275,6 @@ mod tests {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
-            domain: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

@@ -1,0 +1,468 @@
+//! System MCP Server — time, system info, notifications, shell, file I/O.
+//!
+//! Provides 6 tools: `get_current_time`, `get_system_info`, `send_notification`,
+//! `run_shell_command`, `read_file`, `write_file`.
+//! Stateless — no external dependencies.
+
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, Content, ErrorCode, ErrorData, Implementation, InitializeResult,
+        ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
+};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+// ── Parameter structs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SystemInfoParams {
+    /// What info to get: "all", "memory", "disk", or "os" (default: "all")
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct NotifyParams {
+    /// Notification title
+    pub title: String,
+    /// Notification body text
+    pub body: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ShellCommandParams {
+    /// The command to execute. Only safe commands are allowed: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv
+    pub command: String,
+    /// Arguments to pass to the command
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ReadFileParams {
+    /// Absolute path to the file to read
+    pub path: String,
+    /// Maximum number of lines to read (default: 100)
+    pub max_lines: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct WriteFileParams {
+    /// Absolute path to the file to write
+    pub path: String,
+    /// Content to write
+    pub content: String,
+    /// If true, append to file instead of overwriting (default: false)
+    #[serde(default)]
+    pub append: bool,
+}
+
+/// Allow-list of safe shell commands for `run_shell_command`.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "echo", "date", "uptime", "df", "free", "whoami", "hostname", "pwd", "wc", "head",
+    "tail", "sort", "uniq", "grep", "find", "which", "env", "printenv",
+];
+
+// ── MCP server ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct SystemMcpServer {
+    #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
+    tool_router: ToolRouter<Self>,
+}
+
+#[tool_router]
+impl SystemMcpServer {
+    pub fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        description = "Get the current date, time, and timezone. Use when asked about the current time or date."
+    )]
+    async fn get_current_time(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let now = chrono::Local::now();
+        let text = format!(
+            "Current time: {}\nDate: {}\nTimezone: {}",
+            now.format("%H:%M:%S"),
+            now.format("%A, %B %d, %Y"),
+            now.format("%Z (UTC%:z)")
+        );
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Get system information: OS, hostname, memory usage, and disk usage. \
+        Use when the user asks about their system, available memory, disk space, or hardware."
+    )]
+    async fn get_system_info(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<SystemInfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use sysinfo::{Disks, System};
+
+        let category = params.0.category.as_deref().unwrap_or("all");
+        let mut sections: Vec<String> = Vec::new();
+
+        let show_os = category == "all" || category == "os";
+        let show_memory = category == "all" || category == "memory";
+        let show_disk = category == "all" || category == "disk";
+
+        if show_os {
+            let host = System::host_name().unwrap_or_else(|| "unknown".to_string());
+            let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
+            let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
+            let kernel = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
+            let arch = System::cpu_arch();
+            let uptime_secs = System::uptime();
+            let hours = uptime_secs / 3600;
+            let minutes = (uptime_secs % 3600) / 60;
+            sections.push(format!(
+                "OS: {} {}\nKernel: {}\nArchitecture: {}\nHostname: {}\nUptime: {}h {}m",
+                os_name, os_version, kernel, arch, host, hours, minutes,
+            ));
+        }
+
+        if show_memory {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            let total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
+            let used_gb = sys.used_memory() as f64 / 1_073_741_824.0;
+            let available_gb = sys.available_memory() as f64 / 1_073_741_824.0;
+            sections.push(format!(
+                "Memory: {:.1} GB used / {:.1} GB total ({:.1} GB available)",
+                used_gb, total_gb, available_gb,
+            ));
+        }
+
+        if show_disk {
+            let disks = Disks::new_with_refreshed_list();
+            let mut disk_lines: Vec<String> = Vec::new();
+            for disk in disks.list() {
+                let mount = disk.mount_point().to_string_lossy();
+                let total_gb = disk.total_space() as f64 / 1_073_741_824.0;
+                let avail_gb = disk.available_space() as f64 / 1_073_741_824.0;
+                let used_gb = total_gb - avail_gb;
+                disk_lines.push(format!(
+                    "  {} — {:.1} GB used / {:.1} GB total ({:.1} GB free)",
+                    mount, used_gb, total_gb, avail_gb,
+                ));
+            }
+            if disk_lines.is_empty() {
+                disk_lines.push("  No disks detected.".to_string());
+            }
+            sections.push(format!("Disks:\n{}", disk_lines.join("\n")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            sections.join("\n\n"),
+        )]))
+    }
+
+    #[tool(
+        description = "Send a desktop notification to the user. Use when the user asks to be \
+        notified, alerted, or reminded with a popup message."
+    )]
+    async fn send_notification(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<NotifyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        notify_rust::Notification::new()
+            .summary(&params.0.title)
+            .body(&params.0.body)
+            .appname("Goose in a Pond")
+            .show()
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to send notification: {}", e),
+                    None,
+                )
+            })?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Notification sent: \"{}\" — {}",
+            params.0.title, params.0.body,
+        ))]))
+    }
+
+    #[tool(
+        description = "Execute a safe shell command. Only allow-listed commands are permitted: \
+        ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, \
+        grep, find, which, env, printenv. Times out after 10 seconds."
+    )]
+    async fn run_shell_command(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ShellCommandParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cmd = params.0.command.trim().to_string();
+
+        if !ALLOWED_COMMANDS.contains(&cmd.as_str()) {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "Command '{}' is not in the allow-list. Allowed: {}",
+                    cmd,
+                    ALLOWED_COMMANDS.join(", "),
+                ),
+                None,
+            ));
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(&cmd)
+                .args(&params.0.args)
+                .output(),
+        )
+        .await;
+
+        match result {
+            Err(_elapsed) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Command '{}' timed out after 10 seconds.", cmd),
+                None,
+            )),
+            Ok(Err(e)) => Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to execute '{}': {}", cmd, e),
+                None,
+            )),
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut text = String::new();
+                if !stdout.is_empty() {
+                    text.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n--- stderr ---\n");
+                    }
+                    text.push_str(&stderr);
+                }
+                if text.is_empty() {
+                    text.push_str("(no output)");
+                }
+                if !output.status.success() {
+                    text.push_str(&format!("\nExit code: {}", output.status));
+                }
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Read the contents of a local file. Returns up to max_lines lines (default 100). \
+        Use when the user asks to read, view, or inspect a file on their system."
+    )]
+    async fn read_file(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ReadFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = params.0.path.trim();
+
+        if path.contains("..") {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path traversal ('..') is not allowed.",
+                None,
+            ));
+        }
+
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path must be absolute.",
+                None,
+            ));
+        }
+
+        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to read '{}': {}", path, e),
+                None,
+            )
+        })?;
+
+        let max_lines = params.0.max_lines.unwrap_or(100);
+        let lines: Vec<&str> = content.lines().take(max_lines).collect();
+        let total_lines = content.lines().count();
+        let truncated = total_lines > max_lines;
+        let mut text = lines.join("\n");
+        if truncated {
+            text.push_str(&format!(
+                "\n\n[Showing {}/{} lines. Use max_lines to read more.]",
+                max_lines, total_lines,
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Write content to a local file. Can overwrite or append. Creates parent \
+        directories if needed. Use when the user asks to write, save, or create a file."
+    )]
+    async fn write_file(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<WriteFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = params.0.path.trim();
+
+        if path.contains("..") {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path traversal ('..') is not allowed.",
+                None,
+            ));
+        }
+
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "Path must be absolute.",
+                None,
+            ));
+        }
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to create directories for '{}': {}", path, e),
+                    None,
+                )
+            })?;
+        }
+
+        let bytes_written = params.0.content.len();
+
+        if params.0.append {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to open '{}' for appending: {}", path, e),
+                        None,
+                    )
+                })?;
+            file.write_all(params.0.content.as_bytes())
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to append to '{}': {}", path, e),
+                        None,
+                    )
+                })?;
+        } else {
+            tokio::fs::write(path, &params.0.content)
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to write '{}': {}", path, e),
+                        None,
+                    )
+                })?;
+        }
+
+        let mode = if params.0.append { "Appended" } else { "Wrote" };
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} {} bytes to '{}'.",
+            mode, bytes_written, path,
+        ))]))
+    }
+}
+
+impl Default for SystemMcpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for SystemMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_server_info(Implementation::new(
+                "giap-system",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "GIAP System MCP server — time, system info, notifications, shell, and file I/O.\n\n\
+                 Tools: get_current_time, get_system_info (OS/memory/disk), send_notification \
+                 (desktop popup), run_shell_command (sandboxed allow-list), read_file (with line \
+                 limit), write_file (with append mode).\n\n\
+                 Shell commands are limited to a safe allow-list with a 10-second timeout. \
+                 File operations reject path traversal and require absolute paths.",
+            )
+    }
+}
+
+// ── Spawn function for Goose builtin registry (stateless — no deps) ──────
+
+use rmcp::ServiceExt;
+use tokio::io::DuplexStream;
+
+/// Spawn function compatible with Goose's `SpawnServerFn` type.
+///
+/// No `init_*` needed — `SystemMcpServer` is stateless.
+pub fn spawn_system_server(reader: DuplexStream, writer: DuplexStream) {
+    let server = SystemMcpServer::default();
+    tokio::spawn(async move {
+        match server.serve((reader, writer)).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(e) => tracing::error!("giap-system MCP server failed: {e}"),
+        }
+    });
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_constructs() {
+        let _server = SystemMcpServer::new();
+    }
+
+    #[test]
+    fn server_default() {
+        let _server = SystemMcpServer::default();
+    }
+
+    #[test]
+    fn allowed_commands_contains_basics() {
+        assert!(ALLOWED_COMMANDS.contains(&"ls"));
+        assert!(ALLOWED_COMMANDS.contains(&"cat"));
+        assert!(ALLOWED_COMMANDS.contains(&"whoami"));
+        assert!(!ALLOWED_COMMANDS.contains(&"rm"));
+        assert!(!ALLOWED_COMMANDS.contains(&"sudo"));
+    }
+}

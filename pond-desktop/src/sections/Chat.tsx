@@ -6,6 +6,7 @@ import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ContextCard } from "../components/ContextCard";
+import { ToolCallChip } from "../components/ToolCallChip";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import type { ChatEvent, ModelEntry, SessionSummary } from "../api/types";
@@ -276,7 +277,7 @@ export function Chat() {
             return [...prev.slice(0, -1), { 
               ...last, 
               cards: [...(last.cards ?? []), card],
-              status: friendlyToolStatus(ev.tool)
+              status: friendlyToolStatus(ev.tool ?? "")
             }];
           });
 
@@ -441,6 +442,15 @@ export function Chat() {
               <div className="bubble__author">
                 {msg.role === "user" ? "You" : "Pond"}
               </div>
+              {/* Tool call chips — shown above message text once streaming is done */}
+              {msg.role === "agent" && msg.cards && msg.cards.length > 0 && !msg.streaming && (
+                <div className="tool-call-chips" role="list" aria-label="Tools used">
+                  {msg.cards.map((card) => (
+                    <ToolCallChip key={card.id} card={card} />
+                  ))}
+                </div>
+              )}
+
               <div
                 className="bubble__body"
                 style={{
@@ -455,13 +465,6 @@ export function Chat() {
                     : <span className="stream-dots"><span /><span /><span /></span>
                 ) : "")}
               </div>
-
-              {/* Inline tool-call ContextCards intentionally NOT rendered in
-               * the chat thread. They were leaking the agent's plumbing
-               * (raw "Get Recipe" / "Get Weather" chips with `{}` JSON
-               * underneath) every time the model invoked a tool. The
-               * canvas overlay still receives cards via PUSH_CONTEXT_CARD
-               * for voice mode, so that flow is unaffected. */}
 
               {/* Model role badge + token count */}
               {msg.role === "agent" && msg.modelRole && !msg.streaming && (

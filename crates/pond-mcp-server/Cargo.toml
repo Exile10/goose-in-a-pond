@@ -7,13 +7,10 @@ authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
     "Africia Kerubo <africia@jarida.io>"]
 license = "Apache-2.0"
 
-# This crate is workspace-excluded — build with:
-#   cargo check --manifest-path crates/pond-mcp-server/Cargo.toml
-#
-# The registration of spawn_giap_server into goose's builtin registry is done
-# inside pond-adapters-goose, which already carries the full goose dep.
-# pond-mcp-server itself only needs rmcp (MCP protocol types + macros) and
-# pond-core (port trait objects for weather/devices/scheduler).
+# 6 modular MCP servers: memory, schedule, weather, knowledge, system, device.
+# Each module exposes init_*() / spawn_*() functions for Goose's builtin registry.
+# Registration into Goose happens in pond-adapters-goose (giap_registration.rs).
+# This crate only needs rmcp (MCP protocol types + macros) and pond-core (port traits).
 
 [dependencies]
 pond-core            = { path = "../pond-core" }
