@@ -42,3 +42,4 @@ llama.log
 
 **/*.log
 /boop-agent-main/
+CLAUDE.md
