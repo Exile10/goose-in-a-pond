@@ -38,14 +38,18 @@ const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local
      ## Tools\n\
      You have tools for weather, scheduling, memory, device management, knowledge lookup, \
      and system operations. Tool schemas describe each one. Use them when the user's request \
-     matches — do not guess answers that tools could provide accurately.\n\n\
+     matches — do not guess answers that tools could provide accurately.\n\
+     When unsure about something, check your tools first. No matching tool? Tell the user honestly.\n\n\
      ## Memory\n\
      When the user shares personal information, save it immediately with save_memory. \
      Check recall_memories before knowledge lookups. \
      Corrections are highest priority.\n\n\
      ## Output Quality\n\
      Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know. \
-     Keep responses concise. Synthesize tool results — do not parrot raw output.";
+     Keep responses concise. Synthesize tool results — do not parrot raw output.\n\n\
+     ## Per-Turn Context\n\
+     User messages use XML tags: <system-context> has date/time and <memories>. \
+     <user-message> has the actual request. Only respond to <user-message>.";
 
 /// Adapter: GooseAdapter
 ///
@@ -587,6 +591,8 @@ impl GooseAdapter {
                 if !registry.has_model(&stem) {
                     let mut settings = ModelSettings::default();
                     settings.native_tool_calling = true;
+                    settings.use_jinja = true;
+                    settings.enable_thinking = false;
                     let entry = LocalModelEntry {
                         id: stem.clone(),
                         repo_id: format!("local/{}", stem),
@@ -596,6 +602,10 @@ impl GooseAdapter {
                         source_url: String::new(),
                         settings,
                         size_bytes: 0,
+                        mmproj_path: None,
+                        mmproj_size_bytes: 0,
+                        mmproj_source_url: None,
+                        shard_files: vec![],
                     };
                     match registry.add_model(entry) {
                         Ok(_) => {
@@ -793,6 +803,10 @@ impl GooseAdapter {
             }
         };
 
+        // Per-turn dynamic context (date/time, profile). Moved from system
+        // prompt to user message to keep system+tools prefix token-stable.
+        let mut dynamic_suffix_for_user_msg = String::new();
+
         // ── Partitioned prompt: static prefix + dynamic suffix ──────────
         // When prefix_cache_prompt is enabled (default), the system prompt is
         // split into a stable static prefix and a per-turn dynamic suffix.
@@ -835,13 +849,9 @@ impl GooseAdapter {
                 );
             }
 
-            // Dynamic suffix: current date/time, profile context, addendum.
-            // Always updated because it changes every turn (at minimum, the time).
-            if !partition.dynamic_suffix.is_empty() {
-                self.agent
-                    .extend_system_prompt("temporal".to_string(), partition.dynamic_suffix)
-                    .await;
-            }
+            // Dynamic suffix (date/time, profile) goes into <system-context> in the
+            // user message — NOT the system prompt. Keeps prefix token-stable.
+            dynamic_suffix_for_user_msg = partition.dynamic_suffix;
         } else {
             // Legacy path: rebuild full system prompt every turn
             let system_prompt = pond_core::prompts::build_system_prompt_from_template_full(
@@ -870,6 +880,9 @@ impl GooseAdapter {
         }
 
         // ── Token-budgeted memory injection ──────────────────────────────
+        // Memories go into <system-context> in the user message (not the system
+        // prompt) to keep the prefix token-stable for KV cache reuse.
+        let mut memory_block_for_user_msg = String::new();
         //
         // Derive a CompactionProfile from the effective context window so
         // memory injection doesn't eat into the already-tight KV cache on
@@ -935,12 +948,7 @@ impl GooseAdapter {
                         effective_ctx,
                     );
 
-                    self.agent
-                        .extend_system_prompt(
-                            "memories".to_string(),
-                            format!("Relevant memories:\n{block}"),
-                        )
-                        .await;
+                    memory_block_for_user_msg = block;
 
                     // Record access for decay tracking
                     for m in budgeted {
@@ -1080,7 +1088,32 @@ impl GooseAdapter {
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
-        let user_msg = Message::user().with_text(&request.message);
+        // Build <system-context> block with per-turn dynamic data (date/time,
+        // memories). This keeps the system prompt + tool tokens stable across
+        // turns, enabling KV cache prefix reuse in the local inference engine.
+        let has_context = !dynamic_suffix_for_user_msg.is_empty()
+            || !memory_block_for_user_msg.is_empty();
+        let user_text = {
+            let mut msg = String::with_capacity(512 + request.message.len());
+            if has_context {
+                msg.push_str("<system-context>\n");
+                if !dynamic_suffix_for_user_msg.is_empty() {
+                    msg.push_str(&dynamic_suffix_for_user_msg);
+                    msg.push('\n');
+                }
+                if !memory_block_for_user_msg.is_empty() {
+                    msg.push_str("<memories>\n");
+                    msg.push_str(&memory_block_for_user_msg);
+                    msg.push_str("\n</memories>\n");
+                }
+                msg.push_str("</system-context>\n");
+            }
+            msg.push_str("<user-message>\n");
+            msg.push_str(&request.message);
+            msg.push_str("\n</user-message>");
+            msg
+        };
+        let user_msg = Message::user().with_text(&user_text);
         let session_cfg = goose::agents::types::SessionConfig {
             id: goose_sid.clone(),
             schedule_id: None,

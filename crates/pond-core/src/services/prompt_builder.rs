@@ -593,7 +593,7 @@ mod tests {
         let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
         assert!(
-            partition.static_prefix.contains("Voice Mode"),
+            partition.static_prefix.contains("<voice-mode>"),
             "Voice mode section must be in static prefix"
         );
     }

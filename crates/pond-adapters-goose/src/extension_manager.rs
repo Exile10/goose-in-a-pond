@@ -166,6 +166,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     name: request.name.clone(),
                     description: request.description.clone(),
                     uri,
+                    socket: None,
                     envs: Envs::default(),
                     env_keys: vec![],
                     headers: std::collections::HashMap::new(),
