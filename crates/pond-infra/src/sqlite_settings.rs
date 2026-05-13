@@ -186,6 +186,55 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        // Extension toggles
+        upsert!(
+            "ext_memory_enabled",
+            if settings.ext_memory_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "ext_schedule_enabled",
+            if settings.ext_schedule_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "ext_weather_enabled",
+            if settings.ext_weather_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "ext_knowledge_enabled",
+            if settings.ext_knowledge_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "ext_system_enabled",
+            if settings.ext_system_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "ext_device_enabled",
+            if settings.ext_device_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         Ok(())
     }
@@ -357,6 +406,13 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "memory_extraction_enabled" => s.memory_extraction_enabled = value == "true",
         "memory_cleanup_enabled" => s.memory_cleanup_enabled = value == "true",
         "memory_consolidation_enabled" => s.memory_consolidation_enabled = value == "true",
+        // Extension toggles
+        "ext_memory_enabled" => s.ext_memory_enabled = value == "true",
+        "ext_schedule_enabled" => s.ext_schedule_enabled = value == "true",
+        "ext_weather_enabled" => s.ext_weather_enabled = value == "true",
+        "ext_knowledge_enabled" => s.ext_knowledge_enabled = value == "true",
+        "ext_system_enabled" => s.ext_system_enabled = value == "true",
+        "ext_device_enabled" => s.ext_device_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }

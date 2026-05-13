@@ -196,11 +196,11 @@ mod tests {
 
     #[test]
     fn mcp_tool_names_known_tools() {
+        assert_eq!(mcp_tool_names("weather"), "giap__get_current_weather");
         assert_eq!(
-            mcp_tool_names("weather"),
-            "giap__get_current_weather"
+            mcp_tool_names("wikipedia"),
+            "giap__search_wikipedia, giap__get_wikipedia_article"
         );
-        assert_eq!(mcp_tool_names("wikipedia"), "giap__search_wikipedia, giap__get_wikipedia_article");
         assert_eq!(mcp_tool_names("recall_memory"), "giap__recall_memories");
         assert_eq!(mcp_tool_names("save_memory"), "giap__save_memory");
     }
@@ -238,7 +238,8 @@ mod tests {
         assert!(output.contains("He is a wrestler."));
         assert!(output.contains("who is John Cena?"));
         assert!(output.contains("Pre-fetched result"));
-        assert!(output.contains("do not call giap__search_wikipedia, giap__get_wikipedia_article again"));
+        assert!(output
+            .contains("do not call giap__search_wikipedia, giap__get_wikipedia_article again"));
     }
 
     #[test]

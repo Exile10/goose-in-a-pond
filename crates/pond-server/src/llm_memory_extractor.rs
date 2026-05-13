@@ -14,14 +14,21 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const EXTRACTION_PROMPT: &str = "\
-Extract ONLY facts about the USER from this conversation. Output a JSON array only.
-Each item: {\"fact\": \"...\", \"segment\": \"identity|preference|correction|relationship|project|knowledge|context\", \"importance\": 0.0-1.0}
-Rules:
-- ONLY save facts about the user — their identity, preferences, corrections, relationships, projects.
-- NEVER save general knowledge, encyclopedia facts, or information the assistant provided. Only save what the USER revealed about themselves.
-- identity: user's name, role, location, age. preference: user's likes/dislikes/allergies. correction: user correcting the assistant. relationship: people the user knows. project: user's ongoing work/goals. knowledge: facts the user taught that aren't common knowledge. context: user's current situation.
-- Max 3 facts. If the user didn't reveal anything about themselves, output [].
-Output ONLY the JSON array.";
+Extract durable facts about the USER from this conversation turn.
+Return JSON: {\"facts\":[{\"content\":\"one sentence fact\",\"segment\":\"identity|preference|correction|relationship|project|knowledge|context\",\"importance\":0.0-1.0}]}
+
+Segment guide:
+- identity: core user facts (name, role, location). importance 0.80-0.85
+- correction: user explicitly corrects something. importance 0.85-0.90
+- preference: style, defaults, likes/dislikes. importance 0.65-0.75
+- relationship: people, pets, connections. importance 0.65-0.75
+- project: ongoing work, deadlines, goals. importance 0.55-0.65
+- knowledge: facts the user taught (not common knowledge). importance 0.45-0.55
+- context: current situation, transient. importance 0.30-0.40
+
+Max 3 facts per turn. Prefer fewer, higher-quality facts.
+ONLY save facts about the user — NEVER save general knowledge or info the assistant provided.
+If nothing is worth remembering, return {\"facts\":[]}.";
 
 pub struct LlmMemoryExtractor {
     live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -72,8 +79,11 @@ impl MemoryExtractor for LlmMemoryExtractor {
 
 /// Parse the LLM's extraction response into `ExtractedFact` objects.
 ///
-/// Tries JSON array first, then falls back to line-by-line parsing
-/// for models that produce malformed JSON.
+/// Accepts multiple formats for robustness with small models:
+/// - New format: `{"facts": [...]}`
+/// - Legacy format: bare JSON array `[...]`
+/// - Preamble: text before the JSON (model may add explanation)
+/// - Wrapped in thinking tags
 fn parse_extraction_response(
     raw: &str,
     existing_content: &[String],
@@ -84,17 +94,34 @@ fn parse_extraction_response(
     // Strip thinking tokens if present
     let cleaned = strip_thinking(text);
 
-    // Try JSON array parse
+    // Try new format: {"facts": [...]}
+    if let Some(arr) = extract_facts_from_object(&cleaned) {
+        let facts = parse_fact_array(&arr, existing_content, max_facts);
+        return Ok(facts);
+    }
+
+    // Try legacy format: bare JSON array [...]
     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
         let facts: Vec<ExtractedFact> = arr
             .iter()
             .filter_map(|v| parse_fact_json(v, existing_content))
-            .take(3)
+            .take(max_facts)
             .collect();
         return Ok(facts);
     }
 
     // Try extracting JSON from within the text (model may add preamble)
+    // First try object format, then array format
+    if let Some(start) = cleaned.find('{') {
+        if let Some(end) = cleaned.rfind('}') {
+            let slice = &cleaned[start..=end];
+            if let Some(arr) = extract_facts_from_object(slice) {
+                let facts = parse_fact_array(&arr, existing_content, max_facts);
+                return Ok(facts);
+            }
+        }
+    }
+
     if let Some(start) = cleaned.find('[') {
         if let Some(end) = cleaned.rfind(']') {
             let slice = &cleaned[start..=end];
@@ -109,16 +136,45 @@ fn parse_extraction_response(
         }
     }
 
-    // Empty array is valid — no facts to extract
-    if cleaned == "[]" || cleaned.is_empty() {
+    // Empty array/object is valid — no facts to extract
+    if cleaned == "[]"
+        || cleaned.is_empty()
+        || cleaned == "{\"facts\":[]}"
+        || cleaned == r#"{"facts": []}"#
+    {
         return Ok(vec![]);
     }
 
     Ok(vec![])
 }
 
+/// Try to parse `{"facts": [...]}` wrapper and return the inner array.
+fn extract_facts_from_object(text: &str) -> Option<Vec<serde_json::Value>> {
+    let obj: serde_json::Value = serde_json::from_str(text).ok()?;
+    let arr = obj.get("facts")?.as_array()?;
+    Some(arr.clone())
+}
+
+/// Parse a JSON array of fact objects into `ExtractedFact` values.
+fn parse_fact_array(
+    arr: &[serde_json::Value],
+    existing_content: &[String],
+    max_facts: usize,
+) -> Vec<ExtractedFact> {
+    arr.iter()
+        .filter_map(|v| parse_fact_json(v, existing_content))
+        .take(max_facts)
+        .collect()
+}
+
 fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<ExtractedFact> {
-    let content = v.get("fact").and_then(|f| f.as_str())?.trim().to_string();
+    // Accept both new format key ("content") and legacy key ("fact")
+    let content = v
+        .get("content")
+        .or_else(|| v.get("fact"))
+        .and_then(|f| f.as_str())?
+        .trim()
+        .to_string();
     if content.len() < 5 {
         return None;
     }
@@ -272,5 +328,64 @@ mod tests {
         let json = r#"[{"fact": "High importance", "segment": "identity", "importance": 1.5}]"#;
         let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts[0].importance, 1.0);
+    }
+
+    // ── New format tests ({"facts": [...]}) ──────────────────────────────────
+
+    #[test]
+    fn parse_new_format_with_content_key() {
+        let json = r#"{"facts": [
+            {"content": "User's name is Jerry", "segment": "identity", "importance": 0.82},
+            {"content": "User prefers dark mode", "segment": "preference", "importance": 0.7}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].content, "User's name is Jerry");
+        assert_eq!(facts[0].segment, MemorySegment::Identity);
+        assert!((facts[0].importance - 0.82).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_new_format_empty() {
+        let json = r#"{"facts": []}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_new_format_with_preamble() {
+        let text = r#"Here are the extracted facts:
+{"facts": [{"content": "Lives in Nairobi", "segment": "identity", "importance": 0.8}]}"#;
+        let facts = parse_extraction_response(text, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "Lives in Nairobi");
+    }
+
+    #[test]
+    fn parse_new_format_with_thinking() {
+        let text = r#"<think>analyzing conversation</think>{"facts": [{"content": "User works at Jarida", "segment": "identity", "importance": 0.83}]}"#;
+        let facts = parse_extraction_response(text, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].segment, MemorySegment::Identity);
+    }
+
+    #[test]
+    fn parse_new_format_respects_max_facts() {
+        let json = r#"{"facts": [
+            {"content": "Fact one", "segment": "knowledge", "importance": 0.5},
+            {"content": "Fact two", "segment": "knowledge", "importance": 0.5},
+            {"content": "Fact three", "segment": "knowledge", "importance": 0.5},
+            {"content": "Fact four", "segment": "knowledge", "importance": 0.5}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 3);
+    }
+
+    #[test]
+    fn parse_new_format_dedup_works() {
+        let existing = vec!["user works at jarida".to_string()];
+        let json = r#"{"facts": [{"content": "User works at Jarida", "segment": "identity", "importance": 0.83}]}"#;
+        let facts = parse_extraction_response(json, &existing, 3).unwrap();
+        assert!(facts.is_empty());
     }
 }

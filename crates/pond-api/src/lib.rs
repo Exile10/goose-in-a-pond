@@ -137,12 +137,8 @@ pub struct AppState {
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.
+    /// Retained for Phase 3 memory vector search.
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
-    /// Embedding-based domain classifier for fast tool routing (~10ms).
-    /// Initialized at startup when `embedding_provider` is available.
-    /// Falls back to keyword classifier when `None`.
-    pub embedding_classifier:
-        Option<Arc<pond_core::services::embedding_classifier::EmbeddingClassifier>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).
@@ -229,9 +225,6 @@ pub struct AppState {
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Tool Agent — classifies messages, executes tools (Wikipedia, weather,
-    /// memory), and returns augmented context before the main LLM runs.
-    pub tool_agent: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>>,
     /// Answer Reviewer — adversarial post-inference review that evaluates
     /// answer quality and triggers revision when below threshold.
     pub answer_reviewer: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>>,
