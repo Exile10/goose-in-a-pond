@@ -5,6 +5,7 @@ pub mod mock_handshake;
 pub mod onboarding;
 pub mod pruning;
 pub mod sqlite_device_registry;
+pub mod sqlite_draft;
 pub mod sqlite_event_log;
 pub mod sqlite_face_recognition;
 pub mod sqlite_mcp_servers;

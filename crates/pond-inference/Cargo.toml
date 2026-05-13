@@ -1,0 +1,41 @@
+[package]
+name = "pond-inference"
+description = "In-process GGUF inference engine for GIAP (llama.cpp, no Goose dependency)"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# ── Build note ────────────────────────────────────────────────────────────────
+# This crate compiles llama-cpp-2 (heavy C++ lib).
+# First compile takes 5-15 min. Metal (macOS) activates automatically via
+# llama-cpp-2's target_os cfg. CUDA (Jetson) requires --features cuda.
+#
+# To build:
+#   cargo build -p pond-inference
+#   cargo build -p pond-inference --features cuda   # Jetson
+
+[features]
+default = []
+# Enable CUDA kernel compilation for Jetson Orin Nano / NVIDIA GPUs.
+cuda = ["llama-cpp-2/cuda"]
+
+[dependencies]
+pond-core     = { workspace = true }
+anyhow        = { workspace = true }
+async-trait   = { workspace = true }
+async-stream  = { workspace = true }
+futures       = { workspace = true }
+serde         = { workspace = true, features = ["derive"] }
+serde_json    = { workspace = true }
+tokio         = { workspace = true, features = ["sync", "rt"] }
+tracing       = { workspace = true }
+uuid          = { workspace = true, features = ["v4"] }
+encoding_rs   = "0.8"
+
+# The version MUST match goose's pinned version to avoid duplicate llama backends.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = { version = "0.1.143", features = ["sampler"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.143", features = ["sampler", "metal"] }

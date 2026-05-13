@@ -61,7 +61,6 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                     model_role: "task".to_string(),
                     images: vec![],
                     voice_mode: false,
-                    domain: None,
                 };
 
                 tracing::info!("[scheduler] executing prompt for task {task_id}");

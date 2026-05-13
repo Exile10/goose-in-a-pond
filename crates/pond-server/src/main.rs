@@ -64,6 +64,7 @@ use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
+use pond_infra::sqlite_draft::SqliteDraftRepository;
 use pond_infra::sqlite_event_log::SqliteEventLogRepository;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
@@ -1075,6 +1076,8 @@ async fn run_server(
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
     let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
         Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<dyn pond_core::ports::sensor_storage::SensorStorage + Send + Sync> =
         Arc::new(SqliteSensorStorage::new(db.logs.clone()));
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
@@ -1254,20 +1257,6 @@ async fn run_server(
         Some(Arc::new(pool))
     };
 
-    // Build ToolAgent for the HTTP path — uses keyword routing (instant, no LLM call).
-    // The live_provider is retained for potential fallback classification.
-    // Tool result cache: in-memory LRU with per-tool TTLs (weather=5m, wikipedia=1h, etc.)
-    let tool_cache: Arc<dyn pond_core::ports::tool_cache::ToolCache> =
-        Arc::new(pond_core::services::tool_cache::InMemoryToolCache::new());
-    println!("  Tool Agent: keyword routing (zero LLM overhead), cache=enabled");
-    let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent {
-            live_provider: llm_provider.clone(),
-            tool_cache: Some(tool_cache),
-            settings_repo: settings_repo.clone(),
-        })
-            as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
-
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
     // The routes.rs handler checks review_mode at request time, not at startup.
@@ -1390,7 +1379,7 @@ async fn run_server(
         });
     }
 
-    // Weather — fed into GiapServiceHandles (MCP tool), not AppState.
+    // Weather — used by the MCP weather module, not AppState.
     // The LLM calls giap__get_current_weather when it needs weather data.
     let weather: Option<Arc<dyn WeatherProvider>> = {
         if settings.weather_enabled
@@ -1468,9 +1457,49 @@ async fn run_server(
     let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> =
         None;
 
+    // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
+    // Initialized before the agent backend so it can be wired into the memory
+    // MCP server for semantic search on recall/save.
+    let embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    > = {
+        use pond_core::ports::embedding::EmbeddingProvider as _;
+        if settings.embedding_provider == "none" {
+            tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
+            None
+        } else {
+            let emb_model = if settings.active_embedding_model.is_empty() {
+                "all-MiniLM-L6-v2"
+            } else {
+                &settings.active_embedding_model
+            };
+            let cache_dir = data_dir.join("models").join("embedding");
+            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                emb_model,
+                Some(cache_dir),
+            ) {
+                Ok(provider) => {
+                    tracing::info!(
+                        model = provider.model_name(),
+                        dims = provider.dimensions(),
+                        "embedding provider ready"
+                    );
+                    Some(Arc::new(provider)
+                        as Arc<
+                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
+                        >)
+                }
+                Err(e) => {
+                    tracing::warn!("embedding provider failed to init: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+
     // ── Agent backend ────────────────────────────────────────────────────────────
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager, tool_caller, tool_registry) = build_goose_backend(
+    let (agent, extension_manager, _tool_caller, tool_registry) = build_goose_backend(
         agent_backend,
         &llamafile_url,
         &data_dir,
@@ -1479,10 +1508,12 @@ async fn run_server(
         scheduler.clone(),
         settings_repo.clone(),
         memory_repo.clone(),
+        embedding_provider.clone(),
         skill_repo.clone(),
         recipe_repo.clone(),
         prompt_template_repo.clone(),
         prompt_extra_repo.clone(),
+        draft_repo.clone(),
         false, // voice_mode — server mode, not voice
     )
     .await;
@@ -1625,66 +1656,6 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
-    // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
-    let embedding_provider: Option<
-        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
-    > = {
-        use pond_core::ports::embedding::EmbeddingProvider as _;
-        if settings.embedding_provider == "none" {
-            tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
-            None
-        } else {
-            let emb_model = if settings.active_embedding_model.is_empty() {
-                "all-MiniLM-L6-v2"
-            } else {
-                &settings.active_embedding_model
-            };
-            let cache_dir = data_dir.join("models").join("embedding");
-            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
-                emb_model,
-                Some(cache_dir),
-            ) {
-                Ok(provider) => {
-                    tracing::info!(
-                        model = provider.model_name(),
-                        dims = provider.dimensions(),
-                        "embedding provider ready"
-                    );
-                    Some(Arc::new(provider)
-                        as Arc<
-                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
-                        >)
-                }
-                Err(e) => {
-                    tracing::warn!("embedding provider failed to init: {e:#}");
-                    None
-                }
-            }
-        }
-    };
-
-    // ── Embedding-based domain classifier ─────────────────────────────────────
-    // Pre-compute domain description embeddings for fast cosine-similarity
-    // classification (~10ms per query vs ~2s for LLM classification).
-    let embedding_classifier = if let Some(ref emb) = embedding_provider {
-        match pond_core::services::embedding_classifier::EmbeddingClassifier::new(emb.as_ref())
-            .await
-        {
-            Ok(c) => {
-                tracing::info!("embedding classifier ready — semantic domain routing enabled");
-                Some(Arc::new(c))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "embedding classifier init failed: {e} — falling back to keyword routing"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1706,7 +1677,6 @@ async fn run_server(
         device_registry,
         memory_repo,
         embedding_provider,
-        embedding_classifier,
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -1743,7 +1713,6 @@ async fn run_server(
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: tool_agent_for_http,
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,
@@ -2108,6 +2077,8 @@ async fn run_chat(
     let device_registry_arc: Arc<
         dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
@@ -2200,10 +2171,12 @@ async fn run_chat(
             None, // scheduler not used in voice mode
             settings_repo_arc,
             memory_repo,
+            None, // embedding_provider — not used in voice/chat CLI mode
             skill_repo,
             recipe_repo,
             template_repo,
             extras_repo,
+            draft_repo,
             input == "whisper", // voice_mode
         )
         .await;
@@ -2497,337 +2470,9 @@ async fn run_chat(
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
-    // ── Wire Tool Agent for voice mode ──
-    // Build a provider for the tool classifier. When goose-agent is active,
-    // ChatService.provider is None (GooseAdapter manages its own provider),
-    // so we construct one explicitly for classification calls.
-    {
-        let classifier_provider: Option<Arc<dyn pond_core::ports::provider::LlmProvider>> =
-            if let Some(ref p) = chat_service.provider_ref() {
-                Some(p.clone())
-            } else {
-                // GooseAdapter mode — build a provider from settings for classification
-                match effective_provider {
-                    "local" | "gguf" => {
-                        #[cfg(feature = "local-inference")]
-                        {
-                            use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-                            LocalInferenceLlmAdapter::new_with_data_dir(effective_model, &data_dir)
-                                .await
-                                .ok()
-                                .map(|p| {
-                                    Arc::new(p) as Arc<dyn pond_core::ports::provider::LlmProvider>
-                                })
-                        }
-                        #[cfg(not(feature = "local-inference"))]
-                        {
-                            None
-                        }
-                    }
-                    "ollama" => Some(Arc::new(OllamaProvider::new(None, Some(effective_model)))
-                        as Arc<dyn pond_core::ports::provider::LlmProvider>),
-                    _ => Some(Arc::new(LlamafileProvider::new(Some(&llamafile_url)))
-                        as Arc<dyn pond_core::ports::provider::LlmProvider>),
-                }
-            };
-
-        if let Some(provider) = classifier_provider {
-            let live = Arc::new(tokio::sync::RwLock::new(Some(
-                provider as Arc<dyn pond_core::ports::provider::LlmProvider>,
-            )));
-            let chat_tool_cache: Arc<dyn pond_core::ports::tool_cache::ToolCache> =
-                Arc::new(pond_core::services::tool_cache::InMemoryToolCache::new());
-            let chat_settings_repo: Arc<
-                dyn pond_core::ports::settings::SettingsRepository + Send + Sync,
-            > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
-            let ta = GiapToolAgent {
-                live_provider: live,
-                tool_cache: Some(chat_tool_cache),
-                settings_repo: chat_settings_repo,
-            };
-            chat_service = chat_service.with_tool_agent(Arc::new(ta));
-            println!("  Tool Agent: active (classifier + wikipedia/weather/memory + cache)");
-        } else {
-            println!("  Tool Agent: inactive (no provider available for classification)");
-        }
-    }
-
     chat_service.run_loop().await?;
 
     Ok(())
-}
-
-/// Tool Agent — LLM-based classification on a concurrent thread.
-///
-/// Uses the live LLM provider to classify every message. The classification
-/// runs concurrently with I/O prep work (memory prefetch, message persist,
-/// llamafile readiness) via `tokio::join!` in routes.rs — so the LLM call
-/// overlaps with other work instead of blocking serially.
-///
-/// On HTTP providers (Ollama/llamafile), the classifier LLM call runs on a
-/// separate HTTP connection, truly parallel with the main chat's prep phase.
-/// On local GGUF, it serializes behind the model mutex but the I/O prep
-/// still runs concurrently.
-struct GiapToolAgent {
-    /// Live provider — reads from the RwLock so it always uses whatever
-    /// model is currently loaded. Zero model-swap overhead.
-    live_provider:
-        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
-    /// Optional tool result cache — when present and the `tool_cache_enabled`
-    /// setting is true, tool results are cached with per-tool TTLs to avoid
-    /// redundant API calls for identical queries.
-    tool_cache: Option<Arc<dyn pond_core::ports::tool_cache::ToolCache>>,
-    /// Settings repository — used to check `tool_output_compaction` and `tool_cache_enabled`.
-    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
-}
-
-#[async_trait::async_trait]
-impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
-    async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
-        let provider = {
-            let guard = self.live_provider.read().await;
-            match guard.as_ref() {
-                Some(p) => p.clone(),
-                None => {
-                    println!("[tool-agent] no provider available, skipping");
-                    return Ok(None);
-                }
-            }
-        };
-
-        let classify_prompt = pond_core::prompts::build_classifier_prompt();
-
-        println!(
-            "[tool-agent] classifying (model={}): {:?}",
-            provider.model_name(),
-            &message[..message.len().min(80)]
-        );
-
-        let classify_msg = vec![pond_core::domain::message::ChatMessage::user(message)];
-        let response = match provider.complete(&classify_prompt, classify_msg).await {
-            Ok(r) => r,
-            Err(e) => {
-                println!("[tool-agent] classify error: {e}");
-                return Ok(None);
-            }
-        };
-
-        let text = strip_thinking_tags(&response.content).to_lowercase();
-        println!(
-            "[tool-agent] classify result: {:?}",
-            &text[..text.len().min(200)]
-        );
-
-        let needs_tool = text.contains("\"needs_tool\": true")
-            || text.contains("\"needs_tool\":true")
-            || text.contains("needs_tool\": true");
-
-        if !needs_tool {
-            return Ok(None);
-        }
-
-        let tool = if text.contains("weather") {
-            "weather"
-        } else if text.contains("time") || text.contains("date") || text.contains("clock") {
-            "time"
-        } else if text.contains("save_memory") {
-            "save_memory"
-        } else if text.contains("recall_memory") {
-            "recall_memory"
-        } else if text.contains("devices") {
-            "devices"
-        } else if text.contains("create_schedule") {
-            "create_schedule"
-        } else if text.contains("schedules") {
-            "schedules"
-        } else {
-            "wikipedia"
-        };
-
-        println!("[tool-agent] tool={}, executing...", tool);
-
-        // ── Time/date — instant, no network call ─────────────────────────
-        if matches!(tool, "time" | "date" | "clock") {
-            let now = chrono::Local::now();
-            let result = format!(
-                "Current time: {}. Today is {}.",
-                now.format("%H:%M:%S %p"),
-                now.format("%A, %B %d, %Y")
-            );
-            return Ok(Some(pond_api::tool_context::format_tool_context(
-                "time",
-                "current time",
-                message,
-                &result,
-            )));
-        }
-
-        // Extract the cleaned query for tool attribution (e.g. "John Cena" from "who is John Cena?")
-        let query = pond_mcp_server::clean_query_for_search(message);
-
-        // ── Tool result cache ────────────────────────────────────────────
-        let use_cache = pond_core::domain::tool_cache::is_cacheable_tool(tool)
-            && self
-                .settings_repo
-                .get()
-                .await
-                .map(|s| s.tool_cache_enabled)
-                .unwrap_or(true);
-
-        if use_cache {
-            if let Some(ref cache) = self.tool_cache {
-                if let Some(cached) = cache.get(tool, message) {
-                    println!(
-                        "[tool-agent] cache HIT for {}:{} ({} chars)",
-                        tool,
-                        &message[..message.len().min(40)],
-                        cached.len()
-                    );
-                    return Ok(Some(pond_api::tool_context::format_tool_context(
-                        tool, &query, message, &cached,
-                    )));
-                }
-            }
-        }
-
-        match pond_mcp_server::try_tool_agent(tool, message).await {
-            Some(info) => {
-                let raw_len = info.len();
-
-                // Cache the raw result for future identical queries.
-                if use_cache {
-                    if let Some(ref cache) = self.tool_cache {
-                        let ttl = pond_core::domain::tool_cache::default_ttl_for_tool(tool);
-                        cache.put(tool, message, info.clone(), ttl);
-                        println!(
-                            "[tool-agent] cached {}:{} (ttl={}s)",
-                            tool,
-                            &message[..message.len().min(40)],
-                            ttl.as_secs()
-                        );
-                    }
-                }
-
-                // Apply context-aware semantic compaction when enabled.
-                let compacted = {
-                    let settings = self.settings_repo.get().await.unwrap_or_default();
-                    if settings.tool_output_compaction {
-                        let ctx = if settings.context_window_override > 0 {
-                            settings.context_window_override as usize
-                        } else {
-                            8192 // default M4/macOS context
-                        };
-                        let c = pond_core::services::tool_output_compactor::compact_tool_output(
-                            tool, &info, ctx,
-                        );
-                        println!(
-                            "[tool-agent] compacted {} -> {} chars ({}%) [ctx={}]",
-                            raw_len,
-                            c.len(),
-                            if raw_len > 0 {
-                                100 - (c.len() * 100 / raw_len)
-                            } else {
-                                0
-                            },
-                            ctx
-                        );
-                        c
-                    } else {
-                        info
-                    }
-                };
-                Ok(Some(pond_api::tool_context::format_tool_context(
-                    tool, &query, message, &compacted,
-                )))
-            }
-            None => {
-                // Tool was classified but returned no result — tell the LLM
-                println!("[tool-agent] tool returned no result, injecting failure context");
-                Ok(Some(pond_api::tool_context::format_tool_failure(
-                    tool, &query, message,
-                )))
-            }
-        }
-    }
-
-    async fn process_multi(
-        &self,
-        message: &str,
-    ) -> anyhow::Result<Vec<pond_core::domain::tool_result::ToolResult>> {
-        use pond_core::domain::tool_result::ToolResult;
-        use pond_core::services::request_classifier::{route_to_tools, ToolRouting};
-
-        let routings = route_to_tools(message);
-
-        // No tools matched — empty result.
-        if routings.is_empty() {
-            println!(
-                "[tool-agent-multi] no tools matched for: {:?}",
-                &message[..message.len().min(80)]
-            );
-            return Ok(vec![]);
-        }
-
-        // Single tool — use the existing single-tool path for consistency.
-        if routings.len() == 1 {
-            let tool_name = routings[0].tool_name();
-            println!(
-                "[tool-agent-multi] single tool: {}, delegating to process()",
-                tool_name
-            );
-            return match self.process(message).await? {
-                Some(result) => Ok(vec![ToolResult::new(tool_name, result)]),
-                None => Ok(vec![]),
-            };
-        }
-
-        // Multiple tools — dispatch in parallel via join_all.
-        println!(
-            "[tool-agent-multi] dispatching {} tools in parallel: {:?}",
-            routings.len(),
-            routings.iter().map(|r| r.tool_name()).collect::<Vec<_>>()
-        );
-
-        let msg = message.to_string();
-        let futures: Vec<_> = routings
-            .iter()
-            .filter(|r| **r != ToolRouting::None)
-            .map(|routing| {
-                let tool_name = routing.tool_name().to_string();
-                let msg_clone = msg.clone();
-                async move {
-                    match pond_mcp_server::try_tool_agent(&tool_name, &msg_clone).await {
-                        Some(info) => {
-                            println!(
-                                "[tool-agent-multi] {} returned {} chars",
-                                tool_name,
-                                info.len()
-                            );
-                            Some(ToolResult::new(tool_name, info))
-                        }
-                        None => {
-                            println!("[tool-agent-multi] {} returned no result", tool_name);
-                            None
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let results: Vec<ToolResult> = futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
-
-        println!(
-            "[tool-agent-multi] got {} results from {} tools",
-            results.len(),
-            routings.len()
-        );
-
-        Ok(results)
-    }
 }
 
 // ── Adversarial Answer Reviewer ───────────────────────────────────────────────
@@ -2839,7 +2484,7 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 /// the critique back to the LLM for revision.
 struct GiapAnswerReviewer {
     /// Live provider reference — reads from the RwLock so it always uses
-    /// whatever model is currently loaded. Matches the GiapToolAgent pattern.
+    /// whatever model is currently loaded.
     live_provider:
         Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
     pass_threshold: u8,
@@ -4129,12 +3774,16 @@ async fn build_goose_backend(
     scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
     settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
     memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    >,
     skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync>,
     recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
     template_repo: Arc<
         dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     >,
     extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
+    draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
@@ -4142,7 +3791,7 @@ async fn build_goose_backend(
     Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
     Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>,
 ) {
-    use pond_adapters_goose::{register_giap_extension, GiapServiceHandles, GooseAdapter};
+    use pond_adapters_goose::GooseAdapter;
     use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::ports::extension_manager::ExtensionManagerPort;
     use pond_core::ports::tool_caller::ToolCaller;
@@ -4156,55 +3805,48 @@ async fn build_goose_backend(
     }
 
     // Build tool-calling specialist (FunctionGemma) if configured.
-    // The Tool Agent runs BEFORE the main LLM — model swap overhead is
-    // accepted because the main model never attempts tool calls itself.
     let tool_caller: Option<Arc<dyn ToolCaller>> = {
         let settings = settings_repo.get().await.unwrap_or_default();
         match settings.tool_model.as_deref() {
             Some(model_name) if !model_name.is_empty() => {
                 match ToolCallerEngine::new(model_name, data_dir).await {
                     Ok(engine) => {
-                        println!(
-                            "[tool-agent] FunctionGemma specialist loaded: {}",
-                            model_name
-                        );
                         tracing::info!("Tool-calling specialist loaded: {}", model_name);
                         Some(Arc::new(engine) as Arc<dyn ToolCaller>)
                     }
                     Err(e) => {
-                        println!(
-                            "[tool-agent] FAILED to load specialist '{}': {e}",
-                            model_name
-                        );
                         tracing::warn!("Failed to load tool specialist '{}': {e}", model_name);
                         None
                     }
                 }
             }
-            _ => {
-                println!("[tool-agent] no tool_model configured, using code-path fallback");
-                None
-            }
+            _ => None,
         }
     };
 
-    // Register the GIAP MCP server into Goose's builtin extension registry.
-    let handles = Arc::new(GiapServiceHandles {
-        weather,
-        device_registry: device_registry.clone(),
+    // Register all GIAP MCP servers into Goose's builtin extension registry.
+    // Extension toggles (ext_*_enabled) are read from settings to gate registration.
+    let settings = settings_repo.get().await.unwrap_or_default();
+    match pond_adapters_goose::register_giap_extensions(
+        &settings,
+        memory_repo.clone(),
+        embedding_provider,
         scheduler,
-        settings_repo: settings_repo.clone(),
-        memory_repo: memory_repo.clone(),
-        skill_repo: skill_repo.clone(),
-        recipe_repo: recipe_repo.clone(),
-        http_client: reqwest::Client::new(),
-        tool_caller: tool_caller.clone(),
-        last_user_message: tokio::sync::RwLock::new(String::new()),
-        last_tool_topic: tokio::sync::RwLock::new(String::new()),
-    });
-    if let Err(e) = register_giap_extension(handles) {
-        tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
-        return (Arc::new(MockAgent::new()), None, None, default_registry);
+        weather,
+        settings_repo.clone(),
+        device_registry.clone(),
+        skill_repo.clone(),
+        recipe_repo.clone(),
+        draft_repo,
+        tool_caller.clone(),
+    ) {
+        Ok(ext_names) => {
+            tracing::info!(extensions = ?ext_names, "GIAP MCP registration complete");
+        }
+        Err(e) => {
+            tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
+            return (Arc::new(MockAgent::new()), None, None, default_registry);
+        }
     }
 
     // Build the adapter with all repos injected.
@@ -4545,15 +4187,11 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
 // ── Agent CLI ─────────────────────────────────────────────────────────────────
 
-/// Resolve the model role string from a `--role` flag value and the message text.
-fn resolve_role(role_arg: &str, message: &str) -> String {
-    use pond_core::services::request_classifier::classify_request;
+/// Resolve the model role string from a `--role` flag value.
+/// All requests default to "chat" — the LLM handles tool routing natively via MCP.
+fn resolve_role(role_arg: &str, _message: &str) -> String {
     match role_arg {
-        "auto" => match classify_request(message) {
-            pond_core::domain::model_role::ModelRole::Think => "think".to_string(),
-            pond_core::domain::model_role::ModelRole::Task => "task".to_string(),
-            pond_core::domain::model_role::ModelRole::Chat => "chat".to_string(),
-        },
+        "auto" | "chat" => "chat".to_string(),
         other => other.to_string(),
     }
 }
@@ -4661,6 +4299,8 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
     let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
@@ -4711,10 +4351,12 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI chat
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
                 false,
             )
             .await;
@@ -4725,7 +4367,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 model_role,
                 images: Vec::new(),
                 voice_mode: false,
-                domain: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -4743,10 +4384,12 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI repl
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
                 false,
             )
             .await;
@@ -4785,7 +4428,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     model_role,
                     images: Vec::new(),
                     voice_mode: false,
-                    domain: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -4803,10 +4445,12 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI tools listing
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
                 false,
             )
             .await;

@@ -4,7 +4,6 @@ use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
-use crate::ports::tool_agent::ToolAgent;
 use crate::ports::voice_input::VoiceInput;
 use crate::ports::voice_output::VoiceOutput;
 use crate::ports::wake_word::StreamingWakeWordDetector;
@@ -21,18 +20,10 @@ use uuid::Uuid;
 
 // ── Voice helpers ─────────────────────────────────────────────────────────────
 
-/// Classify a voice message into a model role string.
-///
-/// Voice mode defaults Chat-classified messages to "chat" as well; the role
-/// is metadata for the GooseAdapter's model selection.
-fn resolve_voice_role(message: &str) -> String {
-    use crate::domain::model_role::ModelRole;
-    use crate::services::request_classifier::classify_request;
-    match classify_request(message) {
-        ModelRole::Think => "think".to_string(),
-        ModelRole::Task => "task".to_string(),
-        ModelRole::Chat => "chat".to_string(),
-    }
+/// Voice mode always uses the "chat" role. The LLM handles tool routing
+/// natively via MCP — no pre-classification needed.
+fn resolve_voice_role(_message: &str) -> String {
+    "chat".to_string()
 }
 
 /// Human-readable announcement spoken while an MCP tool is executing.
@@ -1026,9 +1017,6 @@ pub struct ChatService {
     /// Optional LLM-based context compactor.  When set, triggers at 80% of
     /// the context budget instead of falling straight to trim_to_budget.
     compactor: Option<ContextCompactor>,
-    /// Optional Tool Agent — classifies messages and pre-fetches tool data
-    /// (Wikipedia, weather, memory) before the main LLM runs.
-    tool_agent: Option<Arc<dyn ToolAgent>>,
     /// Optional Answer Reviewer — adversarial post-inference quality gate.
     answer_reviewer: Option<Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>>,
 }
@@ -1049,15 +1037,8 @@ impl ChatService {
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
             compactor: None,
-            tool_agent: None,
             answer_reviewer: None,
         }
-    }
-
-    /// Attach a Tool Agent for pre-inference tool classification and execution.
-    pub fn with_tool_agent(mut self, agent: Arc<dyn ToolAgent>) -> Self {
-        self.tool_agent = Some(agent);
-        self
     }
 
     /// Attach an Answer Reviewer for post-inference adversarial quality review.
@@ -1148,7 +1129,6 @@ impl ChatService {
             model_role: resolve_voice_role(&message),
             images: Vec::new(),
             voice_mode: false,
-            domain: None,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1262,36 +1242,13 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
-        let agent_message = if let Some(ref tool_agent) = self.tool_agent {
-            match tool_agent.process(&message).await {
-                Ok(Some(augmented)) => {
-                    println!(
-                        "[voice-tool-agent] tool result injected ({} chars)",
-                        augmented.len()
-                    );
-                    augmented
-                }
-                Ok(None) => {
-                    println!("[voice-tool-agent] no tool needed");
-                    message.clone()
-                }
-                Err(e) => {
-                    println!("[voice-tool-agent] error: {e}, using original message");
-                    message.clone()
-                }
-            }
-        } else {
-            message.clone()
-        };
-
+        // The LLM handles tool routing natively via MCP — no pre-classification needed.
         let request = AgentRequest {
-            message: agent_message,
+            message: message.clone(),
             session_id: self.session_id.clone(),
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
-            domain: None,
         };
 
         // Start a soft ambient thinking tone while the LLM infers.

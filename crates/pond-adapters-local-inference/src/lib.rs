@@ -163,6 +163,8 @@ impl LocalInferenceLlmAdapter {
                         if !registry.has_model(&stem) {
                             let mut settings = ModelSettings::default();
                             settings.native_tool_calling = true;
+                            settings.use_jinja = true;
+                            settings.enable_thinking = false;
                             let entry = LocalModelEntry {
                                 id: stem.clone(),
                                 repo_id: format!("local/{}", stem),
@@ -172,6 +174,10 @@ impl LocalInferenceLlmAdapter {
                                 source_url: String::new(),
                                 settings,
                                 size_bytes: 0,
+                                mmproj_path: None,
+                                mmproj_size_bytes: 0,
+                                mmproj_source_url: None,
+                                shard_files: vec![],
                             };
                             if let Err(e) = registry.add_model(entry) {
                                 tracing::warn!("Could not register GGUF model '{}': {}", stem, e);
@@ -216,6 +222,8 @@ impl LocalInferenceLlmAdapter {
                     if !registry.has_model(&id) {
                         let mut settings = ModelSettings::default();
                         settings.native_tool_calling = true;
+                        settings.use_jinja = true;
+                        settings.enable_thinking = false;
                         let entry = LocalModelEntry {
                             id: id.clone(),
                             repo_id: repo_id.to_string(),
@@ -225,6 +233,10 @@ impl LocalInferenceLlmAdapter {
                             source_url,
                             settings,
                             size_bytes: 0,
+                            mmproj_path: None,
+                            mmproj_size_bytes: 0,
+                            mmproj_source_url: None,
+                            shard_files: vec![],
                         };
                         if let Err(e) = registry.add_model(entry) {
                             tracing::warn!("Could not register GGUF model '{}': {}", id, e);
@@ -259,16 +271,26 @@ impl LocalInferenceLlmAdapter {
             // Full GPU offload — Apple Silicon has unified memory so all layers
             // fit without any CPU/GPU split.
             n_gpu_layers: Some(99),
-            // 8K context balances memory usage and conversation depth.
-            // Fits ~6K tokens of history + system prompt + 2K generation headroom.
-            // On M4 with 18GB this uses ~322MB KV cache for E4B — very comfortable.
-            context_size: Some(8192),
+            // Dynamic: let Goose's estimate_max_context_for_memory() calculate
+            // from available RAM + model KV cache cost per token. No hardcoded cap.
+            context_size: None,
             // Batch 512 is optimal for Metal prefill throughput.
             n_batch: Some(512),
             // Flash attention reduces KV-cache memory by ~40%.
             flash_attention: Some(true),
             // Unified memory — mlock is unnecessary and can cause issues.
             use_mlock: false,
+            // Jinja ON — Gemma 4's GGUF embeds a Jinja2 template that renders
+            // tool schemas into its native <|tool>declaration:NAME{...}<tool|> format.
+            // Without this, the model never sees tools in the format it was trained on.
+            use_jinja: true,
+            // Native tool calling ON — Gemma 4 produces <|tool_call>call:NAME{...}<tool_call|>
+            // which Goose's tool_parsing.rs already recognizes.
+            native_tool_calling: true,
+            // Thinking OFF — GIAP handles thinking display through its own
+            // PromptState + ThoughtFilter pipeline, not llama.cpp's native
+            // reasoning_format which causes Gemma 4 E2B to produce immediate EOS.
+            enable_thinking: false,
             // Let llama.cpp auto-detect thread count (good on Apple Silicon).
             ..Default::default()
         };
@@ -283,7 +305,7 @@ impl LocalInferenceLlmAdapter {
                     );
                 } else {
                     tracing::info!(
-                        "Applied Metal/platform settings to model '{}' (n_gpu_layers=99, ctx=8192, flash_attn=true)",
+                        "Applied Metal/platform settings to model '{}' (n_gpu_layers=99, ctx=dynamic, flash_attn=true)",
                         model_id
                     );
                 }
@@ -328,6 +350,12 @@ impl LocalInferenceLlmAdapter {
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
+            // Jinja ON — Gemma 4 needs Jinja for native tool declarations.
+            use_jinja: true,
+            // Native tool calling — Gemma 4 produces tool calls in its trained format.
+            native_tool_calling: true,
+            // Thinking OFF — GIAP handles thinking via PromptState + ThoughtFilter.
+            enable_thinking: false,
             ..Default::default()
         };
 

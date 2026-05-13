@@ -68,7 +68,6 @@ async fn live_action_loop_ollama_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
-        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -135,7 +134,6 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
-        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -198,7 +196,6 @@ async fn live_action_loop_local_executes_tool_call() {
         model_role: "task".to_string(),
         images: Vec::new(),
         voice_mode: false,
-        domain: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

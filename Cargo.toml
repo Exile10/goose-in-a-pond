@@ -23,6 +23,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.91.1"
 version = "0.1.0"
 authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
     "Purity Wanjiru <wanjiru@jarida.io>","Emmanuel Oyugi <oyugi@jarida.io>",
@@ -39,15 +40,17 @@ string_slice = "warn"
 # rmcp 1.2.0 — required by goose sub-crates when cargo resolves their
 # `workspace = true` deps against the outer (GIAP) workspace for path-dep builds.
 # No GIAP workspace member uses rmcp directly.
-rmcp = { version = "=1.2.0", features = ["schemars", "auth", "server", "client",
+rmcp = { version = "1.5.0", features = ["schemars", "auth", "server", "client",
     "transport-io", "macros", "transport-child-process",
-    "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+    "transport-streamable-http-client", "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-client-unix-socket"] }
 # ── Goose sub-workspace deps ──────────────────────────────────────────────────
 # Cargo resolves goose crates' `workspace = true` dependency entries against the
 # outermost workspace (GIAP) when those crates are reached via path deps.
 # These entries mirror goose/Cargo.toml [workspace.dependencies] for the deps
 # that are NOT already declared above in GIAP's own dep list.
-agent-client-protocol-schema = { version = "0.11", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.12", features = ["unstable"] }
+agent-client-protocol = "0.11"
 sacp             = "11.0.0"
 arboard          = "3"
 sha2             = "0.10"
