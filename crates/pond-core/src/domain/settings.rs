@@ -273,6 +273,10 @@ pub struct Settings {
     #[serde(default)]
     pub memory_consolidation_enabled: bool,
 
+    /// Consolidation mode: "single" (1 LLM call) or "adversarial" (3-stage Proposer/Adversary/Judge).
+    #[serde(default = "Settings::default_memory_consolidation_mode")]
+    pub memory_consolidation_mode: String,
+
     /// When true, memory retrieval uses causal graph traversal (experimental).
     /// Edges between memories are followed to inject causally relevant context
     /// rather than only recency-based results.
@@ -284,6 +288,16 @@ pub struct Settings {
     pub schedule_result_notify: bool,
 
     // ── Memory tuning ────────────────────────────────────────────────────────
+    /// Base half-life for memory decay in days. Higher-importance memories get
+    /// a longer half-life: `adaptive_half_life = base * (1 + importance)`.
+    /// Default: 11.25 days.
+    #[serde(default = "Settings::default_memory_decay_base_half_life_days")]
+    pub memory_decay_base_half_life_days: f32,
+
+    /// Decay curve steepness factor. Lower = gentler decay. Default: 0.8.
+    #[serde(default = "Settings::default_memory_decay_beta")]
+    pub memory_decay_beta: f32,
+
     /// Memory decay: effective score below this → prune (delete). Default 0.05.
     #[serde(default = "Settings::default_memory_prune_threshold")]
     pub memory_prune_threshold: f32,
@@ -300,7 +314,7 @@ pub struct Settings {
     #[serde(default = "Settings::default_memory_consolidation_interval_hours")]
     pub memory_consolidation_interval_hours: u32,
 
-    /// Max memories to process per consolidation batch. Default 20.
+    /// Max memories to process per consolidation batch. Default 50.
     #[serde(default = "Settings::default_memory_consolidation_batch_size")]
     pub memory_consolidation_batch_size: u32,
 
@@ -458,8 +472,11 @@ impl Default for Settings {
             memory_extraction_enabled: true,
             memory_cleanup_enabled: true,
             memory_consolidation_enabled: false, // requires enough memories to be useful
+            memory_consolidation_mode: Self::default_memory_consolidation_mode(),
             memory_graph_enabled: false,         // experimental causal graph retrieval
             schedule_result_notify: Self::default_schedule_result_notify(),
+            memory_decay_base_half_life_days: Self::default_memory_decay_base_half_life_days(),
+            memory_decay_beta: Self::default_memory_decay_beta(),
             memory_prune_threshold: Self::default_memory_prune_threshold(),
             memory_archive_threshold: Self::default_memory_archive_threshold(),
             memory_cleanup_interval_hours: Self::default_memory_cleanup_interval_hours(),
@@ -612,6 +629,12 @@ impl Settings {
     fn default_schedule_result_notify() -> bool {
         true
     }
+    fn default_memory_decay_base_half_life_days() -> f32 {
+        11.25
+    }
+    fn default_memory_decay_beta() -> f32 {
+        0.8
+    }
     fn default_memory_prune_threshold() -> f32 {
         0.05
     }
@@ -627,6 +650,9 @@ impl Settings {
     fn default_memory_cleanup_enabled() -> bool {
         true
     }
+    fn default_memory_consolidation_mode() -> String {
+        "single".to_string()
+    }
     fn default_memory_cleanup_interval_hours() -> u32 {
         6
     }
@@ -634,7 +660,7 @@ impl Settings {
         24
     }
     fn default_memory_consolidation_batch_size() -> u32 {
-        20
+        50
     }
     fn default_memory_extraction_max_facts() -> u32 {
         3

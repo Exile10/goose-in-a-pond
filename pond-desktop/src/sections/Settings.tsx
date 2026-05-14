@@ -293,6 +293,50 @@ function VoiceTab({
             </FormRow>
           </Section>
 
+          <Section title="Wake-Word Detection">
+            <FormRow label="KWS Whisper URL" hint="Separate whisper server for fast wake-word detection (uses tiny model). Leave blank to share the main server">
+              <input
+                style={nativeInput}
+                value={s.voice_kws_whisper_url ?? ""}
+                onChange={(e) => patch("voice_kws_whisper_url", e.target.value || null)}
+                placeholder="Same as transcription server"
+              />
+            </FormRow>
+            <FormRow label={`Energy threshold: ${(s.voice_kws_energy_threshold ?? 0.003).toFixed(3)}`} hint="Minimum audio energy to trigger whisper (0 = disabled, 0.003 = default)">
+              <input
+                type="range"
+                min={0}
+                max={0.05}
+                step={0.001}
+                value={s.voice_kws_energy_threshold ?? 0.003}
+                onChange={(e) => patch("voice_kws_energy_threshold", Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </FormRow>
+            <FormRow label={`Silence cutoff: ${s.voice_kws_post_trigger_silence_ms ?? 400}ms`} hint="Consecutive silence that ends audio capture after wake word (0 = wait full duration)">
+              <input
+                type="range"
+                min={0}
+                max={2000}
+                step={50}
+                value={s.voice_kws_post_trigger_silence_ms ?? 400}
+                onChange={(e) => patch("voice_kws_post_trigger_silence_ms", Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </FormRow>
+            <FormRow label={`Cooldown: ${s.voice_kws_cooldown_ms ?? 2000}ms`} hint="Delay before re-arming detection after activation (prevents TTS echo re-trigger)">
+              <input
+                type="range"
+                min={500}
+                max={5000}
+                step={100}
+                value={s.voice_kws_cooldown_ms ?? 2000}
+                onChange={(e) => patch("voice_kws_cooldown_ms", Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </FormRow>
+          </Section>
+
           <Section title="Speech Synthesis">
             <FormRow label="Voice model" hint="Piper voice model file (.onnx)">
               <input
@@ -446,6 +490,42 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
           >
             {maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
           </select>
+        </FormRow>
+      </Section>
+
+      <Section title="Context & Embeddings">
+        <FormRow label="Context window override" hint="Override the model's context window size in tokens (0 = use model default)">
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <input
+              type="number"
+              role="spinbutton"
+              style={{ ...nativeInput, width: "120px" }}
+              min={0}
+              max={131072}
+              value={s.context_window_override ?? 0}
+              onChange={(e) => patch("context_window_override", Number(e.target.value))}
+            />
+            <span className="muted-12">tokens</span>
+          </div>
+        </FormRow>
+        <FormRow label="Embedding provider" hint="Provider for text embeddings used by memory search">
+          <select
+            style={selectFallback}
+            value={s.embedding_provider ?? "fastembed"}
+            onChange={(e) => patch("embedding_provider", e.target.value)}
+          >
+            <option value="fastembed">FastEmbed (local ONNX)</option>
+            <option value="none">None</option>
+          </select>
+        </FormRow>
+        <FormRow label="Embedding model" hint="Active embedding model name from the registry">
+          <input
+            style={{ ...nativeInput, opacity: (s.embedding_provider ?? "fastembed") !== "none" ? 1 : 0.45 }}
+            disabled={(s.embedding_provider ?? "fastembed") === "none"}
+            value={s.active_embedding_model ?? ""}
+            onChange={(e) => patch("active_embedding_model", e.target.value)}
+            placeholder="all-MiniLM-L6-v2"
+          />
         </FormRow>
       </Section>
 
@@ -616,6 +696,113 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
   );
 }
 
+function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
+  const [showTuning, setShowTuning] = useState(false);
+
+  return (
+    <>
+      <button
+        style={advancedToggleStyle}
+        onClick={() => setShowTuning((v) => !v)}
+        aria-expanded={showTuning}
+      >
+        {showTuning ? "\u25BE" : "\u25B8"} Advanced memory tuning
+      </button>
+
+      {showTuning && (
+        <Section title="Memory Tuning">
+          <FormRow label="Max facts per turn" hint="Maximum memories extracted per conversation turn (1-10)">
+            <input
+              type="number"
+              role="spinbutton"
+              style={{ ...nativeInput, width: "80px" }}
+              min={1}
+              max={10}
+              value={s.memory_extraction_max_facts ?? 3}
+              onChange={(e) => patch("memory_extraction_max_facts", Number(e.target.value))}
+            />
+          </FormRow>
+          <FormRow label="Extraction cooldown" hint="Minimum seconds between extraction runs">
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+              <input
+                type="number"
+                role="spinbutton"
+                style={{ ...nativeInput, width: "80px" }}
+                min={1}
+                max={300}
+                value={s.memory_extraction_interval_secs ?? 10}
+                onChange={(e) => patch("memory_extraction_interval_secs", Number(e.target.value))}
+              />
+              <span className="muted-12">seconds</span>
+            </div>
+          </FormRow>
+          <FormRow label="Cleanup interval" hint="How often the cleanup task runs">
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+              <input
+                type="number"
+                role="spinbutton"
+                style={{ ...nativeInput, width: "80px" }}
+                min={1}
+                max={168}
+                value={s.memory_cleanup_interval_hours ?? 6}
+                onChange={(e) => patch("memory_cleanup_interval_hours", Number(e.target.value))}
+              />
+              <span className="muted-12">hours</span>
+            </div>
+          </FormRow>
+          <FormRow label="Consolidation interval" hint="How often the consolidation task runs">
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+              <input
+                type="number"
+                role="spinbutton"
+                style={{ ...nativeInput, width: "80px" }}
+                min={1}
+                max={168}
+                value={s.memory_consolidation_interval_hours ?? 24}
+                onChange={(e) => patch("memory_consolidation_interval_hours", Number(e.target.value))}
+              />
+              <span className="muted-12">hours</span>
+            </div>
+          </FormRow>
+          <FormRow label="Consolidation batch" hint="Max memories processed per consolidation pass">
+            <input
+              type="number"
+              role="spinbutton"
+              style={{ ...nativeInput, width: "80px" }}
+              min={5}
+              max={100}
+              value={s.memory_consolidation_batch_size ?? 20}
+              onChange={(e) => patch("memory_consolidation_batch_size", Number(e.target.value))}
+            />
+          </FormRow>
+          <FormRow label={`Prune threshold: ${(s.memory_prune_threshold ?? 0.05).toFixed(2)}`} hint="Memories below this effective score are deleted">
+            <input
+              type="range"
+              min={0}
+              max={0.5}
+              step={0.01}
+              value={s.memory_prune_threshold ?? 0.05}
+              onChange={(e) => patch("memory_prune_threshold", Number(e.target.value))}
+              style={{ width: "100%" }}
+            />
+          </FormRow>
+          <FormRow label={`Archive threshold: ${(s.memory_archive_threshold ?? 0.15).toFixed(2)}`} hint="Memories below this effective score are archived (hidden)">
+            <input
+              type="range"
+              min={0}
+              max={1.0}
+              step={0.01}
+              value={s.memory_archive_threshold ?? 0.15}
+              onChange={(e) => patch("memory_archive_threshold", Number(e.target.value))}
+              style={{ width: "100%" }}
+            />
+          </FormRow>
+        </Section>
+      )}
+    </>
+  );
+}
+
 function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
   const memInject = s.agent_memory_inject ?? false;
 
@@ -658,6 +845,15 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
       </Section>
 
       <Section title="Behaviour">
+        <FormRow label="Fast path" hint="Answer trivial messages (greetings, thanks) instantly without invoking the LLM">
+          <Switch
+            isSelected={s.fast_path_enabled ?? true}
+            onChange={(v) => patch("fast_path_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Instant replies for simple messages
+          </Switch>
+        </FormRow>
         <FormRow label="How thorough" hint="How many steps Pond will take to answer a question (1-50)">
           <input
             type="number"
@@ -668,6 +864,38 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             value={s.agent_max_turns ?? 20}
             onChange={(e) => patch("agent_max_turns", Number(e.target.value))}
           />
+        </FormRow>
+        <FormRow label="Timeout" hint="Maximum seconds before a response is cut off (0 = no limit)">
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <input
+              type="number"
+              role="spinbutton"
+              style={{ ...nativeInput, width: "100px" }}
+              min={0}
+              max={3600}
+              value={s.agent_timeout_secs ?? 300}
+              onChange={(e) => patch("agent_timeout_secs", Number(e.target.value))}
+            />
+            <span className="muted-12">seconds</span>
+          </div>
+        </FormRow>
+        <FormRow label="Tool output compaction" hint="Compress tool results to save context tokens (disable for debugging)">
+          <Switch
+            isSelected={s.tool_output_compaction ?? true}
+            onChange={(v) => patch("tool_output_compaction", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Compact tool outputs
+          </Switch>
+        </FormRow>
+        <FormRow label="KV cache reuse" hint="Keep system prompt stable for faster inference on local models">
+          <Switch
+            isSelected={s.prefix_cache_prompt ?? true}
+            onChange={(v) => patch("prefix_cache_prompt", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Prompt prefix caching
+          </Switch>
         </FormRow>
       </Section>
 
@@ -693,7 +921,55 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             onChange={(e) => patch("agent_memory_limit", Number(e.target.value))}
           />
         </FormRow>
+        <FormRow label="Auto-extract memories" hint="Automatically learn facts from each conversation turn">
+          <Switch
+            isSelected={s.memory_extraction_enabled ?? true}
+            onChange={(v) => patch("memory_extraction_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Extract memories
+          </Switch>
+        </FormRow>
+        <FormRow label="Memory cleanup" hint="Periodically prune and archive decayed memories">
+          <Switch
+            isSelected={s.memory_cleanup_enabled ?? true}
+            onChange={(v) => patch("memory_cleanup_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Auto-cleanup
+          </Switch>
+        </FormRow>
+        <FormRow label="Auto-consolidation" hint="Merge duplicate/contradicting memories during idle periods (15 min inactivity)">
+          <Switch
+            isSelected={s.memory_consolidation_enabled ?? false}
+            onChange={(v) => patch("memory_consolidation_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Consolidate memories
+          </Switch>
+        </FormRow>
+        <FormRow label="Consolidation mode" hint="Single-pass (1 LLM call, fast) or Adversarial (Proposer/Adversary/Judge, thorough)">
+          <select
+            style={selectFallback}
+            value={s.memory_consolidation_mode ?? "single"}
+            onChange={(e) => patch("memory_consolidation_mode", e.target.value)}
+          >
+            <option value="single">Single-pass (fast)</option>
+            <option value="adversarial">Adversarial (3-stage)</option>
+          </select>
+        </FormRow>
+        <FormRow label="Memory graph" hint="Experimental: use causal graph traversal for memory retrieval">
+          <Switch
+            isSelected={s.memory_graph_enabled ?? false}
+            onChange={(v) => patch("memory_graph_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Graph-based recall
+          </Switch>
+        </FormRow>
       </Section>
+
+      <MemoryTuningSection s={s} patch={patch} />
     </div>
   );
 }
@@ -752,6 +1028,69 @@ function DataTab({
               onChange={(e) => patch("retention_session_messages_keep", Number(e.target.value))}
             />
             <span className="muted-12">messages</span>
+          </div>
+        </FormRow>
+      </Section>
+
+      <Section title="Telemetry & Monitoring">
+        <FormRow label="Telemetry" hint="Record per-turn metrics (TTFT, token counts, tool latency)">
+          <Switch
+            isSelected={s.telemetry_enabled ?? true}
+            onChange={(v) => patch("telemetry_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Record telemetry
+          </Switch>
+        </FormRow>
+        <FormRow label="Context monitoring" hint="Track context window fill rate and warn before saturation">
+          <Switch
+            isSelected={s.context_monitor_enabled ?? true}
+            onChange={(v) => patch("context_monitor_enabled", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Monitor context usage
+          </Switch>
+        </FormRow>
+        <FormRow label="Compact encoding" hint="Use compact encoding for prompts to reduce token count by 30-60%">
+          <Switch
+            isSelected={s.compact_encoding ?? true}
+            onChange={(v) => patch("compact_encoding", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Compact encoding
+          </Switch>
+        </FormRow>
+      </Section>
+
+      <Section title="Cloud Cost Comparison">
+        <FormRow label="Input price" hint="Cloud API input token price per million (for savings estimate)">
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <span className="muted-12">$</span>
+            <input
+              type="number"
+              role="spinbutton"
+              step={0.1}
+              style={{ ...nativeInput, width: "100px" }}
+              min={0}
+              value={s.cloud_input_price_per_million ?? 2.5}
+              onChange={(e) => patch("cloud_input_price_per_million", Number(e.target.value))}
+            />
+            <span className="muted-12">/ 1M tokens</span>
+          </div>
+        </FormRow>
+        <FormRow label="Output price" hint="Cloud API output token price per million">
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <span className="muted-12">$</span>
+            <input
+              type="number"
+              role="spinbutton"
+              step={0.1}
+              style={{ ...nativeInput, width: "100px" }}
+              min={0}
+              value={s.cloud_output_price_per_million ?? 10.0}
+              onChange={(e) => patch("cloud_output_price_per_million", Number(e.target.value))}
+            />
+            <span className="muted-12">/ 1M tokens</span>
           </div>
         </FormRow>
       </Section>
@@ -859,7 +1198,7 @@ export function Settings() {
             {tab === "location"  && <LocationTab  s={settings} patch={patch} />}
             {tab === "agent"     && <AgentTab     s={settings} patch={patch} />}
             {tab === "data"      && <DataTab s={settings} patch={patch} serverUrl={state.serverUrl} onServerUrlChange={(v) => dispatch({ type: "SET_SERVER_URL", payload: v })} />}
-            {tab === "tools"     && <ToolsTab />}
+            {tab === "tools"     && <ToolsTab s={settings} patch={patch} />}
           </>
         )}
       </div>
@@ -869,7 +1208,7 @@ export function Settings() {
 
 // ── Tools Tab ─────────────────────────────────────────────────
 
-function ToolsTab() {
+function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -911,11 +1250,104 @@ function ToolsTab() {
 
   return (
     <div className="settings-body">
-      <div style={{ display: "flex", gap: "var(--space-2)" }}>
-        <Button variant="outline" onPress={() => setShowForm((v) => !v)}>
-          <Plus size={14} /> Add Extension
-        </Button>
-      </div>
+      <Section title="Built-in Tool Modules">
+        <FormRow label="Memory" hint="Recall, save, and forget memories">
+          <Switch isSelected={s.ext_memory_enabled ?? true} onChange={(v) => patch("ext_memory_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+        <FormRow label="Schedules" hint="Create, manage, and run scheduled tasks">
+          <Switch isSelected={s.ext_schedule_enabled ?? true} onChange={(v) => patch("ext_schedule_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+        <FormRow label="Weather" hint="Fetch current weather data">
+          <Switch isSelected={s.ext_weather_enabled ?? true} onChange={(v) => patch("ext_weather_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+        <FormRow label="Knowledge" hint="Wikipedia search and article retrieval">
+          <Switch isSelected={s.ext_knowledge_enabled ?? true} onChange={(v) => patch("ext_knowledge_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+        <FormRow label="System" hint="Shell commands, file access, notifications, system info">
+          <Switch isSelected={s.ext_system_enabled ?? true} onChange={(v) => patch("ext_system_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+        <FormRow label="Devices" hint="Device registry, profile info, model assignments">
+          <Switch isSelected={s.ext_device_enabled ?? true} onChange={(v) => patch("ext_device_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </FormRow>
+      </Section>
+
+      <Section title="Tool Behaviour">
+        <FormRow label="Tool result cache" hint="Cache deterministic tool results to avoid redundant calls">
+          <Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Cache tool results
+          </Switch>
+        </FormRow>
+        <FormRow label="Tool call validation" hint="Validate and repair tool call JSON from small models before execution">
+          <Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Validate tool calls
+          </Switch>
+        </FormRow>
+        <FormRow label="Tool request detection" hint="Detect natural-language tool requests in LLM output and execute them">
+          <Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Detect tool requests
+          </Switch>
+        </FormRow>
+        <FormRow label="Multi-tool" hint="Experimental: detect and dispatch multiple tool intents concurrently">
+          <Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Concurrent multi-tool
+          </Switch>
+        </FormRow>
+      </Section>
+
+      <Section title="Scheduling">
+        <FormRow label="Result notifications" hint="Broadcast schedule results as desktop notifications">
+          <Switch isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+            Notify on completion
+          </Switch>
+        </FormRow>
+        <FormRow label="Max concurrent" hint="Maximum scheduled tasks running simultaneously (1-10)">
+          <input
+            type="number"
+            role="spinbutton"
+            style={{ ...nativeInput, width: "80px" }}
+            min={1}
+            max={10}
+            value={s.schedule_max_concurrent ?? 2}
+            onChange={(e) => patch("schedule_max_concurrent", Number(e.target.value))}
+          />
+        </FormRow>
+        <FormRow label="History per task" hint="Maximum execution history entries retained per schedule">
+          <input
+            type="number"
+            role="spinbutton"
+            style={{ ...nativeInput, width: "80px" }}
+            min={5}
+            max={500}
+            value={s.schedule_max_runs_per_task ?? 50}
+            onChange={(e) => patch("schedule_max_runs_per_task", Number(e.target.value))}
+          />
+        </FormRow>
+      </Section>
+
+      <Section title="External Extensions">
+        <div style={{ display: "flex", gap: "var(--space-2)" }}>
+          <Button variant="outline" onPress={() => setShowForm((v) => !v)}>
+            <Plus size={14} /> Add Extension
+          </Button>
+        </div>
+      </Section>
 
       {showForm && (
         <Card shadow="none" className="giap-card">

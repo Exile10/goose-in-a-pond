@@ -7,7 +7,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::memory::{MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier};
+use pond_core::domain::memory::{
+    MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
+};
 use pond_core::ports::memory_repository::MemoryRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
@@ -69,6 +71,8 @@ struct FragmentRow {
     last_accessed_at: Option<String>,
     lifecycle: Option<String>,
     superseded_by: Option<String>,
+    /// For correction memories: what wrong claim this corrects.
+    corrects: Option<String>,
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -109,6 +113,7 @@ fn row_to_fragment(row: FragmentRow) -> MemoryFragment {
         last_accessed_at: row.last_accessed_at.as_deref().map(parse_dt),
         lifecycle: row.lifecycle.as_deref().and_then(parse_lifecycle),
         superseded_by: row.superseded_by,
+        corrects: row.corrects,
     }
 }
 
@@ -116,7 +121,7 @@ fn row_to_fragment(row: FragmentRow) -> MemoryFragment {
 const SELECT_ALL: &str = "\
     id, profile_id, session_id, content, embedding, source, tags, created_at, \
     segment, importance, tier, decay_rate, access_count, last_accessed_at, \
-    lifecycle, superseded_by";
+    lifecycle, superseded_by, corrects";
 
 fn segment_to_str(s: &MemorySegment) -> &'static str {
     match s {
@@ -169,8 +174,8 @@ impl MemoryRepository for SqliteMemoryRepository {
             "INSERT INTO memory_fragments \
              (id, profile_id, session_id, content, embedding, source, tags, created_at, \
               segment, importance, tier, decay_rate, access_count, last_accessed_at, \
-              lifecycle, superseded_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              lifecycle, superseded_by, corrects) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&fragment.id)
         .bind(&fragment.profile_id)
@@ -188,6 +193,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(last_accessed_str)
         .bind(lifecycle_str)
         .bind(&fragment.superseded_by)
+        .bind(&fragment.corrects)
         .execute(&self.pool)
         .await?;
 
@@ -447,6 +453,129 @@ impl MemoryRepository for SqliteMemoryRepository {
         .await?;
         Ok(())
     }
+
+    // ── Audit log ───────────────────────────────────────────────────────────
+
+    async fn log_event(
+        &self,
+        kind: MemoryEventKind,
+        memory_id: &str,
+        session_id: Option<&str>,
+        data: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO memory_events (event_kind, memory_id, session_id, data) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(kind.to_string())
+        .bind(memory_id)
+        .bind(session_id)
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_events(
+        &self,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvent>> {
+        let rows: Vec<EventRow> = match memory_id {
+            Some(mid) => {
+                sqlx::query_as(
+                    "SELECT id, event_kind, memory_id, session_id, data, created_at \
+                     FROM memory_events WHERE memory_id = ? \
+                     ORDER BY created_at DESC, id DESC LIMIT ?",
+                )
+                .bind(mid)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, event_kind, memory_id, session_id, data, created_at \
+                     FROM memory_events ORDER BY created_at DESC, id DESC LIMIT ?",
+                )
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().map(row_to_event).collect())
+    }
+
+    async fn update_segment(
+        &self,
+        id: &str,
+        segment: pond_core::domain::memory::MemorySegment,
+        importance: f32,
+    ) -> anyhow::Result<()> {
+        let seg_str = format!("{:?}", segment).to_lowercase();
+        sqlx::query(
+            "UPDATE memory_fragments SET segment = ?, importance = ? WHERE id = ?",
+        )
+        .bind(&seg_str)
+        .bind(importance as f64)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn log_consolidation_run(
+        &self,
+        mode: &str,
+        memory_count: usize,
+        accepted: usize,
+        rejected: usize,
+        duration_ms: u64,
+        details: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let row = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO consolidation_runs (mode, memory_count, accepted, rejected, duration_ms, details, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+             RETURNING id",
+        )
+        .bind(mode)
+        .bind(memory_count as i64)
+        .bind(accepted as i64)
+        .bind(rejected as i64)
+        .bind(duration_ms as i64)
+        .bind(details)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+}
+
+// ── Event row helper ─────────────────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    id: i64,
+    event_kind: String,
+    memory_id: String,
+    session_id: Option<String>,
+    data: Option<String>,
+    created_at: String,
+}
+
+fn parse_event_kind(s: &str) -> MemoryEventKind {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .unwrap_or(MemoryEventKind::Written)
+}
+
+fn row_to_event(row: EventRow) -> MemoryEvent {
+    MemoryEvent {
+        id: row.id,
+        event_kind: parse_event_kind(&row.event_kind),
+        memory_id: row.memory_id,
+        session_id: row.session_id,
+        data: row.data,
+        created_at: row.created_at,
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +651,7 @@ mod tests {
             "User prefers dark mode".to_string(),
             MemorySegment::Preference,
             0.75,
+            None,
         );
         repo.add(frag).await.unwrap();
         let results = repo.search_recent(None, 10).await.unwrap();
@@ -541,6 +671,7 @@ mod tests {
             "Test access".to_string(),
             MemorySegment::Knowledge,
             0.5,
+            None,
         );
         repo.add(frag).await.unwrap();
         repo.record_access("acc1").await.unwrap();
@@ -559,6 +690,7 @@ mod tests {
             "To archive".to_string(),
             MemorySegment::Context,
             0.2,
+            None,
         );
         repo.add(frag).await.unwrap();
         repo.update_lifecycle("arch1", MemoryLifecycle::Archived)
@@ -578,6 +710,7 @@ mod tests {
             "User loves cats".to_string(),
             MemorySegment::Preference,
             0.8,
+            None,
         ))
         .await
         .unwrap();
@@ -587,6 +720,7 @@ mod tests {
             "User has a dog named Rex".to_string(),
             MemorySegment::Knowledge,
             0.6,
+            None,
         ))
         .await
         .unwrap();
@@ -596,6 +730,7 @@ mod tests {
             "User works at Jarida".to_string(),
             MemorySegment::Identity,
             0.85,
+            None,
         ))
         .await
         .unwrap();
@@ -637,6 +772,7 @@ mod tests {
             "Name is Jerry".to_string(),
             MemorySegment::Identity,
             0.85,
+            None,
         ))
         .await
         .unwrap();
@@ -646,6 +782,7 @@ mod tests {
             "Likes dark mode".to_string(),
             MemorySegment::Preference,
             0.7,
+            None,
         ))
         .await
         .unwrap();
@@ -656,5 +793,43 @@ mod tests {
             .unwrap();
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].id, "id1");
+    }
+
+    #[tokio::test]
+    async fn log_and_get_events() {
+        let (repo, _tmp) = make_repo().await;
+
+        repo.log_event(
+            MemoryEventKind::Extracted,
+            "mem-1",
+            Some("sess-1"),
+            None,
+        )
+        .await
+        .unwrap();
+        repo.log_event(MemoryEventKind::Written, "mem-1", None, Some("via MCP"))
+            .await
+            .unwrap();
+        repo.log_event(MemoryEventKind::Recalled, "mem-2", None, None)
+            .await
+            .unwrap();
+
+        // All events
+        let all = repo.get_events(None, 100).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Filtered by memory_id
+        let mem1_events = repo.get_events(Some("mem-1"), 100).await.unwrap();
+        assert_eq!(mem1_events.len(), 2);
+        // Both events should be for mem-1
+        let kinds: Vec<_> = mem1_events.iter().map(|e| &e.event_kind).collect();
+        assert!(kinds.contains(&&MemoryEventKind::Extracted));
+        assert!(kinds.contains(&&MemoryEventKind::Written));
+        // The extracted event should carry the session_id
+        let extracted = mem1_events
+            .iter()
+            .find(|e| e.event_kind == MemoryEventKind::Extracted)
+            .unwrap();
+        assert_eq!(extracted.session_id.as_deref(), Some("sess-1"));
     }
 }

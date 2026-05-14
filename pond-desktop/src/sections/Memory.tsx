@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Card, CardContent, Button, Chip } from "@heroui/react";
+import { Card, CardContent, Button, Chip, Input } from "@heroui/react";
 import {
   BrainCircuit,
   Shield,
@@ -13,6 +13,13 @@ import {
   Plus,
   RefreshCw,
   X,
+  Search,
+  Pencil,
+  Save,
+  GitMerge,
+  MessageSquare,
+  Layers,
+  Radio,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
@@ -20,6 +27,8 @@ import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api
 // ── Segment metadata ──────────────────────────────────────────
 
 type SegmentKey = MemorySegment | "all";
+type TierKey = MemoryTier | "all";
+type SourceKey = "auto" | "mcp" | "chat" | "all";
 
 const SEGMENTS: Record<
   MemorySegment,
@@ -71,6 +80,14 @@ function sourceLabel(source?: string): string {
   return source;
 }
 
+function normalizedSource(source?: string): SourceKey {
+  const label = sourceLabel(source);
+  if (label === "auto") return "auto";
+  if (label === "mcp") return "mcp";
+  if (label === "chat") return "chat";
+  return "auto";
+}
+
 // ── Stats bar ─────────────────────────────────────────────────
 
 function MemStatsBar({ items }: { items: MemoryFragment[] }) {
@@ -101,35 +118,127 @@ function MemStatsBar({ items }: { items: MemoryFragment[] }) {
 // ── Filter row ────────────────────────────────────────────────
 
 function MemFilterRow({
-  active,
-  counts,
+  activeSegment,
+  activeTier,
+  activeSource,
+  segCounts,
+  tierCounts,
+  sourceCounts,
   total,
-  onChange,
+  onSegmentChange,
+  onTierChange,
+  onSourceChange,
 }: {
-  active: SegmentKey;
-  counts: Partial<Record<MemorySegment, number>>;
+  activeSegment: SegmentKey;
+  activeTier: TierKey;
+  activeSource: SourceKey;
+  segCounts: Partial<Record<MemorySegment, number>>;
+  tierCounts: Partial<Record<MemoryTier, number>>;
+  sourceCounts: Partial<Record<SourceKey, number>>;
   total: number;
-  onChange: (seg: SegmentKey) => void;
+  onSegmentChange: (seg: SegmentKey) => void;
+  onTierChange: (tier: TierKey) => void;
+  onSourceChange: (source: SourceKey) => void;
 }) {
+  const tierLabels: Record<MemoryTier, string> = {
+    short: "Short",
+    long: "Long",
+    permanent: "Permanent",
+  };
+
+  const sourceLabels: Record<SourceKey, string> = {
+    all: "All Sources",
+    auto: "Auto",
+    mcp: "MCP",
+    chat: "Chat",
+  };
+
+  const hasTiers = Object.keys(tierCounts).length > 0;
+  const hasSources = Object.keys(sourceCounts).filter((k) => k !== "all").length > 0;
+
   return (
-    <div className="mem-filter">
-      <button
-        className={`mem-filter__btn${active === "all" ? " is-active" : ""}`}
-        onClick={() => onChange("all")}
-      >
-        All
-        <span className="mem-filter__count">{total}</span>
-      </button>
-      {SEGMENT_ORDER.filter((s) => counts[s]).map((seg) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {/* Segment filter */}
+      <div className="mem-filter">
         <button
-          key={seg}
-          className={`mem-filter__btn${active === seg ? " is-active" : ""}`}
-          onClick={() => onChange(seg)}
+          className={`mem-filter__btn${activeSegment === "all" ? " is-active" : ""}`}
+          onClick={() => onSegmentChange("all")}
         >
-          {SEGMENTS[seg].label}
-          <span className="mem-filter__count">{counts[seg]}</span>
+          All
+          <span className="mem-filter__count">{total}</span>
         </button>
-      ))}
+        {SEGMENT_ORDER.filter((s) => segCounts[s]).map((seg) => (
+          <button
+            key={seg}
+            className={`mem-filter__btn${activeSegment === seg ? " is-active" : ""}`}
+            onClick={() => onSegmentChange(seg)}
+          >
+            {SEGMENTS[seg].label}
+            <span className="mem-filter__count">{segCounts[seg]}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Tier + Source secondary filters */}
+      {(hasTiers || hasSources) && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" as React.CSSProperties["flexWrap"], alignItems: "center" }}>
+          {hasTiers && (
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: "0.07em", color: "var(--grey-400)", textTransform: "uppercase" as React.CSSProperties["textTransform"], marginRight: 2 }}>
+                <Layers size={10} strokeWidth={2} style={{ display: "inline", verticalAlign: "middle", marginRight: 2 }} />
+                Tier
+              </span>
+              {(["all", "short", "long", "permanent"] as const).map((tier) => {
+                const count = tier === "all" ? total : tierCounts[tier];
+                if (tier !== "all" && !count) return null;
+                return (
+                  <button
+                    key={tier}
+                    className={`mem-filter__btn${activeTier === tier ? " is-active" : ""}`}
+                    style={{ fontSize: "11px", padding: "2px 8px", height: "22px" }}
+                    onClick={() => onTierChange(tier)}
+                  >
+                    {tier === "all" ? "Any" : tierLabels[tier]}
+                    {tier !== "all" && count !== undefined && (
+                      <span className="mem-filter__count">{count}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {hasTiers && hasSources && (
+            <span style={{ width: 1, height: 16, background: "var(--grey-150)", display: "inline-block" }} />
+          )}
+
+          {hasSources && (
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: "0.07em", color: "var(--grey-400)", textTransform: "uppercase" as React.CSSProperties["textTransform"], marginRight: 2 }}>
+                <Radio size={10} strokeWidth={2} style={{ display: "inline", verticalAlign: "middle", marginRight: 2 }} />
+                Source
+              </span>
+              {(["all", "auto", "mcp", "chat"] as const).map((src) => {
+                const count = src === "all" ? total : sourceCounts[src];
+                if (src !== "all" && !count) return null;
+                return (
+                  <button
+                    key={src}
+                    className={`mem-filter__btn${activeSource === src ? " is-active" : ""}`}
+                    style={{ fontSize: "11px", padding: "2px 8px", height: "22px" }}
+                    onClick={() => onSourceChange(src)}
+                  >
+                    {sourceLabels[src]}
+                    {src !== "all" && count !== undefined && (
+                      <span className="mem-filter__count">{count}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -139,15 +248,49 @@ function MemFilterRow({
 function MemCard({
   mem,
   onDelete,
+  onUpdate,
 }: {
   mem: MemoryFragment;
   onDelete: (id: string) => void;
+  onUpdate: (id: string, newContent: string) => Promise<void>;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState(mem.content);
+  const [saving, setSaving] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
   const seg = mem.segment;
   const segMeta = seg ? SEGMENTS[seg] : null;
   const segClass = seg ? seg : "none";
   const importanceFill = seg ? SEGMENT_IMPORT_FILL[seg] : "var(--grey-300)";
   const importance = mem.importance ?? (seg ? segMeta?.importanceDefault : undefined);
+
+  function startEdit() {
+    setEditContent(mem.content);
+    setEditing(true);
+    // Focus after render
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setEditContent(mem.content);
+  }
+
+  async function handleSave() {
+    const trimmed = editContent.trim();
+    if (!trimmed || trimmed === mem.content) {
+      cancelEdit();
+      return;
+    }
+    setSaving(true);
+    try {
+      await onUpdate(mem.id, trimmed);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="mem-card">
@@ -183,11 +326,86 @@ function MemCard({
             )}
           </div>
 
-          {/* Content */}
-          <div className="mem-card__content">{mem.content}</div>
+          {/* Content — editable or read-only */}
+          {editing ? (
+            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+              <textarea
+                ref={textareaRef}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                disabled={saving}
+                rows={3}
+                style={{
+                  width: "100%",
+                  padding: "8px 10px",
+                  border: "1px solid rgba(147, 51, 234, 0.35)",
+                  borderRadius: "7px",
+                  fontSize: "13px",
+                  fontFamily: "var(--font-body)",
+                  background: "rgba(147, 51, 234, 0.03)",
+                  color: "var(--fg)",
+                  outline: "none",
+                  resize: "vertical" as React.CSSProperties["resize"],
+                  lineHeight: 1.55,
+                  boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+                }}
+                aria-label="Edit memory content"
+              />
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || !editContent.trim()}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    height: "24px",
+                    padding: "0 10px",
+                    border: "none",
+                    borderRadius: "6px",
+                    background: "rgba(147, 51, 234, 0.1)",
+                    color: "var(--purple-700, #6d28d9)",
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    cursor: saving ? "wait" : "pointer",
+                    opacity: saving ? 0.7 : 1,
+                    fontFamily: "var(--font-body)",
+                  }}
+                  aria-label="Save edit"
+                >
+                  <Save size={11} strokeWidth={2} />
+                  {saving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  onClick={cancelEdit}
+                  disabled={saving}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    height: "24px",
+                    padding: "0 10px",
+                    border: "1px solid var(--grey-200)",
+                    borderRadius: "6px",
+                    background: "transparent",
+                    color: "var(--grey-600)",
+                    fontSize: "11px",
+                    fontWeight: 500,
+                    cursor: "pointer",
+                    fontFamily: "var(--font-body)",
+                  }}
+                  aria-label="Cancel edit"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="mem-card__content">{mem.content}</div>
+          )}
 
           {/* Importance bar */}
-          {importance !== undefined && (
+          {!editing && importance !== undefined && (
             <div className="mem-importance">
               <div className="mem-importance__track">
                 <div
@@ -203,39 +421,54 @@ function MemCard({
           )}
 
           {/* Footer meta */}
-          <div className="mem-card__meta">
-            <span className="mem-card__meta-item">
-              <Clock size={10} strokeWidth={1.8} />
-              {relativeTime(mem.created_at)}
-            </span>
-            {mem.access_count > 0 && (
+          {!editing && (
+            <div className="mem-card__meta">
               <span className="mem-card__meta-item">
-                <Star size={10} strokeWidth={1.8} />
-                accessed {mem.access_count}x
+                <Clock size={10} strokeWidth={1.8} />
+                {relativeTime(mem.created_at)}
               </span>
-            )}
-            {mem.last_accessed_at && (
-              <span className="mem-card__meta-item">
-                last {relativeTime(mem.last_accessed_at)}
-              </span>
-            )}
-            {mem.tags && mem.tags.length > 0 && (
-              <span className="mem-card__meta-item">
-                {mem.tags.slice(0, 3).join(", ")}
-              </span>
-            )}
-          </div>
+              {mem.access_count > 0 && (
+                <span className="mem-card__meta-item">
+                  <Star size={10} strokeWidth={1.8} />
+                  accessed {mem.access_count}x
+                </span>
+              )}
+              {mem.last_accessed_at && (
+                <span className="mem-card__meta-item">
+                  last {relativeTime(mem.last_accessed_at)}
+                </span>
+              )}
+              {mem.tags && mem.tags.length > 0 && (
+                <span className="mem-card__meta-item">
+                  {mem.tags.slice(0, 3).join(", ")}
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
-        {/* Delete button */}
-        <button
-          className="mem-card__delete"
-          onClick={() => onDelete(mem.id)}
-          aria-label="Delete memory"
-          title="Delete memory"
-        >
-          <Trash2 size={13} strokeWidth={1.8} />
-        </button>
+        {/* Action buttons */}
+        {!editing && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flexShrink: 0 }}>
+            <button
+              className="mem-card__delete"
+              style={{ color: "var(--grey-400)" }}
+              onClick={startEdit}
+              aria-label="Edit memory"
+              title="Edit memory"
+            >
+              <Pencil size={13} strokeWidth={1.8} />
+            </button>
+            <button
+              className="mem-card__delete"
+              onClick={() => onDelete(mem.id)}
+              aria-label="Delete memory"
+              title="Delete memory"
+            >
+              <Trash2 size={13} strokeWidth={1.8} />
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -640,6 +873,106 @@ const modalStyles: Record<string, React.CSSProperties> = {
   },
 };
 
+// ── Consolidation progress banner ─────────────────────────────
+
+type ConsolidationStatus = "idle" | "running" | "done" | "error";
+
+function ConsolidationBanner({
+  status,
+  message,
+  onStop,
+  onDismiss,
+}: {
+  status: ConsolidationStatus;
+  message: string;
+  onStop: () => void;
+  onDismiss: () => void;
+}) {
+  if (status === "idle") return null;
+
+  const isRunning = status === "running";
+  const isError = status === "error";
+
+  const bannerBg = isError
+    ? "rgba(239, 68, 68, 0.06)"
+    : isRunning
+    ? "rgba(147, 51, 234, 0.05)"
+    : "rgba(34, 197, 94, 0.06)";
+
+  const bannerBorder = isError
+    ? "rgba(239, 68, 68, 0.2)"
+    : isRunning
+    ? "rgba(147, 51, 234, 0.2)"
+    : "rgba(34, 197, 94, 0.2)";
+
+  const textColor = isError
+    ? "var(--color-destructive)"
+    : isRunning
+    ? "var(--purple-700, #6d28d9)"
+    : "#0e8a4a";
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "10px 14px",
+        borderRadius: "10px",
+        border: `1px solid ${bannerBorder}`,
+        background: bannerBg,
+        fontSize: "12.5px",
+        color: textColor,
+      }}
+      role="status"
+      aria-live="polite"
+    >
+      <GitMerge size={14} strokeWidth={1.8} style={{ flexShrink: 0 }} />
+      <span style={{ flex: 1 }}>
+        {isRunning ? "Consolidating memories…" : ""}{" "}
+        {message}
+      </span>
+      {isRunning && (
+        <button
+          onClick={onStop}
+          style={{
+            background: "none",
+            border: "1px solid currentColor",
+            borderRadius: "6px",
+            cursor: "pointer",
+            color: "inherit",
+            fontSize: "11px",
+            padding: "2px 8px",
+            fontFamily: "var(--font-body)",
+            opacity: 0.8,
+          }}
+          aria-label="Stop consolidation"
+        >
+          Stop
+        </button>
+      )}
+      {!isRunning && (
+        <button
+          onClick={onDismiss}
+          style={{
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            color: "inherit",
+            padding: "2px",
+            display: "grid",
+            placeItems: "center",
+            opacity: 0.6,
+          }}
+          aria-label="Dismiss"
+        >
+          <X size={13} strokeWidth={2} />
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Memory settings toggles ──────────────────────────────────
 
 function MemorySettingsCard({ settings, onToggle }: {
@@ -719,9 +1052,16 @@ export function Memory() {
   const [items, setItems]         = useState<MemoryFragment[]>([]);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState<string | null>(null);
-  const [activeFilter, setFilter] = useState<SegmentKey>("all");
+  const [activeSegment, setSegment] = useState<SegmentKey>("all");
+  const [activeTier, setTier]     = useState<TierKey>("all");
+  const [activeSource, setSource] = useState<SourceKey>("all");
+  const [searchQuery, setSearchQuery] = useState("");
   const [showAddModal, setShowAddModal] = useState(false);
   const [memSettings, setMemSettings] = useState<Partial<Settings>>({});
+
+  // Consolidation state
+  const [consolidationStatus, setConsolidationStatus] = useState<ConsolidationStatus>("idle");
+  const [consolidationMsg, setConsolidationMsg] = useState("");
 
   function load() {
     setLoading(true);
@@ -776,7 +1116,34 @@ export function Memory() {
     }
   }
 
-  // Only show active lifecycle memories (skip archived/merged) — with fallback for old API without lifecycle
+  // Edit = delete old + create new with same metadata
+  async function handleUpdate(id: string, newContent: string) {
+    const original = items.find((m) => m.id === id);
+    if (!original) return;
+    try {
+      await api.addMemory(
+        newContent,
+        original.tags,
+        original.segment,
+        original.importance,
+        original.tier,
+      );
+      await api.deleteMemory(id);
+      setItems((prev) =>
+        prev.map((m) =>
+          m.id === id
+            ? { ...m, content: newContent }
+            : m,
+        ),
+      );
+      load();
+    } catch (e) {
+      setError(String(e));
+      throw e;
+    }
+  }
+
+  // Only show active lifecycle memories — with fallback for old API without lifecycle
   const visibleItems = items.filter(
     (m) => !m.lifecycle || m.lifecycle === "active",
   );
@@ -794,6 +1161,69 @@ export function Memory() {
     if (errs.length) setError(`${errs.length} deletion(s) failed.`);
   }
 
+  // Consolidation
+  async function handleConsolidate() {
+    if (consolidationStatus === "running") return;
+    setConsolidationStatus("running");
+    setConsolidationMsg("");
+    try {
+      for await (const event of api.streamConsolidation()) {
+        switch (event.type) {
+          case "started":
+            setConsolidationMsg(`Analyzing ${event.memory_count ?? ""} memories...`);
+            break;
+          case "proposer_done":
+            setConsolidationMsg(`Proposer found ${(event.proposals as unknown[])?.length ?? 0} changes`);
+            break;
+          case "adversary_done":
+            setConsolidationMsg("Adversary reviewing proposals...");
+            break;
+          case "judge_done":
+            setConsolidationMsg("Judge making final decisions...");
+            break;
+          case "applied":
+            setConsolidationMsg("Applying accepted changes...");
+            break;
+          case "completed":
+            if (event.result) {
+              const { accepted_count, rejected_count, duration_ms } = event.result;
+              const secs = (duration_ms / 1000).toFixed(1);
+              setConsolidationMsg(
+                `Done in ${secs}s — ${accepted_count} accepted, ${rejected_count} rejected.`,
+              );
+            } else {
+              setConsolidationMsg("Done.");
+            }
+            setConsolidationStatus("done");
+            load();
+            break;
+          case "error":
+            setConsolidationMsg(event.message ?? "Consolidation failed.");
+            setConsolidationStatus("error");
+            break;
+          case "cancelled":
+            setConsolidationMsg("Cancelled.");
+            setConsolidationStatus("done");
+            break;
+        }
+        if (event.type === "completed" || event.type === "error" || event.type === "cancelled") break;
+      }
+    } catch (e) {
+      setConsolidationMsg(String(e));
+      setConsolidationStatus("error");
+    }
+  }
+
+  async function handleStopConsolidation() {
+    try {
+      await api.stopConsolidation();
+    } catch {
+      // best-effort
+    }
+    setConsolidationStatus("done");
+    setConsolidationMsg("Cancelled.");
+  }
+
   // Segment counts for filter row
   const segCounts = SEGMENT_ORDER.reduce<Partial<Record<MemorySegment, number>>>((acc, seg) => {
     const n = visibleItems.filter((m) => m.segment === seg).length;
@@ -801,11 +1231,33 @@ export function Memory() {
     return acc;
   }, {});
 
-  // Filtered list
-  const filtered =
-    activeFilter === "all"
-      ? visibleItems
-      : visibleItems.filter((m) => m.segment === activeFilter);
+  // Tier counts
+  const tierCounts = (["short", "long", "permanent"] as MemoryTier[]).reduce<Partial<Record<MemoryTier, number>>>((acc, tier) => {
+    const n = visibleItems.filter((m) => m.tier === tier).length;
+    if (n > 0) acc[tier] = n;
+    return acc;
+  }, {});
+
+  // Source counts
+  const sourceCounts = (["auto", "mcp", "chat"] as SourceKey[]).reduce<Partial<Record<SourceKey, number>>>((acc, src) => {
+    const n = visibleItems.filter((m) => normalizedSource(m.source) === src).length;
+    if (n > 0) acc[src] = n;
+    return acc;
+  }, {});
+
+  // Apply all filters
+  const filtered = visibleItems.filter((m) => {
+    if (activeSegment !== "all" && m.segment !== activeSegment) return false;
+    if (activeTier !== "all" && m.tier !== activeTier) return false;
+    if (activeSource !== "all" && normalizedSource(m.source) !== activeSource) return false;
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      if (!m.content.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  const hasActiveFilters = activeSegment !== "all" || activeTier !== "all" || activeSource !== "all" || searchQuery !== "";
 
   return (
     <div className="screen">
@@ -819,6 +1271,15 @@ export function Memory() {
           <Button size="sm" variant="ghost" onPress={load} isDisabled={loading}>
             <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
             Refresh
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onPress={handleConsolidate}
+            isDisabled={consolidationStatus === "running" || loading || visibleItems.length === 0}
+          >
+            <GitMerge size={14} strokeWidth={1.8} />
+            Consolidate
           </Button>
           {!loading && visibleItems.length > 0 && (
             <Button size="sm" variant="ghost" color="danger" onPress={handleDeleteAll}>
@@ -841,6 +1302,14 @@ export function Memory() {
         />
       )}
 
+      {/* Consolidation progress */}
+      <ConsolidationBanner
+        status={consolidationStatus}
+        message={consolidationMsg}
+        onStop={handleStopConsolidation}
+        onDismiss={() => { setConsolidationStatus("idle"); setConsolidationMsg(""); }}
+      />
+
       {/* Error */}
       {error && (
         <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>
@@ -852,41 +1321,97 @@ export function Memory() {
       {!loading && visibleItems.length > 0 && (
         <>
           <MemStatsBar items={visibleItems} />
+
+          {/* Search bar */}
+          <div style={{ position: "relative" }}>
+            <Search
+              size={14}
+              strokeWidth={1.8}
+              style={{
+                position: "absolute",
+                left: 10,
+                top: "50%",
+                transform: "translateY(-50%)",
+                color: "var(--grey-400)",
+                pointerEvents: "none",
+              }}
+            />
+            <Input
+              size="sm"
+              radius="md"
+              variant="bordered"
+              placeholder="Search memories…"
+              value={searchQuery}
+              onValueChange={setSearchQuery}
+              style={{ paddingLeft: 32 }}
+              aria-label="Search memories"
+              className="w-full"
+              startContent={null}
+            />
+          </div>
+
           <MemFilterRow
-            active={activeFilter}
-            counts={segCounts}
+            activeSegment={activeSegment}
+            activeTier={activeTier}
+            activeSource={activeSource}
+            segCounts={segCounts}
+            tierCounts={tierCounts}
+            sourceCounts={sourceCounts}
             total={visibleItems.length}
-            onChange={(seg) => setFilter(seg)}
+            onSegmentChange={setSegment}
+            onTierChange={setTier}
+            onSourceChange={setSource}
           />
         </>
       )}
 
       {/* Memory list */}
       {loading ? (
-        <p className="muted-12">Loading...</p>
+        <p className="muted-12">Loading…</p>
       ) : visibleItems.length === 0 ? (
         <div className="empty-state">
-          <BrainCircuit size={32} strokeWidth={1.2} />
-          <div>
-            <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 4 }}>
+          <BrainCircuit size={36} strokeWidth={1.2} />
+          <div style={{ maxWidth: 320 }}>
+            <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 6, fontSize: "15px" }}>
               No memories yet
             </div>
-            <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)" }}>
-              Memories are auto-extracted from conversations, or add one manually above.
+            <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)", lineHeight: 1.6 }}>
+              The assistant builds up memory as you chat — facts about you, your preferences, and ongoing projects get saved automatically.
+            </div>
+            <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
+                <MessageSquare size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                Chat with the assistant to create memories automatically
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
+                <Plus size={13} strokeWidth={2} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                Or add one manually with the button above
+              </div>
             </div>
           </div>
         </div>
       ) : filtered.length === 0 ? (
         <div className="empty-state empty-state--inline">
-          <BrainCircuit size={18} />
-          <span>No {activeFilter !== "all" ? SEGMENTS[activeFilter as MemorySegment]?.label.toLowerCase() : ""} memories.</span>
+          <Search size={18} strokeWidth={1.8} />
+          <span>
+            {searchQuery
+              ? `No memories match "${searchQuery}".`
+              : hasActiveFilters
+              ? "No memories match the current filters."
+              : "No memories."}
+          </span>
         </div>
       ) : (
         <Card shadow="none" className="giap-card">
           <CardContent>
             <div className="mem-list">
               {filtered.map((m) => (
-                <MemCard key={m.id} mem={m} onDelete={handleDelete} />
+                <MemCard
+                  key={m.id}
+                  mem={m}
+                  onDelete={handleDelete}
+                  onUpdate={handleUpdate}
+                />
               ))}
             </div>
           </CardContent>
@@ -898,3 +1423,4 @@ export function Memory() {
     </div>
   );
 }
+

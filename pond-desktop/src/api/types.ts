@@ -57,21 +57,114 @@ export interface Settings {
   lat?: number;  // legacy alias
   lon?: number;  // legacy alias
 
+  // Fast path
+  fast_path_enabled?: boolean;
+
+  // Active model selection
+  active_embedding_model?: string;
+  embedding_provider?: string;
+
+  // Voice KWS tuning
+  voice_kws_whisper_url?: string | null;
+  voice_kws_energy_threshold?: number;
+  voice_kws_post_trigger_silence_ms?: number;
+  voice_kws_cooldown_ms?: number;
+
+  // Context
+  context_window_override?: number;
+
   // Agent behaviour
   agent_goose_mode?: string;
   agent_max_turns?: number;
+  agent_timeout_secs?: number;
+  prefix_cache_prompt?: boolean;
   agent_memory_inject: boolean;
   agent_memory_limit?: number;
+  tool_output_compaction?: boolean;
 
   // Memory lifecycle
   memory_extraction_enabled?: boolean;
   memory_cleanup_enabled?: boolean;
   memory_consolidation_enabled?: boolean;
+  memory_graph_enabled?: boolean;
+
+  // Memory tuning
+  memory_prune_threshold?: number;
+  memory_archive_threshold?: number;
+  memory_decay_base_half_life_days?: number;
+  memory_decay_beta?: number;
+  memory_cleanup_interval_hours?: number;
+  memory_consolidation_interval_hours?: number;
+  memory_consolidation_batch_size?: number;
+  memory_consolidation_mode?: string;
+  memory_extraction_max_facts?: number;
+  memory_extraction_interval_secs?: number;
+
+  // Scheduling tuning
+  schedule_result_notify?: boolean;
+  schedule_max_concurrent?: number;
+  schedule_max_runs_per_task?: number;
+
+  // Context monitoring
+  context_monitor_enabled?: boolean;
+
+  // Cost comparison
+  cloud_input_price_per_million?: number;
+  cloud_output_price_per_million?: number;
+
+  // Tool cache
+  tool_cache_enabled?: boolean;
+
+  // Telemetry
+  telemetry_enabled?: boolean;
+
+  // Compact encoding
+  compact_encoding?: boolean;
+
+  // Experimental
+  multi_tool_enabled?: boolean;
+  tool_call_validation?: boolean;
+  tool_request_detection?: boolean;
+
+  // Extension toggles
+  ext_memory_enabled?: boolean;
+  ext_schedule_enabled?: boolean;
+  ext_weather_enabled?: boolean;
+  ext_knowledge_enabled?: boolean;
+  ext_system_enabled?: boolean;
+  ext_device_enabled?: boolean;
 
   // Data retention
   retention_event_log_days?: number;
   retention_sensor_days?: number;
   retention_session_messages_keep?: number;
+}
+
+// ── Consolidation ────────────────────────────────────────────
+export type ConsolidationEventType =
+  | "started"
+  | "proposer_done"
+  | "adversary_done"
+  | "judge_done"
+  | "applied"
+  | "completed"
+  | "error"
+  | "cancelled";
+
+export interface ConsolidationEvent {
+  type: ConsolidationEventType;
+  memory_count?: number;
+  proposals?: unknown[];
+  challenges?: unknown[];
+  decisions?: unknown[];
+  exchange?: unknown;
+  result?: {
+    exchanges: unknown[];
+    accepted_count: number;
+    rejected_count: number;
+    duration_ms: number;
+  };
+  message?: string;
 }
 
 // ── Devices ───────────────────────────────────────────────────

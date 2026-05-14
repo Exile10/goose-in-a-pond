@@ -3,7 +3,9 @@
 //! Provides 3 tools: `recall_memories`, `save_memory`, `forget_memory`.
 //! Depends only on [`MemoryRepository`] — no god-struct.
 
-use pond_core::domain::memory::{MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier};
+use pond_core::domain::memory::{
+    MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
+};
 use pond_core::ports::embedding::EmbeddingProvider;
 use pond_core::ports::memory_repository::MemoryRepository;
 use rmcp::{
@@ -43,6 +45,13 @@ pub struct SaveMemoryParams {
     pub importance: Option<f32>,
     /// Tier: short, long, or permanent. If omitted, defaults by segment.
     pub tier: Option<String>,
+    /// Memory IDs that this new memory replaces. Those memories will be
+    /// immediately archived with lifecycle=merged and superseded_by set.
+    #[serde(default)]
+    pub supersedes: Option<Vec<String>>,
+    /// For correction segment: describes what wrong claim this corrects.
+    /// Prevents consolidation from reverting the fix.
+    pub corrects: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -139,9 +148,13 @@ impl MemoryMcpServer {
                 })?
         };
 
-        // Record access for decay tracking
+        // Record access for decay tracking + audit log
         for f in &filtered {
             let _ = self.memory_repo.record_access(&f.id).await;
+            let _ = self
+                .memory_repo
+                .log_event(MemoryEventKind::Recalled, &f.id, None, None)
+                .await;
         }
 
         let text = if filtered.is_empty() {
@@ -160,8 +173,9 @@ impl MemoryMcpServer {
                         .map(|i| format!("{:.1}", i))
                         .unwrap_or_else(|| "—".to_string());
                     format!(
-                        "[{}] [{}, {}] {}",
+                        "[{}] [id:{}] [{}, {}] {}",
                         f.created_at.format("%Y-%m-%d"),
+                        f.id,
                         seg,
                         imp,
                         f.content
@@ -174,10 +188,8 @@ impl MemoryMcpServer {
     }
 
     #[tool(
-        description = "Save a new memory fragment for future recall. Supports optional segment \
-        (identity, preference, correction, relationship, project, knowledge, context), importance \
-        (0-1), and tier (short, long, permanent). If segment is omitted, it is auto-classified \
-        from the content."
+        description = "Save a new memory. Optionally specify 'supersedes' with IDs of memories \
+        this replaces (they'll be archived). Supports segment, importance, and tier."
     )]
     async fn save_memory(
         &self,
@@ -185,6 +197,9 @@ impl MemoryMcpServer {
         params: Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let id = uuid::Uuid::new_v4().to_string();
+
+        // Extract supersedes list before other fields are consumed
+        let supersedes = params.0.supersedes.clone();
 
         // Fallback: if model sent empty content, extract from user message
         let content = if !params.0.content.is_empty() {
@@ -247,6 +262,10 @@ impl MemoryMcpServer {
             None
         };
 
+        // For correction segments, capture what wrong claim is being corrected
+        let corrects = params.0.corrects.clone().filter(|s| !s.is_empty());
+
+        let new_id = id.clone();
         let fragment = MemoryFragment {
             id,
             profile_id: None,
@@ -264,6 +283,7 @@ impl MemoryMcpServer {
             last_accessed_at: None,
             lifecycle: Some(MemoryLifecycle::Active),
             superseded_by: None,
+            corrects,
         };
 
         self.memory_repo.add(fragment).await.map_err(|e| {
@@ -273,6 +293,19 @@ impl MemoryMcpServer {
                 None,
             )
         })?;
+
+        // Audit log
+        let _ = self
+            .memory_repo
+            .log_event(MemoryEventKind::Written, &new_id, None, None)
+            .await;
+
+        // Archive any memories that this new one supersedes
+        if let Some(ref superseded_ids) = supersedes {
+            for old_id in superseded_ids {
+                let _ = self.memory_repo.mark_superseded(old_id, &new_id).await;
+            }
+        }
 
         let seg_label = format!("{:?}", segment).to_lowercase();
         let tier_label = format!("{:?}", tier).to_lowercase();
@@ -295,6 +328,10 @@ impl MemoryMcpServer {
                     None,
                 )
             })?;
+            let _ = self
+                .memory_repo
+                .log_event(MemoryEventKind::Deleted, id, None, None)
+                .await;
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "Memory {id} deleted."
             ))]));
@@ -317,6 +354,10 @@ impl MemoryMcpServer {
                         None,
                     )
                 })?;
+                let _ = self
+                    .memory_repo
+                    .log_event(MemoryEventKind::Deleted, &id, None, None)
+                    .await;
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "Memory deleted: {}",
                     found.content
@@ -345,9 +386,11 @@ impl ServerHandler for MemoryMcpServer {
             ))
             .with_instructions(
                 "GIAP Memory MCP server — save, recall, and forget memory fragments.\n\n\
-                 Tools: recall_memories (keyword-filtered recall with segment metadata), \
-                 save_memory (with optional segment/importance/tier classification), \
-                 forget_memory (by ID or exact content match).\n\n\
+                 Tools: recall_memories (keyword-filtered recall with segment metadata and IDs), \
+                 save_memory (with optional segment/importance/tier; use 'supersedes' to replace \
+                 old memories by ID), forget_memory (by ID or exact content match).\n\n\
+                 When correcting a fact, recall the old memory first, then save the correction \
+                 with supersedes=[old_id] to replace it.\n\n\
                  Memories are categorized by segment (identity, preference, correction, \
                  relationship, project, knowledge, context) with importance scoring and \
                  decay-based lifecycle management.",

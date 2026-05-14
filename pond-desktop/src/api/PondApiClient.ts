@@ -218,6 +218,40 @@ export class PondApiClient {
     return this.del(`/api/v1/memories/${id}`);
   }
 
+  // ── Consolidation ─────────────────────────────────────────
+
+  /** Start manual consolidation. Returns an SSE stream of ConsolidationEvent. */
+  async *streamConsolidation(): AsyncGenerator<import("./types").ConsolidationEvent> {
+    const res = await fetch(`${this.base}/api/v1/memory/consolidate`, {
+      method: "POST",
+      headers: this.headers(),
+    });
+    if (!res.ok || !res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (!data) continue;
+        try {
+          yield JSON.parse(data) as import("./types").ConsolidationEvent;
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+
+  /** Stop an in-progress consolidation. */
+  stopConsolidation(): Promise<void> {
+    return this.post("/api/v1/memory/consolidate/stop", {});
+  }
+
   // ── Skills ────────────────────────────────────────────────
 
   listSkills(all = false): Promise<UserSkill[]> {

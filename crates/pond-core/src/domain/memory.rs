@@ -139,6 +139,10 @@ pub struct MemoryFragment {
     /// ID of the memory that superseded this one (via consolidation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// For correction memories: describes what wrong claim this corrects,
+    /// so consolidation never accidentally reverts the fix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrects: Option<String>,
 }
 
 impl MemoryFragment {
@@ -166,16 +170,22 @@ impl MemoryFragment {
             last_accessed_at: None,
             lifecycle: None,
             superseded_by: None,
+            corrects: None,
         }
     }
 
     /// Create a fragment from background memory extraction.
+    ///
+    /// `corrects` should be set for `Correction` segments to record
+    /// what wrong claim this memory fixes, preventing consolidation
+    /// from accidentally reverting the correction.
     pub fn from_extraction(
         id: String,
         session_id: Option<String>,
         content: String,
         segment: MemorySegment,
         importance: f32,
+        corrects: Option<String>,
     ) -> Self {
         let tier = segment.default_tier();
         let decay_rate = tier.default_decay_rate();
@@ -196,6 +206,7 @@ impl MemoryFragment {
             last_accessed_at: None,
             lifecycle: Some(MemoryLifecycle::Active),
             superseded_by: None,
+            corrects,
         }
     }
 }
@@ -234,6 +245,48 @@ pub struct MemoryGraph {
     pub nodes: Vec<MemoryFragment>,
     /// The edges connecting nodes in this subgraph.
     pub edges: Vec<MemoryEdge>,
+}
+
+// ── Memory audit log ────────────────────────────────────────────────────────
+
+/// Tracks memory lifecycle events for audit and debugging.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEventKind {
+    Extracted,
+    Written,
+    Recalled,
+    Archived,
+    Pruned,
+    Consolidated,
+    Superseded,
+    Deleted,
+}
+
+impl std::fmt::Display for MemoryEventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Extracted => write!(f, "extracted"),
+            Self::Written => write!(f, "written"),
+            Self::Recalled => write!(f, "recalled"),
+            Self::Archived => write!(f, "archived"),
+            Self::Pruned => write!(f, "pruned"),
+            Self::Consolidated => write!(f, "consolidated"),
+            Self::Superseded => write!(f, "superseded"),
+            Self::Deleted => write!(f, "deleted"),
+        }
+    }
+}
+
+/// A single audit log entry for a memory lifecycle event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub id: i64,
+    pub event_kind: MemoryEventKind,
+    pub memory_id: String,
+    pub session_id: Option<String>,
+    pub data: Option<String>,
+    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -295,6 +348,7 @@ mod tests {
             "User's name is Jerry".to_string(),
             MemorySegment::Identity,
             0.85,
+            None,
         );
         assert_eq!(frag.segment, Some(MemorySegment::Identity));
         assert_eq!(frag.importance, Some(0.85));
@@ -302,6 +356,24 @@ mod tests {
         assert_eq!(frag.decay_rate, Some(0.0));
         assert_eq!(frag.lifecycle, Some(MemoryLifecycle::Active));
         assert_eq!(frag.source, "extraction");
+        assert!(frag.corrects.is_none());
+    }
+
+    #[test]
+    fn from_extraction_with_corrects() {
+        let frag = MemoryFragment::from_extraction(
+            "corr-1".to_string(),
+            None,
+            "User's name is Jerry, not John".to_string(),
+            MemorySegment::Correction,
+            0.9,
+            Some("User's name is John".to_string()),
+        );
+        assert_eq!(frag.segment, Some(MemorySegment::Correction));
+        assert_eq!(
+            frag.corrects,
+            Some("User's name is John".to_string())
+        );
     }
 
     #[test]
@@ -356,5 +428,21 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].relation, EdgeRelation::Superseded);
+    }
+
+    #[test]
+    fn memory_event_kind_serde_round_trip() {
+        let kind = MemoryEventKind::Extracted;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"extracted\"");
+        let back: MemoryEventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MemoryEventKind::Extracted);
+    }
+
+    #[test]
+    fn memory_event_kind_display() {
+        assert_eq!(MemoryEventKind::Written.to_string(), "written");
+        assert_eq!(MemoryEventKind::Pruned.to_string(), "pruned");
+        assert_eq!(MemoryEventKind::Superseded.to_string(), "superseded");
     }
 }

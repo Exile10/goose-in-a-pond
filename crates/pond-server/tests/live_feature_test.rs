@@ -228,7 +228,7 @@ async fn live_extraction_then_cleanup_cycle() {
 
     // Run cleanup — fresh memories should NOT be pruned
     let (scanned, archived, pruned) =
-        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15)
+        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15, 11.25, 0.8)
             .await
             .unwrap();
     println!("[live-test] cleanup: scanned={scanned}, archived={archived}, pruned={pruned}");
@@ -270,6 +270,7 @@ async fn live_consolidation_merges_duplicates() {
             content.into(),
             MemorySegment::Identity,
             0.8,
+            None,
         ))
         .await
         .unwrap();

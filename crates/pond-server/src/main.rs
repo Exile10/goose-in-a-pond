@@ -32,6 +32,7 @@ mod reqwest_model_downloader;
 mod schedule_executors;
 mod startup;
 mod system_deps;
+mod three_stage_consolidator;
 mod whisper_process;
 
 use anyhow::Result;
@@ -1311,6 +1312,8 @@ async fn run_server(
         let cleanup_interval_secs = settings.memory_cleanup_interval_hours as u64 * 3600;
         let prune_threshold = settings.memory_prune_threshold;
         let archive_threshold = settings.memory_archive_threshold;
+        let base_half_life = settings.memory_decay_base_half_life_days;
+        let decay_beta = settings.memory_decay_beta;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
@@ -1320,6 +1323,8 @@ async fn run_server(
                     cleanup_repo.as_ref(),
                     prune_threshold,
                     archive_threshold,
+                    base_half_life,
+                    decay_beta,
                 )
                 .await
                 {
@@ -1337,36 +1342,81 @@ async fn run_server(
         tracing::info!("memory cleanup enabled — runs every 6 hours");
     }
 
-    // Spawn background memory consolidation task
+    // ── Adversarial memory consolidation (inactivity-based) ──────────────
+    //
+    // Three shared pieces of state:
+    //   - last_user_activity: reset on every chat request
+    //   - consolidation_cancel: abort mid-run when the user comes back
+    //   - consolidation_event_tx: broadcast channel for SSE + background logs
+    let last_user_activity = Arc::new(tokio::sync::RwLock::new(std::time::Instant::now()));
+    let consolidation_cancel: Arc<
+        tokio::sync::RwLock<Option<tokio_util::sync::CancellationToken>>,
+    > = Arc::new(tokio::sync::RwLock::new(None));
+    let (consolidation_event_tx, _) = tokio::sync::broadcast::channel::<
+        pond_core::ports::memory_consolidator::ConsolidationEvent,
+    >(64);
+
+    // Build the ConsolidationRunner closure that pond-api will call from the
+    // POST /api/v1/memory/consolidate endpoint. Captures repo, provider, and
+    // the broadcast channel so pond-api never imports the consolidator crate.
+    let consolidation_runner: Option<pond_api::ConsolidationRunner> =
+        if settings.memory_consolidation_enabled {
+            let cr_repo = memory_repo.clone();
+            let cr_provider = llm_provider.clone();
+            let cr_broadcast_tx = consolidation_event_tx.clone();
+            Some(Arc::new(
+                move |cancel: tokio_util::sync::CancellationToken| {
+                    let repo = cr_repo.clone();
+                    let provider = cr_provider.clone();
+                    let broadcast_tx = cr_broadcast_tx.clone();
+                    Box::pin(async move {
+                        run_consolidation_pipeline(repo, provider, broadcast_tx, cancel).await;
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                },
+            ))
+        } else {
+            None
+        };
+
+    // Spawn inactivity-based consolidation scheduler
     if settings.memory_consolidation_enabled {
-        let consol_repo = memory_repo.clone();
-        let consol_provider = llm_provider.clone();
-        let consol_interval_secs = settings.memory_consolidation_interval_hours as u64 * 3600;
+        let inact_repo = memory_repo.clone();
+        let inact_provider = llm_provider.clone();
+        let inact_activity = last_user_activity.clone();
+        let inact_cancel = consolidation_cancel.clone();
+        let inact_event_tx = consolidation_event_tx.clone();
+        let inactivity_secs = 15 * 60u64; // 15 minutes
+
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(consol_interval_secs));
             loop {
-                interval.tick().await;
-                let consolidator =
-                    llm_memory_consolidator::LlmMemoryConsolidator::new(consol_provider.clone());
-                match pond_core::services::memory_consolidation::run_consolidation(
-                    &consolidator,
-                    consol_repo.as_ref(),
-                )
-                .await
-                {
-                    Ok((merged, pruned)) => {
-                        if merged > 0 || pruned > 0 {
-                            tracing::info!(
-                                "memory consolidation: merged={merged}, pruned={pruned}"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!("memory consolidation failed: {e}"),
+                // Poll every 60 seconds
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                // Check if 15 minutes of inactivity have passed
+                let elapsed = inact_activity.read().await.elapsed();
+                if elapsed < std::time::Duration::from_secs(inactivity_secs) {
+                    continue;
                 }
+
+                tracing::info!("15 minutes of inactivity — starting memory consolidation");
+
+                let cancel = tokio_util::sync::CancellationToken::new();
+                *inact_cancel.write().await = Some(cancel.clone());
+
+                run_consolidation_pipeline(
+                    inact_repo.clone(),
+                    inact_provider.clone(),
+                    inact_event_tx.clone(),
+                    cancel,
+                )
+                .await;
+
+                // Reset the activity timer so we don't immediately re-run
+                *inact_activity.write().await = std::time::Instant::now();
             }
         });
-        tracing::info!("memory consolidation enabled — runs every 24 hours");
+        tracing::info!("memory consolidation enabled — triggers after 15 min inactivity");
     }
 
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
@@ -1716,6 +1766,10 @@ async fn run_server(
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,
+        last_user_activity: last_user_activity.clone(),
+        consolidation_cancel: consolidation_cancel.clone(),
+        consolidation_event_tx: consolidation_event_tx.clone(),
+        consolidation_runner,
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
         telemetry: Some(Arc::new(
@@ -2685,6 +2739,154 @@ fn has_display() -> bool {
 /// history is not replayed. It then polls every second and prints any new rows
 /// to stdout. This is intentionally a plain `println!` rather than a tracing
 /// event so the output is always visible alongside the tracing output, making
+/// Run the three-stage adversarial consolidation pipeline, apply accepted
+/// actions, and broadcast events. Shared by the inactivity scheduler and the
+/// manual `POST /api/v1/memory/consolidate` endpoint (via `ConsolidationRunner`).
+async fn run_consolidation_pipeline(
+    repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    broadcast_tx: tokio::sync::broadcast::Sender<
+        pond_core::ports::memory_consolidator::ConsolidationEvent,
+    >,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use pond_core::domain::memory::MemoryLifecycle;
+    use pond_core::ports::memory_consolidator::{ConsolidationAction, ConsolidationEvent};
+
+    let memories = match repo.search_scoreable(None).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("consolidation: failed to load memories: {e}");
+            let _ = broadcast_tx.send(ConsolidationEvent::Error {
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    if memories.len() < 6 {
+        tracing::debug!(
+            "consolidation: skipped — only {} memories (need >= 6)",
+            memories.len()
+        );
+        let _ = broadcast_tx.send(ConsolidationEvent::Error {
+            message: format!(
+                "Need at least 6 memories to consolidate, found {}",
+                memories.len()
+            ),
+        });
+        return;
+    }
+
+    // Bridge: mpsc -> broadcast so the consolidator writes to mpsc and the
+    // SSE stream (if any) reads from broadcast.
+    let (mpsc_tx, mut mpsc_rx) = tokio::sync::mpsc::channel::<ConsolidationEvent>(64);
+    let bridge_tx = broadcast_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = mpsc_rx.recv().await {
+            let _ = bridge_tx.send(event);
+        }
+    });
+
+    let memory_count = memories.len();
+    let consolidator = three_stage_consolidator::ThreeStageConsolidator::new(provider);
+    let result = consolidator.run(&memories, cancel, Some(mpsc_tx)).await;
+
+    match result {
+        Ok(ref result) => {
+            for exchange in &result.exchanges {
+                if !exchange.judgment.accepted {
+                    continue;
+                }
+                match &exchange.proposal.action {
+                    ConsolidationAction::Merge {
+                        source_ids,
+                        merged_content,
+                        segment,
+                        importance,
+                    } => {
+                        let new_frag = pond_core::domain::memory::MemoryFragment::from_extraction(
+                            uuid::Uuid::new_v4().to_string(),
+                            None,
+                            merged_content.clone(),
+                            segment.clone(),
+                            *importance,
+                            None,
+                        );
+                        let new_id = new_frag.id.clone();
+                        let _ = repo.add(new_frag).await;
+                        for src_id in source_ids {
+                            let _ = repo.mark_superseded(src_id, &new_id).await;
+                        }
+                    }
+                    ConsolidationAction::Prune { id } => {
+                        let _ = repo.update_lifecycle(id, MemoryLifecycle::Archived).await;
+                    }
+                    ConsolidationAction::Recategorize {
+                        id,
+                        new_segment,
+                        new_importance,
+                    } => {
+                        let _ = repo.update_segment(id, new_segment.clone(), *new_importance).await;
+                    }
+                    ConsolidationAction::Split {
+                        source_id,
+                        new_memories,
+                    } => {
+                        // Create each split entry as a new memory
+                        let mut first_new_id = String::new();
+                        for entry in new_memories {
+                            let new_frag =
+                                pond_core::domain::memory::MemoryFragment::from_extraction(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    None,
+                                    entry.content.clone(),
+                                    entry.segment.clone(),
+                                    entry.importance,
+                                    None,
+                                );
+                            if first_new_id.is_empty() {
+                                first_new_id = new_frag.id.clone();
+                            }
+                            let _ = repo.add(new_frag).await;
+                        }
+                        // Mark the original as superseded by the first split
+                        if !first_new_id.is_empty() {
+                            let _ = repo.mark_superseded(source_id, &first_new_id).await;
+                        }
+                    }
+                }
+            }
+            if result.accepted_count > 0 || result.rejected_count > 0 {
+                tracing::info!(
+                    accepted = result.accepted_count,
+                    rejected = result.rejected_count,
+                    duration_ms = result.duration_ms,
+                    "adversarial consolidation complete"
+                );
+                // Persist audit trail
+                let details_json = serde_json::to_string(&result).ok();
+                let _ = repo
+                    .log_consolidation_run(
+                        "adversarial",
+                        memory_count,
+                        result.accepted_count,
+                        result.rejected_count,
+                        result.duration_ms,
+                        details_json.as_deref(),
+                    )
+                    .await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("consolidation failed: {e}");
+            let _ = broadcast_tx.send(ConsolidationEvent::Error {
+                message: e.to_string(),
+            });
+        }
+    }
+}
+
 /// it easy to correlate API activity with DB-level events in a single terminal.
 ///
 /// Output format:
@@ -4810,6 +5012,7 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
                 last_accessed_at: None,
                 lifecycle: None,
                 superseded_by: None,
+                corrects: None,
             };
             repo.add(fragment).await?;
             println!("✓ Memory saved (id: {id})");

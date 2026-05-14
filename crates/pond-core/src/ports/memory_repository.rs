@@ -1,7 +1,8 @@
 //! MemoryRepository port — driven port for semantic memory persistence.
 
 use crate::domain::memory::{
-    MemoryEdge, MemoryFragment, MemoryGraph, MemoryLifecycle, MemorySegment,
+    MemoryEdge, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryGraph, MemoryLifecycle,
+    MemorySegment,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -114,5 +115,52 @@ pub trait MemoryRepository: Send + Sync {
             nodes: vec![],
             edges: vec![],
         })
+    }
+
+    // ── Audit log methods (default no-op impls for backward compat) ─────
+
+    /// Record a memory lifecycle event for audit purposes.
+    async fn log_event(
+        &self,
+        _kind: MemoryEventKind,
+        _memory_id: &str,
+        _session_id: Option<&str>,
+        _data: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retrieve memory audit events, optionally filtered by memory ID.
+    async fn get_events(
+        &self,
+        _memory_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<MemoryEvent>> {
+        Ok(vec![])
+    }
+
+    /// Update the segment and importance of a memory (for recategorization).
+    async fn update_segment(
+        &self,
+        _id: &str,
+        _segment: MemorySegment,
+        _importance: f32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Consolidation run audit (default no-op) ────────────────────────────
+
+    /// Record a completed consolidation run with full details.
+    async fn log_consolidation_run(
+        &self,
+        _mode: &str,
+        _memory_count: usize,
+        _accepted: usize,
+        _rejected: usize,
+        _duration_ms: u64,
+        _details: Option<&str>,
+    ) -> Result<i64> {
+        Ok(0)
     }
 }

@@ -4,7 +4,7 @@
 //! durable facts, deduplicates against existing memories, and stores them.
 //! Runs asynchronously — must never block the SSE chat stream.
 
-use crate::domain::memory::MemoryFragment;
+use crate::domain::memory::{MemoryEventKind, MemoryFragment};
 use crate::ports::memory_extractor::MemoryExtractor;
 use crate::ports::memory_repository::MemoryRepository;
 use std::sync::Arc;
@@ -81,6 +81,12 @@ impl MemoryExtractionService {
         // Deduplicate and store
         let mut stored = 0;
         for fact in facts {
+            // Skip empty/whitespace-only content
+            if fact.content.trim().is_empty() {
+                tracing::debug!("[memory-extraction] skipped empty fact");
+                continue;
+            }
+
             // Skip if content already exists (case-insensitive substring match)
             let lower = fact.content.to_lowercase();
             if existing
@@ -91,12 +97,14 @@ impl MemoryExtractionService {
                 continue;
             }
 
+            let id = uuid::Uuid::new_v4().to_string();
             let fragment = MemoryFragment::from_extraction(
-                uuid::Uuid::new_v4().to_string(),
+                id.clone(),
                 session_id.map(|s| s.to_string()),
                 fact.content.clone(),
                 fact.segment,
                 fact.importance,
+                fact.corrects.clone(),
             );
 
             if let Err(e) = repo.add(fragment).await {
@@ -104,6 +112,9 @@ impl MemoryExtractionService {
             } else {
                 stored += 1;
                 tracing::info!("[memory-extraction] stored: {:?}", fact.content);
+                let _ = repo
+                    .log_event(MemoryEventKind::Extracted, &id, session_id, None)
+                    .await;
             }
         }
 

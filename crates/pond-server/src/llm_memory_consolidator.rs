@@ -13,12 +13,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const CONSOLIDATION_PROMPT: &str = "\
-Review these memories and find duplicates or redundancies.
-Output a JSON array of actions:
+Review these memories and find problems. Output a JSON array of actions:
 - To merge duplicates: {\"action\":\"merge\",\"ids\":[\"id1\",\"id2\"],\"merged\":\"combined fact\",\"segment\":\"...\",\"importance\":0.0-1.0}
-- To prune redundant: {\"action\":\"prune\",\"id\":\"id1\"}
+- To prune: {\"action\":\"prune\",\"id\":\"id1\"}
 - If nothing to change: []
-Be conservative: only merge truly duplicate facts. Keep distinct facts separate.
+MERGE truly duplicate facts. Keep distinct facts separate.
+PRUNE: empty content, general knowledge (weather, Wikipedia facts), info already available in the system prompt (assistant name, timezone, personality), speculative/unverified claims, vague statements, conversational filler, anything the assistant said rather than a user fact.
+Only keep memories personally relevant to the user that would be lost if forgotten.
 Output ONLY the JSON array.";
 
 pub struct LlmMemoryConsolidator {

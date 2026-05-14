@@ -14,6 +14,9 @@ pub struct ExtractedFact {
     pub segment: MemorySegment,
     pub importance: f32,
     pub tier: MemoryTier,
+    /// For correction segments: describes the wrong claim being fixed.
+    /// Prevents consolidation from accidentally reverting the correction.
+    pub corrects: Option<String>,
 }
 
 /// Driven port: extract durable facts from a user–assistant exchange.

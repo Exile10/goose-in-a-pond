@@ -7806,6 +7806,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "urlencoding",
  "wiremock",
 ]
 
@@ -7850,6 +7851,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -7977,6 +7980,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

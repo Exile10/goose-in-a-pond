@@ -106,6 +106,18 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Callback that spawns the three-stage adversarial memory consolidation
+/// pipeline. Injected by `pond-server` so `pond-api` has no dependency on
+/// the consolidator implementation. Receives the cancellation token so the
+/// caller can abort mid-run.
+pub type ConsolidationRunner = Arc<
+    dyn Fn(
+            tokio_util::sync::CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Shared application state available to all route handlers.
 pub struct AppState {
     pub db: Arc<Database>,
@@ -234,6 +246,20 @@ pub struct AppState {
     /// Shared extraction service instance (rate limiter + dedup state).
     pub memory_extraction_service:
         Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
+    /// Timestamp of the last user request — used by the inactivity-based
+    /// consolidation scheduler. Updated on every chat/API call.
+    pub last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+    /// Cancellation token for in-progress consolidation. When a user request
+    /// arrives, this token is cancelled to stop consolidation immediately.
+    pub consolidation_cancel: Arc<tokio::sync::RwLock<Option<tokio_util::sync::CancellationToken>>>,
+    /// Broadcast channel for consolidation events (streamed to SSE for the UI modal).
+    pub consolidation_event_tx:
+        tokio::sync::broadcast::Sender<pond_core::ports::memory_consolidator::ConsolidationEvent>,
+    /// Injected by `pond-server` — spawns the three-stage adversarial
+    /// consolidation pipeline.  `pond-api` never imports the consolidator
+    /// directly; the closure captures everything it needs.
+    /// `None` when `memory_consolidation_enabled` is false.
+    pub consolidation_runner: Option<ConsolidationRunner>,
     /// Inference pool — concurrent LLM task submission with provider-aware
     /// semaphore (3 for HTTP providers, 1 for GGUF). Used for parallel
     /// post-processing (review + extraction can run concurrently on HTTP providers).
