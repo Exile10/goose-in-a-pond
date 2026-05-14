@@ -19,7 +19,7 @@ Return JSON: {\"facts\":[{\"content\":\"one sentence fact\",\"segment\":\"identi
 
 Segment guide:
 - identity: core user facts (name, role, location). importance 0.80-0.85
-- correction: user explicitly corrects something. importance 0.85-0.90
+- correction: user explicitly corrects something. importance 0.85-0.90. Add \"corrects\":\"the wrong claim being fixed\" field.
 - preference: style, defaults, likes/dislikes. importance 0.65-0.75
 - relationship: people, pets, connections. importance 0.65-0.75
 - project: ongoing work, deadlines, goals. importance 0.55-0.65
@@ -27,7 +27,13 @@ Segment guide:
 - context: current situation, transient. importance 0.30-0.40
 
 Max 3 facts per turn. Prefer fewer, higher-quality facts.
-ONLY save facts about the user — NEVER save general knowledge or info the assistant provided.
+NEVER save:
+- General knowledge or facts the assistant provided (weather, Wikipedia, etc.)
+- Info already in the system prompt (assistant name, timezone, personality)
+- Speculative or unverified claims (\"I think\", \"maybe\", \"probably\")
+- Transient conversational filler (\"OK\", \"thanks\", greetings)
+- Empty or vague content without concrete information
+ONLY save facts about the user that would be lost if forgotten.
 If nothing is worth remembering, return {\"facts\":[]}.";
 
 pub struct LlmMemoryExtractor {
@@ -202,11 +208,19 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
 
     let tier = segment.default_tier();
 
+    // For correction segments, read what wrong claim is being corrected
+    let corrects = v
+        .get("corrects")
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     Some(ExtractedFact {
         content,
         segment,
         importance,
         tier,
+        corrects,
     })
 }
 
@@ -387,5 +401,26 @@ mod tests {
         let json = r#"{"facts": [{"content": "User works at Jarida", "segment": "identity", "importance": 0.83}]}"#;
         let facts = parse_extraction_response(json, &existing, 3).unwrap();
         assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_correction_with_corrects_field() {
+        let json = r#"{"facts": [
+            {"content": "User's name is Jerry, not John", "segment": "correction", "importance": 0.9, "corrects": "User's name is John"}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].segment, MemorySegment::Correction);
+        assert_eq!(facts[0].corrects, Some("User's name is John".to_string()));
+    }
+
+    #[test]
+    fn parse_non_correction_has_no_corrects() {
+        let json = r#"{"facts": [
+            {"content": "User likes dark mode", "segment": "preference", "importance": 0.7}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].corrects.is_none());
     }
 }

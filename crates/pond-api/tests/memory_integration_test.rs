@@ -139,6 +139,10 @@ async fn make_app_with_real_memory(
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
@@ -200,6 +204,7 @@ async fn segment_fields_round_trip_through_sqlite() {
         "User's name is Jerry".into(),
         MemorySegment::Identity,
         0.85,
+        None,
     );
     repo.add(frag).await.unwrap();
 
@@ -226,6 +231,7 @@ async fn access_tracking_increments_and_timestamps() {
         "Test fact".into(),
         MemorySegment::Knowledge,
         0.5,
+        None,
     );
     repo.add(frag).await.unwrap();
 
@@ -250,6 +256,7 @@ async fn lifecycle_update_hides_from_search() {
         "Active memory".into(),
         MemorySegment::Knowledge,
         0.5,
+        None,
     ))
     .await
     .unwrap();
@@ -260,6 +267,7 @@ async fn lifecycle_update_hides_from_search() {
         "To be archived".into(),
         MemorySegment::Context,
         0.3,
+        None,
     ))
     .await
     .unwrap();
@@ -285,6 +293,7 @@ async fn search_by_segment_filters_correctly() {
         "Name is Jerry".into(),
         MemorySegment::Identity,
         0.85,
+        None,
     ))
     .await
     .unwrap();
@@ -294,6 +303,7 @@ async fn search_by_segment_filters_correctly() {
         "Likes dark mode".into(),
         MemorySegment::Preference,
         0.7,
+        None,
     ))
     .await
     .unwrap();
@@ -303,6 +313,7 @@ async fn search_by_segment_filters_correctly() {
         "Lives in Nairobi".into(),
         MemorySegment::Identity,
         0.8,
+        None,
     ))
     .await
     .unwrap();
@@ -335,6 +346,7 @@ async fn mark_superseded_sets_lifecycle_and_link() {
         "User likes coffee".into(),
         MemorySegment::Preference,
         0.7,
+        None,
     ))
     .await
     .unwrap();
@@ -344,6 +356,7 @@ async fn mark_superseded_sets_lifecycle_and_link() {
         "User likes coffee and tea".into(),
         MemorySegment::Preference,
         0.7,
+        None,
     ))
     .await
     .unwrap();
@@ -366,8 +379,9 @@ fn effective_score_permanent_tier_no_decay() {
         "Name".into(),
         MemorySegment::Identity,
         0.9,
+        None,
     );
-    let score = effective_score(&frag);
+    let score = effective_score(&frag, 11.25, 0.8);
     assert!((score - 0.9).abs() < 0.01);
 }
 
@@ -379,16 +393,17 @@ fn effective_score_decays_over_time() {
         "Old fact".into(),
         MemorySegment::Context,
         0.3,
+        None,
     );
     // Make it 30 days old
     frag.created_at = chrono::Utc::now() - chrono::Duration::days(30);
     frag.tier = Some(MemoryTier::Short);
     frag.decay_rate = Some(0.1);
 
-    let score = effective_score(&frag);
+    let score = effective_score(&frag, 11.25, 0.8);
     assert!(
-        score < 0.05,
-        "30-day-old short-tier memory should decay below 0.05, got {score}"
+        score < 0.15,
+        "30-day-old short-tier memory should decay significantly, got {score}"
     );
 }
 
@@ -400,13 +415,14 @@ fn effective_score_access_reinforces() {
         "Fact".into(),
         MemorySegment::Knowledge,
         0.5,
+        None,
     );
     no_access.created_at = chrono::Utc::now() - chrono::Duration::days(10);
 
     let mut accessed = no_access.clone();
     accessed.access_count = 20;
 
-    assert!(effective_score(&accessed) > effective_score(&no_access));
+    assert!(effective_score(&accessed, 11.25, 0.8) > effective_score(&no_access, 11.25, 0.8));
 }
 
 // ── Cleanup Integration Test ─────────────────────────────────────────────────
@@ -424,6 +440,7 @@ async fn cleanup_archives_decayed_memories() {
         "Recent fact".into(),
         MemorySegment::Knowledge,
         0.7,
+        None,
     ))
     .await
     .unwrap();
@@ -435,6 +452,7 @@ async fn cleanup_archives_decayed_memories() {
         "Ancient context".into(),
         MemorySegment::Context,
         0.3,
+        None,
     );
     old.created_at = chrono::Utc::now() - chrono::Duration::days(60);
     old.tier = Some(MemoryTier::Short);
@@ -448,12 +466,13 @@ async fn cleanup_archives_decayed_memories() {
         "Identity fact".into(),
         MemorySegment::Identity,
         0.9,
+        None,
     ))
     .await
     .unwrap();
 
     let (scanned, archived, pruned) =
-        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15)
+        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15, 11.25, 0.8)
             .await
             .unwrap();
 
@@ -510,6 +529,7 @@ async fn api_list_memories_returns_recent() {
         "Fact one".into(),
         MemorySegment::Knowledge,
         0.5,
+        None,
     ))
     .await
     .unwrap();
@@ -519,6 +539,7 @@ async fn api_list_memories_returns_recent() {
         "Fact two".into(),
         MemorySegment::Preference,
         0.7,
+        None,
     ))
     .await
     .unwrap();
@@ -541,6 +562,7 @@ async fn api_delete_memory_removes_from_db() {
         "To delete".into(),
         MemorySegment::Context,
         0.3,
+        None,
     ))
     .await
     .unwrap();

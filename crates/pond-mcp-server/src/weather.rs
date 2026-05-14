@@ -1,19 +1,45 @@
-//! Weather MCP Server — current weather conditions.
+//! Weather MCP Server — current weather and forecasts.
 //!
-//! Provides 1 tool: `get_current_weather`.
+//! Provides 2 tools: `get_current_weather`, `get_weather_forecast`.
 //! Depends on [`WeatherProvider`] (wrapped in `Option` for unconfigured instances).
 
 use pond_adapters_weather::WeatherProvider;
 use rmcp::{
-    handler::server::router::tool::ToolRouter,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, ErrorData, Implementation, InitializeResult,
+        CallToolResult, Content, ErrorData, Implementation, InitializeResult,
         ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use std::sync::Arc;
+
+// ── Parameter structs ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct WeatherParams {
+    /// City or place name (e.g. "Kisumu", "London", "Tokyo"). If omitted, uses the configured default location.
+    pub location: Option<String>,
+    /// Catch-all for unexpected fields the model might send.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ForecastParams {
+    /// City or place name (e.g. "Kisumu", "London", "Tokyo"). If omitted, uses the configured default location.
+    pub location: Option<String>,
+    /// Number of days to forecast (1-7, default 3).
+    pub days: Option<u8>,
+    /// Catch-all for unexpected fields the model might send.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 // ── MCP server ─────────────────────────────────────────────────────────────
 
@@ -33,43 +59,110 @@ impl WeatherMcpServer {
         }
     }
 
-    #[tool(description = "Get the current weather conditions for the configured location.")]
+    #[tool(description = "\
+Get current weather conditions. Pass a location name for any city \
+(e.g. 'Kisumu', 'London'). Omit location for the user's default. \
+DO NOT guess weather data or use shell commands for weather.")]
     async fn get_current_weather(
         &self,
         _ctx: RequestContext<RoleServer>,
+        params: Parameters<WeatherParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        println!(
-            "[weather] get_current_weather called, provider={}",
+        let location = resolve_location(&params.0);
+        tracing::debug!(
+            "get_current_weather called, location={:?}, provider={}",
+            location,
             if self.weather.is_some() {
                 "configured"
             } else {
                 "NONE"
             }
         );
+
         match &self.weather {
-            None => {
-                println!("[weather] no provider configured, returning guidance");
-                Ok(CallToolResult::success(vec![Content::text(
-                    "The weather service is not configured on this GIAP instance. \
-                     Inform the user that they need to configure a weather location in their settings. \
-                     DO NOT attempt to fetch weather using any other tool, shell command, or external request.",
-                )]))
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "The weather service is not configured on this GIAP instance. \
+                 Inform the user that they need to configure a weather location in their settings. \
+                 DO NOT attempt to fetch weather using any other tool, shell command, or external request.",
+            )])),
+            Some(w) => {
+                let result = match &location {
+                    Some(loc) => w.current_for(loc).await,
+                    None => w.current().await,
+                };
+                match result {
+                    Ok(data) => {
+                        tracing::debug!("weather: fetched current for {}", data.location_name);
+                        Ok(CallToolResult::success(vec![Content::text(
+                            data.as_context_block(),
+                        )]))
+                    }
+                    Err(e) => {
+                        tracing::warn!("weather: fetch failed: {e}");
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Weather fetch failed: {e}. Tell the user the weather service \
+                             is temporarily unavailable and suggest they try again shortly."
+                        ))]))
+                    }
+                }
             }
-            Some(w) => match w.current().await {
-                Ok(data) => {
-                    println!("[weather] fetched successfully");
-                    Ok(CallToolResult::success(vec![Content::text(
-                        data.as_context_block(),
-                    )]))
+        }
+    }
+
+    #[tool(description = "\
+Get a multi-day weather forecast with highs, lows, rain chance, UV index, \
+and sunrise/sunset. Pass 'location' for any city, 'days' for how many days \
+(1-7, default 3). DO NOT guess forecast data.")]
+    async fn get_weather_forecast(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ForecastParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let location = resolve_forecast_location(&params.0);
+        let days = params.0.days.unwrap_or(3).clamp(1, 7);
+
+        tracing::debug!(
+            "get_weather_forecast called, location={:?}, days={}, provider={}",
+            location,
+            days,
+            if self.weather.is_some() {
+                "configured"
+            } else {
+                "NONE"
+            }
+        );
+
+        match &self.weather {
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "The weather service is not configured on this GIAP instance. \
+                 Inform the user that they need to configure a weather location in their settings. \
+                 DO NOT attempt to fetch forecasts using any other tool, shell command, or external request.",
+            )])),
+            Some(w) => {
+                let result = match &location {
+                    Some(loc) => w.forecast_for(loc, days).await,
+                    None => w.forecast(days).await,
+                };
+                match result {
+                    Ok(data) => {
+                        tracing::debug!(
+                            "weather: fetched {}-day forecast for {}",
+                            data.days.len(),
+                            data.location_name
+                        );
+                        Ok(CallToolResult::success(vec![Content::text(
+                            data.as_context_block(),
+                        )]))
+                    }
+                    Err(e) => {
+                        tracing::warn!("weather: forecast fetch failed: {e}");
+                        Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Forecast fetch failed: {e}. Tell the user the weather service \
+                             is temporarily unavailable and suggest they try again shortly."
+                        ))]))
+                    }
                 }
-                Err(e) => {
-                    println!("[weather] fetch FAILED: {e}");
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Weather fetch failed: {e}. Tell the user the weather service \
-                         is temporarily unavailable and suggest they try again shortly."
-                    ))]))
-                }
-            },
+            }
         }
     }
 }
@@ -84,12 +177,61 @@ impl ServerHandler for WeatherMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Weather MCP server — current weather conditions for the configured location.\n\n\
-                 Tool: get_current_weather. Returns temperature, humidity, conditions, and wind \
-                 for the user's configured location. If not configured, instructs the user to \
-                 set up a weather location in settings.",
+                "GIAP Weather MCP server — current conditions and multi-day forecasts.\n\n\
+                 Tools:\n\
+                 - get_current_weather: temperature, humidity, wind, cloud cover, sunrise/sunset. \
+                 Pass 'location' for any city or omit for the user's default.\n\
+                 - get_weather_forecast: multi-day forecast with highs/lows, rain chance, UV index. \
+                 Pass 'location' and 'days' (1-7).\n\n\
+                 If weather is not configured, instructs the user to set up a location in settings.",
             )
     }
+}
+
+// ── Param resolution ──────────────────────────────────────────────────────────
+
+/// Extract location from WeatherParams, scanning extras as fallback.
+fn resolve_location(params: &WeatherParams) -> Option<String> {
+    // Direct param
+    if let Some(ref loc) = params.location {
+        let trimmed = loc.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    // Scan extras for common synonyms
+    for key in &["location", "city", "place", "loc", "where"] {
+        if let Some(val) = params.extra.get(*key) {
+            if let Some(s) = val.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract location from ForecastParams, scanning extras as fallback.
+fn resolve_forecast_location(params: &ForecastParams) -> Option<String> {
+    if let Some(ref loc) = params.location {
+        let trimmed = loc.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    for key in &["location", "city", "place", "loc", "where"] {
+        if let Some(val) = params.extra.get(*key) {
+            if let Some(s) = val.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
@@ -132,5 +274,56 @@ mod tests {
     #[test]
     fn server_constructs_with_none() {
         let _server = WeatherMcpServer::new(None);
+    }
+
+    #[test]
+    fn resolve_location_from_direct_param() {
+        let params = WeatherParams {
+            location: Some("Kisumu".to_string()),
+            extra: Default::default(),
+        };
+        assert_eq!(resolve_location(&params), Some("Kisumu".to_string()));
+    }
+
+    #[test]
+    fn resolve_location_from_extras() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "city".to_string(),
+            serde_json::Value::String("Mombasa".to_string()),
+        );
+        let params = WeatherParams {
+            location: None,
+            extra,
+        };
+        assert_eq!(resolve_location(&params), Some("Mombasa".to_string()));
+    }
+
+    #[test]
+    fn resolve_location_returns_none_for_empty() {
+        let params = WeatherParams {
+            location: Some("  ".to_string()),
+            extra: Default::default(),
+        };
+        assert_eq!(resolve_location(&params), None);
+    }
+
+    #[test]
+    fn resolve_location_returns_none_for_no_params() {
+        let params = WeatherParams::default();
+        assert_eq!(resolve_location(&params), None);
+    }
+
+    #[test]
+    fn resolve_forecast_location_works() {
+        let params = ForecastParams {
+            location: Some("Eldoret".to_string()),
+            days: Some(5),
+            extra: Default::default(),
+        };
+        assert_eq!(
+            resolve_forecast_location(&params),
+            Some("Eldoret".to_string())
+        );
     }
 }

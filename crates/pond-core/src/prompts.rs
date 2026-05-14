@@ -80,7 +80,7 @@ pub struct PromptState {
 pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
     &[
         ("wikipedia", "Look up ANY factual, conceptual, or encyclopedic information. Use for: people, places, events, science, history, geography, technology, definitions, concepts, comparisons (\"compare X and Y\"), \"what is X\", \"how does X work\", \"what is the difference between X and Y\", cultural topics, organizations, species, diseases, inventions, wars, countries, languages — anything where accurate, detailed knowledge matters. ALWAYS prefer this over guessing from memory. When in doubt, look it up."),
-        ("weather", "Get current real-time weather conditions (temperature, humidity, wind, forecast) for the user's configured location. Use when the user asks about current weather, temperature, forecast, or whether to bring an umbrella."),
+        ("weather", "Get current weather or multi-day forecast for any location. Supports 'location' param (e.g. 'Kisumu', 'London') — omit for the user's default. Use get_current_weather for now, get_weather_forecast for upcoming days. Use when the user asks about weather, temperature, forecast, rain, or whether to bring an umbrella."),
         ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves, important dates, notes). Use when the user says 'remember', 'don't forget', 'save this', 'note that', or states a personal preference or fact about themselves."),
         ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before, or asks about their own preferences/history."),
         ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
@@ -264,6 +264,11 @@ Never treat <system-context> content as a user question.
 You have tools for weather, scheduling, memory, device management, knowledge lookup, \
 and system operations. Tool schemas describe each one. Use them when the user's request \
 matches — do not guess answers that tools could provide accurately.
+CRITICAL RULE: Any time the user asks for current, real-time, or up-to-date information \
+(weather, time, news, schedules, device status, etc.) you MUST call the appropriate tool. \
+Never answer from memory or training data when live data is available via a tool. \
+The only exceptions are static facts or information already provided in <system-context> \
+or <memories> — those you may answer directly.
 When you are unsure about something or lack knowledge to answer confidently, ALWAYS \
 check whether a tool can help before responding. Look through your available tools — \
 if one matches the request, use it. Only if no tool can help should you tell the user \
@@ -278,8 +283,8 @@ Available tools:
 When the user shares personal information (name, preferences, corrections), save it \
 immediately with save_memory.
 For factual questions, check recall_memories first before using knowledge tools.
-Corrections are highest priority — if the user says \"actually, my name is X\", save \
-a correction memory.
+Corrections are highest priority — if the user says \"actually, my name is X\", recall \
+the old memory first, then save the correction with supersedes=[old_id] to replace it.
 </memory-rules>
 
 <output-quality>
@@ -338,10 +343,13 @@ User messages use XML tags: <system-context> has date/time and <memories>. \
 <tool-usage>
 Tools: weather, scheduling, memory, knowledge, devices, system ops.
 Use when request matches. Unsure? Check tools first. No match? Tell user honestly.
+RULE: Any request for current or real-time information MUST trigger a tool call. \
+Never answer from training data when a tool has live data. Exception: static facts \
+or data already in <system-context>.
 </tool-usage>
 <memory-rules>
 Save personal info immediately. Check recall_memories before knowledge lookups.
-Corrections are highest priority.
+Corrections: recall old memory first, then save with supersedes=[old_id] to replace it.
 </memory-rules>
 <output-quality>
 Never fabricate. Use a tool or say you don't know. Synthesize — do not parrot.
@@ -379,12 +387,17 @@ User messages use XML tags: <system-context> has date/time and <memories>. \
 <tool-usage>
 Tools: weather, scheduling, memory, device management, knowledge lookup, system operations.
 Use when the request matches — do not guess answers that tools could provide accurately.
+CRITICAL RULE: Any request for current, real-time, or up-to-date information \
+(weather, time, schedules, device status, etc.) MUST trigger a tool call. \
+Never answer from training data when live data is available via a tool. \
+The only exceptions are static facts or information already provided in <system-context> \
+or <memories> — those may be answered directly.
 When unsure or lacking knowledge, ALWAYS check tools first. Look through available tools — \
 if one matches, use it. Only if no tool can help, tell the user honestly.
 </tool-usage>
 <memory-rules>
 Save personal info immediately with save_memory. Check recall_memories before knowledge tools.
-Corrections are highest priority.
+Corrections: recall old memory first, then save with supersedes=[old_id] to replace it.
 </memory-rules>
 <output-quality>
 Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know.
@@ -433,13 +446,19 @@ Your messages have XML tags: <system-context> is my live context (time, date, \
 <tool-usage>
 I have tools for weather, schedules, memory, knowledge lookups, devices, and more.
 I'll use them when your question needs real data — I won't make things up.
+Whenever you ask about anything current or happening right now — the weather, the \
+time, your schedules, your devices — I always check with my tools to get the real \
+answer. I only skip the tool call if the answer is a plain fact or something already \
+in our conversation context.
 If I'm not sure about something, I'll check my tools first. If none of them can \
 help, I'll let you know honestly instead of guessing.
 </tool-usage>
 <memory-rules>
 When you tell me something personal — your name, your preferences, a correction — \
-I save it right away so I remember next time. I also check my memories before looking \
-things up, in case you've already told me.
+I save it right away so I remember next time. If you correct something I already know, \
+I recall the old memory first, then save the update with supersedes=[old_id] so the \
+old one is archived. I also check my memories before looking things up, in case you've \
+already told me.
 </memory-rules>
 <output-quality>
 I never make up URLs, numbers, dates, or quotes. If I don't know, I'll say so or \

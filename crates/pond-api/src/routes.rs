@@ -185,6 +185,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Memories ──────────────────────────────────────────────────────────
         .route("/memories", get(list_memories).post(save_memory))
         .route("/memories/{id}", delete(delete_memory))
+        // ── Memory Consolidation ─────────────────────────────────────────────
+        .route("/memory/consolidate", post(start_consolidation))
+        .route("/memory/consolidate/stop", post(stop_consolidation))
         // ── Skills ────────────────────────────────────────────────────────────
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/{id}", put(update_skill).delete(delete_skill))
@@ -579,6 +582,14 @@ async fn chat_stream(
 {
     use futures::StreamExt;
     use pond_core::ports::agent::AgentStreamEvent;
+
+    // Update activity timestamp — resets the consolidation inactivity timer
+    *state.last_user_activity.write().await = std::time::Instant::now();
+    // Cancel any in-progress consolidation
+    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
+        cancel.cancel();
+    }
+
     let permit = state
         .sse_semaphore
         .clone()
@@ -4609,6 +4620,13 @@ async fn agent_chat_stream(
     use pond_core::domain::agent::AgentRequest;
     use pond_core::ports::agent::AgentStreamEvent;
 
+    // Update activity timestamp — resets the consolidation inactivity timer
+    *state.last_user_activity.write().await = std::time::Instant::now();
+    // Cancel any in-progress consolidation
+    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
+        cancel.cancel();
+    }
+
     let permit = match state.sse_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -6184,6 +6202,7 @@ async fn save_memory(
         last_accessed_at: None,
         lifecycle: Some(pond_core::domain::memory::MemoryLifecycle::Active),
         superseded_by: None,
+        corrects: None,
     };
     match state.memory_repo.add(fragment.clone()).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(fragment))).into_response(),
@@ -6207,6 +6226,63 @@ async fn delete_memory(
         )
             .into_response(),
     }
+}
+
+// ── Memory Consolidation ─────────────────────────────────────────────────────
+
+/// POST /api/v1/memory/consolidate — manually trigger three-stage adversarial
+/// consolidation. Returns an SSE stream of `ConsolidationEvent` so the UI can
+/// show live progress (proposer -> adversary -> judge).
+async fn start_consolidation(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use pond_core::ports::memory_consolidator::ConsolidationEvent;
+
+    let runner = match &state.consolidation_runner {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Memory consolidation is not enabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    *state.consolidation_cancel.write().await = Some(cancel.clone());
+
+    // Subscribe BEFORE spawning so we don't miss the first event
+    let mut rx = state.consolidation_event_tx.subscribe();
+
+    // Spawn the injected consolidation runner
+    tokio::spawn(runner(cancel));
+
+    // Return an SSE stream backed by the broadcast receiver
+    let stream = async_stream::stream! {
+        while let Ok(event) = rx.recv().await {
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            yield Ok::<_, Infallible>(Event::default().data(json));
+            // Terminal events — stop streaming after these
+            match event {
+                ConsolidationEvent::Completed { .. }
+                | ConsolidationEvent::Error { .. }
+                | ConsolidationEvent::Cancelled => break,
+                _ => {}
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// POST /api/v1/memory/consolidate/stop — cancel an in-progress consolidation.
+async fn stop_consolidation(State(state): State<Arc<AppState>>) -> StatusCode {
+    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
+        cancel.cancel();
+    }
+    StatusCode::OK
 }
 
 // ── Skills ────────────────────────────────────────────────────────────────────
