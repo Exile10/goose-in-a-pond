@@ -8,10 +8,10 @@
 :root {
   /* ── Font Families ──────────────────────────────────────── */
   /* Quicksand + Comfortaa only. Both bundled via fontsource. */
-  --font-display: "Quicksand", "Comfortaa", sans-serif;
-  --font-heading: "Quicksand", "Comfortaa", sans-serif;
-  --font-body:    "Quicksand", "Comfortaa", sans-serif;
-  --font-body-alt:"Comfortaa", "Quicksand", sans-serif;
+  --font-display: "Quicksand", "Comfortaa";
+  --font-heading: "Quicksand", "Comfortaa";
+  --font-body:    "Quicksand", "Comfortaa";
+  --font-body-alt:"Comfortaa", "Quicksand";
   --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   /* ── Type Scale ──────────────────────────────────────────── */
