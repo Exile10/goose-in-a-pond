@@ -14,8 +14,9 @@ members = [
     "crates/pond-adapters-gotg",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
-    # Independent agent (no Goose dependency — future primary path)
+    # Independent agent + inference engine (no Goose dependency — future primary path)
     "crates/pond-agent",
+    "crates/pond-inference",
     # Goose-dependent crates — use goose with default-features=false to avoid
     # the rmcp version conflict (code-mode feature is not enabled).
     "crates/pond-adapters-goose",
