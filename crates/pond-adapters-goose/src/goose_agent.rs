@@ -102,6 +102,12 @@ pub struct GooseAdapter {
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
     /// local inference providers to reuse their KV-cache for the stable portion.
     last_prefix_hash: Mutex<u64>,
+    /// Cached tool set from the last list_tools() call. Invalidated when
+    /// extensions are added/removed. Avoids re-querying all MCP servers every turn.
+    cached_tools: tokio::sync::RwLock<Option<std::collections::HashSet<String>>>,
+    /// Whether the Goose default extensions have been stripped for this session.
+    /// Only needs to happen once, not every turn.
+    defaults_stripped: Mutex<HashSet<String>>,
 }
 
 impl GooseAdapter {
@@ -185,6 +191,8 @@ impl GooseAdapter {
                 pond_core::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
+            cached_tools: tokio::sync::RwLock::new(None),
+            defaults_stripped: Mutex::new(HashSet::new()),
         })
     }
 
@@ -233,11 +241,15 @@ impl GooseAdapter {
     /// Mark an extension name as user-added so it survives the per-turn extension strip.
     pub async fn track_user_extension(&self, name: &str) {
         self.user_extensions.write().await.insert(name.to_string());
+        // Invalidate tool cache — new extension means new tools available.
+        *self.cached_tools.write().await = None;
     }
 
     /// Remove an extension from the user-tracking set.
     pub async fn untrack_user_extension(&self, name: &str) {
         self.user_extensions.write().await.remove(name);
+        // Invalidate tool cache — removed extension means tools changed.
+        *self.cached_tools.write().await = None;
     }
 
     /// Add a named builtin extension to a Goose session (idempotent).
@@ -975,116 +987,136 @@ impl GooseAdapter {
 
         // ── 6. Extension cleanup ──────────────────────────────────────────────
         // Strip Goose default extensions that would pollute the prompt.
-        // PRESERVE GIAP builtin extensions (they ARE the tool interface now)
-        // and user-added MCP extensions (music, filesystem, etc.).
-        let strip_list: &[&str] = &[
-            "developer",
-            "computercontroller",
-            "extensionmanager",
-            "todo",
-            "apps",
-            "analyze",
-            "summon",
-            "summarize",
-            "orchestrator",
-            "tom",
-        ];
-        let user_exts = self.user_extensions.read().await;
-        for ext in strip_list {
-            if !user_exts.contains(*ext) {
-                self.agent.remove_extension(ext, &goose_sid).await.ok();
+        // Only do this once per session — subsequent turns skip the strip loop.
+        {
+            let already_stripped = self
+                .defaults_stripped
+                .lock()
+                .unwrap()
+                .contains(&goose_sid);
+            if !already_stripped {
+                let strip_list: &[&str] = &[
+                    "developer",
+                    "computercontroller",
+                    "extensionmanager",
+                    "todo",
+                    "apps",
+                    "analyze",
+                    "summon",
+                    "summarize",
+                    "orchestrator",
+                    "tom",
+                ];
+                let user_exts = self.user_extensions.read().await;
+                for ext in strip_list {
+                    if !user_exts.contains(*ext) {
+                        self.agent.remove_extension(ext, &goose_sid).await.ok();
+                    }
+                }
+                drop(user_exts);
+                self.defaults_stripped
+                    .lock()
+                    .unwrap()
+                    .insert(goose_sid.clone());
+                // Invalidate tool cache since extensions changed.
+                *self.cached_tools.write().await = None;
             }
         }
-        drop(user_exts);
 
         // ── 6b. Extension tool discovery ─────────────────────────────────────
-        // Query all tools registered with Goose, group by extension prefix
-        // (format: "ext_name__tool_name"), and inject external extension
-        // descriptions into the system prompt so the LLM knows about MCP tools.
-        // This also builds the `allowed_tools` set used later to filter
-        // hallucinated tool calls.
-        let all_tools = self.agent.list_tools(&goose_sid, None).await;
+        // Use cached tools when available — only re-query MCP servers when the
+        // cache has been invalidated (extensions added/removed/defaults stripped).
+        let allowed_tools = {
+            let cache = self.cached_tools.read().await;
+            if let Some(cached) = cache.as_ref() {
+                cached.clone()
+            } else {
+                drop(cache);
+                // Cache miss — query all tools and rebuild.
+                let all_tools = self.agent.list_tools(&goose_sid, None).await;
+                let tools_set: std::collections::HashSet<String> =
+                    all_tools.iter().map(|t| t.name.to_string()).collect();
 
-        let allowed_tools: std::collections::HashSet<String> =
-            all_tools.iter().map(|t| t.name.to_string()).collect();
-
-        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
-
-        // Group tools by extension prefix and inject external extension
-        // descriptions so the agent knows about MCP tools (music, filesystem, etc.).
-        {
-            let mut ext_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-            for tool in &all_tools {
-                let name = tool.name.as_ref();
-                if let Some(sep) = name.find("__") {
-                    let ext_name = &name[..sep];
-                    let tool_name = &name[sep + 2..];
-                    let desc = tool
-                        .description
-                        .as_deref()
-                        .unwrap_or("No description")
-                        .to_string();
-                    ext_map
-                        .entry(ext_name.to_string())
-                        .or_default()
-                        .push((tool_name.to_string(), desc));
-                }
-            }
-
-            // Filter out built-in GIAP extensions (already covered by the
-            // available_tools section in the prompt) and Goose defaults.
-            let is_builtin = |name: &str| {
-                registered_extensions().iter().any(|e| e == name)
-                    || matches!(
-                        name,
-                        "default"
-                            | "developer"
-                            | "computercontroller"
-                            | "extensionmanager"
-                            | "todo"
-                            | "apps"
-                            | "analyze"
-                            | "summon"
-                            | "summarize"
-                            | "orchestrator"
-                            | "tom"
-                            | "suggestions"
-                    )
-            };
-
-            let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
-                .into_iter()
-                .filter(|(name, _)| !is_builtin(name.as_str()))
-                .collect();
-
-            if !external_extensions.is_empty() {
-                let mut desc_lines = Vec::with_capacity(external_extensions.len() * 6);
-                desc_lines.push("# MCP Extensions".to_string());
-                desc_lines.push(
-                    "The following MCP extensions are loaded. Use their tools when the user's request matches."
-                        .to_string(),
-                );
-
-                for (ext_name, tools) in &external_extensions {
-                    desc_lines.push(format!("\n## {}", ext_name));
-                    for (tool_name, tool_desc) in tools {
-                        desc_lines.push(format!("  - {}: {}", tool_name, tool_desc));
+                // Group tools by extension prefix and inject external extension
+                // descriptions so the agent knows about MCP tools.
+                let mut ext_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for tool in &all_tools {
+                    let name = tool.name.as_ref();
+                    if let Some(sep) = name.find("__") {
+                        let ext_name = &name[..sep];
+                        let tool_name = &name[sep + 2..];
+                        let desc = tool
+                            .description
+                            .as_deref()
+                            .unwrap_or("No description")
+                            .to_string();
+                        ext_map
+                            .entry(ext_name.to_string())
+                            .or_default()
+                            .push((tool_name.to_string(), desc));
                     }
                 }
 
-                let ext_description = desc_lines.join("\n");
+                // Filter out built-in GIAP extensions (already covered by the
+                // available_tools section in the prompt) and Goose defaults.
+                let is_builtin = |name: &str| {
+                    registered_extensions().iter().any(|e| e == name)
+                        || matches!(
+                            name,
+                            "default"
+                                | "developer"
+                                | "computercontroller"
+                                | "extensionmanager"
+                                | "todo"
+                                | "apps"
+                                | "analyze"
+                                | "summon"
+                                | "summarize"
+                                | "orchestrator"
+                                | "tom"
+                                | "suggestions"
+                        )
+                };
 
-                tracing::info!(
-                    extensions = external_extensions.len(),
-                    "Injecting {} external extension(s) into system prompt",
-                    external_extensions.len(),
-                );
+                let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
+                    .into_iter()
+                    .filter(|(name, _)| !is_builtin(name.as_str()))
+                    .collect();
 
-                self.agent
-                    .extend_system_prompt("extensions".to_string(), ext_description)
-                    .await;
+                if !external_extensions.is_empty() {
+                    let mut desc_lines = Vec::with_capacity(external_extensions.len() * 6);
+                    desc_lines.push("# MCP Extensions".to_string());
+                    desc_lines.push(
+                        "The following MCP extensions are loaded. Use their tools when the user's request matches."
+                            .to_string(),
+                    );
+
+                    for (ext_name, tools) in &external_extensions {
+                        desc_lines.push(format!("\n## {}", ext_name));
+                        for (tool_name, tool_desc) in tools {
+                            desc_lines.push(format!("  - {}: {}", tool_name, tool_desc));
+                        }
+                    }
+
+                    let ext_description = desc_lines.join("\n");
+
+                    tracing::info!(
+                        extensions = external_extensions.len(),
+                        "Injecting {} external extension(s) into system prompt",
+                        external_extensions.len(),
+                    );
+
+                    self.agent
+                        .extend_system_prompt("extensions".to_string(), ext_description)
+                        .await;
+                }
+
+                *self.cached_tools.write().await = Some(tools_set.clone());
+                tools_set
             }
-        }
+        };
+
+        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;

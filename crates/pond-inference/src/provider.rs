@@ -109,8 +109,20 @@ fn generation_task(
     // ── Build the prompt ─────────────────────────────────────────────────
 
     let oai_messages_json = build_openai_messages_json(&system_prompt, &messages);
-    let full_tools_json = tool_calling::tools_to_json(&tools);
     let compact_tools = tool_calling::compact_tools_json(&tools);
+
+    // On small-context platforms (Jetson ≤4096), full tool schemas always exceed
+    // the budget. Skip directly to compact to avoid wasting time on serialization,
+    // Jinja rendering, and tokenization that will be discarded immediately.
+    let n_ctx_train = loaded.model.n_ctx_train() as usize;
+    let use_compact_directly = n_ctx_train <= 4096;
+
+    let full_tools_json = if use_compact_directly {
+        tracing::debug!(n_ctx_train, "small context — skipping full tool schema serialization");
+        None
+    } else {
+        tool_calling::tools_to_json(&tools)
+    };
 
     let template_result = match apply_template(
         &loaded.model,
