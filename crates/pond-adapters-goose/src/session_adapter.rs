@@ -242,6 +242,8 @@ mod tests {
             provider_name: None,
             model_config: None,
             goose_mode: GooseMode::default(),
+            archived_at: None,
+            project_id: None,
         };
 
         let pond = goose_session_to_pond(&gs);

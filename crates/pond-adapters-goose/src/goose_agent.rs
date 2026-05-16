@@ -796,6 +796,7 @@ impl GooseAdapter {
                 has_home_devices,
                 online_device_names,
                 voice_mode: is_voice,
+                canvas_mode: request.canvas_mode,
                 available_tools,
                 thinking_enabled,
                 compact_prompt,
@@ -950,10 +951,15 @@ impl GooseAdapter {
 
                     memory_block_for_user_msg = block;
 
-                    // Record access for decay tracking
-                    for m in budgeted {
-                        let _ = self.memory_repo.record_access(&m.id).await;
-                    }
+                    // Record access for decay tracking — fire-and-forget in background
+                    // to avoid blocking the inference hot path with sequential DB writes.
+                    let ids: Vec<String> = budgeted.iter().map(|m| m.id.clone()).collect();
+                    let repo = self.memory_repo.clone();
+                    tokio::spawn(async move {
+                        for id in ids {
+                            let _ = repo.record_access(&id).await;
+                        }
+                    });
                 }
             }
         }
@@ -1091,8 +1097,8 @@ impl GooseAdapter {
         // Build <system-context> block with per-turn dynamic data (date/time,
         // memories). This keeps the system prompt + tool tokens stable across
         // turns, enabling KV cache prefix reuse in the local inference engine.
-        let has_context = !dynamic_suffix_for_user_msg.is_empty()
-            || !memory_block_for_user_msg.is_empty();
+        let has_context =
+            !dynamic_suffix_for_user_msg.is_empty() || !memory_block_for_user_msg.is_empty();
         let user_text = {
             let mut msg = String::with_capacity(512 + request.message.len());
             if has_context {
@@ -1122,6 +1128,8 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
+        let session_mgr = self.session_manager.clone();
+        let goose_sid_for_usage = goose_sid.clone();
 
         let user_msg_len = request.message.len();
 
@@ -1139,6 +1147,8 @@ impl GooseAdapter {
 
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
             let mut total_output_chars: usize = 0;
+            // Track tool call ID → tool name so ToolResult events carry the tool name.
+            let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
             let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, Some(cancel_token)).await {
                 Ok(s) => s,
@@ -1169,6 +1179,7 @@ impl GooseAdapter {
                                                 );
                                                 continue;
                                             }
+                                            tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
                                             yield Ok(AgentStreamEvent::ToolCall {
                                                 id: tr.id.clone(),
                                                 tool: tool_name,
@@ -1188,9 +1199,13 @@ impl GooseAdapter {
                                                 .collect::<Vec<_>>()
                                                 .join("\n");
 
+                                            let tool_name = tool_id_to_name
+                                                .get(&tr.id)
+                                                .cloned()
+                                                .unwrap_or_default();
                                             yield Ok(AgentStreamEvent::ToolResult {
                                                 id: tr.id.clone(),
-                                                tool: String::new(), // Goose ToolResponse doesn't store tool name directly in new version
+                                                tool: tool_name,
                                                 content: content_text,
                                             });
                                         }
@@ -1220,13 +1235,28 @@ impl GooseAdapter {
                     }
                 }
             }
-            // Estimate token usage (chars/4 heuristic for English text).
-            // Prompt estimate includes user message; output is accumulated stream text.
-            let est_usage = pond_core::ports::provider::UsageStats {
-                prompt_tokens: (user_msg_len / 4).max(1) as u32,
-                completion_tokens: (total_output_chars / 4).max(1) as u32,
+            // Read real token usage from Goose's session metrics (tracked by
+            // the provider during inference). Fall back to chars/4 heuristic
+            // if the session isn't available or counts are missing.
+            let usage = match session_mgr.get_session(&goose_sid_for_usage, false).await {
+                Ok(goose_session) => {
+                    let input = goose_session.accumulated_input_tokens
+                        .map(|t| t.max(0) as u32)
+                        .unwrap_or((user_msg_len / 4).max(1) as u32);
+                    let output = goose_session.accumulated_output_tokens
+                        .map(|t| t.max(0) as u32)
+                        .unwrap_or((total_output_chars / 4).max(1) as u32);
+                    pond_core::ports::provider::UsageStats {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                    }
+                }
+                Err(_) => pond_core::ports::provider::UsageStats {
+                    prompt_tokens: (user_msg_len / 4).max(1) as u32,
+                    completion_tokens: (total_output_chars / 4).max(1) as u32,
+                },
             };
-            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(est_usage) });
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage) });
         };
 
         Ok(Box::pin(stream))
@@ -1292,6 +1322,61 @@ impl AgentPort for GooseAdapter {
     ) -> Result<futures::stream::BoxStream<'static, Result<AgentStreamEvent>>> {
         self.chat_stream(request).await
     }
+
+    async fn call_tool(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Result<String> {
+        let goose_sid = self.resolve_goose_session(session_id).await;
+        let session = self
+            .session_manager
+            .get_session(&goose_sid, false)
+            .await
+            .map_err(|e| anyhow!("Failed to get session: {e}"))?;
+
+        // Parse the JSON args into the Map that rmcp expects.
+        let arguments: serde_json::Map<String, serde_json::Value> = if args_json.is_empty()
+            || args_json == "{}"
+        {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_str(args_json).unwrap_or_default()
+        };
+
+        let tool_call =
+            rmcp::model::CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments);
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (_req_id, dispatch_result) = self
+            .agent
+            .dispatch_tool_call(tool_call, request_id, None, &session)
+            .await;
+
+        match dispatch_result {
+            Ok(mut tool_call_result) => {
+                // ToolCallResult.result is a Future — await it to get the actual result.
+                let tool_result = tool_call_result.result.as_mut().await;
+                match tool_result {
+                    Ok(call_result) => {
+                        let text = call_result
+                            .content
+                            .iter()
+                            .filter_map(|c| match c.deref() {
+                                rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Ok(text)
+                    }
+                    Err(e) => Err(anyhow!("Tool returned error: {}", e.message)),
+                }
+            }
+            Err(e) => Err(anyhow!("Tool dispatch failed: {}", e.message)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1308,6 +1393,7 @@ mod tests {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            canvas_mode: false,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();
