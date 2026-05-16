@@ -14,6 +14,8 @@ members = [
     "crates/pond-adapters-gotg",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
+    # Independent agent (no Goose dependency — future primary path)
+    "crates/pond-agent",
     # Goose-dependent crates — use goose with default-features=false to avoid
     # the rmcp version conflict (code-mode feature is not enabled).
     "crates/pond-adapters-goose",
@@ -166,3 +168,4 @@ opentelemetry_sdk          = { git = "https://github.com/open-telemetry/opentele
 opentelemetry-appender-tracing = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
 opentelemetry-otlp         = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
 opentelemetry-stdout       = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+temporal_rs                = { path = "vendor/temporal_rs" }

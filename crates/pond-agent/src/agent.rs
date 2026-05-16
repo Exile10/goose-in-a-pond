@@ -30,6 +30,7 @@ use pond_core::ports::provider::UsageStats;
 use pond_core::ports::session_storage::SessionStorage;
 use pond_core::ports::settings::SettingsRepository;
 use pond_core::ports::skill::UserSkillRepository;
+use pond_core::ports::tool_dispatcher::ToolDispatcher;
 use pond_core::prompts;
 use pond_core::services::prompt_builder;
 use std::sync::Arc;
@@ -63,6 +64,8 @@ pub struct PondAgent {
     device_repo: Arc<dyn DeviceRegistry>,
     /// Session message persistence.
     session_storage: Arc<dyn SessionStorage>,
+    /// MCP tool dispatcher — routes tool calls to the correct MCP server.
+    tool_dispatcher: Option<Arc<dyn ToolDispatcher>>,
     /// Tracks the current provider key for hot-swap detection.
     last_provider_key: Mutex<String>,
 }
@@ -82,6 +85,7 @@ impl PondAgent {
         skill_repo: Option<Arc<dyn UserSkillRepository>>,
         device_repo: Arc<dyn DeviceRegistry>,
         session_storage: Arc<dyn SessionStorage>,
+        tool_dispatcher: Option<Arc<dyn ToolDispatcher>>,
     ) -> Self {
         let initial_key = format!("initial:{}", provider.model_name());
         Self {
@@ -93,6 +97,7 @@ impl PondAgent {
             skill_repo,
             device_repo,
             session_storage,
+            tool_dispatcher,
             last_provider_key: Mutex::new(initial_key),
         }
     }
@@ -223,6 +228,7 @@ impl PondAgent {
             has_home_devices,
             online_device_names,
             voice_mode: request.voice_mode,
+            canvas_mode: request.canvas_mode,
             available_tools,
             thinking_enabled,
             compact_prompt: false,
@@ -340,6 +346,7 @@ impl Agent for PondAgent {
         let provider = Arc::clone(&*provider);
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
+        let dispatcher = self.tool_dispatcher.clone();
 
         // 8. Spawn the tool loop on a channel.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent>>(64);
@@ -417,7 +424,7 @@ impl Agent for PondAgent {
                     break;
                 }
 
-                // Emit tool call events and append results to history.
+                // Emit tool call events and dispatch via MCP.
                 for (id, name, args) in &tool_calls {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::ToolCall {
@@ -427,9 +434,16 @@ impl Agent for PondAgent {
                         }))
                         .await;
 
-                    // TODO: In the wired version, dispatch via MCP client here.
-                    // For now, emit a placeholder tool result.
-                    let result_text = format!("Tool '{}' called (dispatch not yet wired)", name);
+                    // Dispatch the tool call through the MCP dispatcher.
+                    let result_text = if let Some(ref disp) = dispatcher {
+                        match disp.dispatch(name, args.clone()).await {
+                            Ok(result) => result.content,
+                            Err(e) => format!("Tool '{}' failed: {}", name, e),
+                        }
+                    } else {
+                        format!("Tool '{}' is not available (no dispatcher configured)", name)
+                    };
+
                     let _ = tx
                         .send(Ok(AgentStreamEvent::ToolResult {
                             id: id.clone(),
@@ -614,6 +628,7 @@ mod tests {
             None,
             Arc::new(MockDeviceRegistry),
             Arc::new(MockSessionStorage),
+            None, // no tool dispatcher in tests
         )
     }
 
@@ -629,6 +644,7 @@ mod tests {
                 model_role: "chat".to_string(),
                 images: vec![],
                 voice_mode: false,
+                canvas_mode: false,
             })
             .await
             .unwrap();
@@ -646,6 +662,7 @@ mod tests {
                 model_role: "chat".to_string(),
                 images: vec![],
                 voice_mode: false,
+                canvas_mode: false,
             })
             .await
             .unwrap();
