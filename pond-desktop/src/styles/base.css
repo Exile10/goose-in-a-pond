@@ -3,14 +3,21 @@
    Reset · Fonts · Typography · Scrollbars · Cross-platform
    ============================================================================= */
 
-/* ── Font Imports (offline-first via fontsource) ───────────── */
-@import "@fontsource-variable/quicksand";
-@import "@fontsource-variable/comfortaa";
-@import "@fontsource/jetbrains-mono/400.css";
-/* Inter kept for HeroUI component library compatibility */
-@import "@fontsource/inter/400.css";
-@import "@fontsource/inter/500.css";
-@import "@fontsource/inter/600.css";
+/* ── Font Faces (bundled TTFs in public/fonts/) ────────────── */
+@font-face {
+  font-family: "Quicksand";
+  src: url("/fonts/Quicksand-VariableFont_wght.ttf") format("truetype");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Comfortaa";
+  src: url("/fonts/Comfortaa-VariableFont_wght.ttf") format("truetype");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
 
 /* ── Reset ──────────────────────────────────────────────────── */
 *,
