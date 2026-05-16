@@ -166,6 +166,18 @@ impl LlamaCppEngine {
         Arc::clone(&self.backend)
     }
 
+    /// Compute the session cache file path for KV-cache persistence.
+    ///
+    /// Returns `Some(path)` when a model is loaded (sync check via try_lock).
+    /// The generation task uses this to save/load KV state between turns.
+    pub(crate) fn cache_path(&self) -> Option<PathBuf> {
+        // Use try_lock to avoid blocking — if the model is busy, skip caching.
+        let guard = self.model.try_lock().ok()?;
+        let model_id = guard.as_ref()?.model_id.clone();
+        drop(guard);
+        Some(crate::kv_cache::cache_file_path(&self.data_dir, &model_id))
+    }
+
     /// Resolve a model identifier to an absolute filesystem path.
     fn resolve_model_path(&self, model_id: &str) -> Result<PathBuf> {
         let gguf_dir = self.data_dir.join("models").join("gguf");

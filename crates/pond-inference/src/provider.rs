@@ -49,6 +49,9 @@ impl InferenceProvider for LlamaCppEngine {
         let model_slot = self.model_slot();
         let backend = self.backend_arc();
 
+        // Compute cache path for KV-cache reuse between turns.
+        let cache_path = self.cache_path();
+
         tokio::task::spawn_blocking(move || {
             generation_task(
                 model_slot,
@@ -58,6 +61,7 @@ impl InferenceProvider for LlamaCppEngine {
                 tools,
                 temperature,
                 max_tokens,
+                cache_path,
                 tx,
             );
         });
@@ -88,6 +92,10 @@ impl InferenceProvider for LlamaCppEngine {
 /// Acquires the model lock, builds the prompt, creates a context, and runs
 /// the autoregressive generation loop, sending [`ChatEvent`]s through the
 /// channel.
+///
+/// When `cache_path` is provided, the context state is saved after generation
+/// and loaded before the next call. Prefix matching skips re-decoding tokens
+/// already in the KV cache, saving 5-15s on Jetson for stable system prompts.
 #[allow(clippy::too_many_arguments)]
 fn generation_task(
     model_slot: ModelSlot,
@@ -97,6 +105,7 @@ fn generation_task(
     tools: Vec<ToolDefinition>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    cache_path: Option<std::path::PathBuf>,
     tx: mpsc::Sender<Result<ChatEvent>>,
 ) {
     // Acquire the model lock (blocking).
@@ -202,7 +211,7 @@ fn generation_task(
         return;
     }
 
-    // ── Create context and prefill ───────────────────────────────────────
+    // ── Create context and prefill (with KV-cache reuse) ──────────────────
 
     let mut ctx_params =
         LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
@@ -218,19 +227,76 @@ fn generation_task(
         }
     };
 
-    // Prefill prompt tokens in batches.
-    let n_batch = ctx.n_batch() as usize;
-    for chunk in tokens.chunks(n_batch) {
-        let mut batch = match LlamaBatch::get_one(chunk) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
+    // Attempt KV-cache reuse via session file.
+    // If a cache exists, load it, compute prefix match, and only decode the delta.
+    let tokens_to_decode = if let Some(ref path) = cache_path {
+        if path.exists() {
+            match ctx.state_load_file(path, tokens.len()) {
+                Ok(cached_tokens) => {
+                    let action = crate::kv_cache::plan_cache_reuse(&cached_tokens, &tokens);
+                    match action {
+                        crate::kv_cache::CacheAction::FullHit => {
+                            tracing::info!(
+                                cached = cached_tokens.len(),
+                                "KV cache full hit — skipping all prefill"
+                            );
+                            &tokens[tokens.len()..] // empty slice — nothing to decode
+                        }
+                        crate::kv_cache::CacheAction::IncrementalDecode {
+                            trim_from,
+                            decode_from,
+                            tokens_saved,
+                        } => {
+                            // Clear stale positions from the KV cache.
+                            // src=None means all sequences, p0=trim_from, p1=None means to end.
+                            let _ = ctx.clear_kv_cache_seq(
+                                None,
+                                Some(trim_from as u32),
+                                None,
+                            );
+                            tracing::info!(
+                                tokens_saved,
+                                decode_from,
+                                total = tokens.len(),
+                                "KV cache partial hit — decoding only delta"
+                            );
+                            &tokens[decode_from..]
+                        }
+                        crate::kv_cache::CacheAction::FullPrefill => {
+                            tracing::info!("KV cache miss (no prefix match) — full prefill");
+                            ctx.clear_kv_cache();
+                            &tokens[..]
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("failed to load KV cache (will full prefill): {}", e);
+                    &tokens[..]
+                }
+            }
+        } else {
+            &tokens[..] // no cache file yet — full prefill
+        }
+    } else {
+        &tokens[..] // caching disabled — full prefill
+    };
+
+    // Prefill tokens in batches (only the delta when cache hit).
+    if !tokens_to_decode.is_empty() {
+        let n_batch = ctx.n_batch() as usize;
+        for chunk in tokens_to_decode.chunks(n_batch) {
+            let mut batch = match LlamaBatch::get_one(chunk) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ =
+                        tx.blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
+                    return;
+                }
+            };
+            if let Err(e) = ctx.decode(&mut batch) {
+                let _ = tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
                 return;
             }
-        };
-        if let Err(e) = ctx.decode(&mut batch) {
-            let _ = tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
-            return;
         }
     }
 
@@ -372,6 +438,27 @@ fn generation_task(
             let remaining = &generated_text[streamed_len..];
             if !remaining.is_empty() {
                 let _ = tx.blocking_send(Ok(ChatEvent::Text(remaining.to_string())));
+            }
+        }
+    }
+
+    // ── Save KV-cache state for next turn ─────────────────────────────────
+    // Persist the context state so the next call can skip re-prefilling the
+    // stable prefix (system prompt + tool declarations).
+    if let Some(ref path) = cache_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match ctx.state_save_file(path, &tokens) {
+            Ok(_) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    tokens = tokens.len(),
+                    "KV cache saved for next turn"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to save KV cache: {}", e);
             }
         }
     }

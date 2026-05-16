@@ -39,6 +39,7 @@
 //! ```
 
 mod engine;
+pub mod kv_cache;
 mod memory;
 mod provider;
 mod sampling;
