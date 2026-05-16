@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use pond_core::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
 use pond_core::ports::schedule_execution::ScheduleExecutor;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
+use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -232,6 +232,19 @@ impl CronSchedulerAdapter {
                 // Record run start
                 let run_id = run_history.record_start(&id).await;
                 let start = std::time::Instant::now();
+
+                // Broadcast "started" event so clients see progress immediately
+                if let Some(tx) = &result_tx {
+                    let _ = tx.send(ScheduleResultEvent {
+                        schedule_id: id.clone(),
+                        schedule_label: label.clone(),
+                        run_id: run_id.clone(),
+                        status: RunStatus::Running,
+                        result: None,
+                        error: None,
+                        duration_ms: None,
+                    });
+                }
 
                 // Execute
                 let result = executor.execute(&id, &kind).await;
@@ -521,6 +534,20 @@ impl SchedulerPort for CronSchedulerAdapter {
 
             let run_id = run_history.record_start(&id).await;
             let start = std::time::Instant::now();
+
+            // Broadcast "started" event so clients see progress immediately
+            if let Some(tx) = &result_tx {
+                let _ = tx.send(ScheduleResultEvent {
+                    schedule_id: id.clone(),
+                    schedule_label: label.clone(),
+                    run_id: run_id.clone(),
+                    status: RunStatus::Running,
+                    result: None,
+                    error: None,
+                    duration_ms: None,
+                });
+            }
+
             let result = executor.execute(&id, &kind).await;
             let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -564,6 +591,66 @@ impl SchedulerPort for CronSchedulerAdapter {
         });
 
         Ok(())
+    }
+
+    async fn update_task(&self, id: &str, req: UpdateScheduleRequest) -> Result<Schedule> {
+        let cron_changed = req.cron.is_some();
+
+        // Read current state and apply non-cron changes first.
+        let (old_job_id, new_cron, new_kind, was_paused) = {
+            let mut guard = self.tasks.lock().await;
+            let entry = guard
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+
+            if let Some(label) = &req.label {
+                entry.persisted.label = label.clone();
+            }
+            if let Some(tz) = &req.timezone {
+                entry.persisted.timezone = tz.clone();
+            }
+            if let Some(kind) = &req.kind {
+                entry.persisted.kind = Some(kind.clone());
+            }
+
+            let old_job_id = entry.job_id;
+            let paused = entry.persisted.paused;
+            // Use the NEW cron for scheduling but don't commit it to metadata yet.
+            let cron = req.cron.as_ref().unwrap_or(&entry.persisted.cron).clone();
+            let kind = Self::resolve_kind(entry);
+            (old_job_id, cron, kind, paused)
+        };
+
+        // If the cron changed and the schedule is active, reschedule the job.
+        // Create the new job FIRST — if it fails (e.g. invalid cron), the old job
+        // stays active and the schedule keeps running with the previous cron.
+        if cron_changed && !was_paused {
+            let new_job_id = self.add_job_to_scheduler(id, &new_cron, new_kind).await?;
+            // New job created successfully — now safe to remove the old one and commit
+            // the cron change to in-memory metadata.
+            if old_job_id != uuid::Uuid::nil() {
+                let _ = self.scheduler.remove(&old_job_id).await;
+            }
+            let mut guard = self.tasks.lock().await;
+            if let Some(entry) = guard.get_mut(id) {
+                entry.persisted.cron = new_cron;
+                entry.job_id = new_job_id;
+            }
+        } else if cron_changed && was_paused {
+            // Schedule is paused — just update the stored cron (no active job to replace).
+            let mut guard = self.tasks.lock().await;
+            if let Some(entry) = guard.get_mut(id) {
+                entry.persisted.cron = new_cron;
+            }
+        }
+
+        self.save().await?;
+
+        let guard = self.tasks.lock().await;
+        let entry = guard
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
+        Ok(Self::to_schedule(entry))
     }
 
     async fn get_runs(&self, schedule_id: &str, limit: u32) -> Result<Vec<ScheduleRun>> {
@@ -832,6 +919,87 @@ mod tests {
     fn compute_next_run_invalid_cron() {
         let next = super::compute_next_run("not a cron", "UTC");
         assert!(next.is_none(), "invalid cron should return None");
+    }
+
+    #[tokio::test]
+    async fn update_task_changes_fields() {
+        use pond_core::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("upd1", "0 0 8 * * *"))
+            .await
+            .unwrap();
+
+        let updated = sched
+            .update_task(
+                "upd1",
+                UpdateScheduleRequest {
+                    label: Some("Updated label".to_string()),
+                    cron: Some("0 30 9 * * *".to_string()),
+                    timezone: Some("Africa/Nairobi".to_string()),
+                    kind: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.label, "Updated label");
+        assert_eq!(updated.cron, "0 30 9 * * *");
+        assert_eq!(updated.timezone, "Africa/Nairobi");
+        // Kind unchanged
+        match &updated.kind {
+            TaskKind::AgentPrompt { prompt } => assert_eq!(prompt, "Hello"),
+            _ => panic!("expected AgentPrompt"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_with_invalid_cron_preserves_old_schedule() {
+        use pond_core::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("atomic1", "0 0 8 * * *"))
+            .await
+            .unwrap();
+
+        // Attempt to update with an invalid cron — should fail without breaking the schedule.
+        let result = sched
+            .update_task(
+                "atomic1",
+                UpdateScheduleRequest {
+                    label: None,
+                    cron: Some("every morning at 9".to_string()),
+                    timezone: None,
+                    kind: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_err(), "invalid cron should produce an error");
+
+        // The schedule should still exist with the ORIGINAL cron.
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "atomic1").unwrap();
+        assert_eq!(task.cron, "0 0 8 * * *", "original cron should be preserved");
+        assert!(!task.paused, "schedule should still be active");
+    }
+
+    #[tokio::test]
+    async fn update_nonexistent_errors() {
+        use pond_core::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        assert!(sched
+            .update_task("ghost", UpdateScheduleRequest::default())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

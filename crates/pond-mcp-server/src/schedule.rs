@@ -1,11 +1,12 @@
 //! Schedule MCP Server — manage cron-based scheduled tasks.
 //!
-//! Provides 7 tools: `list_schedules`, `create_schedule`, `delete_schedule`,
-//! `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs`.
+//! Provides 9 tools: `list_schedules`, `create_schedule`, `update_schedule`,
+//! `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`,
+//! `get_schedule_runs`, `world_clock`.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
 use pond_core::domain::schedule::TaskKind;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
+use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
 use pond_core::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -56,6 +57,35 @@ pub struct GetScheduleRunsParams {
     pub id: String,
     /// Maximum number of runs to return (default 10).
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct UpdateScheduleParams {
+    /// The schedule ID to update (required).
+    #[serde(default)]
+    pub id: String,
+    /// New name (optional — only provided fields are updated).
+    pub name: Option<String>,
+    /// New 6-field cron expression (optional). You can also use natural language like "every morning at 9am".
+    pub cron: Option<String>,
+    /// New prompt/action (optional).
+    pub prompt: Option<String>,
+    /// New IANA timezone (optional).
+    pub timezone: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct WorldClockParams {
+    /// One or more IANA timezone names (e.g. "America/New_York", "Asia/Tokyo", "Africa/Nairobi"). If omitted, returns the user's configured timezone.
+    pub timezones: Option<Vec<String>>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ── MCP server ─────────────────────────────────────────────────────────────
@@ -115,7 +145,40 @@ impl ScheduleMcpServer {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+                // Build UI hint with structured schedule data
+                let ui_schedules: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|t| {
+                        let kind_label = match &t.kind {
+                            TaskKind::AgentPrompt { .. } => "agent",
+                            TaskKind::Webhook { .. } => "webhook",
+                        };
+                        let prompt_preview = match &t.kind {
+                            TaskKind::AgentPrompt { prompt } => prompt.clone(),
+                            TaskKind::Webhook { webhook_url } => webhook_url.clone(),
+                        };
+                        let status = if t.currently_running {
+                            "running"
+                        } else if t.paused {
+                            "paused"
+                        } else {
+                            "active"
+                        };
+                        serde_json::json!({
+                            "id": t.id,
+                            "name": t.label,
+                            "cron": t.cron,
+                            "timezone": t.timezone,
+                            "kind": kind_label,
+                            "status": status,
+                            "prompt": prompt_preview,
+                        })
+                    })
+                    .collect();
+                let ui_data = serde_json::json!({ "schedules": ui_schedules });
+                let hint = format!("[[[mcp-ui:schedule:{}]]]\n", ui_data);
+                let full_result = format!("{}{}", hint, text);
+                Ok(CallToolResult::success(vec![Content::text(full_result)]))
             }
             Err(e) => Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
@@ -146,30 +209,43 @@ impl ScheduleMcpServer {
         // ── ToolCaller PRIMARY: generate all params from user message ──
         const SCHEDULE_SCHEMA: &str = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron: sec min hr dom mon dow. Example: 0 0 8 * * * for daily 8 AM"},"prompt":{"type":"string","description":"The action to perform on each fire"},"name":{"type":"string","description":"Short human-readable name"}},"required":["cron","prompt"]}"#;
 
-        let (tc_cron, tc_prompt, tc_name) = if let Some(args) =
-            crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await
-        {
-            println!("[schedule] ToolCaller generated: {:?}", args);
-            (
-                args.get("cron").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
-                args.get("prompt").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
-                args.get("name").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (tc_cron, tc_prompt, tc_name) =
+            if let Some(args) = crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await {
+                println!("[schedule] ToolCaller generated: {:?}", args);
+                (
+                    args.get("cron")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string()),
+                    args.get("prompt")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string()),
+                    args.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string()),
+                )
+            } else {
+                (None, None, None)
+            };
 
         // ── Resolve cron: ToolCaller > model param > user message parse > nudge ──
         // Validate cron looks like a real 6-field expression (not garbage from small models)
         let looks_like_cron = |s: &str| {
             let parts: Vec<&str> = s.split_whitespace().collect();
-            parts.len() == 6 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ','))
+            parts.len() == 6
+                && parts.iter().all(|p| {
+                    p.chars()
+                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
+                })
         };
         let cron = tc_cron
             .filter(|s| !s.is_empty() && looks_like_cron(s))
             .or_else(|| {
                 let c = &params.0.cron;
-                if c.is_empty() || !looks_like_cron(c) { None } else { Some(c.clone()) }
+                if c.is_empty() || !looks_like_cron(c) {
+                    None
+                } else {
+                    Some(c.clone())
+                }
             })
             .or_else(|| parse_cron_from_message(&user_msg.to_lowercase()));
 
@@ -190,7 +266,11 @@ impl ScheduleMcpServer {
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 let p = &params.0.prompt;
-                if p.is_empty() { None } else { Some(p.clone()) }
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p.clone())
+                }
             })
             .unwrap_or_else(|| extract_prompt_from_message(&user_msg.to_lowercase(), &user_msg));
 
@@ -199,10 +279,18 @@ impl ScheduleMcpServer {
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 let n = &params.0.name;
-                if n.is_empty() { None } else { Some(n.clone()) }
+                if n.is_empty() {
+                    None
+                } else {
+                    Some(n.clone())
+                }
             })
             .unwrap_or_else(|| {
-                if prompt.len() > 40 { format!("{}...", &prompt[..37]) } else { prompt.clone() }
+                if prompt.len() > 40 {
+                    format!("{}...", &prompt[..37])
+                } else {
+                    prompt.clone()
+                }
             });
 
         // Default timezone to user's setting if not provided.
@@ -361,7 +449,31 @@ impl ScheduleMcpServer {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+                // Build UI hint with structured run data
+                let ui_runs: Vec<serde_json::Value> = runs
+                    .iter()
+                    .map(|r| {
+                        let status_str = match &r.status {
+                            pond_core::domain::schedule::RunStatus::Completed => "completed",
+                            pond_core::domain::schedule::RunStatus::Failed => "failed",
+                            pond_core::domain::schedule::RunStatus::Running => "running",
+                        };
+                        serde_json::json!({
+                            "started_at": r.started_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                            "status": status_str,
+                            "duration_ms": r.duration_ms,
+                            "result": r.result.as_deref().unwrap_or("").chars().take(200).collect::<String>(),
+                            "error": r.error.as_deref().unwrap_or(""),
+                        })
+                    })
+                    .collect();
+                let ui_data = serde_json::json!({
+                    "schedule_id": params.0.id,
+                    "runs": ui_runs,
+                });
+                let hint = format!("[[[mcp-ui:schedule_runs:{}]]]\n", ui_data);
+                let full_result = format!("{}{}", hint, text);
+                Ok(CallToolResult::success(vec![Content::text(full_result)]))
             }
             Err(e) => Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
@@ -369,6 +481,193 @@ impl ScheduleMcpServer {
                 None,
             )),
         }
+    }
+
+    #[tool(
+        description = "Update an existing scheduled task. You can change the name, cron schedule, \
+        prompt, or timezone. Only the fields you provide will be updated."
+    )]
+    async fn update_schedule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<UpdateScheduleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let user_msg = crate::last_user_message();
+
+        // ── Resolve ID: model param > extract from user message ──
+        let id = if params.0.id.is_empty() {
+            // Try to find a UUID-shaped string in the user message
+            user_msg
+                .split_whitespace()
+                .find(|w| uuid::Uuid::parse_str(w).is_ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        } else {
+            params.0.id.clone()
+        };
+
+        if id.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Missing schedule ID. Please provide the ID of the schedule to update. \
+                 Use list_schedules to see all schedules and their IDs.",
+            )]));
+        }
+
+        // ── Resolve cron: natural language parse > validated literal ──
+        // Same validation as create_schedule — reject strings that aren't valid 6-field cron.
+        let looks_like_cron = |s: &str| {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            parts.len() == 6
+                && parts.iter().all(|p| {
+                    p.chars()
+                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
+                })
+        };
+        let cron = params.0.cron.as_ref().and_then(|c| {
+            if c.is_empty() {
+                return None;
+            }
+            // Try natural language first, then validated literal
+            parse_cron_from_message(&c.to_lowercase())
+                .or_else(|| if looks_like_cron(c) { Some(c.clone()) } else { None })
+        });
+
+        // ── Resolve prompt: pass through if provided ──
+        let prompt =
+            params.0.prompt.as_ref().and_then(
+                |p| {
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.clone())
+                    }
+                },
+            );
+
+        // ── Build TaskKind only if prompt changed ──
+        let kind = prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
+
+        let req = UpdateScheduleRequest {
+            label: params.0.name.as_ref().and_then(|n| {
+                if n.is_empty() {
+                    None
+                } else {
+                    Some(n.clone())
+                }
+            }),
+            cron,
+            timezone: params.0.timezone.as_ref().and_then(|tz| {
+                if tz.is_empty() {
+                    None
+                } else {
+                    Some(tz.clone())
+                }
+            }),
+            kind,
+        };
+
+        match self.scheduler.update_task(&id, req).await {
+            Ok(schedule) => {
+                let prompt_preview = match &schedule.kind {
+                    TaskKind::AgentPrompt { prompt } => {
+                        if prompt.len() > 60 {
+                            format!("{}...", &prompt[..57])
+                        } else {
+                            prompt.clone()
+                        }
+                    }
+                    TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
+                };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Schedule updated: \"{}\" [{}] — {} {} ({})",
+                    schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt_preview,
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to update schedule '{}': {e}. Check the ID is correct \
+                 (use list_schedules to see all schedules).",
+                id
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Get the current time in one or more timezones. Use this before scheduling \
+        tasks to confirm the right time across zones. Pass IANA timezone names like \
+        'America/New_York', 'Asia/Tokyo', 'Africa/Nairobi'."
+    )]
+    async fn world_clock(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<WorldClockParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use chrono::Offset;
+        use chrono_tz::Tz;
+        use std::str::FromStr;
+
+        let tz_names: Vec<String> = match params.0.timezones {
+            Some(ref tzs) if !tzs.is_empty() => {
+                tzs.iter().filter(|s| !s.is_empty()).cloned().collect()
+            }
+            _ => {
+                // Fall back to user's configured timezone
+                let tz = self
+                    .settings_repo
+                    .get()
+                    .await
+                    .map(|s| s.timezone.clone())
+                    .unwrap_or_else(|_| "UTC".to_string());
+                vec![tz]
+            }
+        };
+
+        if tz_names.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No timezones provided. Pass one or more IANA timezone names \
+                 like 'America/New_York', 'Europe/London', 'Asia/Tokyo'.",
+            )]));
+        }
+
+        let now = chrono::Utc::now();
+        let mut lines = Vec::with_capacity(tz_names.len());
+
+        for name in &tz_names {
+            match Tz::from_str(name) {
+                Ok(tz) => {
+                    let local = now.with_timezone(&tz);
+                    // Format: "Wednesday, 14 May 2026 10:30 AM (EDT, UTC-4)"
+                    let abbrev = local.format("%Z").to_string();
+                    let offset_secs = local.offset().fix().local_minus_utc();
+                    let offset_hours = offset_secs / 3600;
+                    let offset_mins = (offset_secs.abs() % 3600) / 60;
+                    let utc_offset = if offset_mins == 0 {
+                        format!("UTC{offset_hours:+}")
+                    } else {
+                        let sign = if offset_secs >= 0 { '+' } else { '-' };
+                        format!("UTC{sign}{}:{:02}", offset_hours.abs(), offset_mins)
+                    };
+                    lines.push(format!(
+                        "- {}: {} ({}, {})",
+                        name,
+                        local.format("%A, %d %B %Y %I:%M %p"),
+                        abbrev,
+                        utc_offset,
+                    ));
+                }
+                Err(_) => {
+                    lines.push(format!(
+                        "- {}: unknown timezone. Use IANA names like 'America/New_York', \
+                         'Europe/London', 'Africa/Nairobi'. See: \
+                         https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+                        name
+                    ));
+                }
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
     }
 }
 
@@ -383,8 +682,9 @@ impl ServerHandler for ScheduleMcpServer {
             ))
             .with_instructions(
                 "GIAP Schedule MCP server — manage cron-based scheduled tasks.\n\n\
-                 Tools: list_schedules, create_schedule (6-field cron), delete_schedule, \
-                 pause_schedule, resume_schedule, run_schedule_now, get_schedule_runs.\n\n\
+                 Tools (9): list_schedules, create_schedule (6-field cron), update_schedule, \
+                 delete_schedule, pause_schedule, resume_schedule, run_schedule_now, \
+                 get_schedule_runs, world_clock.\n\n\
                  Cron format is 6-field: sec min hr dom mon dow. \
                  Example: '0 0 8 * * *' = daily at 8:00 AM.",
             )
