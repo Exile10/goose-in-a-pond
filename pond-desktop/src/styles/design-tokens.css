@@ -7,13 +7,11 @@
 
 :root {
   /* ── Font Families ──────────────────────────────────────── */
-  /* Quicksand (primary) + Comfortaa (warm alt) for display AND body.
-     Inter as cross-platform fallback (also required by HeroUI).
-     Matches Jarida Brand Design Heuristics — jarida.css */
-  --font-display: "Quicksand", "Comfortaa", "Inter", system-ui, sans-serif;
-  --font-heading: "Quicksand", "Comfortaa", "Inter", system-ui, sans-serif;
-  --font-body:    "Quicksand", "Comfortaa", "Inter", "Segoe UI", Arial, Helvetica, sans-serif;
-  --font-body-alt:"Comfortaa", "Quicksand", "Inter", "Segoe UI", Arial, Helvetica, sans-serif;
+  /* Quicksand + Comfortaa only. Both bundled via fontsource. */
+  --font-display: "Quicksand", "Comfortaa", sans-serif;
+  --font-heading: "Quicksand", "Comfortaa", sans-serif;
+  --font-body:    "Quicksand", "Comfortaa", sans-serif;
+  --font-body-alt:"Comfortaa", "Quicksand", sans-serif;
   --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   /* ── Type Scale ──────────────────────────────────────────── */
