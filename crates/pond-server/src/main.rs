@@ -806,6 +806,14 @@ async fn run_server(
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
 
+    // Override agent_backend from DB settings (UI can change it without CLI restart).
+    // CLI flag takes precedence only when explicitly set to something other than "goose".
+    let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {
+        &settings.agent_backend
+    } else {
+        agent_backend
+    };
+
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 

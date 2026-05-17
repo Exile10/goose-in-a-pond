@@ -818,7 +818,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
       <Section title="Inference Engine">
         <p className="row__hint" style={{ marginBottom: "var(--space-3)" }}>
           Choose how Pond runs the AI model. This affects speed, features, and resource usage.
-          Changes take effect on the next server restart.
+          The server reads this setting on startup — restart to apply changes.
         </p>
         <RadioGroup
           aria-label="Agent backend"
