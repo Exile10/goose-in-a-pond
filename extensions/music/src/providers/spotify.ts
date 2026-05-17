@@ -30,16 +30,40 @@ export class SpotifyProvider implements MusicProvider {
   name = 'Spotify';
   private baseUrl = 'https://api.spotify.com/v1';
 
+  /** Current access token — initialized from env, updated on refresh. */
+  private accessToken: string | null = process.env.SPOTIFY_ACCESS_TOKEN ?? null;
+
   private get token(): string {
-    const t = process.env.SPOTIFY_ACCESS_TOKEN;
-    if (!t) {
+    if (!this.accessToken) {
       throw new Error('SPOTIFY_ACCESS_TOKEN not set. Sign in via GIAP Extensions.');
     }
-    return t;
+    return this.accessToken;
   }
 
   /** GIAP server URL for OAuth refresh requests. */
   private readonly giapUrl = process.env.GIAP_SERVER_URL || 'http://127.0.0.1:4000';
+
+  /**
+   * Ask GIAP to refresh the Spotify token, then update the in-memory
+   * token from the response so we can retry without a process restart.
+   */
+  private async refreshToken(): Promise<boolean> {
+    try {
+      const refreshResp = await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: 'spotify' }),
+      });
+      if (!refreshResp.ok) return false;
+
+      const data = await refreshResp.json() as { refreshed?: boolean; access_token?: string };
+      if (data.access_token) {
+        this.accessToken = data.access_token;
+        return true;
+      }
+    } catch { /* GIAP may be unreachable */ }
+    return false;
+  }
 
   private async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     const resp = await fetch(`${this.baseUrl}${path}`, {
@@ -52,16 +76,24 @@ export class SpotifyProvider implements MusicProvider {
     });
 
     if (resp.status === 401) {
-      // Token expired — ask GIAP to refresh and restart us with new env vars.
-      try {
-        await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: 'spotify' }),
+      // Token expired — refresh and retry once
+      const refreshed = await this.refreshToken();
+      if (refreshed) {
+        const retry = await fetch(`${this.baseUrl}${path}`, {
+          method,
+          headers: {
+            'Authorization': `Bearer ${this.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: body ? JSON.stringify(body) : undefined,
         });
-      } catch { /* ignore refresh errors — GIAP may be unreachable */ }
+        if (retry.status === 204) return {} as T;
+        if (retry.ok) return retry.json() as Promise<T>;
+        const err = await retry.text();
+        throw new Error(`Spotify API ${retry.status} (after refresh): ${err}`);
+      }
       throw new Error(
-        'Spotify token expired. Refreshing — please try again in a moment.'
+        'Spotify token expired and refresh failed. Re-authenticate via GIAP Extensions.'
       );
     }
 
