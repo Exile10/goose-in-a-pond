@@ -19,7 +19,40 @@ pub(crate) struct LoadedModel {
     pub model_id: String,
     pub chat_template: LlamaChatTemplate,
     pub capabilities: ModelCapabilities,
+    /// Persistent KV-cache context — kept alive between inference calls.
+    ///
+    /// On subsequent turns, prefix matching identifies tokens already in the
+    /// cache and only decodes the delta. This eliminates re-prefilling the
+    /// system prompt + tool declarations (~2000 tokens) on every turn.
+    ///
+    /// MUST be set to `None` before the model is dropped or replaced.
+    pub cached_ctx: Option<CachedInferenceContext>,
 }
+
+/// Persistent inference context with token history for KV-cache prefix reuse.
+///
+/// # Safety
+///
+/// `LlamaContext<'model>` borrows from `LlamaModel`. We store it as `'static`
+/// via unsafe lifetime extension. The invariant is enforced by:
+/// 1. Both live inside the same `LoadedModel` struct
+/// 2. `cached_ctx` is declared AFTER `model` (Rust drops fields in declaration order)
+/// 3. `unload_model()` explicitly sets `cached_ctx = None` before dropping
+/// 4. All access is through `Mutex<Option<LoadedModel>>` — no aliasing
+pub(crate) struct CachedInferenceContext {
+    /// The llama.cpp context with KV cache state from previous turns.
+    /// Lifetime is actually tied to the sibling `model` field.
+    pub ctx: llama_cpp_2::context::LlamaContext<'static>,
+    /// Tokens currently prefilled in the KV cache (for prefix matching).
+    pub tokens_in_cache: Vec<llama_cpp_2::token::LlamaToken>,
+}
+
+// SAFETY: CachedInferenceContext is only accessed through Mutex<Option<LoadedModel>>.
+// The mutex serializes all access — only one thread touches the context at a time.
+// The raw pointer inside LlamaContext is to GPU/CPU memory managed by llama.cpp,
+// which is thread-safe when accessed serially (no concurrent decode calls).
+unsafe impl Send for CachedInferenceContext {}
+unsafe impl Sync for CachedInferenceContext {}
 
 /// Global weak reference to the shared backend. Only a `Weak` is stored --
 /// strong `Arc`s live in `LlamaCppEngine` instances. When all strong refs
@@ -132,12 +165,17 @@ impl LlamaCppEngine {
     }
 
     /// Unload the current model, freeing all GPU/CPU memory.
+    ///
+    /// Drops the cached context BEFORE the model to maintain the safety
+    /// invariant (context borrows from model).
     pub async fn unload_model(&self) {
         let mut guard = self.model.lock().await;
-        if guard.is_some() {
+        if let Some(loaded) = guard.as_mut() {
+            // Drop cached context first — it borrows from the model.
+            loaded.cached_ctx = None;
             tracing::info!("unloading model");
-            *guard = None;
         }
+        *guard = None;
     }
 
     /// Whether a model is currently loaded.
@@ -175,16 +213,13 @@ impl LlamaCppEngine {
         Arc::clone(&self.backend)
     }
 
-    /// Compute the session cache file path for KV-cache persistence.
-    ///
-    /// Returns `Some(path)` when a model is loaded (sync check via try_lock).
-    /// The generation task uses this to save/load KV state between turns.
-    pub(crate) fn cache_path(&self) -> Option<PathBuf> {
-        // Use try_lock to avoid blocking — if the model is busy, skip caching.
-        let guard = self.model.try_lock().ok()?;
-        let model_id = guard.as_ref()?.model_id.clone();
-        drop(guard);
-        Some(crate::kv_cache::cache_file_path(&self.data_dir, &model_id))
+    /// Invalidate the in-memory KV cache (e.g. when settings change the prompt).
+    pub async fn invalidate_kv_cache(&self) {
+        let mut guard = self.model.lock().await;
+        if let Some(loaded) = guard.as_mut() {
+            loaded.cached_ctx = None;
+            tracing::info!("KV cache invalidated");
+        }
     }
 
     /// Resolve a model identifier to an absolute filesystem path.
@@ -269,6 +304,7 @@ fn load_model_sync(
         model_id: model_id.to_string(),
         chat_template,
         capabilities,
+        cached_ctx: None,
     })
 }
 
