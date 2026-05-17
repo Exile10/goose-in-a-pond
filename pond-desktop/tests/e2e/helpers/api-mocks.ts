@@ -280,6 +280,31 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     return route.fulfill({ json: { requirements: [], fulfilled: {} } });
   });
 
+  // Logs
+  await page.route("**/api/v1/logs", (route) =>
+    route.fulfill({
+      json: [
+        { id: "1", timestamp: new Date().toISOString(), level: "INFO", source: "pond-server", message: "Server bound to 127.0.0.1:4000", metadata: null },
+        { id: "2", timestamp: new Date().toISOString(), level: "INFO", source: "models", message: "Loaded gemma-4-E4B-it-Q4_K_M (5363 MB)", metadata: null },
+        { id: "3", timestamp: new Date().toISOString(), level: "WARN", source: "memory", message: "Available memory below 25% threshold (1.8 GB)", metadata: null },
+      ],
+    }),
+  );
+
+  // Usage
+  await page.route("**/api/v1/usage", (route) =>
+    route.fulfill({
+      json: {
+        total_prompt_tokens: 142000,
+        total_completion_tokens: 38000,
+        total_tokens: 180000,
+        session_count: 3,
+        cloud_input_price_per_m: 2.50,
+        cloud_output_price_per_m: 10.00,
+      },
+    }),
+  );
+
   // OAuth
   await page.route("**/api/v1/oauth/**", (route) =>
     route.fulfill({ json: { auth_url: "https://accounts.spotify.com/authorize?test=1", state: "test-state" } }),

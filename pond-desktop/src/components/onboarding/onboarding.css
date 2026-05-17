@@ -1399,3 +1399,74 @@
   flex-shrink: 0;
   font-family: var(--font-mono);
 }
+
+/* ── Rail step text wrapper ───────────────────────────────── */
+
+.ob-rail__step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* ── Loading state ────────────────────────────────────────── */
+
+.ob-loading {
+  text-align: center;
+  padding-top: 80px;
+}
+
+.ob-loading__text {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-md);
+}
+
+/* ── Required field asterisk ──────────────────────────────── */
+
+.ob-required {
+  color: var(--color-destructive);
+}
+
+/* ── Error text (inline field error) ─────────────────────── */
+
+.ob-field-error {
+  font-size: var(--text-sm);
+  color: var(--color-destructive);
+  margin: 2px 0 0;
+}
+
+/* ── Birthday field width constraint ─────────────────────── */
+
+.ob-field--narrow {
+  max-width: 280px;
+}
+
+/* ── Model count badge ────────────────────────────────────── */
+
+.ob-model-count {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-left: 4px;
+}
+
+/* ── Slider fill (dynamic width set via style prop) ───────── */
+/* Background gradient uses var(--color-accent) + var(--grey-200)      */
+/* The fill position is dynamic so width is set inline; only the track  */
+/* needs to override the base appearance reset.                         */
+
+/* ── Meter bar active state (dynamic hsl set via style prop) ─ */
+/* .ob-calibration__meter-bar.is-on is set inline for hsl color        */
+
+/* ── Calibration title with icon ─────────────────────────── */
+
+.ob-calibration__title-icon {
+  display: inline;
+  vertical-align: -2px;
+  margin-right: 6px;
+}
+
+/* ── Extensions hint ──────────────────────────────────────── */
+
+.ob-complete__extensions-hint {
+  font-style: italic;
+  margin-top: 12px;
+}

@@ -58,7 +58,7 @@ function StepRail({ stepIndex, onJump }: { stepIndex: number; onJump: (i: number
                     i + 1
                   )}
                 </span>
-                <span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                <span className="ob-rail__step-text">
                   <span className={`ob-rail__step-label ${active ? "ob-rail__step-label--active" : ""} ${done ? "ob-rail__step-label--done" : ""}`}>
                     {s.label}
                   </span>
@@ -148,10 +148,8 @@ function WizardInner({ onComplete }: { onComplete: () => void }) {
       <div className="ob-shell">
         <StepRail stepIndex={0} onJump={() => {}} />
         <main className="ob-main ob-main--centered">
-          <div className="ob-main__inner" style={{ textAlign: "center", paddingTop: 80 }}>
-            <p style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-md)" }}>
-              Loading your settings...
-            </p>
+          <div className="ob-main__inner ob-loading">
+            <p className="ob-loading__text">Loading your settings...</p>
           </div>
         </main>
       </div>

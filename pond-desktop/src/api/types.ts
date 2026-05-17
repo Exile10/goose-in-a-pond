@@ -16,13 +16,10 @@ export interface Settings {
   assistant_name: string;
   user_name: string;
   assistant_personality?: string;
-  location?: string;       // legacy alias
-  personality?: string;    // legacy alias
   timezone?: string;
 
   // Voice pipeline
   voice_wake_word?: string;
-  wake_word?: string;      // legacy alias
   voice_wake_word_transcriptions?: string[];
   voice_recording_duration_secs?: number;
   voice_whisper_url?: string;
@@ -54,8 +51,6 @@ export interface Settings {
   weather_location_name?: string;
   weather_latitude?: number;
   weather_longitude?: number;
-  lat?: number;  // legacy alias
-  lon?: number;  // legacy alias
 
   // Fast path
   fast_path_enabled?: boolean;
@@ -133,6 +128,16 @@ export interface Settings {
   ext_knowledge_enabled?: boolean;
   ext_system_enabled?: boolean;
   ext_device_enabled?: boolean;
+  ext_news_enabled?: boolean;
+  ext_finance_enabled?: boolean;
+  ext_discovery_enabled?: boolean;
+
+  // API keys for keyed services
+  api_key_guardian?: string | null;
+  api_key_gnews?: string | null;
+  api_key_finnhub?: string | null;
+  api_key_coingecko?: string | null;
+  searxng_url?: string | null;
 
   // Data retention
   retention_event_log_days?: number;
@@ -202,6 +207,30 @@ export interface ScheduleRun {
   started_at: string;
   finished_at?: string;
   duration_ms?: number;
+}
+
+/** Enriched schedule run for UI notification display. */
+export interface ScheduleRunNotification {
+  id: string;
+  scheduleId: string;
+  scheduleName: string;
+  status: "running" | "completed" | "failed";
+  result: string | null;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  read: boolean;
+  /** First ~80 chars of result for preview */
+  excerpt: string;
+  /** Inferred recipe type from schedule name/prompt */
+  recipe: string | null;
+}
+
+/** Context passed when navigating to Canvas to view a schedule debrief. */
+export interface DebriefContext {
+  type: "debrief";
+  run: ScheduleRunNotification;
 }
 
 // ── Memory ────────────────────────────────────────────────────
@@ -316,6 +345,11 @@ export interface ChatEvent {
   input?: unknown;          // for "tool_call" events — model's tool call arguments
   result?: unknown;         // for "tool_call" events
   error?: string;           // for "error" events
+  /** Optional MCP-APP UI rendering hint from backend */
+  ui?: {
+    card_type?: string;
+    data?: Record<string, unknown>;
+  };
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)

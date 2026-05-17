@@ -78,6 +78,10 @@ const NAME_MAP: Record<string, string> = {
   list_registered_devices: "Devices",
   get_current_profile: "Profile",
   get_model_config: "Model Config",
+  // music
+  play: "Play Music",
+  status: "Now Playing",
+  control: "Playback Control",
 };
 
 export function friendlyToolName(raw: string): string {

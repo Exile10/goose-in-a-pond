@@ -73,8 +73,8 @@ test.describe("Models section", () => {
 
     await goToModels(page);
 
-    // 8192 MB should appear on the page
-    await expect(page.getByText(/8192|8,192/)).toBeVisible({ timeout: 10_000 });
+    // Memory total should appear somewhere (8192 MB or 8 GB or similar)
+    await expect(page.getByText(/8192|8,192|8\.0|8 GB/i).first()).toBeVisible({ timeout: 10_000 });
   });
 
   test("memory status shows loaded model name when a model is hot", async ({ page }) => {

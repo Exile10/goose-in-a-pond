@@ -179,8 +179,14 @@ export function ScheduleCalendar({ schedules }: Props) {
                       />
                     )}
 
-                    {/* Pills / dots for this cell */}
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 2, alignItems: "flex-start" }}>
+                    {/* Pills / dots for this cell — side by side when 2+ */}
+                    <div className="sched-cal__cell-items" style={{
+                      display: "flex",
+                      flexDirection: cellItems.length <= 2 ? "row" : "column",
+                      flexWrap: "wrap",
+                      gap: 2,
+                      alignItems: "flex-start",
+                    }}>
                       {cellItems.map((slot) =>
                         slot.frequency === "hourly" ? (
                           <button
@@ -195,7 +201,11 @@ export function ScheduleCalendar({ schedules }: Props) {
                           <button
                             key={slot.scheduleId}
                             className="sched-cal__pill"
-                            style={{ background: slot.color }}
+                            style={{
+                              background: slot.color,
+                              flex: cellItems.length === 2 ? "1 1 0" : undefined,
+                              minWidth: cellItems.length === 2 ? 0 : undefined,
+                            }}
                             onClick={(e) => handlePillClick(e, slot)}
                             aria-label={slot.label}
                           >

@@ -178,12 +178,69 @@ export class PondApiClient {
     return this.del(`/api/v1/schedules/${id}`);
   }
 
+  async updateSchedule(
+    id: string,
+    patch: { name?: string; cron?: string; prompt?: string; timezone?: string },
+  ): Promise<Schedule> {
+    const t = await this.put<Record<string, unknown>>(
+      `/api/v1/schedules/${encodeURIComponent(id)}`,
+      patch,
+    );
+    const kind = t.kind as Record<string, unknown> | undefined;
+    const prompt = (kind?.prompt as string) ?? patch.prompt ?? "";
+    return {
+      id: t.id as string,
+      name: ((t.label ?? t.name) as string) || "",
+      cron: t.cron as string,
+      prompt,
+      enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
+      timezone: (t.timezone as string) ?? "UTC",
+      kind: t.kind as Schedule["kind"],
+      last_run: t.last_run as string | undefined,
+      next_run: t.next_run as string | undefined,
+      created_at: t.created_at as string | undefined,
+    };
+  }
+
   getScheduleRuns(id: string, limit = 10): Promise<ScheduleRun[]> {
     return this.get<ScheduleRun[]>(`/api/v1/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`);
   }
 
   getUpcomingSchedules(limit = 10): Promise<Schedule[]> {
     return this.get<Schedule[]>(`/api/v1/schedules/upcoming?limit=${limit}`);
+  }
+
+  /** Fetch recent runs across all schedules, merged and sorted by start time. */
+  async getAllRecentRuns(perScheduleLimit = 5): Promise<Array<ScheduleRun & { schedule_name: string }>> {
+    const schedules = await this.listSchedules();
+    const runSets = await Promise.all(
+      schedules.map(async (s) => {
+        try {
+          const runs = await this.getScheduleRuns(s.id, perScheduleLimit);
+          return runs.map((r) => ({ ...r, schedule_name: s.name || s.label || s.id }));
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return runSets
+      .flat()
+      .sort((a, b) => (a.started_at < b.started_at ? 1 : -1));
+  }
+
+  // ── MCP Apps ──────────────────────────────────────────────
+
+  /** Fetch an MCP App resource by its ui:// URI. Returns the HTML content. */
+  async getMcpResource(uri: string): Promise<string> {
+    const res = await this.get<{ contents: Array<{ text?: string }> }>(
+      `/api/v1/mcp/resources?uri=${encodeURIComponent(uri)}`,
+    );
+    return res.contents?.[0]?.text ?? "";
+  }
+
+  /** Execute an MCP tool by name with arguments. Returns the tool result. */
+  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    return this.post<unknown>("/api/v1/mcp/tools/call", { name, arguments: args });
   }
 
   // ── Usage ─────────────────────────────────────────────────
@@ -433,6 +490,7 @@ export class PondApiClient {
     message: string,
     sessionId?: string,
     token?: string,
+    canvasMode?: boolean,
   ): AsyncGenerator<ChatEvent> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const tok = token ?? this.token;
@@ -441,7 +499,7 @@ export class PondApiClient {
     const res = await fetch(`${this.base}/api/v1/chat/stream`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ message, session_id: sessionId }),
+      body: JSON.stringify({ message, session_id: sessionId, canvas_mode: canvasMode ?? false }),
     });
 
     if (!res.ok) {

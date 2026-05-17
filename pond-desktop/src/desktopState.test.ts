@@ -36,10 +36,11 @@ describe("desktopState", () => {
     expect(normalizeGuiSection(undefined)).toBe("dashboard");
   });
 
-  it("DESKTOP_SECTIONS is a flat ordered list of all 12 sidebar items", () => {
-    // 14 = dashboard, chat, canvas, devices, schedules, memory, skills, extensions,
-    // models, prompts, faces, settings, agent, logs.
-    expect(DESKTOP_SECTIONS).toHaveLength(14);
+  it("DESKTOP_SECTIONS is a flat ordered list of all sidebar items", () => {
+    // 11 = dashboard, chat, devices, schedules, memory, skills, logs,
+    // models, prompts, settings, extensions.
+    // (canvas, faces, agent are hidden from sidebar but still routable)
+    expect(DESKTOP_SECTIONS).toHaveLength(11);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
     const sectionKeys = DESKTOP_SECTIONS.map((s) => s.section);
@@ -50,10 +51,14 @@ describe("desktopState", () => {
     expect(sectionKeys).toContain("extensions");
     expect(sectionKeys).toContain("models");
     expect(sectionKeys).toContain("prompts");
-    expect(sectionKeys).toContain("faces");
     expect(sectionKeys).toContain("settings");
-    expect(sectionKeys).toContain("agent");
     expect(sectionKeys).toContain("logs");
+  });
+
+  it("hidden sections are still valid for normalizeGuiSection", () => {
+    expect(normalizeGuiSection("faces")).toBe("faces");
+    expect(normalizeGuiSection("agent")).toBe("agent");
+    expect(normalizeGuiSection("canvas")).toBe("canvas");
   });
 
   it("derives consistent desktop section labels", () => {
@@ -61,6 +66,7 @@ describe("desktopState", () => {
     expect(getDesktopSectionLabel("chat")).toBe("Chat");
     expect(getDesktopSectionLabel("settings")).toBe("Settings");
     expect(getDesktopSectionLabel("models")).toBe("Models");
+    // agent is not in sidebar groups — falls back to capitalized name
     expect(getDesktopSectionLabel("agent")).toBe("Agent");
   });
 

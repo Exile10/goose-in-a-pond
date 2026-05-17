@@ -1250,7 +1250,7 @@ export function Extensions() {
       {activeTab === "installed" && (
         <>
           {/* Extensions list */}
-          <Card shadow="none" className="giap-card">
+          <Card className="card">
             <CardContent>
               {loading && (
                 <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)" }}>
@@ -1313,7 +1313,7 @@ export function Extensions() {
       )}
 
       {activeTab === "browse" && (
-        <Card shadow="none" className="giap-card">
+        <Card className="card">
           <CardContent>
             <BrowseTab
               installedExtensions={extensions}

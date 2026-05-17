@@ -50,7 +50,7 @@ export function StepAboutYou() {
       {/* Name fields */}
       <div className="ob-field-grid">
         <div>
-          <FormLabel>Your name <span style={{ color: "var(--color-destructive)" }}>*</span></FormLabel>
+          <FormLabel>Your name <span className="ob-required">*</span></FormLabel>
           <input
             className="ob-input"
             placeholder="e.g. Jack Smith"
@@ -88,7 +88,7 @@ export function StepAboutYou() {
       </div>
 
       {/* Birthday */}
-      <div className="ob-field" style={{ maxWidth: 280 }}>
+      <div className="ob-field ob-field--narrow">
         <FormLabel optional>Birthday</FormLabel>
         <input
           className="ob-input"
@@ -104,7 +104,7 @@ export function StepAboutYou() {
       {/* Accessibility section */}
       <div className="ob-field">
         <FormLabel>Accessibility</FormLabel>
-        <p className="ob-field-hint" style={{ marginBottom: 12 }}>
+        <p className="ob-field-hint">
           All options can be changed at any time in Settings &rarr; Accessibility.
         </p>
         <div className="ob-toggle-stack">

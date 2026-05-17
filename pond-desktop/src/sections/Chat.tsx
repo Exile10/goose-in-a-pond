@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Button } from "@heroui/react";
-import { ArrowUp, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Zap } from "lucide-react";
+import { Button, Chip } from "@heroui/react";
+import { ArrowUp, Brain, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Zap } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -37,6 +37,7 @@ interface Message {
   streaming?: boolean;
   status?: string;       // current activity description (e.g. "Thinking...", "Using tool...")
   cards?: ContextCardType[];  // inline tool call results attached to this message
+  thinkingBlocks?: string[];  // captured reasoning blocks (shown when show_thinking is on)
   modelRole?: string;         // which role answered (chat/think/task)
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
   error?: boolean;            // true when this bubble represents an error
@@ -256,6 +257,16 @@ export function Chat() {
             });
           }
 
+        } else if (ev.type === "thinking" && ev.content) {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || last.role !== "agent") return prev;
+            return [...prev.slice(0, -1), {
+              ...last,
+              thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content],
+            }];
+          });
+
         } else if (ev.type === "status" && ev.content) {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
@@ -267,6 +278,7 @@ export function Chat() {
           const card: ContextCardType = {
             id: nextCardId(),
             tool: ev.tool,
+            callId: ev.id as string | undefined,
             data: (ev.result as Record<string, unknown>) ?? {},
             timestamp_ms: Date.now(),
           };
@@ -285,13 +297,25 @@ export function Chat() {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent" || !last.cards) return prev;
-            // Update the data for the specific card
-            const newCards = last.cards.map(c => 
-              // We don't have tool_call_id on ContextCardType yet, but we can match by tool name if it was the last one
-              // or better: let's just update the last one for now or add id to card
-              c.tool === ev.tool ? { ...c, data: { result: ev.content } } : c
+            // Use explicit UI data if provided by MCP-APP, else wrap content
+            const cardData = ev.ui?.data ?? { result: ev.content };
+            const renderHint = ev.ui?.card_type;
+            // Match by MCP request ID (primary) or tool name (fallback).
+            const evId = ev.id as string;
+            const evTool = ev.tool as string | undefined;
+            const newCards = last.cards.map(c =>
+              (c.callId && c.callId === evId) || (evTool && c.tool === evTool)
+                ? { ...c, data: cardData, ...(renderHint ? { renderHint } : {}) }
+                : c
             );
             return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
+          });
+
+        } else if (ev.type === "review_status" && ev.content) {
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || last.role !== "agent") return prev;
+            return [...prev.slice(0, -1), { ...last, status: ev.content }];
           });
 
         } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
@@ -386,6 +410,9 @@ export function Chat() {
             <History size={16} />
           </Button>
           <h1 className="page-header__title chat-toolbar__title">Chat</h1>
+          <Chip size="sm" variant="flat" startContent={<Cpu size={12} />}>
+            {modelLabel}
+          </Chip>
         </div>
         <div className="chat-toolbar__right">
           <Button
@@ -396,10 +423,12 @@ export function Chat() {
           >
             New chat
           </Button>
-          <Button size="sm" variant="outline">
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-              <Zap size={14} /> Tools
-            </span>
+          <Button
+            size="sm"
+            variant="outline"
+            startContent={<Zap size={14} />}
+          >
+            Tools
           </Button>
         </div>
 
@@ -419,19 +448,19 @@ export function Chat() {
       <div className="chat-body" role="log" aria-live="polite">
         <div className="chat-thread">
           {loadingSession && (
-            <div style={styles.skeleton} aria-busy="true" aria-label="Loading conversation">
-              {[88, 64, 72].map((w, i) => (
-                <div key={i} style={{ ...styles.skeletonRow, alignSelf: i % 2 === 0 ? "flex-start" : "flex-end" }}>
-                  <div style={{ ...styles.skeletonLine, width: `${w}%`, height: "14px", marginBottom: "6px" }} />
-                  <div style={{ ...styles.skeletonLine, width: `${Math.round(w * 0.65)}%`, height: "14px" }} />
+            <div className="chat-skeleton" aria-busy="true" aria-label="Loading conversation">
+              {([88, 64, 72] as const).map((w, i) => (
+                <div key={i} className={`chat-skeleton__row${i % 2 !== 0 ? " chat-skeleton__row--right" : ""}`}>
+                  <div className="chat-skeleton__line" style={{ width: `${w}%`, height: "14px", marginBottom: "6px" }} />
+                  <div className="chat-skeleton__line" style={{ width: `${Math.round(w * 0.65)}%`, height: "14px" }} />
                 </div>
               ))}
             </div>
           )}
           {!loadingSession && messages.length === 0 && (
             <div className="empty-state">
-              <p style={styles.emptyTitle}>Start a conversation</p>
-              <p style={styles.emptyHint}>Ask Pond anything. Type a message or use voice mode.</p>
+              <p className="chat-empty__title">Start a conversation</p>
+              <p className="chat-empty__hint">Ask Pond anything. Type a message or use voice mode.</p>
             </div>
           )}
           {messages.map((msg) => (
@@ -451,13 +480,23 @@ export function Chat() {
                 </div>
               )}
 
+              {/* Thinking blocks — collapsible reasoning shown when show_thinking is on */}
+              {msg.role === "agent" && msg.thinkingBlocks && msg.thinkingBlocks.length > 0 && !msg.streaming && (
+                <details className="thinking-block">
+                  <summary className="thinking-block__toggle">
+                    <Brain size={12} aria-hidden /> Thinking
+                  </summary>
+                  <div className="thinking-block__content">
+                    {msg.thinkingBlocks.map((block, i) => (
+                      <p key={i}>{block}</p>
+                    ))}
+                  </div>
+                </details>
+              )}
+
               <div
-                className="bubble__body"
-                style={{
-                  userSelect: "text",
-                  wordBreak: "break-word",
-                  ...(msg.error ? styles.bubbleError : {}),
-                }}
+                className={`bubble__body${msg.error ? " bubble__body--error" : ""}`}
+                style={{ userSelect: "text", wordBreak: "break-word" }}
               >
                 {msg.text || (msg.streaming ? (
                   msg.status
@@ -468,7 +507,7 @@ export function Chat() {
 
               {/* Model role badge + token count */}
               {msg.role === "agent" && msg.modelRole && !msg.streaming && (
-                <span style={styles.modelRoleBadge}>
+                <span className="bubble__meta">
                   {msg.modelRole}
                   {msg.tokenUsage && msg.tokenUsage.completion_tokens > 0 && (
                     <> · {msg.tokenUsage.completion_tokens} tokens</>
@@ -486,8 +525,7 @@ export function Chat() {
         <div className="chat-composer__inner">
           <textarea
             ref={textareaRef}
-            className="chat-composer__field"
-            style={styles.textarea}
+            className="chat-composer__textarea"
             value={input}
             onChange={onInput}
             onKeyDown={onKeyDown}
@@ -551,7 +589,6 @@ export function Chat() {
                         <div className="model-selector-dropdown__group-label">{providerLabel}</div>
                         {group.map((m) => {
                           const isActive = modelLabel === m.name || modelLabel === (m.display_name ?? m.name);
-                          // Use name as label; fall back to display_name but skip generic descriptions
                           const label = m.name;
                           return (
                             <button
@@ -585,69 +622,3 @@ export function Chat() {
     </div>
   );
 }
-
-/* Residual inline styles for elements not fully covered by CSS classes */
-const styles: Record<string, React.CSSProperties> = {
-  emptyTitle: {
-    fontFamily: "var(--font-heading)",
-    fontWeight: 700,
-    fontSize: "var(--text-lg)",
-    color: "var(--fg)",
-    margin: 0,
-  },
-  emptyHint: {
-    fontSize: "var(--text-sm)",
-    color: "var(--grey-500)",
-    margin: 0,
-  },
-  bubbleError: {
-    borderColor: "var(--color-destructive)",
-    color: "var(--color-destructive)",
-  },
-  cardList: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "8px",
-    maxWidth: "360px",
-    width: "100%",
-  },
-  modelRoleBadge: {
-    fontSize: "10px",
-    color: "var(--grey-500)",
-    fontFamily: "var(--font-mono)",
-    paddingTop: "2px",
-  },
-  textarea: {
-    flex: 1,
-    border: "none",
-    background: "transparent",
-    resize: "none",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-body)",
-    color: "var(--fg)",
-    lineHeight: 1.55,
-    outline: "none",
-    padding: "8px 12px",
-    minHeight: "36px",
-    maxHeight: "120px",
-    overflowY: "auto",
-    userSelect: "text",
-  },
-  skeleton: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "20px",
-    padding: "16px 0",
-  },
-  skeletonRow: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "4px",
-    maxWidth: "70%",
-  },
-  skeletonLine: {
-    borderRadius: "var(--radius-md)",
-    background: "var(--grey-200)",
-    animation: "shimmer 1.4s ease-in-out infinite",
-  },
-};
