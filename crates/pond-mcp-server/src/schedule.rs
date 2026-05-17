@@ -528,8 +528,13 @@ impl ScheduleMcpServer {
                 return None;
             }
             // Try natural language first, then validated literal
-            parse_cron_from_message(&c.to_lowercase())
-                .or_else(|| if looks_like_cron(c) { Some(c.clone()) } else { None })
+            parse_cron_from_message(&c.to_lowercase()).or_else(|| {
+                if looks_like_cron(c) {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
         });
 
         // ── Resolve prompt: pass through if provided ──
