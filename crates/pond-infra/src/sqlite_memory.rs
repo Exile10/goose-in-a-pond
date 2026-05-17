@@ -476,11 +476,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
-    async fn get_events(
-        &self,
-        memory_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<MemoryEvent>> {
+    async fn get_events(&self, memory_id: Option<&str>, limit: usize) -> Result<Vec<MemoryEvent>> {
         let rows: Vec<EventRow> = match memory_id {
             Some(mid) => {
                 sqlx::query_as(
@@ -513,14 +509,12 @@ impl MemoryRepository for SqliteMemoryRepository {
         importance: f32,
     ) -> anyhow::Result<()> {
         let seg_str = format!("{:?}", segment).to_lowercase();
-        sqlx::query(
-            "UPDATE memory_fragments SET segment = ?, importance = ? WHERE id = ?",
-        )
-        .bind(&seg_str)
-        .bind(importance as f64)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE memory_fragments SET segment = ?, importance = ? WHERE id = ?")
+            .bind(&seg_str)
+            .bind(importance as f64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -799,14 +793,9 @@ mod tests {
     async fn log_and_get_events() {
         let (repo, _tmp) = make_repo().await;
 
-        repo.log_event(
-            MemoryEventKind::Extracted,
-            "mem-1",
-            Some("sess-1"),
-            None,
-        )
-        .await
-        .unwrap();
+        repo.log_event(MemoryEventKind::Extracted, "mem-1", Some("sess-1"), None)
+            .await
+            .unwrap();
         repo.log_event(MemoryEventKind::Written, "mem-1", None, Some("via MCP"))
             .await
             .unwrap();
