@@ -117,8 +117,8 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
-        /// Agent backend: goose (default, Block's Goose with MCP tool calls) or mock (fast, no LLM).
-        /// Override: cargo run -p pond-server -- serve --agent mock
+        /// Agent backend: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse) | "mock".
+        /// Also configurable via PUT /api/v1/settings with agent_backend field.
         #[arg(long, default_value = "goose")]
         agent: String,
 

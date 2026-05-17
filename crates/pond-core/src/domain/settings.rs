@@ -223,6 +223,12 @@ pub struct Settings {
     pub context_window_override: u32,
 
     // ── Agent behaviour ────────────────────────────────────────────────────────
+    /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
+    /// "goose" uses Block's Goose framework with all MCP extensions, cloud provider support.
+    /// "pond" uses PondAgent + LlamaCppEngine directly for minimal latency on local models.
+    #[serde(default = "Settings::default_agent_backend")]
+    pub agent_backend: String,
+
     /// GooseMode for the agent loop: "auto" | "chat" | "smart"
     #[serde(default = "Settings::default_agent_goose_mode")]
     pub agent_goose_mode: String,
@@ -389,6 +395,29 @@ pub struct Settings {
     #[serde(default = "Settings::default_tool_request_detection")]
     pub tool_request_detection: bool,
 
+    // ── API keys ─────────────────────────────────────────────────────────
+    // Optional API keys for external data services. Tools degrade gracefully
+    // (fewer sources, rate-limited fallbacks) when keys are absent.
+    /// The Guardian Open Platform API key.
+    #[serde(default)]
+    pub api_key_guardian: Option<String>,
+
+    /// GNews API key.
+    #[serde(default)]
+    pub api_key_gnews: Option<String>,
+
+    /// Finnhub stock/market data API key.
+    #[serde(default)]
+    pub api_key_finnhub: Option<String>,
+
+    /// CoinGecko crypto API key (optional — demo tier works without one).
+    #[serde(default)]
+    pub api_key_coingecko: Option<String>,
+
+    /// Self-hosted SearXNG instance URL for web/news search.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
+
     // ── Extension toggles ───────────────────────────────────────────────
     // Controls which builtin MCP tool modules are registered at startup.
     // External extensions are managed separately via the MCP server repository.
@@ -415,6 +444,18 @@ pub struct Settings {
     /// Enable the device/profile tools module (devices, profile, model config).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_device_enabled: bool,
+
+    /// Enable the news tools module (headlines, search, trending topics).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_news_enabled: bool,
+
+    /// Enable the finance tools module (stocks, crypto, market data).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_finance_enabled: bool,
+
+    /// Enable the discovery tools module (product search, recommendations).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_discovery_enabled: bool,
 }
 
 impl Default for Settings {
@@ -462,6 +503,7 @@ impl Default for Settings {
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
             context_window_override: 0,
+            agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
             agent_timeout_secs: Self::default_agent_timeout_secs(),
@@ -473,7 +515,7 @@ impl Default for Settings {
             memory_cleanup_enabled: true,
             memory_consolidation_enabled: false, // requires enough memories to be useful
             memory_consolidation_mode: Self::default_memory_consolidation_mode(),
-            memory_graph_enabled: false,         // experimental causal graph retrieval
+            memory_graph_enabled: false, // experimental causal graph retrieval
             schedule_result_notify: Self::default_schedule_result_notify(),
             memory_decay_base_half_life_days: Self::default_memory_decay_base_half_life_days(),
             memory_decay_beta: Self::default_memory_decay_beta(),
@@ -496,12 +538,20 @@ impl Default for Settings {
             multi_tool_enabled: false,
             tool_call_validation: Self::default_tool_call_validation(),
             tool_request_detection: Self::default_tool_request_detection(),
+            api_key_guardian: None,
+            api_key_gnews: None,
+            api_key_finnhub: None,
+            api_key_coingecko: None,
+            searxng_url: None,
             ext_memory_enabled: true,
             ext_schedule_enabled: true,
             ext_weather_enabled: true,
             ext_knowledge_enabled: true,
             ext_system_enabled: true,
             ext_device_enabled: true,
+            ext_news_enabled: true,
+            ext_finance_enabled: true,
+            ext_discovery_enabled: true,
         }
     }
 }
@@ -607,6 +657,9 @@ impl Settings {
     }
     fn default_review_pass_threshold() -> u8 {
         3
+    }
+    fn default_agent_backend() -> String {
+        "goose".to_string()
     }
     fn default_agent_goose_mode() -> String {
         "auto".to_string()
@@ -801,5 +854,48 @@ mod tests {
         assert!(s.ext_knowledge_enabled);
         assert!(s.ext_system_enabled);
         assert!(s.ext_device_enabled);
+    }
+
+    #[test]
+    fn new_api_key_fields_default_to_none() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.api_key_guardian.is_none());
+        assert!(s.api_key_gnews.is_none());
+        assert!(s.api_key_finnhub.is_none());
+        assert!(s.api_key_coingecko.is_none());
+        assert!(s.searxng_url.is_none());
+    }
+
+    #[test]
+    fn new_extension_toggles_default_to_true() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.ext_news_enabled);
+        assert!(s.ext_finance_enabled);
+        assert!(s.ext_discovery_enabled);
+    }
+
+    #[test]
+    fn api_keys_deserialize_when_present() {
+        let json =
+            r#"{"api_key_guardian": "test-guardian-key", "searxng_url": "http://localhost:8888"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.api_key_guardian, Some("test-guardian-key".to_string()));
+        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
+        // Others still None
+        assert!(s.api_key_gnews.is_none());
+        assert!(s.api_key_finnhub.is_none());
+        assert!(s.api_key_coingecko.is_none());
+    }
+
+    #[test]
+    fn partial_overrides_preserve_new_defaults() {
+        let json = r#"{"ext_news_enabled": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.ext_news_enabled);
+        // Other new toggles keep their defaults
+        assert!(s.ext_finance_enabled);
+        assert!(s.ext_discovery_enabled);
+        // API keys still None
+        assert!(s.api_key_guardian.is_none());
     }
 }
