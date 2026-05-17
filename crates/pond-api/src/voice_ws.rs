@@ -161,6 +161,7 @@ async fn handle_voice_session(mut socket: WebSocket, state: Arc<AppState>) {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: true,
+            canvas_mode: false,
         };
 
         let agent_stream = match state.agent.chat_stream(agent_req).await {
