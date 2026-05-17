@@ -337,9 +337,16 @@ impl Agent for PondAgent {
             vec![]
         };
 
+        let thinking_enabled = match settings.thinking_mode.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => provider.capabilities().thinking, // "auto"
+        };
+
         let options = InferenceOptions {
             max_tokens: Some(settings.llm_max_tokens),
             temperature: Some(settings.llm_temperature),
+            enable_thinking: thinking_enabled,
         };
 
         // 7. Clone what we need for the spawned task.
@@ -386,13 +393,21 @@ impl Agent for PondAgent {
 
                 let mut text_buf = String::new();
                 let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+                // Stream text tokens immediately so the ThoughtFilter in the SSE layer
+                // can capture thinking blocks in real-time. If tool calls follow, the
+                // text was preamble (e.g. "Let me check...") — harmless since the
+                // ThoughtFilter strips reasoning markup and the UI handles it.
+                let mut streamed_any_text = false;
 
                 while let Some(event) = stream.next().await {
                     match event {
                         Ok(pond_core::ports::inference::ChatEvent::Text(t)) => {
                             text_buf.push_str(&t);
-                            // Don't stream text yet — wait to see if tool calls follow.
-                            // If no tools, we'll flush it all at the end.
+                            // Stream immediately so ThoughtFilter sees tokens in real-time
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Text { content: t }))
+                                .await;
+                            streamed_any_text = true;
                         }
                         Ok(pond_core::ports::inference::ChatEvent::ToolCall {
                             id,
@@ -436,15 +451,8 @@ impl Agent for PondAgent {
                     last_tool_call = Some(calls_key);
                 }
 
-                // If no tool calls, this is the final response — stream the text and break.
+                // If no tool calls, this is the final response — text already streamed.
                 if tool_calls.is_empty() {
-                    if !text_buf.is_empty() {
-                        let _ = tx
-                            .send(Ok(AgentStreamEvent::Text {
-                                content: text_buf.clone(),
-                            }))
-                            .await;
-                    }
                     messages.push(ChatMessage::assistant(&text_buf));
                     break;
                 }

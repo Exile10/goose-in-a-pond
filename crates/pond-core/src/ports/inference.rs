@@ -45,6 +45,8 @@ pub struct InferenceOptions {
     pub max_tokens: Option<u32>,
     /// Sampling temperature (0.0 = deterministic).
     pub temperature: Option<f32>,
+    /// Enable model thinking/reasoning (produces `<|channel>thought...<channel|>` tags).
+    pub enable_thinking: bool,
 }
 
 /// A pinned, boxed stream of [`ChatEvent`] items.
