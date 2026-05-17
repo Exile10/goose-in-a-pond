@@ -220,79 +220,104 @@ fn generation_task(
     ctx_params = ctx_params.with_n_batch(512);
     ctx_params = ctx_params.with_flash_attention_policy(1);
 
+    // Helper: create a fresh context sized for the current prompt.
+    let create_fresh_ctx =
+        |model: &llama_cpp_2::model::LlamaModel,
+         backend: &LlamaBackend,
+         ctx_size: usize|
+         -> Result<llama_cpp_2::context::LlamaContext<'static>> {
+            let mut params =
+                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
+            params = params.with_n_batch(512);
+            params = params.with_flash_attention_policy(1);
+            let ctx = model
+                .new_context(backend, params)
+                .map_err(|e| anyhow::anyhow!("failed to create context: {}", e))?;
+            // SAFETY: Context borrows from model which lives in the same LoadedModel struct.
+            // We guarantee it's dropped before the model (see LoadedModel docs).
+            Ok(unsafe { std::mem::transmute(ctx) })
+        };
+
     // Check if we can reuse the persistent context.
     let (mut ctx, tokens_to_decode_start) = if let Some(ref cached) = loaded.cached_ctx {
-        // We have a persistent context — check prefix match.
-        let action = crate::kv_cache::plan_cache_reuse(&cached.tokens_in_cache, &tokens);
-        match action {
-            crate::kv_cache::CacheAction::FullHit => {
-                tracing::info!(
-                    cached = cached.tokens_in_cache.len(),
-                    "KV cache full hit (in-memory) — skipping all prefill"
-                );
-                // Take ownership of the cached context.
-                let ctx = loaded.cached_ctx.take().unwrap().ctx;
-                (ctx, tokens.len()) // decode_from = end → empty slice
+        // Check if the new prompt fits in the cached context's allocation.
+        // The context was sized for an earlier (smaller) prompt — if the conversation
+        // grew beyond it, we must create a fresh context with the right size.
+        // Reserve 512 tokens for generation headroom.
+        let cached_n_ctx = cached.ctx.n_ctx() as usize;
+        if tokens.len() + 512 > cached_n_ctx {
+            tracing::info!(
+                prompt_tokens = tokens.len(),
+                cached_n_ctx,
+                new_ctx_size = ctx_size,
+                "KV cache too small for current prompt — creating larger context"
+            );
+            loaded.cached_ctx = None;
+            match create_fresh_ctx(&loaded.model, &backend, ctx_size) {
+                Ok(ctx) => (ctx, 0),
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
             }
-            crate::kv_cache::CacheAction::IncrementalDecode {
-                trim_from,
-                decode_from,
-                tokens_saved,
-            } => {
-                let mut ctx = loaded.cached_ctx.take().unwrap().ctx;
-                // Clear stale positions beyond the matching prefix.
-                let _ = ctx.clear_kv_cache_seq(None, Some(trim_from as u32), None);
-                tracing::info!(
-                    tokens_saved,
+        } else {
+            // Context fits — check prefix match.
+            let action = crate::kv_cache::plan_cache_reuse(&cached.tokens_in_cache, &tokens);
+            match action {
+                crate::kv_cache::CacheAction::FullHit => {
+                    tracing::info!(
+                        cached = cached.tokens_in_cache.len(),
+                        "KV cache full hit (in-memory) — skipping all prefill"
+                    );
+                    let ctx = loaded.cached_ctx.take().unwrap().ctx;
+                    (ctx, tokens.len())
+                }
+                crate::kv_cache::CacheAction::IncrementalDecode {
+                    trim_from,
                     decode_from,
-                    total = tokens.len(),
-                    "KV cache partial hit (in-memory) — decoding only delta"
-                );
-                (ctx, decode_from)
-            }
-            crate::kv_cache::CacheAction::FullPrefill => {
-                tracing::info!("KV cache miss (in-memory, no prefix match) — full prefill");
-                // Discard the old context and create fresh.
-                loaded.cached_ctx = None;
-                let ctx = match loaded.model.new_context(&backend, ctx_params) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(anyhow::anyhow!(
-                            "failed to create context: {}", e
-                        )));
-                        return;
+                    tokens_saved,
+                } => {
+                    let mut ctx = loaded.cached_ctx.take().unwrap().ctx;
+                    let _ = ctx.clear_kv_cache_seq(None, Some(trim_from as u32), None);
+                    tracing::info!(
+                        tokens_saved,
+                        decode_from,
+                        total = tokens.len(),
+                        "KV cache partial hit (in-memory) — decoding only delta"
+                    );
+                    (ctx, decode_from)
+                }
+                crate::kv_cache::CacheAction::FullPrefill => {
+                    tracing::info!("KV cache miss (in-memory, no prefix match) — full prefill");
+                    loaded.cached_ctx = None;
+                    match create_fresh_ctx(&loaded.model, &backend, ctx_size) {
+                        Ok(ctx) => (ctx, 0),
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
                     }
-                };
-                // SAFETY: Context borrows from loaded.model which lives in the same struct.
-                // We guarantee it's dropped before the model (see LoadedModel docs).
-                let ctx: llama_cpp_2::context::LlamaContext<'static> =
-                    unsafe { std::mem::transmute(ctx) };
-                (ctx, 0)
+                }
             }
         }
     } else {
-        // No cached context — cold start, create fresh.
         tracing::info!("KV cache cold start (in-memory) — creating fresh context");
-        let ctx = match loaded.model.new_context(&backend, ctx_params) {
-            Ok(c) => c,
+        match create_fresh_ctx(&loaded.model, &backend, ctx_size) {
+            Ok(ctx) => (ctx, 0),
             Err(e) => {
-                let _ = tx.blocking_send(Err(anyhow::anyhow!(
-                    "failed to create context: {}", e
-                )));
+                let _ = tx.blocking_send(Err(e));
                 return;
             }
-        };
-        // SAFETY: Context borrows from loaded.model which lives in the same struct.
-        let ctx: llama_cpp_2::context::LlamaContext<'static> =
-            unsafe { std::mem::transmute(ctx) };
-        (ctx, 0)
+        }
     };
 
     let tokens_to_decode = &tokens[tokens_to_decode_start..];
 
     // Prefill tokens in batches (only the delta when cache hit).
+    // If decode fails (NoKvCacheSlot), drop the cache and retry with a fresh context.
     if !tokens_to_decode.is_empty() {
         let n_batch = ctx.n_batch() as usize;
+        let mut decode_failed = false;
         for chunk in tokens_to_decode.chunks(n_batch) {
             let mut batch = match LlamaBatch::get_one(chunk) {
                 Ok(b) => b,
@@ -303,8 +328,36 @@ fn generation_task(
                 }
             };
             if let Err(e) = ctx.decode(&mut batch) {
-                let _ = tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
-                return;
+                tracing::warn!("decode failed ({}), retrying with fresh context", e);
+                decode_failed = true;
+                break;
+            }
+        }
+        // Retry: create fresh context and full prefill if cached decode failed.
+        if decode_failed {
+            drop(ctx);
+            ctx = match create_fresh_ctx(&loaded.model, &backend, ctx_size) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let n_batch = ctx.n_batch() as usize;
+            for chunk in tokens.chunks(n_batch) {
+                let mut batch = match LlamaBatch::get_one(chunk) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx
+                            .blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
+                        return;
+                    }
+                };
+                if let Err(e) = ctx.decode(&mut batch) {
+                    let _ =
+                        tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
+                    return;
+                }
             }
         }
     }
