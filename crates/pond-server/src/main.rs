@@ -1548,26 +1548,94 @@ async fn run_server(
     };
 
     // ── Agent backend ────────────────────────────────────────────────────────────
+    // When "pond" is selected, skip Goose entirely to avoid the llama.cpp backend
+    // singleton conflict. PondAgent uses its own LlamaCppEngine directly.
+    #[cfg(feature = "pond-agent")]
+    let pond_agent_active = agent_backend == "pond";
+    #[cfg(not(feature = "pond-agent"))]
+    let pond_agent_active = false;
+
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager, _tool_caller, tool_registry) = build_goose_backend(
-        agent_backend,
-        &llamafile_url,
-        &data_dir,
-        weather.clone(),
-        device_registry.clone(),
-        scheduler.clone(),
-        settings_repo.clone(),
-        memory_repo.clone(),
-        embedding_provider.clone(),
-        skill_repo.clone(),
-        recipe_repo.clone(),
-        prompt_template_repo.clone(),
-        prompt_extra_repo.clone(),
-        draft_repo.clone(),
-        Some(session_storage.clone()),
-        false, // voice_mode — server mode, not voice
-    )
-    .await;
+    let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
+        // Build PondAgent directly — no Goose, no llama backend conflict.
+        let default_registry: Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort> =
+            Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+
+        #[cfg(feature = "pond-agent")]
+        let agent: Arc<dyn Agent> = {
+            let settings = settings_repo.get().await.unwrap_or_default();
+            if let Ok(eng) = pond_inference::LlamaCppEngine::new(&data_dir) {
+                let model_id = &settings.chat_model;
+                if !model_id.is_empty() {
+                    if let Err(e) = eng.load_model(model_id, 99, true).await {
+                        tracing::error!("Failed to load model '{}': {e}", model_id);
+                    }
+                }
+                let dispatcher = pond_mcp_server::McpToolDispatcher::new(
+                    memory_repo.clone(),
+                    weather.clone(),
+                    scheduler.clone(),
+                    settings_repo.clone(),
+                    device_registry.clone(),
+                    skill_repo.clone(),
+                    recipe_repo.clone(),
+                    draft_repo.clone(),
+                    embedding_provider.clone(),
+                );
+                let disp: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+                    Arc::new(dispatcher);
+                let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = disp
+                    .available_tools()
+                    .await
+                    .into_iter()
+                    .map(|name| pond_core::ports::inference::ToolDefinition {
+                        name: name.clone(),
+                        description: format!("GIAP tool: {}", name),
+                        parameters_schema: serde_json::json!({}),
+                    })
+                    .collect();
+                let agent = pond_agent::PondAgent::new(
+                    Arc::new(eng),
+                    tool_defs,
+                    settings_repo.clone(),
+                    Some(prompt_template_repo.clone()),
+                    Some(prompt_extra_repo.clone()),
+                    Some(skill_repo.clone()),
+                    device_registry.clone(),
+                    session_storage.clone(),
+                    Some(disp),
+                );
+                tracing::info!("PondAgent ready — independent inference with KV-cache reuse");
+                Arc::new(agent) as Arc<dyn Agent>
+            } else {
+                Arc::new(MockAgent::new()) as Arc<dyn Agent>
+            }
+        };
+        #[cfg(not(feature = "pond-agent"))]
+        let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+
+        (agent, None, None, default_registry)
+    } else {
+        build_goose_backend(
+            agent_backend,
+            &llamafile_url,
+            &data_dir,
+            weather.clone(),
+            device_registry.clone(),
+            scheduler.clone(),
+            settings_repo.clone(),
+            memory_repo.clone(),
+            embedding_provider.clone(),
+            skill_repo.clone(),
+            recipe_repo.clone(),
+            prompt_template_repo.clone(),
+            prompt_extra_repo.clone(),
+            draft_repo.clone(),
+            Some(session_storage.clone()),
+            false, // voice_mode — server mode, not voice
+        )
+        .await
+    };
 
     #[cfg(not(feature = "goose-agent"))]
     let tool_caller: Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>> = None;
