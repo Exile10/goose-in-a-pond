@@ -1129,6 +1129,7 @@ impl ChatService {
             model_role: resolve_voice_role(&message),
             images: Vec::new(),
             voice_mode: false,
+            canvas_mode: false,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1249,6 +1250,7 @@ impl ChatService {
             model_role: "chat".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            canvas_mode: false,
         };
 
         // Start a soft ambient thinking tone while the LLM infers.

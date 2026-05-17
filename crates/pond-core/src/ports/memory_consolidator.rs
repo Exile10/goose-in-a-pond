@@ -102,12 +102,26 @@ pub struct ConsolidationRunResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConsolidationEvent {
-    Started { memory_count: usize },
-    ProposerDone { proposals: Vec<ConsolidationProposal> },
-    AdversaryDone { challenges: Vec<ChallengeVerdict> },
-    JudgeDone { decisions: Vec<JudgeDecision> },
-    Applied { exchange: TrialExchange },
-    Completed { result: ConsolidationRunResult },
-    Error { message: String },
+    Started {
+        memory_count: usize,
+    },
+    ProposerDone {
+        proposals: Vec<ConsolidationProposal>,
+    },
+    AdversaryDone {
+        challenges: Vec<ChallengeVerdict>,
+    },
+    JudgeDone {
+        decisions: Vec<JudgeDecision>,
+    },
+    Applied {
+        exchange: TrialExchange,
+    },
+    Completed {
+        result: ConsolidationRunResult,
+    },
+    Error {
+        message: String,
+    },
     Cancelled,
 }

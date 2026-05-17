@@ -184,7 +184,10 @@ mod tests {
         let mem = make_memory(0.5, 0.1, 30.0, 0, MemoryTier::Short);
         let score = effective_score(&mem, BASE, BETA);
         // Adaptive half-life = 11.25 * 1.5 = 16.9 days; at 30 days ~0.17
-        assert!(score < 0.25, "short-tier 30-day-old memory should decay significantly, got {score}");
+        assert!(
+            score < 0.25,
+            "short-tier 30-day-old memory should decay significantly, got {score}"
+        );
     }
 
     #[test]
