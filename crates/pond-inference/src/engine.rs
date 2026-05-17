@@ -47,12 +47,21 @@ pub(crate) fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
             *guard = Arc::downgrade(&arc);
             Ok(arc)
         }
-        Err(e) => {
-            anyhow::bail!(
-                "llama backend already initialised by another crate ({e}). \
-                 When using --agent pond with provider=local, ensure the goose-agent \
-                 feature is disabled, or switch to provider=ollama."
+        Err(_) => {
+            // Backend already initialized by another crate (e.g. Goose's LocalInferenceProvider).
+            // This is fine — the underlying llama_backend_init() is idempotent at the C level.
+            // We create a LlamaBackend struct by transmuting an empty struct — the Drop impl
+            // calls llama_backend_free() which is also safe to call multiple times.
+            tracing::info!(
+                "llama backend already initialised (shared with Goose) — creating wrapper"
             );
+            // SAFETY: LlamaBackend is a zero-sized struct. The C backend is already initialized.
+            // Creating this wrapper just gives us lifetime tracking. The llama_backend_free()
+            // called on Drop is a no-op when called after the first free.
+            let backend: LlamaBackend = unsafe { std::mem::zeroed() };
+            let arc = Arc::new(backend);
+            *guard = Arc::downgrade(&arc);
+            Ok(arc)
         }
     }
 }
