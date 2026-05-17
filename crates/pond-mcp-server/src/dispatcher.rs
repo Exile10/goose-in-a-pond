@@ -48,63 +48,64 @@ const PREFIX_FINANCE: &str = "giap-finance__";
 const PREFIX_DISCOVERY: &str = "giap-discovery__";
 const PREFIX_DRAFT: &str = "giap-draft__";
 
-/// All tool names registered by GIAP's builtin MCP servers.
-const ALL_TOOLS: &[&str] = &[
+/// All tool (name, description) pairs registered by GIAP's builtin MCP servers.
+/// Descriptions are pulled from the `#[tool(description = "...")]` attributes on each handler.
+const ALL_TOOLS: &[(&str, &str)] = &[
     // Weather
-    "giap-weather__get_current_weather",
-    "giap-weather__get_weather_forecast",
+    ("giap-weather__get_current_weather", "Get current weather conditions for any city. Pass a location name or omit for default."),
+    ("giap-weather__get_weather_forecast", "Get multi-day weather forecast. Pass location and number of days."),
     // Knowledge
-    "giap-knowledge__get_wikipedia_article",
-    "giap-knowledge__search_wikipedia",
-    "giap-knowledge__instant_answer",
-    "giap-knowledge__define_word",
-    "giap-knowledge__search_books",
+    ("giap-knowledge__get_wikipedia_article", "Look up factual, encyclopedic information about any topic. Use for people, places, events, science, history."),
+    ("giap-knowledge__search_wikipedia", "Search Wikipedia when the exact title is unknown. Returns matching articles."),
+    ("giap-knowledge__instant_answer", "Get a quick factual answer from DuckDuckGo instant answers."),
+    ("giap-knowledge__define_word", "Look up dictionary definitions, etymology, and usage of a word."),
+    ("giap-knowledge__search_books", "Search for books by title, author, or topic via Open Library."),
     // Memory
-    "giap-memory__save_memory",
-    "giap-memory__recall_memories",
-    "giap-memory__forget_memory",
+    ("giap-memory__save_memory", "Save information the user wants remembered (preferences, facts, notes, corrections)."),
+    ("giap-memory__recall_memories", "Search saved memories for previously stored information about the user."),
+    ("giap-memory__forget_memory", "Delete a specific saved memory by its ID."),
     // Schedule
-    "giap-schedule__create_schedule",
-    "giap-schedule__list_schedules",
-    "giap-schedule__update_schedule",
-    "giap-schedule__delete_schedule",
-    "giap-schedule__pause_schedule",
-    "giap-schedule__resume_schedule",
-    "giap-schedule__run_schedule_now",
-    "giap-schedule__get_schedule_runs",
-    "giap-schedule__world_clock",
+    ("giap-schedule__create_schedule", "Create a new scheduled task that runs a prompt at a recurring time."),
+    ("giap-schedule__list_schedules", "List all scheduled tasks with their cron, timezone, and status."),
+    ("giap-schedule__update_schedule", "Update an existing schedule's name, cron, prompt, or timezone."),
+    ("giap-schedule__delete_schedule", "Permanently delete a scheduled task by ID."),
+    ("giap-schedule__pause_schedule", "Pause a schedule so it stops firing until resumed."),
+    ("giap-schedule__resume_schedule", "Resume a previously paused schedule."),
+    ("giap-schedule__run_schedule_now", "Manually trigger a scheduled task to execute immediately."),
+    ("giap-schedule__get_schedule_runs", "Get the execution history for a scheduled task."),
+    ("giap-schedule__world_clock", "Get the current time in one or more timezones."),
     // System
-    "giap-system__get_current_time",
-    "giap-system__get_system_info",
-    "giap-system__send_notification",
-    "giap-system__run_shell_command",
-    "giap-system__read_file",
-    "giap-system__write_file",
+    ("giap-system__get_current_time", "Get the current date, time, and timezone."),
+    ("giap-system__get_system_info", "Get system information: OS, hostname, memory, disk usage."),
+    ("giap-system__send_notification", "Send a desktop notification popup to the user."),
+    ("giap-system__run_shell_command", "Execute a safe, sandboxed shell command (ls, cat, date, uptime, df, etc)."),
+    ("giap-system__read_file", "Read the contents of a local file."),
+    ("giap-system__write_file", "Write or append content to a local file."),
     // Device
-    "giap-device__list_registered_devices",
-    "giap-device__get_user_profile",
-    "giap-device__get_model_assignments",
-    "giap-device__list_skills",
-    "giap-device__get_recipe",
+    ("giap-device__list_registered_devices", "List all registered smart home devices and their online status."),
+    ("giap-device__get_user_profile", "Get the current user's profile preferences."),
+    ("giap-device__get_model_assignments", "Get which AI models are assigned to which roles."),
+    ("giap-device__list_skills", "List available agent skills and their descriptions."),
+    ("giap-device__get_recipe", "Get details of a named agent recipe/workflow."),
     // News
-    "giap-news__get_top_stories",
-    "giap-news__search_news",
-    "giap-news__get_headlines",
+    ("giap-news__get_top_stories", "Get today's top news stories from Hacker News or other sources."),
+    ("giap-news__search_news", "Search for news articles on a specific topic."),
+    ("giap-news__get_headlines", "Get current news headlines, optionally filtered by category."),
     // Finance
-    "giap-finance__get_exchange_rate",
-    "giap-finance__convert_currency",
-    "giap-finance__get_stock_quote",
-    "giap-finance__get_crypto_price",
+    ("giap-finance__get_exchange_rate", "Get the current exchange rate between two currencies."),
+    ("giap-finance__convert_currency", "Convert an amount from one currency to another."),
+    ("giap-finance__get_stock_quote", "Get the current stock price and market data for a ticker symbol."),
+    ("giap-finance__get_crypto_price", "Get the current price of a cryptocurrency (Bitcoin, Ethereum, etc)."),
     // Discovery
-    "giap-discovery__get_country_info",
-    "giap-discovery__lookup_product",
-    "giap-discovery__get_product_price",
-    "giap-discovery__search_web",
+    ("giap-discovery__get_country_info", "Get information about a country: capital, population, languages, currency."),
+    ("giap-discovery__lookup_product", "Look up a product by name or barcode via Open Food Facts."),
+    ("giap-discovery__get_product_price", "Get the price of a product from open price databases."),
+    ("giap-discovery__search_web", "Search the web via DuckDuckGo or SearXNG for general queries."),
     // Draft
-    "giap-draft__save_draft",
-    "giap-draft__list_drafts",
-    "giap-draft__approve_draft",
-    "giap-draft__reject_draft",
+    ("giap-draft__save_draft", "Save a draft response for user approval before executing."),
+    ("giap-draft__list_drafts", "List pending drafts awaiting user approval."),
+    ("giap-draft__approve_draft", "Approve a pending draft for execution."),
+    ("giap-draft__reject_draft", "Reject a pending draft."),
 ];
 
 // ── Dispatcher ───────────────────────────────────────────────────────────────
@@ -269,10 +270,20 @@ impl ToolDispatcher for McpToolDispatcher {
     }
 
     async fn available_tools(&self) -> Vec<String> {
-        let mut tools: Vec<String> = ALL_TOOLS.iter().map(|s| s.to_string()).collect();
-        // Remove schedule tools if scheduler is not configured
+        let mut tools: Vec<String> = ALL_TOOLS.iter().map(|(name, _)| name.to_string()).collect();
         if self.schedule.is_none() {
             tools.retain(|t| !t.starts_with(PREFIX_SCHEDULE));
+        }
+        tools
+    }
+
+    async fn available_tools_with_descriptions(&self) -> Vec<(String, String)> {
+        let mut tools: Vec<(String, String)> = ALL_TOOLS
+            .iter()
+            .map(|(name, desc)| (name.to_string(), desc.to_string()))
+            .collect();
+        if self.schedule.is_none() {
+            tools.retain(|(name, _)| !name.starts_with(PREFIX_SCHEDULE));
         }
         tools
     }
@@ -357,11 +368,16 @@ mod tests {
             PREFIX_DISCOVERY,
             PREFIX_DRAFT,
         ];
-        for tool in ALL_TOOLS {
+        for (tool, desc) in ALL_TOOLS {
             let has_valid_prefix = valid_prefixes.iter().any(|p| tool.starts_with(p));
             assert!(
                 has_valid_prefix,
                 "Tool '{}' doesn't start with a known prefix",
+                tool
+            );
+            assert!(
+                !desc.is_empty(),
+                "Tool '{}' has an empty description",
                 tool
             );
         }
