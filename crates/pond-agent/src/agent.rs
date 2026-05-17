@@ -62,12 +62,16 @@ pub struct PondAgent {
     skill_repo: Option<Arc<dyn UserSkillRepository>>,
     /// Device registry for prompt context.
     device_repo: Arc<dyn DeviceRegistry>,
-    /// Session message persistence.
+    /// Session message persistence (for cross-session history if needed).
     session_storage: Arc<dyn SessionStorage>,
     /// MCP tool dispatcher — routes tool calls to the correct MCP server.
     tool_dispatcher: Option<Arc<dyn ToolDispatcher>>,
     /// Tracks the current provider key for hot-swap detection.
     last_provider_key: Mutex<String>,
+    /// In-memory conversation history per session (current server lifetime only).
+    /// Each session_id maps to accumulated (user, assistant) message pairs.
+    /// Sent to the model as `<history>` XML in the user message.
+    session_history: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
 }
 
 impl PondAgent {
@@ -99,6 +103,7 @@ impl PondAgent {
             session_storage,
             tool_dispatcher,
             last_provider_key: Mutex::new(initial_key),
+            session_history: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -321,13 +326,35 @@ impl Agent for PondAgent {
         // 3. Build system prompt.
         let system_prompt = self.build_system_prompt(&settings, &request).await;
 
-        // 4. Load conversation history.
-        let history =
-            history::load_history(&*self.session_storage, &request.session_id, HISTORY_LIMIT).await;
+        // 4. Build user message with in-memory session history as XML.
+        // History is scoped to current server lifetime (not cross-session DB).
+        // Format: <history><user>...</user><assistant>...</assistant></history>
+        //         <user-message>current request</user-message>
+        let history_xml = {
+            let hist = self.session_history.lock().await;
+            if let Some(turns) = hist.get(request.session_id.as_str()) {
+                if turns.is_empty() {
+                    String::new()
+                } else {
+                    let mut xml = "<history>\n".to_string();
+                    for (user_msg, asst_msg) in turns.iter().rev().take(HISTORY_LIMIT / 2).rev() {
+                        xml.push_str(&format!("<user>{}</user>\n<assistant>{}</assistant>\n", user_msg, asst_msg));
+                    }
+                    xml.push_str("</history>\n");
+                    xml
+                }
+            } else {
+                String::new()
+            }
+        };
 
-        // 5. Build initial messages: history + new user message.
-        let mut messages = history;
-        messages.push(ChatMessage::user(request.message.clone()));
+        // 5. Build messages array with history embedded in the user message.
+        let user_content = if history_xml.is_empty() {
+            request.message.clone()
+        } else {
+            format!("{}<user-message>\n{}\n</user-message>", history_xml, request.message)
+        };
+        let mut messages = vec![ChatMessage::user(user_content)];
 
         // 6. Determine if tools should be offered.
         let provider = self.provider.read().await;
@@ -355,7 +382,7 @@ impl Agent for PondAgent {
         let user_message = request.message.clone();
         let model_role = request.model_role.clone();
         let dispatcher = self.tool_dispatcher.clone();
-        let session_storage = self.session_storage.clone();
+        let session_history = self.session_history.clone();
 
         // 8. Spawn the tool loop on a channel.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent>>(64);
@@ -513,25 +540,14 @@ impl Agent for PondAgent {
                 // Loop back for next LLM call with tool results.
             }
 
-            // ── Persist conversation history ────────────────────────────────
-            // Save the user message and final assistant response so subsequent
-            // turns on the same session_id have context.
-            use pond_core::domain::session::SessionMessage;
-            let user_msg = SessionMessage::new(
-                uuid::Uuid::new_v4().to_string(),
-                session_id.clone(),
-                ChatMessage::user(&user_message),
-            );
-            let _ = session_storage.add_message(session_id.clone(), user_msg).await;
-
-            // Find the last assistant message in the built-up history.
+            // ── Persist turn to in-memory session history ──────────────────
+            // Store (user_message, assistant_response) for XML injection on
+            // subsequent turns. Scoped to current server lifetime only.
             if let Some(last_assistant) = messages.iter().rev().find(|m| m.role == pond_core::domain::message::Role::Assistant) {
-                let asst_msg = SessionMessage::new(
-                    uuid::Uuid::new_v4().to_string(),
-                    session_id.clone(),
-                    ChatMessage::assistant(&last_assistant.content),
-                );
-                let _ = session_storage.add_message(session_id.clone(), asst_msg).await;
+                let mut hist = session_history.lock().await;
+                hist.entry(session_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push((user_message.clone(), last_assistant.content.clone()));
             }
 
             // Emit done event.
