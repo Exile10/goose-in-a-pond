@@ -115,6 +115,7 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.custom_system_prompt.as_deref().unwrap_or("")
         );
         upsert!("prompt_addendum", &settings.prompt_addendum);
+        upsert!("agent_backend", &settings.agent_backend);
         upsert!("agent_goose_mode", &settings.agent_goose_mode);
         upsert!("agent_max_turns", settings.agent_max_turns.to_string());
         upsert!(
@@ -437,6 +438,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             };
         }
         "prompt_addendum" => s.prompt_addendum = value.to_string(),
+        "agent_backend" => s.agent_backend = value.to_string(),
         "agent_goose_mode" => s.agent_goose_mode = value.to_string(),
         "agent_max_turns" => {
             if let Ok(v) = value.parse() {
