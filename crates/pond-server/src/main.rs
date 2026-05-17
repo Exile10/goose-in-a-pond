@@ -1593,13 +1593,13 @@ async fn run_server(
                 let disp: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
                     Arc::new(dispatcher);
                 let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = disp
-                    .available_tools_with_descriptions()
+                    .available_tool_definitions()
                     .await
                     .into_iter()
-                    .map(|(name, desc)| pond_core::ports::inference::ToolDefinition {
+                    .map(|(name, desc, schema)| pond_core::ports::inference::ToolDefinition {
                         name,
                         description: desc,
-                        parameters_schema: serde_json::json!({}),
+                        parameters_schema: schema,
                     })
                     .collect();
                 let agent = pond_agent::PondAgent::new(

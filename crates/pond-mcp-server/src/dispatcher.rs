@@ -48,87 +48,74 @@ const PREFIX_FINANCE: &str = "giap-finance__";
 const PREFIX_DISCOVERY: &str = "giap-discovery__";
 const PREFIX_DRAFT: &str = "giap-draft__";
 
-/// All tool (name, description) pairs registered by GIAP's builtin MCP servers.
-/// Descriptions are pulled from the `#[tool(description = "...")]` attributes on each handler.
-const ALL_TOOLS: &[(&str, &str)] = &[
-    // Weather
-    ("giap-weather__get_current_weather", "Get current weather conditions for any city. Pass a location name (e.g. 'London', 'Kisumu') or omit to use the pond's configured home location."),
-    ("giap-weather__get_weather_forecast", "Get multi-day weather forecast. Pass location and number of days. Omit location to use the pond's configured home location."),
-    // Knowledge
-    ("giap-knowledge__get_wikipedia_article", "Look up factual, encyclopedic information about any topic. Use for people, places, events, science, history."),
-    ("giap-knowledge__search_wikipedia", "Search Wikipedia when the exact title is unknown. Returns matching articles."),
-    ("giap-knowledge__instant_answer", "Get a quick factual answer from DuckDuckGo instant answers."),
-    ("giap-knowledge__define_word", "Look up dictionary definitions, etymology, and usage of a word."),
-    ("giap-knowledge__search_books", "Search for books by title, author, or topic via Open Library."),
-    // Memory
-    ("giap-memory__save_memory", "Save information the user wants remembered (preferences, facts, notes, corrections)."),
-    ("giap-memory__recall_memories", "Search saved memories for previously stored information about the user."),
-    ("giap-memory__forget_memory", "Delete a specific saved memory by its ID."),
-    // Schedule
-    ("giap-schedule__create_schedule", "Create a new scheduled task that runs a prompt at a recurring time."),
-    ("giap-schedule__list_schedules", "List all scheduled tasks with their cron, timezone, and status."),
-    ("giap-schedule__update_schedule", "Update an existing schedule's name, cron, prompt, or timezone."),
-    ("giap-schedule__delete_schedule", "Permanently delete a scheduled task by ID."),
-    ("giap-schedule__pause_schedule", "Pause a schedule so it stops firing until resumed."),
-    ("giap-schedule__resume_schedule", "Resume a previously paused schedule."),
-    ("giap-schedule__run_schedule_now", "Manually trigger a scheduled task to execute immediately."),
-    ("giap-schedule__get_schedule_runs", "Get the execution history for a scheduled task."),
-    ("giap-schedule__world_clock", "Get the current time in one or more timezones."),
-    // System
-    ("giap-system__get_current_time", "Get the current date, time, and timezone."),
-    ("giap-system__get_system_info", "Get system information: OS, hostname, memory, disk usage."),
-    ("giap-system__send_notification", "Send a desktop notification popup to the user."),
-    ("giap-system__run_shell_command", "Execute a safe, sandboxed shell command (ls, cat, date, uptime, df, etc)."),
-    ("giap-system__read_file", "Read the contents of a local file."),
-    ("giap-system__write_file", "Write or append content to a local file."),
-    // Device
-    ("giap-device__list_registered_devices", "List all registered smart home devices and their online status."),
-    ("giap-device__get_user_profile", "Get the current user's profile preferences."),
-    ("giap-device__get_model_assignments", "Get which AI models are assigned to which roles."),
-    ("giap-device__list_skills", "List available agent skills and their descriptions."),
-    ("giap-device__get_recipe", "Get details of a named agent recipe/workflow."),
-    // News
-    ("giap-news__get_top_stories", "Get today's top news stories from Hacker News or other sources."),
-    ("giap-news__search_news", "Search for news articles on a specific topic."),
-    ("giap-news__get_headlines", "Get current news headlines, optionally filtered by category."),
-    // Finance
-    ("giap-finance__get_exchange_rate", "Get the current exchange rate between two currencies."),
-    ("giap-finance__convert_currency", "Convert an amount from one currency to another."),
-    ("giap-finance__get_stock_quote", "Get the current stock price and market data for a ticker symbol."),
-    ("giap-finance__get_crypto_price", "Get the current price of a cryptocurrency (Bitcoin, Ethereum, etc)."),
-    // Discovery
-    ("giap-discovery__get_country_info", "Get information about a country: capital, population, languages, currency."),
-    ("giap-discovery__lookup_product", "Look up a product by name or barcode via Open Food Facts."),
-    ("giap-discovery__get_product_price", "Get the price of a product from open price databases."),
-    ("giap-discovery__search_web", "Search the web via DuckDuckGo or SearXNG for general queries."),
-    // Draft
-    ("giap-draft__save_draft", "Save a draft response for user approval before executing."),
-    ("giap-draft__list_drafts", "List pending drafts awaiting user approval."),
-    ("giap-draft__approve_draft", "Approve a pending draft for execution."),
-    ("giap-draft__reject_draft", "Reject a pending draft."),
-];
+// No hardcoded tool list — all tools discovered dynamically via ServerHandler::list_tools().
 
 // ── Dispatcher ───────────────────────────────────────────────────────────────
 
+/// A registered MCP server with its tool-name prefix.
+struct RegisteredServer {
+    prefix: &'static str,
+    server: Box<dyn McpServerBridge>,
+}
+
+/// Object-safe bridge for calling MCP server methods we need.
+/// Wraps rmcp's `ServerHandler` (which isn't object-safe due to `impl Future`).
+#[async_trait]
+trait McpServerBridge: Send + Sync {
+    async fn list_tools_bridged(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Vec<(String, String, serde_json::Value)>;
+
+    async fn call_tool_bridged(
+        &self,
+        params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<RmcpCallToolResult>;
+}
+
+/// Blanket impl for any rmcp ServerHandler.
+#[async_trait]
+impl<T: ServerHandler + Send + Sync> McpServerBridge for T {
+    async fn list_tools_bridged(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        match ServerHandler::list_tools(self, None, ctx).await {
+            Ok(result) => result
+                .tools
+                .into_iter()
+                .map(|t| {
+                    let name = t.name.to_string();
+                    let desc = t.description.map(|d| d.to_string()).unwrap_or_default();
+                    let schema = serde_json::Value::Object(
+                        t.input_schema.as_ref().clone()
+                    );
+                    (name, desc, schema)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn call_tool_bridged(
+        &self,
+        params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<RmcpCallToolResult> {
+        ServerHandler::call_tool(self, params, ctx)
+            .await
+            .map_err(|e| anyhow!("MCP call_tool failed: {}", e))
+    }
+}
+
 /// Concrete dispatcher that routes tool calls to GIAP's builtin MCP servers.
 ///
-/// Holds instances of all MCP servers and dispatches by parsing the tool name
-/// prefix. Each server is constructed once and reused for all calls.
-///
-/// A background "peer service" is kept alive to provide a valid `Peer<RoleServer>`
-/// for constructing `RequestContext` values. This is a no-op service — no real
-/// MCP transport is active.
+/// Servers are registered dynamically — adding a new MCP server only requires
+/// pushing it into the `servers` vec with its prefix. Tool schemas are queried
+/// from each server at runtime via `list_tools()`, not hardcoded.
 pub struct McpToolDispatcher {
-    weather: WeatherMcpServer,
-    knowledge: KnowledgeMcpServer,
-    memory: MemoryMcpServer,
-    schedule: Option<ScheduleMcpServer>,
-    system: SystemMcpServer,
-    device: DeviceMcpServer,
-    news: NewsMcpServer,
-    finance: FinanceMcpServer,
-    discovery: DiscoveryMcpServer,
-    draft: DraftMcpServer,
+    servers: Vec<RegisteredServer>,
     /// Cloned peer from a minimal running service — used to construct RequestContext.
     peer: Peer<RoleServer>,
     /// Keeps the background peer-provider service alive. Dropped on dispatcher drop.
@@ -178,17 +165,25 @@ impl McpToolDispatcher {
         let running = rmcp::service::serve_directly(SystemMcpServer::new(), server_stream, None);
         let peer = running.peer().clone();
 
+        // Register all servers dynamically. Adding a new MCP server only
+        // requires pushing it here — schemas come from list_tools() automatically.
+        let mut servers: Vec<RegisteredServer> = vec![
+            RegisteredServer { prefix: PREFIX_WEATHER, server: Box::new(weather_server) },
+            RegisteredServer { prefix: PREFIX_KNOWLEDGE, server: Box::new(knowledge_server) },
+            RegisteredServer { prefix: PREFIX_MEMORY, server: Box::new(memory_server) },
+            RegisteredServer { prefix: PREFIX_SYSTEM, server: Box::new(system_server) },
+            RegisteredServer { prefix: PREFIX_DEVICE, server: Box::new(device_server) },
+            RegisteredServer { prefix: PREFIX_NEWS, server: Box::new(news_server) },
+            RegisteredServer { prefix: PREFIX_FINANCE, server: Box::new(finance_server) },
+            RegisteredServer { prefix: PREFIX_DISCOVERY, server: Box::new(discovery_server) },
+            RegisteredServer { prefix: PREFIX_DRAFT, server: Box::new(draft_server) },
+        ];
+        if let Some(sched) = schedule_server {
+            servers.push(RegisteredServer { prefix: PREFIX_SCHEDULE, server: Box::new(sched) });
+        }
+
         Self {
-            weather: weather_server,
-            knowledge: knowledge_server,
-            memory: memory_server,
-            schedule: schedule_server,
-            system: system_server,
-            device: device_server,
-            news: news_server,
-            finance: finance_server,
-            discovery: discovery_server,
-            draft: draft_server,
+            servers,
             peer,
             _peer_service: running,
         }
@@ -210,10 +205,16 @@ impl ToolDispatcher for McpToolDispatcher {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolCallResult> {
-        // Strip the server prefix to get the bare tool name for rmcp dispatch
         let (server_prefix, bare_name) = parse_tool_name(tool_name)?;
 
-        // Convert arguments to the format rmcp expects
+        // Find the server that owns this prefix.
+        let server = self
+            .servers
+            .iter()
+            .find(|s| s.prefix == server_prefix)
+            .ok_or_else(|| anyhow!("No server registered for prefix '{}'", server_prefix))?;
+
+        // Convert arguments to rmcp format.
         let args_map = match arguments {
             serde_json::Value::Object(map) => Some(map),
             serde_json::Value::Null => None,
@@ -223,69 +224,322 @@ impl ToolDispatcher for McpToolDispatcher {
             )])),
         };
 
-        // Build rmcp CallToolRequestParams — must own the tool name
-        let bare_name_owned = bare_name.to_string();
         let params = if let Some(args) = args_map {
-            CallToolRequestParams::new(bare_name_owned).with_arguments(args)
+            CallToolRequestParams::new(bare_name.to_string()).with_arguments(args)
         } else {
-            CallToolRequestParams::new(bare_name_owned)
+            CallToolRequestParams::new(bare_name.to_string())
         };
 
         let ctx = self.make_context();
-
-        // Route to the correct server and call via ServerHandler::call_tool
-        let result = match server_prefix {
-            PREFIX_WEATHER => self.weather.call_tool(params, ctx).await,
-            PREFIX_KNOWLEDGE => self.knowledge.call_tool(params, ctx).await,
-            PREFIX_MEMORY => self.memory.call_tool(params, ctx).await,
-            PREFIX_SCHEDULE => {
-                if let Some(ref sched) = self.schedule {
-                    sched.call_tool(params, ctx).await
-                } else {
-                    return Ok(ToolCallResult {
-                        content: "Schedule service is not configured.".to_string(),
-                        success: false,
-                    });
-                }
-            }
-            PREFIX_SYSTEM => self.system.call_tool(params, ctx).await,
-            PREFIX_DEVICE => self.device.call_tool(params, ctx).await,
-            PREFIX_NEWS => self.news.call_tool(params, ctx).await,
-            PREFIX_FINANCE => self.finance.call_tool(params, ctx).await,
-            PREFIX_DISCOVERY => self.discovery.call_tool(params, ctx).await,
-            PREFIX_DRAFT => self.draft.call_tool(params, ctx).await,
-            _ => {
-                return Err(anyhow!("Unknown tool server prefix: {}", server_prefix));
-            }
-        };
-
-        // Convert rmcp result to our domain type
-        match result {
+        match server.server.call_tool_bridged(params, ctx).await {
             Ok(rmcp_result) => Ok(convert_rmcp_result(rmcp_result)),
-            Err(error_data) => Ok(ToolCallResult {
-                content: error_data.message.to_string(),
+            Err(e) => Ok(ToolCallResult {
+                content: e.to_string(),
                 success: false,
             }),
         }
     }
 
     async fn available_tools(&self) -> Vec<String> {
-        let mut tools: Vec<String> = ALL_TOOLS.iter().map(|(name, _)| name.to_string()).collect();
-        if self.schedule.is_none() {
-            tools.retain(|t| !t.starts_with(PREFIX_SCHEDULE));
+        // Dynamically query all registered servers.
+        let mut tools = Vec::new();
+        for reg in &self.servers {
+            let ctx = self.make_context();
+            let defs = reg.server.list_tools_bridged(ctx).await;
+            for (name, _, _) in defs {
+                tools.push(format!("{}{}", reg.prefix, name));
+            }
         }
         tools
     }
 
-    async fn available_tools_with_descriptions(&self) -> Vec<(String, String)> {
-        let mut tools: Vec<(String, String)> = ALL_TOOLS
-            .iter()
-            .map(|(name, desc)| (name.to_string(), desc.to_string()))
-            .collect();
-        if self.schedule.is_none() {
-            tools.retain(|(name, _)| !name.starts_with(PREFIX_SCHEDULE));
+    async fn available_tool_definitions(&self) -> Vec<(String, String, serde_json::Value)> {
+        // Query each registered server for its tool schemas dynamically.
+        // Adding a new MCP server only requires pushing it in the constructor —
+        // schemas come from list_tools() automatically, no hardcoding needed.
+        let mut all_defs = Vec::new();
+        for reg in &self.servers {
+            let ctx = self.make_context();
+            let defs = reg.server.list_tools_bridged(ctx).await;
+            for (bare_name, desc, schema) in defs {
+                let full_name = format!("{}{}", reg.prefix, bare_name);
+                all_defs.push((full_name, desc, schema));
+            }
         }
-        tools
+        all_defs
+    }
+}
+
+// Removed: tool_param_schema() — schemas now come dynamically from ServerHandler::list_tools().
+// This dead code is kept temporarily for reference during the transition.
+#[allow(dead_code)]
+fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
+    use serde_json::json;
+    match tool_name {
+        // Weather
+        "giap-weather__get_current_weather" => json!({
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "City name (e.g. 'Nairobi', 'London'). Omit for home location." }
+            }
+        }),
+        "giap-weather__get_weather_forecast" => json!({
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "City name. Omit for home location." },
+                "days": { "type": "integer", "description": "Number of days (1-7, default 3)." }
+            }
+        }),
+        // Knowledge
+        "giap-knowledge__get_wikipedia_article" => json!({
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string", "description": "The person, place, event, or concept to look up." }
+            },
+            "required": ["topic"]
+        }),
+        "giap-knowledge__search_wikipedia" => json!({
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string", "description": "Search query for Wikipedia." }
+            },
+            "required": ["topic"]
+        }),
+        "giap-knowledge__instant_answer" => json!({
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string", "description": "The question or topic to get a quick answer for." }
+            },
+            "required": ["topic"]
+        }),
+        "giap-knowledge__define_word" => json!({
+            "type": "object",
+            "properties": {
+                "word": { "type": "string", "description": "The word to define." }
+            },
+            "required": ["word"]
+        }),
+        "giap-knowledge__search_books" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Book title, author, or topic to search for." }
+            },
+            "required": ["query"]
+        }),
+        // Memory
+        "giap-memory__save_memory" => json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "description": "The fact, preference, or note to save." },
+                "segment": { "type": "string", "description": "Category: identity, preference, correction, relationship, project, knowledge, context." }
+            },
+            "required": ["content"]
+        }),
+        "giap-memory__recall_memories" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "What to search for in saved memories." }
+            },
+            "required": ["query"]
+        }),
+        "giap-memory__forget_memory" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The memory ID to delete." }
+            },
+            "required": ["id"]
+        }),
+        // Schedule
+        "giap-schedule__create_schedule" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Human-readable name for the task." },
+                "cron": { "type": "string", "description": "6-field cron: sec min hr dom mon dow. E.g. '0 0 8 * * *' for daily 8 AM." },
+                "prompt": { "type": "string", "description": "The prompt to run on each fire." },
+                "timezone": { "type": "string", "description": "IANA timezone (e.g. 'Africa/Nairobi')." }
+            },
+            "required": ["name", "cron", "prompt"]
+        }),
+        "giap-schedule__list_schedules" => json!({ "type": "object", "properties": {} }),
+        "giap-schedule__update_schedule" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Schedule ID to update." },
+                "name": { "type": "string" },
+                "cron": { "type": "string" },
+                "prompt": { "type": "string" },
+                "timezone": { "type": "string" }
+            },
+            "required": ["id"]
+        }),
+        "giap-schedule__delete_schedule" | "giap-schedule__pause_schedule"
+        | "giap-schedule__resume_schedule" | "giap-schedule__run_schedule_now" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Schedule ID." }
+            },
+            "required": ["id"]
+        }),
+        "giap-schedule__get_schedule_runs" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Schedule ID." },
+                "limit": { "type": "integer", "description": "Max runs to return (default 10)." }
+            },
+            "required": ["id"]
+        }),
+        "giap-schedule__world_clock" => json!({
+            "type": "object",
+            "properties": {
+                "timezones": { "type": "array", "items": { "type": "string" }, "description": "IANA timezone names. Omit for user's timezone." }
+            }
+        }),
+        // System
+        "giap-system__get_current_time" => json!({ "type": "object", "properties": {} }),
+        "giap-system__get_system_info" => json!({ "type": "object", "properties": {} }),
+        "giap-system__send_notification" => json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Notification title." },
+                "body": { "type": "string", "description": "Notification body text." }
+            },
+            "required": ["title", "body"]
+        }),
+        "giap-system__run_shell_command" => json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "The shell command to execute (must be in the allow-list)." }
+            },
+            "required": ["command"]
+        }),
+        "giap-system__read_file" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to the file to read." }
+            },
+            "required": ["path"]
+        }),
+        "giap-system__write_file" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to the file." },
+                "content": { "type": "string", "description": "Content to write." },
+                "append": { "type": "boolean", "description": "If true, append instead of overwrite." }
+            },
+            "required": ["path", "content"]
+        }),
+        // Device
+        "giap-device__list_registered_devices" | "giap-device__get_user_profile"
+        | "giap-device__get_model_assignments" | "giap-device__list_skills" => {
+            json!({ "type": "object", "properties": {} })
+        }
+        "giap-device__get_recipe" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Recipe name to look up." }
+            },
+            "required": ["name"]
+        }),
+        // News
+        "giap-news__get_top_stories" => json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "Number of stories (default 5)." }
+            }
+        }),
+        "giap-news__search_news" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Topic to search for in news." }
+            },
+            "required": ["query"]
+        }),
+        "giap-news__get_headlines" => json!({
+            "type": "object",
+            "properties": {
+                "category": { "type": "string", "description": "News category (e.g. 'technology', 'sports', 'business')." }
+            }
+        }),
+        // Finance
+        "giap-finance__get_exchange_rate" => json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Source currency code (e.g. 'USD')." },
+                "to": { "type": "string", "description": "Target currency code (e.g. 'KES')." }
+            },
+            "required": ["from", "to"]
+        }),
+        "giap-finance__convert_currency" => json!({
+            "type": "object",
+            "properties": {
+                "amount": { "type": "number", "description": "Amount to convert." },
+                "from": { "type": "string", "description": "Source currency code." },
+                "to": { "type": "string", "description": "Target currency code." }
+            },
+            "required": ["amount", "from", "to"]
+        }),
+        "giap-finance__get_stock_quote" => json!({
+            "type": "object",
+            "properties": {
+                "symbol": { "type": "string", "description": "Stock ticker symbol (e.g. 'AAPL', 'MSFT')." }
+            },
+            "required": ["symbol"]
+        }),
+        "giap-finance__get_crypto_price" => json!({
+            "type": "object",
+            "properties": {
+                "coin": { "type": "string", "description": "Cryptocurrency name or ID (e.g. 'bitcoin', 'ethereum')." }
+            },
+            "required": ["coin"]
+        }),
+        // Discovery
+        "giap-discovery__get_country_info" => json!({
+            "type": "object",
+            "properties": {
+                "country": { "type": "string", "description": "Country name (e.g. 'Kenya', 'Japan')." }
+            },
+            "required": ["country"]
+        }),
+        "giap-discovery__lookup_product" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Product name or barcode." }
+            },
+            "required": ["query"]
+        }),
+        "giap-discovery__get_product_price" => json!({
+            "type": "object",
+            "properties": {
+                "product": { "type": "string", "description": "Product name to get price for." }
+            },
+            "required": ["product"]
+        }),
+        "giap-discovery__search_web" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query." }
+            },
+            "required": ["query"]
+        }),
+        // Draft
+        "giap-draft__save_draft" => json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "description": "Draft content to save for approval." },
+                "title": { "type": "string", "description": "Draft title." }
+            },
+            "required": ["content"]
+        }),
+        "giap-draft__list_drafts" => json!({ "type": "object", "properties": {} }),
+        "giap-draft__approve_draft" | "giap-draft__reject_draft" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Draft ID." }
+            },
+            "required": ["id"]
+        }),
+        // Fallback
+        _ => json!({ "type": "object", "properties": {} }),
     }
 }
 

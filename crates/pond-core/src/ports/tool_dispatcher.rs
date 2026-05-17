@@ -36,14 +36,14 @@ pub trait ToolDispatcher: Send + Sync {
     /// List all available tool names (for validation / filtering).
     async fn available_tools(&self) -> Vec<String>;
 
-    /// List all available tools with their descriptions.
-    /// Returns `(name, description)` pairs from the MCP server schemas.
-    async fn available_tools_with_descriptions(&self) -> Vec<(String, String)> {
-        // Default: return names with empty descriptions (backwards-compatible).
+    /// List all available tools with descriptions and parameter schemas.
+    /// Returns `(name, description, parameters_json_schema)` from the MCP server schemas.
+    async fn available_tool_definitions(&self) -> Vec<(String, String, serde_json::Value)> {
+        // Default: return names with empty descriptions and empty schemas.
         self.available_tools()
             .await
             .into_iter()
-            .map(|name| (name, String::new()))
+            .map(|name| (name, String::new(), serde_json::json!({})))
             .collect()
     }
 }
