@@ -69,6 +69,7 @@ export interface Settings {
   context_window_override?: number;
 
   // Agent behaviour
+  agent_backend?: string;
   agent_goose_mode?: string;
   agent_max_turns?: number;
   agent_timeout_secs?: number;
