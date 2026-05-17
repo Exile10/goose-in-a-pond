@@ -352,8 +352,10 @@ impl Agent for PondAgent {
         // 7. Clone what we need for the spawned task.
         let provider = Arc::clone(&*provider);
         let session_id = request.session_id.clone();
+        let user_message = request.message.clone();
         let model_role = request.model_role.clone();
         let dispatcher = self.tool_dispatcher.clone();
+        let session_storage = self.session_storage.clone();
 
         // 8. Spawn the tool loop on a channel.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent>>(64);
@@ -509,6 +511,27 @@ impl Agent for PondAgent {
                 ));
 
                 // Loop back for next LLM call with tool results.
+            }
+
+            // ── Persist conversation history ────────────────────────────────
+            // Save the user message and final assistant response so subsequent
+            // turns on the same session_id have context.
+            use pond_core::domain::session::SessionMessage;
+            let user_msg = SessionMessage::new(
+                uuid::Uuid::new_v4().to_string(),
+                session_id.clone(),
+                ChatMessage::user(&user_message),
+            );
+            let _ = session_storage.add_message(session_id.clone(), user_msg).await;
+
+            // Find the last assistant message in the built-up history.
+            if let Some(last_assistant) = messages.iter().rev().find(|m| m.role == pond_core::domain::message::Role::Assistant) {
+                let asst_msg = SessionMessage::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    session_id.clone(),
+                    ChatMessage::assistant(&last_assistant.content),
+                );
+                let _ = session_storage.add_message(session_id.clone(), asst_msg).await;
             }
 
             // Emit done event.
