@@ -87,7 +87,11 @@ impl ToolCaller for ToolCallerEngine {
         println!("[tool_caller] ┌─────────────────────────────────────");
         println!("[tool_caller] │ tool:   {}", tool_name);
         println!("[tool_caller] │ query:  {:?}", user_query);
-        println!("[tool_caller] │ system: {}...({} chars)", &system[..system.len().min(120)], system.len());
+        println!(
+            "[tool_caller] │ system: {}...({} chars)",
+            &system[..system.len().min(120)],
+            system.len()
+        );
         println!("[tool_caller] └─────────────────────────────────────");
 
         // Pass NO tools to the provider — we've baked the declaration into the
@@ -220,7 +224,9 @@ fn parse_functiongemma_call(text: &str) -> Option<serde_json::Map<String, serde_
     let after_tag = &text[call_start + "<start_function_call>call:".len()..];
     let brace_pos = after_tag.find('{')?;
     let args_start = brace_pos + 1;
-    let end_tag_pos = after_tag.find("<end_function_call>").unwrap_or(after_tag.len());
+    let end_tag_pos = after_tag
+        .find("<end_function_call>")
+        .unwrap_or(after_tag.len());
     let args_end = after_tag[..end_tag_pos].rfind('}')?;
     let args_block = &after_tag[args_start..args_end];
 
@@ -277,7 +283,11 @@ fn parse_functiongemma_call(text: &str) -> Option<serde_json::Map<String, serde_
         }
     }
 
-    if map.is_empty() { None } else { Some(map) }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
 }
 
 /// Parse the specialist model's output into a tool-call arguments map.
@@ -465,7 +475,9 @@ mod tests {
         let decl = build_functiongemma_declaration("get_wikipedia_article", schema);
         assert!(decl.starts_with("<start_function_declaration>declaration:get_wikipedia_article{"));
         assert!(decl.ends_with("<end_function_declaration>"));
-        assert!(decl.contains("topic:{description:<escape>The topic to look up<escape>,type:<escape>STRING<escape>}"));
+        assert!(decl.contains(
+            "topic:{description:<escape>The topic to look up<escape>,type:<escape>STRING<escape>}"
+        ));
         assert!(decl.contains("required:[<escape>topic<escape>]"));
     }
 
@@ -473,8 +485,12 @@ mod tests {
     fn build_declaration_schedule() {
         let schema = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron"},"prompt":{"type":"string","description":"Action to perform"}},"required":["cron","prompt"]}"#;
         let decl = build_functiongemma_declaration("create_schedule", schema);
-        assert!(decl.contains("cron:{description:<escape>6-field cron<escape>,type:<escape>STRING<escape>}"));
-        assert!(decl.contains("prompt:{description:<escape>Action to perform<escape>,type:<escape>STRING<escape>}"));
+        assert!(decl.contains(
+            "cron:{description:<escape>6-field cron<escape>,type:<escape>STRING<escape>}"
+        ));
+        assert!(decl.contains(
+            "prompt:{description:<escape>Action to perform<escape>,type:<escape>STRING<escape>}"
+        ));
         assert!(decl.contains("required:[<escape>cron<escape>,<escape>prompt<escape>]"));
     }
 }

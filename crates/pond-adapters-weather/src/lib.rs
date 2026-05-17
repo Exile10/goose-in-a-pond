@@ -84,7 +84,11 @@ pub struct ForecastData {
 impl ForecastData {
     /// Compact context block for the LLM.
     pub fn as_context_block(&self) -> String {
-        let mut out = format!("[{}-Day Forecast — {}]\n", self.days.len(), self.location_name);
+        let mut out = format!(
+            "[{}-Day Forecast — {}]\n",
+            self.days.len(),
+            self.location_name
+        );
         for d in &self.days {
             out.push_str(&format!(
                 "{}: {} | {:.0}\u{00B0}C/{:.0}\u{00B0}C | Rain: {:.1}mm ({}%) | \

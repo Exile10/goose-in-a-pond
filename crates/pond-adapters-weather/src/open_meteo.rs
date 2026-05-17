@@ -212,7 +212,13 @@ impl OpenMeteoWeatherAdapter {
         })
     }
 
-    async fn fetch_forecast(&self, lat: f64, lon: f64, name: &str, days: u8) -> Result<ForecastData> {
+    async fn fetch_forecast(
+        &self,
+        lat: f64,
+        lon: f64,
+        name: &str,
+        days: u8,
+    ) -> Result<ForecastData> {
         let days = days.clamp(1, 16);
         let url = format!(
             "{}/v1/forecast\
@@ -329,7 +335,10 @@ impl WeatherProvider for OpenMeteoWeatherAdapter {
     async fn current(&self) -> Result<WeatherData> {
         let key = Self::cache_key(None);
         if let Some(data) = self.get_cached_current(&key) {
-            tracing::debug!("weather: serving current from cache ({})", self.location_name);
+            tracing::debug!(
+                "weather: serving current from cache ({})",
+                self.location_name
+            );
             return Ok(data);
         }
 
@@ -358,7 +367,10 @@ impl WeatherProvider for OpenMeteoWeatherAdapter {
     async fn forecast(&self, days: u8) -> Result<ForecastData> {
         let key = format!("{}__{}d", Self::cache_key(None), days);
         if let Some(data) = self.get_cached_forecast(&key) {
-            tracing::debug!("weather: serving forecast from cache ({})", self.location_name);
+            tracing::debug!(
+                "weather: serving forecast from cache ({})",
+                self.location_name
+            );
             return Ok(data);
         }
 

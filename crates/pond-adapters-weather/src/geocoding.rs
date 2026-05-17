@@ -87,7 +87,13 @@ impl Geocoder {
 
         let result = geo
             .results
-            .and_then(|mut r| if r.is_empty() { None } else { Some(r.remove(0)) })
+            .and_then(|mut r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.remove(0))
+                }
+            })
             .context(format!("no location found for '{query}'"))?;
 
         // Build a readable display name: "Kisumu, Kenya" or "Kisumu, Kisumu County, Kenya"
