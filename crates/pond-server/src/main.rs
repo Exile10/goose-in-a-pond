@@ -1564,6 +1564,7 @@ async fn run_server(
         prompt_template_repo.clone(),
         prompt_extra_repo.clone(),
         draft_repo.clone(),
+        Some(session_storage.clone()),
         false, // voice_mode — server mode, not voice
     )
     .await;
@@ -1776,6 +1777,10 @@ async fn run_server(
             pond_core::services::telemetry::InMemoryTelemetry::new(),
         )),
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: pond_mcp_server::all_app_resources()
+            .into_iter()
+            .map(|(uri, html)| (uri.to_string(), html))
+            .collect(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port,
     });
@@ -2231,6 +2236,7 @@ async fn run_chat(
             template_repo,
             extras_repo,
             draft_repo,
+            None, // session_storage — not needed for goose backend
             input == "whisper", // voice_mode
         )
         .await;
@@ -2794,6 +2800,12 @@ async fn run_consolidation_pipeline(
 
     match result {
         Ok(ref result) => {
+            // Build lookup for source memory metadata (corrects, segment)
+            let memory_map: std::collections::HashMap<
+                &str,
+                &pond_core::domain::memory::MemoryFragment,
+            > = memories.iter().map(|m| (m.id.as_str(), m)).collect();
+
             for exchange in &result.exchanges {
                 if !exchange.judgment.accepted {
                     continue;
@@ -2805,37 +2817,122 @@ async fn run_consolidation_pipeline(
                         segment,
                         importance,
                     } => {
+                        // Guard: if any source is a correction, preserve its metadata
+                        let any_correction = source_ids
+                            .iter()
+                            .filter_map(|id| memory_map.get(id.as_str()))
+                            .any(|m| m.is_correction());
+
+                        let effective_segment = if any_correction {
+                            pond_core::domain::memory::MemorySegment::Correction
+                        } else {
+                            segment.clone()
+                        };
+
+                        let corrects = source_ids
+                            .iter()
+                            .filter_map(|id| memory_map.get(id.as_str()))
+                            .filter_map(|m| m.corrects.clone())
+                            .next();
+
+                        if any_correction {
+                            tracing::info!(
+                                "[consolidation] merge includes correction source — forcing segment=Correction"
+                            );
+                        }
+
                         let new_frag = pond_core::domain::memory::MemoryFragment::from_extraction(
                             uuid::Uuid::new_v4().to_string(),
                             None,
                             merged_content.clone(),
-                            segment.clone(),
+                            effective_segment,
                             *importance,
-                            None,
+                            corrects,
                         );
                         let new_id = new_frag.id.clone();
                         let _ = repo.add(new_frag).await;
                         for src_id in source_ids {
                             let _ = repo.mark_superseded(src_id, &new_id).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    src_id,
+                                    None,
+                                    Some(&new_id),
+                                )
+                                .await;
                         }
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                &new_id,
+                                None,
+                                None,
+                            )
+                            .await;
                     }
                     ConsolidationAction::Prune { id } => {
+                        // Guard: never prune correction memories
+                        if let Some(mem) = memory_map.get(id.as_str()) {
+                            if mem.is_correction() {
+                                tracing::warn!(
+                                    "[consolidation] blocked prune of correction memory {id}"
+                                );
+                                continue;
+                            }
+                        }
+
                         let _ = repo.update_lifecycle(id, MemoryLifecycle::Archived).await;
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Pruned,
+                                id,
+                                None,
+                                None,
+                            )
+                            .await;
                     }
                     ConsolidationAction::Recategorize {
                         id,
                         new_segment,
                         new_importance,
                     } => {
-                        let _ = repo.update_segment(id, new_segment.clone(), *new_importance).await;
+                        let _ = repo
+                            .update_segment(id, new_segment.clone(), *new_importance)
+                            .await;
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                id,
+                                None,
+                                Some("recategorized"),
+                            )
+                            .await;
                     }
                     ConsolidationAction::Split {
                         source_id,
                         new_memories,
                     } => {
-                        // Create each split entry as a new memory
+                        // If source is a correction, propagate corrects to split entries
+                        let source_corrects = memory_map
+                            .get(source_id.as_str())
+                            .and_then(|m| m.corrects.clone());
+
                         let mut first_new_id = String::new();
+                        let mut corrects_assigned = false;
+
                         for entry in new_memories {
+                            let entry_corrects = if !corrects_assigned
+                                && source_corrects.is_some()
+                                && entry.segment
+                                    == pond_core::domain::memory::MemorySegment::Correction
+                            {
+                                corrects_assigned = true;
+                                source_corrects.clone()
+                            } else {
+                                None
+                            };
+
                             let new_frag =
                                 pond_core::domain::memory::MemoryFragment::from_extraction(
                                     uuid::Uuid::new_v4().to_string(),
@@ -2843,16 +2940,32 @@ async fn run_consolidation_pipeline(
                                     entry.content.clone(),
                                     entry.segment.clone(),
                                     entry.importance,
-                                    None,
+                                    entry_corrects,
                                 );
+                            let nid = new_frag.id.clone();
                             if first_new_id.is_empty() {
-                                first_new_id = new_frag.id.clone();
+                                first_new_id = nid.clone();
                             }
                             let _ = repo.add(new_frag).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                    &nid,
+                                    None,
+                                    None,
+                                )
+                                .await;
                         }
-                        // Mark the original as superseded by the first split
                         if !first_new_id.is_empty() {
                             let _ = repo.mark_superseded(source_id, &first_new_id).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    source_id,
+                                    None,
+                                    Some(&first_new_id),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -3986,6 +4099,7 @@ async fn build_goose_backend(
     >,
     extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
     draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync>,
+    session_storage: Option<Arc<dyn pond_core::ports::session_storage::SessionStorage>>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
@@ -4001,6 +4115,78 @@ async fn build_goose_backend(
 
     let default_registry: Arc<dyn ToolRegistryPort> =
         Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+
+    // ── PondAgent backend (independent, no Goose dependency) ──────────────
+    #[cfg(feature = "pond-agent")]
+    if agent_backend == "pond" {
+        tracing::info!("Building PondAgent backend (independent, KV-cache enabled)");
+
+        let settings = settings_repo.get().await.unwrap_or_default();
+
+        // Build LlamaCppEngine as the inference provider.
+        let engine = match pond_inference::LlamaCppEngine::new(data_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("LlamaCppEngine init failed: {e} — falling back to mock");
+                return (Arc::new(MockAgent::new()), None, None, default_registry);
+            }
+        };
+
+        // Load the configured model.
+        let model_id = &settings.chat_model;
+        if !model_id.is_empty() {
+            if let Err(e) = engine.load_model(model_id, 99, true).await {
+                tracing::error!("Failed to load model '{}': {e}", model_id);
+                return (Arc::new(MockAgent::new()), None, None, default_registry);
+            }
+        }
+
+        // Build the McpToolDispatcher for direct MCP tool routing.
+        let dispatcher = pond_mcp_server::McpToolDispatcher::new(
+            memory_repo.clone(),
+            weather,
+            scheduler,
+            settings_repo.clone(),
+            device_registry.clone(),
+            skill_repo.clone(),
+            recipe_repo.clone(),
+            draft_repo,
+            embedding_provider,
+        );
+
+        let dispatcher: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+            Arc::new(dispatcher);
+
+        // Get tool definitions from the dispatcher for prompt injection.
+        let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = dispatcher
+            .available_tools()
+            .await
+            .into_iter()
+            .map(|name| pond_core::ports::inference::ToolDefinition {
+                name: name.clone(),
+                description: format!("GIAP tool: {}", name),
+                parameters_schema: serde_json::json!({}),
+            })
+            .collect();
+
+        let ss = session_storage.expect(
+            "session_storage is required for pond-agent backend — pass it from the server scope",
+        );
+        let agent = pond_agent::PondAgent::new(
+            Arc::new(engine),
+            tool_defs,
+            settings_repo.clone(),
+            Some(template_repo),
+            Some(extras_repo),
+            Some(skill_repo),
+            device_registry,
+            ss,
+            Some(dispatcher),
+        );
+
+        tracing::info!("PondAgent ready — independent inference with KV-cache reuse");
+        return (Arc::new(agent), None, None, default_registry);
+    }
 
     if agent_backend != "goose" {
         return (Arc::new(MockAgent::new()), None, None, default_registry);
@@ -4559,6 +4745,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
             )
             .await;
@@ -4569,6 +4756,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 model_role,
                 images: Vec::new(),
                 voice_mode: false,
+                canvas_mode: false,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -4592,6 +4780,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
             )
             .await;
@@ -4630,6 +4819,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     model_role,
                     images: Vec::new(),
                     voice_mode: false,
+                    canvas_mode: false,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -4653,6 +4843,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
             )
             .await;
