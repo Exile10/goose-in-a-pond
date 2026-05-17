@@ -202,7 +202,7 @@
 }
 /* Ensure CardContent always provides inner padding */
 [data-slot="card-content"] {
-  padding: 20px !important;
+  padding: 16px 18px !important;
 }
 .card-header {
   display: flex;
@@ -1472,24 +1472,24 @@
 /* ─── Settings ─── */
 .settings-tabs { padding: 0; }
 
-.settings-body { display: flex; flex-direction: column; gap: 16px; margin-top: 4px; }
+.settings-body { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
 
-/* Section card — extra padding for breathing room */
+/* Section card title */
 .section__title {
   font-family: var(--font-heading);
   font-size: var(--text-md);
   font-weight: var(--weight-bold);
   letter-spacing: -0.005em;
-  margin: 0 0 16px;
+  margin: 0 0 12px;
   color: var(--fg);
 }
-.section__rows { display: flex; flex-direction: column; gap: 18px; }
+.section__rows { display: flex; flex-direction: column; gap: 14px; }
 
 /* Row — label + control layout */
 .row {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 .row__label { display: flex; flex-direction: column; gap: 2px; }
 .row__name {

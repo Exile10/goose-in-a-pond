@@ -1161,7 +1161,7 @@ export function Settings() {
   }
 
   return (
-    <div className="screen" style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+    <div className="screen">
       <PageHeader
         title="Settings"
         action={
@@ -1192,7 +1192,7 @@ export function Settings() {
       {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0, flexShrink: 0 }}>{error}</p>}
 
       {/* Panel area */}
-      <div className="settings-body" style={{ flex: 1, overflowY: "auto", marginTop: 4 }}>
+      <div className="settings-body">
         {loading ? (
           <p className="muted-12">Loading settings...</p>
         ) : (
