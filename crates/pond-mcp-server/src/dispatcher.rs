@@ -52,8 +52,8 @@ const PREFIX_DRAFT: &str = "giap-draft__";
 /// Descriptions are pulled from the `#[tool(description = "...")]` attributes on each handler.
 const ALL_TOOLS: &[(&str, &str)] = &[
     // Weather
-    ("giap-weather__get_current_weather", "Get current weather conditions for any city. Pass a location name or omit for default."),
-    ("giap-weather__get_weather_forecast", "Get multi-day weather forecast. Pass location and number of days."),
+    ("giap-weather__get_current_weather", "Get current weather conditions for any city. Pass a location name (e.g. 'London', 'Kisumu') or omit to use the pond's configured home location."),
+    ("giap-weather__get_weather_forecast", "Get multi-day weather forecast. Pass location and number of days. Omit location to use the pond's configured home location."),
     // Knowledge
     ("giap-knowledge__get_wikipedia_article", "Look up factual, encyclopedic information about any topic. Use for people, places, events, science, history."),
     ("giap-knowledge__search_wikipedia", "Search Wikipedia when the exact title is unknown. Returns matching articles."),
