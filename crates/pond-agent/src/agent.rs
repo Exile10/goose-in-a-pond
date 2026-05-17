@@ -39,8 +39,12 @@ use tokio::sync::{Mutex, RwLock};
 /// Maximum tool-calling loop iterations before the agent gives up.
 const MAX_TOOL_ITERATIONS: u32 = 10;
 
-/// Maximum conversation history messages to load per turn.
+/// Maximum conversation history turns to include per request.
 const HISTORY_LIMIT: usize = 30;
+
+/// Maximum characters for the history XML block (~tokens * 4).
+/// Keeps history from consuming too much of the context window.
+const HISTORY_CHAR_BUDGET: usize = 4000;
 
 /// The core GIAP agent with sustained tool-calling support.
 ///
@@ -336,12 +340,27 @@ impl Agent for PondAgent {
                 if turns.is_empty() {
                     String::new()
                 } else {
-                    let mut xml = "<history>\n".to_string();
-                    for (user_msg, asst_msg) in turns.iter().rev().take(HISTORY_LIMIT / 2).rev() {
-                        xml.push_str(&format!("<user>{}</user>\n<assistant>{}</assistant>\n", user_msg, asst_msg));
+                    // Build history from most recent turns, respecting char budget.
+                    // Older turns are dropped first to fit within context window.
+                    let mut entries: Vec<String> = Vec::new();
+                    let mut total_chars = 0usize;
+                    for (user_msg, asst_msg) in turns.iter().rev().take(HISTORY_LIMIT / 2) {
+                        let entry = format!(
+                            "<user>{}</user>\n<assistant>{}</assistant>\n",
+                            user_msg, asst_msg
+                        );
+                        if total_chars + entry.len() > HISTORY_CHAR_BUDGET {
+                            break; // Budget exhausted — drop older turns
+                        }
+                        total_chars += entry.len();
+                        entries.push(entry);
                     }
-                    xml.push_str("</history>\n");
-                    xml
+                    if entries.is_empty() {
+                        String::new()
+                    } else {
+                        entries.reverse(); // Chronological order
+                        format!("<history>\n{}</history>\n", entries.join(""))
+                    }
                 }
             } else {
                 String::new()
@@ -486,11 +505,12 @@ impl Agent for PondAgent {
                     break;
                 }
 
-                // Tool calls detected — dispatch and inject results as assistant context.
-                // We format tool results as an assistant message containing the call + result
-                // so the model sees its own action and knows to synthesize next.
+                // Tool calls detected — dispatch ALL concurrently, then inject results.
+                // Parallel execution saves latency when multiple tools are called
+                // (e.g. weather + time, or multiple lookups).
                 let mut tool_context = text_buf.clone();
 
+                // Emit all tool_call events immediately.
                 for (id, name, args) in &tool_calls {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::ToolCall {
@@ -499,17 +519,34 @@ impl Agent for PondAgent {
                             input: Some(args.clone()),
                         }))
                         .await;
+                }
 
-                    // Dispatch the tool call through the MCP dispatcher.
-                    let result_text = if let Some(ref disp) = dispatcher {
-                        match disp.dispatch(name, args.clone()).await {
-                            Ok(result) => result.content,
-                            Err(e) => format!("Tool '{}' failed: {}", name, e),
+                // Dispatch all tools in parallel.
+                let dispatch_futures: Vec<_> = tool_calls
+                    .iter()
+                    .map(|(id, name, args)| {
+                        let disp = dispatcher.clone();
+                        let name = name.clone();
+                        let args = args.clone();
+                        let id = id.clone();
+                        async move {
+                            let result_text = if let Some(ref d) = disp {
+                                match d.dispatch(&name, args).await {
+                                    Ok(result) => result.content,
+                                    Err(e) => format!("Tool '{}' failed: {}", name, e),
+                                }
+                            } else {
+                                format!("Tool '{}' not available (no dispatcher)", name)
+                            };
+                            (id, name, result_text)
                         }
-                    } else {
-                        format!("Tool '{}' is not available (no dispatcher configured)", name)
-                    };
+                    })
+                    .collect();
 
+                let results = futures::future::join_all(dispatch_futures).await;
+
+                // Emit results and build context (in original call order).
+                for (id, name, result_text) in &results {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::ToolResult {
                             id: id.clone(),
@@ -518,8 +555,6 @@ impl Agent for PondAgent {
                         }))
                         .await;
 
-                    // Build tool context as assistant message — the model sees this as
-                    // its own prior output containing the tool result data.
                     tool_context.push_str(&format!(
                         "\n[Tool {} returned]: {}",
                         name, result_text
