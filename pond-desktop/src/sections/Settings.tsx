@@ -815,6 +815,46 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
 
   return (
     <>
+      <Section title="Inference Engine">
+        <p className="row__hint" style={{ marginBottom: "var(--space-3)" }}>
+          Choose how Pond runs the AI model. This affects speed, features, and resource usage.
+          Changes take effect on the next server restart.
+        </p>
+        <RadioGroup
+          aria-label="Agent backend"
+          value={s.agent_backend ?? "goose"}
+          onChange={(v) => patch("agent_backend", v)}
+        >
+          <Radio value="goose">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Goose Engine (default)</div>
+                <div className="row__hint">
+                  Full-featured. Supports cloud providers (OpenAI, Anthropic), community MCP extensions,
+                  parallel tool execution, context compaction, and session persistence. Battle-tested
+                  with extensive edge-case handling. First build takes 10+ minutes (compiles Block's Goose framework).
+                </div>
+              </div>
+            </Radio.Content>
+          </Radio>
+          <Radio value="pond">
+            <Radio.Control><Radio.Indicator /></Radio.Control>
+            <Radio.Content>
+              <div>
+                <div style={{ fontWeight: 500 }}>Pond Engine (optimized local)</div>
+                <div className="row__hint">
+                  Fastest for local models. KV-cache persistence skips re-processing the system prompt
+                  on every turn (78x faster on cached turns). Zero disk I/O, minimal memory overhead.
+                  Best for Jetson/embedded deployment and latency-critical use. Local GGUF models only
+                  -- no cloud provider support. Requires server restart with --agent pond.
+                </div>
+              </div>
+            </Radio.Content>
+          </Radio>
+        </RadioGroup>
+      </Section>
+
       <Section title="How thorough should Pond be?">
         <RadioGroup
           aria-label="Agent mode"
