@@ -15,6 +15,7 @@ import { api } from "../api/PondApiClient";
 import { useAppDispatch, useAppState } from "../state/AppContext";
 import type { Settings as SettingsType, Extension } from "../api/types";
 import { ModelPickerModal, type ModelRole } from "../components/ModelPickerModal";
+import { PageHeader, Section, Row } from "../components/shared";
 const WakeWordCalibration = lazy(() => import("../components/WakeWordCalibration").then(m => ({ default: m.WakeWordCalibration })));
 
 // ── Tab definitions ───────────────────────────────────────────
@@ -31,31 +32,6 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: "data",     label: "Data" },
   { id: "tools",    label: "Tools" },
 ];
-
-// ── Shared form primitives ────────────────────────────────────
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <Card shadow="none" className="giap-card">
-      <CardContent>
-        <h4 className="section__title">{title}</h4>
-        <div className="section__rows">{children}</div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function FormRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <div className="settings-row">
-      <div className="settings-row__label">
-        <div className="settings-row__name">{label}</div>
-        {hint && <div className="settings-row__hint">{hint}</div>}
-      </div>
-      <div>{children}</div>
-    </div>
-  );
-}
 
 // Hardcoded common IANA timezone list (offline-first, no API needed)
 const TIMEZONES = [
@@ -84,25 +60,25 @@ const TIMEZONES = [
 
 function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
   return (
-    <div className="settings-body">
+    <>
       <Section title="Personal">
-        <FormRow label="Your name" hint="How Goose addresses you">
+        <Row label="Your name" hint="How Goose addresses you">
           <input
             style={nativeInput}
             value={s.user_name ?? ""}
             onChange={(e) => patch("user_name", e.target.value)}
             placeholder="Friend"
           />
-        </FormRow>
-        <FormRow label="Assistant name" hint="What you call your assistant">
+        </Row>
+        <Row label="Assistant name" hint="What you call your assistant">
           <input
             style={nativeInput}
             value={s.assistant_name ?? ""}
             onChange={(e) => patch("assistant_name", e.target.value)}
             placeholder="Goose"
           />
-        </FormRow>
-        <FormRow label="Timezone">
+        </Row>
+        <Row label="Timezone">
           <select
             style={selectFallback}
             value={s.timezone ?? "UTC"}
@@ -112,20 +88,20 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
               <option key={tz} value={tz}>{tz}</option>
             ))}
           </select>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Personality">
-        <FormRow label="Personality" hint="Describe how your assistant should behave">
+        <Row label="Personality" hint="Describe how your assistant should behave">
           <textarea
             style={{ ...nativeInput, height: "80px", resize: "vertical" as const }}
-            value={s.assistant_personality ?? s.personality ?? ""}
+            value={s.assistant_personality ?? ""}
             onChange={(e) => patch("assistant_personality", e.target.value)}
             placeholder="Friendly, concise, and helpful"
           />
-        </FormRow>
+        </Row>
       </Section>
-    </div>
+    </>
   );
 }
 
@@ -148,7 +124,7 @@ function VoiceTab({
   const [calibrating, setCalibrating] = useState(false);
   const recDur = s.voice_recording_duration_secs ?? 30;
 
-  const wakePhrase = (s.voice_wake_word ?? s.wake_word ?? "").trim();
+  const wakePhrase = (s.voice_wake_word ?? "").trim();
   const transcriptions = s.voice_wake_word_transcriptions ?? [];
   const isCalibrated = transcriptions.length > 0;
 
@@ -175,10 +151,10 @@ function VoiceTab({
   }
 
   return (
-    <div className="settings-body">
+    <>
       {/* Activation */}
       <Section title="Activation">
-        <FormRow label="Keyboard shortcut" hint="Press this to activate voice from anywhere">
+        <Row label="Keyboard shortcut" hint="Press this to activate voice from anywhere">
           <div className="shortcut-row">
             <input
               style={{ ...nativeInput, flex: 1 }}
@@ -188,16 +164,16 @@ function VoiceTab({
             />
             <Button variant="outline" onPress={applyHotkey}>Apply</Button>
           </div>
-        </FormRow>
-        <FormRow label="Wake phrase" hint="Say this phrase to activate voice mode">
+        </Row>
+        <Row label="Wake phrase" hint="Say this phrase to activate voice mode">
           <input
             style={nativeInput}
-            value={s.voice_wake_word ?? s.wake_word ?? ""}
+            value={s.voice_wake_word ?? ""}
             onChange={(e) => patch("voice_wake_word", e.target.value)}
             placeholder="goose"
             disabled={calibrating}
           />
-        </FormRow>
+        </Row>
 
         {/* Calibration status */}
         {!calibrating && wakePhrase && (
@@ -250,7 +226,7 @@ function VoiceTab({
 
       {/* Recording */}
       <Section title="Recording">
-        <FormRow label={`Max listen time: ${recDur}s`} hint="Auto-stops recording after this duration">
+        <Row label={`Max listen time: ${recDur}s`} hint="Auto-stops recording after this duration">
           <input
             type="range"
             min={5}
@@ -260,7 +236,7 @@ function VoiceTab({
             onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))}
             style={{ width: "100%" }}
           />
-        </FormRow>
+        </Row>
       </Section>
 
       {/* Advanced toggle */}
@@ -275,34 +251,34 @@ function VoiceTab({
       {showAdvanced && (
         <>
           <Section title="Transcription">
-            <FormRow label="Server address" hint="Where the speech-to-text server is running">
+            <Row label="Server address" hint="Where the speech-to-text server is running">
               <input
                 style={nativeInput}
                 value={s.voice_whisper_url ?? ""}
                 onChange={(e) => patch("voice_whisper_url", e.target.value)}
                 placeholder="http://127.0.0.1:9000"
               />
-            </FormRow>
-            <FormRow label="Model file" hint="Speech recognition model (e.g. ggml-base.bin)">
+            </Row>
+            <Row label="Model file" hint="Speech recognition model (e.g. ggml-base.bin)">
               <input
                 style={nativeInput}
                 value={s.active_whisper_model ?? ""}
                 onChange={(e) => patch("active_whisper_model", e.target.value)}
                 placeholder="ggml-base.bin"
               />
-            </FormRow>
+            </Row>
           </Section>
 
           <Section title="Wake-Word Detection">
-            <FormRow label="KWS Whisper URL" hint="Separate whisper server for fast wake-word detection (uses tiny model). Leave blank to share the main server">
+            <Row label="KWS Whisper URL" hint="Separate whisper server for fast wake-word detection (uses tiny model). Leave blank to share the main server">
               <input
                 style={nativeInput}
                 value={s.voice_kws_whisper_url ?? ""}
                 onChange={(e) => patch("voice_kws_whisper_url", e.target.value || null)}
                 placeholder="Same as transcription server"
               />
-            </FormRow>
-            <FormRow label={`Energy threshold: ${(s.voice_kws_energy_threshold ?? 0.003).toFixed(3)}`} hint="Minimum audio energy to trigger whisper (0 = disabled, 0.003 = default)">
+            </Row>
+            <Row label={`Energy threshold: ${(s.voice_kws_energy_threshold ?? 0.003).toFixed(3)}`} hint="Minimum audio energy to trigger whisper (0 = disabled, 0.003 = default)">
               <input
                 type="range"
                 min={0}
@@ -312,8 +288,8 @@ function VoiceTab({
                 onChange={(e) => patch("voice_kws_energy_threshold", Number(e.target.value))}
                 style={{ width: "100%" }}
               />
-            </FormRow>
-            <FormRow label={`Silence cutoff: ${s.voice_kws_post_trigger_silence_ms ?? 400}ms`} hint="Consecutive silence that ends audio capture after wake word (0 = wait full duration)">
+            </Row>
+            <Row label={`Silence cutoff: ${s.voice_kws_post_trigger_silence_ms ?? 400}ms`} hint="Consecutive silence that ends audio capture after wake word (0 = wait full duration)">
               <input
                 type="range"
                 min={0}
@@ -323,8 +299,8 @@ function VoiceTab({
                 onChange={(e) => patch("voice_kws_post_trigger_silence_ms", Number(e.target.value))}
                 style={{ width: "100%" }}
               />
-            </FormRow>
-            <FormRow label={`Cooldown: ${s.voice_kws_cooldown_ms ?? 2000}ms`} hint="Delay before re-arming detection after activation (prevents TTS echo re-trigger)">
+            </Row>
+            <Row label={`Cooldown: ${s.voice_kws_cooldown_ms ?? 2000}ms`} hint="Delay before re-arming detection after activation (prevents TTS echo re-trigger)">
               <input
                 type="range"
                 min={500}
@@ -334,19 +310,19 @@ function VoiceTab({
                 onChange={(e) => patch("voice_kws_cooldown_ms", Number(e.target.value))}
                 style={{ width: "100%" }}
               />
-            </FormRow>
+            </Row>
           </Section>
 
           <Section title="Speech Synthesis">
-            <FormRow label="Voice model" hint="Piper voice model file (.onnx)">
+            <Row label="Voice model" hint="Piper voice model file (.onnx)">
               <input
                 style={nativeInput}
                 value={s.active_tts_model ?? ""}
                 onChange={(e) => patch("active_tts_model", e.target.value)}
                 placeholder="en_US-lessac-medium.onnx"
               />
-            </FormRow>
-            <FormRow label="Voice name">
+            </Row>
+            <Row label="Voice name">
               <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
                 <input
                   style={{ ...nativeInput, flex: 1 }}
@@ -356,11 +332,11 @@ function VoiceTab({
                 />
                 <Button variant="outline" isDisabled title="Coming soon">Preview</Button>
               </div>
-            </FormRow>
+            </Row>
           </Section>
         </>
       )}
-    </div>
+    </>
   );
 }
 
@@ -419,17 +395,17 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
   const maxTokenOpts = [128, 256, 512, 1024, 2048, 4096];
 
   return (
-    <div className="settings-body">
+    <>
       <Section title="AI Models">
-        <FormRow label="Main LLM" hint="Handles all conversation, reasoning, and response generation">
+        <Row label="Main LLM" hint="Handles all conversation, reasoning, and response generation">
           <ModelRoleRow
             provider={s.chat_provider}
             model={s.chat_model}
             onPick={() => setPickerOpen(true)}
           />
-        </FormRow>
+        </Row>
 
-        <FormRow label="Tool Caller" hint="Small specialist model for structured tool-call arguments (optional)">
+        <Row label="Tool Caller" hint="Small specialist model for structured tool-call arguments (optional)">
           <select
             value={s.tool_model ?? ""}
             onChange={(e) => patch("tool_model", e.target.value || null)}
@@ -445,11 +421,11 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
               Same model as main LLM — zero swap overhead
             </span>
           )}
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Response Quality">
-        <FormRow label="Thinking Mode" hint="Enable internal reasoning for better analysis, planning, and complex answers">
+        <Row label="Thinking Mode" hint="Enable internal reasoning for better analysis, planning, and complex answers">
           <select
             style={selectFallback}
             value={s.thinking_mode ?? "auto"}
@@ -459,8 +435,16 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             <option value="on">Always On</option>
             <option value="off">Off</option>
           </select>
-        </FormRow>
-        <FormRow label="Answer Review" hint="Adversarial critic reviews answers for completeness, accuracy, and depth before delivery">
+        </Row>
+        <Row label="Show thinking" hint="Display the model's reasoning process in chat bubbles">
+          <Switch
+            isSelected={s.show_thinking ?? false}
+            onChange={(v) => patch("show_thinking", v)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
+        <Row label="Answer Review" hint="Adversarial critic reviews answers for completeness, accuracy, and depth before delivery">
           <select
             style={selectFallback}
             value={s.review_mode ?? "off"}
@@ -470,8 +454,31 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             <option value="auto">Auto (review factual/analytical questions only)</option>
             <option value="on">Always On (review every answer)</option>
           </select>
-        </FormRow>
-        <FormRow label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
+        </Row>
+        <Row label="Review rounds" hint="Maximum review-revision cycles before accepting (1-3)">
+          <select
+            style={selectFallback}
+            value={s.review_max_rounds ?? 1}
+            onChange={(e) => patch("review_max_rounds", Number(e.target.value))}
+          >
+            <option value={1}>1 round</option>
+            <option value={2}>2 rounds</option>
+            <option value={3}>3 rounds</option>
+          </select>
+        </Row>
+        <Row label="Review quality bar" hint="Minimum score (1-5) to accept an answer without revision">
+          <select
+            style={selectFallback}
+            value={s.review_pass_threshold ?? 3}
+            onChange={(e) => patch("review_pass_threshold", Number(e.target.value))}
+          >
+            <option value={2}>2 - Lenient</option>
+            <option value={3}>3 - Balanced (default)</option>
+            <option value={4}>4 - Strict</option>
+            <option value={5}>5 - Very Strict</option>
+          </select>
+        </Row>
+        <Row label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more creative; lower = more focused and consistent">
           <input
             type="range"
             min={0}
@@ -481,8 +488,8 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             onChange={(e) => patch("llm_temperature", Number(e.target.value))}
             style={{ width: "100%" }}
           />
-        </FormRow>
-        <FormRow label="Response length" hint="Maximum length of each response">
+        </Row>
+        <Row label="Response length" hint="Maximum length of each response">
           <select
             style={selectFallback}
             value={s.llm_max_tokens ?? 1024}
@@ -490,11 +497,11 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
           >
             {maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}
           </select>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Context & Embeddings">
-        <FormRow label="Context window override" hint="Override the model's context window size in tokens (0 = use model default)">
+        <Row label="Context window override" hint="Override the model's context window size in tokens (0 = use model default)">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
@@ -507,8 +514,8 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             />
             <span className="muted-12">tokens</span>
           </div>
-        </FormRow>
-        <FormRow label="Embedding provider" hint="Provider for text embeddings used by memory search">
+        </Row>
+        <Row label="Embedding provider" hint="Provider for text embeddings used by memory search">
           <select
             style={selectFallback}
             value={s.embedding_provider ?? "fastembed"}
@@ -517,8 +524,8 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             <option value="fastembed">FastEmbed (local ONNX)</option>
             <option value="none">None</option>
           </select>
-        </FormRow>
-        <FormRow label="Embedding model" hint="Active embedding model name from the registry">
+        </Row>
+        <Row label="Embedding model" hint="Active embedding model name from the registry">
           <input
             style={{ ...nativeInput, opacity: (s.embedding_provider ?? "fastembed") !== "none" ? 1 : 0.45 }}
             disabled={(s.embedding_provider ?? "fastembed") === "none"}
@@ -526,7 +533,7 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
             onChange={(e) => patch("active_embedding_model", e.target.value)}
             placeholder="all-MiniLM-L6-v2"
           />
-        </FormRow>
+        </Row>
       </Section>
 
       {pickerOpen && (
@@ -542,7 +549,7 @@ function ModelsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Se
           onClose={() => setPickerOpen(false)}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -552,7 +559,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
   const customPrompt = s.custom_system_prompt ?? "";
 
   return (
-    <div className="settings-body">
+    <>
       <Section title="Prompt Style">
         <RadioGroup
           aria-label="Prompt style"
@@ -564,7 +571,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Balanced</div>
-                <div className="settings-row__hint">Natural conversation, medium length responses</div>
+                <div className="row__hint">Natural conversation, medium length responses</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -573,7 +580,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Concise</div>
-                <div className="settings-row__hint">Short, direct answers. Minimal explanation</div>
+                <div className="row__hint">Short, direct answers. Minimal explanation</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -582,7 +589,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Technical</div>
-                <div className="settings-row__hint">Precise, detailed. Favors accuracy over brevity</div>
+                <div className="row__hint">Precise, detailed. Favors accuracy over brevity</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -591,7 +598,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Warm</div>
-                <div className="settings-row__hint">Friendly, encouraging tone. Conversational style</div>
+                <div className="row__hint">Friendly, encouraging tone. Conversational style</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -599,7 +606,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
       </Section>
 
       <Section title="Prompt Addendum">
-        <FormRow label="Additional context" hint="Appended to every system prompt">
+        <Row label="Additional context" hint="Appended to every system prompt">
           <div style={{ position: "relative" }}>
             <textarea
               style={{ ...nativeInput, height: "80px", resize: "vertical" as const, width: "100%" }}
@@ -610,11 +617,11 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             />
             <span style={charCounter}>{addendum.length}/500</span>
           </div>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Custom System Prompt">
-        <FormRow label="Enable custom prompt">
+        <Row label="Enable custom prompt">
           <Switch
             isSelected={customEnabled}
             onChange={(v) => {
@@ -624,8 +631,8 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
           >
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="System prompt" hint="Replaces the built-in system prompt entirely">
+        </Row>
+        <Row label="System prompt" hint="Replaces the built-in system prompt entirely">
           <div style={{ position: "relative" }}>
             <textarea
               style={{ ...nativeInput, height: "140px", resize: "vertical" as const, width: "100%", opacity: customEnabled ? 1 : 0.45 }}
@@ -637,9 +644,9 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
             />
             {customEnabled && <span style={charCounter}>{customPrompt.length}/4000</span>}
           </div>
-        </FormRow>
+        </Row>
       </Section>
-    </div>
+    </>
   );
 }
 
@@ -647,9 +654,9 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
   const enabled = s.weather_enabled ?? false;
 
   return (
-    <div className="settings-body">
+    <>
       <Section title="Weather">
-        <FormRow label="Enable weather" hint="Allow the assistant to fetch current weather data">
+        <Row label="Enable weather" hint="Allow the assistant to fetch current weather data">
           <Switch
             isSelected={enabled}
             onChange={(v) => patch("weather_enabled", v)}
@@ -657,8 +664,8 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Enable weather
           </Switch>
-        </FormRow>
-        <FormRow label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
+        </Row>
+        <Row label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
           <input
             style={{ ...nativeInput, opacity: enabled ? 1 : 0.45 }}
             disabled={!enabled}
@@ -666,8 +673,8 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             onChange={(e) => patch("weather_location_name", e.target.value)}
             placeholder="Nairobi, Kenya"
           />
-        </FormRow>
-        <FormRow label="Latitude">
+        </Row>
+        <Row label="Latitude">
           <input
             type="number"
             role="spinbutton"
@@ -678,8 +685,8 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             onChange={(e) => patch("weather_latitude", Number(e.target.value))}
             placeholder="-1.2921"
           />
-        </FormRow>
-        <FormRow label="Longitude">
+        </Row>
+        <Row label="Longitude">
           <input
             type="number"
             role="spinbutton"
@@ -690,9 +697,9 @@ function LocationTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             onChange={(e) => patch("weather_longitude", Number(e.target.value))}
             placeholder="36.8219"
           />
-        </FormRow>
+        </Row>
       </Section>
-    </div>
+    </>
   );
 }
 
@@ -711,7 +718,7 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
 
       {showTuning && (
         <Section title="Memory Tuning">
-          <FormRow label="Max facts per turn" hint="Maximum memories extracted per conversation turn (1-10)">
+          <Row label="Max facts per turn" hint="Maximum memories extracted per conversation turn (1-10)">
             <input
               type="number"
               role="spinbutton"
@@ -721,8 +728,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               value={s.memory_extraction_max_facts ?? 3}
               onChange={(e) => patch("memory_extraction_max_facts", Number(e.target.value))}
             />
-          </FormRow>
-          <FormRow label="Extraction cooldown" hint="Minimum seconds between extraction runs">
+          </Row>
+          <Row label="Extraction cooldown" hint="Minimum seconds between extraction runs">
             <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
               <input
                 type="number"
@@ -735,8 +742,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               />
               <span className="muted-12">seconds</span>
             </div>
-          </FormRow>
-          <FormRow label="Cleanup interval" hint="How often the cleanup task runs">
+          </Row>
+          <Row label="Cleanup interval" hint="How often the cleanup task runs">
             <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
               <input
                 type="number"
@@ -749,8 +756,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               />
               <span className="muted-12">hours</span>
             </div>
-          </FormRow>
-          <FormRow label="Consolidation interval" hint="How often the consolidation task runs">
+          </Row>
+          <Row label="Consolidation interval" hint="How often the consolidation task runs">
             <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
               <input
                 type="number"
@@ -763,8 +770,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               />
               <span className="muted-12">hours</span>
             </div>
-          </FormRow>
-          <FormRow label="Consolidation batch" hint="Max memories processed per consolidation pass">
+          </Row>
+          <Row label="Consolidation batch" hint="Max memories processed per consolidation pass">
             <input
               type="number"
               role="spinbutton"
@@ -774,8 +781,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               value={s.memory_consolidation_batch_size ?? 20}
               onChange={(e) => patch("memory_consolidation_batch_size", Number(e.target.value))}
             />
-          </FormRow>
-          <FormRow label={`Prune threshold: ${(s.memory_prune_threshold ?? 0.05).toFixed(2)}`} hint="Memories below this effective score are deleted">
+          </Row>
+          <Row label={`Prune threshold: ${(s.memory_prune_threshold ?? 0.05).toFixed(2)}`} hint="Memories below this effective score are deleted">
             <input
               type="range"
               min={0}
@@ -785,8 +792,8 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               onChange={(e) => patch("memory_prune_threshold", Number(e.target.value))}
               style={{ width: "100%" }}
             />
-          </FormRow>
-          <FormRow label={`Archive threshold: ${(s.memory_archive_threshold ?? 0.15).toFixed(2)}`} hint="Memories below this effective score are archived (hidden)">
+          </Row>
+          <Row label={`Archive threshold: ${(s.memory_archive_threshold ?? 0.15).toFixed(2)}`} hint="Memories below this effective score are archived (hidden)">
             <input
               type="range"
               min={0}
@@ -796,7 +803,7 @@ function MemoryTuningSection({ s, patch }: { s: Partial<SettingsType>; patch: (k
               onChange={(e) => patch("memory_archive_threshold", Number(e.target.value))}
               style={{ width: "100%" }}
             />
-          </FormRow>
+          </Row>
         </Section>
       )}
     </>
@@ -807,7 +814,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
   const memInject = s.agent_memory_inject ?? false;
 
   return (
-    <div className="settings-body">
+    <>
       <Section title="How thorough should Pond be?">
         <RadioGroup
           aria-label="Agent mode"
@@ -819,7 +826,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Smart (recommended)</div>
-                <div className="settings-row__hint">Pond decides when to look things up or take actions</div>
+                <div className="row__hint">Pond decides when to look things up or take actions</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -828,7 +835,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Chat only</div>
-                <div className="settings-row__hint">Conversation only -- Pond won't use any tools</div>
+                <div className="row__hint">Conversation only -- Pond won't use any tools</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -837,7 +844,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Radio.Content>
               <div>
                 <div style={{ fontWeight: 500 }}>Proactive</div>
-                <div className="settings-row__hint">Pond actively uses tools to give more detailed answers</div>
+                <div className="row__hint">Pond actively uses tools to give more detailed answers</div>
               </div>
             </Radio.Content>
           </Radio>
@@ -845,7 +852,7 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
       </Section>
 
       <Section title="Behaviour">
-        <FormRow label="Fast path" hint="Answer trivial messages (greetings, thanks) instantly without invoking the LLM">
+        <Row label="Fast path" hint="Answer trivial messages (greetings, thanks) instantly without invoking the LLM">
           <Switch
             isSelected={s.fast_path_enabled ?? true}
             onChange={(v) => patch("fast_path_enabled", v)}
@@ -853,8 +860,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Instant replies for simple messages
           </Switch>
-        </FormRow>
-        <FormRow label="How thorough" hint="How many steps Pond will take to answer a question (1-50)">
+        </Row>
+        <Row label="How thorough" hint="How many steps Pond will take to answer a question (1-50)">
           <input
             type="number"
             role="spinbutton"
@@ -864,8 +871,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             value={s.agent_max_turns ?? 20}
             onChange={(e) => patch("agent_max_turns", Number(e.target.value))}
           />
-        </FormRow>
-        <FormRow label="Timeout" hint="Maximum seconds before a response is cut off (0 = no limit)">
+        </Row>
+        <Row label="Timeout" hint="Maximum seconds before a response is cut off (0 = no limit)">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
@@ -878,8 +885,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             />
             <span className="muted-12">seconds</span>
           </div>
-        </FormRow>
-        <FormRow label="Tool output compaction" hint="Compress tool results to save context tokens (disable for debugging)">
+        </Row>
+        <Row label="Tool output compaction" hint="Compress tool results to save context tokens (disable for debugging)">
           <Switch
             isSelected={s.tool_output_compaction ?? true}
             onChange={(v) => patch("tool_output_compaction", v)}
@@ -887,8 +894,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Compact tool outputs
           </Switch>
-        </FormRow>
-        <FormRow label="KV cache reuse" hint="Keep system prompt stable for faster inference on local models">
+        </Row>
+        <Row label="KV cache reuse" hint="Keep system prompt stable for faster inference on local models">
           <Switch
             isSelected={s.prefix_cache_prompt ?? true}
             onChange={(v) => patch("prefix_cache_prompt", v)}
@@ -896,11 +903,11 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Prompt prefix caching
           </Switch>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Memory">
-        <FormRow label="Remember context" hint="Pond recalls facts from past conversations to give better answers">
+        <Row label="Remember context" hint="Pond recalls facts from past conversations to give better answers">
           <Switch
             isSelected={memInject}
             onChange={(v) => patch("agent_memory_inject", v)}
@@ -908,8 +915,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Use conversation memory
           </Switch>
-        </FormRow>
-        <FormRow label="How much to recall" hint="Number of past memories to include (1-20)">
+        </Row>
+        <Row label="How much to recall" hint="Number of past memories to include (1-20)">
           <input
             type="number"
             role="spinbutton"
@@ -920,8 +927,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             value={s.agent_memory_limit ?? 5}
             onChange={(e) => patch("agent_memory_limit", Number(e.target.value))}
           />
-        </FormRow>
-        <FormRow label="Auto-extract memories" hint="Automatically learn facts from each conversation turn">
+        </Row>
+        <Row label="Auto-extract memories" hint="Automatically learn facts from each conversation turn">
           <Switch
             isSelected={s.memory_extraction_enabled ?? true}
             onChange={(v) => patch("memory_extraction_enabled", v)}
@@ -929,8 +936,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Extract memories
           </Switch>
-        </FormRow>
-        <FormRow label="Memory cleanup" hint="Periodically prune and archive decayed memories">
+        </Row>
+        <Row label="Memory cleanup" hint="Periodically prune and archive decayed memories">
           <Switch
             isSelected={s.memory_cleanup_enabled ?? true}
             onChange={(v) => patch("memory_cleanup_enabled", v)}
@@ -938,8 +945,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Auto-cleanup
           </Switch>
-        </FormRow>
-        <FormRow label="Auto-consolidation" hint="Merge duplicate/contradicting memories during idle periods (15 min inactivity)">
+        </Row>
+        <Row label="Auto-consolidation" hint="Merge duplicate/contradicting memories during idle periods (15 min inactivity)">
           <Switch
             isSelected={s.memory_consolidation_enabled ?? false}
             onChange={(v) => patch("memory_consolidation_enabled", v)}
@@ -947,8 +954,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Consolidate memories
           </Switch>
-        </FormRow>
-        <FormRow label="Consolidation mode" hint="Single-pass (1 LLM call, fast) or Adversarial (Proposer/Adversary/Judge, thorough)">
+        </Row>
+        <Row label="Consolidation mode" hint="Single-pass (1 LLM call, fast) or Adversarial (Proposer/Adversary/Judge, thorough)">
           <select
             style={selectFallback}
             value={s.memory_consolidation_mode ?? "single"}
@@ -957,8 +964,8 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <option value="single">Single-pass (fast)</option>
             <option value="adversarial">Adversarial (3-stage)</option>
           </select>
-        </FormRow>
-        <FormRow label="Memory graph" hint="Experimental: use causal graph traversal for memory retrieval">
+        </Row>
+        <Row label="Memory graph" hint="Experimental: use causal graph traversal for memory retrieval">
           <Switch
             isSelected={s.memory_graph_enabled ?? false}
             onChange={(v) => patch("memory_graph_enabled", v)}
@@ -966,11 +973,11 @@ function AgentTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Graph-based recall
           </Switch>
-        </FormRow>
+        </Row>
       </Section>
 
       <MemoryTuningSection s={s} patch={patch} />
-    </div>
+    </>
   );
 }
 
@@ -986,9 +993,9 @@ function DataTab({
   onServerUrlChange: (v: string) => void;
 }) {
   return (
-    <div className="settings-body">
+    <>
       <Section title="Data Retention">
-        <FormRow label="Event logs" hint="How many days to keep event log entries">
+        <Row label="Event logs" hint="How many days to keep event log entries">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
@@ -1001,8 +1008,8 @@ function DataTab({
             />
             <span className="muted-12">days</span>
           </div>
-        </FormRow>
-        <FormRow label="Sensor readings" hint="How many days to keep sensor data">
+        </Row>
+        <Row label="Sensor readings" hint="How many days to keep sensor data">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
@@ -1015,8 +1022,8 @@ function DataTab({
             />
             <span className="muted-12">days</span>
           </div>
-        </FormRow>
-        <FormRow label="Session messages" hint="Maximum messages to keep per session">
+        </Row>
+        <Row label="Session messages" hint="Maximum messages to keep per session">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <input
               type="number"
@@ -1029,11 +1036,11 @@ function DataTab({
             />
             <span className="muted-12">messages</span>
           </div>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Telemetry & Monitoring">
-        <FormRow label="Telemetry" hint="Record per-turn metrics (TTFT, token counts, tool latency)">
+        <Row label="Telemetry" hint="Record per-turn metrics (TTFT, token counts, tool latency)">
           <Switch
             isSelected={s.telemetry_enabled ?? true}
             onChange={(v) => patch("telemetry_enabled", v)}
@@ -1041,8 +1048,8 @@ function DataTab({
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Record telemetry
           </Switch>
-        </FormRow>
-        <FormRow label="Context monitoring" hint="Track context window fill rate and warn before saturation">
+        </Row>
+        <Row label="Context monitoring" hint="Track context window fill rate and warn before saturation">
           <Switch
             isSelected={s.context_monitor_enabled ?? true}
             onChange={(v) => patch("context_monitor_enabled", v)}
@@ -1050,8 +1057,8 @@ function DataTab({
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Monitor context usage
           </Switch>
-        </FormRow>
-        <FormRow label="Compact encoding" hint="Use compact encoding for prompts to reduce token count by 30-60%">
+        </Row>
+        <Row label="Compact encoding" hint="Use compact encoding for prompts to reduce token count by 30-60%">
           <Switch
             isSelected={s.compact_encoding ?? true}
             onChange={(v) => patch("compact_encoding", v)}
@@ -1059,11 +1066,11 @@ function DataTab({
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Compact encoding
           </Switch>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Cloud Cost Comparison">
-        <FormRow label="Input price" hint="Cloud API input token price per million (for savings estimate)">
+        <Row label="Input price" hint="Cloud API input token price per million (for savings estimate)">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <span className="muted-12">$</span>
             <input
@@ -1077,8 +1084,8 @@ function DataTab({
             />
             <span className="muted-12">/ 1M tokens</span>
           </div>
-        </FormRow>
-        <FormRow label="Output price" hint="Cloud API output token price per million">
+        </Row>
+        <Row label="Output price" hint="Cloud API output token price per million">
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
             <span className="muted-12">$</span>
             <input
@@ -1092,20 +1099,20 @@ function DataTab({
             />
             <span className="muted-12">/ 1M tokens</span>
           </div>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Desktop">
-        <FormRow label="Server URL" hint="pond-server base URL">
+        <Row label="Server URL" hint="pond-server base URL">
           <input
             style={nativeInput}
             value={serverUrl}
             onChange={(e) => onServerUrlChange(e.target.value)}
             placeholder="http://127.0.0.1:4000"
           />
-        </FormRow>
+        </Row>
       </Section>
-    </div>
+    </>
   );
 }
 
@@ -1155,15 +1162,14 @@ export function Settings() {
 
   return (
     <div className="screen" style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-      {/* Page header */}
-      <div className="page-header">
-        <h2 className="page-header__title">Settings</h2>
-        <div className="page-header__action">
+      <PageHeader
+        title="Settings"
+        action={
           <Button variant="primary" onPress={save} isDisabled={saving || loading}>
             {saving ? "Saving..." : saved ? "Saved" : "Save Settings"}
           </Button>
-        </div>
-      </div>
+        }
+      />
 
       {/* Tab bar */}
       <Tabs
@@ -1186,7 +1192,7 @@ export function Settings() {
       {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0, flexShrink: 0 }}>{error}</p>}
 
       {/* Panel area */}
-      <div style={{ flex: 1, overflowY: "auto", marginTop: 4 }}>
+      <div className="settings-body" style={{ flex: 1, overflowY: "auto", marginTop: 4 }}>
         {loading ? (
           <p className="muted-12">Loading settings...</p>
         ) : (
@@ -1249,75 +1255,90 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
   }
 
   return (
-    <div className="settings-body">
+    <>
       <Section title="Built-in Tool Modules">
-        <FormRow label="Memory" hint="Recall, save, and forget memories">
+        <Row label="Memory" hint="Recall, save, and forget memories">
           <Switch isSelected={s.ext_memory_enabled ?? true} onChange={(v) => patch("ext_memory_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="Schedules" hint="Create, manage, and run scheduled tasks">
+        </Row>
+        <Row label="Schedules" hint="Create, manage, and run scheduled tasks">
           <Switch isSelected={s.ext_schedule_enabled ?? true} onChange={(v) => patch("ext_schedule_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="Weather" hint="Fetch current weather data">
+        </Row>
+        <Row label="Weather" hint="Fetch current weather data">
           <Switch isSelected={s.ext_weather_enabled ?? true} onChange={(v) => patch("ext_weather_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="Knowledge" hint="Wikipedia search and article retrieval">
+        </Row>
+        <Row label="Knowledge" hint="Wikipedia search and article retrieval">
           <Switch isSelected={s.ext_knowledge_enabled ?? true} onChange={(v) => patch("ext_knowledge_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="System" hint="Shell commands, file access, notifications, system info">
+        </Row>
+        <Row label="System" hint="Shell commands, file access, notifications, system info">
           <Switch isSelected={s.ext_system_enabled ?? true} onChange={(v) => patch("ext_system_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
-        <FormRow label="Devices" hint="Device registry, profile info, model assignments">
+        </Row>
+        <Row label="Devices" hint="Device registry, profile info, model assignments">
           <Switch isSelected={s.ext_device_enabled ?? true} onChange={(v) => patch("ext_device_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
           </Switch>
-        </FormRow>
+        </Row>
+        <Row label="News" hint="Top stories and headline search">
+          <Switch isSelected={s.ext_news_enabled ?? true} onChange={(v) => patch("ext_news_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
+        <Row label="Finance" hint="Stock quotes, crypto prices, and currency exchange rates">
+          <Switch isSelected={s.ext_finance_enabled ?? true} onChange={(v) => patch("ext_finance_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
+        <Row label="Discovery" hint="Country info, product lookup, web search">
+          <Switch isSelected={s.ext_discovery_enabled ?? true} onChange={(v) => patch("ext_discovery_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
       </Section>
 
       <Section title="Tool Behaviour">
-        <FormRow label="Tool result cache" hint="Cache deterministic tool results to avoid redundant calls">
+        <Row label="Tool result cache" hint="Cache deterministic tool results to avoid redundant calls">
           <Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Cache tool results
           </Switch>
-        </FormRow>
-        <FormRow label="Tool call validation" hint="Validate and repair tool call JSON from small models before execution">
+        </Row>
+        <Row label="Tool call validation" hint="Validate and repair tool call JSON from small models before execution">
           <Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Validate tool calls
           </Switch>
-        </FormRow>
-        <FormRow label="Tool request detection" hint="Detect natural-language tool requests in LLM output and execute them">
+        </Row>
+        <Row label="Tool request detection" hint="Detect natural-language tool requests in LLM output and execute them">
           <Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Detect tool requests
           </Switch>
-        </FormRow>
-        <FormRow label="Multi-tool" hint="Experimental: detect and dispatch multiple tool intents concurrently">
+        </Row>
+        <Row label="Multi-tool" hint="Experimental: detect and dispatch multiple tool intents concurrently">
           <Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Concurrent multi-tool
           </Switch>
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="Scheduling">
-        <FormRow label="Result notifications" hint="Broadcast schedule results as desktop notifications">
+        <Row label="Result notifications" hint="Broadcast schedule results as desktop notifications">
           <Switch isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}>
             <Switch.Control><Switch.Thumb /></Switch.Control>
             Notify on completion
           </Switch>
-        </FormRow>
-        <FormRow label="Max concurrent" hint="Maximum scheduled tasks running simultaneously (1-10)">
+        </Row>
+        <Row label="Max concurrent" hint="Maximum scheduled tasks running simultaneously (1-10)">
           <input
             type="number"
             role="spinbutton"
@@ -1327,8 +1348,8 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             value={s.schedule_max_concurrent ?? 2}
             onChange={(e) => patch("schedule_max_concurrent", Number(e.target.value))}
           />
-        </FormRow>
-        <FormRow label="History per task" hint="Maximum execution history entries retained per schedule">
+        </Row>
+        <Row label="History per task" hint="Maximum execution history entries retained per schedule">
           <input
             type="number"
             role="spinbutton"
@@ -1338,7 +1359,7 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
             value={s.schedule_max_runs_per_task ?? 50}
             onChange={(e) => patch("schedule_max_runs_per_task", Number(e.target.value))}
           />
-        </FormRow>
+        </Row>
       </Section>
 
       <Section title="External Extensions">
@@ -1350,7 +1371,7 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
       </Section>
 
       {showForm && (
-        <Card shadow="none" className="giap-card">
+        <Card className="card">
           <CardContent style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
             <input
               style={nativeInput}
@@ -1417,7 +1438,7 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
           ))}
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1429,21 +1450,28 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
  * <select> with <option> children).
  */
 const nativeInput: React.CSSProperties = {
-  height: "36px",
+  height: "38px",
   border: "1px solid var(--grey-200)",
-  borderRadius: "var(--radius-card)",
-  padding: "0 var(--space-3)",
+  borderRadius: "10px",
+  padding: "0 12px",
   fontSize: "var(--text-base)",
   fontFamily: "var(--font-body)",
+  fontWeight: "var(--weight-regular)" as unknown as number,
   background: "#fff",
   color: "var(--fg)",
   width: "100%",
   userSelect: "text",
+  transition: "border-color 150ms, box-shadow 150ms",
 };
 
 const selectFallback: React.CSSProperties = {
   ...nativeInput,
   cursor: "pointer",
+  appearance: "none",
+  backgroundImage: "url(\"data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238A8A8A' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\")",
+  backgroundRepeat: "no-repeat",
+  backgroundPosition: "right 12px center",
+  paddingRight: "32px",
 };
 
 const charCounter: React.CSSProperties = {
