@@ -184,6 +184,28 @@ impl MemoryMcpServer {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+
+        // Build UI hint from memory fragments
+        if !filtered.is_empty() {
+            let ui_memories: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "content": f.content,
+                        "segment": f.segment.as_ref()
+                            .map(|s| format!("{:?}", s).to_lowercase())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        "importance": f.importance.unwrap_or(0.0),
+                        "created_at": f.created_at.format("%Y-%m-%d").to_string(),
+                    })
+                })
+                .collect();
+            let ui_data = serde_json::json!({ "memories": ui_memories });
+            let hint = format!("[[[mcp-ui:memory:{}]]]\n", ui_data);
+            let full_result = format!("{}{}", hint, text);
+            return Ok(CallToolResult::success(vec![Content::text(full_result)]));
+        }
+
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
@@ -211,7 +233,10 @@ impl MemoryMcpServer {
                     "No content provided to save. Tell me what you'd like me to remember.",
                 )]));
             }
-            println!("[memory] empty content param, using user message: {:?}", user_msg);
+            println!(
+                "[memory] empty content param, using user message: {:?}",
+                user_msg
+            );
             user_msg
         };
         let tag_list: Vec<String> = params
@@ -309,9 +334,17 @@ impl MemoryMcpServer {
 
         let seg_label = format!("{:?}", segment).to_lowercase();
         let tier_label = format!("{:?}", tier).to_lowercase();
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        let plain_text = format!(
             "Memory saved ({seg_label}, importance={importance:.1}, tier={tier_label}): {content}"
-        ))]))
+        );
+        let ui_data = serde_json::json!({
+            "content": content,
+            "segment": seg_label,
+            "saved": true,
+        });
+        let hint = format!("[[[mcp-ui:memory_saved:{}]]]\n", ui_data);
+        let full_result = format!("{}{}", hint, plain_text);
+        Ok(CallToolResult::success(vec![Content::text(full_result)]))
     }
 
     #[tool(description = "Delete a specific memory by ID or by exact content match.")]

@@ -96,7 +96,15 @@ impl SystemMcpServer {
             now.format("%A, %B %d, %Y"),
             now.format("%Z (UTC%:z)")
         );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        let ui_data = serde_json::json!({
+            "time": now.format("%H:%M").to_string(),
+            "timezone": now.format("%Z").to_string(),
+            "date": now.format("%A, %B %d, %Y").to_string(),
+            "utc_offset": now.format("%:z").to_string(),
+        });
+        let hint = format!("[[[mcp-ui:time:{}]]]\n", ui_data);
+        let full_result = format!("{}{}", hint, text);
+        Ok(CallToolResult::success(vec![Content::text(full_result)]))
     }
 
     #[tool(
@@ -163,9 +171,22 @@ impl SystemMcpServer {
             sections.push(format!("Disks:\n{}", disk_lines.join("\n")));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            sections.join("\n\n"),
-        )]))
+        // Build UI hint with system overview
+        let os_name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
+        let arch = sysinfo::System::cpu_arch();
+        let mut sys_mem = sysinfo::System::new();
+        sys_mem.refresh_memory();
+        let total_gb = sys_mem.total_memory() as f64 / 1_073_741_824.0;
+        let ui_data = serde_json::json!({
+            "platform": os_name,
+            "arch": arch,
+            "memory_total": format!("{:.0} GB", total_gb),
+            "cpu": sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string()),
+        });
+        let hint = format!("[[[mcp-ui:system:{}]]]\n", ui_data);
+        let plain_text = sections.join("\n\n");
+        let full_result = format!("{}{}", hint, plain_text);
+        Ok(CallToolResult::success(vec![Content::text(full_result)]))
     }
 
     #[tool(
