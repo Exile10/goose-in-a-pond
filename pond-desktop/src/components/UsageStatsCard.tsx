@@ -32,7 +32,7 @@ export function UsageStatsCard({ data, loading, inputPricePerMillion, outputPric
   const outputPrice = outputPricePerMillion ?? DEFAULT_OUTPUT_PER_1M;
   if (loading) {
     return (
-      <Card shadow="none" className="giap-card">
+      <Card className="card">
         <CardContent>
           <div className="card-header" style={{ padding: 0 }}>
             <span className="card__label">Usage & Savings</span>
@@ -45,7 +45,7 @@ export function UsageStatsCard({ data, loading, inputPricePerMillion, outputPric
 
   if (!data || data.total_tokens === 0) {
     return (
-      <Card shadow="none" className="giap-card">
+      <Card className="card">
         <CardContent>
           <div className="card-header" style={{ padding: 0 }}>
             <span className="card__label">Usage & Savings</span>
@@ -63,7 +63,7 @@ export function UsageStatsCard({ data, loading, inputPricePerMillion, outputPric
     (data.total_completion_tokens / 1_000_000) * outputPrice;
 
   return (
-    <Card shadow="none" className="giap-card">
+    <Card className="card">
       <CardContent>
         <div className="card-header" style={{ padding: 0, marginBottom: 12 }}>
           <span className="card__label">Usage & Savings</span>

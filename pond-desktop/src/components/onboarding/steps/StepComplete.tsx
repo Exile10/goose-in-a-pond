@@ -74,7 +74,7 @@ export function StepComplete({ onFinish }: Props) {
             badge="Beta"
           />
         </div>
-        <p className="ob-field-hint" style={{ fontStyle: "italic", marginTop: 12 }}>
+        <p className="ob-complete__extensions-hint ob-field-hint">
           Custom MCP servers and more can be added in Settings &rarr; Extensions.
         </p>
       </div>

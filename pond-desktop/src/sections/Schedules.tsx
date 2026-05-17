@@ -3,12 +3,12 @@ import {
   Card,
   CardContent,
   Button,
-  Switch,
   Chip,
   Separator,
 } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { PageHeader } from "../components/shared";
 import { useAppState } from "../state/AppContext";
 import type { Schedule, ScheduleRun } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
@@ -109,6 +109,58 @@ function humanPreview(repeat: RepeatPattern, cfg: ScheduleConfig, timezone: stri
   }
 }
 
+function timeAgo(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function parseCronToConfig(cron: string): { repeat: RepeatPattern; config: ScheduleConfig } {
+  const cfg = defaultConfig();
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 6) return { repeat: "custom", config: { ...cfg, customCron: cron } };
+
+  const [_sec, min, hour, dom, _month, dow] = parts;
+
+  // Hourly: "0 M */N * * *"
+  if (hour.startsWith("*/") && dom === "*" && dow === "*") {
+    cfg.everyNHours = parseInt(hour.slice(2)) || 1;
+    cfg.startMinute = parseInt(min) || 0;
+    return { repeat: "hourly", config: cfg };
+  }
+
+  const h = parseInt(hour);
+  const m = parseInt(min);
+  if (isNaN(h) || isNaN(m)) return { repeat: "custom", config: { ...cfg, customCron: cron } };
+  cfg.hour = h;
+  cfg.minute = m;
+
+  // Monthly: "0 M H D * *"
+  if (dom !== "*" && dow === "*") {
+    cfg.dayOfMonth = parseInt(dom) || 1;
+    return { repeat: "monthly", config: cfg };
+  }
+
+  // Weekly: "0 M H * * d,d,d"
+  if (dom === "*" && dow !== "*") {
+    cfg.daysOfWeek = dow.split(",").map((d) => parseInt(d)).filter((d) => !isNaN(d));
+    if (cfg.daysOfWeek.length === 0) cfg.daysOfWeek = [1];
+    return { repeat: "weekly", config: cfg };
+  }
+
+  // Daily: "0 M H * * *"
+  if (dom === "*" && dow === "*") {
+    return { repeat: "daily", config: cfg };
+  }
+
+  return { repeat: "custom", config: { ...cfg, customCron: cron } };
+}
+
 /* ── Recipe / prompt presets ───────────────────────────────── */
 const RECIPE_PRESETS: Record<string, string> = {
   "Morning briefing":     "Give me a morning briefing: weather, calendar, and top news.",
@@ -141,11 +193,14 @@ const TIMEZONE_OPTIONS = [
 
 export function Schedules() {
   const state = useAppState();
-  const [schedules, setSchedules]     = useState<Schedule[]>([]);
-  const [loading, setLoading]         = useState(true);
-  const [error, setError]             = useState<string | null>(null);
-  const [actionMsg, setActionMsg]     = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [schedules, setSchedules]         = useState<Schedule[]>([]);
+  const [loading, setLoading]             = useState(true);
+  const [error, setError]                 = useState<string | null>(null);
+  const [actionMsg, setActionMsg]         = useState<string | null>(null);
+  const [actionError, setActionError]     = useState<string | null>(null);
+  const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null);
+  const [runningIds, setRunningIds]       = useState<Set<string>>(new Set());
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   // View toggle: list vs calendar
   const [view, setView] = useState<"list" | "calendar">(() => {
@@ -192,14 +247,27 @@ export function Schedules() {
     load();
   }, []);
 
-  // Refresh the list whenever a new schedule result arrives via the global
-  // SSE listener in AppContext (state.latestScheduleResult).
-  const latestResult = state.latestScheduleResult;
+  // Track running schedules and refresh on completion via global SSE listener.
+  const latestScheduleResult = state.latestScheduleResult;
   useEffect(() => {
-    if (!latestResult) return;
-    load();
+    if (!latestScheduleResult) return;
+    if (latestScheduleResult.status === "running") {
+      setRunningIds((prev) => {
+        const next = new Set(prev);
+        next.add(latestScheduleResult.schedule_id);
+        return next;
+      });
+    } else {
+      setRunningIds((prev) => {
+        const next = new Set(prev);
+        next.delete(latestScheduleResult.schedule_id);
+        return next;
+      });
+      // Refresh schedule list when a run completes to update last_run
+      load();
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [latestResult]);
+  }, [latestScheduleResult]);
 
   function flashMsg(msg: string, isError = false) {
     if (isError) {
@@ -265,6 +333,27 @@ export function Schedules() {
     }
   }
 
+  async function handleUpdate() {
+    if (!editingSchedule) return;
+    setSubmitting(true);
+    try {
+      const patch: Record<string, string> = {};
+      if (name.trim()) patch.name = name.trim();
+      if (pickerCron.trim()) patch.cron = pickerCron.trim();
+      if (prompt.trim()) patch.prompt = prompt.trim();
+      if (timezone) patch.timezone = timezone;
+      await api.updateSchedule(editingSchedule.id, patch);
+      setEditingSchedule(null);
+      setShowForm(false);
+      flashMsg("Schedule updated.");
+      load();
+    } catch (e) {
+      flashMsg(String(e), true);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function handleDelete(id: string, schedName: string) {
     if (!confirm(`Delete schedule "${schedName}"?`)) return;
     try {
@@ -320,18 +409,23 @@ export function Schedules() {
     if (preset) setPrompt(preset);
   }
 
-  /* ── Create-form modal overlay ──────────────────────────── */
+  function closeModal() {
+    setShowForm(false);
+    setEditingSchedule(null);
+  }
+
+  /* ── Create / Edit form modal overlay ───────────────────── */
   function renderModal() {
     if (!showForm) return null;
     return (
-      <div style={modalStyles.overlay} onClick={() => setShowForm(false)}>
+      <div style={modalStyles.overlay} onClick={closeModal}>
         <div style={modalStyles.dialog} onClick={(e) => e.stopPropagation()}>
           {/* Header */}
           <div style={modalStyles.header}>
-            <h2 style={modalStyles.title}>New Schedule</h2>
+            <h2 style={modalStyles.title}>{editingSchedule ? "Edit Schedule" : "New Schedule"}</h2>
             <button
               style={modalStyles.closeBtn}
-              onClick={() => setShowForm(false)}
+              onClick={closeModal}
               aria-label="Close"
             >
               x
@@ -569,16 +663,18 @@ export function Schedules() {
 
           {/* Footer */}
           <div style={modalStyles.footer}>
-            <Button size="sm" variant="light" onPress={() => setShowForm(false)}>
+            <Button size="sm" variant="ghost" onPress={closeModal}>
               Cancel
             </Button>
             <Button
               size="sm"
-              color="secondary"
-              onPress={handleCreate}
+              variant="primary"
+              onPress={editingSchedule ? handleUpdate : handleCreate}
               isDisabled={submitting || !name.trim() || !pickerCron.trim() || !prompt.trim()}
             >
-              {submitting ? "Creating..." : "Create Schedule"}
+              {submitting
+                ? editingSchedule ? "Updating..." : "Creating..."
+                : editingSchedule ? "Update Schedule" : "Create Schedule"}
             </Button>
           </div>
         </div>
@@ -587,7 +683,7 @@ export function Schedules() {
   }
 
   return (
-    <div className="screen">
+    <div className="screen screen--schedules">
       {/* ── Page header ─────────────────────────────────────── */}
       <div className="page-header">
         <h1 className="page-header__title">Schedules</h1>
@@ -600,7 +696,7 @@ export function Schedules() {
               aria-label="List view"
               title="List view"
             >
-              <List size={14} />
+              <List size={16} />
             </button>
             <button
               className={`view-toggle__btn${view === "calendar" ? " is-active" : ""}`}
@@ -609,12 +705,12 @@ export function Schedules() {
               aria-label="Calendar view"
               title="Calendar view"
             >
-              <Calendar size={14} />
+              <Calendar size={16} />
             </button>
           </div>
           <Button
             size="sm"
-            color="secondary"
+            variant="primary"
             isDisabled={!state.serverOnline}
             onPress={() => setShowForm(true)}
             startContent={<Plus size={14} />}
@@ -654,60 +750,64 @@ export function Schedules() {
       ) : (
         <div className="sched-grid">
           {schedules.map((s) => (
-            <Card key={s.id} shadow="none" className="giap-card">
+            <Card key={s.id} className="card sched-card">
               <CardContent>
-                {/* Head: icon + name + cron + toggle */}
+                {/* Head: icon + name + toggle */}
                 <div className="sched-card__head">
                   <div className="sched-card__icon">
-                    <CalendarClock size={18} />
+                    <CalendarClock size={16} />
                   </div>
                   <div className="sched-card__main">
                     <div className="sched-card__name">{s.name}</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                      <code style={cronStyle}>{s.cron}</code>
+                    <div className="sched-card__subtitle">
+                      <code className="sched-card__cron">{s.cron}</code>
                       {s.timezone && s.timezone !== "UTC" && (
-                        <span style={{ fontSize: 11, color: "var(--grey-500)" }}>
-                          <Clock size={10} style={{ marginRight: 2, verticalAlign: "middle" }} />
+                        <span className="sched-card__tz">
+                          <Clock size={9} />
                           {s.timezone}
                         </span>
                       )}
                     </div>
                   </div>
-                  <Switch
-                    size="sm"
-                    color="success"
-                    isSelected={s.enabled}
-                    onValueChange={() => handleToggle(s)}
-                    isDisabled={!state.serverOnline}
-                    aria-label={s.enabled ? "Pause schedule" : "Resume schedule"}
-                  >
-                    <Switch.Control><Switch.Thumb /></Switch.Control>
-                  </Switch>
+                  <label className="toggle-wrap" aria-label={s.enabled ? "Pause schedule" : "Resume schedule"}>
+                    <input
+                      type="checkbox"
+                      checked={s.enabled}
+                      disabled={!state.serverOnline}
+                      onChange={() => handleToggle(s)}
+                    />
+                    <span className="toggle-track" />
+                    <span className="toggle-thumb" />
+                  </label>
                 </div>
 
-                {/* Meta: recipe + next run */}
+                {/* Meta: recipe + status */}
                 <div className="sched-card__meta">
-                  <div>
-                    <span className="muted-12">Recipe</span>
-                    <p style={{ margin: "2px 0 0", fontSize: "var(--text-sm)" }}>
+                  <div className="sched-card__meta-row">
+                    <span className="sched-card__meta-label">Recipe</span>
+                    <span className="sched-card__meta-value">
                       {s.prompt
-                        ? s.prompt.length > 80
-                          ? s.prompt.slice(0, 80) + "..."
+                        ? s.prompt.length > 60
+                          ? s.prompt.slice(0, 60) + "..."
                           : s.prompt
                         : "--"}
-                    </p>
+                    </span>
                   </div>
-                  <div>
-                    <span className="muted-12">Status</span>
-                    <p style={{ margin: "2px 0 0" }}>
-                      <Chip
-                        size="sm"
-                        variant="flat"
-                        color={s.enabled ? "success" : "default"}
-                      >
-                        {s.enabled ? "Active" : "Paused"}
-                      </Chip>
-                    </p>
+                  <div className="sched-card__meta-row">
+                    <span className="sched-card__meta-label">Status</span>
+                    {(() => {
+                      const isRunning = runningIds.has(s.id);
+                      return (
+                        <Chip
+                          size="sm"
+                          variant="flat"
+                          color={isRunning ? "warning" : s.enabled ? "success" : "default"}
+                          className={isRunning ? "sched-card__chip--running" : ""}
+                        >
+                          {isRunning ? "Running" : s.enabled ? "Active" : "Paused"}
+                        </Chip>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -715,32 +815,41 @@ export function Schedules() {
                 <div className="sched-card__actions">
                   <Button
                     size="sm"
-                    variant="light"
+                    variant="ghost"
                     onPress={() => handleRunNow(s)}
                     isDisabled={!state.serverOnline}
                     aria-label="Run now"
-                    startContent={<Play size={12} />}
+                    startContent={<Play size={11} />}
                   >
                     Run now
                   </Button>
                   <Button
                     size="sm"
-                    variant="light"
+                    variant="ghost"
                     isDisabled={!state.serverOnline}
                     aria-label="Edit schedule"
-                    startContent={<Pencil size={12} />}
+                    startContent={<Pencil size={11} />}
+                    onPress={() => {
+                      const parsed = parseCronToConfig(s.cron);
+                      setName(s.name);
+                      setPrompt(s.prompt);
+                      setTimezone(s.timezone ?? "UTC");
+                      setRepeat(parsed.repeat);
+                      setSchedCfg(parsed.config);
+                      setEditingSchedule(s);
+                      setShowForm(true);
+                    }}
                   >
                     Edit
                   </Button>
                   <Button
                     size="sm"
-                    variant="light"
-                    color="danger"
+                    variant="ghost"
                     className="sched-card__trash"
                     onPress={() => handleDelete(s.id, s.name)}
                     isDisabled={!state.serverOnline}
                     aria-label="Delete schedule"
-                    startContent={<Trash2 size={12} />}
+                    startContent={<Trash2 size={11} />}
                   >
                     Delete
                   </Button>
@@ -762,6 +871,26 @@ export function Schedules() {
 
                   {expandedRuns === s.id && (
                     <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {/* Mini health bar — last 5 run statuses */}
+                      {(runsCache[s.id] ?? []).length > 0 && (
+                        <div className="sched-health-bar">
+                          {(runsCache[s.id] ?? []).slice(0, 5).map((r) => (
+                            <span
+                              key={r.id}
+                              className="sched-health-dot"
+                              title={`${r.status} — ${new Date(r.started_at).toLocaleString()}`}
+                              style={{
+                                width: 8, height: 8, borderRadius: "50%",
+                                background: r.status === "completed"
+                                  ? "var(--color-success, #34C759)"
+                                  : r.status === "failed"
+                                  ? "var(--color-destructive, #FF3B30)"
+                                  : "var(--color-warning, #FF9500)",
+                              }}
+                            />
+                          ))}
+                        </div>
+                      )}
                       {(runsCache[s.id] ?? []).length === 0 ? (
                         <span style={{ fontSize: 12, color: "var(--grey-400)" }}>No runs yet.</span>
                       ) : (
@@ -781,25 +910,33 @@ export function Schedules() {
                             >
                               {r.status}
                             </Chip>
-                            <span style={{ color: "var(--grey-500)", whiteSpace: "nowrap" }}>
-                              {new Date(r.started_at).toLocaleString(undefined, {
-                                month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-                              })}
+                            <span
+                              style={{ color: "var(--grey-500)", whiteSpace: "nowrap" }}
+                              title={new Date(r.started_at).toLocaleString()}
+                            >
+                              {timeAgo(r.started_at)}
                             </span>
                             {r.duration_ms != null && (
                               <span style={{ color: "var(--grey-400)" }}>{(r.duration_ms / 1000).toFixed(1)}s</span>
                             )}
-                            {r.result && (
-                              <span style={{
-                                flex: 1, overflow: "hidden", textOverflow: "ellipsis",
-                                whiteSpace: "nowrap", color: "var(--grey-600)",
-                              }}>
-                                {r.result.slice(0, 120)}
-                              </span>
-                            )}
-                            {r.error && (
-                              <span style={{ color: "var(--color-destructive)", flex: 1 }}>
-                                {r.error.slice(0, 120)}
+                            {(r.result || r.error) && (
+                              <span
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setExpandedRunId(expandedRunId === r.id ? null : r.id);
+                                }}
+                                style={{
+                                  flex: 1, overflow: "hidden",
+                                  textOverflow: expandedRunId === r.id ? "unset" : "ellipsis",
+                                  whiteSpace: expandedRunId === r.id ? "pre-wrap" : "nowrap",
+                                  color: r.error ? "var(--color-destructive)" : "var(--grey-600)",
+                                  cursor: "pointer",
+                                  wordBreak: expandedRunId === r.id ? "break-word" : undefined,
+                                }}
+                              >
+                                {expandedRunId === r.id
+                                  ? (r.result ?? r.error ?? "")
+                                  : (r.result ?? r.error ?? "").slice(0, 120)}
                               </span>
                             )}
                           </div>
@@ -820,17 +957,7 @@ export function Schedules() {
   );
 }
 
-/* ── Inline cron code style ────────────────────────────────── */
-const cronStyle: React.CSSProperties = {
-  fontFamily: "var(--font-mono)",
-  fontSize: "11px",
-  color: "var(--grey-600)",
-  background: "var(--grey-100)",
-  padding: "2px 8px",
-  borderRadius: "4px",
-  display: "inline-block",
-  marginTop: "2px",
-};
+/* cronStyle removed — cron is now styled via .sched-card__cron CSS class */
 
 /* ── Schedule picker styles ────────────────────────────────── */
 const pickerStyles: Record<string, React.CSSProperties> = {

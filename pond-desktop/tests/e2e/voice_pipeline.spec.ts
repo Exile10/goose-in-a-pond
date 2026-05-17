@@ -16,7 +16,7 @@ import { mockAllApiRoutes } from "./helpers/api-mocks";
 
 // The sidebar footer has a button with exact aria-label "Voice mode"
 // (not to be confused with other buttons that contain "voice mode" in their text)
-const VOICE_BTN = '[aria-label="Voice mode"][title*="Switch"]';
+const VOICE_BTN = '[aria-label="Voice mode"]';
 
 test.beforeEach(async ({ page }) => {
   await mockAllApiRoutes(page);

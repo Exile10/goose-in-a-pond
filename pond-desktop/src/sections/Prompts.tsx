@@ -1,74 +1,93 @@
 import { useState, useEffect } from "react";
-import { Button, Card, CardContent, Chip } from "@heroui/react";
-import { RotateCcw, Save } from "lucide-react";
+import { Button, Card, CardContent, Chip, Tabs } from "@heroui/react";
+import { Cpu, RotateCcw, Save } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { PageHeader } from "../components/shared";
 import type { PromptTemplate } from "../api/types";
 
-// ── Preset descriptions (keyed by common template names) ─────
-const PRESET_META: Record<string, string> = {
-  system:   "Core system prompt sent with every request",
-  chat:     "Lightweight prompt for casual conversation",
-  think:    "Reasoning prompt for analytical tasks",
-  task:     "Action-oriented prompt for tool use & tasks",
+// ── Preset metadata ───────────────────────────────────────────
+const PRESET_META: Record<string, { label: string; desc: string }> = {
+  balanced:  { label: "Balanced",  desc: "Natural conversation, medium-length responses" },
+  concise:   { label: "Concise",   desc: "Short, direct answers. Minimal explanation" },
+  technical: { label: "Technical", desc: "Precise, detailed. Favors accuracy over brevity" },
+  warm:      { label: "Warm",      desc: "Friendly, encouraging tone. Conversational style" },
 };
+
+/** The four preset keys in display order. */
+const PRESET_KEYS = ["balanced", "concise", "technical", "warm"];
 
 /** Rough token estimate: ~4 chars per token. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Known template variables the backend interpolates. */
+/** Template variables the backend interpolates. */
 const TEMPLATE_VARS = [
-  "{{user_name}}",
-  "{{assistant_name}}",
-  "{{personality}}",
-  "{{location}}",
-  "{{datetime}}",
-  "{{timezone}}",
-  "{{memory}}",
+  "assistant_name",
+  "user_name",
+  "personality",
+  "timezone",
+  "location",
+  "current_date",
+  "device_count",
+  "online_device_names",
+  "has_home_devices",
 ];
 
 export function Prompts() {
-  const [prompts, setPrompts]   = useState<PromptTemplate[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [content, setContent]   = useState("");
-  const [original, setOriginal] = useState("");
-  const [loading, setLoading]   = useState(true);
-  const [saving, setSaving]     = useState(false);
-  const [error, setError]       = useState<string | null>(null);
+  const [prompts, setPrompts]     = useState<PromptTemplate[]>([]);
+  const [active, setActive]       = useState<string>("balanced");
+  const [bodies, setBodies]       = useState<Record<string, string>>({});
+  const [originals, setOriginals] = useState<Record<string, string>>({});
+  const [loading, setLoading]     = useState(true);
+  const [saving, setSaving]       = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [error, setError]         = useState<string | null>(null);
 
   useEffect(() => {
-    api.listPrompts()
-      .then((p) => {
-        const list = Array.isArray(p) ? p : [];
-        setPrompts(list);
-        if (list.length) select(list[0].name, list);
+    api
+      .listPrompts()
+      .then((list) => {
+        const arr = Array.isArray(list) ? list : [];
+        setPrompts(arr);
+
+        // Seed bodies + originals from API data
+        const bodyMap: Record<string, string> = {};
+        const origMap: Record<string, string> = {};
+        for (const p of arr) {
+          bodyMap[p.name] = p.content;
+          origMap[p.name] = p.content;
+        }
+        setBodies(bodyMap);
+        setOriginals(origMap);
+
+        // Select first available preset, falling back to first item
+        const firstPreset = PRESET_KEYS.find((k) => arr.some((p) => p.name === k));
+        if (firstPreset) setActive(firstPreset);
+        else if (arr.length) setActive(arr[0].name);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, []);
 
-  function select(name: string, list?: PromptTemplate[]) {
-    setSelected(name);
-    const src = list ?? prompts;
-    const p = src.find((x) => x.name === name);
-    if (p) {
-      setContent(p.content);
-      setOriginal(p.content);
-    }
-  }
+  /** Sorted list: known presets first, then any extras. */
+  const orderedPrompts = [
+    ...PRESET_KEYS.map((k) => prompts.find((p) => p.name === k)).filter(Boolean),
+    ...prompts.filter((p) => !PRESET_KEYS.includes(p.name)),
+  ] as PromptTemplate[];
 
-  function reset() {
-    setContent(original);
-  }
+  const body = bodies[active] ?? "";
+  const dirty = body !== (originals[active] ?? "");
+  const tokens = estimateTokens(body);
 
   async function save() {
-    if (!selected) return;
+    if (!active) return;
     setSaving(true);
     try {
-      const updated = await api.updatePrompt(selected, content);
-      setPrompts((prev) => prev.map((p) => p.name === selected ? updated : p));
-      setOriginal(content);
+      const updated = await api.updatePrompt(active, body);
+      setPrompts((prev) => prev.map((p) => (p.name === active ? updated : p)));
+      setOriginals((prev) => ({ ...prev, [active]: updated.content }));
+      setBodies((prev) => ({ ...prev, [active]: updated.content }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -76,106 +95,141 @@ export function Prompts() {
     }
   }
 
-  if (loading) return <p className="muted-12">Loading...</p>;
-  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
-  if (!prompts.length) return (
-    <p className="muted-12">
-      No prompt templates found. Prompts are created automatically when the agent runs for the first time.
-    </p>
-  );
+  async function reset() {
+    if (!active) return;
+    setResetting(true);
+    try {
+      const restored = await api.resetPrompt(active);
+      setPrompts((prev) => prev.map((p) => (p.name === active ? restored : p)));
+      setOriginals((prev) => ({ ...prev, [active]: restored.content }));
+      setBodies((prev) => ({ ...prev, [active]: restored.content }));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setResetting(false);
+    }
+  }
 
-  const dirty = content !== original;
-  const tokens = estimateTokens(content);
+  if (loading) return <p className="muted-12">Loading...</p>;
+  if (error)
+    return (
+      <p className="muted-12" style={{ color: "var(--color-destructive)" }}>
+        {error}
+      </p>
+    );
+  if (!prompts.length)
+    return (
+      <p className="muted-12">
+        No prompt templates found. Prompts are created automatically when the agent runs for the
+        first time.
+      </p>
+    );
 
   return (
     <div className="screen">
-      {/* Page header */}
-      <div className="page-header">
-        <h2 className="page-header__title">Prompts</h2>
-        <Chip size="sm" variant="soft">{prompts.length} preset{prompts.length !== 1 ? "s" : ""}</Chip>
-      </div>
+      <PageHeader
+        title="Prompts"
+        action={
+          <Chip size="sm" variant="soft">
+            {orderedPrompts.length} preset{orderedPrompts.length !== 1 ? "s" : ""}
+          </Chip>
+        }
+      />
 
-      {/* Prompt tab grid */}
-      <div className="prompt-tabs">
-        {prompts.map((p) => (
-          <button
-            key={p.name}
-            className={`prompt-tab${selected === p.name ? " is-active" : ""}`}
-            onClick={() => select(p.name)}
-          >
-            <div className="prompt-tab__title">
-              <span>{p.name}</span>
-              <span className="prompt-tab__desc">
-                {PRESET_META[p.name] ?? "Custom template"}
-              </span>
+      {/* Preset tabs */}
+      <Tabs selectedKey={active} onSelectionChange={(k) => setActive(String(k))}>
+        <Tabs.ListContainer>
+          <Tabs.List aria-label="Prompt presets" className="prompt-tabs">
+            {orderedPrompts.map((p) => {
+              const meta = PRESET_META[p.name];
+              return (
+                <Tabs.Tab
+                  key={p.name}
+                  id={p.name}
+                  onClick={() => setActive(p.name)}
+                  className="prompt-tab"
+                >
+                  <Tabs.Indicator />
+                  <div className="prompt-tab__title">
+                    <span>{meta?.label ?? p.name}</span>
+                    <span className="prompt-tab__desc">
+                      {meta?.desc ?? "Custom template"}
+                    </span>
+                  </div>
+                </Tabs.Tab>
+              );
+            })}
+          </Tabs.List>
+        </Tabs.ListContainer>
+      </Tabs>
+
+      {/* Editor card */}
+      <Card className="card">
+        <CardContent>
+          <textarea
+            className="prompt-area"
+            value={body}
+            onChange={(e) =>
+              setBodies((prev) => ({ ...prev, [active]: e.target.value }))
+            }
+            aria-label="Prompt editor"
+            rows={16}
+            spellCheck={false}
+            placeholder={`Write the ${PRESET_META[active]?.label?.toLowerCase() ?? active} system prompt…`}
+            style={{
+              width: "100%",
+              border: "1px solid var(--grey-200)",
+              borderRadius: "var(--radius-card)",
+              padding: "12px",
+              background: "var(--bg)",
+              color: "var(--fg)",
+              resize: "vertical",
+              lineHeight: "1.55",
+            }}
+          />
+          <div className="prompt-foot">
+            <div className="prompt-foot__tokens">
+              <Cpu size={13} />
+              <span>~{tokens.toLocaleString()} tokens</span>
+              {dirty && (
+                <Chip size="sm" variant="soft" color="warning">
+                  Unsaved
+                </Chip>
+              )}
             </div>
-          </button>
-        ))}
-      </div>
-
-      {/* Editor */}
-      {selected && (
-        <Card shadow="none" className="giap-card">
-          <CardContent>
-            <textarea
-              className="prompt-area"
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              aria-label="Prompt editor"
-              rows={16}
-              spellCheck={false}
-              style={{
-                width: "100%",
-                border: "1px solid var(--grey-200)",
-                borderRadius: "var(--radius-card)",
-                padding: "12px",
-                background: "#fff",
-                color: "var(--fg)",
-                resize: "vertical",
-                lineHeight: "1.55",
-              }}
-            />
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Footer */}
-      {selected && (
-        <div className="prompt-foot">
-          <div className="prompt-foot__tokens">
-            <span>~{tokens.toLocaleString()} tokens</span>
-            {dirty && <Chip size="sm" color="warning" variant="soft">Unsaved</Chip>}
+            <div className="prompt-foot__actions">
+              <Button
+                variant="ghost"
+                size="sm"
+                onPress={reset}
+                isDisabled={resetting || saving}
+              >
+                <RotateCcw size={13} />
+                {resetting ? "Resetting…" : "Reset"}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onPress={save}
+                isDisabled={saving || !dirty}
+              >
+                <Save size={13} />
+                {saving ? "Saving…" : "Save"}
+              </Button>
+            </div>
           </div>
-          <div className="prompt-foot__actions">
-            <Button
-              variant="outline"
-              onPress={reset}
-              isDisabled={!dirty}
-            >
-              <RotateCcw size={14} />
-              Reset
-            </Button>
-            <Button
-              variant="primary"
-              onPress={save}
-              isDisabled={saving || !dirty}
-            >
-              <Save size={14} />
-              {saving ? "Saving..." : "Save"}
-            </Button>
-          </div>
-        </div>
-      )}
+        </CardContent>
+      </Card>
 
-      {/* Variables reference */}
-      <Card shadow="none" className="giap-card">
+      {/* Variables reference card */}
+      <Card className="card">
         <CardContent>
           <span className="card__label">Variables you can use</span>
           <div className="var-grid">
             {TEMPLATE_VARS.map((v) => (
-              <Chip key={v} size="sm" variant="soft">
-                <code style={{ fontFamily: "var(--font-mono)", fontSize: "11px" }}>{v}</code>
-              </Chip>
+              <code key={v} className="var-chip">
+                {`{{${v}}}`}
+              </code>
             ))}
           </div>
         </CardContent>

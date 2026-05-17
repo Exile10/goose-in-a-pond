@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { CheckCircle, XCircle, Bell, X } from "lucide-react";
+import { CheckCircle, XCircle, Loader, Bell, X } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import type { ScheduleToast } from "../state/reducer";
 
@@ -9,18 +9,23 @@ function ToastCard({ toast }: { toast: ScheduleToast }) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    // Running toasts stay visible until replaced by a completion event
+    if (toast.status === "running") return;
     timerRef.current = setTimeout(() => {
       dispatch({ type: "DISMISS_TOAST", payload: toast.id });
     }, 5000);
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [toast.id, dispatch]);
+  }, [toast.id, toast.status, dispatch]);
 
   const isOk = toast.status === "completed";
-  const preview = isOk
-    ? toast.result?.slice(0, 80) ?? null
-    : toast.error?.slice(0, 80) ?? null;
+  const isRunning = toast.status === "running";
+  const preview = isRunning
+    ? "Running..."
+    : isOk
+      ? toast.result?.slice(0, 80) ?? null
+      : toast.error?.slice(0, 80) ?? null;
 
   return (
     <div
@@ -31,9 +36,11 @@ function ToastCard({ toast }: { toast: ScheduleToast }) {
       onClick={() => dispatch({ type: "DISMISS_TOAST", payload: toast.id })}
     >
       <div className="toast-card__icon">
-        {isOk
-          ? <CheckCircle size={16} />
-          : <XCircle size={16} />
+        {isRunning
+          ? <Loader size={16} className="toast-card__spinner" />
+          : isOk
+            ? <CheckCircle size={16} />
+            : <XCircle size={16} />
         }
       </div>
       <div className="toast-card__body">

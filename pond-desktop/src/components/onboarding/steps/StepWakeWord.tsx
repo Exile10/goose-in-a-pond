@@ -70,7 +70,7 @@ export function StepWakeWord() {
       {/* Custom phrase input */}
       {isCustom && (
         <div className="ob-field">
-          <FormLabel>Your custom phrase <span style={{ color: "var(--color-destructive)" }}>*</span></FormLabel>
+          <FormLabel>Your custom phrase <span className="ob-required">*</span></FormLabel>
           <input
             className="ob-input"
             placeholder="e.g. hey duck, morning pond"
@@ -86,7 +86,7 @@ export function StepWakeWord() {
         <div className="ob-calibration__header">
           <div>
             <div className="ob-calibration__title">
-              <Mic size={16} strokeWidth={1.8} style={{ display: "inline", verticalAlign: "-2px", marginRight: 6 }} />
+              <Mic size={16} strokeWidth={1.8} className="ob-calibration__title-icon" />
               Calibrate microphone
             </div>
             <p className="ob-calibration__desc">

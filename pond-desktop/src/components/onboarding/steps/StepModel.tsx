@@ -149,7 +149,7 @@ export function StepModel() {
                     <span className="ob-toggle-row__badge">Recommended</span>
                   )}
                   {p.models.length > 0 && (
-                    <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginLeft: 4 }}>
+                    <span className="ob-model-count">
                       {p.models.length} model{p.models.length !== 1 ? "s" : ""}
                     </span>
                   )}
@@ -163,9 +163,9 @@ export function StepModel() {
 
       {/* ── LLM Model ────────────────────────────────────── */}
       <div className="ob-field">
-        <FormLabel>Chat model <span style={{ color: "var(--color-destructive)" }}>*</span></FormLabel>
+        <FormLabel>Chat model <span className="ob-required">*</span></FormLabel>
         {loading && <p className="ob-field-hint">Loading available models...</p>}
-        {error && <p style={{ fontSize: "var(--text-sm)", color: "var(--color-destructive)" }}>{error}</p>}
+        {error && <p className="ob-field-error">{error}</p>}
         {!loading && currentLlmModels.length === 0 && !error && (
           <p className="ob-field-hint">No models available for this provider. Make sure the provider is running.</p>
         )}

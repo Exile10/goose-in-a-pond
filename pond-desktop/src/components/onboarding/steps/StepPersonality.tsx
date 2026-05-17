@@ -74,7 +74,7 @@ export function StepPersonality() {
 
       {/* Assistant name */}
       <div className="ob-field">
-        <FormLabel>Assistant name <span style={{ color: "var(--color-destructive)" }}>*</span></FormLabel>
+        <FormLabel>Assistant name <span className="ob-required">*</span></FormLabel>
         <input
           className="ob-input"
           placeholder="Goose"

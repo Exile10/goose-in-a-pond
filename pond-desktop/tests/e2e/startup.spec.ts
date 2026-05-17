@@ -27,7 +27,7 @@ test.describe("App startup", () => {
   test("server status indicator is visible", async ({ page }) => {
     await page.goto("/");
     // Status dot exists — health + handshake mocked so it should show Connected
-    await expect(page.locator('[style*="border-radius: 50%"]').first()).toBeVisible();
+    await expect(page.locator('.sidebar__status-dot').first()).toBeVisible();
   });
 
   test("Voice mode button is present in sidebar footer", async ({ page }) => {

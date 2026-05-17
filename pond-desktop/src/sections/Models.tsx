@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
+import { PageHeader } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
   HfModel, HfModelFile, DownloadEntry,
@@ -117,13 +118,6 @@ function ActiveRolesBanner({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <span className="card__label">Active Roles</span>
-        <Button size="sm" variant="ghost" isIconOnly onPress={onRefresh} isDisabled={loading} aria-label="Refresh roles">
-          <RefreshCw size={13} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
-        </Button>
-      </div>
-
       <div className="role-grid">
         {ROLE_DEFS.map(({ key, label, icon, category }) => {
           const a = roles?.[key];
@@ -337,7 +331,7 @@ function ModelList({
   }
 
   return (
-    <div className="models-list">
+    <div className="card" style={{ overflow: "hidden" }}>
       {models.map((m) => {
         const activeFor = activeRolesFor(m);
         const isAnyActive = activeFor.length > 0;
@@ -345,22 +339,26 @@ function ModelList({
         return (
           <div
             key={m.id}
-            className={`giap-model-row${isAnyActive ? " is-active" : ""}`}
+            className={`model-row${isAnyActive ? " is-active" : ""}`}
           >
             <div>
-              <div className="giap-model-row__title-row">
-                <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+              <div className="model-row__title-row">
+                <span className="model-row__name">{m.display_name ?? m.name}</span>
                 {m.ram_estimate_mb && (
-                  <span className="giap-model-row__meta">{m.ram_estimate_mb} MB</span>
+                  <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.ram_estimate_mb} MB</Chip>
                 )}
                 {activeFor.map((r) => (
-                  <Chip key={r} size="sm" color="accent" variant="soft">{ROLE_LABELS[r]}</Chip>
+                  <Chip key={r} size="sm" variant="flat"
+                    color={r === "chat" ? "secondary" : r === "tool" ? "success" : r === "asr" ? "primary" : r === "tts" ? "danger" : "default"}
+                    className="model-row__tag">
+                    {ROLE_LABELS[r]}
+                  </Chip>
                 ))}
                 <CapabilityBadges name={m.name} />
               </div>
-              <div className="giap-model-row__file"><code>{m.provider} / {m.name}</code></div>
+              <div className="model-row__file"><code>{m.provider} / {m.name}</code></div>
             </div>
-            <div className="giap-model-row__actions">
+            <div className="model-row__actions">
               <div className="role-select">
                 {availableRoles.map((role) => {
                   const active = isRoleActive(m, role);
@@ -369,6 +367,7 @@ function ModelList({
                       key={role}
                       size="sm"
                       variant={active ? "secondary" : "outline"}
+                      className="role-select__btn"
                       onPress={() => onActivate(m.provider, m.name, role)}
                       isDisabled={!state.serverOnline}
                       aria-label={`Set ${m.name} as ${role} model`}
@@ -383,7 +382,7 @@ function ModelList({
                 size="sm"
                 variant="ghost"
                 isIconOnly
-                className="giap-model-row__trash"
+                className="model-row__trash"
                 onPress={() => onDelete(m.provider, m.name)}
                 isDisabled={!state.serverOnline}
                 aria-label={`Delete ${m.name}`}
@@ -500,7 +499,7 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
                       {!loadingFiles && files.length === 0 && <p className="gh-empty" style={{ padding: "var(--space-2) var(--space-3)" }}>No .gguf files in this repo.</p>}
                       {files.map((file) => (
                         <div key={file.filename} style={accordionSt.fileRow}>
-                          <code className="giap-model-row__name">{file.filename}</code>
+                          <code className="model-row__name">{file.filename}</code>
                           {file.size_mb != null && <Chip size="sm" variant="soft">{file.size_mb.toLocaleString()} MB</Chip>}
                           <Button
                             variant="secondary" size="sm"
@@ -572,7 +571,7 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
             {releases.map((rel) => (
               <div key={rel.name} style={accordionSt.fileRow}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <code className="giap-model-row__name">{rel.name}</code>
+                  <code className="model-row__name">{rel.name}</code>
                   <div style={{ display: "flex", gap: "4px", marginTop: "2px" }}>
                     <Chip size="sm" variant="soft">{rel.tag}</Chip>
                     {rel.size_mb != null && <Chip size="sm" variant="soft">{rel.size_mb.toLocaleString()} MB</Chip>}
@@ -889,20 +888,20 @@ function LlmTab({
               <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
                 Available for download
               </span>
-              <div className="models-list">
+              <div className="card" style={{ overflow: "hidden" }}>
                 {ggufAvailable.map((m) => (
-                  <div key={m.id} className="giap-model-row always-actions">
+                  <div key={m.id} className="model-row">
                     <div>
-                      <div className="giap-model-row__title-row">
-                        <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                        {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                      <div className="model-row__title-row">
+                        <span className="model-row__name">{m.display_name ?? m.name}</span>
+                        {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                         <CapabilityBadges name={m.name} />
                       </div>
                       {m.description && (
-                        <div className="giap-model-row__file"><code>{m.description}</code></div>
+                        <div className="model-row__file"><code>{m.description}</code></div>
                       )}
                     </div>
-                    <div className="giap-model-row__actions">
+                    <div className="model-row__actions">
                       <Button
                         size="sm"
                         variant="secondary"
@@ -947,20 +946,20 @@ function LlmTab({
               <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
                 Available for download
               </span>
-              <div className="models-list">
+              <div className="card" style={{ overflow: "hidden" }}>
                 {llamaAvailable.map((m) => (
-                  <div key={m.id} className="giap-model-row always-actions">
+                  <div key={m.id} className="model-row">
                     <div>
-                      <div className="giap-model-row__title-row">
-                        <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                        {m.size_mb != null && <Chip size="sm" variant="soft">{m.size_mb} MB</Chip>}
+                      <div className="model-row__title-row">
+                        <span className="model-row__name">{m.display_name ?? m.name}</span>
+                        {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                         <CapabilityBadges name={m.name} />
                       </div>
                       {m.description && (
-                        <div className="giap-model-row__file"><code>{m.description}</code></div>
+                        <div className="model-row__file"><code>{m.description}</code></div>
                       )}
                     </div>
-                    <div className="giap-model-row__actions">
+                    <div className="model-row__actions">
                       <Button
                         size="sm"
                         variant="secondary"
@@ -1243,18 +1242,18 @@ function AsrCatalogPanel({
           <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
             Available for download
           </span>
-          <div className="models-list">
+          <div className="card" style={{ overflow: "hidden" }}>
             {available.map((m) => (
-              <div key={m.id} className="giap-model-row always-actions">
+              <div key={m.id} className="model-row">
                 <div>
-                  <div className="giap-model-row__title-row">
-                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
                     {m.asr_language && <span className="cap-badge">{m.asr_language}</span>}
-                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                   </div>
-                  <div className="giap-model-row__file"><code>whisper / {m.name}</code></div>
+                  <div className="model-row__file"><code>whisper / {m.name}</code></div>
                 </div>
-                <div className="giap-model-row__actions">
+                <div className="model-row__actions">
                   <Button
                     size="sm"
                     variant="secondary"
@@ -1385,19 +1384,19 @@ function EmbeddingCatalogPanel({
           <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
             Available for download
           </span>
-          <div className="models-list">
+          <div className="card" style={{ overflow: "hidden" }}>
             {available.map((m) => (
-              <div key={m.id} className="giap-model-row always-actions">
+              <div key={m.id} className="model-row">
                 <div>
-                  <div className="giap-model-row__title-row">
-                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                   </div>
                   {m.description && (
-                    <div className="giap-model-row__file"><code>{m.description}</code></div>
+                    <div className="model-row__file"><code>{m.description}</code></div>
                   )}
                 </div>
-                <div className="giap-model-row__actions">
+                <div className="model-row__actions">
                   <Button
                     size="sm"
                     variant="secondary"
@@ -1495,19 +1494,19 @@ function TtsCatalogPanel({
           <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
             Available for download
           </span>
-          <div className="models-list">
+          <div className="card" style={{ overflow: "hidden" }}>
             {available.map((m) => (
-              <div key={m.id} className="giap-model-row always-actions">
+              <div key={m.id} className="model-row">
                 <div>
-                  <div className="giap-model-row__title-row">
-                    <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
-                    {m.size_mb != null && <span className="giap-model-row__meta">{m.size_mb} MB</span>}
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                   </div>
                   {m.description && (
-                    <div className="giap-model-row__file"><code>{m.description}</code></div>
+                    <div className="model-row__file"><code>{m.description}</code></div>
                   )}
                 </div>
-                <div className="giap-model-row__actions">
+                <div className="model-row__actions">
                   <Button
                     size="sm"
                     variant="secondary"
@@ -1649,24 +1648,46 @@ export function Models() {
   return (
     <div className="screen">
       {/* Page header */}
-      <div className="page-header">
-        <h1 className="page-header__title">Models</h1>
-        <div className="page-header__action">
+      <PageHeader
+        title="Models"
+        action={
           <Button size="sm" variant="ghost" onPress={handleScan}>
             <RefreshCw size={14} strokeWidth={1.8} /> Scan
           </Button>
+        }
+      />
+
+      {/* Active Roles Card */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card__label">Active model roles</span>
+          <div className="card-header__right">
+            {memoryStatus && memoryStatus.total_mb > 0 && (
+              <span style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                {(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100).toFixed(0)}%
+                {" · "}
+                {(memoryStatus.available_for_llm_mb / 1024).toFixed(1)} / {(memoryStatus.total_mb / 1024).toFixed(1)} GB
+                {memoryStatus.loaded_model && (
+                  <Chip size="sm" variant="flat" color="secondary" style={{ fontSize: "10px" }}>{memoryStatus.loaded_model}</Chip>
+                )}
+              </span>
+            )}
+            <Button size="sm" variant="ghost" isIconOnly onPress={loadRoles} isDisabled={rolesLoading} aria-label="Refresh roles">
+              <RefreshCw size={13} strokeWidth={1.8} style={{ opacity: rolesLoading ? 0.4 : 1, transition: "opacity 0.2s" }} />
+            </Button>
+          </div>
+        </div>
+        <div className="card-body--tight" style={{ padding: "0 14px 14px" }}>
+          <ActiveRolesBanner
+            roles={activeRoles}
+            memoryStatus={memoryStatus}
+            capabilities={capabilities}
+            onRefresh={loadRoles}
+            loading={rolesLoading}
+            onNavigate={(cat) => setCategory(cat)}
+          />
         </div>
       </div>
-
-      {/* Active Roles Banner (with memory progress) */}
-      <ActiveRolesBanner
-        roles={activeRoles}
-        memoryStatus={memoryStatus}
-        capabilities={capabilities}
-        onRefresh={loadRoles}
-        loading={rolesLoading}
-        onNavigate={(cat) => setCategory(cat)}
-      />
 
       {/* Download Progress */}
       <DownloadProgress downloads={downloads} onScanModels={handleScan} />
@@ -1708,18 +1729,9 @@ export function Models() {
         </Tabs>
         <div className="models-toolbar__right">
           <div className="models-toolbar__search" style={{ position: "relative" }}>
-            <Search size={13} strokeWidth={1.8} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-300)", pointerEvents: "none" }} />
+            <Search size={13} strokeWidth={1.8} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-400)", pointerEvents: "none" }} />
             <input
-              style={{
-                width: "100%", height: "30px", paddingLeft: "30px", paddingRight: "12px",
-                border: "1px solid var(--grey-100)", borderRadius: "var(--radius-md)",
-                fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-                background: "var(--grey-50)", color: "var(--fg)", outline: "none",
-                boxSizing: "border-box" as const,
-                transition: "border-color var(--transition-fast), background var(--transition-fast)",
-              }}
-              onFocus={(e) => { e.currentTarget.style.borderColor = "var(--grey-200)"; e.currentTarget.style.background = "#fff"; }}
-              onBlur={(e) => { e.currentTarget.style.borderColor = "var(--grey-100)"; e.currentTarget.style.background = "var(--grey-50)"; }}
+              className="models-search-input"
               placeholder="Search models..."
               aria-label="Search models"
             />

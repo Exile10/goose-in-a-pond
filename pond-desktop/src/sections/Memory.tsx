@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Card, CardContent, Button, Chip, Input } from "@heroui/react";
+import { Card, CardContent, Button, Chip } from "@heroui/react";
 import {
   BrainCircuit,
   Shield,
@@ -20,8 +20,11 @@ import {
   MessageSquare,
   Layers,
   Radio,
+  Sparkles,
+  Brain,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { PageHeader } from "../components/shared";
 import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
 
 // ── Segment metadata ──────────────────────────────────────────
@@ -243,9 +246,9 @@ function MemFilterRow({
   );
 }
 
-// ── Memory card ───────────────────────────────────────────────
+// ── Memory row (design-spec layout) ──────────────────────────
 
-function MemCard({
+function MemRow({
   mem,
   onDelete,
   onUpdate,
@@ -268,7 +271,6 @@ function MemCard({
   function startEdit() {
     setEditContent(mem.content);
     setEditing(true);
-    // Focus after render
     setTimeout(() => textareaRef.current?.focus(), 0);
   }
 
@@ -292,183 +294,166 @@ function MemCard({
     }
   }
 
-  return (
-    <div className="mem-card">
-      <div className="mem-card__header">
-        {/* Segment icon */}
-        <div className={`mem-card__seg-icon mem-card__seg-icon--${segClass}`}>
-          {segMeta ? segMeta.icon : <BrainCircuit size={13} strokeWidth={1.8} />}
-        </div>
-
-        <div className="mem-card__body">
-          {/* Top badge row */}
-          <div className="mem-card__top">
-            {seg ? (
-              <span className={`mem-seg-badge mem-seg-badge--${segClass}`}>
-                {segMeta?.icon}
-                {segMeta?.label ?? seg}
-              </span>
-            ) : (
-              <span className="mem-seg-badge mem-seg-badge--none">
-                <BrainCircuit size={10} strokeWidth={1.8} />
-                Memory
-              </span>
-            )}
-
-            {mem.tier && (
-              <span className={`mem-tier-badge mem-tier-badge--${mem.tier}`}>
-                {mem.tier}
-              </span>
-            )}
-
-            {mem.source && (
-              <span className="mem-source-badge">{sourceLabel(mem.source)}</span>
-            )}
+  if (editing) {
+    // Editing state — spans full row width
+    return (
+      <div className="mem-row" style={{ display: "block", padding: "12px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <textarea
+            ref={textareaRef}
+            value={editContent}
+            onChange={(e) => setEditContent(e.target.value)}
+            disabled={saving}
+            rows={3}
+            style={{
+              width: "100%",
+              padding: "8px 12px",
+              border: "1px solid var(--color-accent)",
+              borderRadius: "8px",
+              fontSize: "13px",
+              fontFamily: "var(--font-body)",
+              background: "var(--color-accent-subtle)",
+              color: "var(--fg)",
+              outline: "none",
+              resize: "vertical" as React.CSSProperties["resize"],
+              lineHeight: 1.6,
+              boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+              boxShadow: "0 0 0 3px var(--color-accent-subtle)",
+            }}
+            aria-label="Edit memory content"
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={handleSave}
+              disabled={saving || !editContent.trim()}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                height: "28px",
+                padding: "0 12px",
+                border: "none",
+                borderRadius: "7px",
+                background: "var(--color-accent)",
+                color: "#fff",
+                fontSize: "12px",
+                fontWeight: 600,
+                cursor: saving ? "wait" : "pointer",
+                opacity: saving ? 0.7 : 1,
+                fontFamily: "var(--font-body)",
+                transition: "opacity 120ms",
+              }}
+              aria-label="Save edit"
+            >
+              <Save size={12} strokeWidth={2} />
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button
+              onClick={cancelEdit}
+              disabled={saving}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                height: "28px",
+                padding: "0 12px",
+                border: "1px solid var(--grey-200)",
+                borderRadius: "7px",
+                background: "transparent",
+                color: "var(--grey-600)",
+                fontSize: "12px",
+                fontWeight: 500,
+                cursor: "pointer",
+                fontFamily: "var(--font-body)",
+              }}
+              aria-label="Cancel edit"
+            >
+              Cancel
+            </button>
           </div>
+        </div>
+      </div>
+    );
+  }
 
-          {/* Content — editable or read-only */}
-          {editing ? (
-            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
-              <textarea
-                ref={textareaRef}
-                value={editContent}
-                onChange={(e) => setEditContent(e.target.value)}
-                disabled={saving}
-                rows={3}
-                style={{
-                  width: "100%",
-                  padding: "8px 10px",
-                  border: "1px solid rgba(147, 51, 234, 0.35)",
-                  borderRadius: "7px",
-                  fontSize: "13px",
-                  fontFamily: "var(--font-body)",
-                  background: "rgba(147, 51, 234, 0.03)",
-                  color: "var(--fg)",
-                  outline: "none",
-                  resize: "vertical" as React.CSSProperties["resize"],
-                  lineHeight: 1.55,
-                  boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-                }}
-                aria-label="Edit memory content"
-              />
-              <div style={{ display: "flex", gap: 6 }}>
-                <button
-                  onClick={handleSave}
-                  disabled={saving || !editContent.trim()}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                    height: "24px",
-                    padding: "0 10px",
-                    border: "none",
-                    borderRadius: "6px",
-                    background: "rgba(147, 51, 234, 0.1)",
-                    color: "var(--purple-700, #6d28d9)",
-                    fontSize: "11px",
-                    fontWeight: 600,
-                    cursor: saving ? "wait" : "pointer",
-                    opacity: saving ? 0.7 : 1,
-                    fontFamily: "var(--font-body)",
-                  }}
-                  aria-label="Save edit"
-                >
-                  <Save size={11} strokeWidth={2} />
-                  {saving ? "Saving…" : "Save"}
-                </button>
-                <button
-                  onClick={cancelEdit}
-                  disabled={saving}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                    height: "24px",
-                    padding: "0 10px",
-                    border: "1px solid var(--grey-200)",
-                    borderRadius: "6px",
-                    background: "transparent",
-                    color: "var(--grey-600)",
-                    fontSize: "11px",
-                    fontWeight: 500,
-                    cursor: "pointer",
-                    fontFamily: "var(--font-body)",
-                  }}
-                  aria-label="Cancel edit"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="mem-card__content">{mem.content}</div>
+  return (
+    <div className="mem-row">
+      {/* Bullet: segment icon bubble */}
+      <div className={`mem-row__bullet mem-card__seg-icon--${segClass}`}>
+        {segMeta ? segMeta.icon : <Sparkles size={12} strokeWidth={1.8} />}
+      </div>
+
+      {/* Main text + meta */}
+      <div className="mem-row__text">
+        <div>{mem.content}</div>
+        {/* Badges + importance line */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4, flexWrap: "wrap" as React.CSSProperties["flexWrap"] }}>
+          {seg && (
+            <span className={`mem-seg-badge mem-seg-badge--${segClass}`}>
+              {segMeta?.icon}
+              {segMeta?.label ?? seg}
+            </span>
           )}
-
-          {/* Importance bar */}
-          {!editing && importance !== undefined && (
-            <div className="mem-importance">
-              <div className="mem-importance__track">
-                <div
+          {mem.tier && (
+            <span className={`mem-tier-badge mem-tier-badge--${mem.tier}`}>
+              {mem.tier}
+            </span>
+          )}
+          {mem.source && (
+            <span className="mem-source-badge">{sourceLabel(mem.source)}</span>
+          )}
+          {importance !== undefined && (
+            <span className="mem-card__meta-item mem-card__meta-item--importance">
+              <span className="mem-importance__track">
+                <span
                   className="mem-importance__fill"
                   style={{
                     width: `${Math.round(importance * 100)}%`,
                     background: importanceFill,
                   }}
                 />
-              </div>
-              <span className="mem-importance__label">{Math.round(importance * 10) / 10}</span>
-            </div>
-          )}
-
-          {/* Footer meta */}
-          {!editing && (
-            <div className="mem-card__meta">
-              <span className="mem-card__meta-item">
-                <Clock size={10} strokeWidth={1.8} />
-                {relativeTime(mem.created_at)}
               </span>
-              {mem.access_count > 0 && (
-                <span className="mem-card__meta-item">
-                  <Star size={10} strokeWidth={1.8} />
-                  accessed {mem.access_count}x
-                </span>
-              )}
-              {mem.last_accessed_at && (
-                <span className="mem-card__meta-item">
-                  last {relativeTime(mem.last_accessed_at)}
-                </span>
-              )}
-              {mem.tags && mem.tags.length > 0 && (
-                <span className="mem-card__meta-item">
-                  {mem.tags.slice(0, 3).join(", ")}
-                </span>
-              )}
-            </div>
+              <span className="mem-importance__label">{Math.round(importance * 10) / 10}</span>
+            </span>
+          )}
+          {mem.access_count > 0 && (
+            <span className="mem-card__meta-item">
+              <Star size={10} strokeWidth={1.8} />
+              {mem.access_count}x
+            </span>
+          )}
+          {mem.tags && mem.tags.length > 0 && (
+            <span className="mem-card__meta-item">
+              {mem.tags.slice(0, 3).join(", ")}
+            </span>
           )}
         </div>
+      </div>
 
-        {/* Action buttons */}
-        {!editing && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, flexShrink: 0 }}>
-            <button
-              className="mem-card__delete"
-              style={{ color: "var(--grey-400)" }}
-              onClick={startEdit}
-              aria-label="Edit memory"
-              title="Edit memory"
-            >
-              <Pencil size={13} strokeWidth={1.8} />
-            </button>
-            <button
-              className="mem-card__delete"
-              onClick={() => onDelete(mem.id)}
-              aria-label="Delete memory"
-              title="Delete memory"
-            >
-              <Trash2 size={13} strokeWidth={1.8} />
-            </button>
-          </div>
-        )}
+      {/* Date */}
+      <div className="mem-row__date">
+        <Clock size={10} strokeWidth={1.8} style={{ display: "inline", marginRight: 3, verticalAlign: "middle" }} />
+        {relativeTime(mem.created_at)}
+      </div>
+
+      {/* Actions */}
+      <div style={{ display: "flex", gap: 2 }}>
+        <button
+          className="mem-card__delete"
+          onClick={startEdit}
+          aria-label="Edit memory"
+          title="Edit memory"
+        >
+          <Pencil size={12} strokeWidth={1.8} />
+        </button>
+        <button
+          className="mem-card__delete"
+          onClick={() => onDelete(mem.id)}
+          aria-label="Delete memory"
+          title="Delete memory"
+        >
+          <Trash2 size={12} strokeWidth={1.8} />
+        </button>
       </div>
     </div>
   );
@@ -495,12 +480,10 @@ function AddMemoryModal({
   const [tier, setTier] = useState<MemoryTier | "">("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-focus textarea on open
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
 
-  // Close on Escape
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Escape") onClose();
@@ -665,13 +648,12 @@ function AddMemoryModal({
           </Button>
           <Button
             size="sm"
-            color="secondary"
+            variant="secondary"
             onPress={handleSave}
             isDisabled={!content.trim() || saving}
-            isLoading={saving}
           >
-            {!saving && <Plus size={14} strokeWidth={2} />}
-            Save Memory
+            <Plus size={14} strokeWidth={2} />
+            {saving ? "Saving…" : "Save Memory"}
           </Button>
         </div>
       </div>
@@ -1007,7 +989,7 @@ function MemorySettingsCard({ settings, onToggle }: {
   ];
 
   return (
-    <Card shadow="none" className="giap-card">
+    <Card className="card">
       <CardContent>
         <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: 10, color: "var(--fg)" }}>
           Memory Settings
@@ -1049,13 +1031,15 @@ function MemorySettingsCard({ settings, onToggle }: {
 // ── Main Memory component ─────────────────────────────────────
 
 export function Memory() {
-  const [items, setItems]         = useState<MemoryFragment[]>([]);
-  const [loading, setLoading]     = useState(true);
-  const [error, setError]         = useState<string | null>(null);
+  const [items, setItems]           = useState<MemoryFragment[]>([]);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState<string | null>(null);
   const [activeSegment, setSegment] = useState<SegmentKey>("all");
-  const [activeTier, setTier]     = useState<TierKey>("all");
-  const [activeSource, setSource] = useState<SourceKey>("all");
+  const [activeTier, setTier]       = useState<TierKey>("all");
+  const [activeSource, setSource]   = useState<SourceKey>("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [inlineDraft, setInlineDraft] = useState("");
+  const [inlineAdding, setInlineAdding] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
   const [memSettings, setMemSettings] = useState<Partial<Settings>>({});
 
@@ -1088,7 +1072,7 @@ export function Memory() {
       await api.updateSettings(patch);
     } catch (e) {
       setError(String(e));
-      loadSettings(); // revert on failure
+      loadSettings();
     }
   }
 
@@ -1103,6 +1087,22 @@ export function Memory() {
       load();
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // Inline quick-add (no segment/tier selection)
+  async function handleInlineAdd() {
+    const trimmed = inlineDraft.trim();
+    if (!trimmed) return;
+    setInlineAdding(true);
+    try {
+      await api.addMemory(trimmed, undefined, undefined, undefined, undefined);
+      setInlineDraft("");
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInlineAdding(false);
     }
   }
 
@@ -1262,37 +1262,35 @@ export function Memory() {
   return (
     <div className="screen">
       {/* Page header */}
-      <div className="page-header">
-        <h1 className="page-header__title">Memory</h1>
-        <div className="page-header__action">
-          <Chip size="sm" variant="flat" color="secondary">
-            {loading ? "..." : visibleItems.length}
-          </Chip>
-          <Button size="sm" variant="ghost" onPress={load} isDisabled={loading}>
-            <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
-            Refresh
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onPress={handleConsolidate}
-            isDisabled={consolidationStatus === "running" || loading || visibleItems.length === 0}
-          >
-            <GitMerge size={14} strokeWidth={1.8} />
-            Consolidate
-          </Button>
-          {!loading && visibleItems.length > 0 && (
-            <Button size="sm" variant="ghost" color="danger" onPress={handleDeleteAll}>
-              <Trash2 size={14} strokeWidth={1.8} />
-              Delete All
+      <PageHeader
+        title="Memory"
+        action={
+          <>
+            <Chip size="sm" variant="soft">
+              {loading ? "…" : visibleItems.length} memories
+            </Chip>
+            <Button size="sm" variant="ghost" onPress={load} isDisabled={loading}>
+              <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
+              Refresh
             </Button>
-          )}
-          <Button size="sm" color="secondary" onPress={() => setShowAddModal(true)}>
-            <Plus size={14} strokeWidth={2} />
-            Add Memory
-          </Button>
-        </div>
-      </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={handleConsolidate}
+              isDisabled={consolidationStatus === "running" || loading || visibleItems.length === 0}
+            >
+              <GitMerge size={14} strokeWidth={1.8} />
+              Consolidate
+            </Button>
+            {!loading && visibleItems.length > 0 && (
+              <Button size="sm" variant="danger-soft" onPress={handleDeleteAll}>
+                <Trash2 size={14} strokeWidth={1.8} />
+                Delete All
+              </Button>
+            )}
+          </>
+        }
+      />
 
       {/* Add memory modal */}
       {showAddModal && (
@@ -1317,79 +1315,135 @@ export function Memory() {
         </p>
       )}
 
-      {/* Stats + filter row */}
-      {!loading && visibleItems.length > 0 && (
-        <>
-          <MemStatsBar items={visibleItems} />
-
-          {/* Search bar */}
-          <div style={{ position: "relative" }}>
-            <Search
-              size={14}
-              strokeWidth={1.8}
-              style={{
-                position: "absolute",
-                left: 10,
-                top: "50%",
-                transform: "translateY(-50%)",
-                color: "var(--grey-400)",
-                pointerEvents: "none",
-              }}
-            />
-            <Input
+      {/* Inline add form — design-spec card */}
+      <Card className="card">
+        <CardContent>
+          <div className="mem-add">
+            <div className="mem-add__input" style={{ position: "relative", flex: 1, display: "flex", alignItems: "center" }}>
+              <span style={{ position: "absolute", left: 10, pointerEvents: "none", color: "var(--grey-400)", display: "flex", zIndex: 1 }}>
+                <Sparkles size={14} strokeWidth={1.8} />
+              </span>
+              <input
+                type="text"
+                placeholder="Add a memory…"
+                value={inlineDraft}
+                onChange={(e) => setInlineDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleInlineAdd(); }}
+                disabled={inlineAdding}
+                style={{
+                  width: "100%",
+                  height: "36px",
+                  padding: "0 12px 0 34px",
+                  border: "1px solid var(--grey-200)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: "13px",
+                  fontFamily: "var(--font-body)",
+                  background: "#fff",
+                  color: "var(--fg)",
+                  outline: "none",
+                  boxSizing: "border-box" as React.CSSProperties["boxSizing"],
+                  transition: "border-color 120ms",
+                }}
+                aria-label="Quick add memory"
+              />
+            </div>
+            <Button
               size="sm"
-              radius="md"
-              variant="bordered"
-              placeholder="Search memories…"
-              value={searchQuery}
-              onValueChange={setSearchQuery}
-              style={{ paddingLeft: 32 }}
-              aria-label="Search memories"
-              className="w-full"
-              startContent={null}
-            />
+              variant="secondary"
+              onPress={handleInlineAdd}
+              isDisabled={!inlineDraft.trim() || inlineAdding}
+            >
+              <Plus size={14} strokeWidth={2} />
+              {inlineAdding ? "Adding…" : "Add"}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={() => setShowAddModal(true)}
+            >
+              Advanced
+            </Button>
           </div>
+        </CardContent>
+      </Card>
 
-          <MemFilterRow
-            activeSegment={activeSegment}
-            activeTier={activeTier}
-            activeSource={activeSource}
-            segCounts={segCounts}
-            tierCounts={tierCounts}
-            sourceCounts={sourceCounts}
-            total={visibleItems.length}
-            onSegmentChange={setSegment}
-            onTierChange={setTier}
-            onSourceChange={setSource}
-          />
-        </>
+      {/* Stats row */}
+      {!loading && visibleItems.length > 0 && (
+        <MemStatsBar items={visibleItems} />
       )}
 
-      {/* Memory list */}
+      {/* Search bar */}
+      {!loading && visibleItems.length > 0 && (
+        <div className="mem-search">
+          <span className="mem-search__icon">
+            <Search size={14} strokeWidth={1.8} />
+          </span>
+          <input
+            className="mem-search__input"
+            type="search"
+            placeholder="Search memories…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            aria-label="Search memories"
+          />
+          {searchQuery && (
+            <button
+              className="mem-search__clear"
+              onClick={() => setSearchQuery("")}
+              aria-label="Clear search"
+              type="button"
+            >
+              <X size={11} strokeWidth={2.5} />
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Filter row */}
+      {!loading && visibleItems.length > 0 && (
+        <MemFilterRow
+          activeSegment={activeSegment}
+          activeTier={activeTier}
+          activeSource={activeSource}
+          segCounts={segCounts}
+          tierCounts={tierCounts}
+          sourceCounts={sourceCounts}
+          total={visibleItems.length}
+          onSegmentChange={setSegment}
+          onTierChange={setTier}
+          onSourceChange={setSource}
+        />
+      )}
+
+      {/* Memory list card */}
       {loading ? (
         <p className="muted-12">Loading…</p>
       ) : visibleItems.length === 0 ? (
-        <div className="empty-state">
-          <BrainCircuit size={36} strokeWidth={1.2} />
-          <div style={{ maxWidth: 320 }}>
-            <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 6, fontSize: "15px" }}>
-              No memories yet
-            </div>
-            <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)", lineHeight: 1.6 }}>
-              The assistant builds up memory as you chat — facts about you, your preferences, and ongoing projects get saved automatically.
-            </div>
-            <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
-                <MessageSquare size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
-                Chat with the assistant to create memories automatically
+        <Card className="card">
+          <CardContent>
+            <div className="empty-state">
+              <Brain size={36} strokeWidth={1.2} />
+              <div style={{ maxWidth: 320 }}>
+                <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 6, fontSize: "15px" }}>
+                  No memories yet
+                </div>
+                <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)", lineHeight: 1.6 }}>
+                  The assistant builds up memory as you chat — facts about you, your preferences, and ongoing projects get saved automatically.
+                </div>
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
+                    <MessageSquare size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                    Chat with the assistant to create memories automatically
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
+                    <Plus size={13} strokeWidth={2} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                    Or add one manually with the form above
+                  </div>
+                </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
-                <Plus size={13} strokeWidth={2} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
-                Or add one manually with the button above
-              </div>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       ) : filtered.length === 0 ? (
         <div className="empty-state empty-state--inline">
           <Search size={18} strokeWidth={1.8} />
@@ -1402,18 +1456,16 @@ export function Memory() {
           </span>
         </div>
       ) : (
-        <Card shadow="none" className="giap-card">
-          <CardContent>
-            <div className="mem-list">
-              {filtered.map((m) => (
-                <MemCard
-                  key={m.id}
-                  mem={m}
-                  onDelete={handleDelete}
-                  onUpdate={handleUpdate}
-                />
-              ))}
-            </div>
+        <Card className="card">
+          <CardContent className="card-body--list">
+            {filtered.map((m) => (
+              <MemRow
+                key={m.id}
+                mem={m}
+                onDelete={handleDelete}
+                onUpdate={handleUpdate}
+              />
+            ))}
           </CardContent>
         </Card>
       )}
@@ -1423,4 +1475,3 @@ export function Memory() {
     </div>
   );
 }
-
