@@ -13,6 +13,11 @@ pub struct AgentRequest {
     /// disable thinking, keep responses concise, and avoid formatting.
     #[serde(default)]
     pub voice_mode: bool,
+    /// When true, the request originates from Canvas mode. The agent should
+    /// always prefer tool calls over textual descriptions so that results
+    /// render as visual cards on the user's screen.
+    #[serde(default)]
+    pub canvas_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

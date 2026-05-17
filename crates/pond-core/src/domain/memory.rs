@@ -174,6 +174,15 @@ impl MemoryFragment {
         }
     }
 
+    /// True if this memory represents a user correction — either by segment
+    /// classification or by having a `corrects` field set.
+    ///
+    /// Correction memories must never be pruned or merged away during
+    /// consolidation, as they represent explicit user fixes.
+    pub fn is_correction(&self) -> bool {
+        self.segment.as_ref() == Some(&MemorySegment::Correction) || self.corrects.is_some()
+    }
+
     /// Create a fragment from background memory extraction.
     ///
     /// `corrects` should be set for `Correction` segments to record
@@ -370,10 +379,7 @@ mod tests {
             Some("User's name is John".to_string()),
         );
         assert_eq!(frag.segment, Some(MemorySegment::Correction));
-        assert_eq!(
-            frag.corrects,
-            Some("User's name is John".to_string())
-        );
+        assert_eq!(frag.corrects, Some("User's name is John".to_string()));
     }
 
     #[test]
@@ -444,5 +450,46 @@ mod tests {
         assert_eq!(MemoryEventKind::Written.to_string(), "written");
         assert_eq!(MemoryEventKind::Pruned.to_string(), "pruned");
         assert_eq!(MemoryEventKind::Superseded.to_string(), "superseded");
+    }
+
+    #[test]
+    fn is_correction_by_segment() {
+        let frag = MemoryFragment::from_extraction(
+            "c1".to_string(),
+            None,
+            "Name is Jerry".to_string(),
+            MemorySegment::Correction,
+            0.9,
+            None,
+        );
+        assert!(frag.is_correction());
+    }
+
+    #[test]
+    fn is_correction_by_corrects_field() {
+        let mut frag = MemoryFragment::from_extraction(
+            "c2".to_string(),
+            None,
+            "Likes tea not coffee".to_string(),
+            MemorySegment::Preference,
+            0.7,
+            Some("Likes coffee".to_string()),
+        );
+        // Segment is Preference but corrects is set
+        assert_eq!(frag.segment, Some(MemorySegment::Preference));
+        assert!(frag.is_correction());
+    }
+
+    #[test]
+    fn is_correction_neither() {
+        let frag = MemoryFragment::from_extraction(
+            "k1".to_string(),
+            None,
+            "Works at Jarida".to_string(),
+            MemorySegment::Identity,
+            0.8,
+            None,
+        );
+        assert!(!frag.is_correction());
     }
 }

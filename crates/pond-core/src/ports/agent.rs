@@ -27,4 +27,18 @@ pub trait Agent: Send + Sync {
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities::default()
     }
+
+    /// Call a tool directly by its fully-qualified name (e.g. "giap-weather__get_current_weather").
+    ///
+    /// Used as a fallback when the model emits tool calls as text markup
+    /// (`<|tool_call>...<tool_call|>`) instead of through the structured protocol.
+    /// Returns the tool result text, or an error if the tool is not found.
+    async fn call_tool(
+        &self,
+        _session_id: &str,
+        _tool_name: &str,
+        _args_json: &str,
+    ) -> Result<String> {
+        Err(anyhow::anyhow!("call_tool not supported by this agent"))
+    }
 }

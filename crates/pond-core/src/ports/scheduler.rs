@@ -23,6 +23,16 @@ pub struct CreateScheduleRequest {
     pub kind: TaskKind,
 }
 
+/// Request payload for updating an existing scheduled task.
+/// All fields are optional — only provided fields are changed.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UpdateScheduleRequest {
+    pub label: Option<String>,
+    pub cron: Option<String>,
+    pub timezone: Option<String>,
+    pub kind: Option<TaskKind>,
+}
+
 #[async_trait]
 pub trait SchedulerPort: Send + Sync {
     async fn create_task(&self, req: CreateScheduleRequest) -> Result<Schedule>;
@@ -31,6 +41,9 @@ pub trait SchedulerPort: Send + Sync {
     async fn pause_task(&self, id: &str) -> Result<()>;
     async fn resume_task(&self, id: &str) -> Result<()>;
     async fn run_now(&self, id: &str) -> Result<()>;
+
+    /// Update an existing schedule. Only non-None fields are changed.
+    async fn update_task(&self, id: &str, req: UpdateScheduleRequest) -> Result<Schedule>;
 
     /// Retrieve execution history for a schedule, most recent first.
     async fn get_runs(&self, schedule_id: &str, limit: u32) -> Result<Vec<ScheduleRun>>;

@@ -98,6 +98,7 @@ pub fn build_prompt_partition(
         has_home_devices: state.has_home_devices,
         online_device_names: state.online_device_names.clone(),
         voice_mode: state.voice_mode,
+        canvas_mode: state.canvas_mode,
         available_tools: state.available_tools.clone(),
         thinking_enabled: state.thinking_enabled,
         compact_prompt: state.compact_prompt,
@@ -219,6 +220,7 @@ pub fn compute_prefix_hash_fast(
     state.has_home_devices.hash(&mut hasher);
     state.online_device_names.hash(&mut hasher);
     state.voice_mode.hash(&mut hasher);
+    state.canvas_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
     // Tool descriptions are static, but hash their count as a sanity check
     state.available_tools.len().hash(&mut hasher);
@@ -257,6 +259,7 @@ mod tests {
             has_home_devices: false,
             online_device_names: String::new(),
             voice_mode: false,
+            canvas_mode: false,
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
             thinking_enabled: false,
             compact_prompt: false,
