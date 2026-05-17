@@ -96,9 +96,36 @@ pub fn register_giap_extensions(
     }
 
     if settings.ext_device_enabled {
-        pond_mcp_server::init_device_deps(device_registry, settings_repo, skill_repo, recipe_repo);
+        pond_mcp_server::init_device_deps(
+            device_registry,
+            settings_repo.clone(),
+            skill_repo,
+            recipe_repo,
+        );
         register_builtin_extension("giap-device", pond_mcp_server::spawn_device_server);
         registered.push("giap-device".into());
+    }
+
+    // ── Knowledge expansion servers ────────────────────────────────────────
+    // All share a single HTTP client pool for efficiency.
+    let shared_http = pond_mcp_server::build_http_client();
+
+    if settings.ext_news_enabled {
+        pond_mcp_server::init_news_deps(shared_http.clone(), settings_repo.clone());
+        register_builtin_extension("giap-news", pond_mcp_server::spawn_news_server);
+        registered.push("giap-news".into());
+    }
+
+    if settings.ext_finance_enabled {
+        pond_mcp_server::init_finance_deps(shared_http.clone(), settings_repo.clone());
+        register_builtin_extension("giap-finance", pond_mcp_server::spawn_finance_server);
+        registered.push("giap-finance".into());
+    }
+
+    if settings.ext_discovery_enabled {
+        pond_mcp_server::init_discovery_deps(shared_http, settings_repo);
+        register_builtin_extension("giap-discovery", pond_mcp_server::spawn_discovery_server);
+        registered.push("giap-discovery".into());
     }
 
     // Store for GooseAdapter to read
