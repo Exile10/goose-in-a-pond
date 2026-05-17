@@ -354,6 +354,7 @@ impl Agent for PondAgent {
         tokio::spawn(async move {
             let mut iteration = 0u32;
             let mut total_usage = UsageStats::default();
+            let mut last_tool_call: Option<String> = None;
 
             loop {
                 iteration += 1;
@@ -390,7 +391,8 @@ impl Agent for PondAgent {
                     match event {
                         Ok(pond_core::ports::inference::ChatEvent::Text(t)) => {
                             text_buf.push_str(&t);
-                            let _ = tx.send(Ok(AgentStreamEvent::Text { content: t })).await;
+                            // Don't stream text yet — wait to see if tool calls follow.
+                            // If no tools, we'll flush it all at the end.
                         }
                         Ok(pond_core::ports::inference::ChatEvent::ToolCall {
                             id,
@@ -409,22 +411,49 @@ impl Agent for PondAgent {
                                     content: e.to_string(),
                                 }))
                                 .await;
-                            // Don't break the outer loop on stream errors --
-                            // the error is already emitted.
                             break;
                         }
                     }
                 }
 
-                // Append assistant message to history.
-                messages.push(ChatMessage::assistant(&text_buf));
+                // Repetition detection: if the model calls the same tool again, stop looping.
+                if !tool_calls.is_empty() {
+                    let current_calls: Vec<&str> =
+                        tool_calls.iter().map(|(_, name, _)| name.as_str()).collect();
+                    let calls_key = current_calls.join(",");
+                    if last_tool_call.as_deref() == Some(&calls_key) {
+                        // Same tool(s) called twice in a row — break to prevent infinite loop.
+                        if !text_buf.is_empty() {
+                            let _ = tx
+                                .send(Ok(AgentStreamEvent::Text {
+                                    content: text_buf.clone(),
+                                }))
+                                .await;
+                        }
+                        messages.push(ChatMessage::assistant(&text_buf));
+                        break;
+                    }
+                    last_tool_call = Some(calls_key);
+                }
 
-                // If no tool calls, the model is done.
+                // If no tool calls, this is the final response — stream the text and break.
                 if tool_calls.is_empty() {
+                    if !text_buf.is_empty() {
+                        let _ = tx
+                            .send(Ok(AgentStreamEvent::Text {
+                                content: text_buf.clone(),
+                            }))
+                            .await;
+                    }
+                    messages.push(ChatMessage::assistant(&text_buf));
                     break;
                 }
 
-                // Emit tool call events and dispatch via MCP.
+                // Tool calls detected — dispatch and inject results as assistant context.
+                // We format tool results as an assistant message containing the call + result
+                // so the model sees its own action and knows to synthesize next.
+                let mut tool_context = text_buf.clone();
+
                 for (id, name, args) in &tool_calls {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::ToolCall {
@@ -452,12 +481,24 @@ impl Agent for PondAgent {
                         }))
                         .await;
 
-                    // Append tool result as a user message so the model sees it.
-                    messages.push(ChatMessage::user(format!(
-                        "[Tool result from {}]: {}",
+                    // Build tool context as assistant message — the model sees this as
+                    // its own prior output containing the tool result data.
+                    tool_context.push_str(&format!(
+                        "\n[Tool {} returned]: {}",
                         name, result_text
-                    )));
+                    ));
                 }
+
+                // Append as assistant message (model sees its own tool usage + results).
+                messages.push(ChatMessage::assistant(&tool_context));
+
+                // Inject a user nudge so the model knows to synthesize a final answer
+                // from the tool results rather than calling tools again.
+                messages.push(ChatMessage::user(
+                    "Now provide a helpful answer based on the tool results above. \
+                     Do not call tools again."
+                        .to_string(),
+                ));
 
                 // Loop back for next LLM call with tool results.
             }

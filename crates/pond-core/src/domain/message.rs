@@ -6,6 +6,9 @@ pub enum Role {
     User,
     Assistant,
     System,
+    /// Tool response — result of a tool call, attributed to the tool system.
+    /// In OpenAI-compatible APIs this maps to `role: "tool"`.
+    Tool,
 }
 
 /// An image attached to a chat message.
@@ -51,6 +54,16 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Create a tool result message. In the chat template, this renders with
+    /// `role: "tool"` so the model recognizes it as a tool response, not user input.
+    pub fn tool_result(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
             content: content.into(),
             images: Vec::new(),
         }

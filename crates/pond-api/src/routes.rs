@@ -26,7 +26,7 @@ use pond_core::ports::device_registry::RegisterDeviceRequest;
 use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::ports::provider::LlmProvider;
-use pond_core::ports::scheduler::CreateScheduleRequest;
+use pond_core::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::prompts::{
     build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext,
 };
@@ -121,7 +121,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route("/schedules/upcoming", get(list_upcoming_schedules))
-        .route("/schedules/{id}", delete(delete_schedule))
+        .route(
+            "/schedules/{id}",
+            delete(delete_schedule).put(update_schedule),
+        )
         .route("/schedules/{id}/pause", post(pause_schedule))
         .route("/schedules/{id}/resume", post(resume_schedule))
         .route("/schedules/{id}/run-now", post(run_schedule_now))
@@ -170,6 +173,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/agent/tools", get(list_agent_tools))
         // ── Agent chat stream (agentic tool-use loop) ─────────────────────────
         .route("/agent/chat/stream", post(agent_chat_stream))
+        // ── MCP App Resources ────────────────────────────────────────────────
+        .route("/mcp/resources", get(mcp_read_resource))
+        .route("/mcp/tools/call", post(mcp_call_tool))
         // ── System Prompt Extras ───────────────────────────────────────────────
         .route(
             "/agent/extras",
@@ -373,6 +379,10 @@ struct ChatRequest {
     /// When true, disable thinking and use voice-friendly responses.
     #[serde(default)]
     voice_mode: bool,
+    /// When true, the request originates from Canvas mode. The LLM should
+    /// always prefer tool calls so results render as visual cards.
+    #[serde(default)]
+    canvas_mode: bool,
 }
 
 /// Send a message and get a response.
@@ -779,6 +789,7 @@ async fn chat_stream(
             model_role: model_role.to_string(),
             images: req.images.clone(),
             voice_mode: req.voice_mode,
+            canvas_mode: req.canvas_mode,
         };
 
         let mut full_text = String::new();
@@ -830,7 +841,17 @@ async fn chat_stream(
                                     Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                                 }
                                 AgentStreamEvent::ToolResult { tool, id, content } => {
-                                    Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
+                                    let (clean_content, ui_hint) = extract_ui_hint(&content);
+                                    let mut ev = serde_json::json!({
+                                        "type": "tool_result",
+                                        "tool": tool,
+                                        "id": id,
+                                        "content": clean_content
+                                    });
+                                    if let Some(ui) = ui_hint {
+                                        ev["ui"] = ui;
+                                    }
+                                    Some(ev.to_string())
                                 }
                                 AgentStreamEvent::Text { content } => {
                                     let visible = thought.push(&content);
@@ -871,22 +892,39 @@ async fn chat_stream(
                             }
                             // After every push the filter may have captured a complete
                             // tool-call envelope (`<|tool_call> ... <tool_call|>`).
-                            // Surface those as a visible note so the user understands
-                            // why the action they asked for produced nothing — the
-                            // model emitted Harmony text markup instead of using the
-                            // structured tool-call protocol Goose actually invokes.
+                            // The model emitted tool calls as Harmony text markup instead of
+                            // the structured protocol. Execute them directly as a fallback.
                             for body in thought.take_tool_calls() {
-                                let notice = match crate::thought_filter::parse_tool_envelope(&body) {
-                                    Some((name, args)) => format!(
-                                        "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
-                                    ),
-                                    None => format!(
-                                        "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
-                                    ),
-                                };
-                                full_text.push_str(&notice);
-                                let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
-                                yield Ok(Event::default().data(data));
+                                if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
+                                    tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
+                                    let call_id = uuid::Uuid::new_v4().to_string();
+                                    let args_val: serde_json::Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                                    yield Ok(Event::default().data(
+                                        json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
+                                    ));
+                                    match state.agent.call_tool(&session_id, &name, &args).await {
+                                        Ok(result_text) => {
+                                            let (clean, ui_hint) = extract_ui_hint(&result_text);
+                                            let mut ev = json!({
+                                                "type": "tool_result",
+                                                "tool": name,
+                                                "id": call_id,
+                                                "content": clean
+                                            });
+                                            if let Some(ui) = ui_hint {
+                                                ev["ui"] = ui;
+                                            }
+                                            yield Ok(Event::default().data(ev.to_string()));
+                                        }
+                                        Err(e) => {
+                                            yield Ok(Event::default().data(
+                                                json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!("Unrecognised tool-call envelope: {body}");
+                                }
                             }
                         }
                         Err(e) => {
@@ -933,7 +971,20 @@ async fn chat_stream(
         // event that the frontend uses to replace the text.
         // Skipped when the agent timed out — no point reviewing a partial answer.
         {
-            let should_review = !timed_out && settings.review_mode == "on";
+            let should_review = !timed_out && match settings.review_mode.as_str() {
+                "on" => true,
+                "auto" => {
+                    let msg = req.message.to_lowercase();
+                    msg.contains('?')
+                        || msg.starts_with("what ")
+                        || msg.starts_with("how ")
+                        || msg.starts_with("why ")
+                        || msg.starts_with("explain ")
+                        || msg.starts_with("compare ")
+                        || msg.starts_with("analyze ")
+                }
+                _ => false,
+            };
 
             if should_review {
                 if let Some(ref reviewer) = state.answer_reviewer {
@@ -1318,6 +1369,7 @@ async fn get_session_messages(
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
+                Role::Tool => "tool",
             };
             json!({
                 "id": m.id,
@@ -4447,6 +4499,52 @@ async fn delete_schedule(
     }
 }
 
+/// `PUT /api/v1/schedules/:id` — update an existing scheduled task.
+async fn update_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    result: Result<Json<ApiUpdateScheduleRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Some(scheduler) = &state.scheduler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scheduler not configured"})),
+        );
+    };
+    let Json(api_req) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+
+    let kind = api_req.prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
+
+    let req = UpdateScheduleRequest {
+        label: api_req.name,
+        cron: api_req.cron,
+        timezone: api_req.timezone,
+        kind,
+    };
+
+    match scheduler.update_task(&id, req).await {
+        Ok(task) => (StatusCode::OK, Json(json!(task))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApiUpdateScheduleRequest {
+    #[serde(alias = "label")]
+    name: Option<String>,
+    cron: Option<String>,
+    timezone: Option<String>,
+    prompt: Option<String>,
+}
+
 /// `POST /api/v1/schedules/:id/pause` — pause a scheduled task.
 async fn pause_schedule(
     State(state): State<Arc<AppState>>,
@@ -4577,9 +4675,19 @@ async fn schedule_events_sse(
 
 // ── Agent tools handler ───────────────────────────────────────────────────────
 
+/// Map of tool name prefixes to their MCP App resource URIs.
+/// When a tool's fully-qualified name starts with one of these prefixes,
+/// the `_meta.ui.resourceUri` field is injected in the tool listing.
+const TOOL_UI_RESOURCES: &[(&str, &str)] = &[(
+    "giap-weather__get_current_weather",
+    "ui://giap-weather/weather-card.html",
+)];
+
 /// `GET /api/v1/agent/tools` — list all MCP tools currently loaded by the agent.
 ///
-/// Returns a flat array of `{ extension, name, description }` objects.
+/// Returns a flat array of tool objects. Each entry includes at minimum
+/// `{ "name": "..." }`. Tools with associated MCP App resources also
+/// include `{ "_meta": { "ui": { "resourceUri": "ui://..." } } }`.
 /// Returns an empty array when no extension manager is active (no-crash fallback).
 async fn list_agent_tools(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -4587,13 +4695,122 @@ async fn list_agent_tools(State(state): State<Arc<AppState>>) -> axum::response:
         return Json(json!([])).into_response();
     };
     match manager.list_tools().await {
-        Ok(tools) => Json(json!(tools)).into_response(),
+        Ok(tools) => {
+            let enriched: Vec<Value> = tools
+                .iter()
+                .map(|tool_name| {
+                    let mut obj = json!({ "name": tool_name });
+                    // Inject _meta.ui for tools that have an associated MCP App
+                    for &(prefix, uri) in TOOL_UI_RESOURCES {
+                        if tool_name == prefix || tool_name.ends_with(prefix) {
+                            obj["_meta"] = json!({
+                                "ui": { "resourceUri": uri }
+                            });
+                            break;
+                        }
+                    }
+                    obj
+                })
+                .collect();
+            Json(json!(enriched)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
         )
             .into_response(),
     }
+}
+
+// ── MCP App Resource handlers ────────────────────────────────────────────────
+
+/// Query parameters for `GET /api/v1/mcp/resources`.
+#[derive(Debug, Deserialize)]
+struct McpResourceQuery {
+    /// The `ui://` resource URI to read.
+    uri: String,
+}
+
+/// `GET /api/v1/mcp/resources?uri=ui://giap-weather/weather-card.html`
+///
+/// Proxies MCP resource reads. Looks up the URI in the static resource
+/// registry (populated at startup from embedded HTML files) and returns
+/// the content in MCP `ReadResourceResult` format.
+///
+/// Response: `{ "contents": [{ "uri": "...", "text": "..." }] }`
+async fn mcp_read_resource(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<McpResourceQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let uri = query.uri.trim();
+    if uri.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing 'uri' query parameter" })),
+        )
+            .into_response();
+    }
+
+    match state.mcp_app_resources.get(uri) {
+        Some(html) => Json(json!({
+            "contents": [{
+                "uri": uri,
+                "text": html,
+                "mimeType": "text/html"
+            }]
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Resource not found: {}", uri) })),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for `POST /api/v1/mcp/tools/call`.
+#[derive(Debug, Deserialize)]
+struct McpToolCallRequest {
+    /// Fully-qualified tool name (e.g. "get_current_weather").
+    #[allow(dead_code)]
+    name: String,
+    /// Tool arguments (JSON object).
+    #[allow(dead_code)]
+    arguments: Option<Value>,
+}
+
+/// `POST /api/v1/mcp/tools/call` — execute an MCP tool directly.
+///
+/// Needed for MCP Apps to call tools back via `app.callServerTool()`.
+/// MVP: returns 501 Not Implemented. Full implementation will route
+/// the call through the appropriate MCP server.
+async fn mcp_call_tool(
+    State(_state): State<Arc<AppState>>,
+    body: Result<Json<McpToolCallRequest>, JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let _req = match body {
+        Ok(Json(r)) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Invalid request: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    // MVP placeholder — full implementation will execute the tool via MCP server
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "Direct tool execution is not yet implemented. Use the agent chat stream instead."
+        })),
+    )
+        .into_response()
 }
 
 // ── Agent chat stream ─────────────────────────────────────────────────────────
@@ -4665,6 +4882,7 @@ async fn agent_chat_stream(
             model_role: "task".to_string(),
             images: Vec::new(),
             voice_mode: false,
+            canvas_mode: false,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -4693,7 +4911,17 @@ async fn agent_chat_stream(
                             Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                         }
                         AgentStreamEvent::ToolResult { tool, id, content } => {
-                            Some(json!({"type": "tool_result", "tool": tool, "id": id, "content": content}).to_string())
+                            let (clean_content, ui_hint) = extract_ui_hint(&content);
+                            let mut ev = serde_json::json!({
+                                "type": "tool_result",
+                                "tool": tool,
+                                "id": id,
+                                "content": clean_content
+                            });
+                            if let Some(ui) = ui_hint {
+                                ev["ui"] = ui;
+                            }
+                            Some(ev.to_string())
                         }
                         AgentStreamEvent::Text { content } => {
                             let visible = thought.push(&content);
@@ -4724,20 +4952,31 @@ async fn agent_chat_stream(
                         let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
-                    // See chat_stream for rationale — surface Harmony-format
-                    // tool-call leaks so the user knows the model attempted
-                    // something rather than silently dropping it.
+                    // Execute Harmony-format tool-call envelopes captured by ThoughtFilter.
                     for body in thought.take_tool_calls() {
-                        let notice = match crate::thought_filter::parse_tool_envelope(&body) {
-                            Some((name, args)) => format!(
-                                "_The model attempted to call **{name}** with arguments `{args}` but used the legacy text-based tool-call format instead of the structured protocol, so the call was not executed. Try a chat model that supports OpenAI-style tool calling (e.g. a Llama-3.1 Instruct or Qwen2.5 Instruct GGUF) to enable live weather and similar actions._\n"
-                            ),
-                            None => format!(
-                                "_The model emitted an unrecognised tool-call envelope (`{body}`) and the action was not executed._\n"
-                            ),
-                        };
-                        let data = json!({"type": "text", "content": notice, "token": notice}).to_string();
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
+                        if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
+                            tracing::info!(tool = %name, "Executing text-based tool call (agent chat)");
+                            let call_id = uuid::Uuid::new_v4().to_string();
+                            let args_val: serde_json::Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
+                            ));
+                            match state.agent.call_tool(&session_id, &name, &args).await {
+                                Ok(result_text) => {
+                                    let (clean, ui_hint) = extract_ui_hint(&result_text);
+                                    let mut ev = json!({"type": "tool_result", "tool": name, "id": call_id, "content": clean});
+                                    if let Some(ui) = ui_hint {
+                                        ev["ui"] = ui;
+                                    }
+                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(ev.to_string()));
+                                }
+                                Err(e) => {
+                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                        json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -5791,57 +6030,71 @@ async fn oauth_refresh_handler(
             if let Some(new_refresh) = body["refresh_token"].as_str() {
                 let _ = repo.set(&provider.refresh_key, new_refresh).await;
             }
+            // Capture the new access token to return in the response.
+            let new_access_token = body["access_token"].as_str().map(String::from);
             tracing::info!(provider = %provider_id, "OAuth token refresh succeeded");
 
-            // Restart any running extensions that use this provider's token
-            // so they pick up the refreshed credentials.
-            if let (Some(mgr), Some(mp), Some(secret_repo)) = (
-                &state.extension_manager,
-                &state.marketplace,
-                &state.secret_repo,
-            ) {
-                if let Ok(available) = mp.list_available().await {
-                    for ext in available {
-                        let uses_token = ext
-                            .required_secrets
-                            .iter()
-                            .any(|s| s.key == provider.token_key);
-                        if uses_token {
-                            let mut env = std::collections::HashMap::new();
-                            for sr in &ext.required_secrets {
-                                if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
-                                    env.insert(sr.key.clone(), val);
+            // Spawn extension restart in the background so the HTTP response
+            // is sent BEFORE the extension process is killed.  Without this,
+            // the calling extension (which triggered the refresh) gets killed
+            // before it can read the response containing the new token.
+            let token_key = provider.token_key.clone();
+            let provider_id_bg = provider_id.clone();
+            let mgr = state.extension_manager.clone();
+            let mp = state.marketplace.clone();
+            let secret_repo = state.secret_repo.clone();
+            tokio::spawn(async move {
+                // Brief delay so the HTTP response reaches the caller first.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let (Some(mgr), Some(mp), Some(secret_repo)) = (mgr, mp, secret_repo) {
+                    if let Ok(available) = mp.list_available().await {
+                        for ext in available {
+                            let uses_token = ext
+                                .required_secrets
+                                .iter()
+                                .any(|s| s.key == token_key);
+                            if uses_token {
+                                let mut env = std::collections::HashMap::new();
+                                for sr in &ext.required_secrets {
+                                    if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
+                                        env.insert(sr.key.clone(), val);
+                                    }
                                 }
-                            }
-                            let _ = mgr.remove_extension(&ext.id).await;
-                            let req = pond_core::ports::extension_manager::AddExtensionRequest {
-                                name: ext.id.clone(),
-                                kind: ext.kind.clone(),
-                                description: ext.description.clone(),
-                                command: ext.command.clone(),
-                                args: ext.args.clone(),
-                                env,
-                                uri: ext.uri.clone(),
-                            };
-                            match mgr.add_extension(req).await {
-                                Ok(_) => tracing::info!(
-                                    extension = %ext.id,
-                                    provider = %provider_id,
-                                    "restarted extension with refreshed OAuth tokens"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    extension = %ext.id,
-                                    provider = %provider_id,
-                                    error = %e,
-                                    "failed to restart extension after OAuth refresh"
-                                ),
+                                let _ = mgr.remove_extension(&ext.id).await;
+                                let req =
+                                    pond_core::ports::extension_manager::AddExtensionRequest {
+                                        name: ext.id.clone(),
+                                        kind: ext.kind.clone(),
+                                        description: ext.description.clone(),
+                                        command: ext.command.clone(),
+                                        args: ext.args.clone(),
+                                        env,
+                                        uri: ext.uri.clone(),
+                                    };
+                                match mgr.add_extension(req).await {
+                                    Ok(_) => tracing::info!(
+                                        extension = %ext.id,
+                                        provider = %provider_id_bg,
+                                        "restarted extension with refreshed OAuth tokens"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        extension = %ext.id,
+                                        provider = %provider_id_bg,
+                                        error = %e,
+                                        "failed to restart extension after OAuth refresh"
+                                    ),
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
 
-            Json(json!({"refreshed": true})).into_response()
+            let mut resp_body = json!({"refreshed": true});
+            if let Some(token) = new_access_token {
+                resp_body["access_token"] = serde_json::Value::String(token);
+            }
+            Json(resp_body).into_response()
         }
         Ok(resp) => {
             let err = resp.text().await.unwrap_or_default();
@@ -7214,6 +7467,48 @@ fn env_or(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Extract optional MCP-UI hint from tool result content.
+///
+/// MCP servers can optionally prepend a structured JSON marker to their
+/// plain-text results. The marker format is:
+///
+/// ```text
+/// [[[mcp-ui:card_type:{"key":"value",...}]]]
+/// Clean text for the LLM continues here
+/// ```
+///
+/// The SSE layer calls this before forwarding tool results. The LLM only
+/// sees the clean text; the frontend gets a structured `"ui"` field in the
+/// SSE event for rich rendering.
+///
+/// Returns `(clean_content_for_llm, optional_ui_hint_json)`.
+fn extract_ui_hint(content: &str) -> (String, Option<serde_json::Value>) {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[[[mcp-ui:") {
+        if let Some(end_idx) = rest.find("]]]") {
+            let hint_payload = &rest[..end_idx];
+            let clean_text = rest[end_idx + 3..].trim_start().to_string();
+            // hint_payload = "weather:{...}" -- split on first ':'
+            if let Some(colon_idx) = hint_payload.find(':') {
+                let card_type = &hint_payload[..colon_idx];
+                let json_str = &hint_payload[colon_idx + 1..];
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    return (
+                        clean_text,
+                        Some(serde_json::json!({
+                            "card_type": card_type,
+                            "data": data
+                        })),
+                    );
+                }
+            }
+            // Marker found but malformed JSON -- still strip it, no UI hint
+            return (clean_text, None);
+        }
+    }
+    (content.to_string(), None)
+}
+
 /// POST /api/v1/faces/identify-burst — multi-frame consensus identify.
 ///
 /// Accepts N (1..=12) `image` fields representing successive camera frames
@@ -8175,4 +8470,73 @@ async fn clear_session_user_handler(
         "session_id": session_id,
         "cleared":    removed,
     })))
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_ui_hint_with_valid_weather_hint() {
+        let input = "[[[mcp-ui:weather:{\"temp\":64}]]]\nIt's sunny";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "It's sunny");
+        let ui = hint.expect("should have UI hint");
+        assert_eq!(ui["card_type"], "weather");
+        assert_eq!(ui["data"]["temp"], 64);
+    }
+
+    #[test]
+    fn extract_ui_hint_no_marker_passthrough() {
+        let input = "Plain text no hint";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "Plain text no hint");
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn extract_ui_hint_malformed_json_strips_marker() {
+        let input = "[[[mcp-ui:weather:{not valid json}]]]\nClean text";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "Clean text");
+        assert!(hint.is_none(), "malformed JSON should not produce a hint");
+    }
+
+    #[test]
+    fn extract_ui_hint_empty_content() {
+        let input = "";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "");
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn extract_ui_hint_nested_json_data() {
+        let input = "[[[mcp-ui:schedule:{\"schedules\":[{\"id\":\"abc\",\"name\":\"Morning\"}]}]]]\n- Morning [abc]: 0 0 8 * * *";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "- Morning [abc]: 0 0 8 * * *");
+        let ui = hint.expect("should have UI hint");
+        assert_eq!(ui["card_type"], "schedule");
+        assert_eq!(ui["data"]["schedules"][0]["id"], "abc");
+    }
+
+    #[test]
+    fn extract_ui_hint_with_leading_whitespace() {
+        let input = "  \n  [[[mcp-ui:weather:{\"temp\":72}]]]\nSunny day";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "Sunny day");
+        let ui = hint.expect("should parse hint despite leading whitespace");
+        assert_eq!(ui["data"]["temp"], 72);
+    }
+
+    #[test]
+    fn extract_ui_hint_marker_without_colon_in_payload() {
+        // Marker present but payload has no colon separating type from JSON
+        let input = "[[[mcp-ui:weather]]]\nSome text";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "Some text");
+        assert!(hint.is_none(), "missing colon should not produce a hint");
+    }
 }

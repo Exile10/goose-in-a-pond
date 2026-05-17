@@ -45,6 +45,7 @@ fn role_to_str(role: &Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::System => "system",
+        Role::Tool => "tool",
     }
 }
 
@@ -53,6 +54,7 @@ fn str_to_role(s: &str) -> Result<Role, SessionStorageError> {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
         "system" => Ok(Role::System),
+        "tool" => Ok(Role::Tool),
         other => Err(SessionStorageError::StorageError(format!(
             "Unknown role in DB: '{}'",
             other
