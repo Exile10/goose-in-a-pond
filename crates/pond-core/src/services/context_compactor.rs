@@ -111,6 +111,7 @@ async fn summarise(provider: &dyn LlmProvider, messages: &[ChatMessage]) -> Resu
                 Role::User => "User",
                 Role::Assistant => "Assistant",
                 Role::System => "System",
+                Role::Tool => "Tool",
             };
             format!("{}: {}", role, m.content)
         })

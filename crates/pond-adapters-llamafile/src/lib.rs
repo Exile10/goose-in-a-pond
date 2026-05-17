@@ -118,6 +118,7 @@ impl LlamafileProvider {
                     Role::User      => "user",
                     Role::Assistant => "assistant",
                     Role::System    => "system",
+                    Role::Tool      => "tool",
                 },
                 "content": m.content,
             }));
@@ -144,6 +145,7 @@ impl LlmProvider for LlamafileProvider {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::System => "system",
+                    Role::Tool => "tool",
                 },
                 content: &m.content,
             });

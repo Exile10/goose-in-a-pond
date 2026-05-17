@@ -55,7 +55,7 @@ fn goose_session_to_pond(gs: &GooseSession) -> Session {
 
 fn pond_role_to_goose_message(role: &Role, content: &str) -> GooseMessage {
     match role {
-        Role::User | Role::System => GooseMessage::user().with_text(content),
+        Role::User | Role::System | Role::Tool => GooseMessage::user().with_text(content),
         Role::Assistant => GooseMessage::assistant().with_text(content),
     }
 }

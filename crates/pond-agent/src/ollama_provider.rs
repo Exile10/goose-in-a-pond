@@ -70,6 +70,7 @@ impl OllamaInferenceProvider {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::System => "system",
+                    Role::Tool => "tool",
                 }
                 .to_string(),
                 content: m.content.clone(),

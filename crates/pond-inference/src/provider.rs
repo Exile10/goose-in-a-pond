@@ -625,6 +625,10 @@ fn build_openai_messages_json(system_prompt: &str, messages: &[ChatMessage]) -> 
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
+            // Tool results use "tool" role so the model recognizes them as
+            // tool responses (not user input). This prevents the model from
+            // asking follow-up questions about tool results.
+            Role::Tool => "tool",
         };
         arr.push(serde_json::json!({
             "role": role,
