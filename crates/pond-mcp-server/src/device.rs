@@ -82,6 +82,25 @@ impl DeviceMcpServer {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+
+                if !devices.is_empty() {
+                    let ui_devices: Vec<serde_json::Value> = devices
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name,
+                                "is_online": d.is_online,
+                                "device_type": d.device_type,
+                                "room": "",
+                            })
+                        })
+                        .collect();
+                    let ui_data = serde_json::json!({ "devices": ui_devices });
+                    let hint = format!("[[[mcp-ui:devices:{}]]]\n", ui_data);
+                    let full_result = format!("{}{}", hint, text);
+                    return Ok(CallToolResult::success(vec![Content::text(full_result)]));
+                }
+
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
             Err(e) => Err(ErrorData::new(

@@ -7,8 +7,8 @@ use pond_adapters_weather::WeatherProvider;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorData, Implementation, InitializeResult,
-        ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, Content, ErrorData, Implementation, InitializeResult, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -93,9 +93,23 @@ DO NOT guess weather data or use shell commands for weather.")]
                 match result {
                     Ok(data) => {
                         tracing::debug!("weather: fetched current for {}", data.location_name);
-                        Ok(CallToolResult::success(vec![Content::text(
-                            data.as_context_block(),
-                        )]))
+                        let ui_data = serde_json::json!({
+                            "location": data.location_name,
+                            "temperature": data.temperature_c,
+                            "feels_like": data.feels_like_c,
+                            "condition": data.description,
+                            "humidity": data.humidity_pct,
+                            "wind_speed": data.wind_speed_kmh,
+                            "wind_gusts": data.wind_gusts_kmh,
+                            "cloud_cover": data.cloud_cover_pct,
+                            "precipitation": data.precipitation_mm,
+                            "is_day": data.is_day,
+                            "sunrise": data.sunrise,
+                            "sunset": data.sunset,
+                        });
+                        let hint = format!("[[[mcp-ui:weather:{}]]]\n", ui_data);
+                        let full_result = format!("{}{}", hint, data.as_context_block());
+                        Ok(CallToolResult::success(vec![Content::text(full_result)]))
                     }
                     Err(e) => {
                         tracing::warn!("weather: fetch failed: {e}");
@@ -232,6 +246,20 @@ fn resolve_forecast_location(params: &ForecastParams) -> Option<String> {
         }
     }
     None
+}
+
+// ── MCP App resource ─────────────────────────────────────────────────────
+
+/// Self-contained HTML weather card (MCP App).
+/// Embedded at compile time — no filesystem access required at runtime.
+const WEATHER_APP_HTML: &str = include_str!("../apps/weather-card.html");
+
+/// Resource URI for the weather MCP App.
+pub const WEATHER_APP_URI: &str = "ui://giap-weather/weather-card.html";
+
+/// Returns all `(uri, html_content)` pairs for resources served by this MCP server.
+pub fn app_resources() -> Vec<(&'static str, &'static str)> {
+    vec![(WEATHER_APP_URI, WEATHER_APP_HTML)]
 }
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
