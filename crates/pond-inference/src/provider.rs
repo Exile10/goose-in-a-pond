@@ -50,9 +50,6 @@ impl InferenceProvider for LlamaCppEngine {
         let model_slot = self.model_slot();
         let backend = self.backend_arc();
 
-        // Compute cache path for KV-cache reuse between turns.
-        let cache_path = self.cache_path();
-
         tokio::task::spawn_blocking(move || {
             generation_task(
                 model_slot,
@@ -62,7 +59,6 @@ impl InferenceProvider for LlamaCppEngine {
                 tools,
                 temperature,
                 max_tokens,
-                cache_path,
                 enable_thinking,
                 tx,
             );
@@ -107,13 +103,12 @@ fn generation_task(
     tools: Vec<ToolDefinition>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
-    cache_path: Option<std::path::PathBuf>,
     enable_thinking: bool,
     tx: mpsc::Sender<Result<ChatEvent>>,
 ) {
-    // Acquire the model lock (blocking).
-    let model_guard = model_slot.blocking_lock();
-    let Some(loaded) = model_guard.as_ref() else {
+    // Acquire the model lock (blocking). Mutable for in-memory KV-cache persistence.
+    let mut model_guard = model_slot.blocking_lock();
+    let Some(loaded) = model_guard.as_mut() else {
         let _ = tx.blocking_send(Err(anyhow::anyhow!("no model loaded")));
         return;
     };
@@ -215,75 +210,85 @@ fn generation_task(
         return;
     }
 
-    // ── Create context and prefill (with KV-cache reuse) ──────────────────
+    // ── In-memory KV-cache reuse ───────────────────────────────────────────
+    // Try to reuse the persistent context from the previous turn. If the prefix
+    // matches, we skip re-decoding thousands of tokens (system prompt + tools).
+    // If no cached context exists (first call), create a fresh one.
 
     let mut ctx_params =
         LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
     ctx_params = ctx_params.with_n_batch(512);
-    // Flash attention: enable by default (reduces KV cache memory ~40%).
     ctx_params = ctx_params.with_flash_attention_policy(1);
 
-    let mut ctx = match loaded.model.new_context(&backend, ctx_params) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(anyhow::anyhow!("failed to create context: {}", e)));
-            return;
-        }
-    };
-
-    // Attempt KV-cache reuse via session file.
-    // If a cache exists, load it, compute prefix match, and only decode the delta.
-    let tokens_to_decode = if let Some(ref path) = cache_path {
-        if path.exists() {
-            match ctx.state_load_file(path, tokens.len()) {
-                Ok(cached_tokens) => {
-                    let action = crate::kv_cache::plan_cache_reuse(&cached_tokens, &tokens);
-                    match action {
-                        crate::kv_cache::CacheAction::FullHit => {
-                            tracing::info!(
-                                cached = cached_tokens.len(),
-                                "KV cache full hit — skipping all prefill"
-                            );
-                            &tokens[tokens.len()..] // empty slice — nothing to decode
-                        }
-                        crate::kv_cache::CacheAction::IncrementalDecode {
-                            trim_from,
-                            decode_from,
-                            tokens_saved,
-                        } => {
-                            // Clear stale positions from the KV cache.
-                            // src=None means all sequences, p0=trim_from, p1=None means to end.
-                            let _ = ctx.clear_kv_cache_seq(
-                                None,
-                                Some(trim_from as u32),
-                                None,
-                            );
-                            tracing::info!(
-                                tokens_saved,
-                                decode_from,
-                                total = tokens.len(),
-                                "KV cache partial hit — decoding only delta"
-                            );
-                            &tokens[decode_from..]
-                        }
-                        crate::kv_cache::CacheAction::FullPrefill => {
-                            tracing::info!("KV cache miss (no prefix match) — full prefill");
-                            ctx.clear_kv_cache();
-                            &tokens[..]
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("failed to load KV cache (will full prefill): {}", e);
-                    &tokens[..]
-                }
+    // Check if we can reuse the persistent context.
+    let (mut ctx, tokens_to_decode_start) = if let Some(ref cached) = loaded.cached_ctx {
+        // We have a persistent context — check prefix match.
+        let action = crate::kv_cache::plan_cache_reuse(&cached.tokens_in_cache, &tokens);
+        match action {
+            crate::kv_cache::CacheAction::FullHit => {
+                tracing::info!(
+                    cached = cached.tokens_in_cache.len(),
+                    "KV cache full hit (in-memory) — skipping all prefill"
+                );
+                // Take ownership of the cached context.
+                let ctx = loaded.cached_ctx.take().unwrap().ctx;
+                (ctx, tokens.len()) // decode_from = end → empty slice
             }
-        } else {
-            &tokens[..] // no cache file yet — full prefill
+            crate::kv_cache::CacheAction::IncrementalDecode {
+                trim_from,
+                decode_from,
+                tokens_saved,
+            } => {
+                let mut ctx = loaded.cached_ctx.take().unwrap().ctx;
+                // Clear stale positions beyond the matching prefix.
+                let _ = ctx.clear_kv_cache_seq(None, Some(trim_from as u32), None);
+                tracing::info!(
+                    tokens_saved,
+                    decode_from,
+                    total = tokens.len(),
+                    "KV cache partial hit (in-memory) — decoding only delta"
+                );
+                (ctx, decode_from)
+            }
+            crate::kv_cache::CacheAction::FullPrefill => {
+                tracing::info!("KV cache miss (in-memory, no prefix match) — full prefill");
+                // Discard the old context and create fresh.
+                loaded.cached_ctx = None;
+                let ctx = match loaded.model.new_context(&backend, ctx_params) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(anyhow::anyhow!(
+                            "failed to create context: {}", e
+                        )));
+                        return;
+                    }
+                };
+                // SAFETY: Context borrows from loaded.model which lives in the same struct.
+                // We guarantee it's dropped before the model (see LoadedModel docs).
+                let ctx: llama_cpp_2::context::LlamaContext<'static> =
+                    unsafe { std::mem::transmute(ctx) };
+                (ctx, 0)
+            }
         }
     } else {
-        &tokens[..] // caching disabled — full prefill
+        // No cached context — cold start, create fresh.
+        tracing::info!("KV cache cold start (in-memory) — creating fresh context");
+        let ctx = match loaded.model.new_context(&backend, ctx_params) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(anyhow::anyhow!(
+                    "failed to create context: {}", e
+                )));
+                return;
+            }
+        };
+        // SAFETY: Context borrows from loaded.model which lives in the same struct.
+        let ctx: llama_cpp_2::context::LlamaContext<'static> =
+            unsafe { std::mem::transmute(ctx) };
+        (ctx, 0)
     };
+
+    let tokens_to_decode = &tokens[tokens_to_decode_start..];
 
     // Prefill tokens in batches (only the delta when cache hit).
     if !tokens_to_decode.is_empty() {
@@ -446,26 +451,17 @@ fn generation_task(
         }
     }
 
-    // ── Save KV-cache state for next turn ─────────────────────────────────
-    // Persist the context state so the next call can skip re-prefilling the
-    // stable prefix (system prompt + tool declarations).
-    if let Some(ref path) = cache_path {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match ctx.state_save_file(path, &tokens) {
-            Ok(_) => {
-                tracing::debug!(
-                    path = %path.display(),
-                    tokens = tokens.len(),
-                    "KV cache saved for next turn"
-                );
-            }
-            Err(e) => {
-                tracing::warn!("failed to save KV cache: {}", e);
-            }
-        }
-    }
+    // ── Persist context in memory for next turn ─────────────────────────────
+    // Store the context + token log back into LoadedModel so the next call
+    // can skip re-prefilling the stable prefix. Zero disk I/O.
+    loaded.cached_ctx = Some(crate::engine::CachedInferenceContext {
+        ctx,
+        tokens_in_cache: tokens,
+    });
+    tracing::debug!(
+        tokens_cached = loaded.cached_ctx.as_ref().unwrap().tokens_in_cache.len(),
+        "KV cache persisted in memory for next turn"
+    );
 
     // Emit usage stats.
     let _ = tx.blocking_send(Ok(ChatEvent::Usage(UsageStats {
