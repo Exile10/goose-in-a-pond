@@ -1585,12 +1585,12 @@ async fn run_server(
                 let disp: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
                     Arc::new(dispatcher);
                 let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = disp
-                    .available_tools()
+                    .available_tools_with_descriptions()
                     .await
                     .into_iter()
-                    .map(|name| pond_core::ports::inference::ToolDefinition {
-                        name: name.clone(),
-                        description: format!("GIAP tool: {}", name),
+                    .map(|(name, desc)| pond_core::ports::inference::ToolDefinition {
+                        name,
+                        description: desc,
                         parameters_schema: serde_json::json!({}),
                     })
                     .collect();
