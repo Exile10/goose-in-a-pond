@@ -46,6 +46,7 @@ impl InferenceProvider for LlamaCppEngine {
         let tools = tools.to_vec();
         let temperature = options.temperature;
         let max_tokens = options.max_tokens;
+        let enable_thinking = options.enable_thinking;
         let model_slot = self.model_slot();
         let backend = self.backend_arc();
 
@@ -62,6 +63,7 @@ impl InferenceProvider for LlamaCppEngine {
                 temperature,
                 max_tokens,
                 cache_path,
+                enable_thinking,
                 tx,
             );
         });
@@ -106,6 +108,7 @@ fn generation_task(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     cache_path: Option<std::path::PathBuf>,
+    enable_thinking: bool,
     tx: mpsc::Sender<Result<ChatEvent>>,
 ) {
     // Acquire the model lock (blocking).
@@ -139,6 +142,7 @@ fn generation_task(
         &oai_messages_json,
         full_tools_json.as_deref(),
         compact_tools.as_deref(),
+        enable_thinking,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -486,6 +490,7 @@ fn apply_template(
     messages_json: &str,
     full_tools_json: Option<&str>,
     compact_tools: Option<&str>,
+    enable_thinking: bool,
 ) -> Result<ChatTemplateResult> {
     let apply = |tools: Option<&str>| {
         let params = OpenAIChatTemplateParams {
@@ -494,12 +499,12 @@ fn apply_template(
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
+            reasoning_format: if enable_thinking { Some("auto") } else { None },
             chat_template_kwargs: None,
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
-            enable_thinking: false,
+            enable_thinking,
             add_bos: false,
             add_eos: false,
             parse_tool_calls: true,
