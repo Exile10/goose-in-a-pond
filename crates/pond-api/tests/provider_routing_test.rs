@@ -245,6 +245,7 @@ async fn make_app_with_provider(
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port: 4000,
     });
@@ -560,6 +561,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port: 4000,
     });
@@ -648,6 +650,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port: 4000,
     });

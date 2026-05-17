@@ -272,6 +272,10 @@ pub struct AppState {
     /// Context growth monitor — tracks context window fill rate per session
     /// and emits warnings before the "context cliff" where quality degrades.
     pub context_monitor: Arc<pond_core::services::context_monitor::ContextMonitor>,
+    /// Static registry of MCP App resources: maps `ui://` URIs to embedded HTML
+    /// content. Populated at startup from `pond_mcp_server::all_app_resources()`.
+    /// Used by `GET /api/v1/mcp/resources?uri=...` to serve MCP App HTML.
+    pub mcp_app_resources: std::collections::HashMap<String, &'static str>,
     /// In-memory OAuth PKCE sessions (state nonce -> verifier + provider).
     pub oauth_state: crate::oauth_callback::OAuthState,
     /// The port the API server is actually listening on.

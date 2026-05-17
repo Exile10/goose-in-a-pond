@@ -18,7 +18,7 @@ use pond_core::domain::schedule::{Schedule, ScheduleRun};
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::ports::schedule_execution::ScheduleExecutor;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
+use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
@@ -153,6 +153,26 @@ impl SchedulerPort for InMemoryScheduler {
             .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
+    async fn update_task(&self, id: &str, req: UpdateScheduleRequest) -> anyhow::Result<Schedule> {
+        let mut guard = self.tasks.lock().await;
+        let task = guard
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("not found"))?;
+        if let Some(label) = req.label {
+            task.label = label;
+        }
+        if let Some(cron) = req.cron {
+            task.cron = cron;
+        }
+        if let Some(tz) = req.timezone {
+            task.timezone = tz;
+        }
+        if let Some(kind) = req.kind {
+            task.kind = kind;
+        }
+        Ok(task.clone())
+    }
+
     async fn get_runs(&self, _schedule_id: &str, _limit: u32) -> anyhow::Result<Vec<ScheduleRun>> {
         Ok(vec![])
     }
@@ -235,6 +255,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port: 4000,
     });
