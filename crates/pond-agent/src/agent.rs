@@ -95,6 +95,12 @@ impl PondAgent {
         session_storage: Arc<dyn SessionStorage>,
         tool_dispatcher: Option<Arc<dyn ToolDispatcher>>,
     ) -> Self {
+        tracing::info!(
+            tool_count = tool_definitions.len(),
+            provider = %provider.model_name(),
+            tool_calling = provider.capabilities().tool_calling,
+            "PondAgent initialized"
+        );
         let initial_key = format!("initial:{}", provider.model_name());
         Self {
             provider: RwLock::new(provider),
@@ -376,11 +382,38 @@ impl Agent for PondAgent {
         let mut messages = vec![ChatMessage::user(user_content)];
 
         // 6. Determine if tools should be offered.
+        //    Query the dispatcher LIVE each turn for pre-formatted JSON.
+        //    This produces the EXACT same format as Goose's format_tools() —
+        //    no intermediate conversion through ToolDefinition objects.
         let provider = self.provider.read().await;
-        let tools = if provider.capabilities().tool_calling {
-            self.tool_definitions.clone()
+        let caps = provider.capabilities();
+        let (tools, tools_json_override, compact_json_override) = if caps.tool_calling {
+            if let Some(ref disp) = self.tool_dispatcher {
+                // Get pre-formatted JSON directly from dispatcher (same as Goose's format_tools)
+                let full_json = disp.tools_json().await;
+                let compact_json = disp.compact_tools_json().await;
+                // Also get ToolDefinition vec for the provider interface
+                let defs = disp.available_tool_definitions().await;
+                let tool_defs: Vec<ToolDefinition> = defs
+                    .into_iter()
+                    .map(|(name, desc, schema)| ToolDefinition {
+                        name,
+                        description: desc,
+                        parameters_schema: schema,
+                    })
+                    .collect();
+                tracing::debug!(
+                    tool_calling = true,
+                    tools_count = tool_defs.len(),
+                    full_json_len = full_json.as_ref().map(|j| j.len()).unwrap_or(0),
+                    "tool schemas fetched live from dispatcher"
+                );
+                (tool_defs, full_json, compact_json)
+            } else {
+                (self.tool_definitions.clone(), None, None)
+            }
         } else {
-            vec![]
+            (vec![], None, None)
         };
 
         let thinking_enabled = match settings.thinking_mode.as_str() {
@@ -393,6 +426,8 @@ impl Agent for PondAgent {
             max_tokens: Some(settings.llm_max_tokens),
             temperature: Some(settings.llm_temperature),
             enable_thinking: thinking_enabled,
+            tools_json_override: tools_json_override.clone(),
+            compact_tools_json_override: compact_json_override.clone(),
         };
 
         // 7. Clone what we need for the spawned task.
@@ -429,7 +464,7 @@ impl Agent for PondAgent {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::Status {
                             content: format!(
-                                "Re-evaluating with tool results (round {})",
+                                "Thinking... ({}/10)",
                                 iteration
                             ),
                         }))

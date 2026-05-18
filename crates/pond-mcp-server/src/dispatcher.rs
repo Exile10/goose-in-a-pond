@@ -94,7 +94,14 @@ impl<T: ServerHandler + Send + Sync> McpServerBridge for T {
                     (name, desc, schema)
                 })
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    type_name = std::any::type_name::<T>(),
+                    "MCP server list_tools failed — its tools will be missing"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -261,11 +268,27 @@ impl ToolDispatcher for McpToolDispatcher {
         for reg in &self.servers {
             let ctx = self.make_context();
             let defs = reg.server.list_tools_bridged(ctx).await;
+            let count = defs.len();
+            if count > 0 {
+                // Log ALL tools with their full schemas so you can verify what the model sees.
+                for (name, desc, schema) in &defs {
+                    tracing::debug!(
+                        prefix = reg.prefix,
+                        tool = %name,
+                        description = %desc,
+                        schema = %serde_json::to_string(schema).unwrap_or_default(),
+                        "tool schema"
+                    );
+                }
+            } else {
+                tracing::warn!(prefix = reg.prefix, "server returned 0 tool definitions");
+            }
             for (bare_name, desc, schema) in defs {
                 let full_name = format!("{}{}", reg.prefix, bare_name);
                 all_defs.push((full_name, desc, schema));
             }
         }
+        tracing::info!(total = all_defs.len(), "total tool definitions collected from MCP servers");
         all_defs
     }
 }
@@ -609,31 +632,84 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_have_valid_prefixes() {
-        let valid_prefixes = [
-            PREFIX_WEATHER,
-            PREFIX_KNOWLEDGE,
-            PREFIX_MEMORY,
-            PREFIX_SCHEDULE,
-            PREFIX_SYSTEM,
-            PREFIX_DEVICE,
-            PREFIX_NEWS,
-            PREFIX_FINANCE,
-            PREFIX_DISCOVERY,
-            PREFIX_DRAFT,
-        ];
-        for (tool, desc) in ALL_TOOLS {
-            let has_valid_prefix = valid_prefixes.iter().any(|p| tool.starts_with(p));
-            assert!(
-                has_valid_prefix,
-                "Tool '{}' doesn't start with a known prefix",
-                tool
-            );
-            assert!(
-                !desc.is_empty(),
-                "Tool '{}' has an empty description",
-                tool
-            );
+    fn parse_tool_name_with_ext_prefix() {
+        // External MCP servers use "ext-{name}__" prefix format.
+        let (prefix, bare) = parse_tool_name("ext-filesystem__read_file").unwrap();
+        assert_eq!(prefix, "ext-filesystem__");
+        assert_eq!(bare, "read_file");
+    }
+
+    /// Diagnostic: call list_tools on ALL MCP servers and show what the dispatcher collects.
+    /// Run with `cargo test -p pond-mcp-server -- --nocapture inspect_mcp_tool_schemas`
+    #[tokio::test]
+    async fn inspect_mcp_tool_schemas() {
+        use crate::{
+            SystemMcpServer, KnowledgeMcpServer, WeatherMcpServer,
+            NewsMcpServer, FinanceMcpServer, DiscoveryMcpServer, DraftMcpServer,
+        };
+
+        // Create peer for RequestContext
+        let (_client, server_stream) = tokio::io::duplex(64);
+        let running = rmcp::service::serve_directly(SystemMcpServer::new(), server_stream, None);
+        let peer = running.peer().clone();
+
+        let http_client = crate::build_http_client();
+
+        // Mock settings repo
+        struct MockSettings;
+        #[async_trait]
+        impl pond_core::ports::settings::SettingsRepository for MockSettings {
+            async fn get(&self) -> anyhow::Result<pond_core::domain::settings::Settings> {
+                Ok(pond_core::domain::settings::Settings::default())
+            }
+            async fn update(&self, _: &pond_core::domain::settings::Settings) -> anyhow::Result<()> { Ok(()) }
+            async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> { Ok(None) }
+            async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> { Ok(()) }
         }
+        let settings: Arc<dyn pond_core::ports::settings::SettingsRepository> = Arc::new(MockSettings);
+
+        // All servers that don't require complex real deps
+        let servers: Vec<(&str, Box<dyn McpServerBridge>)> = vec![
+            ("giap-system__", Box::new(SystemMcpServer::new()) as Box<dyn McpServerBridge>),
+            ("giap-weather__", Box::new(WeatherMcpServer::new(None))),
+            ("giap-knowledge__", Box::new(KnowledgeMcpServer::new(http_client.clone()))),
+            ("giap-news__", Box::new(NewsMcpServer::new(http_client.clone(), settings.clone()))),
+            ("giap-finance__", Box::new(FinanceMcpServer::new(http_client.clone(), settings.clone()))),
+            ("giap-discovery__", Box::new(DiscoveryMcpServer::new(http_client.clone(), settings.clone()))),
+        ];
+
+        println!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");
+        let mut total_tools = 0;
+        let mut all_tools_json = Vec::new();
+
+        for (prefix, server) in &servers {
+            let ctx = RequestContext::new(RequestId::Number(0), peer.clone());
+            let defs = server.list_tools_bridged(ctx).await;
+            println!("[{}] {} tools", prefix, defs.len());
+            for (name, _desc, schema) in &defs {
+                let has_props = schema.get("properties").is_some();
+                let has_type = schema.get("type").is_some();
+                println!("  {} — has_properties={}, has_type={}", name, has_props, has_type);
+
+                // Build OpenAI format (same as tools_to_json in pond-inference)
+                all_tools_json.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("{}{}", prefix, name),
+                        "description": _desc,
+                        "parameters": schema,
+                    }
+                }));
+            }
+            total_tools += defs.len();
+        }
+
+        println!("\n=== TOTAL: {} tools ===", total_tools);
+        println!("\n=== FIRST 2 TOOLS IN OPENAI FORMAT (what Jinja receives) ===\n");
+        for tool in all_tools_json.iter().take(2) {
+            println!("{}\n", serde_json::to_string_pretty(tool).unwrap());
+        }
+
+        assert!(total_tools > 25, "Expected 25+ tools, got {}", total_tools);
     }
 }

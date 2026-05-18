@@ -417,6 +417,59 @@ fn parse_xml_arg_key_value_format(
 
 // ── Format 3: Llama3 / Gemma4 ───────────────────────────────────────────────
 
+/// Convert Gemma 4's native tool-call argument format to valid JSON.
+///
+/// Gemma 4 emits: `{key:<|"|>value<|"|>,key2:<|"|>value2<|"|>}`
+/// This needs to become: `{"key":"value","key2":"value2"}`
+///
+/// The format uses `<|"|>` as string delimiters (instead of `"`) and
+/// keys are unquoted identifiers.
+fn gemma4_args_to_json(raw: &str) -> String {
+    // If it already looks like valid JSON (starts with {"), try as-is first.
+    let trimmed = raw.trim();
+    if trimmed.starts_with("{\"") || trimmed == "{}" {
+        return trimmed.to_string();
+    }
+
+    // Replace <|"|> with " (Gemma 4's string delimiter escape)
+    let with_quotes = trimmed.replace("<|\"", "\"").replace("\"|>", "\"");
+
+    // Now we have: {key:"value",key2:"value2"}
+    // Need to quote the keys: {"key":"value","key2":"value2"}
+    let mut result = String::with_capacity(with_quotes.len() + 20);
+    let mut chars = with_quotes.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' || ch == ',' {
+            result.push(ch);
+            // Skip whitespace after { or ,
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            // Read the key (unquoted identifier until : or ")
+            if chars.peek() == Some(&'"') {
+                // Key is already quoted — pass through
+            } else if chars.peek() == Some(&'}') {
+                // Empty object
+            } else {
+                // Unquoted key — collect and wrap in quotes
+                result.push('"');
+                while let Some(&next) = chars.peek() {
+                    if next == ':' {
+                        break;
+                    }
+                    result.push(chars.next().unwrap());
+                }
+                result.push('"');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 #[allow(clippy::type_complexity)]
 fn split_llama3_tool_calls(
     text: &str,
@@ -451,9 +504,20 @@ fn split_llama3_tool_calls(
                 #[allow(clippy::string_slice)]
                 let func_name = after_call[..brace_idx].trim().to_string();
                 #[allow(clippy::string_slice)]
-                let json_str = &after_call[brace_idx..];
+                let raw_args = &after_call[brace_idx..];
+
+                // Convert Gemma 4 native format to JSON, then parse.
+                let json_str = gemma4_args_to_json(raw_args);
                 let args: serde_json::Map<String, Value> =
-                    serde_json::from_str(json_str).unwrap_or_default();
+                    serde_json::from_str(&json_str).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            raw = %raw_args,
+                            normalized = %json_str,
+                            error = %e,
+                            "failed to parse tool call arguments"
+                        );
+                        serde_json::Map::new()
+                    });
                 tool_calls.push((func_name, args));
             }
         } else {
@@ -530,6 +594,57 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "giap__get_weather");
         assert_eq!(calls[0].arguments["location"], "Nairobi");
+    }
+
+    #[test]
+    fn parse_gemma4_native_escape_format() {
+        // Gemma 4 uses <|"|> as string delimiters and unquoted keys
+        let text = "<|tool_call>call:giap-weather__get_current_weather{location:<|\"|\x3eAthens<|\"\x7c>}<tool_call|>";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should parse 1 tool call");
+        assert_eq!(calls[0].name, "giap-weather__get_current_weather");
+        assert_eq!(calls[0].arguments["location"], "Athens");
+    }
+
+    #[test]
+    fn parse_gemma4_native_multiple_params() {
+        let text = "<|tool_call>call:giap-finance__convert_currency{amount:<|\"|\x3e100<|\"\x7c>,from:<|\"|\x3eUSD<|\"\x7c>,to:<|\"|\x3eKES<|\"\x7c>}<tool_call|>";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "giap-finance__convert_currency");
+        assert_eq!(calls[0].arguments["from"], "USD");
+        assert_eq!(calls[0].arguments["to"], "KES");
+    }
+
+    #[test]
+    fn gemma4_args_to_json_basic() {
+        // {location:<|"|>Athens<|"|>} → {"location":"Athens"}
+        let raw = "{location:<|\"|>Athens<|\"|>}";
+        let json = super::gemma4_args_to_json(raw);
+        let parsed: serde_json::Map<String, Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["location"], "Athens");
+    }
+
+    #[test]
+    fn gemma4_args_to_json_multiple() {
+        let raw = "{from:<|\"|>USD<|\"|>,to:<|\"|>KES<|\"|>}";
+        let json = super::gemma4_args_to_json(raw);
+        let parsed: serde_json::Map<String, Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["from"], "USD");
+        assert_eq!(parsed["to"], "KES");
+    }
+
+    #[test]
+    fn gemma4_args_to_json_passthrough_valid_json() {
+        let raw = r#"{"location":"Nairobi"}"#;
+        let json = super::gemma4_args_to_json(raw);
+        let parsed: serde_json::Map<String, Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["location"], "Nairobi");
+    }
+
+    #[test]
+    fn gemma4_args_to_json_empty() {
+        assert_eq!(super::gemma4_args_to_json("{}"), "{}");
     }
 
     #[test]
@@ -642,5 +757,78 @@ mod tests {
         let parsed: Vec<Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed[0]["function"]["name"], "shell");
         assert!(parsed[0]["function"].get("parameters").is_none());
+    }
+
+    /// Diagnostic test: prints the full tools JSON as it would be passed to the
+    /// Jinja chat template. Run with `cargo test -p pond-inference -- --nocapture render_tools_json`
+    /// to see the exact JSON the model receives for tool definitions.
+    #[test]
+    fn render_tools_json_for_inspection() {
+        let tools = vec![
+            ToolDefinition {
+                name: "giap-weather__get_current_weather".to_string(),
+                description: "Get current weather conditions for any city. Pass a location name or omit for default.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City name (e.g. 'Nairobi', 'London'). Omit for home location."
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "giap-knowledge__get_wikipedia_article".to_string(),
+                description: "Look up factual, encyclopedic information about any topic.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "The person, place, event, or concept to look up."
+                        }
+                    },
+                    "required": ["topic"]
+                }),
+            },
+            ToolDefinition {
+                name: "giap-memory__save_memory".to_string(),
+                description: "Save information the user wants remembered.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The fact, preference, or note to save."
+                        },
+                        "segment": {
+                            "type": "string",
+                            "description": "Category: identity, preference, correction, relationship, project, knowledge, context."
+                        }
+                    },
+                    "required": ["content"]
+                }),
+            },
+        ];
+
+        let full_json = tools_to_json(&tools).unwrap();
+        let compact_json = compact_tools_json(&tools).unwrap();
+
+        println!("\n=== FULL tools_json (passed to Jinja template) ===");
+        let pretty: Value = serde_json::from_str(&full_json).unwrap();
+        println!("{}", serde_json::to_string_pretty(&pretty).unwrap());
+
+        println!("\n=== COMPACT tools_json (fallback — NO schemas) ===");
+        let pretty: Value = serde_json::from_str(&compact_json).unwrap();
+        println!("{}", serde_json::to_string_pretty(&pretty).unwrap());
+
+        // Verify full JSON includes parameter schemas
+        let parsed: Vec<Value> = serde_json::from_str(&full_json).unwrap();
+        for tool in &parsed {
+            let params = &tool["function"]["parameters"];
+            assert!(params.is_object(), "tool '{}' missing parameters schema!", tool["function"]["name"]);
+            assert!(params.get("properties").is_some(), "tool '{}' has no properties!", tool["function"]["name"]);
+        }
     }
 }

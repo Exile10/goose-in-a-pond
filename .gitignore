@@ -40,6 +40,10 @@ llama.log
 .claude/
 .vscode/
 
+# Playwright MCP / Vite dev caches
+.playwright-mcp/
+.vite/
+
 **/*.log
 /boop-agent-main/
 CLAUDE.md
