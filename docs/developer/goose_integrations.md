@@ -1,30 +1,154 @@
-# Integrating Goose Built-in Capabilities into GIAP
+# Goose and Pond Engine Integration
 
-> **Status: Implemented (2026-04-08).** All phases described below are complete. This document is preserved as a design record. For current architecture see `CLAUDE.md` and `docs/developer/model_architecture.md`.
+> **Last updated: May 18, 2026.** This document covers the dual-engine architecture where GIAP can run either the Goose agent (via submodule) or the independent PondAgent, selectable at runtime via the `agent_backend` setting.
 
-## Background
+## Dual-Engine Architecture
 
-The Goose submodule (`goose/crates/goose/`) ships production-quality implementations of several capabilities that GIAP previously handled with external HTTP subprocesses. This document describes the integration that wrapped those built-ins as GIAP port adapters.
+GIAP supports two inference backends, selectable at runtime via `PUT /api/v1/settings` with `agent_backend`:
 
-### Why
+| Setting | Engine | Crate | When to use |
+|---------|--------|-------|-------------|
+| `"goose"` | GooseAdapter | `crates/pond-adapters-goose/` | Production default, cloud fallback, complex multi-tool workflows |
+| `"pond"` | PondAgent + LlamaCppEngine | `crates/pond-agent/` + `crates/pond-inference/` | Jetson/embedded, latency-critical, offline, minimal overhead |
 
-| Before | After (implemented) |
-|---|---|
-| llamafile HTTP server (external process) | `LocalInferenceProvider` — GGUF loaded in-process, no subprocess (`pond-adapters-local-inference`) |
-| whisper.cpp HTTP server (external process) | whisper.cpp HTTP server still used; in-process Candle Whisper is a future phase |
-| No persistent cross-session memory | Goose `MemoryServer` (flat-file MCP) injected into system prompt (`pond-adapters-mcp-memory`) |
-| No scheduler | `CronSchedulerAdapter` wrapping `tokio-cron-scheduler` (`pond-infra-scheduler`) |
-| `trim_to_budget()` (char-count truncation) | `ContextCompactor` — LLM-summarization at 80% context threshold (`pond-core`) |
+### Why two engines?
 
-This is the right architecture for the Jetson Orin Nano target: fewer external processes, direct hardware acceleration (Metal on macOS, CUDA on Jetson).
+The Goose submodule provides a mature agent framework with extension management, but:
+- Its `InferenceRuntime` is a global singleton -- cannot coexist with GIAP's `LlamaCppEngine` in the same process
+- It adds ~30s cold-start overhead from extension loading and session setup
+- On Jetson, the KV-cache session persistence in PondAgent saves 5-15s per turn
+
+PondAgent was built as a lightweight alternative that wraps `LlamaCppEngine` directly, giving GIAP full control over KV-cache management, tool dispatch, and prompt construction.
+
+### Backend selection in main.rs
+
+**File:** `crates/pond-server/src/main.rs:1558-1646`
+
+```rust
+// When "pond" is selected, skip Goose entirely to avoid the llama.cpp backend
+// singleton conflict. PondAgent uses its own LlamaCppEngine directly.
+let pond_agent_active = agent_backend == "pond";
+
+if pond_agent_active {
+    // Build PondAgent: LlamaCppEngine + McpToolDispatcher + PromptBuilder
+    let eng = pond_inference::LlamaCppEngine::new(&data_dir)?;
+    eng.load_model(&settings.chat_model, 99, true).await?;
+    let dispatcher = pond_mcp_server::McpToolDispatcher::new(/* deps */);
+    let agent = pond_agent::PondAgent::new(Arc::new(eng), tool_defs, /* deps */);
+} else {
+    // Build Goose backend via build_goose_backend()
+    build_goose_backend(agent_backend, /* deps */).await
+}
+```
+
+The two paths are mutually exclusive -- the llama.cpp backend singleton cannot be shared.
+
+---
+
+## PondAgent Architecture
+
+**File:** `crates/pond-agent/src/agent.rs`
+
+### Direct McpToolDispatcher Usage
+
+PondAgent bypasses Goose's extension manager entirely. Instead, it holds a direct reference to `McpToolDispatcher` (from `crates/pond-mcp-server/src/dispatcher.rs`), which routes tool calls to GIAP's builtin MCP servers by name prefix.
+
+Key difference from Goose:
+
+| Aspect | Goose | PondAgent |
+|--------|-------|-----------|
+| Tool discovery | Extension manager scans MCP servers at session init | `dispatcher.tools_json()` queried LIVE each turn (agent.rs:391) |
+| Tool JSON format | `format_tools()` serializes from internal state | `ToolDispatcher::tools_json()` produces identical OpenAI format |
+| Schema caching | Cached at session creation | Fetched live, always current |
+| Tool dispatch | Goose agentic loop manages lifecycle | `dispatcher.dispatch(name, args)` called directly (agent.rs:569) |
+
+### Live tool schema fetching
+
+On each turn, PondAgent queries the dispatcher for the current tool schemas rather than using a cached copy:
+
+```rust
+// agent.rs:391-411 — inside chat_stream()
+let (tools, tools_json_override, compact_json_override) = if caps.tool_calling {
+    if let Some(ref disp) = self.tool_dispatcher {
+        let full_json = disp.tools_json().await;       // OpenAI-format JSON
+        let compact_json = disp.compact_tools_json().await;
+        let defs = disp.available_tool_definitions().await;
+        // ...
+    }
+};
+```
+
+This means:
+- Adding/removing MCP servers at runtime is immediately reflected
+- Tool schemas always match the current server state
+- No stale cache after MCP server configuration changes
+
+### tools_json_override flow
+
+The pre-formatted JSON from the dispatcher flows through `InferenceOptions` into the generation task:
+
+```
+ToolDispatcher::tools_json() → InferenceOptions.tools_json_override
+  → generation_task() → apply_chat_template_oaicompat(tools_json)
+```
+
+This bypasses `tools_to_json()` re-serialization, ensuring the model sees the exact same schema format that Goose would produce.
+
+---
+
+## McpToolDispatcher
+
+**File:** `crates/pond-mcp-server/src/dispatcher.rs`
+
+Routes tool calls by name prefix to registered MCP servers:
+
+```
+"giap-weather__get_current_weather"
+  → prefix: "giap-weather__"
+  → bare name: "get_current_weather"
+  → dispatched to: WeatherMcpServer
+```
+
+### Dynamic schema discovery
+
+Tool schemas are queried from each `ServerHandler::list_tools()` at runtime, not hardcoded. At debug log level, the dispatcher logs the full JSON schema for every tool:
+
+```rust
+// dispatcher.rs:274
+tracing::debug!(
+    prefix = reg.prefix,
+    tool = %name,
+    description = %desc,
+    schema = %serde_json::to_string(schema).unwrap_or_default(),
+    "tool schema"
+);
+```
+
+### Peer construction
+
+rmcp requires a `Peer<RoleServer>` for `RequestContext`. The dispatcher creates one via a minimal `serve_directly()` on a `DuplexStream` -- the transport is a no-op, but provides a valid peer for calling `ServerHandler` methods.
+
+---
+
+## Goose Submodule
+
+`goose/` is a git submodule (Block's Goose agent framework). GIAP re-declares Goose's transitive dependencies (rmcp, sacp, tree-sitter-*) in the root `Cargo.toml` -- do not remove them.
 
 ### rmcp Conflict Constraint
 
-`pond-adapters-goose` is workspace-excluded because Goose's `code-mode` feature pulls in `pctx_code_execution_runtime` which requires rmcp ^0.14, while `pctx_config` requires rmcp 1.2 — irreconcilable. All new Goose-dependent crates must:
+`pond-adapters-goose` is workspace-excluded because Goose's `code-mode` feature pulls in `pctx_code_execution_runtime` which requires rmcp ^0.14, while `pctx_config` requires rmcp 1.2. All Goose-dependent crates must:
 
 - Use `default-features = false` on the `goose` dependency
 - Never enable the `code-mode` feature
 - Be added to the workspace `exclude` list
+
+### Patched files
+
+GIAP patches two files in the submodule:
+- `goose/crates/goose/src/providers/local_inference.rs` -- OR-merge for `native_tool_calling`
+- `goose/crates/goose/src/providers/local_model_registry.rs` -- same OR-merge in `enrich_with_featured_mmproj()`
+
+Without these patches, non-featured model IDs (like `gemma-4-E2B-it-Q4_K_M`) get `native_tool_calling: false` overwritten on every inference call.
 
 ---
 
