@@ -438,7 +438,10 @@ fn generation_task(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut generated_text = String::new();
     let mut output_token_count: u32 = 0;
-    let mut accumulated_tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+    // Accumulate RAW tool call deltas — merge by index after generation completes.
+    // Arguments arrive as partial strings across multiple deltas and must be
+    // concatenated before JSON parsing (same approach as Goose).
+    let mut raw_tool_deltas: Vec<serde_json::Value> = Vec::new();
 
     for _ in 0..max_output {
         let token = sampler.sample(&ctx, -1);
@@ -470,30 +473,17 @@ fn generation_task(
                     Ok(deltas) => {
                         for delta_json in deltas {
                             if let Ok(delta) = serde_json::from_str::<serde_json::Value>(&delta_json) {
-                                // Stream text content
+                                // Stream text content immediately.
                                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                                     if !content.is_empty() {
                                         let _ = tx.blocking_send(Ok(ChatEvent::Text(content.to_string())));
                                     }
                                 }
-                                // Accumulate tool calls
+                                // Accumulate tool call deltas — DON'T parse args yet.
+                                // Arguments arrive as partial strings across deltas.
                                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                                     for tc in tool_calls {
-                                        let id = tc.get("id").and_then(|v| v.as_str())
-                                            .unwrap_or("").to_string();
-                                        let name = tc.get("function")
-                                            .and_then(|f| f.get("name"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("").to_string();
-                                        let args_str = tc.get("function")
-                                            .and_then(|f| f.get("arguments"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("{}");
-                                        let args: serde_json::Value =
-                                            serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                                        if !name.is_empty() {
-                                            accumulated_tool_calls.push((id, name, args));
-                                        }
+                                        raw_tool_deltas.push(tc.clone());
                                     }
                                 }
                             }
@@ -566,40 +556,76 @@ fn generation_task(
                     }
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tool_calls {
-                            let id = tc.get("id").and_then(|v| v.as_str())
-                                .unwrap_or("").to_string();
-                            let name = tc.get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("").to_string();
-                            let args_str = tc.get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}");
-                            let args: serde_json::Value =
-                                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                            if !name.is_empty() {
-                                accumulated_tool_calls.push((id, name, args));
-                            }
+                            raw_tool_deltas.push(tc.clone());
                         }
                     }
                 }
             }
         }
 
-        // Emit accumulated tool calls.
-        if !accumulated_tool_calls.is_empty() {
-            tracing::debug!(count = accumulated_tool_calls.len(), "tool calls parsed by streaming parser");
-            for (id, name, args) in accumulated_tool_calls {
+        // Merge accumulated deltas by index — concatenate argument strings,
+        // THEN parse the complete JSON. Same as Goose's extract_oai_tool_call_contents.
+        if !raw_tool_deltas.is_empty() {
+            let mut merged: std::collections::BTreeMap<u64, (String, String, String)> =
+                std::collections::BTreeMap::new();
+
+            for delta in &raw_tool_deltas {
+                let index = delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let entry = merged
+                    .entry(index)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+
+                if let Some(id) = delta.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        entry.0 = id.to_string();
+                    }
+                }
+                if let Some(func) = delta.get("function") {
+                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            entry.1 = name.to_string();
+                        }
+                    }
+                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                        entry.2.push_str(args); // ACCUMULATE, don't parse yet
+                    }
+                }
+            }
+
+            let tool_count = merged.values().filter(|(_, n, _)| !n.is_empty()).count();
+            tracing::debug!(
+                deltas = raw_tool_deltas.len(),
+                tools = tool_count,
+                "tool call deltas merged by index"
+            );
+
+            for (_, (id, name, args_str)) in merged {
+                if name.is_empty() {
+                    continue;
+                }
                 let call_id = if id.is_empty() {
                     uuid::Uuid::new_v4().to_string()
                 } else {
                     id
                 };
+                let arguments: serde_json::Value = if args_str.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&args_str).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            tool = %name,
+                            args = %args_str,
+                            error = %e,
+                            "failed to parse merged tool arguments"
+                        );
+                        serde_json::json!({})
+                    })
+                };
+                tracing::debug!(tool = %name, args = %arguments, "emitting tool call");
                 let _ = tx.blocking_send(Ok(ChatEvent::ToolCall {
                     id: call_id,
                     name,
-                    arguments: args,
+                    arguments,
                 }));
             }
         }
