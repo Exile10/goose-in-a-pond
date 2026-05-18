@@ -464,8 +464,8 @@ impl Agent for PondAgent {
                     let _ = tx
                         .send(Ok(AgentStreamEvent::Status {
                             content: format!(
-                                "Thinking... ({}/10)",
-                                iteration
+                                "Thinking... ({}/{})",
+                                iteration, MAX_TOOL_ITERATIONS
                             ),
                         }))
                         .await;
