@@ -8,7 +8,7 @@ import {
 } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
+import { PageHeader, useConfirm } from "../components/shared";
 import { useAppState } from "../state/AppContext";
 import type { Schedule, ScheduleRun } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
@@ -193,6 +193,7 @@ const TIMEZONE_OPTIONS = [
 
 export function Schedules() {
   const state = useAppState();
+  const confirm = useConfirm();
   const [schedules, setSchedules]         = useState<Schedule[]>([]);
   const [loading, setLoading]             = useState(true);
   const [error, setError]                 = useState<string | null>(null);
@@ -355,7 +356,7 @@ export function Schedules() {
   }
 
   async function handleDelete(id: string, schedName: string) {
-    if (!confirm(`Delete schedule "${schedName}"?`)) return;
+    if (!await confirm(`Delete schedule "${schedName}"?`, { title: "Delete Schedule", confirmLabel: "Delete", destructive: true })) return;
     try {
       await api.deleteSchedule(id);
       flashMsg("Schedule deleted.");

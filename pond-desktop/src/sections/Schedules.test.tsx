@@ -23,9 +23,12 @@ vi.mock("../state/AppContext", () => ({
   useAppState: () => ({ serverOnline: true, sessionToken: "test-token" }),
 }));
 
-// ── Mock confirm() (used in handleDelete) ────────────────────────────────────
+// ── Mock useConfirm (used in handleDelete) ────────────────────────────────────
 
-vi.stubGlobal("confirm", () => true);
+vi.mock("../components/shared", async () => {
+  const actual = await vi.importActual("../components/shared") as Record<string, unknown>;
+  return { ...actual, useConfirm: () => async () => true };
+});
 
 // ── Sample data ───────────────────────────────────────────────────────────────
 

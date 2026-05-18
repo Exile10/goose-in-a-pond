@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
-import { PageHeader } from "../components/shared";
+import { PageHeader, useConfirm } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
   HfModel, HfModelFile, DownloadEntry,
@@ -1533,6 +1533,7 @@ function TtsCatalogPanel({
 // ── Main Models Component ─────────────────────────────────────
 
 export function Models() {
+  const confirm = useConfirm();
   const [category, setCategory] = useState<Category>("llm");
   const [activeRoles, setActiveRoles] = useState<ModelActiveRoles | null>(null);
   const [rolesLoading, setRolesLoading] = useState(false);
@@ -1616,7 +1617,7 @@ export function Models() {
   }
 
   async function handleDelete(provider: string, name: string) {
-    if (!confirm(`Delete "${name}"? This removes the file from disk.`)) return;
+    if (!await confirm(`Delete "${name}"? This removes the file from disk.`, { title: "Delete Model", confirmLabel: "Delete", destructive: true })) return;
     try {
       await api.deleteModel(provider, name);
       flash(`${name} deleted.`);
