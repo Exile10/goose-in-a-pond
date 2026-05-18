@@ -174,7 +174,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SERVER_ONLINE" });
       api.handshake("pond-desktop")
         .then(async (res) => {
-          api.setToken(res.token);
+          api.setToken(res.token, res.expires_in);
           dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
           await ensureOnboarded();
         })

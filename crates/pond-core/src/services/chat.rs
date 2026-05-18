@@ -1253,6 +1253,14 @@ impl ChatService {
             canvas_mode: false,
         };
 
+        // ── Quip — fills silence while the LLM starts inference ──
+        // Speak a short reassurance phrase (e.g. "Let me think.") so the user
+        // hears immediate feedback after speaking. The quip plays, then the
+        // thinking tone fills the remaining silence until the first real sentence.
+        if let Some(quip) = self.voice_output.speak_quip().await {
+            tracing::debug!("Spoke quip: {:?}", quip);
+        }
+
         // Start a soft ambient thinking tone while the LLM infers.
         // Stopped as soon as the first speakable content arrives.
         self.voice_output.start_thinking_tone();
@@ -1271,6 +1279,7 @@ impl ChatService {
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
+        let mut barge_in_started = false;
         let mut thought_filter = crate::services::thought_filter::ThoughtFilter::new();
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
@@ -1354,6 +1363,13 @@ impl ChatService {
                             continue;
                         }
                         stop_tone!();
+                        // Start barge-in mic monitoring before first TTS playback.
+                        // If the user speaks during TTS, the listener sets the
+                        // interrupt flag and playback stops immediately.
+                        if !barge_in_started {
+                            self.voice_output.start_barge_in_listener();
+                            barge_in_started = true;
+                        }
                         speak_pipelined!(self, spoken, &mut pending_audio);
                     }
                 }
@@ -1414,6 +1430,11 @@ impl ChatService {
 
         // Ensure the thinking tone is stopped even if no speakable text was produced.
         stop_tone!();
+
+        // Stop barge-in mic monitoring now that all TTS is complete.
+        if barge_in_started {
+            self.voice_output.stop_barge_in_listener();
+        }
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(full_text.clone());
@@ -1584,9 +1605,10 @@ impl ChatService {
                     // Wake word detected during inference/TTS — INTERRUPT
                     println!("\n  🔄 Interrupted! Listening for new request...");
 
-                    // Stop any in-progress TTS playback immediately
+                    // Stop any in-progress TTS playback and background listeners
                     self.voice_output.stop_speaking();
                     self.voice_output.stop_thinking_tone();
+                    self.voice_output.stop_barge_in_listener();
 
                     // chat_fut is dropped here by tokio::select!, which drops the
                     // agent stream.  The channel-receiver drop propagates into

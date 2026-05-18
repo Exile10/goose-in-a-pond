@@ -1,6 +1,15 @@
 /* =============================================================================
    GIAP Canvas Overlay — Jarida Brand · Warm Frosted Glass · Light Mode
+   Local token aliases (canvas runs in a separate Tauri window — no shared root).
    ============================================================================= */
+
+/* Canvas runs in a separate Tauri window without the main design-tokens.css root.
+   Re-declare only the tokens needed by canvas components. */
+:root {
+  --color-text: #171616; /* Jarida Charcoal — matches design-tokens.css --color-text */
+  --color-text-on-accent: #FFFFFF;
+  --color-surface: #ffffff;
+}
 
 * {
   box-sizing: border-box;
@@ -41,7 +50,7 @@ html, body, #root {
   border: 1px solid rgba(23, 22, 22, 0.12);
   border-radius: 18px;
   overflow: hidden;
-  color: #171616;
+  color: var(--color-text);
   box-shadow: 0 8px 32px rgba(23,22,22,0.18), 0 2px 8px rgba(23,22,22,0.08);
   user-select: none;
 }
@@ -104,7 +113,7 @@ html, body, #root {
 }
 
 .canvas-dismiss:hover {
-  color: #171616;
+  color: var(--color-text);
   background: rgba(23,22,22,0.06);
 }
 
@@ -133,13 +142,15 @@ html, body, #root {
   scrollbar-color: rgba(23,22,22,0.15) transparent;
 }
 
-.canvas-cards::-webkit-scrollbar { width: 4px; }
+.canvas-cards::-webkit-scrollbar { width: 6px; }
 .canvas-cards::-webkit-scrollbar-thumb {
   background: rgba(23,22,22,0.15);
   border-radius: 2px;
 }
 
 /* ── Animations ─────────────────────────────────────────── */
+/* Keyframes (fadeIn, pulse, progressSlide) are defined in base.css — canonical source. */
+/* canvas.css re-declares here since it runs in a separate Tauri window without base.css. */
 
 @keyframes progressSlide {
   0%   { transform: translateX(-100%); }

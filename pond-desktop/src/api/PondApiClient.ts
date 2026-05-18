@@ -1,10 +1,12 @@
 import {
   ApiError,
   type AddExtensionRequest,
+  type AgentChatStreamRequest,
   type AgentRecipe,
   type AgentTool,
   type CalibrateResponse,
   type ChatEvent,
+  type ChatStreamRequest,
   type Device,
   type DownloadEntry,
   type Extension,
@@ -48,14 +50,28 @@ declare global {
 export class PondApiClient {
   private readonly base: string;
   private token: string | null;
+  private tokenExpiresAt: number | null = null;
+  private refreshPromise: Promise<void> | null = null;
 
   constructor(base?: string, token?: string | null) {
     this.base = (base ?? window.__GIAP_SERVER_URL__ ?? "http://127.0.0.1:4000").replace(/\/$/, "");
     this.token = token ?? null;
   }
 
-  setToken(token: string | null): void {
+  setToken(token: string | null, expiresIn?: number): void {
     this.token = token;
+    this.tokenExpiresAt = token && expiresIn ? Date.now() + expiresIn * 1000 : null;
+  }
+
+  private async ensureTokenFresh(): Promise<void> {
+    if (!this.token || !this.tokenExpiresAt) return;
+    if (Date.now() < this.tokenExpiresAt - 60_000) return;
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.post<HandshakeResponse>("/api/v1/handshake", { client_id: "pond-desktop" })
+      .then((res) => { this.setToken(res.token, res.expires_in); })
+      .catch(() => { /* refresh failed — continue with current token */ })
+      .finally(() => { this.refreshPromise = null; });
+    return this.refreshPromise;
   }
 
   // ── Internal helpers ───────────────────────────────────────
@@ -66,21 +82,34 @@ export class PondApiClient {
     return h;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.base}${path}`, {
-      method,
-      headers: this.headers(),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
-      throw new ApiError(res.status, msg);
+  private async request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
+    await this.ensureTokenFresh();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout ?? 30_000);
+    try {
+      const res = await fetch(`${this.base}${path}`, {
+        method,
+        headers: this.headers(),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        let msg = res.statusText;
+        try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+        throw new ApiError(res.status, msg);
+      }
+      // 204 No Content and any other empty body — return undefined cast to T
+      const ct = res.headers.get("content-type") ?? "";
+      if (res.status === 204 || !ct.includes("json")) return undefined as unknown as T;
+      return res.json() as Promise<T>;
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e instanceof DOMException && e.name === "AbortError") {
+        throw new ApiError(408, "Request timed out");
+      }
+      throw e;
     }
-    // 204 No Content and any other empty body — return undefined cast to T
-    const ct = res.headers.get("content-type") ?? "";
-    if (res.status === 204 || !ct.includes("json")) return undefined as unknown as T;
-    return res.json() as Promise<T>;
   }
 
   private get<T>(path: string): Promise<T>                       { return this.request<T>("GET", path); }
@@ -175,7 +204,7 @@ export class PondApiClient {
   }
 
   deleteSchedule(id: string): Promise<void> {
-    return this.del(`/api/v1/schedules/${id}`);
+    return this.del(`/api/v1/schedules/${encodeURIComponent(id)}`);
   }
 
   async updateSchedule(
@@ -492,15 +521,40 @@ export class PondApiClient {
     token?: string,
     canvasMode?: boolean,
   ): AsyncGenerator<ChatEvent> {
+    await this.ensureTokenFresh();
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const tok = token ?? this.token;
     if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
-    const res = await fetch(`${this.base}/api/v1/chat/stream`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ message, session_id: sessionId, canvas_mode: canvasMode ?? false }),
-    });
+    const reqBody: ChatStreamRequest = {
+      message,
+      session_id: sessionId,
+      canvas_mode: canvasMode ?? false,
+    };
+
+    // Retry initial connection on network-level failures (not HTTP errors).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120_000);
+    let res!: Response;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        res = await fetch(`${this.base}/api/v1/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        break;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        if (e instanceof DOMException && e.name === "AbortError") {
+          throw new ApiError(408, "Request timed out");
+        }
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
 
     if (!res.ok) {
       let msg = res.statusText;
@@ -672,17 +726,36 @@ export class PondApiClient {
   // ── Agent chat (agentic mode with tool calls) ─────────────
 
   async *agentChatStream(message: string, sessionId?: string): AsyncGenerator<ChatEvent> {
-    const body: Record<string, string> = { message };
-    if (sessionId) body.session_id = sessionId;
+    await this.ensureTokenFresh();
+    const reqBody: AgentChatStreamRequest = { message };
+    if (sessionId) reqBody.session_id = sessionId;
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
 
-    const res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+    // Retry initial connection on network-level failures (not HTTP errors).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120_000);
+    let res!: Response;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        break;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        if (e instanceof DOMException && e.name === "AbortError") {
+          throw new ApiError(408, "Request timed out");
+        }
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
 
     if (!res.ok || !res.body) {
       let msg = res.statusText;
@@ -702,7 +775,10 @@ export class PondApiClient {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
+          if (!trimmed || trimmed === "data: [DONE]") {
+            if (trimmed === "data: [DONE]") yield { type: "done", done: true };
+            continue;
+          }
           const data = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
           try { yield JSON.parse(data) as ChatEvent; } catch { /* malformed */ }
         }

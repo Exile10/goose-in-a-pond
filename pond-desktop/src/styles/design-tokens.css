@@ -71,6 +71,8 @@
 
   /* Surfaces — Jarida warm whites */
   --color-bg:             #FFF9F9;   /* Jarida White — main window */
+  --color-surface:        #ffffff;   /* pure white — card faces, inputs, dropdowns */
+  --color-surface-warm:   #fdf8fb;   /* soft pinkish white — app-shell gradient start */
   --color-sidebar:        #F5F4F0;   /* warm stone sidebar */
   --color-content:        #FAFAF8;   /* slightly warm content area */
   --color-overlay:        rgba(255, 249, 249, 0.88);  /* canvas frosted glass */
@@ -88,12 +90,21 @@
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
   --color-success-soft:     rgba(52, 199, 89, 0.12);
+  --color-success-fg:       #0e8a4a;  /* dark green for text on light bg */
   --color-warning:          #FF9500;
   --color-warning-soft:     rgba(255, 149, 0, 0.12);
+  --color-warning-fg:       #b08000;  /* dark amber for text on light bg */
   --color-destructive:      #FF3B30;
   --color-destructive-soft: rgba(255, 59, 48, 0.10);
   --color-neutral:          #8E8E93;
   --color-neutral-soft:     rgba(142, 142, 147, 0.12);
+
+  /* Info (used in segment banners, role chip primary) */
+  --color-info:             #0072f5;
+  --color-info-soft:        rgba(0, 114, 245, 0.05);
+  --color-info-fg:          #4d94d4;  /* muted blue text on light bg */
+  --color-info-dark:        #0058c4;  /* dark blue for text/icons */
+  --color-info-icon-bg:     rgba(0, 114, 245, 0.10);
 
   /* ── Voice Orb States ───────────────────────────────────── */
   --orb-idle:      #8E8E93;
@@ -198,4 +209,26 @@
   --shadow-canvas: 0 8px 32px rgba(23, 22, 22, 0.18), 0 2px 8px rgba(23, 22, 22, 0.10);
   --shadow-brand:  0 10px 24px rgba(140, 75, 255, 0.28); /* hero CTA glow */
   --shadow-orb:    0 0 24px rgba(140, 75, 255, 0.30);  /* purple glow when active */
+
+  /* ── Notification icon colors ───────────────────────────── */
+  --color-notif-daily-bg:  #FFF7ED;
+  --color-notif-daily-fg:  #EA580C;
+  --color-notif-weekly-bg: #EFF6FF;
+  --color-notif-weekly-fg: #2563EB;
+
+  /* ── Memory segment colors ──────────────────────────────── */
+  --mem-identity:          #9333ea;
+  --mem-identity-bg:       rgba(147, 51, 234, 0.08);
+  --mem-preference:        #3b82f6;
+  --mem-preference-bg:     rgba(59, 130, 246, 0.08);
+  --mem-correction:        #ef4444;
+  --mem-correction-bg:     rgba(239, 68, 68, 0.08);
+  --mem-relationship:      #22c55e;
+  --mem-relationship-bg:   rgba(34, 197, 94, 0.08);
+  --mem-project:           #f97316;
+  --mem-project-bg:        rgba(249, 115, 22, 0.08);
+  --mem-knowledge:         #14b8a6;
+  --mem-knowledge-bg:      rgba(20, 184, 166, 0.08);
+  --mem-context:           #9ca3af;
+  --mem-context-bg:        rgba(156, 163, 175, 0.08);
 }

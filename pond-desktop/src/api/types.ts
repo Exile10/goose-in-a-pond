@@ -335,6 +335,21 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
+
+/** Request body for POST /api/v1/chat/stream */
+export interface ChatStreamRequest {
+  message: string;
+  session_id?: string;
+  canvas_mode?: boolean;
+  voice_mode?: boolean;
+}
+
+/** Request body for POST /api/v1/agent/chat/stream */
+export interface AgentChatStreamRequest {
+  message: string;
+  session_id?: string;
+}
+
 export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision";
 
 export interface ChatEvent {
