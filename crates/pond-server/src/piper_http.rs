@@ -24,8 +24,8 @@ use std::{io::Write as _, path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 struct PiperState {
-    piper_bin:   PathBuf,
-    model:       PathBuf,
+    piper_bin: PathBuf,
+    model: PathBuf,
     espeak_data: Option<PathBuf>,
 }
 
@@ -35,22 +35,23 @@ async fn synthesise(
     State(s): State<Arc<PiperState>>,
     body: String,
 ) -> Result<Response<Body>, StatusCode> {
-    let bin         = s.piper_bin.clone();
-    let model       = s.model.clone();
+    let bin = s.piper_bin.clone();
+    let model = s.model.clone();
     let espeak_data = s.espeak_data.clone();
-    let text        = body.trim().to_string();
+    let text = body.trim().to_string();
 
     if text.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let wav = tokio::task::spawn_blocking(move || run_piper(&bin, &model, espeak_data.as_deref(), &text))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|e| {
-            tracing::warn!("piper synthesis failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let wav =
+        tokio::task::spawn_blocking(move || run_piper(&bin, &model, espeak_data.as_deref(), &text))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+                tracing::warn!("piper synthesis failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "audio/wav")
@@ -69,7 +70,7 @@ fn run_piper(
 
     let mut cmd = Command::new(piper_bin);
     cmd.args(["--model", &model.to_string_lossy()])
-       .args(["--output-raw", "--quiet"]);
+        .args(["--output-raw", "--quiet"]);
     if let Some(d) = espeak_data {
         cmd.args(["--espeak_data", &d.to_string_lossy()]);
     }
@@ -80,7 +81,8 @@ fn run_piper(
         .spawn()
         .with_context(|| format!("failed to spawn piper at {}", piper_bin.display()))?;
 
-    child.stdin
+    child
+        .stdin
         .take()
         .ok_or_else(|| anyhow!("piper stdin unavailable"))?
         .write_all(text.as_bytes())
@@ -100,11 +102,11 @@ fn run_piper(
 }
 
 fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
-    let channels: u16       = 1;
-    let bits: u16           = 16;
-    let byte_rate           = sample_rate * u32::from(channels) * u32::from(bits) / 8;
-    let block_align: u16    = channels * bits / 8;
-    let data_len            = pcm.len() as u32;
+    let channels: u16 = 1;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
+    let block_align: u16 = channels * bits / 8;
+    let data_len = pcm.len() as u32;
 
     let mut w = Vec::with_capacity(44 + pcm.len());
     w.extend_from_slice(b"RIFF");
@@ -136,11 +138,21 @@ pub async fn start(
     model: PathBuf,
     espeak_data: Option<PathBuf>,
 ) -> Result<u16> {
-    let (listener, actual_port) = crate::ports::bind_with_fallback("127.0.0.1", crate::ports::PIPER_TTS)
-        .await
-        .with_context(|| format!("piper-http: could not bind port {}", crate::ports::PIPER_TTS))?;
+    let (listener, actual_port) =
+        crate::ports::bind_with_fallback("127.0.0.1", crate::ports::PIPER_TTS)
+            .await
+            .with_context(|| {
+                format!(
+                    "piper-http: could not bind port {}",
+                    crate::ports::PIPER_TTS
+                )
+            })?;
 
-    let state = Arc::new(PiperState { piper_bin, model, espeak_data });
+    let state = Arc::new(PiperState {
+        piper_bin,
+        model,
+        espeak_data,
+    });
     let app = Router::new()
         .route("/tts", post(synthesise))
         .with_state(state);

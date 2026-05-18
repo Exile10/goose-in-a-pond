@@ -46,8 +46,12 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn get_current_step(&self) -> Option<OnboardingStep> {
         Some(OnboardingStep::Completed)
     }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -56,73 +60,105 @@ struct NoDevices;
 impl DeviceRegistry for NoDevices {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".into(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01 00:00:00".into(), last_seen: None, is_online: false,
+            id: "mock".into(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01 00:00:00".into(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self)           -> anyhow::Result<Vec<Device>>    { Ok(vec![]) }
-    async fn get_device(&self, _: &str)    -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str)    -> anyhow::Result<()>             { Ok(()) }
-    async fn heartbeat(&self, _: &str)     -> anyhow::Result<()>             { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
 async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let db  = Database::init(tmp.path()).await.unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
-    let db   = Arc::new(db);
+    let db = Arc::new(db);
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
-        db:                  db,
-        onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(mock_hs),
-        whisper_url:         "http://127.0.0.1:9000".into(),
-        session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
-        http_client:         reqwest::Client::new(),
-        agent:               Arc::new(MockAgent::new()),
-        llm_provider:        Arc::new(tokio::sync::RwLock::new(None)),
-        llamafile_url:       "http://127.0.0.1:8080".into(),
-        tts:                 None,
-        settings_repo:       Arc::new(MockSettingsRepository::new()),
-        profile_repo:        Arc::new(MockProfileRepository::new()),
-        device_registry:     Arc::new(NoDevices),
-        memory_repo:         Arc::new(MockMemoryRepository::new()),
-        embedding_provider:  None,
-        sensor_storage:      Arc::new(MockSensorStorage::new()),
-        camera_storage:      Arc::new(MockCameraStorage::new()),
-        face_recognition:    None,
+        db: db,
+        onboarding_repo: Arc::new(CompletedOnboarding),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
+        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(NoDevices),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
         prompt_template_dir: None,
-        model_repo:          None,
-        data_dir:            Some(tmp.path().to_path_buf()),
-        skip_onboarding:     true,
-        scheduler:           None,
-        model_scheduler:     None,
-        mcp_memory:          None,
-        extension_manager:   None,
-        mcp_server_repo:     None,
-        download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        piper_http_port:     None,
+        model_repo: None,
+        data_dir: Some(tmp.path().to_path_buf()),
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
         model_catalog_provider: None,
-        model_storage_dir:   None,
+        model_storage_dir: None,
         prompt_template_repo: Some(Arc::new(SqlitePromptTemplateRepository::new(pool.clone()))),
-        prompt_extra_repo:   Some(Arc::new(SqlitePromptExtraRepository::new(pool.clone()))),
-        skill_repo:          Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
-        recipe_repo:         Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
+        prompt_extra_repo: Some(Arc::new(SqlitePromptExtraRepository::new(pool.clone()))),
+        skill_repo: Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
+        recipe_repo: Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
 
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -164,7 +200,9 @@ fn delete(uri: &str) -> Request<Body> {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -183,14 +221,22 @@ async fn prompt_templates_list_empty() {
 async fn prompt_templates_upsert_then_get_then_list() {
     let (app, _tmp) = make_app().await;
 
-    let resp = app.clone()
-        .oneshot(put("/api/v1/prompts/custom",
-            serde_json::json!({"content": "You are a test bot.", "description": "Test template"})))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/prompts/custom",
+            serde_json::json!({"content": "You are a test bot.", "description": "Test template"}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // GET by name
-    let resp = app.clone().oneshot(get("/api/v1/prompts/custom")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/prompts/custom"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["name"], "custom");
@@ -207,7 +253,10 @@ async fn prompt_templates_upsert_then_get_then_list() {
 #[tokio::test]
 async fn prompt_template_get_missing_returns_404() {
     let (app, _tmp) = make_app().await;
-    let resp = app.oneshot(get("/api/v1/prompts/nonexistent")).await.unwrap();
+    let resp = app
+        .oneshot(get("/api/v1/prompts/nonexistent"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -216,11 +265,17 @@ async fn prompt_template_delete_user_defined() {
     let (app, _tmp) = make_app().await;
 
     app.clone()
-        .oneshot(put("/api/v1/prompts/deleteme",
-            serde_json::json!({"content": "temp", "description": ""})))
-        .await.unwrap();
+        .oneshot(put(
+            "/api/v1/prompts/deleteme",
+            serde_json::json!({"content": "temp", "description": ""}),
+        ))
+        .await
+        .unwrap();
 
-    let resp = app.oneshot(delete("/api/v1/prompts/deleteme")).await.unwrap();
+    let resp = app
+        .oneshot(delete("/api/v1/prompts/deleteme"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -230,7 +285,7 @@ async fn prompt_template_delete_system_returns_403() {
     use pond_core::ports::prompt_template::PromptTemplateRepository as _;
 
     let tmp = tempfile::tempdir().unwrap();
-    let db   = Database::init(tmp.path()).await.unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
 
     // Seed a system template directly
@@ -241,57 +296,77 @@ async fn prompt_template_delete_system_returns_403() {
         description: "Built-in".into(),
         is_system: true,
         updated_at: String::new(),
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
-        db:                  Arc::new(db),
-        onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(mock_hs),
-        whisper_url:         "http://127.0.0.1:9000".into(),
-        session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
-        http_client:         reqwest::Client::new(),
-        agent:               Arc::new(MockAgent::new()),
-        llm_provider:        Arc::new(tokio::sync::RwLock::new(None)),
-        llamafile_url:       "http://127.0.0.1:8080".into(),
-        tts:                 None,
-        settings_repo:       Arc::new(MockSettingsRepository::new()),
-        profile_repo:        Arc::new(MockProfileRepository::new()),
-        device_registry:     Arc::new(NoDevices),
-        memory_repo:         Arc::new(MockMemoryRepository::new()),
-        embedding_provider:  None,
-        sensor_storage:      Arc::new(MockSensorStorage::new()),
-        camera_storage:      Arc::new(MockCameraStorage::new()),
-        face_recognition:    None,
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(CompletedOnboarding),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
+        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(NoDevices),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
         prompt_template_dir: None,
-        model_repo:          None,
-        data_dir:            None,
-        skip_onboarding:     true,
-        scheduler:           None,
-        model_scheduler:     None,
-        mcp_memory:          None,
-        extension_manager:   None,
-        mcp_server_repo:     None,
-        download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        piper_http_port:     None,
+        model_repo: None,
+        data_dir: None,
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
         model_catalog_provider: None,
-        model_storage_dir:   None,
+        model_storage_dir: None,
         prompt_template_repo: Some(Arc::new(SqlitePromptTemplateRepository::new(pool.clone()))),
-        prompt_extra_repo:   None,
-        skill_repo:          None,
-        recipe_repo:         None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
-    let resp = app.oneshot(delete("/api/v1/prompts/balanced")).await.unwrap();
+    let resp = app
+        .oneshot(delete("/api/v1/prompts/balanced"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -301,14 +376,19 @@ async fn prompt_template_delete_system_returns_403() {
 async fn prompt_extras_create_and_list() {
     let (app, _tmp) = make_app().await;
 
-    let resp = app.clone()
-        .oneshot(post("/api/v1/agent/extras", serde_json::json!({
-            "key": "language",
-            "instruction": "Always reply in French.",
-            "active": true,
-            "sort_order": 10
-        })))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/agent/extras",
+            serde_json::json!({
+                "key": "language",
+                "instruction": "Always reply in French.",
+                "active": true,
+                "sort_order": 10
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app.oneshot(get("/api/v1/agent/extras")).await.unwrap();
@@ -325,16 +405,24 @@ async fn prompt_extras_upsert_updates_existing_key() {
     let (app, _tmp) = make_app().await;
 
     app.clone()
-        .oneshot(post("/api/v1/agent/extras", serde_json::json!({
-            "key": "safety", "instruction": "Original.", "active": true, "sort_order": 0
-        })))
-        .await.unwrap();
+        .oneshot(post(
+            "/api/v1/agent/extras",
+            serde_json::json!({
+                "key": "safety", "instruction": "Original.", "active": true, "sort_order": 0
+            }),
+        ))
+        .await
+        .unwrap();
 
     app.clone()
-        .oneshot(post("/api/v1/agent/extras", serde_json::json!({
-            "key": "safety", "instruction": "Updated.", "active": false, "sort_order": 5
-        })))
-        .await.unwrap();
+        .oneshot(post(
+            "/api/v1/agent/extras",
+            serde_json::json!({
+                "key": "safety", "instruction": "Updated.", "active": false, "sort_order": 5
+            }),
+        ))
+        .await
+        .unwrap();
 
     let resp = app.oneshot(get("/api/v1/agent/extras")).await.unwrap();
     let body = body_json(resp).await;
@@ -349,12 +437,19 @@ async fn prompt_extra_delete() {
     let (app, _tmp) = make_app().await;
 
     app.clone()
-        .oneshot(post("/api/v1/agent/extras", serde_json::json!({
-            "key": "toremove", "instruction": "Gone soon.", "active": true, "sort_order": 0
-        })))
-        .await.unwrap();
+        .oneshot(post(
+            "/api/v1/agent/extras",
+            serde_json::json!({
+                "key": "toremove", "instruction": "Gone soon.", "active": true, "sort_order": 0
+            }),
+        ))
+        .await
+        .unwrap();
 
-    let resp = app.oneshot(delete("/api/v1/agent/extras/toremove")).await.unwrap();
+    let resp = app
+        .oneshot(delete("/api/v1/agent/extras/toremove"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -364,12 +459,17 @@ async fn prompt_extra_delete() {
 async fn memories_save_returns_201_and_list_returns_200() {
     let (app, _tmp) = make_app().await;
 
-    let resp = app.clone()
-        .oneshot(post("/api/v1/memories", serde_json::json!({
-            "content": "User prefers Celsius",
-            "tags": ["preferences"]
-        })))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/memories",
+            serde_json::json!({
+                "content": "User prefers Celsius",
+                "tags": ["preferences"]
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let resp = app.oneshot(get("/api/v1/memories")).await.unwrap();
@@ -380,7 +480,10 @@ async fn memories_save_returns_201_and_list_returns_200() {
 async fn memories_delete_returns_204() {
     let (app, _tmp) = make_app().await;
     // MockMemoryRepository.delete() is a no-op returning Ok
-    let resp = app.oneshot(delete("/api/v1/memories/any-id")).await.unwrap();
+    let resp = app
+        .oneshot(delete("/api/v1/memories/any-id"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -391,12 +494,17 @@ async fn skills_full_lifecycle() {
     let (app, _tmp) = make_app().await;
 
     // Create
-    let resp = app.clone()
-        .oneshot(post("/api/v1/skills", serde_json::json!({
-            "name": "light_control",
-            "content": "Call giap__list_registered_devices when asked about lights."
-        })))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/skills",
+            serde_json::json!({
+                "name": "light_control",
+                "content": "Call giap__list_registered_devices when asked about lights."
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let created = body_json(resp).await;
     let id = created["id"].as_str().unwrap().to_string();
@@ -410,9 +518,14 @@ async fn skills_full_lifecycle() {
     assert_eq!(skills.as_array().unwrap().len(), 1);
 
     // Update — disable
-    let resp = app.clone()
-        .oneshot(put(&format!("/api/v1/skills/{id}"), serde_json::json!({"active": false})))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/skills/{id}"),
+            serde_json::json!({"active": false}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let updated = body_json(resp).await;
     assert_eq!(updated["active"], false);
@@ -420,7 +533,10 @@ async fn skills_full_lifecycle() {
     assert_eq!(updated["name"], "light_control");
 
     // Delete
-    let resp = app.oneshot(delete(&format!("/api/v1/skills/{id}"))).await.unwrap();
+    let resp = app
+        .oneshot(delete(&format!("/api/v1/skills/{id}")))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -432,7 +548,8 @@ async fn skill_update_missing_id_returns_404() {
             "/api/v1/skills/00000000-0000-0000-0000-000000000000",
             serde_json::json!({"active": false}),
         ))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -440,8 +557,12 @@ async fn skill_update_missing_id_returns_404() {
 async fn skill_create_missing_content_returns_400() {
     let (app, _tmp) = make_app().await;
     let resp = app
-        .oneshot(post("/api/v1/skills", serde_json::json!({"name": "incomplete"})))
-        .await.unwrap();
+        .oneshot(post(
+            "/api/v1/skills",
+            serde_json::json!({"name": "incomplete"}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -453,13 +574,18 @@ async fn recipes_full_lifecycle() {
     let yaml = "title: Morning Brief\nprompt: Give me weather and schedule.";
 
     // Create
-    let resp = app.clone()
-        .oneshot(post("/api/v1/recipes", serde_json::json!({
-            "name": "morning_brief",
-            "description": "Daily briefing",
-            "yaml": yaml
-        })))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/recipes",
+            serde_json::json!({
+                "name": "morning_brief",
+                "description": "Daily briefing",
+                "yaml": yaml
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let created = body_json(resp).await;
     let id = created["id"].as_str().unwrap().to_string();
@@ -473,12 +599,17 @@ async fn recipes_full_lifecycle() {
     assert_eq!(recipes.as_array().unwrap().len(), 1);
 
     // Update — change description and disable
-    let resp = app.clone()
-        .oneshot(put(&format!("/api/v1/recipes/{id}"), serde_json::json!({
-            "description": "Updated description",
-            "active": false
-        })))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/recipes/{id}"),
+            serde_json::json!({
+                "description": "Updated description",
+                "active": false
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let updated = body_json(resp).await;
     assert_eq!(updated["description"], "Updated description");
@@ -487,7 +618,10 @@ async fn recipes_full_lifecycle() {
     assert_eq!(updated["yaml"], yaml);
 
     // Delete
-    let resp = app.oneshot(delete(&format!("/api/v1/recipes/{id}"))).await.unwrap();
+    let resp = app
+        .oneshot(delete(&format!("/api/v1/recipes/{id}")))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
@@ -499,7 +633,8 @@ async fn recipe_update_missing_id_returns_404() {
             "/api/v1/recipes/00000000-0000-0000-0000-000000000000",
             serde_json::json!({"active": false}),
         ))
-        .await.unwrap();
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -507,8 +642,12 @@ async fn recipe_update_missing_id_returns_404() {
 async fn recipe_create_missing_yaml_returns_400() {
     let (app, _tmp) = make_app().await;
     let resp = app
-        .oneshot(post("/api/v1/recipes", serde_json::json!({"name": "incomplete"})))
-        .await.unwrap();
+        .oneshot(post(
+            "/api/v1/recipes",
+            serde_json::json!({"name": "incomplete"}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -517,52 +656,67 @@ async fn recipe_create_missing_yaml_returns_400() {
 #[tokio::test]
 async fn returns_501_when_repos_not_configured() {
     let tmp = tempfile::tempdir().unwrap();
-    let db   = Database::init(tmp.path()).await.unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
     let state = Arc::new(AppState {
-        db:                  Arc::new(db),
-        onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(mock_hs),
-        whisper_url:         "http://127.0.0.1:9000".into(),
-        session_storage:     Arc::new(SqliteSessionStorage::new(pool.clone())),
-        http_client:         reqwest::Client::new(),
-        agent:               Arc::new(MockAgent::new()),
-        llm_provider:        Arc::new(tokio::sync::RwLock::new(None)),
-        llamafile_url:       "http://127.0.0.1:8080".into(),
-        tts:                 None,
-        settings_repo:       Arc::new(MockSettingsRepository::new()),
-        profile_repo:        Arc::new(MockProfileRepository::new()),
-        device_registry:     Arc::new(NoDevices),
-        memory_repo:         Arc::new(MockMemoryRepository::new()),
-        embedding_provider:  None,
-        sensor_storage:      Arc::new(MockSensorStorage::new()),
-        camera_storage:      Arc::new(MockCameraStorage::new()),
-        face_recognition:    None,
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(CompletedOnboarding),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
+        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(NoDevices),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
         prompt_template_dir: None,
-        model_repo:          None,
-        data_dir:            None,
-        skip_onboarding:     true,
-        scheduler:           None,
-        model_scheduler:     None,
-        mcp_memory:          None,
-        extension_manager:   None,
-        mcp_server_repo:     None,
-        download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        piper_http_port:     None,
+        model_repo: None,
+        data_dir: None,
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
         model_catalog_provider: None,
-        model_storage_dir:   None,
+        model_storage_dir: None,
         prompt_template_repo: None,
-        prompt_extra_repo:   None,
-        skill_repo:          None,
-        recipe_repo:         None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -579,7 +733,10 @@ async fn returns_501_when_repos_not_configured() {
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED,
-            "expected 501 for {method} {uri}");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "expected 501 for {method} {uri}"
+        );
     }
 }

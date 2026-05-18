@@ -194,7 +194,7 @@ describe("VoiceMode — wake-word-detected triggers recording", () => {
     });
   });
 
-  it("calls stop_wake_listener then start_recording when wake-word-detected fires", async () => {
+  it("does NOT stop wake listener on detection (always-on), starts recording or pipeline", async () => {
     renderVoiceMode({ voiceState: "wait" });
 
     // Wait for start_wake_listener to be called (wake listener setup complete)
@@ -215,38 +215,28 @@ describe("VoiceMode — wake-word-detected triggers recording", () => {
       fireTauriEvent("wake-word-detected");
     });
 
-    // The mic must be released before new recording opens
-    expect(mockInvoke).toHaveBeenCalledWith("stop_wake_listener");
-    // VAD recording must start immediately after (or one-breath pipeline)
+    // Wake listener is always-on — stop_wake_listener must NOT be called on detection
+    expect(mockInvoke).not.toHaveBeenCalledWith("stop_wake_listener");
+    // VAD recording or one-breath pipeline must start
     const usesVad = mockInvoke.mock.calls.some((c: unknown[]) => c[0] === "record_with_vad");
     const usesPipeline = mockInvoke.mock.calls.some((c: unknown[]) => c[0] === "run_voice_pipeline");
     expect(usesVad || usesPipeline).toBe(true);
   });
 
-  it("order: stop_wake_listener fires before record_with_vad", async () => {
+  it("registers wake-word-interrupt listener for barge-in", async () => {
     renderVoiceMode({ voiceState: "wait" });
 
     await waitFor(() => {
-      expect(_listeners["wake-word-detected"]?.length).toBeGreaterThan(0);
+      expect(mockInvoke).toHaveBeenCalledWith("start_wake_listener", {
+        wakeWord: "goose",
+        variants: null,
+      });
     });
 
-    const callOrder: string[] = [];
-    mockInvoke.mockImplementation((cmd: string) => {
-      callOrder.push(cmd);
-      return Promise.resolve(undefined);
+    // The interrupt listener should be registered alongside the detection listener
+    await waitFor(() => {
+      expect(_listeners["wake-word-interrupt"]?.length).toBeGreaterThan(0);
     });
-
-    await act(async () => {
-      fireTauriEvent("wake-word-detected");
-    });
-
-    const stopIdx  = callOrder.indexOf("stop_wake_listener");
-    const startIdx = callOrder.indexOf("record_with_vad");
-    expect(stopIdx).toBeGreaterThanOrEqual(0);
-    // record_with_vad or run_voice_pipeline (one-breath) should follow
-    const recordIdx = startIdx >= 0 ? startIdx : callOrder.indexOf("run_voice_pipeline");
-    expect(recordIdx).toBeGreaterThanOrEqual(0);
-    expect(stopIdx).toBeLessThan(recordIdx);
   });
 });
 

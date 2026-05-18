@@ -6,15 +6,17 @@
    ============================================================================= */
 
 :root {
-  /* ── Fonts ──────────────────────────────────────────────── */
-  --font-display: "Quicksand", "Comfortaa", "Helvetica Neue", Arial, sans-serif;
-  --font-body:    "Quicksand", "Comfortaa", "Helvetica Neue", Arial, sans-serif;
-  --font-body-alt:"Comfortaa", "Quicksand", "Helvetica Neue", Arial, sans-serif;
-  --font-mono:    "JetBrains Mono", "Menlo", "Consolas", monospace;
+  /* ── Font Families ──────────────────────────────────────── */
+  /* Quicksand + Comfortaa only. Both bundled via fontsource. */
+  --font-display: "Quicksand", "Comfortaa";
+  --font-heading: "Quicksand", "Comfortaa";
+  --font-body:    "Quicksand", "Comfortaa";
+  --font-body-alt:"Comfortaa", "Quicksand";
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
-  /* Font sizes */
-  --text-xs:   10px;   /* group labels, badges */
-  --text-sm:   12px;   /* captions, hints */
+  /* ── Type Scale ──────────────────────────────────────────── */
+  --text-xs:   10px;   /* group labels, badges, eyebrow */
+  --text-sm:   12px;   /* captions, hints, meta */
   --text-base: 13px;   /* body, nav items */
   --text-md:   15px;   /* section toolbar title */
   --text-lg:   18px;   /* card headings */
@@ -22,16 +24,17 @@
   --text-2xl:  28px;   /* startup screen title */
   --text-3xl:  36px;   /* voice mode orb label */
 
-  /* Font weights */
+  /* ── Font Weights ────────────────────────────────────────── */
   --weight-regular:  400;
   --weight-medium:   500;
   --weight-semibold: 600;
   --weight-bold:     700;
 
-  /* Line heights */
-  --leading-tight: 1.2;
-  --leading-base:  1.5;
-  --leading-loose: 1.75;
+  /* ── Line Heights ────────────────────────────────────────── */
+  --leading-tight: 1.15;  /* headings, display text */
+  --leading-snug:  1.25;  /* compact body, subheadings */
+  --leading-base:  1.5;   /* standard body text */
+  --leading-loose: 1.7;   /* long-form, descriptions */
 
   /* ── Jarida Brand Colors ────────────────────────────────── */
 
@@ -68,6 +71,8 @@
 
   /* Surfaces — Jarida warm whites */
   --color-bg:             #FFF9F9;   /* Jarida White — main window */
+  --color-surface:        #ffffff;   /* pure white — card faces, inputs, dropdowns */
+  --color-surface-warm:   #fdf8fb;   /* soft pinkish white — app-shell gradient start */
   --color-sidebar:        #F5F4F0;   /* warm stone sidebar */
   --color-content:        #FAFAF8;   /* slightly warm content area */
   --color-overlay:        rgba(255, 249, 249, 0.88);  /* canvas frosted glass */
@@ -85,12 +90,21 @@
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
   --color-success-soft:     rgba(52, 199, 89, 0.12);
+  --color-success-fg:       #0e8a4a;  /* dark green for text on light bg */
   --color-warning:          #FF9500;
   --color-warning-soft:     rgba(255, 149, 0, 0.12);
+  --color-warning-fg:       #b08000;  /* dark amber for text on light bg */
   --color-destructive:      #FF3B30;
   --color-destructive-soft: rgba(255, 59, 48, 0.10);
   --color-neutral:          #8E8E93;
   --color-neutral-soft:     rgba(142, 142, 147, 0.12);
+
+  /* Info (used in segment banners, role chip primary) */
+  --color-info:             #0072f5;
+  --color-info-soft:        rgba(0, 114, 245, 0.05);
+  --color-info-fg:          #4d94d4;  /* muted blue text on light bg */
+  --color-info-dark:        #0058c4;  /* dark blue for text/icons */
+  --color-info-icon-bg:     rgba(0, 114, 245, 0.10);
 
   /* ── Voice Orb States ───────────────────────────────────── */
   --orb-idle:      #8E8E93;
@@ -129,6 +143,8 @@
   --grey-500: #71717A;
   --grey-600: #52525B;
   --grey-700: #3F3F46;
+  --grey-800: #262626;
+  --grey-900: #1C1C1C;
 
   /* ── Aliases (used by sections.css BEM classes) ─────────── */
   --fg:           var(--color-text);
@@ -165,13 +181,13 @@
   --space-12: 48px;
   --space-16: 64px;
 
-  /* ── Border Radius ──────────────────────────────────────── */
-  --radius-xs:   3px;
+  /* ── Border Radius (aligned with Jarida design) ─────────── */
+  --radius-xs:   4px;
   --radius-sm:   6px;
-  --radius-md:   8px;
-  --radius-lg:  12px;
-  --radius-xl:  16px;
-  --radius-2xl: 24px;
+  --radius-md:  10px;
+  --radius-lg:  14px;
+  --radius-xl:  20px;
+  --radius-2xl: 28px;
   --radius-pill: 999px;
 
   /* ── Transitions ─────────────────────────────────────────── */
@@ -179,11 +195,40 @@
   --transition-base: 180ms ease;
   --transition-slow: 300ms ease;
 
+  /* ── Motion (Jarida design tokens) ─────────────────────── */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+
   /* ── Shadows (restrained, warm-toned) ───────────────────── */
+  --shadow-xs:     0 1px 1px rgba(23, 22, 22, 0.06);
   --shadow-sm:     0 1px 3px rgba(23, 22, 22, 0.06);
   --shadow-md:     0 2px 8px rgba(23, 22, 22, 0.08);
   --shadow-lg:     0 4px 16px rgba(23, 22, 22, 0.10);
   --shadow-canvas: 0 8px 32px rgba(23, 22, 22, 0.18), 0 2px 8px rgba(23, 22, 22, 0.10);
   --shadow-brand:  0 10px 24px rgba(140, 75, 255, 0.28); /* hero CTA glow */
   --shadow-orb:    0 0 24px rgba(140, 75, 255, 0.30);  /* purple glow when active */
+
+  /* ── Notification icon colors ───────────────────────────── */
+  --color-notif-daily-bg:  #FFF7ED;
+  --color-notif-daily-fg:  #EA580C;
+  --color-notif-weekly-bg: #EFF6FF;
+  --color-notif-weekly-fg: #2563EB;
+
+  /* ── Memory segment colors ──────────────────────────────── */
+  --mem-identity:          #9333ea;
+  --mem-identity-bg:       rgba(147, 51, 234, 0.08);
+  --mem-preference:        #3b82f6;
+  --mem-preference-bg:     rgba(59, 130, 246, 0.08);
+  --mem-correction:        #ef4444;
+  --mem-correction-bg:     rgba(239, 68, 68, 0.08);
+  --mem-relationship:      #22c55e;
+  --mem-relationship-bg:   rgba(34, 197, 94, 0.08);
+  --mem-project:           #f97316;
+  --mem-project-bg:        rgba(249, 115, 22, 0.08);
+  --mem-knowledge:         #14b8a6;
+  --mem-knowledge-bg:      rgba(20, 184, 166, 0.08);
+  --mem-context:           #9ca3af;
+  --mem-context-bg:        rgba(156, 163, 175, 0.08);
 }

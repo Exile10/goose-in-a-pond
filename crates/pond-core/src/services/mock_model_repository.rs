@@ -14,14 +14,14 @@ use crate::ports::model_repository::ModelRepository;
 ///
 /// Suitable for unit tests in pond-core and integration tests in pond-server.
 pub struct MockModelRepository {
-    models:      Arc<RwLock<HashMap<String, ModelRecord>>>,
+    models: Arc<RwLock<HashMap<String, ModelRecord>>>,
     assignments: Arc<RwLock<HashMap<String, String>>>, // role → model_id
 }
 
 impl MockModelRepository {
     pub fn new() -> Self {
         Self {
-            models:      Arc::new(RwLock::new(HashMap::new())),
+            models: Arc::new(RwLock::new(HashMap::new())),
             assignments: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -85,7 +85,7 @@ impl ModelRepository for MockModelRepository {
         Ok(map
             .iter()
             .map(|(role, model_id)| ModelRoleAssignment {
-                role:     role.clone(),
+                role: role.clone(),
                 model_id: model_id.clone(),
             })
             .collect())
@@ -94,7 +94,7 @@ impl ModelRepository for MockModelRepository {
     async fn get_assignment(&self, role: &str) -> Result<Option<ModelRoleAssignment>> {
         let map = self.assignments.read().await;
         Ok(map.get(role).map(|model_id| ModelRoleAssignment {
-            role:     role.to_string(),
+            role: role.to_string(),
             model_id: model_id.clone(),
         }))
     }
@@ -120,28 +120,28 @@ mod tests {
 
     fn gguf_record(name: &str) -> ModelRecord {
         ModelRecord {
-            id:               format!("gguf/{name}"),
-            category:         ModelCategory::Gguf,
-            name:             name.to_string(),
-            filename:         Some(format!("{name}.gguf")),
-            description:      format!("{name} test model"),
-            size_mb:          100,
-            url:              Some(format!("https://example.com/{name}.gguf")),
-            hf_id:            None,
-            ram_estimate_mb:  None,
+            id: format!("gguf/{name}"),
+            category: ModelCategory::Gguf,
+            name: name.to_string(),
+            filename: Some(format!("{name}.gguf")),
+            description: format!("{name} test model"),
+            size_mb: 100,
+            url: Some(format!("https://example.com/{name}.gguf")),
+            hf_id: None,
+            ram_estimate_mb: None,
             recommended_role: None,
-            context_length:   None,
-            quantization:     None,
-            asr_language:     None,
-            asr_size:         None,
-            tts_engine:       None,
-            tts_voice_name:   None,
-            config_filename:  None,
-            config_url:       None,
-            tts_url:          None,
-            sample_rate:      None,
-            downloaded:       false,
-            is_custom:        false,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
         }
     }
 
@@ -197,8 +197,12 @@ mod tests {
         let repo = MockModelRepository::new();
         repo.upsert(&gguf_record("chat-model")).await.unwrap();
         repo.upsert(&gguf_record("think-model")).await.unwrap();
-        repo.set_assignment("chat", "gguf/chat-model").await.unwrap();
-        repo.set_assignment("think", "gguf/think-model").await.unwrap();
+        repo.set_assignment("chat", "gguf/chat-model")
+            .await
+            .unwrap();
+        repo.set_assignment("think", "gguf/think-model")
+            .await
+            .unwrap();
 
         let list = repo.list_assignments().await.unwrap();
         assert_eq!(list.len(), 2);

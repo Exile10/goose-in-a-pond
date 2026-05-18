@@ -119,8 +119,8 @@ test.describe("Schedules section", () => {
       .or(page.getByLabel(/cron/i))
       .first();
     const promptInput = page
-      .getByPlaceholder(/prompt/i)
-      .or(page.getByLabel(/prompt/i))
+      .getByLabel("Schedule prompt")
+      .or(page.locator('textarea[aria-label="Schedule prompt"]'))
       .first();
 
     if (await nameInput.isVisible({ timeout: 3_000 })) {

@@ -20,7 +20,9 @@ pub struct InstantActivation;
 #[async_trait]
 impl StreamingWakeWordDetector for InstantActivation {
     async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
-        Ok(WakeWordActivation { captured_audio: None })
+        Ok(WakeWordActivation {
+            captured_audio: None,
+        })
     }
 
     fn activation_prompt(&self) -> &str {

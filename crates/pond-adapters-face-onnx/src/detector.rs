@@ -40,11 +40,11 @@ const MEAN: [f32; 3] = [127.0, 127.0, 127.0];
 const SCALE: f32 = 1.0 / 128.0;
 
 pub struct UltraFaceDetector {
-    session:       Arc<Mutex<Session>>,
-    score_thresh:  f32,
-    iou_thresh:    f32,
-    input_w:       u32,
-    input_h:       u32,
+    session: Arc<Mutex<Session>>,
+    score_thresh: f32,
+    iou_thresh: f32,
+    input_w: u32,
+    input_h: u32,
 }
 
 impl UltraFaceDetector {
@@ -54,11 +54,7 @@ impl UltraFaceDetector {
     /// first pass (default 0.7 is a good balance for indoor cameras).
     /// `iou_thresh` — IoU above which overlapping boxes are collapsed in
     /// NMS (default 0.3).
-    pub fn new(
-        model_path: impl Into<PathBuf>,
-        score_thresh: f32,
-        iou_thresh: f32,
-    ) -> Result<Self> {
+    pub fn new(model_path: impl Into<PathBuf>, score_thresh: f32, iou_thresh: f32) -> Result<Self> {
         let path = model_path.into();
         if !path.exists() {
             return Err(anyhow!(
@@ -74,11 +70,11 @@ impl UltraFaceDetector {
             })?;
         info!(path = %path.display(), "UltraFace detector loaded");
         Ok(Self {
-            session:      Arc::new(Mutex::new(session)),
+            session: Arc::new(Mutex::new(session)),
             score_thresh,
             iou_thresh,
-            input_w:      INPUT_W,
-            input_h:      INPUT_H,
+            input_w: INPUT_W,
+            input_h: INPUT_H,
         })
     }
 
@@ -117,11 +113,11 @@ impl FaceDetector for UltraFaceDetector {
             // Preprocess inside the blocking thread so image decode doesn't
             // hog the async runtime.
             let det = UltraFaceDetector {
-                session:      session.clone(),
+                session: session.clone(),
                 score_thresh,
                 iou_thresh,
-                input_w:      this_input.0,
-                input_h:      this_input.1,
+                input_w: this_input.0,
+                input_h: this_input.1,
             };
             let (input, orig_w, orig_h) = det.preprocess(&bytes)?;
 
@@ -147,8 +143,14 @@ impl FaceDetector for UltraFaceDetector {
                     .context("failed to extract UltraFace output tensor")?;
                 let ushape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
                 match ushape.last().copied().unwrap_or(0) {
-                    4 => { boxes_vec  = Some(data.to_vec()); boxes_shape  = ushape; }
-                    2 => { scores_vec = Some(data.to_vec()); scores_shape = ushape; }
+                    4 => {
+                        boxes_vec = Some(data.to_vec());
+                        boxes_shape = ushape;
+                    }
+                    2 => {
+                        scores_vec = Some(data.to_vec());
+                        scores_shape = ushape;
+                    }
                     other => {
                         debug!(last_dim = other, shape = ?ushape, "unexpected UltraFace output");
                     }
@@ -156,15 +158,16 @@ impl FaceDetector for UltraFaceDetector {
             }
             let scores = scores_vec
                 .ok_or_else(|| anyhow!("UltraFace scores tensor missing (last-dim 2)"))?;
-            let boxes = boxes_vec
-                .ok_or_else(|| anyhow!("UltraFace boxes tensor missing (last-dim 4)"))?;
+            let boxes =
+                boxes_vec.ok_or_else(|| anyhow!("UltraFace boxes tensor missing (last-dim 4)"))?;
 
             // scores: [1, N, 2], boxes: [1, N, 4]
             let n = *scores_shape.get(1).unwrap_or(&0);
             if n == 0 || boxes_shape.get(1) != Some(&n) {
                 return Err(anyhow!(
                     "UltraFace shape mismatch: scores={:?}, boxes={:?}",
-                    scores_shape, boxes_shape,
+                    scores_shape,
+                    boxes_shape,
                 ));
             }
 
@@ -184,7 +187,10 @@ impl FaceDetector for UltraFaceDetector {
                 }
                 candidates.push(([x1, y1, x2, y2], face_score));
             }
-            debug!(n_candidates = candidates.len(), "UltraFace pre-NMS candidates");
+            debug!(
+                n_candidates = candidates.len(),
+                "UltraFace pre-NMS candidates"
+            );
 
             if candidates.is_empty() {
                 return Ok(None);
@@ -212,9 +218,9 @@ impl FaceDetector for UltraFaceDetector {
                 let py2 = (y2 * orig_h as f32).round().clamp(0.0, orig_h as f32) as u32;
                 DetectedFace {
                     bbox: BoundingBox {
-                        x:      px1,
-                        y:      py1,
-                        width:  px2.saturating_sub(px1),
+                        x: px1,
+                        y: py1,
+                        width: px2.saturating_sub(px1),
                         height: py2.saturating_sub(py1),
                     },
                     landmarks: None,
@@ -241,7 +247,11 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
     let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
     let union = area_a + area_b - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maps — MCP App</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Quicksand', sans-serif; background: transparent; }
+  .card { background: #fff; border-radius: 16px; border: 1px solid #EBEBF0; overflow: hidden; display: flex; flex-direction: column; }
+  .divider { height: 1px; background: #F1F5F9; }
+  .routes { padding: 10px 14px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .route { display: flex; align-items: center; padding: 9px 12px; border-radius: 11px; }
+  .route-normal { background: #FAFAFA; border: 1px solid #F1F5F9; }
+  .route-best { background: #F5F3FF; border: 1px solid #DDD6FE; }
+  .route-body { flex: 1; margin-left: 10px; }
+  .route-name { font-size: 13px; font-weight: 700; color: #18181B; display: flex; align-items: center; gap: 6px; }
+  .fastest { font-size: 10px; font-weight: 700; background: #7C3AED; color: #fff; padding: 1px 7px; border-radius: 999px; }
+  .route-meta { font-size: 11px; color: #94A3B8; margin-top: 2px; display: flex; gap: 8px; font-weight: 500; }
+  .route-time { font-size: 15px; font-weight: 800; }
+  .actions { padding: 0 14px 14px; display: flex; gap: 8px; }
+  .btn { flex: 1; padding: 9px; border-radius: 10px; font-size: 12px; font-weight: 700; cursor: pointer; font-family: inherit; }
+  .btn-outline { border: 1px solid #E4E4E7; background: #fff; color: #475569; }
+  .btn-primary { border: none; background: #7C3AED; color: #fff; display: flex; align-items: center; justify-content: center; gap: 6px; }
+  .loading { padding: 40px; text-align: center; color: #94A3B8; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="root" class="card"><div class="loading">Loading routes...</div></div>
+<script src="mcp-bridge.js"></script>
+<script>
+  const root = document.getElementById('root');
+  const app = new McpApp({ name: 'giap-maps', version: '1.0.0' });
+
+  function trafficColor(t) {
+    const l = (t||'').toLowerCase();
+    if (l==='light'||l==='low') return '#16A34A';
+    if (l==='clear'||l==='free') return '#0EA5E9';
+    if (l==='heavy') return '#DC2626';
+    return '#D97706';
+  }
+
+  function render(data) {
+    const origin = data.origin || data.from || 'Your location';
+    const dest = data.destination || data.to || 'Destination';
+    const routes = data.routes || [];
+    const navSvg = (c) => `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="1.75" stroke-linecap="round"><path d="M3 11l19-9-9 19-2-8-8-2z"/></svg>`;
+    const arrowSvg = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>';
+
+    let html = `<div style="position:relative;overflow:hidden"><svg viewBox="0 0 340 110" width="100%" height="110" preserveAspectRatio="none"><rect width="340" height="110" fill="#EEF2F7"/>`;
+    [40,80,120,160,200,240,280,320].forEach(x => html += `<line x1="${x}" y1="0" x2="${x}" y2="110" stroke="#DDE3EA" stroke-width="0.8"/>`);
+    [22,44,66,88].forEach(y => html += `<line x1="0" y1="${y}" x2="340" y2="${y}" stroke="#DDE3EA" stroke-width="0.8"/>`);
+    html += `<rect x="150" y="40" width="40" height="30" rx="3" fill="#D1D8E0" opacity="0.6"/><rect x="230" y="55" width="30" height="20" rx="3" fill="#D1D8E0" opacity="0.5"/><rect x="80" y="60" width="25" height="18" rx="3" fill="#D1D8E0" opacity="0.4"/>`;
+    html += `<path d="M28 94 Q 110 72 178 52 T 318 32" stroke="#B0B8C6" stroke-width="2" fill="none" stroke-dasharray="6 4" stroke-linecap="round" opacity="0.7"/>`;
+    html += `<path d="M28 94 Q 115 66 182 46 T 318 24" stroke="#7C3AED" stroke-width="3.5" fill="none" stroke-linecap="round"/>`;
+    html += `<circle cx="28" cy="94" r="6" fill="#7C3AED" stroke="white" stroke-width="2.5"/><circle cx="318" cy="24" r="6" fill="#18181B" stroke="white" stroke-width="2.5"/>`;
+    html += `<text x="38" y="104" font-size="8.5" fill="#7C3AED" font-weight="800" font-family="sans-serif">${origin.slice(0,20)}</text>`;
+    html += `<text x="265" y="19" font-size="8.5" fill="#18181B" font-weight="800" font-family="sans-serif">${dest.slice(0,16)}</text></svg></div>`;
+    html += '<div class="divider"></div><div class="routes">';
+
+    routes.slice(0,3).forEach(r => {
+      const dist = r.distance || r.dist || '';
+      const cls = r.best ? 'route-best' : 'route-normal';
+      const timeColor = r.best ? '#7C3AED' : '#475569';
+      html += `<div class="route ${cls}">${navSvg(r.best?'#7C3AED':'#94A3B8')}<div class="route-body"><div class="route-name">${r.name}${r.best?'<span class="fastest">Fastest</span>':''}</div><div class="route-meta">${dist?`<span>${dist}</span>`:''}${r.traffic?`<span style="color:${trafficColor(r.traffic)};font-weight:600">\u25CF ${r.traffic} traffic</span>`:''}</div></div><span class="route-time" style="color:${timeColor}">${r.time}</span></div>`;
+    });
+
+    html += '</div>';
+    if (routes.length > 0) html += `<div class="actions"><button class="btn btn-outline">Open in Maps</button><button class="btn btn-primary">Navigate ${arrowSvg}</button></div>`;
+    root.innerHTML = html;
+    app.reportSize(root.offsetWidth, root.offsetHeight);
+  }
+
+  app.ontoolresult = (result) => {
+    const text = result?.content?.find(c => c.type === 'text')?.text;
+    if (!text) return;
+    try { render(JSON.parse(text)); } catch {}
+  };
+  app.ontoolinput = (input) => { if (input?.arguments) render(input.arguments); };
+  app.connect();
+</script>
+</body>
+</html>

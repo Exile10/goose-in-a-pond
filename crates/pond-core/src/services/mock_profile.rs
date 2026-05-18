@@ -40,7 +40,10 @@ impl ProfileRepository for MockProfileRepository {
             created_at: now,
             updated_at: now,
         };
-        self.store.write().await.insert(profile.id.clone(), profile.clone());
+        self.store
+            .write()
+            .await
+            .insert(profile.id.clone(), profile.clone());
         Ok(profile)
     }
 
@@ -96,25 +99,50 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all() {
         let repo = MockProfileRepository::new();
-        repo.create(CreateProfileRequest { display_name: "A".to_string(), avatar_emoji: "A".to_string() }).await.unwrap();
-        repo.create(CreateProfileRequest { display_name: "B".to_string(), avatar_emoji: "B".to_string() }).await.unwrap();
+        repo.create(CreateProfileRequest {
+            display_name: "A".to_string(),
+            avatar_emoji: "A".to_string(),
+        })
+        .await
+        .unwrap();
+        repo.create(CreateProfileRequest {
+            display_name: "B".to_string(),
+            avatar_emoji: "B".to_string(),
+        })
+        .await
+        .unwrap();
         assert_eq!(repo.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn update_preferences() {
         let repo = MockProfileRepository::new();
-        let profile = repo.create(CreateProfileRequest { display_name: "Jerry".to_string(), avatar_emoji: "X".to_string() }).await.unwrap();
+        let profile = repo
+            .create(CreateProfileRequest {
+                display_name: "Jerry".to_string(),
+                avatar_emoji: "X".to_string(),
+            })
+            .await
+            .unwrap();
         let mut prefs = HashMap::new();
         prefs.insert("language".to_string(), "en".to_string());
         let updated = repo.update_preferences(&profile.id, prefs).await.unwrap();
-        assert_eq!(updated.preferences.get("language").map(|s| s.as_str()), Some("en"));
+        assert_eq!(
+            updated.preferences.get("language").map(|s| s.as_str()),
+            Some("en")
+        );
     }
 
     #[tokio::test]
     async fn delete_removes_profile() {
         let repo = MockProfileRepository::new();
-        let profile = repo.create(CreateProfileRequest { display_name: "Temp".to_string(), avatar_emoji: "T".to_string() }).await.unwrap();
+        let profile = repo
+            .create(CreateProfileRequest {
+                display_name: "Temp".to_string(),
+                avatar_emoji: "T".to_string(),
+            })
+            .await
+            .unwrap();
         repo.delete(&profile.id).await.unwrap();
         assert!(repo.get(&profile.id).await.unwrap().is_none());
     }

@@ -16,7 +16,13 @@ use std::collections::HashMap;
 pub trait McpMemoryPort: Send + Sync {
     /// Store `data` under `category` with optional `tags`.
     /// `global = true` stores in the shared memory dir; `false` is session-local.
-    async fn remember(&self, category: &str, data: &str, tags: &[String], global: bool) -> Result<()>;
+    async fn remember(
+        &self,
+        category: &str,
+        data: &str,
+        tags: &[String],
+        global: bool,
+    ) -> Result<()>;
 
     /// Retrieve all entries for `category`.  Returns a map of
     /// `{ entry_key → [lines] }`.  Use `"*"` as category to get everything.

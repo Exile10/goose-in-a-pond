@@ -87,9 +87,9 @@ pub enum Variant {
 }
 
 pub struct OnnxAntispoof {
-    session:    Arc<Mutex<Session>>,
+    session: Arc<Mutex<Session>>,
     model_path: PathBuf,
-    variant:    Variant,
+    variant: Variant,
 }
 
 impl OnnxAntispoof {
@@ -103,16 +103,10 @@ impl OnnxAntispoof {
     /// Build with explicit control over which env var supplies the
     /// variant override. The env var lookup falls back to the filename
     /// heuristic when unset.
-    pub fn new_with_variant_env(
-        model_path: impl Into<PathBuf>,
-        variant_env: &str,
-    ) -> Result<Self> {
+    pub fn new_with_variant_env(model_path: impl Into<PathBuf>, variant_env: &str) -> Result<Self> {
         let path = model_path.into();
         if !path.exists() {
-            return Err(anyhow!(
-                "Anti-spoof model not found at {}",
-                path.display()
-            ));
+            return Err(anyhow!("Anti-spoof model not found at {}", path.display()));
         }
         let variant = resolve_variant(&path, variant_env);
         let session = Session::builder()
@@ -156,12 +150,13 @@ impl OnnxAntispoof {
         if !path.exists() {
             warn!(
                 "{} set to {} but file does not exist; skipping",
-                var, path.display()
+                var,
+                path.display()
             );
             return Ok(None);
         }
         let variant_env = match var {
-            "POND_FACE_ANTISPOOF_PATH"   => "POND_FACE_ANTISPOOF_VARIANT".to_string(),
+            "POND_FACE_ANTISPOOF_PATH" => "POND_FACE_ANTISPOOF_VARIANT".to_string(),
             "POND_FACE_ANTISPOOF_PATH_2" => "POND_FACE_ANTISPOOF_2_VARIANT".to_string(),
             other => format!("{}_VARIANT", other),
         };
@@ -178,7 +173,7 @@ impl OnnxAntispoof {
     /// are zeroed because they are not produced by the ONNX path.
     pub fn analyse(&self, img: &RgbImage) -> Result<AntispoofReport> {
         match self.variant {
-            Variant::SilentFace80   => self.analyse_silent_face(img),
+            Variant::SilentFace80 => self.analyse_silent_face(img),
             Variant::DeepPixBis224 => self.analyse_deep_pix_bis(img),
         }
     }
@@ -210,8 +205,7 @@ impl OnnxAntispoof {
             tensor[[0, 2, y as usize, x as usize]] = r as f32 / divisor;
         }
 
-        let input = Tensor::from_array(tensor)
-            .context("failed to wrap anti-spoof input tensor")?;
+        let input = Tensor::from_array(tensor).context("failed to wrap anti-spoof input tensor")?;
         let mut sess = self
             .session
             .lock()
@@ -256,10 +250,10 @@ impl OnnxAntispoof {
             "Silent-Face score"
         );
         Ok(AntispoofReport {
-            spoof_score:       spoof,
-            saturation_var:    0.0,
+            spoof_score: spoof,
+            saturation_var: 0.0,
             highlight_density: 0.0,
-            gradient_skew:     0.0,
+            gradient_skew: 0.0,
         })
     }
 
@@ -286,7 +280,7 @@ impl OnnxAntispoof {
 
         // ImageNet normalisation per channel (R, G, B).
         const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-        const STD:  [f32; 3] = [0.229, 0.224, 0.225];
+        const STD: [f32; 3] = [0.229, 0.224, 0.225];
         let side = DEEPPIXBIS_SIDE as usize;
         let mut tensor = Array4::<f32>::zeros((1, 3, side, side));
         for (x, y, px) in big.enumerate_pixels() {
@@ -300,8 +294,7 @@ impl OnnxAntispoof {
             tensor[[0, 2, y as usize, x as usize]] = bn;
         }
 
-        let input = Tensor::from_array(tensor)
-            .context("failed to wrap DeepPixBis input tensor")?;
+        let input = Tensor::from_array(tensor).context("failed to wrap DeepPixBis input tensor")?;
         let mut sess = self
             .session
             .lock()
@@ -318,13 +311,11 @@ impl OnnxAntispoof {
             .iter()
             .find(|(name, _)| name.contains("output_binary") || name.contains("binary"))
             .or_else(|| {
-                outputs
-                    .iter()
-                    .min_by_key(|(_, v)| {
-                        v.try_extract_tensor::<f32>()
-                            .map(|(_, d)| d.len())
-                            .unwrap_or(usize::MAX)
-                    })
+                outputs.iter().min_by_key(|(_, v)| {
+                    v.try_extract_tensor::<f32>()
+                        .map(|(_, d)| d.len())
+                        .unwrap_or(usize::MAX)
+                })
             })
             .ok_or_else(|| anyhow!("DeepPixBis returned no outputs"))?;
 
@@ -355,10 +346,10 @@ impl OnnxAntispoof {
             "DeepPixBis score"
         );
         Ok(AntispoofReport {
-            spoof_score:       spoof,
-            saturation_var:    0.0,
+            spoof_score: spoof,
+            saturation_var: 0.0,
             highlight_density: 0.0,
-            gradient_skew:     0.0,
+            gradient_skew: 0.0,
         })
     }
 
@@ -427,7 +418,11 @@ fn live_index_from_env(n_classes: usize) -> usize {
                     n_classes, raw = %other,
                     "invalid POND_FACE_ANTISPOOF_LIVE_INDEX; falling back to auto"
                 );
-                if n_classes == 2 { 1 } else { 0 }
+                if n_classes == 2 {
+                    1
+                } else {
+                    0
+                }
             }
         },
     }
@@ -463,8 +458,7 @@ fn resolve_variant(path: &std::path::Path, variant_env: &str) -> Variant {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let looks_like_deeppixbis =
-        lower.contains("deeppixbis")
+    let looks_like_deeppixbis = lower.contains("deeppixbis")
         || lower.contains("oulu_protocol")
         || lower.contains("oulu_npu")
         || lower.contains("pixel_supervision")
@@ -492,14 +486,21 @@ mod tests {
     fn resolve_variant_default_is_silent_face() {
         let _g = ENV_LOCK.lock().unwrap();
         let p = std::path::Path::new("/x/2.7_80x80_MiniFASNetV2.onnx");
-        unsafe { std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT"); }
-        assert_eq!(resolve_variant(p, "POND_FACE_ANTISPOOF_VARIANT"), Variant::SilentFace80);
+        unsafe {
+            std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT");
+        }
+        assert_eq!(
+            resolve_variant(p, "POND_FACE_ANTISPOOF_VARIANT"),
+            Variant::SilentFace80
+        );
     }
 
     #[test]
     fn resolve_variant_detects_deeppixbis_from_filename() {
         let _g = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT"); }
+        unsafe {
+            std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT");
+        }
         for name in [
             "/x/OULU_Protocol_2_model_0_0.onnx",
             "/x/deeppixbis.onnx",
@@ -522,29 +523,47 @@ mod tests {
         // SAFETY: ENV_LOCK serialises every test in this file that touches
         // POND_FACE_ANTISPOOF_VARIANT; we always restore on the way out.
         let p = std::path::Path::new("/x/deeppixbis.onnx");
-        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_VARIANT", "silentface"); }
-        assert_eq!(resolve_variant(p, "POND_FACE_ANTISPOOF_VARIANT"), Variant::SilentFace80);
-        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_VARIANT", "deeppixbis"); }
+        unsafe {
+            std::env::set_var("POND_FACE_ANTISPOOF_VARIANT", "silentface");
+        }
+        assert_eq!(
+            resolve_variant(p, "POND_FACE_ANTISPOOF_VARIANT"),
+            Variant::SilentFace80
+        );
+        unsafe {
+            std::env::set_var("POND_FACE_ANTISPOOF_VARIANT", "deeppixbis");
+        }
         let q = std::path::Path::new("/x/2.7_80x80_MiniFASNetV2.onnx");
-        assert_eq!(resolve_variant(q, "POND_FACE_ANTISPOOF_VARIANT"), Variant::DeepPixBis224);
-        unsafe { std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT"); }
+        assert_eq!(
+            resolve_variant(q, "POND_FACE_ANTISPOOF_VARIANT"),
+            Variant::DeepPixBis224
+        );
+        unsafe {
+            std::env::remove_var("POND_FACE_ANTISPOOF_VARIANT");
+        }
     }
 
     #[test]
     fn try_from_env_with_unset_var_returns_none() {
         // SAFETY: we only mutate POND_FACE_ANTISPOOF_PATH for this test,
         // and the var should not be set in the default test environment.
-        unsafe { std::env::remove_var("POND_FACE_ANTISPOOF_PATH"); }
+        unsafe {
+            std::env::remove_var("POND_FACE_ANTISPOOF_PATH");
+        }
         let r = OnnxAntispoof::try_from_env().expect("should not error");
         assert!(r.is_none());
     }
 
     #[test]
     fn try_from_env_with_missing_file_returns_none() {
-        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", "/does/not/exist.onnx"); }
+        unsafe {
+            std::env::set_var("POND_FACE_ANTISPOOF_PATH", "/does/not/exist.onnx");
+        }
         let r = OnnxAntispoof::try_from_env().expect("should not error");
         assert!(r.is_none());
-        unsafe { std::env::remove_var("POND_FACE_ANTISPOOF_PATH"); }
+        unsafe {
+            std::env::remove_var("POND_FACE_ANTISPOOF_PATH");
+        }
     }
 
     #[test]

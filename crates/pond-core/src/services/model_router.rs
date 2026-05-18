@@ -1,10 +1,8 @@
 //! ModelRouter — an `LlmProvider` that dispatches to role-specific providers.
 //!
-//! Sits between `ChatService` and the concrete LLM providers. On every request
-//! it:
-//! 1. Extracts the last user message.
-//! 2. Calls `classify_request()` to determine the `ModelRole`.
-//! 3. Forwards to the appropriate provider arc.
+//! Sits between `ChatService` and the concrete LLM providers. All requests
+//! currently route to the `chat` provider. The `think` and `task` providers
+//! are retained for future per-role model assignment but are not auto-selected.
 //!
 //! If `think` or `task` arcs are the same object as `chat`, no extra latency
 //! is incurred — it's just a pointer comparison that short-circuits.
@@ -15,10 +13,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::debug;
 
-use crate::domain::message::{ChatMessage, Role};
+use crate::domain::message::ChatMessage;
 use crate::domain::model_role::ModelRole;
 use crate::ports::provider::LlmProvider;
-use crate::services::request_classifier::classify_request;
 
 pub struct ModelRouter {
     chat:  Arc<dyn LlmProvider>,
@@ -55,15 +52,9 @@ impl LlmProvider for ModelRouter {
         system_prompt: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<ChatMessage> {
-        // Extract the last user message text for classification.
-        let last_user_text = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-
-        let role = classify_request(last_user_text);
+        // All requests route to the chat provider. The LLM decides tool use
+        // natively via MCP — no pre-classification needed.
+        let role = ModelRole::Chat;
 
         debug!(
             role = ?role,
@@ -88,18 +79,8 @@ impl LlmProvider for ModelRouter {
         system_prompt: &'a str,
         messages: Vec<ChatMessage>,
     ) -> crate::ports::provider::TokenStream<'a> {
-        // Classify up-front so the borrow of `messages` ends before it is moved.
-        let role = {
-            let last_user = messages
-                .iter()
-                .rev()
-                .find(|m| m.role == Role::User)
-                .map(|m| m.content.as_str())
-                .unwrap_or("");
-            classify_request(last_user)
-        };
-        // Delegate to the concrete provider (e.g. LlamafileProvider), which
-        // implements native token-by-token streaming via "stream": true.
+        // All requests route to the chat provider.
+        let role = ModelRole::Chat;
         self.provider_for(role).stream_complete(system_prompt, messages)
     }
 }

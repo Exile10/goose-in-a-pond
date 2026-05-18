@@ -14,10 +14,13 @@ name = "pond_server"
 path = "src/lib.rs"
 
 [features]
-default = ["goose-agent", "local-inference"]
+default = ["goose-agent", "local-inference", "pond-agent"]
 # Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
 # Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
 goose-agent = ["dep:pond-adapters-goose"]
+# Enable the independent PondAgent backend (no Goose dependency, KV-cache reuse).
+# Use agent_backend="pond" in settings to activate. Requires local-inference feature.
+pond-agent = ["dep:pond-agent", "dep:pond-inference"]
 # Enable flat-file MCP memory (memories injected into system prompt every chat turn).
 # cargo run -p pond-server --features mcp-memory -- serve
 mcp-memory = ["dep:pond-adapters-mcp-memory"]
@@ -34,6 +37,9 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 [dependencies]
 # Optional: only compiled when --features goose-agent is passed.
 pond-adapters-goose           = { path = "../pond-adapters-goose", optional = true }
+# Optional: only compiled when --features pond-agent is passed.
+pond-agent                    = { path = "../pond-agent", optional = true }
+pond-inference                = { path = "../pond-inference", optional = true }
 # Optional: only compiled when --features mcp-memory is passed.
 pond-adapters-mcp-memory      = { workspace = true, optional = true }
 # Optional: only compiled when --features local-inference is passed.
@@ -70,6 +76,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio-util = { workspace = true }
 # Required to query pond_logs.db directly in the debug log-tail task.
 sqlx = { workspace = true }
 webbrowser = { workspace = true }

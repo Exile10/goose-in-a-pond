@@ -47,7 +47,10 @@ async fn system_prompt_is_first_message_in_request() {
 
     let provider = OllamaProvider::new(Some(&server.uri()), None);
     provider
-        .complete("You are a helpful assistant.", vec![ChatMessage::user("Hi")])
+        .complete(
+            "You are a helpful assistant.",
+            vec![ChatMessage::user("Hi")],
+        )
         .await
         .unwrap();
 
@@ -58,7 +61,10 @@ async fn system_prompt_is_first_message_in_request() {
         serde_json::from_slice(&requests[0].body).expect("request body is not valid JSON");
 
     let first = &body["messages"][0];
-    assert_eq!(first["role"], "system", "first message role must be 'system'");
+    assert_eq!(
+        first["role"], "system",
+        "first message role must be 'system'"
+    );
     assert_eq!(
         first["content"], "You are a helpful assistant.",
         "system message content mismatch"
@@ -198,7 +204,10 @@ async fn connection_refused_propagates_as_err() {
         .complete("sys", vec![ChatMessage::user("hi")])
         .await;
 
-    assert!(result.is_err(), "expected Err for connection refused, got Ok");
+    assert!(
+        result.is_err(),
+        "expected Err for connection refused, got Ok"
+    );
 }
 
 // ── Model name ───────────────────────────────────────────────────────────────
@@ -215,11 +224,17 @@ async fn model_name_in_request_body_matches_configured_model() {
     mount_ok(&server, "ok").await;
 
     let provider = OllamaProvider::new(Some(&server.uri()), Some("mistral"));
-    provider.complete("sys", vec![ChatMessage::user("hi")]).await.unwrap();
+    provider
+        .complete("sys", vec![ChatMessage::user("hi")])
+        .await
+        .unwrap();
 
     let requests = server.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["model"], "mistral", "request body model must match configured model");
+    assert_eq!(
+        body["model"], "mistral",
+        "request body model must match configured model"
+    );
 }
 
 // ── stream_complete + usage ───────────────────────────────────────────────────
@@ -238,7 +253,9 @@ async fn stream_complete_yields_full_text_as_one_chunk() {
 
     let mut texts = Vec::new();
     while let Some(Ok(item)) = stream.next().await {
-        if let StreamToken::Text(t) = item { texts.push(t); }
+        if let StreamToken::Text(t) = item {
+            texts.push(t);
+        }
     }
 
     assert_eq!(texts, vec!["Hello from Ollama!".to_string()]);
@@ -254,15 +271,13 @@ async fn stream_complete_yields_usage_from_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "model": "llama3.2",
-                "message": { "role": "assistant", "content": "Four." },
-                "done": true,
-                "prompt_eval_count": 28,
-                "eval_count": 5
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "llama3.2",
+            "message": { "role": "assistant", "content": "Four." },
+            "done": true,
+            "prompt_eval_count": 28,
+            "eval_count": 5
+        })))
         .mount(&server)
         .await;
 
@@ -271,7 +286,9 @@ async fn stream_complete_yields_usage_from_response() {
 
     let mut usage_opt = None;
     while let Some(Ok(item)) = stream.next().await {
-        if let StreamToken::Usage(u) = item { usage_opt = Some(u); }
+        if let StreamToken::Usage(u) = item {
+            usage_opt = Some(u);
+        }
     }
 
     let usage = usage_opt.expect("expected a Usage token in stream");

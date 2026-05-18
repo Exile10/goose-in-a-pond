@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Button, Tabs, Card, CardContent, Chip, ProgressBar } from "@heroui/react";
+import { Button, Tabs, Chip } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
-  ScanFace, Loader2, Puzzle,
+  ScanFace, Loader2, Puzzle, Cpu,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
+import { PageHeader } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
   HfModel, HfModelFile, DownloadEntry,
@@ -50,7 +51,7 @@ function CapabilityBadges({ name }: { name: string }) {
   return (
     <>
       {badges.map(b => (
-        <Chip key={b.label} size="sm" variant="soft" color="default" title={b.title}>{b.label}</Chip>
+        <span key={b.label} className="cap-badge" title={b.title}>{b.label}</span>
       ))}
     </>
   );
@@ -59,18 +60,38 @@ function CapabilityBadges({ name }: { name: string }) {
 // ── Design constants ──────────────────────────────────────────
 
 const CAT_COLOR = {
-  llm:  "var(--color-role-chat)",
-  asr:  "var(--color-role-asr)",
-  tts:  "var(--color-role-tts)",
-  face: "#3b82f6",
+  llm:       "var(--color-role-chat)",
+  asr:       "var(--color-role-asr)",
+  tts:       "var(--color-role-tts)",
+  face:      "#3b82f6",
+  embedding: "#8b5cf6",
 } as const;
 
 // ── Active Roles Banner ───────────────────────────────────────
 
 /** Maps role keys to role-chip CSS modifier classes */
 const ROLE_CHIP_VARIANT: Record<string, string> = {
-  chat: "secondary", tool: "success", asr: "primary", tts: "danger",
+  chat: "secondary", tool: "success", asr: "primary", tts: "danger", embedding: "accent",
 };
+
+/** Infer embedding dimension from well-known model names. */
+function inferEmbeddingDimension(modelName: string): string | null {
+  const n = modelName.toLowerCase();
+  if (n.includes("minilm-l6") || n.includes("minilm_l6")) return "384d";
+  if (n.includes("minilm-l12") || n.includes("minilm_l12")) return "384d";
+  if (n.includes("bge-small") || n.includes("bge_small")) return "384d";
+  if (n.includes("bge-base") || n.includes("bge_base")) return "768d";
+  if (n.includes("bge-large") || n.includes("bge_large")) return "1024d";
+  if (n.includes("e5-small") || n.includes("e5_small")) return "384d";
+  if (n.includes("e5-base") || n.includes("e5_base")) return "768d";
+  if (n.includes("e5-large") || n.includes("e5_large")) return "1024d";
+  if (n.includes("multilingual-e5")) return "768d";
+  if (n.includes("nomic-embed")) return "768d";
+  if (n.includes("gte-small") || n.includes("gte_small")) return "384d";
+  if (n.includes("gte-base") || n.includes("gte_base")) return "768d";
+  if (n.includes("gte-large") || n.includes("gte_large")) return "1024d";
+  return null;
+}
 
 function ActiveRolesBanner({
   roles,
@@ -85,58 +106,31 @@ function ActiveRolesBanner({
   capabilities: ModelCapabilities | null;
   onRefresh: () => void;
   loading: boolean;
-  onNavigate?: (category: "llm" | "asr" | "tts") => void;
+  onNavigate?: (category: "llm" | "asr" | "tts" | "embedding") => void;
 }) {
-  const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" }> = [
-    { key: "chat", label: "Main LLM", icon: <MessageSquare size={10} />, category: "llm" },
-    { key: "asr",  label: "ASR",      icon: <Mic size={10} />,           category: "asr" },
-    { key: "tts",  label: "TTS",      icon: <Volume2 size={10} />,       category: "tts" },
+  const ROLE_DEFS: Array<{ key: "chat" | "asr" | "tts" | "embedding"; label: string; icon: React.ReactNode; category: "llm" | "asr" | "tts" | "embedding" }> = [
+    { key: "chat",      label: "Main LLM",  icon: <MessageSquare size={12} strokeWidth={1.8} />, category: "llm" },
+    { key: "asr",       label: "ASR",       icon: <Mic size={12} strokeWidth={1.8} />,           category: "asr" },
+    { key: "tts",       label: "TTS",       icon: <Volume2 size={12} strokeWidth={1.8} />,        category: "tts" },
+    { key: "embedding", label: "Embedding", icon: <Cpu size={12} strokeWidth={1.8} />,            category: "embedding" },
   ];
   const toolModel = roles?.tool?.model;
 
-  const memPct = memoryStatus && memoryStatus.total_mb > 0
-    ? Math.round(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100)
-    : null;
-
   return (
-    <Card className="giap-card">
-      <CardContent style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
-        <div className="card-header" style={{ padding: 0 }}>
-          <span className="card__label">Active Model Roles</span>
-          <div className="card-header__right">
-            {memoryStatus && memoryStatus.total_mb > 0 && (
-              <div style={{ width: 160, display: "flex", flexDirection: "column", gap: 4 }}>
-                <div className="mem-progress__label">
-                  <span>Memory</span>
-                  <span className="mem-progress__num">
-                    {memoryStatus.available_for_llm_mb.toLocaleString()} / {memoryStatus.total_mb.toLocaleString()} MB
-                  </span>
-                </div>
-                <ProgressBar
-                  size="sm"
-                  value={memPct ?? 0}
-                  color={memPct != null && memPct > 85 ? "warning" : "accent"}
-                  aria-label="Memory usage"
-                >
-                  <ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track>
-                </ProgressBar>
-              </div>
-            )}
-            <Button size="sm" variant="ghost" isIconOnly onPress={onRefresh} isDisabled={loading} aria-label="Refresh roles">
-              <RefreshCw size={13} style={{ opacity: loading ? 0.4 : 1, transition: "opacity 0.2s" }} />
-            </Button>
-          </div>
-        </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div className="role-grid">
+        {ROLE_DEFS.map(({ key, label, icon, category }) => {
+          const a = roles?.[key];
+          const isSet = !!(a?.provider && a?.model);
+          const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
 
-        <div className="role-grid">
-          {ROLE_DEFS.map(({ key, label, icon, category }) => {
-            const a = roles?.[key];
-            const isSet = !!(a?.provider && a?.model);
-            const variant = ROLE_CHIP_VARIANT[key] ?? "secondary";
+          // Embedding chip: show model name + dimension + green Active indicator
+          if (key === "embedding") {
+            const dim = isSet ? inferEmbeddingDimension(a!.model) : null;
             return (
               <div
                 key={key}
-                className={`role-chip role-chip--${variant}`}
+                className={`role-chip role-chip--${variant}${isSet ? " is-set" : ""}`}
                 onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
                 style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
                 title={!isSet ? `Click to set ${label} model` : undefined}
@@ -146,64 +140,98 @@ function ActiveRolesBanner({
                   <div className="role-chip__head">
                     {icon}
                     <span className="role-chip__role">{label}</span>
+                    {isSet && (
+                      <span style={{
+                        marginLeft: "auto",
+                        display: "flex", alignItems: "center", gap: 3,
+                        fontSize: "var(--text-xs)", fontWeight: 600,
+                        color: "var(--color-success)",
+                      }}>
+                        <CheckCircle size={10} strokeWidth={2.5} />
+                        Active
+                      </span>
+                    )}
                   </div>
-                  <span style={{
-                    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                    color: isSet ? "var(--fg)" : "var(--grey-500)", fontStyle: isSet ? "normal" : "italic",
-                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
-                  }}>
-                    {isSet ? `${a!.provider} / ${a!.model}` : "Not set"}
+                  <span className={`role-chip__value ${isSet ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+                    {isSet
+                      ? <>
+                          {a!.model}
+                          {dim && (
+                            <span style={{
+                              marginLeft: 5,
+                              fontSize: "var(--text-xs)",
+                              color: "var(--color-text-secondary)",
+                              fontFamily: "var(--font-mono)",
+                            }}>
+                              {dim}
+                            </span>
+                          )}
+                        </>
+                      : "---"}
                   </span>
                 </div>
               </div>
             );
-          })}
-          {/* Tool Caller chip */}
-          <div
-            className="role-chip role-chip--success"
-            onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
-            style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
-            title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
-          >
-            <div className="role-chip__bar" />
-            <div className="role-chip__body">
-              <div className="role-chip__head">
-                <Puzzle size={10} />
-                <span className="role-chip__role">Tool Caller</span>
+          }
+
+          return (
+            <div
+              key={key}
+              className={`role-chip role-chip--${variant}${isSet ? " is-set" : ""}`}
+              onClick={!isSet && onNavigate ? () => onNavigate(category) : undefined}
+              style={{ cursor: !isSet && onNavigate ? "pointer" : "default" }}
+              title={!isSet ? `Click to set ${label} model` : undefined}
+            >
+              <div className="role-chip__bar" />
+              <div className="role-chip__body">
+                <div className="role-chip__head">
+                  {icon}
+                  <span className="role-chip__role">{label}</span>
+                </div>
+                <span className={`role-chip__value ${isSet ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+                  {isSet ? `${a!.provider} / ${a!.model}` : "---"}
+                </span>
               </div>
-              <span style={{
-                fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                color: toolModel ? "var(--fg)" : "var(--grey-500)", fontStyle: toolModel ? "normal" : "italic",
-                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "block",
-              }}>
-                {toolModel ?? "Not set"}
-              </span>
             </div>
+          );
+        })}
+        {/* Tool Caller chip */}
+        <div
+          className={`role-chip role-chip--success${toolModel ? " is-set" : ""}`}
+          onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
+          style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
+          title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
+        >
+          <div className="role-chip__bar" />
+          <div className="role-chip__body">
+            <div className="role-chip__head">
+              <Puzzle size={12} strokeWidth={1.8} />
+              <span className="role-chip__role">Tool Caller</span>
+            </div>
+            <span className={`role-chip__value ${toolModel ? "role-chip__value--set" : "role-chip__value--empty"}`}>
+              {toolModel ?? "---"}
+            </span>
           </div>
         </div>
+      </div>
 
-        {/* Active model capabilities */}
-        {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
-          <div style={{
-            display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center",
-            padding: "6px 0 0", borderTop: "1px solid var(--grey-200)",
-          }}>
-            <span style={{ fontSize: "var(--text-xs)", color: "var(--grey-500)", marginRight: 4 }}>
-              Model features:
+      {/* Active model capabilities -- shown inline when set */}
+      {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
+        <div style={{
+          display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center",
+        }}>
+          {capabilities.thinking && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Thinking</span>}
+          {capabilities.vision && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Vision</span>}
+          {capabilities.audio_input && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Audio</span>}
+          {capabilities.structured_output && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Structured</span>}
+          {capabilities.context_window_tokens > 4096 && (
+            <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>
+              {Math.round(capabilities.context_window_tokens / 1000)}k ctx
             </span>
-            {capabilities.thinking && <Chip size="sm" variant="soft" color="accent">Thinking</Chip>}
-            {capabilities.vision && <Chip size="sm" variant="soft" color="accent">Vision</Chip>}
-            {capabilities.audio_input && <Chip size="sm" variant="soft" color="accent">Audio</Chip>}
-            {capabilities.structured_output && <Chip size="sm" variant="soft" color="accent">Structured Output</Chip>}
-            {capabilities.context_window_tokens > 4096 && (
-              <Chip size="sm" variant="soft" color="accent">
-                {Math.round(capabilities.context_window_tokens / 1000)}k context
-              </Chip>
-            )}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -258,10 +286,10 @@ function DownloadProgress({ downloads, onScanModels }: { downloads: DownloadEntr
 
 // ── Shared ModelList ──────────────────────────────────────────
 
-type RoleKey = "chat" | "tool" | "asr" | "tts";
+type RoleKey = "chat" | "tool" | "asr" | "tts" | "embedding";
 
 const ROLE_LABELS: Record<RoleKey, string> = {
-  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS",
+  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS", embedding: "Embedding",
 };
 
 function ModelList({
@@ -303,7 +331,7 @@ function ModelList({
   }
 
   return (
-    <div className="models-list">
+    <div className="card" style={{ overflow: "hidden" }}>
       {models.map((m) => {
         const activeFor = activeRolesFor(m);
         const isAnyActive = activeFor.length > 0;
@@ -311,25 +339,26 @@ function ModelList({
         return (
           <div
             key={m.id}
-            className={`giap-model-row${isAnyActive ? " is-active" : ""}`}
+            className={`model-row${isAnyActive ? " is-active" : ""}`}
           >
             <div>
-              <div className="giap-model-row__title-row">
-                <span className="giap-model-row__name">{m.display_name ?? m.name}</span>
+              <div className="model-row__title-row">
+                <span className="model-row__name">{m.display_name ?? m.name}</span>
                 {m.ram_estimate_mb && (
-                  <Chip size="sm" variant="soft">{m.ram_estimate_mb} MB</Chip>
-                )}
-                {m.recommended_role && (
-                  <Chip size="sm" variant="soft">{m.recommended_role}</Chip>
+                  <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.ram_estimate_mb} MB</Chip>
                 )}
                 {activeFor.map((r) => (
-                  <Chip key={r} size="sm" color="accent" variant="soft">{ROLE_LABELS[r]}</Chip>
+                  <Chip key={r} size="sm" variant="flat"
+                    color={r === "chat" ? "secondary" : r === "tool" ? "success" : r === "asr" ? "primary" : r === "tts" ? "danger" : "default"}
+                    className="model-row__tag">
+                    {ROLE_LABELS[r]}
+                  </Chip>
                 ))}
                 <CapabilityBadges name={m.name} />
               </div>
-              <div className="giap-model-row__file"><code>{m.provider} / {m.name}</code></div>
+              <div className="model-row__file"><code>{m.provider} / {m.name}</code></div>
             </div>
-            <div className="giap-model-row__actions">
+            <div className="model-row__actions">
               <div className="role-select">
                 {availableRoles.map((role) => {
                   const active = isRoleActive(m, role);
@@ -338,11 +367,12 @@ function ModelList({
                       key={role}
                       size="sm"
                       variant={active ? "secondary" : "outline"}
+                      className="role-select__btn"
                       onPress={() => onActivate(m.provider, m.name, role)}
                       isDisabled={!state.serverOnline}
                       aria-label={`Set ${m.name} as ${role} model`}
                     >
-                      {active && <CheckCircle size={11} />}
+                      {active && <CheckCircle size={11} strokeWidth={1.8} />}
                       {ROLE_LABELS[role]}
                     </Button>
                   );
@@ -350,14 +380,14 @@ function ModelList({
               </div>
               <Button
                 size="sm"
-                variant="outline"
+                variant="ghost"
                 isIconOnly
-                className="giap-model-row__trash"
+                className="model-row__trash"
                 onPress={() => onDelete(m.provider, m.name)}
                 isDisabled={!state.serverOnline}
                 aria-label={`Delete ${m.name}`}
               >
-                <Trash2 size={12} />
+                <Trash2 size={12} strokeWidth={1.8} />
               </Button>
             </div>
           </div>
@@ -469,7 +499,7 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
                       {!loadingFiles && files.length === 0 && <p className="gh-empty" style={{ padding: "var(--space-2) var(--space-3)" }}>No .gguf files in this repo.</p>}
                       {files.map((file) => (
                         <div key={file.filename} style={accordionSt.fileRow}>
-                          <code className="giap-model-row__name">{file.filename}</code>
+                          <code className="model-row__name">{file.filename}</code>
                           {file.size_mb != null && <Chip size="sm" variant="soft">{file.size_mb.toLocaleString()} MB</Chip>}
                           <Button
                             variant="secondary" size="sm"
@@ -541,7 +571,7 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
             {releases.map((rel) => (
               <div key={rel.name} style={accordionSt.fileRow}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <code className="giap-model-row__name">{rel.name}</code>
+                  <code className="model-row__name">{rel.name}</code>
                   <div style={{ display: "flex", gap: "4px", marginTop: "2px" }}>
                     <Chip size="sm" variant="soft">{rel.tag}</Chip>
                     {rel.size_mb != null && <Chip size="sm" variant="soft">{rel.size_mb.toLocaleString()} MB</Chip>}
@@ -733,7 +763,7 @@ function OllamaPanel({
         loading={modelsLoading && ollamaLoading}
         error={modelsError}
         activeRoles={activeRoles}
-        availableRoles={["chat"]}
+        availableRoles={["chat", "tool"]}
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
@@ -772,7 +802,10 @@ function LlmTab({
   onDownloadStarted: () => void;
   onScanModels: () => void;
 }) {
+  const state = useAppState();
   const [provider, setProvider] = useState<LlmProvider>("gguf");
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
   const PROVIDERS: Array<{ key: LlmProvider; label: string }> = [
     { key: "gguf", label: "GGUF" },
     { key: "llamafile", label: "Llamafile" },
@@ -783,8 +816,23 @@ function LlmTab({
   const llamafileModels = models.filter((m) => m.provider === "llamafile");
   const ollamaRegistryModels = models.filter((m) => m.provider === "ollama");
 
+  const ggufDownloaded  = ggufModels.filter((m) => m.downloaded !== false);
+  const ggufAvailable   = ggufModels.filter((m) => m.downloaded === false);
+  const llamaDownloaded = llamafileModels.filter((m) => m.downloaded !== false);
+  const llamaAvailable  = llamafileModels.filter((m) => m.downloaded === false);
+
+  async function handleCatalogDownload(category: string, m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel(category, m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Provider sub-tabs */}
       <div className="seg-toolbar">
         <Tabs
@@ -802,24 +850,73 @@ function LlmTab({
             </Tabs.List>
           </Tabs.ListContainer>
         </Tabs>
-        <div className="seg-toolbar__count">
-          <span>{ggufModels.length + llamafileModels.length + ollamaRegistryModels.length} models</span>
-        </div>
+        {(ggufModels.length + llamafileModels.length + ollamaRegistryModels.length) > 0 && (
+          <div className="seg-toolbar__count">
+            <span>{ggufModels.length + llamafileModels.length + ollamaRegistryModels.length} models</span>
+          </div>
+        )}
       </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
 
       {/* GGUF panel */}
       {provider === "gguf" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-          <ModelList
-            models={ggufModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["chat", "tool"]}
-            onActivate={onActivate}
-            onDelete={onDelete}
-            emptyMessage="No GGUF models found. Download one below."
-          />
+          {ggufDownloaded.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Installed
+              </span>
+              <ModelList
+                models={ggufDownloaded}
+                loading={modelsLoading}
+                error={modelsError}
+                activeRoles={activeRoles}
+                availableRoles={["chat", "tool"]}
+                onActivate={onActivate}
+                onDelete={onDelete}
+                emptyMessage=""
+              />
+            </>
+          )}
+          {!modelsLoading && ggufAvailable.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Available for download
+              </span>
+              <div className="card" style={{ overflow: "hidden" }}>
+                {ggufAvailable.map((m) => (
+                  <div key={m.id} className="model-row">
+                    <div>
+                      <div className="model-row__title-row">
+                        <span className="model-row__name">{m.display_name ?? m.name}</span>
+                        {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
+                        <CapabilityBadges name={m.name} />
+                      </div>
+                      {m.description && (
+                        <div className="model-row__file"><code>{m.description}</code></div>
+                      )}
+                    </div>
+                    <div className="model-row__actions">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onPress={() => handleCatalogDownload("gguf", m)}
+                        isDisabled={downloadingModel === m.name || !state.serverOnline}
+                      >
+                        <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {modelsLoading && ggufDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
           <BrowseHfAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
@@ -827,16 +924,57 @@ function LlmTab({
       {/* Llamafile panel */}
       {provider === "llamafile" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-          <ModelList
-            models={llamafileModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["chat"]}
-            onActivate={onActivate}
-            onDelete={onDelete}
-            emptyMessage="No Llamafile models found. Download one below."
-          />
+          {llamaDownloaded.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Installed
+              </span>
+              <ModelList
+                models={llamaDownloaded}
+                loading={modelsLoading}
+                error={modelsError}
+                activeRoles={activeRoles}
+                availableRoles={["chat", "tool"]}
+                onActivate={onActivate}
+                onDelete={onDelete}
+                emptyMessage=""
+              />
+            </>
+          )}
+          {!modelsLoading && llamaAvailable.length > 0 && (
+            <>
+              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Available for download
+              </span>
+              <div className="card" style={{ overflow: "hidden" }}>
+                {llamaAvailable.map((m) => (
+                  <div key={m.id} className="model-row">
+                    <div>
+                      <div className="model-row__title-row">
+                        <span className="model-row__name">{m.display_name ?? m.name}</span>
+                        {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
+                        <CapabilityBadges name={m.name} />
+                      </div>
+                      {m.description && (
+                        <div className="model-row__file"><code>{m.description}</code></div>
+                      )}
+                    </div>
+                    <div className="model-row__actions">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onPress={() => handleCatalogDownload("llamafile", m)}
+                        isDisabled={downloadingModel === m.name || !state.serverOnline}
+                      >
+                        <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {modelsLoading && llamaDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
           <BrowseGithubAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
@@ -860,13 +998,14 @@ function LlmTab({
 
 // ── Category Tabs ─────────────────────────────────────────────
 
-type Category = "llm" | "asr" | "tts" | "face";
+type Category = "llm" | "asr" | "tts" | "face" | "embedding";
 
 const CATEGORIES: Array<{ key: Category; label: string; icon: React.ReactNode; color: string }> = [
-  { key: "llm", label: "LLM", icon: <Brain size={14} />, color: CAT_COLOR.llm },
-  { key: "asr", label: "ASR", icon: <Mic size={14} />, color: CAT_COLOR.asr },
-  { key: "tts", label: "TTS", icon: <Volume2 size={14} />, color: CAT_COLOR.tts },
-  { key: "face", label: "Face", icon: <ScanFace size={14} />, color: "#3b82f6" },
+  { key: "llm",       label: "LLM",       icon: <Brain size={14} strokeWidth={1.8} />,   color: CAT_COLOR.llm },
+  { key: "asr",       label: "ASR",       icon: <Mic size={14} strokeWidth={1.8} />,     color: CAT_COLOR.asr },
+  { key: "tts",       label: "TTS",       icon: <Volume2 size={14} strokeWidth={1.8} />, color: CAT_COLOR.tts },
+  { key: "embedding", label: "Embedding", icon: <Cpu size={14} strokeWidth={1.8} />,     color: CAT_COLOR.embedding },
+  { key: "face",      label: "Face",      icon: <ScanFace size={14} strokeWidth={1.8} />, color: "#3b82f6" },
 ];
 
 // ── Face Recognition Panel ───────────────────────────────────
@@ -1029,6 +1168,368 @@ function MemoryStatusBar({ status }: { status: ModelMemoryStatus | null }) {
   );
 }
 
+// ── ASR Catalog Panel ────────────────────────────────────────
+
+function AsrCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+
+  const downloaded = models.filter((m) => m.downloaded !== false);
+  const available  = models.filter((m) => m.downloaded === false);
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("whisper", m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner seg-banner--info">
+        <Mic size={14} />
+        <span>Automatic Speech Recognition &mdash; Whisper models for voice-to-text</span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {/* Downloaded models */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["asr"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="card" style={{ overflow: "hidden" }}>
+            {available.map((m) => (
+              <div key={m.id} className="model-row">
+                <div>
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
+                    {m.asr_language && <span className="cap-badge">{m.asr_language}</span>}
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
+                  </div>
+                  <div className="model-row__file"><code>whisper / {m.name}</code></div>
+                </div>
+                <div className="model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No Whisper models found in catalog. Try refreshing the registry.</p>
+      )}
+    </div>
+  );
+}
+
+// ── Embedding Catalog Panel ───────────────────────────────────
+
+function EmbeddingCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+  // Track models that returned "ready" immediately — treated as installed
+  const [readyModels, setReadyModels] = useState<Set<string>>(new Set());
+
+  const downloaded = models.filter((m) => m.downloaded !== false || readyModels.has(m.name));
+  const available  = models.filter((m) => m.downloaded === false && !readyModels.has(m.name));
+
+  const activeEmbedding = activeRoles?.embedding;
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("embedding", m.name);
+      if (res.status === "ready") {
+        // fastembed auto-downloads on first use — mark as installed immediately
+        setReadyModels((prev) => new Set([...prev, m.name]));
+        setDlMsg(`${m.name} is ready — downloads automatically on first use.`);
+      } else if (res.status === "already_downloaded") {
+        setDlMsg(`${m.name} already downloaded.`);
+        onDownloadStarted();
+      } else {
+        setDlMsg(`Download started: ${m.name}`);
+        onDownloadStarted();
+      }
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner" style={{ borderColor: `${CAT_COLOR.embedding}33`, background: `${CAT_COLOR.embedding}0d` }}>
+        <Cpu size={14} style={{ color: CAT_COLOR.embedding, flexShrink: 0 }} />
+        <span>Embedding models help the agent understand your intent and route queries to the right tools</span>
+      </div>
+
+      {/* First-use note */}
+      <div className="seg-banner" style={{ borderColor: "var(--color-border)", background: "var(--grey-50)" }}>
+        <Download size={13} style={{ color: "var(--grey-500)", flexShrink: 0 }} />
+        <span style={{ color: "var(--grey-600)", fontSize: "var(--text-sm)" }}>
+          First-time setup: the model downloads 23-86 MB on first use. Check server logs for progress.
+        </span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {!activeEmbedding && !modelsLoading && downloaded.length === 0 && models.length === 0 && (
+        <p style={{ ...hint, fontStyle: "italic" }}>
+          No embedding models found. Download one below to enable better tool routing.
+        </p>
+      )}
+
+      {!activeEmbedding && !modelsLoading && downloaded.length > 0 && (
+        <p style={{ ...hint, fontStyle: "italic" }}>
+          Set a default embedding model for better tool routing.
+        </p>
+      )}
+
+      {/* Downloaded / ready models */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["embedding"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="card" style={{ overflow: "hidden" }}>
+            {available.map((m) => (
+              <div key={m.id} className="model-row">
+                <div>
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
+                  </div>
+                  {m.description && (
+                    <div className="model-row__file"><code>{m.description}</code></div>
+                  )}
+                </div>
+                <div className="model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No embedding models found in catalog. Try refreshing the registry.</p>
+      )}
+    </div>
+  );
+}
+
+// ── TTS Catalog Panel ────────────────────────────────────────
+
+function TtsCatalogPanel({
+  models,
+  modelsLoading,
+  modelsError,
+  activeRoles,
+  onActivate,
+  onDelete,
+  onDownloadStarted,
+}: {
+  models: ModelEntry[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  activeRoles: ModelActiveRoles | null;
+  onActivate: (provider: string, name: string, role: string) => void;
+  onDelete: (provider: string, name: string) => void;
+  onDownloadStarted: () => void;
+}) {
+  const state = useAppState();
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+
+  const downloaded = models.filter((m) => m.downloaded !== false);
+  const available  = models.filter((m) => m.downloaded === false);
+
+  async function handleDownload(m: ModelEntry) {
+    setDownloadingModel(m.name); setDlMsg(null);
+    try {
+      const res = await api.downloadModel("tts", m.name);
+      setDlMsg(res.status === "already_downloaded" ? `${m.name} already downloaded.` : `Download started: ${m.name}`);
+      onDownloadStarted();
+    } catch (e) { setDlMsg(`Error: ${String(e)}`); }
+    finally { setDownloadingModel(null); }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="seg-banner seg-banner--warn">
+        <Volume2 size={14} />
+        <span>Text-to-Speech &mdash; Piper voices for spoken output</span>
+      </div>
+
+      {dlMsg && (
+        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
+          {dlMsg}
+        </p>
+      )}
+
+      {/* Downloaded voices */}
+      {downloaded.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Installed
+          </span>
+          <ModelList
+            models={downloaded}
+            loading={modelsLoading}
+            error={modelsError}
+            activeRoles={activeRoles}
+            availableRoles={["tts"]}
+            onActivate={onActivate}
+            onDelete={onDelete}
+            emptyMessage=""
+          />
+        </>
+      )}
+
+      {/* Available for download */}
+      {!modelsLoading && available.length > 0 && (
+        <>
+          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Available for download
+          </span>
+          <div className="card" style={{ overflow: "hidden" }}>
+            {available.map((m) => (
+              <div key={m.id} className="model-row">
+                <div>
+                  <div className="model-row__title-row">
+                    <span className="model-row__name">{m.display_name ?? m.name}</span>
+                    {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
+                  </div>
+                  {m.description && (
+                    <div className="model-row__file"><code>{m.description}</code></div>
+                  )}
+                </div>
+                <div className="model-row__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onPress={() => handleDownload(m)}
+                    isDisabled={downloadingModel === m.name || !state.serverOnline}
+                  >
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {!modelsLoading && models.length === 0 && (
+        <p style={hint}>No TTS voices found in catalog. Try refreshing the registry.</p>
+      )}
+    </div>
+  );
+}
+
 // ── Main Models Component ─────────────────────────────────────
 
 export function Models() {
@@ -1137,32 +1638,56 @@ export function Models() {
     } catch (e) { flash(String(e), false); }
   }
 
-  const asrModels = models.filter((m) => m.provider === "whisper");
-  const ttsModels = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
+  const asrModels       = models.filter((m) => m.provider === "whisper");
+  const ttsModels       = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
+  const embeddingModels = models.filter((m) => m.provider === "embedding" || m.category === "embedding");
 
-  const llmCount = models.filter((m) => m.provider !== "whisper" && m.provider !== "tts" && m.provider !== "tts_piper" && m.provider !== "tts_http").length;
+  const NON_LLM_PROVIDERS = new Set(["whisper", "tts", "tts_piper", "tts_http", "embedding"]);
+  const llmCount = models.filter((m) => !NON_LLM_PROVIDERS.has(m.provider) && m.category !== "embedding").length;
 
   return (
     <div className="screen">
       {/* Page header */}
-      <div className="page-header">
-        <h1 className="page-header__title">Models</h1>
-        <div className="page-header__action">
-          <Button size="sm" variant="outline" onPress={handleScan}>
-            <RefreshCw size={14} /> Scan
+      <PageHeader
+        title="Models"
+        action={
+          <Button size="sm" variant="ghost" onPress={handleScan}>
+            <RefreshCw size={14} strokeWidth={1.8} /> Scan
           </Button>
+        }
+      />
+
+      {/* Active Roles Card */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card__label">Active model roles</span>
+          <div className="card-header__right">
+            {memoryStatus && memoryStatus.total_mb > 0 && (
+              <span style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                {(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100).toFixed(0)}%
+                {" · "}
+                {(memoryStatus.available_for_llm_mb / 1024).toFixed(1)} / {(memoryStatus.total_mb / 1024).toFixed(1)} GB
+                {memoryStatus.loaded_model && (
+                  <Chip size="sm" variant="flat" color="secondary" style={{ fontSize: "10px" }}>{memoryStatus.loaded_model}</Chip>
+                )}
+              </span>
+            )}
+            <Button size="sm" variant="ghost" isIconOnly onPress={loadRoles} isDisabled={rolesLoading} aria-label="Refresh roles">
+              <RefreshCw size={13} strokeWidth={1.8} style={{ opacity: rolesLoading ? 0.4 : 1, transition: "opacity 0.2s" }} />
+            </Button>
+          </div>
+        </div>
+        <div className="card-body--tight" style={{ padding: "0 14px 14px" }}>
+          <ActiveRolesBanner
+            roles={activeRoles}
+            memoryStatus={memoryStatus}
+            capabilities={capabilities}
+            onRefresh={loadRoles}
+            loading={rolesLoading}
+            onNavigate={(cat) => setCategory(cat)}
+          />
         </div>
       </div>
-
-      {/* Active Roles Banner (with memory progress) */}
-      <ActiveRolesBanner
-        roles={activeRoles}
-        memoryStatus={memoryStatus}
-        capabilities={capabilities}
-        onRefresh={loadRoles}
-        loading={rolesLoading}
-        onNavigate={(cat) => setCategory(cat)}
-      />
 
       {/* Download Progress */}
       <DownloadProgress downloads={downloads} onScanModels={handleScan} />
@@ -1182,33 +1707,32 @@ export function Models() {
         >
           <Tabs.ListContainer>
             <Tabs.List aria-label="Model categories" className="models-toolbar__tabs">
-              {CATEGORIES.map(({ key, label, icon }) => (
-                <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
-                  <Tabs.Indicator />
-                  <div className="tab-title">
-                    {icon}
-                    <span>{label}</span>
-                    <span className="tab-title__count">
-                      {key === "llm" ? llmCount : key === "asr" ? asrModels.length : ttsModels.length}
-                    </span>
-                  </div>
-                </Tabs.Tab>
-              ))}
+              {CATEGORIES.map(({ key, label, icon }) => {
+                const count =
+                  key === "llm" ? llmCount :
+                  key === "asr" ? asrModels.length :
+                  key === "tts" ? ttsModels.length :
+                  key === "embedding" ? embeddingModels.length : 0;
+                return (
+                  <Tabs.Tab key={key} id={key} onClick={() => setCategory(key as Category)}>
+                    <Tabs.Indicator />
+                    <div className="tab-title">
+                      {icon}
+                      <span>{label}</span>
+                      {count > 0 && <span className="tab-title__count">{count}</span>}
+                    </div>
+                  </Tabs.Tab>
+                );
+              })}
             </Tabs.List>
           </Tabs.ListContainer>
         </Tabs>
         <div className="models-toolbar__right">
           <div className="models-toolbar__search" style={{ position: "relative" }}>
-            <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-500)", pointerEvents: "none" }} />
+            <Search size={13} strokeWidth={1.8} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-400)", pointerEvents: "none" }} />
             <input
-              style={{
-                width: "100%", height: "32px", paddingLeft: "32px", paddingRight: "12px",
-                border: "1px solid var(--grey-200)", borderRadius: "8px",
-                fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-                background: "#fff", color: "var(--fg)", outline: "none",
-                boxSizing: "border-box" as const,
-              }}
-              placeholder="Search models…"
+              className="models-search-input"
+              placeholder="Search models..."
               aria-label="Search models"
             />
           </div>
@@ -1230,114 +1754,42 @@ export function Models() {
       )}
 
       {category === "asr" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--info">
-            <Mic size={14} />
-            <span>Automatic Speech Recognition</span>
-          </div>
-          <ModelList
-            models={asrModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["asr"]}
-            onActivate={handleActivate}
-            onDelete={handleDelete}
-            emptyMessage="No Whisper models found. Run a model scan or download from HuggingFace."
-          />
-          <p className="muted-foot">Whisper models power voice-to-text transcription. Place <code>.bin</code> files in <code>models/whisper/</code> and click Scan.</p>
-        </div>
+        <AsrCatalogPanel
+          models={asrModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
       )}
 
       {category === "tts" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="seg-banner seg-banner--warn">
-            <Volume2 size={14} />
-            <span>Text-to-Speech</span>
-          </div>
-          <ModelList
-            models={ttsModels}
-            loading={modelsLoading}
-            error={modelsError}
-            activeRoles={activeRoles}
-            availableRoles={["tts"]}
-            onActivate={handleActivate}
-            onDelete={handleDelete}
-            emptyMessage="No TTS models found. Place Piper .onnx files in models/tts/ and scan."
-          />
-          <p className="muted-foot">TTS models power the voice output. Piper voices use <code>.onnx</code> + <code>.json</code> pairs in <code>models/tts/</code>.</p>
-        </div>
+        <TtsCatalogPanel
+          models={ttsModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
+      )}
+
+      {category === "embedding" && (
+        <EmbeddingCatalogPanel
+          models={embeddingModels}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          activeRoles={activeRoles}
+          onActivate={handleActivate}
+          onDelete={handleDelete}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+        />
       )}
 
       {category === "face" && <FacePanel />}
-    </div>
-  );
-}
-
-// ── Face Recognition Panel ───────────────────────────────────
-
-function FacePanel() {
-  const [data, setData] = useState<FaceModelsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    api.listFaceModels()
-      .then(setData)
-      .catch(() => setData(null))
-      .finally(() => setLoading(false));
-  }, []);
-
-  if (loading) {
-    return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 16, color: "var(--grey-500)" }}>
-        <Loader2 size={16} className="spin" /> Loading face models...
-      </div>
-    );
-  }
-
-  if (!data || !data.feature_enabled) {
-    return (
-      <div className="seg-banner seg-banner--warn">
-        <ScanFace size={14} />
-        <span>Face recognition is not enabled. Build the server with <code>--features face-onnx</code> to activate.</span>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div className="seg-banner" style={{ borderColor: "#3b82f6", background: "rgba(59,130,246,0.06)" }}>
-        <ScanFace size={14} />
-        <span>Face Recognition Models</span>
-      </div>
-      {data.models.map((m) => (
-        <div
-          key={m.name}
-          className={`giap-model-row ${m.downloaded ? "is-active" : ""}`}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
-            {m.downloaded
-              ? <CheckCircle size={14} style={{ color: "var(--color-success)", flexShrink: 0 }} />
-              : <XCircle size={14} style={{ color: "var(--color-destructive)", flexShrink: 0 }} />}
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: "var(--text-sm)" }}>{m.label || m.name}</div>
-              {m.path && (
-                <code style={{ fontSize: 10, color: "var(--grey-500)", display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {m.path}
-                </code>
-              )}
-            </div>
-          </div>
-          <Chip size="sm" variant={m.downloaded ? "success" : "outline"}>
-            {m.downloaded ? "Ready" : "Missing"}
-          </Chip>
-        </div>
-      ))}
-      {data.models_dir && (
-        <p className="muted-foot">
-          Models directory: <code>{data.models_dir}</code>
-        </p>
-      )}
     </div>
   );
 }

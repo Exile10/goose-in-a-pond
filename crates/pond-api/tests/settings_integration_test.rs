@@ -30,9 +30,15 @@ struct CompletedOnboarding;
 
 #[async_trait::async_trait]
 impl OnboardingRepository for CompletedOnboarding {
-    async fn get_current_step(&self) -> Option<OnboardingStep> { Some(OnboardingStep::Completed) }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn get_current_step(&self) -> Option<OnboardingStep> {
+        Some(OnboardingStep::Completed)
+    }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoDevices;
@@ -41,15 +47,29 @@ struct NoDevices;
 impl DeviceRegistry for NoDevices {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".to_string(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01 00:00:00".to_string(), last_seen: None, is_online: false,
+            id: "mock".to_string(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01 00:00:00".to_string(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn make_app() -> (axum::Router, tempfile::TempDir) {
@@ -87,6 +107,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -100,10 +123,25 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -133,7 +171,9 @@ async fn put_settings_returns_full_settings_object() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     // Must be a Settings object — NOT {"status":"ok"}
@@ -198,7 +238,9 @@ async fn put_settings_partial_patch_preserves_other_fields() {
         .unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(
@@ -248,7 +290,9 @@ async fn get_settings_returns_current_settings() {
 
     assert_eq!(get_resp.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(

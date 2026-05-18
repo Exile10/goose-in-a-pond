@@ -22,7 +22,6 @@ pub const LLAMAFILE: u16 = 8080;
 /// Piper TTS in-process HTTP bridge (loopback only).
 pub const PIPER_TTS: u16 = 8282;
 
-
 /// How many sequential port numbers to try before giving up.
 pub const MAX_TRIES: u16 = 10;
 

@@ -52,7 +52,7 @@ function renderSchedules() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
 });
 
 afterEach(() => {

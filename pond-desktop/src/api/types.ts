@@ -16,13 +16,10 @@ export interface Settings {
   assistant_name: string;
   user_name: string;
   assistant_personality?: string;
-  location?: string;       // legacy alias
-  personality?: string;    // legacy alias
   timezone?: string;
 
   // Voice pipeline
   voice_wake_word?: string;
-  wake_word?: string;      // legacy alias
   voice_wake_word_transcriptions?: string[];
   voice_recording_duration_secs?: number;
   voice_whisper_url?: string;
@@ -54,19 +51,126 @@ export interface Settings {
   weather_location_name?: string;
   weather_latitude?: number;
   weather_longitude?: number;
-  lat?: number;  // legacy alias
-  lon?: number;  // legacy alias
+
+  // Fast path
+  fast_path_enabled?: boolean;
+
+  // Active model selection
+  active_embedding_model?: string;
+  embedding_provider?: string;
+
+  // Voice KWS tuning
+  voice_kws_whisper_url?: string | null;
+  voice_kws_energy_threshold?: number;
+  voice_kws_post_trigger_silence_ms?: number;
+  voice_kws_cooldown_ms?: number;
+
+  // Context
+  context_window_override?: number;
 
   // Agent behaviour
+  agent_backend?: string;
   agent_goose_mode?: string;
   agent_max_turns?: number;
+  agent_timeout_secs?: number;
+  prefix_cache_prompt?: boolean;
   agent_memory_inject: boolean;
   agent_memory_limit?: number;
+  tool_output_compaction?: boolean;
+
+  // Memory lifecycle
+  memory_extraction_enabled?: boolean;
+  memory_cleanup_enabled?: boolean;
+  memory_consolidation_enabled?: boolean;
+  memory_graph_enabled?: boolean;
+
+  // Memory tuning
+  memory_prune_threshold?: number;
+  memory_archive_threshold?: number;
+  memory_decay_base_half_life_days?: number;
+  memory_decay_beta?: number;
+  memory_cleanup_interval_hours?: number;
+  memory_consolidation_interval_hours?: number;
+  memory_consolidation_batch_size?: number;
+  memory_consolidation_mode?: string;
+  memory_extraction_max_facts?: number;
+  memory_extraction_interval_secs?: number;
+
+  // Scheduling tuning
+  schedule_result_notify?: boolean;
+  schedule_max_concurrent?: number;
+  schedule_max_runs_per_task?: number;
+
+  // Context monitoring
+  context_monitor_enabled?: boolean;
+
+  // Cost comparison
+  cloud_input_price_per_million?: number;
+  cloud_output_price_per_million?: number;
+
+  // Tool cache
+  tool_cache_enabled?: boolean;
+
+  // Telemetry
+  telemetry_enabled?: boolean;
+
+  // Compact encoding
+  compact_encoding?: boolean;
+
+  // Experimental
+  multi_tool_enabled?: boolean;
+  tool_call_validation?: boolean;
+  tool_request_detection?: boolean;
+
+  // Extension toggles
+  ext_memory_enabled?: boolean;
+  ext_schedule_enabled?: boolean;
+  ext_weather_enabled?: boolean;
+  ext_knowledge_enabled?: boolean;
+  ext_system_enabled?: boolean;
+  ext_device_enabled?: boolean;
+  ext_news_enabled?: boolean;
+  ext_finance_enabled?: boolean;
+  ext_discovery_enabled?: boolean;
+
+  // API keys for keyed services
+  api_key_guardian?: string | null;
+  api_key_gnews?: string | null;
+  api_key_finnhub?: string | null;
+  api_key_coingecko?: string | null;
+  searxng_url?: string | null;
 
   // Data retention
   retention_event_log_days?: number;
   retention_sensor_days?: number;
   retention_session_messages_keep?: number;
+}
+
+// ── Consolidation ────────────────────────────────────────────
+export type ConsolidationEventType =
+  | "started"
+  | "proposer_done"
+  | "adversary_done"
+  | "judge_done"
+  | "applied"
+  | "completed"
+  | "error"
+  | "cancelled";
+
+export interface ConsolidationEvent {
+  type: ConsolidationEventType;
+  memory_count?: number;
+  proposals?: unknown[];
+  challenges?: unknown[];
+  decisions?: unknown[];
+  exchange?: unknown;
+  result?: {
+    exchanges: unknown[];
+    accepted_count: number;
+    rejected_count: number;
+    duration_ms: number;
+  };
+  message?: string;
 }
 
 // ── Devices ───────────────────────────────────────────────────
@@ -84,18 +188,78 @@ export interface Device {
 export interface Schedule {
   id: string;
   name: string;
+  label?: string;
   cron: string;
   prompt: string;
   enabled: boolean;
+  timezone?: string;
+  kind?: { type: "agent_prompt"; prompt: string } | { type: "webhook"; webhook_url: string };
+  last_run?: string;
+  next_run?: string;
   created_at?: string;
 }
 
+export interface ScheduleRun {
+  id: string;
+  schedule_id: string;
+  status: "running" | "completed" | "failed";
+  result?: string;
+  error?: string;
+  started_at: string;
+  finished_at?: string;
+  duration_ms?: number;
+}
+
+/** Enriched schedule run for UI notification display. */
+export interface ScheduleRunNotification {
+  id: string;
+  scheduleId: string;
+  scheduleName: string;
+  status: "running" | "completed" | "failed";
+  result: string | null;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  read: boolean;
+  /** First ~80 chars of result for preview */
+  excerpt: string;
+  /** Inferred recipe type from schedule name/prompt */
+  recipe: string | null;
+}
+
+/** Context passed when navigating to Canvas to view a schedule debrief. */
+export interface DebriefContext {
+  type: "debrief";
+  run: ScheduleRunNotification;
+}
+
 // ── Memory ────────────────────────────────────────────────────
+export type MemorySegment =
+  | "identity"
+  | "preference"
+  | "correction"
+  | "relationship"
+  | "project"
+  | "knowledge"
+  | "context";
+
+export type MemoryTier = "short" | "long" | "permanent";
+export type MemoryLifecycle = "active" | "archived" | "merged";
+
 export interface MemoryFragment {
   id: string;
   content: string;
+  source?: string;
   tags?: string[];
   created_at: string;
+  segment?: MemorySegment;
+  importance?: number;
+  tier?: MemoryTier;
+  lifecycle?: MemoryLifecycle;
+  access_count: number;
+  last_accessed_at?: string;
+  superseded_by?: string;
 }
 
 // ── User Skills ───────────────────────────────────────────────
@@ -117,6 +281,16 @@ export interface ModelEntry {
   is_active: boolean;
   ram_estimate_mb?: number;
   recommended_role?: string;
+  downloaded?: boolean;
+  description?: string;
+  size_mb?: number;
+  category?: string;
+  filename?: string;
+  url?: string;
+  asr_language?: string;
+  asr_size?: string;
+  tts_engine?: string;
+  config_filename?: string;
 }
 
 export interface ModelMemoryStatus {
@@ -161,15 +335,37 @@ export interface AgentRecipe {
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision";
+
+/** Request body for POST /api/v1/chat/stream */
+export interface ChatStreamRequest {
+  message: string;
+  session_id?: string;
+  canvas_mode?: boolean;
+  voice_mode?: boolean;
+}
+
+/** Request body for POST /api/v1/agent/chat/stream */
+export interface AgentChatStreamRequest {
+  message: string;
+  session_id?: string;
+}
+
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision";
 
 export interface ChatEvent {
   type: ChatEventType;
   content?: string;         // for "text" events
   token?: string;           // legacy backend alias for content
-  tool?: string;            // for "tool_call" events
+  tool?: string;            // for "tool_call" and "tool_result" events
+  id?: string;              // tool call ID — for matching tool_call to tool_result
+  input?: unknown;          // for "tool_call" events — model's tool call arguments
   result?: unknown;         // for "tool_call" events
   error?: string;           // for "error" events
+  /** Optional MCP-APP UI rendering hint from backend */
+  ui?: {
+    card_type?: string;
+    data?: Record<string, unknown>;
+  };
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)
@@ -208,10 +404,11 @@ export interface ModelRoleAssignment {
 }
 
 export interface ModelActiveRoles {
-  chat:  ModelRoleAssignment | null;
-  tool:  { model: string | null } | null;
-  asr:   ModelRoleAssignment | null;
-  tts:   ModelRoleAssignment | null;
+  chat:       ModelRoleAssignment | null;
+  tool:       { model: string | null } | null;
+  asr:        ModelRoleAssignment | null;
+  tts:        ModelRoleAssignment | null;
+  embedding:  ModelRoleAssignment | null;
 }
 
 // ── Sessions ──────────────────────────────────────────────────
@@ -221,6 +418,18 @@ export interface SessionSummary {
   created_at: string;
   updated_at: string;
   message_count?: number;
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  model_name?: string;
+}
+
+export interface UsageSummary {
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  session_count: number;
+  cloud_input_price_per_million?: number;
+  cloud_output_price_per_million?: number;
 }
 
 export interface SessionMessage {
@@ -282,6 +491,10 @@ export interface Extension {
   description: string;
   tools: string[];
   enabled: boolean;
+  /** Extension connection status: "connected", "error", or "loading" */
+  status?: string;
+  /** Last error message if status is "error" */
+  last_error?: string | null;
 }
 
 export interface AddExtensionRequest {
@@ -292,6 +505,29 @@ export interface AddExtensionRequest {
   description?: string;
   args?: string[];
   env?: Record<string, string>;
+}
+
+export interface SecretRequirement {
+  key: string;
+  display_name: string;
+  description: string;
+  required: boolean;
+  kind: 'api_key' | 'oauth_flow' | 'generic';
+}
+
+export interface MarketplaceExtension {
+  id: string;
+  name: string;
+  description: string;
+  kind: string;
+  command?: string;
+  args: string[];
+  uri?: string;
+  category: string;
+  author: string;
+  tools: string[];
+  featured: boolean;
+  required_secrets: SecretRequirement[];
 }
 
 // ── Logs / Telemetry ─────────────────────────────────────────

@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "extensions": [
+    {
+      "id": "filesystem",
+      "name": "Filesystem",
+      "description": "Read, write, search, and manage files on your local disk",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"],
+      "category": "productivity",
+      "author": "Anthropic",
+      "tools": ["read_file", "write_file", "list_directory", "search_files", "get_file_info", "list_allowed_directories"],
+      "featured": true
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "description": "Manage repositories, issues, pull requests, and branches on GitHub",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "category": "development",
+      "author": "Anthropic",
+      "tools": ["create_issue", "list_issues", "create_pull_request", "search_repositories"],
+      "featured": true,
+      "required_secrets": [
+        {
+          "key": "GITHUB_PERSONAL_ACCESS_TOKEN",
+          "display_name": "GitHub Token",
+          "description": "Create at github.com/settings/tokens with repo scope",
+          "required": true,
+          "kind": "api_key"
+        }
+      ]
+    },
+    {
+      "id": "brave-search",
+      "name": "Brave Search",
+      "description": "Search the web using Brave Search API for current information",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "category": "productivity",
+      "author": "Anthropic",
+      "tools": ["brave_web_search", "brave_local_search"],
+      "featured": true,
+      "required_secrets": [
+        {
+          "key": "BRAVE_API_KEY",
+          "display_name": "Brave API Key",
+          "description": "Get your API key at brave.com/search/api",
+          "required": true,
+          "kind": "api_key"
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "name": "Memory (MCP)",
+      "description": "Persistent key-value memory using a local knowledge graph",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "category": "productivity",
+      "author": "Anthropic",
+      "tools": ["create_entities", "create_relations", "search_nodes", "open_nodes"],
+      "featured": false
+    },
+    {
+      "id": "puppeteer",
+      "name": "Puppeteer",
+      "description": "Control a headless browser for web scraping and automation",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
+      "category": "automation",
+      "author": "Anthropic",
+      "tools": ["navigate", "screenshot", "click", "fill", "evaluate"],
+      "featured": false
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "description": "Send messages, read channels, and manage Slack workspaces",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "category": "communication",
+      "author": "Anthropic",
+      "tools": ["send_message", "list_channels", "read_channel", "search_messages"],
+      "featured": false,
+      "required_secrets": [
+        {
+          "key": "SLACK_BOT_TOKEN",
+          "display_name": "Slack Bot Token",
+          "description": "Create a Slack app at api.slack.com/apps and get your Bot Token",
+          "required": true,
+          "kind": "api_key"
+        }
+      ]
+    },
+    {
+      "id": "music",
+      "name": "Music",
+      "description": "Control music playback, search tracks, and manage playlists via Spotify",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["tsx", "extensions/music/src/server.ts"],
+      "category": "entertainment",
+      "author": "GIAP",
+      "tools": ["play", "status", "control"],
+      "featured": true,
+      "required_secrets": [
+        {
+          "key": "SPOTIFY_ACCESS_TOKEN",
+          "display_name": "Spotify",
+          "description": "Sign in to control playback and manage playlists",
+          "required": true,
+          "kind": "oauth_flow"
+        }
+      ]
+    }
+  ]
+}

@@ -55,7 +55,9 @@ mod tests {
 
     impl MockRepo {
         fn new() -> Self {
-            Self { step: Mutex::new(None) }
+            Self {
+                step: Mutex::new(None),
+            }
         }
     }
 
