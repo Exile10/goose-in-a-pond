@@ -44,9 +44,7 @@ impl InferenceProvider for LlamaCppEngine {
         let system_prompt = system_prompt.to_string();
         let messages = messages.to_vec();
         let tools = tools.to_vec();
-        let temperature = options.temperature;
-        let max_tokens = options.max_tokens;
-        let enable_thinking = options.enable_thinking;
+        let options = options.clone();
         let model_slot = self.model_slot();
         let backend = self.backend_arc();
 
@@ -57,9 +55,7 @@ impl InferenceProvider for LlamaCppEngine {
                 system_prompt,
                 messages,
                 tools,
-                temperature,
-                max_tokens,
-                enable_thinking,
+                &options,
                 tx,
             );
         });
@@ -77,11 +73,11 @@ impl InferenceProvider for LlamaCppEngine {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        self.model_slot()
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|m| m.capabilities.clone()))
-            .unwrap_or_default()
+        // Use the lock-free capabilities cache. This avoids contending with
+        // the model mutex, which is held for the entire duration of generation.
+        // The old try_lock() approach silently returned defaults (tool_calling=false)
+        // whenever a generation task was in progress.
+        self.cached_capabilities()
     }
 }
 
@@ -94,16 +90,13 @@ impl InferenceProvider for LlamaCppEngine {
 /// When `cache_path` is provided, the context state is saved after generation
 /// and loaded before the next call. Prefix matching skips re-decoding tokens
 /// already in the KV cache, saving 5-15s on Jetson for stable system prompts.
-#[allow(clippy::too_many_arguments)]
 fn generation_task(
     model_slot: ModelSlot,
     backend: Arc<LlamaBackend>,
     system_prompt: String,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    enable_thinking: bool,
+    options: &InferenceOptions,
     tx: mpsc::Sender<Result<ChatEvent>>,
 ) {
     // Acquire the model lock (blocking). Mutable for in-memory KV-cache persistence.
@@ -116,7 +109,8 @@ fn generation_task(
     // ── Build the prompt ─────────────────────────────────────────────────
 
     let oai_messages_json = build_openai_messages_json(&system_prompt, &messages);
-    let compact_tools = tool_calling::compact_tools_json(&tools);
+    let compact_tools = options.compact_tools_json_override.clone()
+        .or_else(|| tool_calling::compact_tools_json(&tools));
 
     // On small-context platforms (Jetson ≤4096), full tool schemas always exceed
     // the budget. Skip directly to compact to avoid wasting time on serialization,
@@ -124,11 +118,30 @@ fn generation_task(
     let n_ctx_train = loaded.model.n_ctx_train() as usize;
     let use_compact_directly = n_ctx_train <= 4096;
 
-    let full_tools_json = if use_compact_directly {
-        tracing::debug!(n_ctx_train, "small context — skipping full tool schema serialization");
+    // Prefer pre-formatted JSON from the dispatcher (matches Goose's format_tools() exactly).
+    // Fall back to re-serializing ToolDefinition objects only when no override is provided.
+    let full_tools_json = if let Some(ref override_json) = options.tools_json_override {
+        tracing::info!(
+            schema_len = override_json.len(),
+            tools = tools.len(),
+            "using pre-formatted tools_json from dispatcher (Goose-compatible)"
+        );
+        Some(override_json.clone())
+    } else if tools.is_empty() {
+        tracing::warn!("no tools passed to generation_task — model will have no tool schemas");
+        None
+    } else if use_compact_directly {
+        tracing::debug!(n_ctx_train, tools = tools.len(), "small context — skipping full tool schema serialization");
         None
     } else {
-        tool_calling::tools_to_json(&tools)
+        let json = tool_calling::tools_to_json(&tools);
+        tracing::info!(
+            tools = tools.len(),
+            schema_len = json.as_ref().map(|j| j.len()).unwrap_or(0),
+            n_ctx_train,
+            "full tool schemas serialized for Jinja template"
+        );
+        json
     };
 
     let template_result = match apply_template(
@@ -137,7 +150,7 @@ fn generation_task(
         &oai_messages_json,
         full_tools_json.as_deref(),
         compact_tools.as_deref(),
-        enable_thinking,
+        options.enable_thinking,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -148,6 +161,28 @@ fn generation_task(
 
     let prompt = &template_result.prompt;
     let additional_stops = &template_result.additional_stops;
+
+    // Dump full rendered prompt to file when GIAP_DUMP_PROMPT is set.
+    // This lets you see exactly what the model receives (system prompt +
+    // tool declarations + user message) rendered through the Jinja template.
+    if std::env::var("GIAP_DUMP_PROMPT").is_ok() {
+        let dump_val = std::env::var("GIAP_DUMP_PROMPT").unwrap_or_default();
+        let dump_path = if dump_val == "1" || dump_val.is_empty() {
+            "/tmp/giap-rendered-prompt.txt".to_string()
+        } else {
+            dump_val
+        };
+        if let Err(e) = std::fs::write(&dump_path, prompt) {
+            tracing::warn!(path = %dump_path, error = %e, "failed to dump rendered prompt");
+        } else {
+            tracing::info!(
+                path = %dump_path,
+                prompt_len = prompt.len(),
+                tools_count = tools.len(),
+                "rendered prompt dumped to file"
+            );
+        }
+    }
 
     // Debug: log the formatted prompt and tool state so we can diagnose
     // whether the chat template is including tools properly.
@@ -364,7 +399,7 @@ fn generation_task(
 
     // ── Generation loop ──────────────────────────────────────────────────
 
-    let mut sampler = build_sampler(temperature);
+    let mut sampler = build_sampler(options.temperature);
 
     // NOTE: Grammar constraints from the chat template are intentionally
     // NOT applied to the sampler. The lazy grammar sampler in llama-cpp-2
@@ -381,7 +416,7 @@ fn generation_task(
         );
     }
 
-    let max_output = if let Some(max) = max_tokens {
+    let max_output = if let Some(max) = options.max_tokens {
         ctx_size
             .saturating_sub(prompt_token_count)
             .min(max as usize)

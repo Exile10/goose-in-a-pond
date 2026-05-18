@@ -47,6 +47,12 @@ pub struct InferenceOptions {
     pub temperature: Option<f32>,
     /// Enable model thinking/reasoning (produces `<|channel>thought...<channel|>` tags).
     pub enable_thinking: bool,
+    /// Pre-formatted OpenAI-compatible tools JSON string from the dispatcher.
+    /// When set, the provider uses this directly instead of re-serializing ToolDefinition objects.
+    /// This matches Goose's `format_tools()` output exactly.
+    pub tools_json_override: Option<String>,
+    /// Pre-formatted compact tools JSON (name + description only, no schemas).
+    pub compact_tools_json_override: Option<String>,
 }
 
 /// A pinned, boxed stream of [`ChatEvent`] items.

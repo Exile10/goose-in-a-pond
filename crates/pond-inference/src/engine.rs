@@ -10,7 +10,7 @@ use llama_cpp_2::model::{LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::LogOptions;
 use pond_core::domain::model_capabilities::ModelCapabilities;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::sync::Mutex;
 
 /// A model loaded into memory with its chat template and capabilities.
@@ -115,6 +115,10 @@ pub struct LlamaCppEngine {
     model: ModelSlot,
     backend: Arc<LlamaBackend>,
     data_dir: PathBuf,
+    /// Cached capabilities — updated on model load/unload, read lock-free.
+    /// Avoids contending with the model mutex (which is held for the entire
+    /// duration of generation) when the agent needs to check tool_calling, etc.
+    capabilities: Arc<StdRwLock<ModelCapabilities>>,
 }
 
 impl LlamaCppEngine {
@@ -130,6 +134,7 @@ impl LlamaCppEngine {
             model: Arc::new(Mutex::new(None)),
             backend,
             data_dir: data_dir.to_path_buf(),
+            capabilities: Arc::new(StdRwLock::new(ModelCapabilities::default())),
         })
     }
 
@@ -158,6 +163,10 @@ impl LlamaCppEngine {
         .await
         .context("model loading task panicked")??;
 
+        // Update lock-free capabilities cache before acquiring the model lock.
+        *self.capabilities.write().expect("capabilities lock poisoned") =
+            loaded.capabilities.clone();
+
         // Swap: unload previous, install new.
         let mut guard = self.model.lock().await;
         *guard = Some(loaded);
@@ -169,6 +178,10 @@ impl LlamaCppEngine {
     /// Drops the cached context BEFORE the model to maintain the safety
     /// invariant (context borrows from model).
     pub async fn unload_model(&self) {
+        // Reset capabilities cache first.
+        *self.capabilities.write().expect("capabilities lock poisoned") =
+            ModelCapabilities::default();
+
         let mut guard = self.model.lock().await;
         if let Some(loaded) = guard.as_mut() {
             // Drop cached context first — it borrows from the model.
@@ -201,6 +214,18 @@ impl LlamaCppEngine {
             .as_ref()
             .map(|m| m.capabilities.clone())
             .unwrap_or_default()
+    }
+
+    /// Lock-free capabilities read — safe to call from sync contexts.
+    ///
+    /// Returns capabilities cached at model load time. Unlike `model_capabilities()`,
+    /// this never contends with the model mutex (which is held for the entire
+    /// duration of a generation task).
+    pub fn cached_capabilities(&self) -> ModelCapabilities {
+        self.capabilities
+            .read()
+            .expect("capabilities lock poisoned")
+            .clone()
     }
 
     /// Clone the model slot `Arc` for use in `spawn_blocking` tasks.
@@ -326,6 +351,7 @@ mod tests {
             model: Arc::new(Mutex::new(None)),
             backend: get_or_init_backend().expect("init"),
             data_dir: PathBuf::from("/tmp/test-data"),
+            capabilities: Arc::new(StdRwLock::new(ModelCapabilities::default())),
         };
 
         // Non-existent path, but verify the logic.

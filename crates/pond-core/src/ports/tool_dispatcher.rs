@@ -46,4 +46,57 @@ pub trait ToolDispatcher: Send + Sync {
             .map(|name| (name, String::new(), serde_json::json!({})))
             .collect()
     }
+
+    /// Return tool definitions pre-formatted as OpenAI-compatible JSON string.
+    ///
+    /// This produces the EXACT same format as Goose's `format_tools()`:
+    /// ```json
+    /// [{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]
+    /// ```
+    ///
+    /// The string is ready to be passed directly to `apply_chat_template_oaicompat()`
+    /// as `tools_json`. This bypasses any intermediate conversion that could alter
+    /// the schema structure.
+    async fn tools_json(&self) -> Option<String> {
+        let defs = self.available_tool_definitions().await;
+        if defs.is_empty() {
+            return None;
+        }
+        let specs: Vec<serde_json::Value> = defs
+            .into_iter()
+            .map(|(name, desc, schema)| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": desc,
+                        "parameters": schema,
+                    }
+                })
+            })
+            .collect();
+        serde_json::to_string(&specs).ok()
+    }
+
+    /// Return compact tool definitions (name + description only, no schemas).
+    /// Used as fallback when full schemas exceed the token budget.
+    async fn compact_tools_json(&self) -> Option<String> {
+        let defs = self.available_tool_definitions().await;
+        if defs.is_empty() {
+            return None;
+        }
+        let specs: Vec<serde_json::Value> = defs
+            .into_iter()
+            .map(|(name, desc, _)| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": desc,
+                    }
+                })
+            })
+            .collect();
+        serde_json::to_string(&specs).ok()
+    }
 }
