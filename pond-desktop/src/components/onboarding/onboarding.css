@@ -222,7 +222,7 @@
   height: 100%;
   background: var(--color-accent);
   border-radius: var(--radius-pill);
-  transition: width 0.4s ease;
+  transition: width var(--dur-slow) ease;
 }
 
 /* ── Action bar ───────────────────────────────────────────── */
@@ -583,7 +583,7 @@
   background: var(--grey-300);
   cursor: pointer;
   padding: 0;
-  transition: background 0.2s ease;
+  transition: background var(--dur-base) ease;
 }
 
 .ob-switch--on {
@@ -599,7 +599,7 @@
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-  transition: transform 0.2s ease;
+  transition: transform var(--dur-base) ease;
 }
 
 .ob-switch--on .ob-switch__thumb {
@@ -655,7 +655,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: border-color var(--transition-fast), background var(--transition-fast), transform 0.1s;
+  transition: border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
 }
 
 .ob-avatar-btn--selected {
@@ -737,7 +737,7 @@
   border: 2px solid #fff;
   box-shadow: 0 1px 4px rgba(140, 75, 255, 0.35);
   cursor: pointer;
-  transition: transform 0.1s ease;
+  transition: transform var(--transition-fast);
 }
 
 .ob-slider::-webkit-slider-thumb:hover {
@@ -1363,7 +1363,7 @@
   flex: 1;
   border-radius: 2px;
   background: var(--grey-200);
-  transition: height 0.15s, background 0.15s;
+  transition: height var(--transition-fast), background var(--transition-fast);
 }
 
 .ob-calibration__progress {
@@ -1390,7 +1390,7 @@
   height: 100%;
   background: var(--color-accent);
   border-radius: var(--radius-pill);
-  transition: width 0.25s;
+  transition: width var(--transition-fast);
 }
 
 .ob-calibration__progress-count {

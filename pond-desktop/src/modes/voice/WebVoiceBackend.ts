@@ -17,6 +17,7 @@ import {
   playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
   isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
   filterThinkingFull, createVadState, advanceVad, DEFAULT_VAD_CONFIG,
+  registerTtsSource, clearTtsSource, stopTtsPlayback, isTtsInterrupted, resetTtsInterrupt,
 } from "./webAudioUtils";
 
 // ── Internal types ───────────────────────────────────────────────
@@ -122,6 +123,7 @@ export class WebVoiceBackend implements VoiceBackend {
   async runPipeline(wav: Blob, opts: PipelineOpts): Promise<void> {
     this.cancelled = false;
     this.pipelineActive = true;
+    resetTtsInterrupt();
     const ac = new AbortController();
     this.abortController = ac;
 
@@ -168,7 +170,8 @@ export class WebVoiceBackend implements VoiceBackend {
       // Step 2: SSE chat stream
       await this.streamChat(text, opts, ac, () => {
         stopThink(); this.stopThinkingFn = null;
-        if (!quipDone && this.ttsSource) { try { this.ttsSource.stop(); } catch { /* ok */ } }
+        // Stop quip if still playing so first real sentence starts immediately
+        if (!quipDone) { stopTtsPlayback(); resetTtsInterrupt(); }
       });
 
       if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
@@ -190,7 +193,10 @@ export class WebVoiceBackend implements VoiceBackend {
     this.pipelineActive = false;
     this.abortController?.abort(); this.abortController = null;
     if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
-    if (this.ttsSource) { try { this.ttsSource.stop(); } catch { /* ok */ } this.ttsSource = null; }
+    // Stop any in-progress TTS: kills the active source, resolves pending
+    // promises, and sets the interrupted flag so queued sentences are skipped.
+    stopTtsPlayback();
+    this.ttsSource = null;
     this.closeMic();
     this.onAudioLevel?.(0);
   }
@@ -219,6 +225,7 @@ export class WebVoiceBackend implements VoiceBackend {
     this.cancelPipeline();
     this.stopWakeInternal();
     this.closeMic();
+    resetTtsInterrupt();
     closeAudioContext();
   }
 
@@ -280,7 +287,7 @@ export class WebVoiceBackend implements VoiceBackend {
   }
 
   private async playTtsSentence(text: string, signal: AbortSignal): Promise<void> {
-    if (this.cancelled || signal.aborted) return;
+    if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
     try {
       const res = await fetch(`${this.serverUrl}/api/v1/tts`, {
         method: "POST",
@@ -291,17 +298,18 @@ export class WebVoiceBackend implements VoiceBackend {
       if (!res.ok) { console.warn("TTS failed:", res.status); return; }
 
       const data = await res.arrayBuffer();
-      if (this.cancelled || signal.aborted) return;
+      if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
       const actx = getAudioContext();
       const buf = await actx.decodeAudioData(data);
-      if (this.cancelled || signal.aborted) return;
+      if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
 
       return new Promise<void>((resolve) => {
         const src = actx.createBufferSource();
         src.buffer = buf;
         src.connect(actx.destination);
         this.ttsSource = src;
-        src.onended = () => { this.ttsSource = null; resolve(); };
+        registerTtsSource(src, resolve);
+        src.onended = () => { this.ttsSource = null; clearTtsSource(); resolve(); };
         src.start(0);
       });
     } catch (err) {
@@ -332,7 +340,11 @@ export class WebVoiceBackend implements VoiceBackend {
     let playing = false;
 
     const playNext = async (): Promise<void> => {
-      if (this.cancelled || !ttsQ.length) { playing = false; return; }
+      if (this.cancelled || isTtsInterrupted() || !ttsQ.length) {
+        if (isTtsInterrupted()) ttsQ.length = 0; // drain remaining sentences
+        playing = false;
+        return;
+      }
       playing = true;
       const cleaned = normalizeForSpeech(stripMarkdown(ttsQ.shift()!));
       if (cleaned.trim()) await this.playTtsSentence(cleaned, controller.signal);
@@ -402,9 +414,11 @@ export class WebVoiceBackend implements VoiceBackend {
 
     if (ttsBuf.trim() && !this.cancelled) enqueue(ttsBuf.trim());
 
-    // Wait for TTS queue to drain
+    // Wait for TTS queue to drain (exits immediately if interrupted)
     await new Promise<void>((resolve) => {
-      const id = setInterval(() => { if (!playing || this.cancelled) { clearInterval(id); resolve(); } }, 100);
+      const id = setInterval(() => {
+        if (!playing || this.cancelled || isTtsInterrupted()) { clearInterval(id); resolve(); }
+      }, 100);
     });
   }
 

@@ -760,7 +760,12 @@ export function Schedules() {
                   <div className="sched-card__main">
                     <div className="sched-card__name">{s.name}</div>
                     <div className="sched-card__subtitle">
-                      <code className="sched-card__cron">{s.cron}</code>
+                      <span className="sched-card__cron" title={s.cron}>
+                        {(() => {
+                          const parsed = parseCronToConfig(s.cron);
+                          return humanPreview(parsed.repeat, parsed.config, s.timezone ?? "UTC");
+                        })()}
+                      </span>
                       {s.timezone && s.timezone !== "UTC" && (
                         <span className="sched-card__tz">
                           <Clock size={9} />
@@ -895,14 +900,7 @@ export function Schedules() {
                         <span style={{ fontSize: 12, color: "var(--grey-400)" }}>No runs yet.</span>
                       ) : (
                         (runsCache[s.id] ?? []).map((r) => (
-                          <div
-                            key={r.id}
-                            style={{
-                              fontSize: 12, padding: "4px 8px",
-                              background: "var(--grey-50, #fafafa)",
-                              borderRadius: 4, display: "flex", gap: 8, alignItems: "center",
-                            }}
-                          >
+                          <div key={r.id} className="sched-run-row">
                             <Chip
                               size="sm"
                               variant="flat"
@@ -911,13 +909,13 @@ export function Schedules() {
                               {r.status}
                             </Chip>
                             <span
-                              style={{ color: "var(--grey-500)", whiteSpace: "nowrap" }}
+                              className="sched-run-row__time"
                               title={new Date(r.started_at).toLocaleString()}
                             >
                               {timeAgo(r.started_at)}
                             </span>
                             {r.duration_ms != null && (
-                              <span style={{ color: "var(--grey-400)" }}>{(r.duration_ms / 1000).toFixed(1)}s</span>
+                              <span className="sched-run-row__duration">{(r.duration_ms / 1000).toFixed(1)}s</span>
                             )}
                             {(r.result || r.error) && (
                               <span
@@ -925,14 +923,11 @@ export function Schedules() {
                                   e.stopPropagation();
                                   setExpandedRunId(expandedRunId === r.id ? null : r.id);
                                 }}
-                                style={{
-                                  flex: 1, overflow: "hidden",
-                                  textOverflow: expandedRunId === r.id ? "unset" : "ellipsis",
-                                  whiteSpace: expandedRunId === r.id ? "pre-wrap" : "nowrap",
-                                  color: r.error ? "var(--color-destructive)" : "var(--grey-600)",
-                                  cursor: "pointer",
-                                  wordBreak: expandedRunId === r.id ? "break-word" : undefined,
-                                }}
+                                className={[
+                                  "sched-run-row__result",
+                                  expandedRunId === r.id && "is-expanded",
+                                  r.error && "sched-run-row__result--error",
+                                ].filter(Boolean).join(" ")}
                               >
                                 {expandedRunId === r.id
                                   ? (r.result ?? r.error ?? "")

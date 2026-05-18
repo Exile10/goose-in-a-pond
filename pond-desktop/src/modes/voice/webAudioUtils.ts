@@ -236,6 +236,82 @@ export function closeAudioContext(): void {
   }
 }
 
+// ── TTS Playback Controller ──────────────────────────────────────
+
+/**
+ * Manages TTS audio playback with interruptibility.
+ *
+ * Tracks the active AudioBufferSourceNode and a pending resolve callback
+ * so that an external caller (e.g. barge-in handler) can immediately
+ * silence playback and unblock the sentence queue.
+ */
+
+let _activeTtsSource: AudioBufferSourceNode | null = null;
+let _activeTtsResolve: (() => void) | null = null;
+let _ttsInterrupted = false;
+
+/**
+ * Register the currently-playing TTS source node and its completion
+ * resolve callback. Called by playTtsSentence before starting playback.
+ */
+export function registerTtsSource(
+  source: AudioBufferSourceNode,
+  resolve: () => void,
+): void {
+  _activeTtsSource = source;
+  _activeTtsResolve = resolve;
+}
+
+/**
+ * Clear the registered TTS source after it finishes naturally.
+ */
+export function clearTtsSource(): void {
+  _activeTtsSource = null;
+  _activeTtsResolve = null;
+}
+
+/**
+ * Immediately stop any in-progress TTS audio playback.
+ *
+ * - Calls .stop() on the active AudioBufferSourceNode
+ * - Resolves the pending playback promise so the queue advances
+ * - Sets an interrupted flag that the TTS queue checks before playing
+ *   the next sentence
+ *
+ * Call this when barge-in is detected to silence the assistant mid-sentence.
+ */
+export function stopTtsPlayback(): void {
+  _ttsInterrupted = true;
+  if (_activeTtsSource) {
+    try { _activeTtsSource.stop(); } catch { /* already stopped */ }
+    _activeTtsSource = null;
+  }
+  // Resolve the pending playback promise so playNext() can check the flag
+  if (_activeTtsResolve) {
+    _activeTtsResolve();
+    _activeTtsResolve = null;
+  }
+}
+
+/**
+ * Check and clear the TTS interrupted flag.
+ *
+ * The sentence queue calls this before playing each sentence.
+ * Returns true if stopTtsPlayback() was called (meaning the queue
+ * should drain without playing).
+ */
+export function isTtsInterrupted(): boolean {
+  return _ttsInterrupted;
+}
+
+/**
+ * Reset the TTS interrupted flag. Call this when starting a new
+ * pipeline run so previous interruptions don't carry over.
+ */
+export function resetTtsInterrupt(): void {
+  _ttsInterrupted = false;
+}
+
 // ── Ping Tone Generator ──────────────────────────────────────────
 
 /**

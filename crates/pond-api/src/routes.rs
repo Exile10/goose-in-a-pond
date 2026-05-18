@@ -28,7 +28,8 @@ use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::prompts::{
-    build_system_prompt_with_profile, render_template, sanitize_field, ProfileContext,
+    build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
+    ProfileContext,
 };
 use pond_core::services::chat::ChatService;
 use pond_core::services::onboarding::OnboardingService;
@@ -169,6 +170,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
                 .put(upsert_prompt_template)
                 .delete(delete_prompt_template),
         )
+        .route("/prompts/{name}/reset", post(reset_prompt_template))
         // ── Agent Tools (MCP) ─────────────────────────────────────────────────
         .route("/agent/tools", get(list_agent_tools))
         // ── Agent chat stream (agentic tool-use loop) ─────────────────────────
@@ -6265,6 +6267,50 @@ async fn delete_prompt_template(
     }
     match repo.delete(&name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn reset_prompt_template(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let repo = match &state.prompt_template_repo {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "Prompt template repository not configured"})),
+            )
+                .into_response()
+        }
+    };
+
+    // Only system (built-in) templates can be reset
+    let (content, description) = match builtin_template_content(&name) {
+        Some(pair) => pair,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("'{}' is not a built-in template. Only balanced | concise | technical | warm can be reset.", name)})),
+            )
+                .into_response()
+        }
+    };
+
+    let template = PromptTemplate {
+        name: name.clone(),
+        content: content.to_string(),
+        description: description.to_string(),
+        is_system: true,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match repo.upsert(&template).await {
+        Ok(()) => Json(json!(template)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),

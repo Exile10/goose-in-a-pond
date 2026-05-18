@@ -1497,7 +1497,7 @@ const nativeInput: React.CSSProperties = {
   fontSize: "var(--text-base)",
   fontFamily: "var(--font-body)",
   fontWeight: "var(--weight-regular)" as unknown as number,
-  background: "#fff",
+  background: "var(--color-surface)",
   color: "var(--fg)",
   width: "100%",
   userSelect: "text",
@@ -1528,7 +1528,7 @@ const wakeWordNote: React.CSSProperties = {
   alignItems: "flex-start",
   gap: "6px",
   padding: "8px 10px",
-  background: "rgba(255,149,0,0.08)",
+  background: "var(--color-warning-soft)",
   border: "1px solid rgba(255,149,0,0.25)",
   borderRadius: "8px",
   fontSize: "var(--text-xs)",
@@ -1537,7 +1537,7 @@ const wakeWordNote: React.CSSProperties = {
 };
 
 const wakeWordNoteIcon: React.CSSProperties = {
-  color: "#FF9500",
+  color: "var(--color-warning)",
   flexShrink: 0,
   marginTop: "1px",
   fontWeight: 700,

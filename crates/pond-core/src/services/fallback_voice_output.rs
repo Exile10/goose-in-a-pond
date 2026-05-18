@@ -38,6 +38,44 @@ impl VoiceOutput for FallbackVoiceOutput {
             }
         }
     }
+
+    async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>> {
+        match self.primary.synthesize(text).await {
+            Ok(v) => Ok(v),
+            Err(_) => self.fallback.synthesize(text).await,
+        }
+    }
+
+    async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
+        match self.primary.play_audio(audio.clone()).await {
+            Ok(()) => Ok(()),
+            Err(_) => self.fallback.play_audio(audio).await,
+        }
+    }
+
+    fn stop_speaking(&self) {
+        self.primary.stop_speaking();
+    }
+
+    fn start_thinking_tone(&self) {
+        self.primary.start_thinking_tone();
+    }
+
+    fn stop_thinking_tone(&self) {
+        self.primary.stop_thinking_tone();
+    }
+
+    fn start_barge_in_listener(&self) {
+        self.primary.start_barge_in_listener();
+    }
+
+    fn stop_barge_in_listener(&self) {
+        self.primary.stop_barge_in_listener();
+    }
+
+    async fn speak_quip(&self) -> Option<&'static str> {
+        self.primary.speak_quip().await
+    }
 }
 
 #[cfg(test)]

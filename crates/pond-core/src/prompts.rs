@@ -84,7 +84,7 @@ pub struct PromptState {
 pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
     &[
         ("wikipedia", "Look up ANY factual, conceptual, or encyclopedic information. Use for: people, places, events, science, history, geography, technology, definitions, concepts, comparisons (\"compare X and Y\"), \"what is X\", \"how does X work\", \"what is the difference between X and Y\", cultural topics, organizations, species, diseases, inventions, wars, countries, languages — anything where accurate, detailed knowledge matters. ALWAYS prefer this over guessing from memory. When in doubt, look it up."),
-        ("weather", "Get current weather or multi-day forecast for any location. Supports 'location' param (e.g. 'Kisumu', 'London') — omit to use the pond's configured home location. Use get_current_weather for now, get_weather_forecast for upcoming days. Use when the user asks about weather, temperature, forecast, rain, or whether to bring an umbrella."),
+        ("weather", "Get current weather or multi-day forecast for any location. Supports 'location' param (e.g. 'Kisumu', 'London') — omit for the user's default. Use get_current_weather for now, get_weather_forecast for upcoming days. Use when the user asks about weather, temperature, forecast, rain, or whether to bring an umbrella."),
         ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves, important dates, notes). Use when the user says 'remember', 'don't forget', 'save this', 'note that', or states a personal preference or fact about themselves."),
         ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before, or asks about their own preferences/history."),
         ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
@@ -595,6 +595,35 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 </canvas-mode>
 {% endif %}";
 
+// ── Built-in template lookup ─────────────────────────────────────────────
+
+/// Return the original (factory-default) content and description for a built-in
+/// prompt template name.
+///
+/// Returns `None` for unknown or user-created template names.
+/// Used by both the CLI `prompts reset` command and `POST /api/v1/prompts/{name}/reset`.
+pub fn builtin_template_content(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "balanced" => Some((
+            PROMPT_BALANCED,
+            "Warm, practical, complete behaviour rules. Default for most households.",
+        )),
+        "concise" => Some((
+            PROMPT_CONCISE,
+            "Minimal, action-first. For power users who want brevity.",
+        )),
+        "technical" => Some((
+            PROMPT_TECHNICAL,
+            "Verbose, tool-aware, narrates reasoning. For developers.",
+        )),
+        "warm" => Some((
+            PROMPT_WARM,
+            "Conversational, family-friendly, personality-forward.",
+        )),
+        _ => None,
+    }
+}
+
 // ── Sanitization ──────────────────────────────────────────────────────────────
 
 /// Sanitize a user-supplied prompt field so it cannot inject prompt-breaking
@@ -697,7 +726,10 @@ pub fn render_jinja_template(
     ctx.insert("has_home_devices", &has_home);
     ctx.insert("online_device_names", online_names);
     ctx.insert("voice_mode", &state.map(|s| s.voice_mode).unwrap_or(false));
-    ctx.insert("canvas_mode", &state.map(|s| s.canvas_mode).unwrap_or(false));
+    ctx.insert(
+        "canvas_mode",
+        &state.map(|s| s.canvas_mode).unwrap_or(false),
+    );
 
     // Available tools — rendered into the prompt so the model knows its capabilities
     let tools: Vec<String> = state.map(|s| s.available_tools.clone()).unwrap_or_default();
@@ -1274,5 +1306,42 @@ mod tests {
         let state = PromptState::default(); // thinking_enabled = false
         let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
         assert!(!result.contains("<thinking>"));
+    }
+
+    // ── builtin_template_content ─────────────────────────────────────────
+
+    #[test]
+    fn builtin_template_content_returns_all_four() {
+        for name in &["balanced", "concise", "technical", "warm"] {
+            let result = builtin_template_content(name);
+            assert!(result.is_some(), "should return content for '{name}'");
+            let (content, desc) = result.unwrap();
+            assert!(
+                !content.is_empty(),
+                "content for '{name}' should not be empty"
+            );
+            assert!(
+                !desc.is_empty(),
+                "description for '{name}' should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_template_content_returns_none_for_unknown() {
+        assert!(builtin_template_content("custom_user_prompt").is_none());
+        assert!(builtin_template_content("").is_none());
+    }
+
+    #[test]
+    fn builtin_template_content_matches_constants() {
+        let (content, _) = builtin_template_content("balanced").unwrap();
+        assert_eq!(content, PROMPT_BALANCED);
+        let (content, _) = builtin_template_content("concise").unwrap();
+        assert_eq!(content, PROMPT_CONCISE);
+        let (content, _) = builtin_template_content("technical").unwrap();
+        assert_eq!(content, PROMPT_TECHNICAL);
+        let (content, _) = builtin_template_content("warm").unwrap();
+        assert_eq!(content, PROMPT_WARM);
     }
 }

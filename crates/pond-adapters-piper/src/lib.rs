@@ -28,6 +28,44 @@ use pond_core::ports::voice_output::VoiceOutput;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+// ── Quips ─────────────────────────────────────────────────────────────────────
+
+/// Short reassurance phrases spoken while the LLM starts inference.
+/// Aim for 1-2 seconds of synthesised audio each.
+const QUIPS: &[&str] = &[
+    "On it.",
+    "Let me think.",
+    "Ruffling through possibilities.",
+    "Consulting the pond elders.",
+    "Wading into the knowledge pool.",
+    "Hatching a response.",
+    "Paddling upstream.",
+    "Assembling ideas, feather by feather.",
+    "Skimming the surface.",
+    "One moment.",
+    "Let me check.",
+    "Thinking that through.",
+];
+
+/// Pick a quip using sub-millisecond time as a cheap source of variety.
+fn pick_quip() -> &'static str {
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % QUIPS.len();
+    QUIPS[idx]
+}
+
+// ── Barge-in constants ────────────────────────────────────────────────────────
+
+/// RMS energy threshold for speech detection during barge-in monitoring.
+/// Samples above this trigger an interrupt. Tuned for typical desktop mics.
+const BARGE_IN_RMS_THRESHOLD: f32 = 0.02;
+
+/// Duration in milliseconds of each audio analysis chunk for barge-in.
+const BARGE_IN_CHUNK_MS: u64 = 100;
+
 // ── PiperOutput ───────────────────────────────────────────────────────────────
 
 /// VoiceOutput adapter that synthesises speech via the Piper TTS subprocess.
@@ -45,6 +83,8 @@ pub struct PiperOutput {
     /// Speech interrupt flag — set to true to immediately stop TTS playback.
     /// Checked by `play_wav_interruptible()` every 50ms during playback.
     speech_interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Barge-in listener active flag — shared with the mic monitoring thread.
+    barge_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PiperOutput {
@@ -60,6 +100,7 @@ impl PiperOutput {
             espeak_data: None,
             thinking_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             speech_interrupted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            barge_in_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -151,6 +192,117 @@ impl VoiceOutput for PiperOutput {
     fn stop_speaking(&self) {
         self.speech_interrupted
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn start_barge_in_listener(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Don't spawn a second listener if one is already active
+        if self.barge_in_active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let active_flag = self.barge_in_active.clone();
+        let interrupt_flag = self.speech_interrupted.clone();
+
+        std::thread::spawn(move || {
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+            let host = cpal::default_host();
+            let device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    tracing::debug!("Barge-in: no input device found");
+                    active_flag.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            // Use the device's default input config
+            let config = match device.default_input_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!("Barge-in: no input config: {e}");
+                    active_flag.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let sample_rate = config.sample_rate().0;
+            let channels = config.channels() as usize;
+            // Number of samples per analysis window
+            let chunk_samples = (sample_rate as u64 * BARGE_IN_CHUNK_MS / 1000) as usize * channels;
+
+            let rms_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(chunk_samples)));
+            let rms_buf_write = rms_buf.clone();
+            let active_for_callback = active_flag.clone();
+            let interrupt_for_callback = interrupt_flag.clone();
+
+            let stream_config: cpal::StreamConfig = config.into();
+
+            let stream = device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !active_for_callback.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut buf = rms_buf_write.lock().unwrap();
+                    buf.extend_from_slice(data);
+
+                    if buf.len() >= chunk_samples {
+                        // Compute RMS of the accumulated chunk
+                        let sum_sq: f32 = buf.iter().map(|s| s * s).sum();
+                        let rms = (sum_sq / buf.len() as f32).sqrt();
+                        buf.clear();
+
+                        if rms > BARGE_IN_RMS_THRESHOLD {
+                            tracing::debug!("Barge-in: speech detected (RMS={rms:.4})");
+                            interrupt_for_callback.store(true, Ordering::SeqCst);
+                            active_for_callback.store(false, Ordering::SeqCst);
+                        }
+                    }
+                },
+                move |err| {
+                    tracing::debug!("Barge-in stream error: {err}");
+                },
+                None,
+            );
+
+            let stream = match stream {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("Barge-in: failed to build input stream: {e}");
+                    active_flag.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            if let Err(e) = stream.play() {
+                tracing::debug!("Barge-in: failed to start stream: {e}");
+                active_flag.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            // Keep the stream alive while the listener is active
+            while active_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Stream is dropped here, releasing the mic
+        });
+    }
+
+    fn stop_barge_in_listener(&self) {
+        self.barge_in_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn speak_quip(&self) -> Option<&'static str> {
+        let quip = pick_quip();
+        if let Err(e) = self.speak(quip).await {
+            tracing::debug!("Quip TTS failed: {e}");
+            return None;
+        }
+        Some(quip)
     }
 
     async fn speak(&self, text: &str) -> Result<()> {
