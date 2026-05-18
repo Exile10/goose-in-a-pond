@@ -397,23 +397,34 @@ fn generation_task(
         }
     }
 
-    // ── Generation loop ──────────────────────────────────────────────────
+    // ── Generation loop with streaming parser (matches Goose's approach) ──
+    //
+    // Uses llama-cpp-2's ChatParseStateOaicompat to parse tool calls from the
+    // model's native format (e.g. Gemma 4's <|tool_call>call:NAME{...}<tool_call|>).
+    // This is the SAME parser Goose uses — it handles all the native escape
+    // formats correctly, including <|"|> string delimiters.
 
     let mut sampler = build_sampler(options.temperature);
 
-    // NOTE: Grammar constraints from the chat template are intentionally
-    // NOT applied to the sampler. The lazy grammar sampler in llama-cpp-2
-    // v0.1.143 crashes with `GGML_ASSERT(!stacks.empty())` when Gemma 4's
-    // complex GBNF grammar is used. Gemma 4 is fine-tuned for tool calling
-    // and produces structured `<tool_call>` markup from the Jinja template
-    // formatting alone. The grammar constraint can be re-enabled once the
-    // llama-cpp-2 grammar sampler is stable for this model family.
-    if template_result.grammar.is_some() {
-        tracing::debug!(
-            grammar_lazy = template_result.grammar_lazy,
-            triggers = template_result.grammar_triggers.len(),
-            "grammar available from template (not applied — relying on model fine-tuning)"
-        );
+    // Initialize the streaming parser from the template result.
+    // This understands the model's chat format and extracts structured deltas
+    // (content, reasoning_content, tool_calls) from raw token output.
+    let mut stream_parser = match template_result.streaming_state_oaicompat() {
+        Ok(parser) => {
+            tracing::debug!("streaming parser initialized (same as Goose's native tool call parser)");
+            Some(parser)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to init streaming parser — falling back to manual parsing");
+            None
+        }
+    };
+
+    // Feed the generation prompt to the parser so it knows the context.
+    if let Some(ref mut parser) = stream_parser {
+        if !template_result.generation_prompt.is_empty() {
+            let _ = parser.update(&template_result.generation_prompt, true);
+        }
     }
 
     let max_output = if let Some(max) = options.max_tokens {
@@ -426,8 +437,8 @@ fn generation_task(
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut generated_text = String::new();
-    let mut streamed_len: usize = 0;
     let mut output_token_count: u32 = 0;
+    let mut accumulated_tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
 
     for _ in 0..max_output {
         let token = sampler.sample(&ctx, -1);
@@ -453,19 +464,56 @@ fn generation_task(
         if !piece.is_empty() {
             generated_text.push_str(&piece);
 
-            // Stream text up to the safe boundary (hold back potential tool calls).
-            let stream_up_to = tool_calling::safe_stream_end(&generated_text);
-            if stream_up_to > streamed_len {
-                #[allow(clippy::string_slice)]
-                let new_text = &generated_text[streamed_len..stream_up_to];
-                if !new_text.is_empty()
-                    && tx
-                        .blocking_send(Ok(ChatEvent::Text(new_text.to_string())))
-                        .is_err()
-                {
-                    break; // Receiver dropped.
+            if let Some(ref mut parser) = stream_parser {
+                // Feed token to the streaming parser (same as Goose).
+                match parser.update(&piece, true) {
+                    Ok(deltas) => {
+                        for delta_json in deltas {
+                            if let Ok(delta) = serde_json::from_str::<serde_json::Value>(&delta_json) {
+                                // Stream text content
+                                if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                    if !content.is_empty() {
+                                        let _ = tx.blocking_send(Ok(ChatEvent::Text(content.to_string())));
+                                    }
+                                }
+                                // Accumulate tool calls
+                                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                    for tc in tool_calls {
+                                        let id = tc.get("id").and_then(|v| v.as_str())
+                                            .unwrap_or("").to_string();
+                                        let name = tc.get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("").to_string();
+                                        let args_str = tc.get("function")
+                                            .and_then(|f| f.get("arguments"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("{}");
+                                        let args: serde_json::Value =
+                                            serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                                        if !name.is_empty() {
+                                            accumulated_tool_calls.push((id, name, args));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "streaming parser error");
+                    }
                 }
-                streamed_len = stream_up_to;
+            } else {
+                // Fallback: stream text with safe boundary (old approach).
+                let stream_up_to = tool_calling::safe_stream_end(&generated_text);
+                let streamed_so_far = generated_text.len() - piece.len();
+                if stream_up_to > streamed_so_far {
+                    #[allow(clippy::string_slice)]
+                    let new_text = &generated_text[streamed_so_far..stream_up_to];
+                    if !new_text.is_empty() {
+                        let _ = tx.blocking_send(Ok(ChatEvent::Text(new_text.to_string())));
+                    }
+                }
             }
 
             // Check additional stop sequences from the template.
@@ -492,14 +540,13 @@ fn generation_task(
         }
     }
 
-    // ── Post-generation: stream remaining content and parse tool calls ───
+    // ── Finalize: flush parser and emit tool calls ──────────────────────
 
     tracing::debug!(
         generated_len = generated_text.len(),
         output_tokens = output_token_count,
-        "generation complete, parsing tool calls"
+        "generation complete"
     );
-    // Log the raw output for tool call debugging.
     let output_preview = if generated_text.len() > 300 {
         &generated_text[..300]
     } else {
@@ -507,34 +554,65 @@ fn generation_task(
     };
     tracing::debug!(output = %output_preview, "raw model output (first 300 chars)");
 
-    let tool_calls = tool_calling::parse_tool_calls(&generated_text);
-
-    if !tool_calls.is_empty() {
-        // Stream any remaining content before the tool calls.
-        let content = tool_calling::extract_content(&generated_text);
-        if content.len() > streamed_len {
-            #[allow(clippy::string_slice)]
-            let remaining = &content[streamed_len..];
-            if !remaining.is_empty() {
-                let _ = tx.blocking_send(Ok(ChatEvent::Text(remaining.to_string())));
+    if let Some(ref mut parser) = stream_parser {
+        // Finalize with is_partial=false to flush any remaining deltas.
+        if let Ok(final_deltas) = parser.update("", false) {
+            for delta_json in final_deltas {
+                if let Ok(delta) = serde_json::from_str::<serde_json::Value>(&delta_json) {
+                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                        if !content.is_empty() {
+                            let _ = tx.blocking_send(Ok(ChatEvent::Text(content.to_string())));
+                        }
+                    }
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tool_calls {
+                            let id = tc.get("id").and_then(|v| v.as_str())
+                                .unwrap_or("").to_string();
+                            let name = tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("").to_string();
+                            let args_str = tc.get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            let args: serde_json::Value =
+                                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                            if !name.is_empty() {
+                                accumulated_tool_calls.push((id, name, args));
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Emit tool call events.
-        for tc in tool_calls {
-            let _ = tx.blocking_send(Ok(ChatEvent::ToolCall {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: tc.name,
-                arguments: tc.arguments,
-            }));
+        // Emit accumulated tool calls.
+        if !accumulated_tool_calls.is_empty() {
+            tracing::debug!(count = accumulated_tool_calls.len(), "tool calls parsed by streaming parser");
+            for (id, name, args) in accumulated_tool_calls {
+                let call_id = if id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    id
+                };
+                let _ = tx.blocking_send(Ok(ChatEvent::ToolCall {
+                    id: call_id,
+                    name,
+                    arguments: args,
+                }));
+            }
         }
     } else {
-        // No tool calls -- stream any remaining text.
-        if generated_text.len() > streamed_len {
-            #[allow(clippy::string_slice)]
-            let remaining = &generated_text[streamed_len..];
-            if !remaining.is_empty() {
-                let _ = tx.blocking_send(Ok(ChatEvent::Text(remaining.to_string())));
+        // Fallback: manual parsing (for models without streaming parser support).
+        let tool_calls = tool_calling::parse_tool_calls(&generated_text);
+        if !tool_calls.is_empty() {
+            for tc in tool_calls {
+                let _ = tx.blocking_send(Ok(ChatEvent::ToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: tc.name,
+                    arguments: tc.arguments,
+                }));
             }
         }
     }
