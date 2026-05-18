@@ -2,10 +2,11 @@ import { useState, useEffect } from "react";
 import { Card, CardContent, Button, Input, Switch } from "@heroui/react";
 import { Plus, Trash2, Sparkles, Check } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
+import { PageHeader, useConfirm } from "../components/shared";
 import type { UserSkill } from "../api/types";
 
 export function Skills() {
+  const confirm = useConfirm();
   const [skills, setSkills] = useState<UserSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
@@ -47,7 +48,7 @@ export function Skills() {
   }
 
   async function remove(id: string, skillName: string) {
-    if (!confirm(`Delete skill "${skillName}"? This cannot be undone.`)) return;
+    if (!await confirm(`Delete skill "${skillName}"? This cannot be undone.`, { title: "Delete Skill", confirmLabel: "Delete", destructive: true })) return;
     try {
       await api.removeSkill(id);
       load();
