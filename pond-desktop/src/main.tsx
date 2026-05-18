@@ -7,6 +7,7 @@ import "./styles/sections.css";
 
 import { StartupScreen } from "./components/StartupScreen";
 import { AppContextProvider } from "./state/AppContext";
+import { ConfirmProvider } from "./components/shared";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { App } from "./App";
 
@@ -23,9 +24,11 @@ function Root() {
   // and no way out except force-quitting.
   return (
     <ErrorBoundary>
-      <AppContextProvider>
-        <App />
-      </AppContextProvider>
+      <ConfirmProvider>
+        <AppContextProvider>
+          <App />
+        </AppContextProvider>
+      </ConfirmProvider>
     </ErrorBoundary>
   );
 }

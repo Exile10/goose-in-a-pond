@@ -24,7 +24,7 @@ import {
   Brain,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
+import { PageHeader, useConfirm } from "../components/shared";
 import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
 
 // ── Segment metadata ──────────────────────────────────────────
@@ -1031,6 +1031,7 @@ function MemorySettingsCard({ settings, onToggle }: {
 // ── Main Memory component ─────────────────────────────────────
 
 export function Memory() {
+  const confirm = useConfirm();
   const [items, setItems]           = useState<MemoryFragment[]>([]);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -1107,7 +1108,7 @@ export function Memory() {
   }
 
   async function handleDelete(id: string) {
-    if (!confirm("Delete this memory? This cannot be undone.")) return;
+    if (!await confirm("Delete this memory? This cannot be undone.", { title: "Delete Memory", confirmLabel: "Delete", destructive: true })) return;
     try {
       await api.deleteMemory(id);
       setItems((prev) => prev.filter((m) => m.id !== id));
@@ -1151,7 +1152,7 @@ export function Memory() {
   async function handleDeleteAll() {
     const count = visibleItems.length;
     if (!count) return;
-    if (!confirm(`Delete all ${count} memories? This cannot be undone.`)) return;
+    if (!await confirm(`Delete all ${count} memories? This cannot be undone.`, { title: "Delete All Memories", confirmLabel: "Delete All", destructive: true })) return;
     const errs: string[] = [];
     for (const m of visibleItems) {
       try { await api.deleteMemory(m.id); }

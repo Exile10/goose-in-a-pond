@@ -534,3 +534,61 @@ input[type="range"]::-moz-range-track {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
+
+/* ── Confirm Dialog ───────────────────────────────────────────── */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 9999;
+  background: rgba(0, 0, 0, 0.35);
+  display: grid; place-items: center;
+  animation: fadeIn var(--dur-fast) ease;
+}
+.confirm-dialog {
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-6);
+  width: min(380px, calc(100vw - 40px));
+  animation: fadeIn var(--dur-fast) ease;
+}
+.confirm-dialog__header {
+  display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3);
+}
+.confirm-dialog__icon {
+  width: 36px; height: 36px; border-radius: var(--radius-md);
+  display: grid; place-items: center; flex-shrink: 0;
+  background: var(--color-warning-soft); color: var(--color-warning);
+}
+.confirm-dialog__icon--destructive {
+  background: var(--color-destructive-soft); color: var(--color-destructive);
+}
+.confirm-dialog__title {
+  font-family: var(--font-heading); font-size: var(--text-md);
+  font-weight: var(--weight-semibold); margin: 0;
+}
+.confirm-dialog__message {
+  font-size: var(--text-base); color: var(--color-text-secondary);
+  line-height: var(--leading-base); margin: 0 0 var(--space-6);
+}
+.confirm-dialog__actions {
+  display: flex; justify-content: flex-end; gap: var(--space-2);
+}
+.confirm-dialog__btn {
+  font-family: var(--font-body); font-size: var(--text-sm); font-weight: var(--weight-medium);
+  padding: var(--space-2) var(--space-4); border-radius: var(--radius-md);
+  border: 1px solid var(--grey-200); cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.confirm-dialog__btn--cancel {
+  background: var(--color-surface); color: var(--color-text);
+}
+.confirm-dialog__btn--cancel:hover { background: var(--grey-50); }
+.confirm-dialog__btn--confirm {
+  background: var(--color-accent); color: var(--color-text-on-accent);
+  border-color: var(--color-accent);
+}
+.confirm-dialog__btn--confirm:hover { background: var(--color-accent-hover); }
+.confirm-dialog__btn--destructive {
+  background: var(--color-destructive); color: var(--color-text-on-accent);
+  border-color: var(--color-destructive);
+}
+.confirm-dialog__btn--destructive:hover { background: #e0342b; }

@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
+import { useConfirm } from "../components/shared";
 import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement } from "../api/types";
 
 /** Open a URL in the system browser. Uses Tauri shell plugin when available, falls back to window.open. */
@@ -1028,6 +1029,7 @@ interface SecretEditState {
 
 export function Extensions() {
   const state = useAppState();
+  const confirm = useConfirm();
   const [activeTab, setActiveTab] = useState<Tab>("installed");
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1076,7 +1078,7 @@ export function Extensions() {
   }
 
   async function handleDelete(name: string) {
-    if (!confirm(`Delete extension "${name}"? This cannot be undone.`)) return;
+    if (!await confirm(`Delete extension "${name}"? This cannot be undone.`, { title: "Delete Extension", confirmLabel: "Delete", destructive: true })) return;
     try {
       await api.removeExtension(name);
       setExtensions((prev) => prev.filter((e) => e.name !== name));
