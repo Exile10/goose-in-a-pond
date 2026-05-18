@@ -27,6 +27,11 @@ pub struct ModelCapabilities {
 
     /// Supports constrained/structured output (GBNF grammar, JSON mode).
     pub structured_output: bool,
+
+    /// Model supports native tool calling (e.g. Gemma 4 `<|tool_call>` format).
+    /// When true, tool definitions are passed via the chat template.
+    /// When false, tools are described in the system prompt text.
+    pub tool_calling: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -37,6 +42,7 @@ impl Default for ModelCapabilities {
             audio_input: false,
             context_window_tokens: 4096,
             structured_output: false,
+            tool_calling: false,
         }
     }
 }
@@ -51,16 +57,20 @@ impl ModelCapabilities {
         let mut caps = Self::default();
 
         // Thinking-capable model families
-        if lower.contains("gemma-4") || lower.contains("gemma4")
+        if lower.contains("gemma-4")
+            || lower.contains("gemma4")
             || lower.contains("gemma_4")
-            || lower.contains("qwen3") || lower.contains("qwq")
-            || lower.contains("deepseek-r1") || lower.contains("deepseek_r1")
+            || lower.contains("qwen3")
+            || lower.contains("qwq")
+            || lower.contains("deepseek-r1")
+            || lower.contains("deepseek_r1")
         {
             caps.thinking = true;
         }
 
         // Vision-capable model families
-        if lower.contains("gemma-4") || lower.contains("gemma4")
+        if lower.contains("gemma-4")
+            || lower.contains("gemma4")
             || lower.contains("gemma_4")
             || lower.contains("llava")
             || lower.contains("bakllava")
@@ -93,10 +103,23 @@ impl ModelCapabilities {
         }
 
         // Structured output — all local GGUF models support GBNF via llama.cpp
-        if lower.contains(".gguf") || lower.contains("q4_k") || lower.contains("q5_k")
-            || lower.contains("q8_0") || lower.contains("q6_k")
+        if lower.contains(".gguf")
+            || lower.contains("q4_k")
+            || lower.contains("q5_k")
+            || lower.contains("q8_0")
+            || lower.contains("q6_k")
         {
             caps.structured_output = true;
+        }
+
+        // Native tool calling — Gemma 4 uses <|tool_call> format via Jinja template
+        if lower.contains("gemma-4")
+            || lower.contains("gemma4")
+            || lower.contains("gemma_4")
+            || lower.contains("qwen3")
+            || lower.contains("mistral")
+        {
+            caps.tool_calling = true;
         }
 
         caps
@@ -115,6 +138,7 @@ mod tests {
         assert!(!caps.audio_input);
         assert_eq!(caps.context_window_tokens, 4096);
         assert!(!caps.structured_output);
+        assert!(!caps.tool_calling);
     }
 
     #[test]

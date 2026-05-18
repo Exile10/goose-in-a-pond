@@ -8,8 +8,15 @@ import { AudioWaves } from "../components/AudioWaves";
 import { TranscriptFeed } from "../components/TranscriptFeed";
 import { resolveVoiceDecision } from "../voiceSummon";
 import { api } from "../api/PondApiClient";
+import { useWebVoice } from "./useWebVoice";
 
 import { ORB_STATE_COLORS as STATE_COLORS } from "../lib/colors";
+
+/** True when running inside a Tauri native window. Evaluated lazily so
+ *  test harnesses that inject `__TAURI_INTERNALS__` in beforeEach work. */
+function checkIsTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
 
 const STATE_LABELS: Record<string, string> = {
   idle:      "Ready",
@@ -61,6 +68,17 @@ export function VoiceMode() {
   // Live audio level for waveform (useState so canvas re-renders with level)
   const [audioLevel, setAudioLevel] = useState(0);
   const audioLevelRef = useRef(0);
+
+  // Browser voice pipeline hook -- only active when NOT in Tauri.
+  // When isTauri is true the hook returns stubs (never called).
+  const webVoice = useWebVoice(
+    dispatch,
+    state,
+    checkIsTauri() ? undefined : (level: number) => {
+      audioLevelRef.current = level;
+      setAudioLevel(level);
+    },
+  );
   const voiceHandledRef = useRef(0);
   const voiceStateRef = useRef(state.voiceState);
   voiceStateRef.current = state.voiceState; // always points at latest render
@@ -104,8 +122,7 @@ export function VoiceMode() {
 
   // Hide canvas overlay
   useEffect(() => {
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (isTauri) invoke("hide_canvas").catch(() => undefined);
+    if (checkIsTauri()) invoke("hide_canvas").catch(() => undefined);
   }, []);
 
   // Load max recording duration from settings
@@ -118,10 +135,10 @@ export function VoiceMode() {
       .catch(() => undefined);
   }, []);
 
-  // Track audio levels + silence detection (Tauri only)
+  // Track audio levels + silence detection (Tauri only — browser levels
+  // are handled by useWebVoice's onAudioLevel callback).
   useEffect(() => {
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!isTauri) return;
+    if (!checkIsTauri()) return;
     let unlisten: (() => void) | null = null;
     listen<number>("audio-level", (e) => {
       const level = e.payload;
@@ -163,9 +180,9 @@ export function VoiceMode() {
   // ── Dismissal handler ──────────────────────────────────────────
   // When the Rust pipeline detects "bye", "dismissed", etc. it speaks a
   // farewell and emits `voice-dismissed`.  Reset to wake word mode here.
+  // (Tauri only — the browser pipeline handles dismissal in useWebVoice.)
   useEffect(() => {
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!isTauri) return;
+    if (!checkIsTauri()) return;
     let unlisten: (() => void) | null = null;
     listen<boolean>("voice-dismissed", async (e) => {
       const isExit = e.payload; // true = hard exit, false = soft dismissal
@@ -197,7 +214,6 @@ export function VoiceMode() {
   useEffect(() => {
     let wakeUnlisten: (() => void) | null = null;
     let unmounted = false; // guard against leaked async listeners
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
     api.getSettings()
       .then(async (s) => {
@@ -221,61 +237,78 @@ export function VoiceMode() {
           : [];
 
         dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
-        if (isTauri) {
-          try {
-            await invoke("start_wake_listener", {
-              wakeWord: wakeWord.trim(),
-              variants: variants.length > 0 ? variants : null,
-            });
-          } catch (e) {
-            if (unmounted) return;
-            const msg = String(e);
-            const isMicDenied =
-              msg.toLowerCase().includes("permission") ||
-              msg.toLowerCase().includes("access") ||
-              msg.toLowerCase().includes("device") ||
-              msg.toLowerCase().includes("denied");
 
-            dispatch({
-              type: "SET_VOICE_ERROR",
-              payload: isMicDenied
-                ? "Microphone access denied. Go to System Settings → Privacy → Microphone and allow this app."
-                : `Wake listener failed: ${msg}`,
-            });
-            dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+        if (!checkIsTauri()) {
+          // Browser path — start web-based wake word listener.
+          // Uses VAD-gated periodic transcription (less efficient than Tauri's
+          // always-on detector, but functional for remote browser access).
+          webVoice.startWakeListener(wakeWord.trim(), variants);
+          return;
+        }
+
+        // Tauri path — native IPC wake listener
+        try {
+          await invoke("start_wake_listener", {
+            wakeWord: wakeWord.trim(),
+            variants: variants.length > 0 ? variants : null,
+          });
+        } catch (e) {
+          if (unmounted) return;
+          const msg = String(e);
+          const isMicDenied =
+            msg.toLowerCase().includes("permission") ||
+            msg.toLowerCase().includes("access") ||
+            msg.toLowerCase().includes("device") ||
+            msg.toLowerCase().includes("denied");
+
+          dispatch({
+            type: "SET_VOICE_ERROR",
+            payload: isMicDenied
+              ? "Microphone access denied. Go to System Settings → Privacy → Microphone and allow this app."
+              : `Wake listener failed: ${msg}`,
+          });
+          dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+          return;
+        }
+
+        // One-breath flow: the Rust wake listener captures audio (wake word +
+        // any following command) and passes WAV bytes in the event payload.
+        // The wake listener is always-on — it does NOT stop on detection.
+        const unsub = await listen<number[]>("wake-word-detected", (e) => {
+          if (unmounted) {
+            unsub();
             return;
           }
 
-          // One-breath flow: the Rust wake listener captures audio (wake word +
-          // any following command) and passes WAV bytes in the event payload.
-          const unsub = await listen<number[]>("wake-word-detected", (e) => {
-            // Guard: if component unmounted while listen() was resolving,
-            // the listener leaked — clean it up and do nothing.
-            if (unmounted) {
-              unsub();
-              return;
-            }
+          // Don't stop the wake listener — it keeps running for barge-in.
+          invoke("play_ping").catch(() => undefined);
 
-            invoke("stop_wake_listener").catch(() => undefined);
-            // Audible confirmation so the user knows they were heard
-            invoke("play_ping").catch(() => undefined);
-
-            const wavBytes = e.payload;
-            if (wavBytes && Array.isArray(wavBytes) && wavBytes.length > 100) {
-              // One-breath: audio already captured — send to pipeline
-              handleWakeAudioRef.current(wavBytes);
-            } else {
-              // No captured audio — start fresh recording
-              startRecordingRef.current();
-            }
-          });
-
-          // If cleanup ran while listen() was pending, immediately unsubscribe
-          if (unmounted) {
-            unsub();
+          const wavBytes = e.payload;
+          if (wavBytes && Array.isArray(wavBytes) && wavBytes.length > 100) {
+            handleWakeAudioRef.current(wavBytes);
           } else {
-            wakeUnlisten = unsub;
+            startRecordingRef.current();
           }
+        });
+
+        // Barge-in: wake word detected while pipeline is active (thinking/speaking).
+        // TTS is already being killed by the kill switch — just update UI state.
+        const unsubInterrupt = await listen("wake-word-interrupt", () => {
+          if (unmounted) {
+            unsubInterrupt();
+            return;
+          }
+          // The pipeline's kill switch stops TTS; the pipeline will end
+          // naturally, emitting tts-end → voiceState goes idle →
+          // conversational turn-taking starts the next recording.
+          console.debug("Wake word barge-in — TTS interrupted");
+        });
+
+        if (unmounted) {
+          unsub();
+          unsubInterrupt();
+        } else {
+          wakeUnlisten = () => { unsub(); unsubInterrupt(); };
         }
       })
       .catch(() => undefined);
@@ -283,8 +316,10 @@ export function VoiceMode() {
     return () => {
       unmounted = true;
       wakeUnlisten?.();
-      if (isTauri) {
+      if (checkIsTauri()) {
         invoke("stop_wake_listener").catch(() => undefined);
+      } else {
+        webVoice.stopWakeListener();
       }
       dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
     };
@@ -314,29 +349,15 @@ export function VoiceMode() {
       noSpeechTimerRef.current = setTimeout(() => {
         if (!hasSpeechRef.current) {
           // User didn't respond — conversation over. Abort recording and
-          // return to "wait" (if wake word configured) or "idle".
-          // Use invoke directly since abortRecording captures stale state.
-          invoke("abort_recording").catch(() => undefined);
-          const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-          if (isTauri) {
-            api.getSettings()
-              .then(async (s) => {
-                const raw = s as Record<string, unknown>;
-                const ww = raw.voice_wake_word ?? raw.wake_word;
-                if (ww && typeof ww === "string" && ww.trim()) {
-                  const variants = Array.isArray(raw.voice_wake_word_transcriptions)
-                    ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
-                    : [];
-                  await invoke("start_wake_listener", {
-                    wakeWord: ww.trim(),
-                    variants: variants.length > 0 ? variants : null,
-                  }).catch(() => undefined);
-                  dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
-                } else {
-                  dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-                }
-              })
-              .catch(() => dispatch({ type: "SET_VOICE_STATE", payload: "idle" }));
+          // return to passive wake listening (wake listener is already running).
+          if (checkIsTauri()) {
+            invoke("abort_recording").catch(() => undefined);
+          } else {
+            webVoice.abortRecording();
+          }
+          // Wake listener is always-on — just flip UI state back to "wait".
+          if (wakeWord) {
+            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
           } else {
             dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
           }
@@ -344,26 +365,11 @@ export function VoiceMode() {
       }, NO_SPEECH_TIMEOUT_MS);
     }
 
-    // On error, go back to passive wake listening immediately
+    // On error, go back to passive wake listening immediately.
+    // Wake listener is always-on — just flip UI state.
     if (state.voiceState === "idle" && prev === "error") {
-      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      if (isTauri) {
-        api.getSettings()
-          .then(async (s) => {
-            const raw = s as Record<string, unknown>;
-            const ww = raw.voice_wake_word ?? raw.wake_word;
-            if (!ww || typeof ww !== "string" || !ww.trim()) return;
-            setWakeWord(ww.trim());
-            const variants = Array.isArray(raw.voice_wake_word_transcriptions)
-              ? (raw.voice_wake_word_transcriptions as string[]).filter((v) => typeof v === "string" && v.trim())
-              : [];
-            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
-            await invoke("start_wake_listener", {
-              wakeWord: ww.trim(),
-              variants: variants.length > 0 ? variants : null,
-            }).catch(() => undefined);
-          })
-          .catch(() => undefined);
+      if (wakeWord) {
+        dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
       }
     }
   }, [state.voiceState]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -426,6 +432,26 @@ export function VoiceMode() {
     // Opens the mic, waits for speech, records until silence, then sends.
     // No countdown timer needed — VAD handles end-of-speech automatically.
     dispatch({ type: "SET_VOICE_STATE", payload: "recording" });
+
+    if (!checkIsTauri()) {
+      // Browser path — delegate to useWebVoice
+      try {
+        const blob = await webVoice.recordWithVad();
+        if (!blob) {
+          dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+          return;
+        }
+        dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
+        await webVoice.runVoicePipeline(blob);
+      } catch (e) {
+        console.error("Web VAD recording failed:", e);
+        dispatch({ type: "SET_VOICE_ERROR", payload: String(e) });
+        dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+      }
+      return;
+    }
+
+    // Tauri path — native IPC
     try {
       const wavBytes = await invoke<number[]>("record_with_vad");
       if (!wavBytes || wavBytes.length === 0) {
@@ -448,6 +474,26 @@ export function VoiceMode() {
     // Legacy stop — used by manual "Send" button and hotkey.
     // Falls back to old start/stop if someone presses the button.
     clearTimers();
+
+    if (!checkIsTauri()) {
+      // Browser path — stop recording and run pipeline
+      try {
+        dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
+        const blob = await webVoice.stopRecording();
+        if (blob) {
+          await webVoice.runVoicePipeline(blob);
+        } else {
+          dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+        }
+      } catch (e) {
+        console.error("Web voice pipeline failed:", e);
+        dispatch({ type: "SET_VOICE_ERROR", payload: String(e) });
+        dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+      }
+      return;
+    }
+
+    // Tauri path — native IPC
     try {
       dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
       const wavBytes = await invoke<number[]>("stop_recording");
@@ -465,6 +511,23 @@ export function VoiceMode() {
   // Skips the recording phase and sends directly to the voice pipeline.
   async function handleWakeAudio(wavBytes: number[]) {
     dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
+
+    if (!checkIsTauri()) {
+      // Browser path — convert number[] to Blob and run pipeline.
+      // Pass the wake word so it's stripped from the transcript.
+      try {
+        const uint8 = new Uint8Array(wavBytes);
+        const blob = new Blob([uint8], { type: "audio/wav" });
+        await webVoice.runVoicePipeline(blob, wakeWord || undefined);
+      } catch (e) {
+        console.error("Web one-breath pipeline failed:", e);
+        dispatch({ type: "SET_VOICE_ERROR", payload: String(e) });
+        dispatch({ type: "SET_VOICE_STATE", payload: "error" });
+      }
+      return;
+    }
+
+    // Tauri path — native IPC
     try {
       const authToken = state.sessionToken ?? "";
       const sessionId = state.sessionId ?? undefined;
@@ -484,18 +547,32 @@ export function VoiceMode() {
 
   async function abortRecording() {
     clearTimers();
-    try {
-      await invoke("abort_recording");
-      // Return to "wait" if the wake listener is active, otherwise "idle"
-      const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      if (isTauri) {
+
+    if (!checkIsTauri()) {
+      // Browser path — cancel pipeline and recording
+      webVoice.abortRecording();
+      // Check if wake word is configured to return to "wait" state
+      try {
         const s = await api.getSettings().catch(() => ({}));
-        const wakeWord = (s as Record<string, unknown>).voice_wake_word;
-        if (wakeWord && typeof wakeWord === "string" && wakeWord.trim()) {
-          await invoke("start_wake_listener", { wakeWord: wakeWord.trim() }).catch(() => undefined);
+        const ww = (s as Record<string, unknown>).voice_wake_word;
+        if (ww && typeof ww === "string" && ww.trim()) {
           dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
           return;
         }
+      } catch { /* ignore */ }
+      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+      return;
+    }
+
+    // Tauri path — native IPC
+    try {
+      await invoke("abort_recording");
+      const s = await api.getSettings().catch(() => ({}));
+      const ww = (s as Record<string, unknown>).voice_wake_word;
+      if (ww && typeof ww === "string" && ww.trim()) {
+        await invoke("start_wake_listener", { wakeWord: ww.trim() }).catch(() => undefined);
+        dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+        return;
       }
       dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
     } catch { /* ignore */ }
@@ -655,8 +732,7 @@ export function VoiceMode() {
                 variant="ghost"
                 size="sm"
                 onPress={() => {
-                  const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-                  if (isTauri) {
+                  if (checkIsTauri()) {
                     invoke("open_privacy_mic").catch(() => undefined);
                   }
                 }}

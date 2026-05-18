@@ -1,0 +1,12 @@
+[package]
+name = "giap-extension-example"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace table ensures this template is a standalone project,
+# not part of any parent workspace it might be nested under.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

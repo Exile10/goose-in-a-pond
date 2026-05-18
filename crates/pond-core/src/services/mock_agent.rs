@@ -1,6 +1,6 @@
+use crate::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
 
@@ -39,7 +39,7 @@ impl Agent for MockAgent {
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Status { content: "Mock agent thinking...".to_string() });
             yield Ok(AgentStreamEvent::Text { content: response_text });
-            yield Ok(AgentStreamEvent::Done { session_id, model_role });
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None });
         };
 
         Ok(stream.boxed())
@@ -58,6 +58,8 @@ mod tests {
             session_id: "test-session".to_string(),
             model_role: "chat".to_string(),
             images: Vec::new(),
+            voice_mode: false,
+            canvas_mode: false,
         };
         let response = agent.chat(request).await.unwrap();
         assert_eq!(response.text, "Echo: Hello, Pond!");
@@ -72,6 +74,8 @@ mod tests {
             session_id: "test-session".to_string(),
             model_role: "chat".to_string(),
             images: Vec::new(),
+            voice_mode: false,
+            canvas_mode: false,
         };
         let mut stream = agent.chat_stream(request).await.unwrap();
 

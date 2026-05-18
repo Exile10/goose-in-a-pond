@@ -13,9 +13,20 @@ pub struct ExtensionInfo {
     /// Disabled extensions are not loaded into Goose agent sessions.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Extension connection status: "connected", "error", or "loading"
+    #[serde(default = "default_status")]
+    pub status: String,
+    /// Last error message if status is "error"
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
-fn default_enabled() -> bool { true }
+fn default_enabled() -> bool {
+    true
+}
+fn default_status() -> String {
+    "connected".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddExtensionRequest {

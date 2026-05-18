@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use goose::agents::{Agent as GooseAgent, ExtensionConfig};
 use goose::agents::extension::Envs;
+use goose::agents::{Agent as GooseAgent, ExtensionConfig};
 use pond_core::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
 };
@@ -17,6 +17,8 @@ pub struct GiapGooseExtensionManager {
     disabled: Arc<RwLock<HashSet<String>>>,
     /// Stored configurations for re-enabling extensions.
     extension_configs: Arc<RwLock<HashMap<String, ExtensionConfig>>>,
+    /// Tracks last error per extension name.
+    errors: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl GiapGooseExtensionManager {
@@ -26,6 +28,7 @@ impl GiapGooseExtensionManager {
             session_id,
             disabled: Arc::new(RwLock::new(HashSet::new())),
             extension_configs: Arc::new(RwLock::new(HashMap::new())),
+            errors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -33,7 +36,6 @@ impl GiapGooseExtensionManager {
         self.extension_configs.write().await.insert(name, config);
     }
 }
-
 
 #[async_trait]
 impl ExtensionManagerPort for GiapGooseExtensionManager {
@@ -61,19 +63,70 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
         }
 
         let disabled = self.disabled.read().await;
+        let errors = self.errors.read().await;
+
         Ok(ext_map
             .into_iter()
-            .map(|(name, tools)| ExtensionInfo {
-                kind: "builtin".to_string(),
-                description: String::new(),
-                enabled: !disabled.contains(&name),
-                name,
-                tools,
+            .map(|(name, tools)| {
+                let (status, last_error) = if let Some(err) = errors.get(&name) {
+                    ("error".to_string(), Some(err.clone()))
+                } else if tools.is_empty() {
+                    ("loading".to_string(), None)
+                } else {
+                    ("connected".to_string(), None)
+                };
+                ExtensionInfo {
+                    kind: "builtin".to_string(),
+                    description: String::new(),
+                    enabled: !disabled.contains(&name),
+                    name,
+                    tools,
+                    status,
+                    last_error,
+                }
             })
             .collect())
     }
 
     async fn add_extension(&self, request: AddExtensionRequest) -> Result<ExtensionInfo> {
+        // --- Phase 1.5: Pre-add validation ---
+
+        // Stdio: check that the command exists in PATH
+        if request.kind == "stdio" {
+            if let Some(cmd) = &request.command {
+                let which_check = std::process::Command::new("which")
+                    .arg(cmd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                match which_check {
+                    Ok(output) if output.status.success() => {} // found in PATH
+                    _ => {
+                        return Err(anyhow!(
+                            "Command '{}' not found in PATH. Install it first.",
+                            cmd
+                        ))
+                    }
+                }
+            }
+        }
+
+        // HTTP: attempt a lightweight connectivity check with a timeout
+        if matches!(request.kind.as_str(), "http" | "streamable_http") {
+            if let Some(uri) = &request.uri {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
+                match client.get(uri).send().await {
+                    Ok(_) => {} // reachable
+                    Err(e) => return Err(anyhow!("Cannot reach MCP server at {}: {}", uri, e)),
+                }
+            }
+        }
+
+        // --- Build Goose ExtensionConfig ---
+
         let config = match request.kind.as_str() {
             "builtin" => ExtensionConfig::Builtin {
                 name: request.name.clone(),
@@ -86,6 +139,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             "stdio" => {
                 let cmd = request
                     .command
+                    .clone()
                     .ok_or_else(|| anyhow!("stdio extension requires 'command'"))?;
                 let mut env_map = std::collections::HashMap::new();
                 for (k, v) in &request.env {
@@ -95,7 +149,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     name: request.name.clone(),
                     description: request.description.clone(),
                     cmd,
-                    args: request.args,
+                    args: request.args.clone(),
                     envs: Envs::new(env_map),
                     env_keys: vec![],
                     timeout: None,
@@ -106,11 +160,13 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             "http" | "streamable_http" => {
                 let uri = request
                     .uri
+                    .clone()
                     .ok_or_else(|| anyhow!("http extension requires 'uri'"))?;
                 ExtensionConfig::StreamableHttp {
                     name: request.name.clone(),
                     description: request.description.clone(),
                     uri,
+                    socket: None,
                     envs: Envs::default(),
                     env_keys: vec![],
                     headers: std::collections::HashMap::new(),
@@ -128,23 +184,63 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             .await
             .insert(request.name.clone(), config.clone());
 
-        self.agent
-            .add_extension(config, &self.session_id)
-            .await
-            .map_err(|e| anyhow!("Failed to add extension: {}", e))?;
+        // --- Add to Goose agent ---
+
+        match self.agent.add_extension(config, &self.session_id).await {
+            Ok(()) => {
+                // Clear any previous error for this extension
+                self.errors.write().await.remove(&request.name);
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to add extension: {}", e);
+                self.errors
+                    .write()
+                    .await
+                    .insert(request.name.clone(), error_msg.clone());
+                return Err(anyhow!(error_msg));
+            }
+        }
+
+        // --- Phase 1.4: Poll for tools after add ---
+
+        let mut discovered_tools = vec![];
+        let prefix = format!("{}__", request.name);
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let all_tools = self.agent.list_tools(&self.session_id, None).await;
+            discovered_tools = all_tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t.name.as_ref();
+                    name.strip_prefix(&prefix).map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>();
+            if !discovered_tools.is_empty() {
+                break;
+            }
+        }
+
+        let status = if discovered_tools.is_empty() {
+            "loading".to_string()
+        } else {
+            "connected".to_string()
+        };
 
         Ok(ExtensionInfo {
             name: request.name,
             kind: request.kind,
             description: request.description,
-            tools: vec![],
+            tools: discovered_tools,
             enabled: true,
+            status,
+            last_error: None,
         })
     }
 
     async fn remove_extension(&self, name: &str) -> Result<()> {
         self.extension_configs.write().await.remove(name);
         self.disabled.write().await.remove(name);
+        self.errors.write().await.remove(name);
         self.agent
             .remove_extension(name, &self.session_id)
             .await

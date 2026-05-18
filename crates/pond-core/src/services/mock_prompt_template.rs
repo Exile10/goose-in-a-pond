@@ -28,7 +28,13 @@ impl Default for MockPromptTemplateRepository {
 #[async_trait]
 impl PromptTemplateRepository for MockPromptTemplateRepository {
     async fn get(&self, name: &str) -> Result<Option<PromptTemplate>> {
-        Ok(self.templates.read().await.iter().find(|t| t.name == name).cloned())
+        Ok(self
+            .templates
+            .read()
+            .await
+            .iter()
+            .find(|t| t.name == name)
+            .cloned())
     }
 
     async fn list(&self) -> Result<Vec<PromptTemplate>> {

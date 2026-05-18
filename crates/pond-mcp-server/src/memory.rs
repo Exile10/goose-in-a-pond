@@ -1,0 +1,763 @@
+//! Memory MCP Server — recall, save, and forget memory fragments.
+//!
+//! Provides 3 tools: `recall_memories`, `save_memory`, `forget_memory`.
+//! Depends only on [`MemoryRepository`] — no god-struct.
+
+use pond_core::domain::memory::{
+    MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
+};
+use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::ports::memory_repository::MemoryRepository;
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, Content, ErrorCode, ErrorData, Implementation, InitializeResult,
+        ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
+};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use std::sync::Arc;
+
+// ── Parameter structs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct RecallMemoriesParams {
+    /// Optional keyword to search for in memory content.
+    pub query: Option<String>,
+    /// Maximum number of memories to return (default 10).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SaveMemoryParams {
+    /// The content to remember.
+    #[serde(default)]
+    pub content: String,
+    /// Optional comma-separated tags (e.g. "preferences,home").
+    pub tags: Option<String>,
+    /// Memory segment: identity, preference, correction, relationship, project, knowledge, or context.
+    /// If omitted, auto-classified from content.
+    pub segment: Option<String>,
+    /// Importance score 0.0-1.0. If omitted, defaults by segment.
+    pub importance: Option<f32>,
+    /// Tier: short, long, or permanent. If omitted, defaults by segment.
+    pub tier: Option<String>,
+    /// Memory IDs that this new memory replaces. Those memories will be
+    /// immediately archived with lifecycle=merged and superseded_by set.
+    #[serde(default)]
+    pub supersedes: Option<Vec<String>>,
+    /// For correction segment: describes what wrong claim this corrects.
+    /// Prevents consolidation from reverting the fix.
+    pub corrects: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ForgetMemoryParams {
+    /// The memory ID to delete.
+    pub id: Option<String>,
+    /// Exact content to search for and delete (if id not provided).
+    pub content: Option<String>,
+}
+
+// ── MCP server ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct MemoryMcpServer {
+    memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
+    tool_router: ToolRouter<Self>,
+}
+
+#[tool_router]
+impl MemoryMcpServer {
+    pub fn new(
+        memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    ) -> Self {
+        Self {
+            memory_repo,
+            embedding_provider,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        description = "Recall memories, optionally filtered by a keyword. Uses semantic search \
+        when embeddings are available, falling back to keyword matching. Returns memories \
+        with their segment (identity, preference, etc.) and importance score."
+    )]
+    async fn recall_memories(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<RecallMemoriesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = params.0.limit.unwrap_or(10) as usize;
+
+        let filtered: Vec<_> = if let Some(ref query) = params.0.query {
+            // Try vector search first when embedding provider is available
+            if let Some(ref emb) = self.embedding_provider {
+                match emb.embed(query).await {
+                    Ok(query_vec) => {
+                        match self
+                            .memory_repo
+                            .search_similar(&query_vec, None, limit)
+                            .await
+                        {
+                            Ok(results) if !results.is_empty() => {
+                                tracing::debug!(
+                                    count = results.len(),
+                                    "recall_memories: vector search returned results"
+                                );
+                                results
+                            }
+                            _ => {
+                                // Vector search returned nothing — fall back to keyword
+                                tracing::debug!(
+                                    "recall_memories: vector search empty, falling back to keyword"
+                                );
+                                keyword_search(&self.memory_repo, query, limit).await?
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "recall_memories: embedding failed ({e}), falling back to keyword"
+                        );
+                        keyword_search(&self.memory_repo, query, limit).await?
+                    }
+                }
+            } else {
+                // No embedding provider — keyword search
+                keyword_search(&self.memory_repo, query, limit).await?
+            }
+        } else {
+            // No query — return recent memories
+            self.memory_repo
+                .search_recent(None, limit)
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Memory error: {}", e),
+                        None,
+                    )
+                })?
+        };
+
+        // Record access for decay tracking + audit log
+        for f in &filtered {
+            let _ = self.memory_repo.record_access(&f.id).await;
+            let _ = self
+                .memory_repo
+                .log_event(MemoryEventKind::Recalled, &f.id, None, None)
+                .await;
+        }
+
+        let text = if filtered.is_empty() {
+            "No memories found.".to_string()
+        } else {
+            filtered
+                .iter()
+                .map(|f| {
+                    let seg = f
+                        .segment
+                        .as_ref()
+                        .map(|s| format!("{:?}", s).to_lowercase())
+                        .unwrap_or_else(|| "—".to_string());
+                    let imp = f
+                        .importance
+                        .map(|i| format!("{:.1}", i))
+                        .unwrap_or_else(|| "—".to_string());
+                    format!(
+                        "[{}] [id:{}] [{}, {}] {}",
+                        f.created_at.format("%Y-%m-%d"),
+                        f.id,
+                        seg,
+                        imp,
+                        f.content
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Build UI hint from memory fragments
+        if !filtered.is_empty() {
+            let ui_memories: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "content": f.content,
+                        "segment": f.segment.as_ref()
+                            .map(|s| format!("{:?}", s).to_lowercase())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        "importance": f.importance.unwrap_or(0.0),
+                        "created_at": f.created_at.format("%Y-%m-%d").to_string(),
+                    })
+                })
+                .collect();
+            let ui_data = serde_json::json!({ "memories": ui_memories });
+            let hint = format!("[[[mcp-ui:memory:{}]]]\n", ui_data);
+            let full_result = format!("{}{}", hint, text);
+            return Ok(CallToolResult::success(vec![Content::text(full_result)]));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        description = "Save a new memory. Optionally specify 'supersedes' with IDs of memories \
+        this replaces (they'll be archived). Supports segment, importance, and tier."
+    )]
+    async fn save_memory(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<SaveMemoryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // Extract supersedes list before other fields are consumed
+        let supersedes = params.0.supersedes.clone();
+
+        // Fallback: if model sent empty content, extract from user message
+        let content = if !params.0.content.is_empty() {
+            params.0.content.clone()
+        } else {
+            let user_msg = crate::last_user_message();
+            if user_msg.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "No content provided to save. Tell me what you'd like me to remember.",
+                )]));
+            }
+            println!(
+                "[memory] empty content param, using user message: {:?}",
+                user_msg
+            );
+            user_msg
+        };
+        let tag_list: Vec<String> = params
+            .0
+            .tags
+            .unwrap_or_default()
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        // Resolve segment: explicit > auto-classify from content
+        let segment = params
+            .0
+            .segment
+            .as_deref()
+            .and_then(parse_memory_segment)
+            .unwrap_or_else(|| auto_classify_segment(&content));
+
+        let importance = params
+            .0
+            .importance
+            .map(|i| i.clamp(0.0, 1.0))
+            .unwrap_or_else(|| segment.default_importance());
+
+        let tier = params
+            .0
+            .tier
+            .as_deref()
+            .and_then(parse_memory_tier)
+            .unwrap_or_else(|| segment.default_tier());
+
+        let decay_rate = tier.default_decay_rate();
+
+        // Generate embedding if provider is available
+        let embedding = if let Some(ref emb) = self.embedding_provider {
+            match emb.embed(&content).await {
+                Ok(vec) => {
+                    tracing::debug!(dims = vec.len(), "save_memory: embedding generated");
+                    Some(vec)
+                }
+                Err(e) => {
+                    tracing::warn!("save_memory: embedding failed ({e}), saving without");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // For correction segments, capture what wrong claim is being corrected
+        let corrects = params.0.corrects.clone().filter(|s| !s.is_empty());
+
+        let new_id = id.clone();
+        let fragment = MemoryFragment {
+            id,
+            profile_id: None,
+            session_id: None,
+            content: content.clone(),
+            embedding,
+            source: "mcp_tool".to_string(),
+            tags: tag_list,
+            created_at: chrono::Utc::now(),
+            segment: Some(segment.clone()),
+            importance: Some(importance),
+            tier: Some(tier.clone()),
+            decay_rate: Some(decay_rate),
+            access_count: 0,
+            last_accessed_at: None,
+            lifecycle: Some(MemoryLifecycle::Active),
+            superseded_by: None,
+            corrects,
+        };
+
+        self.memory_repo.add(fragment).await.map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to save memory: {}", e),
+                None,
+            )
+        })?;
+
+        // Audit log
+        let _ = self
+            .memory_repo
+            .log_event(MemoryEventKind::Written, &new_id, None, None)
+            .await;
+
+        // Archive any memories that this new one supersedes
+        if let Some(ref superseded_ids) = supersedes {
+            for old_id in superseded_ids {
+                let _ = self.memory_repo.mark_superseded(old_id, &new_id).await;
+            }
+        }
+
+        let seg_label = format!("{:?}", segment).to_lowercase();
+        let tier_label = format!("{:?}", tier).to_lowercase();
+        let plain_text = format!(
+            "Memory saved ({seg_label}, importance={importance:.1}, tier={tier_label}): {content}"
+        );
+        let ui_data = serde_json::json!({
+            "content": content,
+            "segment": seg_label,
+            "saved": true,
+        });
+        let hint = format!("[[[mcp-ui:memory_saved:{}]]]\n", ui_data);
+        let full_result = format!("{}{}", hint, plain_text);
+        Ok(CallToolResult::success(vec![Content::text(full_result)]))
+    }
+
+    #[tool(description = "Delete a specific memory by ID or by exact content match.")]
+    async fn forget_memory(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ForgetMemoryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(id) = &params.0.id {
+            self.memory_repo.delete(id).await.map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to delete: {}", e),
+                    None,
+                )
+            })?;
+            let _ = self
+                .memory_repo
+                .log_event(MemoryEventKind::Deleted, id, None, None)
+                .await;
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Memory {id} deleted."
+            ))]));
+        }
+
+        if let Some(content) = &params.0.content {
+            let memories = self
+                .memory_repo
+                .search_recent(None, 100)
+                .await
+                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+            let lower = content.to_lowercase();
+            if let Some(found) = memories.iter().find(|m| m.content.to_lowercase() == lower) {
+                let id = found.id.clone();
+                self.memory_repo.delete(&id).await.map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to delete: {}", e),
+                        None,
+                    )
+                })?;
+                let _ = self
+                    .memory_repo
+                    .log_event(MemoryEventKind::Deleted, &id, None, None)
+                    .await;
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Memory deleted: {}",
+                    found.content
+                ))]));
+            }
+
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No memory found with that exact content.".to_string(),
+            )]));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            "Provide either an 'id' or 'content' to identify the memory to forget.".to_string(),
+        )]))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for MemoryMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_server_info(Implementation::new(
+                "giap-memory",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "GIAP Memory MCP server — save, recall, and forget memory fragments.\n\n\
+                 Tools: recall_memories (keyword-filtered recall with segment metadata and IDs), \
+                 save_memory (with optional segment/importance/tier; use 'supersedes' to replace \
+                 old memories by ID), forget_memory (by ID or exact content match).\n\n\
+                 When correcting a fact, recall the old memory first, then save the correction \
+                 with supersedes=[old_id] to replace it.\n\n\
+                 Memories are categorized by segment (identity, preference, correction, \
+                 relationship, project, knowledge, context) with importance scoring and \
+                 decay-based lifecycle management.",
+            )
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────
+
+/// Keyword-based memory search: fetch recent, then filter by substring match.
+async fn keyword_search(
+    memory_repo: &Arc<dyn MemoryRepository + Send + Sync>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryFragment>, ErrorData> {
+    let fragments = memory_repo
+        .search_recent(None, limit * 2) // fetch more to allow for filtering
+        .await
+        .map_err(|e| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Memory error: {}", e),
+                None,
+            )
+        })?;
+    let q_lower = query.to_lowercase();
+    Ok(fragments
+        .into_iter()
+        .filter(|f| f.content.to_lowercase().contains(&q_lower))
+        .take(limit)
+        .collect())
+}
+
+// ── Memory helpers (public for use by other crates) ────────────────────────
+
+/// Parse a string into a [`MemorySegment`].
+pub fn parse_memory_segment(s: &str) -> Option<MemorySegment> {
+    match s.to_lowercase().as_str() {
+        "identity" => Some(MemorySegment::Identity),
+        "preference" => Some(MemorySegment::Preference),
+        "correction" => Some(MemorySegment::Correction),
+        "relationship" => Some(MemorySegment::Relationship),
+        "project" => Some(MemorySegment::Project),
+        "knowledge" => Some(MemorySegment::Knowledge),
+        "context" => Some(MemorySegment::Context),
+        _ => None,
+    }
+}
+
+/// Parse a string into a [`MemoryTier`].
+pub fn parse_memory_tier(s: &str) -> Option<MemoryTier> {
+    match s.to_lowercase().as_str() {
+        "short" => Some(MemoryTier::Short),
+        "long" => Some(MemoryTier::Long),
+        "permanent" => Some(MemoryTier::Permanent),
+        _ => None,
+    }
+}
+
+/// Auto-classify a memory's segment from its content using keyword heuristics.
+/// No LLM needed — fast and deterministic.
+pub fn auto_classify_segment(content: &str) -> MemorySegment {
+    let lower = content.to_lowercase();
+
+    // Correction indicators (highest priority)
+    if lower.starts_with("actually")
+        || lower.starts_with("no, ")
+        || lower.starts_with("correction:")
+        || lower.contains("that's wrong")
+        || lower.contains("that's not right")
+        || lower.contains("not correct")
+    {
+        return MemorySegment::Correction;
+    }
+
+    // Identity indicators
+    if lower.starts_with("my name is")
+        || lower.starts_with("i am a ")
+        || lower.starts_with("i'm a ")
+        || lower.contains("i live in")
+        || lower.contains("i work at")
+        || lower.contains("i work as")
+        || lower.contains("my job is")
+        || lower.contains("my role is")
+    {
+        return MemorySegment::Identity;
+    }
+
+    // Relationship indicators
+    if lower.contains("my wife")
+        || lower.contains("my husband")
+        || lower.contains("my partner")
+        || lower.contains("my friend")
+        || lower.contains("my boss")
+        || lower.contains("my colleague")
+        || lower.contains("my sister")
+        || lower.contains("my brother")
+        || lower.contains("my mother")
+        || lower.contains("my father")
+        || lower.contains("my son")
+        || lower.contains("my daughter")
+    {
+        return MemorySegment::Relationship;
+    }
+
+    // Preference indicators
+    if lower.starts_with("i prefer")
+        || lower.starts_with("i like")
+        || lower.starts_with("i love")
+        || lower.starts_with("i hate")
+        || lower.starts_with("i don't like")
+        || lower.contains("my favorite")
+        || lower.contains("my favourite")
+    {
+        return MemorySegment::Preference;
+    }
+
+    // Project indicators
+    if lower.contains("working on")
+        || lower.contains("my project")
+        || lower.contains("my goal")
+        || lower.contains("deadline")
+        || lower.contains("i'm building")
+        || lower.contains("i'm developing")
+    {
+        return MemorySegment::Project;
+    }
+
+    // Context indicators (transient)
+    if lower.starts_with("right now")
+        || lower.starts_with("currently")
+        || lower.starts_with("today ")
+        || lower.contains("at the moment")
+    {
+        return MemorySegment::Context;
+    }
+
+    // Default
+    MemorySegment::Knowledge
+}
+
+// ── Static deps + spawn function for Goose builtin registry ──────────────
+
+use rmcp::ServiceExt;
+use std::sync::OnceLock;
+use tokio::io::DuplexStream;
+
+struct MemoryDeps {
+    memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+}
+
+static MEMORY_DEPS: OnceLock<MemoryDeps> = OnceLock::new();
+
+/// Initialize memory server dependencies. Call once at startup.
+///
+/// `embedding_provider` enables semantic search (vector similarity) in
+/// `recall_memories` and auto-embedding in `save_memory`. When `None`,
+/// the server falls back to keyword/substring search.
+pub fn init_memory_deps(
+    memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+) {
+    let _ = MEMORY_DEPS.set(MemoryDeps {
+        memory_repo,
+        embedding_provider,
+    });
+}
+
+/// Spawn function compatible with Goose's `SpawnServerFn` type.
+pub fn spawn_memory_server(reader: DuplexStream, writer: DuplexStream) {
+    let deps = MEMORY_DEPS.get().expect("init_memory_deps() not called");
+    let server = MemoryMcpServer::new(deps.memory_repo.clone(), deps.embedding_provider.clone());
+    tokio::spawn(async move {
+        match server.serve((reader, writer)).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(e) => tracing::error!("giap-memory MCP server failed: {e}"),
+        }
+    });
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use pond_core::domain::memory::MemoryFragment;
+    use pond_core::ports::memory_repository::MemoryRepository;
+
+    struct StubMemory;
+    #[async_trait]
+    impl MemoryRepository for StubMemory {
+        async fn add(&self, _: MemoryFragment) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn search_recent(
+            &self,
+            _: Option<&str>,
+            _: usize,
+        ) -> anyhow::Result<Vec<MemoryFragment>> {
+            Ok(vec![])
+        }
+        async fn search_similar(
+            &self,
+            _: &[f32],
+            _: Option<&str>,
+            _: usize,
+        ) -> anyhow::Result<Vec<MemoryFragment>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_server() -> MemoryMcpServer {
+        MemoryMcpServer::new(Arc::new(StubMemory), None)
+    }
+
+    /// Stub embedding provider for testing vector search paths.
+    struct StubEmbedding;
+    #[async_trait]
+    impl EmbeddingProvider for StubEmbedding {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            // Return a deterministic 4-dim unit vector
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    fn test_server_with_embeddings() -> MemoryMcpServer {
+        MemoryMcpServer::new(Arc::new(StubMemory), Some(Arc::new(StubEmbedding)))
+    }
+
+    #[test]
+    fn server_constructs_with_embeddings() {
+        let _server = test_server_with_embeddings();
+    }
+
+    #[test]
+    fn auto_classify_correction() {
+        assert_eq!(
+            auto_classify_segment("Actually, my name is Jerry"),
+            MemorySegment::Correction
+        );
+        assert_eq!(
+            auto_classify_segment("No, that's not right"),
+            MemorySegment::Correction
+        );
+    }
+
+    #[test]
+    fn auto_classify_identity() {
+        assert_eq!(
+            auto_classify_segment("My name is Jerry"),
+            MemorySegment::Identity
+        );
+        assert_eq!(
+            auto_classify_segment("I work at Jarida"),
+            MemorySegment::Identity
+        );
+    }
+
+    #[test]
+    fn auto_classify_relationship() {
+        assert_eq!(
+            auto_classify_segment("My wife loves gardening"),
+            MemorySegment::Relationship
+        );
+    }
+
+    #[test]
+    fn auto_classify_preference() {
+        assert_eq!(
+            auto_classify_segment("I prefer dark mode"),
+            MemorySegment::Preference
+        );
+        assert_eq!(
+            auto_classify_segment("My favorite color is blue"),
+            MemorySegment::Preference
+        );
+    }
+
+    #[test]
+    fn auto_classify_project() {
+        assert_eq!(
+            auto_classify_segment("I'm building a home automation system"),
+            MemorySegment::Project
+        );
+    }
+
+    #[test]
+    fn auto_classify_context() {
+        assert_eq!(
+            auto_classify_segment("Right now I'm at the office"),
+            MemorySegment::Context
+        );
+    }
+
+    #[test]
+    fn auto_classify_defaults_to_knowledge() {
+        assert_eq!(
+            auto_classify_segment("The capital of France is Paris"),
+            MemorySegment::Knowledge
+        );
+    }
+
+    #[test]
+    fn parse_segment_valid() {
+        assert_eq!(
+            parse_memory_segment("identity"),
+            Some(MemorySegment::Identity)
+        );
+        assert_eq!(
+            parse_memory_segment("CORRECTION"),
+            Some(MemorySegment::Correction)
+        );
+        assert_eq!(parse_memory_segment("unknown"), None);
+    }
+
+    #[test]
+    fn parse_tier_valid() {
+        assert_eq!(parse_memory_tier("short"), Some(MemoryTier::Short));
+        assert_eq!(parse_memory_tier("PERMANENT"), Some(MemoryTier::Permanent));
+        assert_eq!(parse_memory_tier("invalid"), None);
+    }
+
+    #[test]
+    fn server_constructs() {
+        let _server = test_server();
+    }
+}

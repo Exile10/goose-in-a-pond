@@ -41,11 +41,7 @@ impl NotificationSender for GotgNotificationAdapter {
 
     async fn broadcast(&self, notification: Notification) -> Result<()> {
         // TODO: Push to all connected GOTG devices
-        tracing::info!(
-            "Broadcast: {} — {}",
-            notification.title,
-            notification.body
-        );
+        tracing::info!("Broadcast: {} — {}", notification.title, notification.body);
         Ok(())
     }
 }

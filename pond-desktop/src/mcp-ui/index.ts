@@ -1,0 +1,31 @@
+// MCP-UI Card Registry — barrel export
+//
+// Importing this module triggers registerMcpCard() for all built-in cards.
+// To add a new card type: create a file in cards/ that calls registerMcpCard(),
+// then add the import here. Zero core code changes needed.
+
+import "./cards/WeatherCard";
+import "./cards/CalendarCard";
+import "./cards/NewsCard";
+import "./cards/CryptoCard";
+import "./cards/SmartHomeCard";
+import "./cards/MapCard";
+import "./cards/MemoryCard";
+import "./cards/ScheduleListCard";
+import "./cards/KnowledgeCard";
+import "./cards/TimeCard";
+import "./cards/SystemInfoCard";
+import "./cards/DeviceCard";
+// GenericCard is NOT auto-registered — used as explicit fallback only
+
+export {
+  registerMcpCard,
+  findCardRenderer,
+  findCardByHint,
+  getAllRegistrations,
+  type McpCardProps,
+  type McpCardRegistration,
+} from "./registry";
+export { McpCardShell } from "./McpCardShell";
+export { GenericCard } from "./cards/GenericCard";
+export { McpAppHost, type McpAppHostProps, type McpToolResult } from "./McpAppHost";

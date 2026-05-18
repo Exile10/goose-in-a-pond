@@ -1,4 +1,5 @@
 import { Card, Chip } from "@heroui/react";
+import { findCardRenderer, findCardByHint } from "../mcp-ui";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 
 interface Props {
@@ -15,15 +16,32 @@ export function ContextCard({ card }: Props) {
         <Chip size="sm" variant="primary">{formatToolName(toolName)}</Chip>
       </div>
       <div style={styles.body}>
-        <ToolContent toolName={toolName} data={data} />
+        <ToolContent toolName={toolName} data={data} renderHint={card.renderHint} />
       </div>
     </Card>
   );
 }
 
-function ToolContent({ toolName, data }: { toolName: string; data: Record<string, unknown> | null }) {
+function ToolContent({ toolName, data, renderHint }: { toolName: string; data: Record<string, unknown> | null; renderHint?: string }) {
   const safe = data ?? {};
-  if (toolName === "get_current_weather") return <WeatherContent data={safe} />;
+
+  // 1. Try explicit MCP-APP hint (highest priority)
+  if (renderHint) {
+    const reg = findCardByHint(renderHint);
+    if (reg) {
+      const Renderer = reg.component;
+      return <Renderer data={safe} toolName={toolName} variant="compact" />;
+    }
+  }
+
+  // 2. Try MCP-UI registry pattern match
+  const reg = findCardRenderer(toolName);
+  if (reg) {
+    const Renderer = reg.component;
+    return <Renderer data={safe} toolName={toolName} variant="compact" />;
+  }
+
+  // 3. Legacy fallbacks for backward compatibility
   if (toolName === "list_registered_devices") return <DevicesContent data={safe} />;
   if (toolName === "recall_memories" || toolName === "save_memory") return <MemoryContent data={safe} />;
   if (toolName === "list_schedules") return <SchedulesContent data={safe} />;

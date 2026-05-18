@@ -42,8 +42,12 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn get_current_step(&self) -> Option<OnboardingStep> {
         Some(OnboardingStep::Completed)
     }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct MockDeviceRegistry;
@@ -52,34 +56,51 @@ struct MockDeviceRegistry;
 impl DeviceRegistry for MockDeviceRegistry {
     async fn register(&self, req: RegisterDeviceRequest) -> anyhow::Result<Device> {
         Ok(Device {
-            id: "mock".into(), name: req.name, device_type: req.device_type,
-            hostname: req.hostname, ip_address: None, capabilities: req.capabilities,
-            registered_at: "2024-01-01 00:00:00".into(), last_seen: None, is_online: false,
+            id: "mock".into(),
+            name: req.name,
+            device_type: req.device_type,
+            hostname: req.hostname,
+            ip_address: None,
+            capabilities: req.capabilities,
+            registered_at: "2024-01-01 00:00:00".into(),
+            last_seen: None,
+            is_online: false,
         })
     }
-    async fn list_devices(&self)                    -> anyhow::Result<Vec<Device>>    { Ok(vec![]) }
-    async fn get_device(&self, _: &str)             -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str)             -> anyhow::Result<()>             { Ok(()) }
-    async fn heartbeat(&self, _: &str)              -> anyhow::Result<()>             { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Fixture ────────────────────────────────────────────────────────────────────
 
 /// Build a test router with a real SQLite model_repo backed by a tempdir.
-async fn make_app() -> (axum::Router, Arc<dyn ModelRepository + Send + Sync>, tempfile::TempDir) {
+async fn make_app() -> (
+    axum::Router,
+    Arc<dyn ModelRepository + Send + Sync>,
+    tempfile::TempDir,
+) {
     let (router, model_repo, _settings_repo, tmp) = make_app_with_settings_repo().await;
     (router, model_repo, tmp)
 }
 
-async fn make_app_with_settings_repo(
-) -> (
+async fn make_app_with_settings_repo() -> (
     axum::Router,
     Arc<dyn ModelRepository + Send + Sync>,
     Arc<dyn SettingsRepository + Send + Sync>,
     tempfile::TempDir,
 ) {
     let tmp = tempfile::tempdir().unwrap();
-    let db  = Database::init(tmp.path()).await.unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
 
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     let model_repo: Arc<dyn ModelRepository + Send + Sync> =
@@ -91,47 +112,62 @@ async fn make_app_with_settings_repo(
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
-        db:                  Arc::new(db),
-        onboarding_repo:     Arc::new(CompletedOnboarding),
-        handshake:           Arc::new(mock_hs),
-        whisper_url:         "http://127.0.0.1:9000".into(),
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(CompletedOnboarding),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
         session_storage,
-        http_client:         reqwest::Client::new(),
-        agent:               Arc::new(MockAgent::new()),
-        llm_provider:        Arc::new(tokio::sync::RwLock::new(None)),
-        llamafile_url:       "http://127.0.0.1:8080".into(),
-        tts:                 None,
-        settings_repo:       settings_repo.clone(),
-        profile_repo:        Arc::new(MockProfileRepository::new()),
-        device_registry:     Arc::new(MockDeviceRegistry),
-        memory_repo:         Arc::new(MockMemoryRepository::new()),
-        embedding_provider:  None,
-        sensor_storage:      Arc::new(MockSensorStorage::new()),
-        camera_storage:      Arc::new(MockCameraStorage::new()),
-        face_recognition:    None,
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        settings_repo: settings_repo.clone(),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(MockDeviceRegistry),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
         prompt_template_dir: None,
-        model_repo:          Some(model_repo.clone()),
-        data_dir:            Some(tmp.path().to_path_buf()),
-        skip_onboarding:     true,
-        scheduler:           None,
-        model_scheduler:     None,
-        mcp_memory:          None,
-        extension_manager:   None,
-        mcp_server_repo:     None,
-        download_tracker:    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        piper_http_port:     None,
+        model_repo: Some(model_repo.clone()),
+        data_dir: Some(tmp.path().to_path_buf()),
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
         model_catalog_provider: None,
-        model_storage_dir:   None,
+        model_storage_dir: None,
         prompt_template_repo: None,
-        prompt_extra_repo:   None,
-        skill_repo:          None,
-        recipe_repo:         None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
 
     (
@@ -144,55 +180,55 @@ async fn make_app_with_settings_repo(
 
 fn gguf_record(name: &str) -> ModelRecord {
     ModelRecord {
-        id:               ModelRecord::id_for(&ModelCategory::Gguf, name),
-        category:         ModelCategory::Gguf,
-        name:             name.to_string(),
-        filename:         Some(format!("{name}.gguf")),
-        description:      format!("{name} model"),
-        size_mb:          1000,
-        url:              Some("https://example.com/model.gguf".into()),
-        hf_id:            None,
-        ram_estimate_mb:  None,
+        id: ModelRecord::id_for(&ModelCategory::Gguf, name),
+        category: ModelCategory::Gguf,
+        name: name.to_string(),
+        filename: Some(format!("{name}.gguf")),
+        description: format!("{name} model"),
+        size_mb: 1000,
+        url: Some("https://example.com/model.gguf".into()),
+        hf_id: None,
+        ram_estimate_mb: None,
         recommended_role: Some("chat".into()),
-        context_length:   None,
-        quantization:     None,
-        asr_language:     None,
-        asr_size:         None,
-        tts_engine:       None,
-        tts_voice_name:   None,
-        config_filename:  None,
-        config_url:       None,
-        tts_url:          None,
-        sample_rate:      None,
-        downloaded:       true,
-        is_custom:        false,
+        context_length: None,
+        quantization: None,
+        asr_language: None,
+        asr_size: None,
+        tts_engine: None,
+        tts_voice_name: None,
+        config_filename: None,
+        config_url: None,
+        tts_url: None,
+        sample_rate: None,
+        downloaded: true,
+        is_custom: false,
     }
 }
 
 fn whisper_record(name: &str) -> ModelRecord {
     ModelRecord {
-        id:               ModelRecord::id_for(&ModelCategory::Whisper, name),
-        category:         ModelCategory::Whisper,
-        name:             name.to_string(),
-        filename:         Some(format!("ggml-{name}.en.bin")),
-        description:      format!("Whisper {name}"),
-        size_mb:          74,
-        url:              Some("https://example.com/whisper.bin".into()),
-        hf_id:            None,
-        ram_estimate_mb:  None,
+        id: ModelRecord::id_for(&ModelCategory::Whisper, name),
+        category: ModelCategory::Whisper,
+        name: name.to_string(),
+        filename: Some(format!("ggml-{name}.en.bin")),
+        description: format!("Whisper {name}"),
+        size_mb: 74,
+        url: Some("https://example.com/whisper.bin".into()),
+        hf_id: None,
+        ram_estimate_mb: None,
         recommended_role: None,
-        context_length:   None,
-        quantization:     None,
-        asr_language:     Some("en".into()),
-        asr_size:         Some(name.to_string()),
-        tts_engine:       None,
-        tts_voice_name:   None,
-        config_filename:  None,
-        config_url:       None,
-        tts_url:          None,
-        sample_rate:      None,
-        downloaded:       true,
-        is_custom:        false,
+        context_length: None,
+        quantization: None,
+        asr_language: Some("en".into()),
+        asr_size: Some(name.to_string()),
+        tts_engine: None,
+        tts_voice_name: None,
+        config_filename: None,
+        config_url: None,
+        tts_url: None,
+        sample_rate: None,
+        downloaded: true,
+        is_custom: false,
     }
 }
 
@@ -204,7 +240,9 @@ fn auth_req(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
-    let bytes = body.map(|b| serde_json::to_vec(&b).unwrap()).unwrap_or_default();
+    let bytes = body
+        .map(|b| serde_json::to_vec(&b).unwrap())
+        .unwrap_or_default();
     builder.body(Body::from(bytes)).unwrap()
 }
 
@@ -224,7 +262,9 @@ async fn delete_model_409_when_model_has_active_role() {
 
     let m = gguf_record("test-model");
     repo.upsert(&m).await.unwrap();
-    repo.set_assignment("chat", "gguf/test-model").await.unwrap();
+    repo.set_assignment("chat", "gguf/test-model")
+        .await
+        .unwrap();
 
     let req = auth_req("DELETE", "/api/v1/models/gguf/test-model", None);
     let resp = app.oneshot(req).await.unwrap();

@@ -27,3 +27,15 @@ pre-build = [
       libdbus-1-dev:arm64
     """,
 ]
+
+[patch.crates-io]
+icu_calendar = "=1.5.0"
+icu_provider = "=1.5.0"
+icu_locid = "=1.5.0"
+icu_locid_transform = "=1.5.0"
+icu_collections = "=1.5.0"
+icu_properties = "=1.5.1"
+icu_normalizer = "=1.5.0"
+writeable = "=0.5.5"
+yoke = "=0.7.5"
+zerovec = "=0.10.4"

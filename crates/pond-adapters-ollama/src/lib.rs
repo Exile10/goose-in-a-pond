@@ -116,11 +116,18 @@ impl OllamaProvider {
     /// a single JSON response when done.
     async fn pull_model(&self, model: &str) -> Result<()> {
         let url = format!("{}/api/pull", self.base_url);
-        let body = PullRequest { model, stream: false };
+        let body = PullRequest {
+            model,
+            stream: false,
+        };
 
-        tracing::info!("Ollama: pulling model '{}' — this may take a while...", model);
+        tracing::info!(
+            "Ollama: pulling model '{}' — this may take a while...",
+            model
+        );
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&body)
             .send()
@@ -148,6 +155,7 @@ impl OllamaProvider {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::System => "system",
+                    Role::Tool => "tool",
                 }
                 .to_string(),
                 content: m.content.clone(),
@@ -420,7 +428,9 @@ mod tests {
         // Pull endpoint — should be called exactly once
         Mock::given(method("POST"))
             .and(path("/api/pull"))
-            .and(body_partial_json(serde_json::json!({"model": "test-model"})))
+            .and(body_partial_json(
+                serde_json::json!({"model": "test-model"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "success"
             })))

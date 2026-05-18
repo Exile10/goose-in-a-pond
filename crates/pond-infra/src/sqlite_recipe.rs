@@ -21,12 +21,12 @@ impl SqliteRecipeRepository {
 
 fn row_to_recipe(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRecipe> {
     Ok(AgentRecipe {
-        id:          row.try_get("id")?,
-        name:        row.try_get("name")?,
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
         description: row.try_get("description")?,
-        yaml:        row.try_get("yaml")?,
-        active:      row.try_get::<i64, _>("active")? != 0,
-        created_at:  row.try_get("created_at")?,
+        yaml: row.try_get("yaml")?,
+        active: row.try_get::<i64, _>("active")? != 0,
+        created_at: row.try_get("created_at")?,
     })
 }
 

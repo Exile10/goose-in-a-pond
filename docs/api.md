@@ -57,6 +57,7 @@ All errors return JSON:
 | PATCH | /sessions/{id} | Protected | Rename session |
 | GET | /sessions/{id}/messages | Protected | Get session messages |
 | GET | /models | Protected | List model catalog |
+| GET | /models/capabilities | Protected | Active model's runtime capabilities |
 | GET | /models/active-roles | Protected | Current role assignments |
 | GET | /models/memory-status | Protected | LLM RAM budget |
 | POST | /models/registry/refresh | Protected | Refresh online model catalog |
@@ -94,6 +95,9 @@ All errors return JSON:
 | GET | /extensions | Protected | List loaded MCP extensions |
 | POST | /extensions | Protected | Add an MCP extension |
 | DELETE | /extensions/{name} | Protected | Remove an MCP extension |
+| PATCH | /extensions/{name} | Protected | Enable or disable an MCP extension |
+| GET | /marketplace | Protected | List marketplace extensions |
+| POST | /marketplace/{id}/install | Protected | Install a marketplace extension |
 | GET | /prompts | Protected | List prompt templates |
 | GET | /prompts/{name} | Protected | Get a prompt template |
 | PUT | /prompts/{name} | Protected | Create or update a prompt template |
@@ -306,12 +310,15 @@ Returns the full settings object.
   "llm_max_tokens": 1024,
   "llm_temperature": 0.7,
   "llm_provider": "llamafile",
-  "chat_provider": "llamafile",
-  "chat_model": "",
-  "think_provider": "",
-  "think_model": "",
-  "task_provider": "",
-  "task_model": "",
+  "chat_provider": "local",
+  "chat_model": "gemma-4-E4B-it-Q4_K_M",
+  "tool_model": null,
+  "thinking_mode": "auto",
+  "show_thinking": false,
+  "review_mode": "off",
+  "review_max_rounds": 1,
+  "review_pass_threshold": 3,
+  "context_window_override": 0,
   "prompt_style": "balanced",
   "custom_system_prompt": null,
   "prompt_addendum": "",
@@ -403,24 +410,30 @@ Streaming variant of `/chat` using Server-Sent Events. The response body is a st
 
 **Request** — same as `/chat`
 
+**Request**
+```json
+{
+  "session_id": "550e8400-...",
+  "message": "What is MKBHD?",
+  "images": []
+}
+```
+
+`images` is optional -- array of `{data: "base64...", mime_type: "image/jpeg"}` for multimodal models.
+
 **SSE Event stream**
 
-Token events (multiple, may arrive rapidly):
-```
-data: {"token": "It's "}
-data: {"token": "currently "}
-data: {"token": "22°C..."}
-```
-
-Final event:
-```
-data: {"done": true, "session_id": "...", "model_role": "chat"}
-```
-
-Error event:
-```
-data: {"error": "Agent failed: ..."}
-```
+| Event Type | Example | Description |
+|------------|---------|-------------|
+| `status` | `{"type":"status","content":"Thinking..."}` | Pipeline progress |
+| `thinking` | `{"type":"thinking","content":"...reasoning..."}` | Chain-of-thought (when `show_thinking` enabled) |
+| `tool_call` | `{"type":"tool_call","tool":"wikipedia","id":"..."}` | Tool invocation |
+| `tool_result` | `{"type":"tool_result","tool":"wikipedia","content":"..."}` | Tool result data |
+| `text` | `{"type":"text","content":"MKBHD is..."}` | Streamed response tokens |
+| `review_status` | `{"type":"review_status","content":"Reviewing..."}` | Answer review progress (when review enabled) |
+| `review_revision` | `{"type":"review_revision","content":"...","score":4}` | Revised answer (replaces streamed text) |
+| `done` | `{"done":true,"session_id":"...","model_role":"chat"}` | Stream complete |
+| `error` | `{"error":"Agent failed: ..."}` | Error |
 
 | Code | Meaning |
 |------|---------|
@@ -595,6 +608,25 @@ Returns the current role assignments for all five roles.
   "router_name": "ModelRouter(llamafile→ollama→llamafile)"
 }
 ```
+
+---
+
+### GET /models/capabilities
+
+Returns the active model's runtime capabilities. Used by the frontend to conditionally enable features (image upload, thinking display, etc.).
+
+**Response 200**
+```json
+{
+  "thinking": true,
+  "vision": true,
+  "audio_input": false,
+  "context_window_tokens": 128000,
+  "structured_output": true
+}
+```
+
+See [Model Capabilities](./architecture/model_capabilities.md) for details on how capabilities are detected.
 
 ---
 
@@ -1227,6 +1259,74 @@ Removes the extension and deletes its persisted config so it won't reconnect on 
 |------|---------|
 | 404 | Extension not found |
 | 503 | Extension manager not available |
+
+---
+
+### PATCH /extensions/{name}
+
+Enables or disables an extension without removing its persisted config. Disabled extensions are excluded from future Goose agent sessions but keep their registration so they can be re-enabled later.
+
+**Request**
+```json
+{ "enabled": false }
+```
+
+**Response 200**
+```json
+{ "name": "my-ext", "enabled": false }
+```
+
+| Code | Meaning |
+|------|---------|
+| 404 | Extension not found |
+| 503 | Extension manager not available |
+
+---
+
+## Marketplace
+
+The marketplace provides a curated registry of popular MCP extensions for one-click installation.
+
+### GET /marketplace
+
+Lists all available extensions in the curated registry.
+
+**Response 200**
+```json
+{
+  "extensions": [
+    {
+      "id": "filesystem",
+      "name": "Filesystem",
+      "description": "Read, write, and search files on the local filesystem.",
+      "kind": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"],
+      "category": "productivity",
+      "author": "Anthropic",
+      "tools": ["read_file", "write_file", "list_directory"],
+      "featured": true
+    }
+  ]
+}
+```
+
+| Code | Meaning |
+|------|---------|
+| 503 | Marketplace not configured |
+
+---
+
+### POST /marketplace/{id}/install
+
+Installs a marketplace extension by its registry ID. Looks up the extension in the catalogue, converts it to an `AddExtensionRequest`, registers it with the extension manager, and persists the config so it reconnects on restart.
+
+**Response 201** — extension info object (same shape as `POST /extensions` response)
+
+| Code | Meaning |
+|------|---------|
+| 404 | Extension ID not found in marketplace |
+| 503 | Marketplace or extension manager not available |
 
 ---
 

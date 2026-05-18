@@ -4,6 +4,7 @@ import {
   normalizeDesktopMode,
   normalizeGuiSection,
 } from "../desktopState";
+import type { ScheduleRunNotification, DebriefContext } from "../api/types";
 
 export type VoiceState = "idle" | "wait" | "recording" | "thinking" | "speaking" | "error";
 
@@ -17,8 +18,12 @@ export interface TranscriptMessage {
 export interface ContextCard {
   id: number;
   tool: string;
+  /** MCP request ID — used to match ToolResult events back to their ToolCall card */
+  callId?: string;
   data: Record<string, unknown>;
   timestamp_ms: number;
+  /** Explicit card type from MCP-APP UI hint — takes priority over tool name pattern matching */
+  renderHint?: string;
 }
 
 const TRANSCRIPT_CAP = 50;
@@ -27,6 +32,16 @@ export interface LastResponseMeta {
   modelName: string;
   modelRole: string;
   completionTokens: number;
+}
+
+export interface ScheduleToast {
+  id: string;
+  schedule_id: string;
+  schedule_label: string;
+  status: "completed" | "failed" | "running";
+  result?: string;
+  error?: string;
+  timestamp: number;
 }
 
 export interface AppState {
@@ -44,6 +59,14 @@ export interface AppState {
   contextCards: ContextCard[];
   voiceRequestId: number;
   lastResponseMeta: LastResponseMeta | null;
+  scheduleToasts: ScheduleToast[];
+  latestScheduleResult: ScheduleToast | null;
+  /** Persistent schedule run notifications (survives page navigation, unlike toasts). */
+  scheduleRuns: ScheduleRunNotification[];
+  /** Number of unread schedule runs. */
+  unreadRunCount: number;
+  /** When set, Canvas should render a debrief card for this run. */
+  debriefContext: DebriefContext | null;
 }
 
 export type AppAction =
@@ -64,7 +87,16 @@ export type AppAction =
   | { type: "CLEAR_CONTEXT_CARDS" }
   | { type: "VOICE_ACTIVATE" }
   | { type: "SET_LAST_RESPONSE_META"; payload: LastResponseMeta }
-  | { type: "SET_NEEDS_ONBOARDING"; payload: boolean };
+  | { type: "SET_NEEDS_ONBOARDING"; payload: boolean }
+  | { type: "SCHEDULE_RESULT"; payload: ScheduleToast }
+  | { type: "DISMISS_TOAST"; payload: string }
+  | { type: "SET_SCHEDULE_RUNS"; payload: ScheduleRunNotification[] }
+  | { type: "ADD_SCHEDULE_RUN"; payload: ScheduleRunNotification }
+  | { type: "UPDATE_SCHEDULE_RUN"; payload: { id: string; status: "completed" | "failed"; result?: string; error?: string } }
+  | { type: "MARK_RUN_READ"; payload: string }
+  | { type: "MARK_ALL_RUNS_READ" }
+  | { type: "SET_DEBRIEF_CONTEXT"; payload: DebriefContext | null }
+  | { type: "CLEAR_DEBRIEF_CONTEXT" };
 
 let _transcriptIdCounter = 0;
 let _cardIdCounter = 0;
@@ -92,6 +124,11 @@ export function buildInitialState(): AppState {
     contextCards: [],
     voiceRequestId: 0,
     lastResponseMeta: null,
+    scheduleToasts: [],
+    latestScheduleResult: null,
+    scheduleRuns: [],
+    unreadRunCount: 0,
+    debriefContext: null,
   };
 }
 
@@ -180,6 +217,94 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "SET_NEEDS_ONBOARDING":
       return { ...state, needsOnboarding: action.payload };
+
+    case "SCHEDULE_RESULT": {
+      const incoming = action.payload;
+      let existing = state.scheduleToasts;
+      // If this is a completion event, replace the "running" toast for same schedule
+      if (incoming.status !== "running") {
+        existing = existing.filter(
+          (t) => !(t.status === "running" && t.schedule_id === incoming.schedule_id)
+        );
+      }
+      return {
+        ...state,
+        scheduleToasts: [incoming, ...existing].slice(0, 10),
+        latestScheduleResult: incoming,
+      };
+    }
+
+    case "DISMISS_TOAST":
+      return {
+        ...state,
+        scheduleToasts: state.scheduleToasts.filter((t) => t.id !== action.payload),
+      };
+
+    case "SET_SCHEDULE_RUNS": {
+      const runs = action.payload;
+      return {
+        ...state,
+        scheduleRuns: runs,
+        unreadRunCount: runs.filter((r) => !r.read).length,
+      };
+    }
+
+    case "ADD_SCHEDULE_RUN": {
+      const run = action.payload;
+      // Avoid duplicates — replace if same id exists (e.g. running -> completed)
+      const filtered = state.scheduleRuns.filter((r) => r.id !== run.id);
+      const updated = [run, ...filtered].slice(0, 50);
+      return {
+        ...state,
+        scheduleRuns: updated,
+        unreadRunCount: updated.filter((r) => !r.read).length,
+      };
+    }
+
+    case "UPDATE_SCHEDULE_RUN": {
+      const { id, status, result, error } = action.payload;
+      const updated = state.scheduleRuns.map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              status,
+              result: result ?? r.result,
+              error: error ?? r.error,
+              excerpt: (result ?? r.result ?? error ?? "").slice(0, 80),
+            }
+          : r,
+      );
+      return {
+        ...state,
+        scheduleRuns: updated,
+        unreadRunCount: updated.filter((r) => !r.read).length,
+      };
+    }
+
+    case "MARK_RUN_READ": {
+      const updated = state.scheduleRuns.map((r) =>
+        r.id === action.payload ? { ...r, read: true } : r,
+      );
+      return {
+        ...state,
+        scheduleRuns: updated,
+        unreadRunCount: updated.filter((r) => !r.read).length,
+      };
+    }
+
+    case "MARK_ALL_RUNS_READ": {
+      return {
+        ...state,
+        scheduleRuns: state.scheduleRuns.map((r) => ({ ...r, read: true })),
+        unreadRunCount: 0,
+      };
+    }
+
+    case "SET_DEBRIEF_CONTEXT":
+      return { ...state, debriefContext: action.payload };
+
+    case "CLEAR_DEBRIEF_CONTEXT":
+      return { ...state, debriefContext: null };
 
     default:
       return state;

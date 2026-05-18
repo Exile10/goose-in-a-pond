@@ -1,0 +1,13 @@
+{
+  "name": "giap-extension-example",
+  "version": "0.1.0",
+  "description": "Example MCP extension for Goose in a Pond",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx src/server.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

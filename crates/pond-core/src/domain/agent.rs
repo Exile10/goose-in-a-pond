@@ -9,6 +9,15 @@ pub struct AgentRequest {
     /// Optional image attachments for multimodal models.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<crate::domain::message::ImageAttachment>,
+    /// When true, the request originates from voice mode. The agent should
+    /// disable thinking, keep responses concise, and avoid formatting.
+    #[serde(default)]
+    pub voice_mode: bool,
+    /// When true, the request originates from Canvas mode. The agent should
+    /// always prefer tool calls over textual descriptions so that results
+    /// render as visual cards on the user's screen.
+    #[serde(default)]
+    pub canvas_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +64,8 @@ pub enum AgentStreamEvent {
     Done {
         session_id: String,
         model_role: String,
+        /// Token usage for this response (estimated if real counts unavailable).
+        usage: Option<crate::ports::provider::UsageStats>,
     },
     Error {
         content: String,

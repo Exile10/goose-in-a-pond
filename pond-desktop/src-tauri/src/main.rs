@@ -7,6 +7,7 @@ mod commands;
 mod hotkey;
 mod notifications;
 mod process;
+mod thought_filter;
 mod tray;
 mod tts_text;
 
@@ -109,6 +110,8 @@ fn main() {
         .manage(AudioState::new())
         .manage(WakeListenerState::new())
         .manage(hotkey::HotkeyState::new())
+        .manage(audio_cmd::AudioKillSwitch::new())
+        .manage(audio_cmd::PipelineActive::new())
         // ── Commands ─────────────────────────────────────────────────────────
         .invoke_handler(tauri::generate_handler![
             server_cmd::get_server_url,

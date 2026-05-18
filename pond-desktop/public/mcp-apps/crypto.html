@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto — MCP App</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Quicksand', sans-serif; background: transparent; }
+  .card { background: #fff; border-radius: 16px; border: 1px solid #EBEBF0; overflow: hidden; }
+  .header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; }
+  .header-left { display: flex; align-items: center; gap: 8px; }
+  .title { font-size: 13px; font-weight: 700; color: #18181B; }
+  .live-chip { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: #DCFCE7; color: #15803D; }
+  .live-dot { width: 6px; height: 6px; border-radius: 50%; background: #16A34A; animation: pulse 1.8s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.5; transform:scale(0.75); } }
+  .divider { height: 1px; background: #F1F5F9; }
+  .row { display: flex; align-items: center; padding: 10px 16px; gap: 10px; }
+  .row + .row { border-top: 1px solid #F8FAFC; }
+  .coin-icon { width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 11px; font-weight: 800; }
+  .coin-icon.up { background: #F0FDF4; border: 1px solid #DCFCE7; color: #16A34A; }
+  .coin-icon.down { background: #FFF1F2; border: 1px solid #FFE4E6; color: #DC2626; }
+  .coin-info { flex: 1; min-width: 0; }
+  .coin-sym { font-size: 13px; font-weight: 700; color: #18181B; }
+  .coin-name { font-size: 11px; color: #94A3B8; font-weight: 500; }
+  .price-col { text-align: right; flex-shrink: 0; }
+  .price { font-size: 13px; font-weight: 800; color: #18181B; }
+  .change { font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: flex-end; gap: 3px; margin-top: 2px; }
+  .change.up { color: #16A34A; }
+  .change.down { color: #DC2626; }
+  .loading { padding: 40px; text-align: center; color: #94A3B8; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="root" class="card"><div class="loading">Loading crypto prices...</div></div>
+<script src="mcp-bridge.js"></script>
+<script>
+  const root = document.getElementById('root');
+  const app = new McpApp({ name: 'giap-finance-crypto', version: '1.0.0' });
+
+  function sparklineSvg(data, positive) {
+    if (!data || data.length < 2) return '';
+    const w = 64, h = 26;
+    const min = Math.min(...data), max = Math.max(...data), range = max - min || 1;
+    const step = w / (data.length - 1);
+    const pts = data.map((v, i) => `${(i*step).toFixed(1)},${(h - 2 - ((v-min)/range)*(h-4)).toFixed(1)}`).join(' ');
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline points="${pts}" fill="none" stroke="${positive?'#16A34A':'#DC2626'}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  }
+
+  function render(data) {
+    let coins = data.coins || [];
+    if (!Array.isArray(coins) && data.symbol) coins = [data];
+
+    let html = `<div class="header"><div class="header-left"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="1.75" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span class="title">Crypto prices</span></div><div class="live-chip"><span class="live-dot"></span>Live</div></div><div class="divider"></div>`;
+
+    coins.forEach(c => {
+      const up = (c.change ?? 0) >= 0;
+      const cls = up ? 'up' : 'down';
+      const arrow = up ? '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 6l-9.5 9.5-5-5L1 18"/></svg>' : '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 18l-9.5-9.5-5 5L1 6"/></svg>';
+      html += `<div class="row"><div class="coin-icon ${cls}">${(c.symbol||'').slice(0,4)}</div><div class="coin-info"><div class="coin-sym">${c.symbol||''}</div><div class="coin-name">${c.name||''}</div></div>`;
+      if (c.sparkline) html += sparklineSvg(c.sparkline, up);
+      html += `<div class="price-col"><div class="price">${c.price||''}</div><div class="change ${cls}">${arrow}${up?'+':''}${(c.change??0).toFixed(2)}%</div></div></div>`;
+    });
+
+    root.innerHTML = html;
+    app.reportSize(root.offsetWidth, root.offsetHeight);
+  }
+
+  app.ontoolresult = (result) => {
+    const text = result?.content?.find(c => c.type === 'text')?.text;
+    if (!text) return;
+    try { render(JSON.parse(text)); } catch { /* ignore parse errors */ }
+  };
+  app.ontoolinput = (input) => { if (input?.arguments) render(input.arguments); };
+  app.connect();
+</script>
+</body>
+</html>

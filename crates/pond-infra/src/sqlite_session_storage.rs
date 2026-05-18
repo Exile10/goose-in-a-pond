@@ -13,18 +13,21 @@ use sqlx::{Pool, Sqlite};
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
-    id:         String,
-    title:      Option<String>,
+    id: String,
+    title: Option<String>,
+    total_prompt_tokens: i64,
+    total_completion_tokens: i64,
+    model_name: Option<String>,
     created_at: String,
     updated_at: String,
 }
 
 #[derive(sqlx::FromRow)]
 struct MessageRow {
-    id:         String,
+    id: String,
     session_id: String,
-    role:       String,
-    content:    String,
+    role: String,
+    content: String,
     created_at: String,
 }
 
@@ -39,20 +42,23 @@ fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
 
 fn role_to_str(role: &Role) -> &'static str {
     match role {
-        Role::User      => "user",
+        Role::User => "user",
         Role::Assistant => "assistant",
-        Role::System    => "system",
+        Role::System => "system",
+        Role::Tool => "tool",
     }
 }
 
 fn str_to_role(s: &str) -> Result<Role, SessionStorageError> {
     match s {
-        "user"      => Ok(Role::User),
+        "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
-        "system"    => Ok(Role::System),
-        other       => Err(SessionStorageError::StorageError(
-            format!("Unknown role in DB: '{}'", other),
-        )),
+        "system" => Ok(Role::System),
+        "tool" => Ok(Role::Tool),
+        other => Err(SessionStorageError::StorageError(format!(
+            "Unknown role in DB: '{}'",
+            other
+        ))),
     }
 }
 
@@ -60,8 +66,11 @@ impl TryFrom<SessionRow> for Session {
     type Error = SessionStorageError;
     fn try_from(r: SessionRow) -> Result<Self, Self::Error> {
         Ok(Session {
-            id:         r.id,
-            title:      r.title,
+            id: r.id,
+            title: r.title,
+            total_prompt_tokens: r.total_prompt_tokens as u32,
+            total_completion_tokens: r.total_completion_tokens as u32,
+            model_name: r.model_name,
             created_at: parse_dt(&r.created_at),
             updated_at: parse_dt(&r.updated_at),
         })
@@ -72,9 +81,13 @@ impl TryFrom<MessageRow> for SessionMessage {
     type Error = SessionStorageError;
     fn try_from(r: MessageRow) -> Result<Self, Self::Error> {
         Ok(SessionMessage {
-            id:         r.id,
+            id: r.id,
             session_id: r.session_id,
-            message:    ChatMessage { role: str_to_role(&r.role)?, content: r.content, images: Vec::new() },
+            message: ChatMessage {
+                role: str_to_role(&r.role)?,
+                content: r.content,
+                images: Vec::new(),
+            },
             created_at: parse_dt(&r.created_at),
         })
     }
@@ -109,7 +122,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -118,7 +131,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         match row {
             Some(r) => Session::try_from(r),
-            None    => Err(SessionStorageError::SessionNotFound(session_id.to_string())),
+            None => Err(SessionStorageError::SessionNotFound(session_id.to_string())),
         }
     }
 
@@ -150,7 +163,10 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(message)
     }
 
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError> {
+    async fn get_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError> {
         self.get_session(session_id).await?; // guard: session must exist
 
         let rows = sqlx::query_as::<_, MessageRow>(
@@ -174,14 +190,12 @@ impl SessionStorage for SqliteSessionStorage {
     ) -> Result<(), SessionStorageError> {
         self.get_session(session_id).await?; // guard: session must exist
 
-        sqlx::query(
-            "UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(&title)
-        .bind(session_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        sqlx::query("UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(&title)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
 
         Ok(())
     }
@@ -198,7 +212,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -253,10 +267,37 @@ impl SessionStorage for SqliteSessionStorage {
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
 
-        let mut messages: Vec<SessionMessage> =
-            rows.into_iter().map(SessionMessage::try_from).collect::<Result<_, _>>()?;
+        let mut messages: Vec<SessionMessage> = rows
+            .into_iter()
+            .map(SessionMessage::try_from)
+            .collect::<Result<_, _>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    async fn increment_usage(
+        &self,
+        session_id: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        model_name: Option<&str>,
+    ) -> Result<(), SessionStorageError> {
+        sqlx::query(
+            "UPDATE sessions SET \
+                total_prompt_tokens = total_prompt_tokens + ?, \
+                total_completion_tokens = total_completion_tokens + ?, \
+                model_name = COALESCE(?, model_name), \
+                updated_at = datetime('now') \
+             WHERE id = ?",
+        )
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(model_name)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -288,14 +329,21 @@ mod tests {
     async fn get_nonexistent_session_returns_error() {
         let (s, _tmp) = make_storage().await;
         let result = s.get_session("missing").await;
-        assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
     }
 
     #[tokio::test]
     async fn add_and_retrieve_messages() {
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
-        let msg = SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("Hello"));
+        let msg = SessionMessage::new(
+            "m1".to_string(),
+            "sess-1".to_string(),
+            ChatMessage::user("Hello"),
+        );
         s.add_message("sess-1".to_string(), msg).await.unwrap();
         let msgs = s.get_messages("sess-1").await.unwrap();
         assert_eq!(msgs.len(), 1);
@@ -307,8 +355,26 @@ mod tests {
     async fn messages_preserve_insertion_order() {
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
-        s.add_message("sess-1".to_string(), SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("First"))).await.unwrap();
-        s.add_message("sess-1".to_string(), SessionMessage::new("m2".to_string(), "sess-1".to_string(), ChatMessage::assistant("Second"))).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("First"),
+            ),
+        )
+        .await
+        .unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m2".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Second"),
+            ),
+        )
+        .await
+        .unwrap();
         let msgs = s.get_messages("sess-1").await.unwrap();
         assert_eq!(msgs[0].message.content, "First");
         assert_eq!(msgs[1].message.content, "Second");
@@ -318,17 +384,36 @@ mod tests {
     async fn delete_session_cascades_to_messages() {
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
-        s.add_message("sess-1".to_string(), SessionMessage::new("m1".to_string(), "sess-1".to_string(), ChatMessage::user("Hi"))).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
         s.delete_session("sess-1").await.unwrap();
-        assert!(matches!(s.get_session("sess-1").await, Err(SessionStorageError::SessionNotFound(_))));
+        assert!(matches!(
+            s.get_session("sess-1").await,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
     }
 
     #[tokio::test]
     async fn add_message_to_missing_session_errors() {
         let (s, _tmp) = make_storage().await;
-        let msg = SessionMessage::new("m1".to_string(), "no-session".to_string(), ChatMessage::user("Hi"));
+        let msg = SessionMessage::new(
+            "m1".to_string(),
+            "no-session".to_string(),
+            ChatMessage::user("Hi"),
+        );
         let result = s.add_message("no-session".to_string(), msg).await;
-        assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -339,8 +424,14 @@ mod tests {
         // Add a message to sess-a to update its updated_at
         s.add_message(
             "sess-a".to_string(),
-            SessionMessage::new("m1".to_string(), "sess-a".to_string(), ChatMessage::user("Hi")),
-        ).await.unwrap();
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-a".to_string(),
+                ChatMessage::user("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
 
         let sessions = s.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 2);
@@ -356,8 +447,14 @@ mod tests {
         for i in 0..10 {
             s.add_message(
                 "sess-1".to_string(),
-                SessionMessage::new(format!("m{}", i), "sess-1".to_string(), ChatMessage::user(format!("Msg {}", i))),
-            ).await.unwrap();
+                SessionMessage::new(
+                    format!("m{}", i),
+                    "sess-1".to_string(),
+                    ChatMessage::user(format!("Msg {}", i)),
+                ),
+            )
+            .await
+            .unwrap();
         }
 
         let page = s.get_messages_paginated("sess-1", 3, 0).await.unwrap();
@@ -384,7 +481,9 @@ mod tests {
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
 
-        s.update_title("sess-1", "Weather Chat".to_string()).await.unwrap();
+        s.update_title("sess-1", "Weather Chat".to_string())
+            .await
+            .unwrap();
         let session = s.get_session("sess-1").await.unwrap();
         assert_eq!(session.title, Some("Weather Chat".to_string()));
     }
@@ -393,7 +492,10 @@ mod tests {
     async fn update_title_on_missing_session_errors() {
         let (s, _tmp) = make_storage().await;
         let result = s.update_title("missing", "Nope".to_string()).await;
-        assert!(matches!(result, Err(SessionStorageError::SessionNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -451,7 +553,16 @@ mod tests {
             let db = Database::init(tmp.path()).await.unwrap();
             let s = SqliteSessionStorage::new(db.system);
             s.create_session("persistent".to_string()).await.unwrap();
-            s.add_message("persistent".to_string(), SessionMessage::new("m1".to_string(), "persistent".to_string(), ChatMessage::user("Remember me"))).await.unwrap();
+            s.add_message(
+                "persistent".to_string(),
+                SessionMessage::new(
+                    "m1".to_string(),
+                    "persistent".to_string(),
+                    ChatMessage::user("Remember me"),
+                ),
+            )
+            .await
+            .unwrap();
         }
         // Second run: read back
         {

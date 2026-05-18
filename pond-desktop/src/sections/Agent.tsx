@@ -8,6 +8,7 @@ import {
 } from "@heroui/react";
 import { Trash2, Plus, Send, Wrench, Terminal, FileText, ChefHat } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { PageHeader } from "../components/shared";
 import type { AgentTool, AgentRecipe, PromptExtra, ChatEvent } from "../api/types";
 
 type Tab = "chat" | "tools" | "extras" | "recipes";
@@ -16,11 +17,8 @@ export function Agent() {
   const [tab, setTab] = useState<Tab>("chat");
 
   return (
-    <div className="screen">
-      {/* Page header */}
-      <div className="page-header">
-        <h1 className="page-header__title">Agent</h1>
-      </div>
+    <div className="screen screen--agent">
+      <PageHeader title="Agent" />
 
       <Tabs
         selectedKey={tab}
@@ -110,7 +108,7 @@ function AgentChatPanel() {
   }
 
   return (
-    <Card shadow="none" className="giap-card agent-chat-card">
+    <Card className="card agent-chat-card">
       <CardContent style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", minHeight: "420px" }}>
         {/* Messages */}
         <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 4 }}>
@@ -194,7 +192,7 @@ function ToolsPanel() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
       {Object.entries(byExtension).map(([ext, extTools]) => (
-        <Card key={ext} shadow="none" className="giap-card">
+        <Card key={ext} className="card">
           <CardContent className="card-body--flush">
             <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderBottom: "1px solid var(--grey-200)", background: "var(--grey-50)" }}>
               <Chip variant="primary" size="sm">{ext}</Chip>
@@ -289,7 +287,7 @@ function ExtrasPanel() {
           <span>No prompt extras. Extras are injected into every agent system prompt.</span>
         </div>
       ) : (
-        <Card shadow="none" className="giap-card">
+        <Card className="card">
           <CardContent className="card-body--flush">
             {extras.map((ex) => (
               <div key={ex.key} className="extra-row">
@@ -336,7 +334,7 @@ function RecipesPanel() {
   if (loading) return <p className="muted-12">Loading recipes...</p>;
   if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
   if (!recipes.length) return (
-    <Card shadow="none" className="giap-card">
+    <Card className="card">
       <CardContent>
         <div className="empty-state">
           <ChefHat size={28} />
@@ -357,7 +355,7 @@ function RecipesPanel() {
   return (
     <div style={{ display: "flex", gap: 12, paddingTop: 8, minHeight: 320 }}>
       {/* Recipe list */}
-      <Card shadow="none" className="giap-card" style={{ width: 200, flexShrink: 0 }}>
+      <Card className="card" style={{ width: 200, flexShrink: 0 }}>
         <CardContent className="card-body--list" style={{ padding: 4 }}>
           {recipes.map((r) => (
             <button
@@ -376,7 +374,7 @@ function RecipesPanel() {
       </Card>
 
       {/* Recipe detail */}
-      <Card shadow="none" className="giap-card" style={{ flex: 1, minWidth: 0 }}>
+      <Card className="card" style={{ flex: 1, minWidth: 0 }}>
         <CardContent style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {current ? (
             <>

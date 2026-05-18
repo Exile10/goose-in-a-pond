@@ -88,10 +88,7 @@ fn ollama_response(content: &str) -> serde_json::Value {
     })
 }
 
-async fn make_chat_service(
-    ollama_uri: &str,
-    voice_out: Arc<CapturingVoiceOutput>,
-) -> ChatService {
+async fn make_chat_service(ollama_uri: &str, voice_out: Arc<CapturingVoiceOutput>) -> ChatService {
     let agent = Arc::new(MockAgent::new());
     let storage = Arc::new(InMemorySessionStorage::new());
     let session_id = "test-session".to_string();
@@ -159,8 +156,7 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(ollama_response("My name is Goose.")),
+            ResponseTemplate::new(200).set_body_json(ollama_response("My name is Goose.")),
         )
         .mount(&server)
         .await;
@@ -195,8 +191,7 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
         let body = String::from_utf8_lossy(&r.body);
         body.contains("What did you say your name was?")
     });
-    let body: serde_json::Value =
-        serde_json::from_slice(&second_turn.unwrap().body).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&second_turn.unwrap().body).unwrap();
 
     let contents: Vec<&str> = body["messages"]
         .as_array()
@@ -238,8 +233,7 @@ async fn voice_mode_whisper_to_ollama_pipeline() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(ollama_response("A famous JFK quote.")),
+            ResponseTemplate::new(200).set_body_json(ollama_response("A famous JFK quote.")),
         )
         .mount(&ollama_server)
         .await;
@@ -277,9 +271,7 @@ async fn pipeline_message_roles_are_correct() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(ollama_response("42")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(ollama_response("42")))
         .mount(&server)
         .await;
 
@@ -295,7 +287,9 @@ async fn pipeline_message_roles_are_correct() {
         )))
         .with_voice_output(Arc::new(CapturingVoiceOutput::default()));
 
-    svc.chat_once("What is 6 times 7?".to_string()).await.unwrap();
+    svc.chat_once("What is 6 times 7?".to_string())
+        .await
+        .unwrap();
 
     let messages = storage.get_messages(&session_id).await.unwrap();
     assert!(messages.len() >= 2, "expected at least 2 messages");
@@ -361,8 +355,8 @@ async fn live_full_voice_loop() {
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
 fn load_jfk_wav() -> Vec<u8> {
-    let wav_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/blobs/jfk.wav");
+    let wav_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");
     std::fs::read(&wav_path)
         .expect("tests/blobs/jfk.wav not found — run `cargo test` from workspace root")
 }

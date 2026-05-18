@@ -2,17 +2,25 @@ import { useState, useEffect, useCallback } from "react";
 import { Button, Card, CardContent, Chip, Input, Switch, Tabs } from "@heroui/react";
 import { RefreshCw, Download, Search } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { PageHeader } from "../components/shared";
 import type { LogEntry } from "../api/types";
 
 type LevelFilter = "ALL" | "INFO" | "WARN" | "ERROR";
 
+const LEVELS: { key: LevelFilter; label: string }[] = [
+  { key: "ALL", label: "All" },
+  { key: "INFO", label: "Info" },
+  { key: "WARN", label: "Warn" },
+  { key: "ERROR", label: "Error" },
+];
+
 export function Logs() {
-  const [entries, setEntries]       = useState<LogEntry[]>([]);
-  const [level, setLevel]           = useState<LevelFilter>("ALL");
-  const [search, setSearch]         = useState("");
+  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [level, setLevel] = useState<LevelFilter>("ALL");
+  const [search, setSearch] = useState("");
   const [autoscroll, setAutoscroll] = useState(true);
-  const [loading, setLoading]       = useState(true);
-  const [error, setError]           = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -25,7 +33,6 @@ export function Logs() {
 
   useEffect(() => { load(); }, [load]);
 
-  // Auto-refresh every 10s
   useEffect(() => {
     const id = setInterval(load, 10_000);
     return () => clearInterval(id);
@@ -47,18 +54,15 @@ export function Logs() {
   function levelColor(l: string): "danger" | "warning" | "default" {
     switch (l.toUpperCase()) {
       case "ERROR": return "danger";
-      case "WARN":  return "warning";
-      default:      return "default";
+      case "WARN": return "warning";
+      default: return "default";
     }
   }
 
   return (
     <div className="screen screen--logs">
-      <div className="page-header">
-        <h1 className="page-header__title">Logs</h1>
-      </div>
+      <PageHeader title="Logs" />
 
-      {/* Toolbar */}
       <div className="logs-toolbar">
         <Tabs
           selectedKey={level}
@@ -66,10 +70,10 @@ export function Logs() {
         >
           <Tabs.ListContainer>
             <Tabs.List aria-label="Log level filter">
-              {(["ALL", "INFO", "WARN", "ERROR"] as const).map((l) => (
-                <Tabs.Tab key={l} id={l} onClick={() => setLevel(l)}>
+              {LEVELS.map((l) => (
+                <Tabs.Tab key={l.key} id={l.key} onClick={() => setLevel(l.key)}>
                   <Tabs.Indicator />
-                  {l === "ALL" ? "All" : l.charAt(0) + l.slice(1).toLowerCase()}
+                  {l.label}
                 </Tabs.Tab>
               ))}
             </Tabs.List>
@@ -81,7 +85,7 @@ export function Logs() {
             size="sm"
             radius="md"
             variant="bordered"
-            placeholder="Search messages…"
+            placeholder="Search messages..."
             value={search}
             onValueChange={setSearch}
             startContent={<Search size={14} />}
@@ -99,16 +103,15 @@ export function Logs() {
           <Button size="sm" variant="light" onPress={load} isDisabled={loading} startContent={<RefreshCw size={14} />}>
             Refresh
           </Button>
-          <Button size="sm" variant="bordered" radius="md" onPress={downloadCsv} startContent={<Download size={14} />}>
+          <Button size="sm" variant="outline" radius="md" onPress={downloadCsv} startContent={<Download size={14} />}>
             Download CSV
           </Button>
         </div>
       </div>
 
-      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>{error}</p>}
+      {error && <p className="text-error" style={{ fontSize: 12, margin: 0 }}>{error}</p>}
 
-      {/* Log table */}
-      <Card shadow="none" className="giap-card logs-table">
+      <Card className="card logs-table">
         <CardContent className="card-body--flush">
           <div className="logs-table__head">
             <div>Timestamp</div>
@@ -116,15 +119,15 @@ export function Logs() {
             <div>Source</div>
             <div>Message</div>
           </div>
-          <div>
+          <div className="logs-table__body">
             {loading && entries.length === 0 && (
               <div className="empty-state empty-state--inline">
-                <span>Loading logs\u2026</span>
+                <span>Loading logs...</span>
               </div>
             )}
             {!loading && filtered.length === 0 && (
               <div className="empty-state empty-state--inline">
-                <span>No log entries {search ? "match" : "found"}.</span>
+                <span>No log entries match.</span>
               </div>
             )}
             {filtered.map((e) => (
@@ -136,14 +139,7 @@ export function Logs() {
                   </Chip>
                 </div>
                 <div className="logs-table__src"><code>{e.source}</code></div>
-                <div className="logs-table__msg">
-                  {e.message}
-                  {e.metadata && (
-                    <code style={{ display: "block", marginTop: 2, fontSize: "10px", color: "var(--grey-500)", wordBreak: "break-all" }}>
-                      {truncate(e.metadata, 120)}
-                    </code>
-                  )}
-                </div>
+                <div className="logs-table__msg">{e.message}</div>
               </div>
             ))}
           </div>
@@ -153,8 +149,6 @@ export function Logs() {
   );
 }
 
-// ── Helpers ───────────────────────────────────────────────────
-
 function formatTs(ts: string): string {
   try {
     const d = new Date(ts);
@@ -162,8 +156,4 @@ function formatTs(ts: string): string {
   } catch {
     return ts;
   }
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "\u2026" : s;
 }

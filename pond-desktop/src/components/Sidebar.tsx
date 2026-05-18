@@ -14,6 +14,7 @@ import {
   ScrollText,
   Box,
   PenLine,
+  Puzzle,
   Settings,
   Bot,
   ChevronLeft,
@@ -26,19 +27,21 @@ import {
 // ── Icon map — standard lucide icons matching each section's intent ──────────
 
 const NAV_ICONS: Record<string, React.ElementType> = {
-  home:     LayoutDashboard,
-  chat:     MessageCircle,
-  devices:  Monitor,
-  clock:    CalendarClock,
-  memory:   Brain,
-  skills:   Sparkles,
-  logs:     ScrollText,
-  model:    Box,
-  prompt:   PenLine,
-  settings: Settings,
-  face:     ScanFace,
-  canvas:   Layers,
-  agent:    Bot,
+  dashboard:  LayoutDashboard,
+  home:       LayoutDashboard,
+  chat:       MessageCircle,
+  devices:    Monitor,
+  clock:      CalendarClock,
+  memory:     Brain,
+  skills:     Sparkles,
+  logs:       ScrollText,
+  extensions: Puzzle,
+  model:      Box,
+  prompt:     PenLine,
+  settings:   Settings,
+  face:       ScanFace,
+  canvas:     Layers,
+  agent:      Bot,
 };
 
 function NavIcon({ name }: { name: string }) {
@@ -83,22 +86,50 @@ export function Sidebar() {
   }
 
   async function switchToCanvas() {
-    dispatch({ type: "SET_MODE", payload: "canvas" });
-    try { await invoke("show_canvas"); } catch { /* ignore */ }
+    // Try Tauri native canvas window first; fall back to inline section
+    try {
+      await invoke("show_canvas");
+      dispatch({ type: "SET_MODE", payload: "canvas" });
+    } catch {
+      dispatch({ type: "SET_SECTION", payload: "canvas" });
+    }
   }
 
   return (
     <aside
       className={`sidebar ${collapsed ? "is-collapsed" : ""}`}
       aria-label="Navigation"
-      style={collapsed ? { width: "var(--sidebar-width-collapsed)", minWidth: "var(--sidebar-width-collapsed)" } : undefined}
     >
       {/* ── Brand ── */}
-      <div className="sidebar__brand" style={collapsed ? { justifyContent: "center", padding: "12px 8px 14px" } : undefined}>
+      <div className={`sidebar__brand${collapsed ? " sidebar__brand--collapsed" : ""}`}>
         <div className="sidebar__logo">
           <img src={logoSrc} alt="" style={{ width: 26, height: 26, objectFit: "contain" }} />
         </div>
         {!collapsed && <span className="sidebar__brand-name">Goose In A Pond</span>}
+      </div>
+
+      {/* ── Mode buttons (Voice + Canvas) — at top ── */}
+      <div className="sidebar__actions">
+        <Button
+          size="sm"
+          variant="outline"
+          className="sidebar__action-btn"
+          onPress={switchToVoice}
+          aria-label="Voice mode"
+        >
+          <Mic size={14} />
+          {!collapsed && "Voice"}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="sidebar__action-btn"
+          onPress={switchToCanvas}
+          aria-label="Canvas mode"
+        >
+          <Layers size={14} />
+          {!collapsed && "Canvas"}
+        </Button>
       </div>
 
       {/* ── Navigation groups ── */}
@@ -106,7 +137,7 @@ export function Sidebar() {
         {SIDEBAR_GROUPS.map((group, gi) => (
           <div className="sidebar__group" key={gi}>
             {group.label && !collapsed && (
-              <div className="sidebar__group-label">{group.label}</div>
+              <div className="sidebar__group-label">{group.label.charAt(0) + group.label.slice(1).toLowerCase()}</div>
             )}
             {group.sections.map((item) => {
               const active = state.section === item.section;
@@ -118,7 +149,6 @@ export function Sidebar() {
                   aria-current={active ? "page" : undefined}
                   aria-label={item.label}
                   title={collapsed ? item.label : undefined}
-                  style={collapsed ? { justifyContent: "center", padding: "0 4px" } : undefined}
                 >
                   <span className="sidebar__icon">
                     <NavIcon name={item.icon} />
@@ -134,7 +164,7 @@ export function Sidebar() {
       {/* ── Footer ── */}
       <div className="sidebar__footer">
         {/* Server status */}
-        <div className="sidebar__status" style={collapsed ? { justifyContent: "center" } : undefined}>
+        <div className="sidebar__status">
           <span className={`sidebar__status-dot ${state.serverOnline ? "is-connected" : ""}`} />
           {!collapsed && (
             <span>
@@ -143,43 +173,12 @@ export function Sidebar() {
           )}
         </div>
 
-        {/* Mode buttons */}
-        <div className="sidebar__actions" style={collapsed ? { flexDirection: "column" } : undefined}>
-          <Button
-            size="sm"
-            variant="bordered"
-            className="sidebar__action-btn"
-            onPress={switchToVoice}
-            aria-label="Voice mode"
-          >
-            <Mic size={14} />
-            {!collapsed && "Voice"}
-          </Button>
-          <Button
-            size="sm"
-            variant="bordered"
-            className="sidebar__action-btn"
-            onPress={switchToCanvas}
-            aria-label="Canvas mode"
-          >
-            <Layers size={14} />
-            {!collapsed && "Canvas"}
-          </Button>
-        </div>
-
         {/* Collapse toggle */}
         <button
           className="sidebar__collapse-btn"
           onClick={toggleCollapsed}
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          style={{
-            display: "flex", alignItems: "center", justifyContent: "center",
-            height: 24, background: "transparent", border: "none", cursor: "pointer",
-            color: "var(--grey-400)", borderRadius: "var(--radius-sm)",
-            margin: "2px 8px 0", width: "calc(100% - 16px)",
-            transition: "color 0.15s",
-          }}
         >
           {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
         </button>

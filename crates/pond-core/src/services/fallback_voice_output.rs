@@ -11,13 +11,13 @@
 //! ));
 //! ```
 
-use std::sync::Arc;
+use crate::ports::voice_output::VoiceOutput;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::ports::voice_output::VoiceOutput;
+use std::sync::Arc;
 
 pub struct FallbackVoiceOutput {
-    primary:  Arc<dyn VoiceOutput>,
+    primary: Arc<dyn VoiceOutput>,
     fallback: Arc<dyn VoiceOutput>,
 }
 
@@ -37,6 +37,44 @@ impl VoiceOutput for FallbackVoiceOutput {
                 self.fallback.speak(text).await
             }
         }
+    }
+
+    async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>> {
+        match self.primary.synthesize(text).await {
+            Ok(v) => Ok(v),
+            Err(_) => self.fallback.synthesize(text).await,
+        }
+    }
+
+    async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
+        match self.primary.play_audio(audio.clone()).await {
+            Ok(()) => Ok(()),
+            Err(_) => self.fallback.play_audio(audio).await,
+        }
+    }
+
+    fn stop_speaking(&self) {
+        self.primary.stop_speaking();
+    }
+
+    fn start_thinking_tone(&self) {
+        self.primary.start_thinking_tone();
+    }
+
+    fn stop_thinking_tone(&self) {
+        self.primary.stop_thinking_tone();
+    }
+
+    fn start_barge_in_listener(&self) {
+        self.primary.start_barge_in_listener();
+    }
+
+    fn stop_barge_in_listener(&self) {
+        self.primary.stop_barge_in_listener();
+    }
+
+    async fn speak_quip(&self) -> Option<&'static str> {
+        self.primary.speak_quip().await
     }
 }
 
@@ -74,8 +112,14 @@ mod tests {
         );
 
         tts.speak("hello").await.unwrap();
-        assert!(primary_called.load(Ordering::SeqCst), "primary should have been called");
-        assert!(!fallback_called.load(Ordering::SeqCst), "fallback should NOT have been called");
+        assert!(
+            primary_called.load(Ordering::SeqCst),
+            "primary should have been called"
+        );
+        assert!(
+            !fallback_called.load(Ordering::SeqCst),
+            "fallback should NOT have been called"
+        );
     }
 
     #[tokio::test]
@@ -88,15 +132,15 @@ mod tests {
         );
 
         tts.speak("hello").await.unwrap();
-        assert!(fallback_called.load(Ordering::SeqCst), "fallback should have been called");
+        assert!(
+            fallback_called.load(Ordering::SeqCst),
+            "fallback should have been called"
+        );
     }
 
     #[tokio::test]
     async fn returns_error_when_both_fail() {
-        let tts = FallbackVoiceOutput::new(
-            Arc::new(FailingTts),
-            Arc::new(FailingTts),
-        );
+        let tts = FallbackVoiceOutput::new(Arc::new(FailingTts), Arc::new(FailingTts));
         let err = tts.speak("hello").await.unwrap_err();
         assert!(err.to_string().contains("TTS server offline"));
     }

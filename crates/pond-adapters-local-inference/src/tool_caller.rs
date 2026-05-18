@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use goose::conversation::message::Message;
 use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
-use goose::conversation::message::Message;
 use pond_core::ports::tool_caller::ToolCaller;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +43,8 @@ impl ToolCallerEngine {
         };
 
         println!("[tool_caller] loading specialist model: {}", model_id);
-        let provider = LocalInferenceProvider::from_env(model_config.clone(), vec![]).await
+        let provider = LocalInferenceProvider::from_env(model_config.clone(), vec![])
+            .await
             .map_err(|e| anyhow!("Failed to load tool-caller model '{}': {e}", model_id))?;
         println!("[tool_caller] specialist model loaded: {}", model_id);
 
@@ -63,40 +64,229 @@ impl ToolCaller for ToolCallerEngine {
         tool_schema_json: &str,
         user_query: &str,
     ) -> Result<serde_json::Map<String, serde_json::Value>> {
-        use rmcp::model::Tool;
+        // Build FunctionGemma's exact prompt format.
+        // Ref: https://ai.google.dev/gemma/docs/functiongemma/formatting-and-best-practices
+        //
+        // We bypass Goose's template rendering entirely — no Jinja, no rmcp Tool
+        // objects. The prompt is constructed in FunctionGemma's native format:
+        //   <start_of_turn>developer ... <start_function_declaration>declaration:NAME{...}<end_function_declaration><end_of_turn>
+        //   <start_of_turn>user ... <end_of_turn>
+        //   <start_of_turn>model\n
+        //
+        // The model outputs: <start_function_call>call:NAME{key:<escape>val<escape>}<end_function_call>
 
-        let system = "You are a tool-calling assistant. Call the appropriate tool for the user's request.";
+        let declaration = build_functiongemma_declaration(tool_name, tool_schema_json);
 
-        // Build a proper rmcp Tool so the GGUF chat template renders it via
-        // its native tool-calling path (Gemma's <tool_call> format, etc.).
-        // Passing tools as freeform text causes FunctionGemma's Jinja template
-        // to enter a degenerate recursive rendering loop.
-        let tool: Tool = serde_json::from_value(serde_json::json!({
-            "name": tool_name,
-            "description": format!("Look up information about a topic using {}", tool_name),
-            "inputSchema": serde_json::from_str::<serde_json::Value>(tool_schema_json)
-                .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}})),
-        })).unwrap_or_else(|_| {
-            // Fallback: construct minimal tool manually
-            serde_json::from_value(serde_json::json!({
-                "name": tool_name,
-                "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}}},
-            })).expect("hardcoded tool schema must parse")
-        });
+        // The system prompt IS the function declaration — FunctionGemma was trained
+        // with this exact activation phrase followed by inline declarations.
+        let system = format!(
+            "You are a model that can do function calling with the following functions{}",
+            declaration
+        );
 
-        let prompt = format!("User request: {user_query}");
-        println!("[tool_caller] generating args for tool={}, query={:?}", tool_name, user_query);
+        println!("[tool_caller] ┌─────────────────────────────────────");
+        println!("[tool_caller] │ tool:   {}", tool_name);
+        println!("[tool_caller] │ query:  {:?}", user_query);
+        println!(
+            "[tool_caller] │ system: {}...({} chars)",
+            &system[..system.len().min(120)],
+            system.len()
+        );
+        println!("[tool_caller] └─────────────────────────────────────");
 
-        let messages = vec![Message::user().with_text(&prompt)];
-        let (response, _usage) = self.provider
-            .complete(&self.model_config, &self.session_id, system, &messages, &[tool])
+        // Pass NO tools to the provider — we've baked the declaration into the
+        // system prompt. The model generates text, we parse the function call.
+        let messages = vec![Message::user().with_text(user_query)];
+        let (response, _usage) = self
+            .provider
+            .complete(
+                &self.model_config,
+                &self.session_id,
+                &system,
+                &messages,
+                &[], // No tools — declarations are in the system prompt
+            )
             .await
             .map_err(|e| anyhow!("Tool-caller inference failed: {e}"))?;
 
         let response_text = response.as_concat_text();
-        println!("[tool_caller] raw response: {:?}", response_text);
+        println!(
+            "[tool_caller] raw response ({}): {:?}",
+            response_text.len(),
+            &response_text[..response_text.len().min(300)]
+        );
 
-        parse_tool_call_json(&response_text, tool_name)
+        // Parse: try FunctionGemma's native format first, then JSON fallback
+        if let Some(args) = parse_functiongemma_call(&response_text) {
+            println!(
+                "[tool_caller] parsed FunctionGemma call: {:?}",
+                args.keys().collect::<Vec<_>>()
+            );
+            return Ok(args);
+        }
+        if let Ok(args) = parse_tool_call_json(&response_text, tool_name) {
+            println!(
+                "[tool_caller] parsed JSON: {:?}",
+                args.keys().collect::<Vec<_>>()
+            );
+            return Ok(args);
+        }
+
+        Err(anyhow!(
+            "Tool-caller produced no usable output for '{}': {:?}",
+            tool_name,
+            &response_text[..response_text.len().min(200)]
+        ))
+    }
+}
+
+/// Build a FunctionGemma-style function declaration from a JSON schema.
+///
+/// Output format (no spaces, all on one line):
+/// `<start_function_declaration>declaration:NAME{description:<escape>DESC<escape>,parameters:{properties:{key:{description:<escape>DESC<escape>,type:<escape>TYPE<escape>}},required:[<escape>key<escape>],type:<escape>OBJECT<escape>}}<end_function_declaration>`
+fn build_functiongemma_declaration(tool_name: &str, schema_json: &str) -> String {
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_json).unwrap_or_else(|_| serde_json::json!({}));
+
+    let mut decl = String::new();
+    decl.push_str("<start_function_declaration>declaration:");
+    decl.push_str(tool_name);
+    decl.push('{');
+
+    // Description — derive from properties
+    let properties = schema.get("properties").and_then(|p| p.as_object());
+    if let Some(props) = properties {
+        let desc: String = props
+            .iter()
+            .map(|(k, v)| {
+                let d = v.get("description").and_then(|d| d.as_str()).unwrap_or(k);
+                format!("{}: {}", k, d)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        decl.push_str("description:<escape>");
+        decl.push_str(&desc);
+        decl.push_str("<escape>,");
+    }
+
+    // Parameters
+    decl.push_str("parameters:{properties:{");
+    if let Some(props) = properties {
+        let prop_strs: Vec<String> = props
+            .iter()
+            .map(|(name, spec)| {
+                let desc = spec
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or(name);
+                let typ = spec
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("string")
+                    .to_uppercase();
+                format!(
+                    "{}:{{description:<escape>{}<escape>,type:<escape>{}<escape>}}",
+                    name, desc, typ
+                )
+            })
+            .collect();
+        decl.push_str(&prop_strs.join(","));
+    }
+    decl.push_str("},");
+
+    // Required
+    let required = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("<escape>{}<escape>", s))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    decl.push_str("required:[");
+    decl.push_str(&required);
+    decl.push_str("],type:<escape>OBJECT<escape>}");
+
+    decl.push('}');
+    decl.push_str("<end_function_declaration>");
+    decl
+}
+
+/// Parse FunctionGemma's native `<start_function_call>` output format.
+///
+/// Format: `<start_function_call>call:NAME{key:<escape>string_val<escape>,key2:42}<end_function_call>`
+/// String values use `<escape>` delimiters. Bare values for integers/booleans.
+fn parse_functiongemma_call(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let call_start = text.find("<start_function_call>call:")?;
+    let after_tag = &text[call_start + "<start_function_call>call:".len()..];
+    let brace_pos = after_tag.find('{')?;
+    let args_start = brace_pos + 1;
+    let end_tag_pos = after_tag
+        .find("<end_function_call>")
+        .unwrap_or(after_tag.len());
+    let args_end = after_tag[..end_tag_pos].rfind('}')?;
+    let args_block = &after_tag[args_start..args_end];
+
+    if args_block.trim().is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut remaining = args_block;
+
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start_matches([',', ' ']);
+        if remaining.is_empty() {
+            break;
+        }
+        let colon = match remaining.find(':') {
+            Some(p) => p,
+            None => break,
+        };
+        let key = remaining[..colon].trim().to_string();
+        remaining = &remaining[colon + 1..];
+
+        let value = if remaining.starts_with("<escape>") {
+            remaining = &remaining["<escape>".len()..];
+            match remaining.find("<escape>") {
+                Some(end) => {
+                    let val = remaining[..end].to_string();
+                    remaining = &remaining[end + "<escape>".len()..];
+                    serde_json::Value::String(val)
+                }
+                None => {
+                    let val = remaining.to_string();
+                    remaining = "";
+                    serde_json::Value::String(val)
+                }
+            }
+        } else {
+            let end = remaining.find(',').unwrap_or(remaining.len());
+            let raw = remaining[..end].trim();
+            remaining = &remaining[end..];
+            if let Ok(n) = raw.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if raw.eq_ignore_ascii_case("true") {
+                serde_json::Value::Bool(true)
+            } else if raw.eq_ignore_ascii_case("false") {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::String(raw.to_string())
+            }
+        };
+
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
     }
 }
 
@@ -113,9 +303,12 @@ fn parse_tool_call_json(
     // Strip markdown code fences if present
     let cleaned = text
         .trim()
-        .strip_prefix("```json").unwrap_or(text.trim())
-        .strip_prefix("```").unwrap_or(text.trim())
-        .strip_suffix("```").unwrap_or(text.trim())
+        .strip_prefix("```json")
+        .unwrap_or(text.trim())
+        .strip_prefix("```")
+        .unwrap_or(text.trim())
+        .strip_suffix("```")
+        .unwrap_or(text.trim())
         .trim();
 
     // Find the first '{' and last '}' to extract JSON even with surrounding text
@@ -123,7 +316,12 @@ fn parse_tool_call_json(
     let end = cleaned.rfind('}');
     let json_str = match (start, end) {
         (Some(s), Some(e)) if s < e => &cleaned[s..=e],
-        _ => return Err(anyhow!("No JSON object found in tool-caller response: {:?}", text)),
+        _ => {
+            return Err(anyhow!(
+                "No JSON object found in tool-caller response: {:?}",
+                text
+            ))
+        }
     };
 
     let value: serde_json::Value = serde_json::from_str(json_str)
@@ -132,7 +330,10 @@ fn parse_tool_call_json(
     // Case 1: {"name": "tool_name", "arguments": {...}}
     if let Some(args) = value.get("arguments") {
         if let Some(map) = args.as_object() {
-            println!("[tool_caller] parsed arguments from 'arguments' field: {:?}", map);
+            println!(
+                "[tool_caller] parsed arguments from 'arguments' field: {:?}",
+                map
+            );
             return Ok(map.clone());
         }
     }
@@ -140,7 +341,8 @@ fn parse_tool_call_json(
     // Case 2: {"key": "value"} — bare arguments (no "name" wrapper)
     if let Some(map) = value.as_object() {
         // Filter out "name" if present (it's the tool name, not an argument)
-        let args: serde_json::Map<String, serde_json::Value> = map.iter()
+        let args: serde_json::Map<String, serde_json::Value> = map
+            .iter()
             .filter(|(k, _)| k.as_str() != "name")
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -152,7 +354,8 @@ fn parse_tool_call_json(
 
     Err(anyhow!(
         "Tool-caller produced no usable arguments for '{}': {:?}",
-        tool_name, text
+        tool_name,
+        text
     ))
 }
 
@@ -188,12 +391,28 @@ fn register_tool_model(model_id: &str, data_dir: &Path) {
                     quantization: String::new(),
                     local_path,
                     source_url: String::new(),
-                    settings: ModelSettings::default(),
+                    settings: ModelSettings {
+                        // Jinja OFF — we build FunctionGemma's exact prompt format
+                        // ourselves in generate_tool_call(). Jinja would double-render.
+                        use_jinja: false,
+                        // Native tool calling ON — but we pass no tools to complete(),
+                        // so this only affects how the provider handles the response.
+                        native_tool_calling: true,
+                        // Dynamic context from available memory.
+                        context_size: None,
+                        ..ModelSettings::default()
+                    },
                     size_bytes: 0,
+                    mmproj_path: None,
+                    mmproj_size_bytes: 0,
+                    mmproj_source_url: None,
+                    shard_files: vec![],
                 };
                 match registry.add_model(entry) {
                     Ok(_) => println!("[tool_caller] registered GGUF '{}' in model registry", stem),
-                    Err(e) => tracing::warn!("Could not register tool-caller model '{}': {}", stem, e),
+                    Err(e) => {
+                        tracing::warn!("Could not register tool-caller model '{}': {}", stem, e)
+                    }
                 }
             }
         }
@@ -248,5 +467,30 @@ mod tests {
     fn parse_no_json_returns_error() {
         let input = "I don't know how to call tools.";
         assert!(parse_tool_call_json(input, "test").is_err());
+    }
+
+    #[test]
+    fn build_declaration_wikipedia() {
+        let schema = r#"{"type":"object","properties":{"topic":{"type":"string","description":"The topic to look up"}},"required":["topic"]}"#;
+        let decl = build_functiongemma_declaration("get_wikipedia_article", schema);
+        assert!(decl.starts_with("<start_function_declaration>declaration:get_wikipedia_article{"));
+        assert!(decl.ends_with("<end_function_declaration>"));
+        assert!(decl.contains(
+            "topic:{description:<escape>The topic to look up<escape>,type:<escape>STRING<escape>}"
+        ));
+        assert!(decl.contains("required:[<escape>topic<escape>]"));
+    }
+
+    #[test]
+    fn build_declaration_schedule() {
+        let schema = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron"},"prompt":{"type":"string","description":"Action to perform"}},"required":["cron","prompt"]}"#;
+        let decl = build_functiongemma_declaration("create_schedule", schema);
+        assert!(decl.contains(
+            "cron:{description:<escape>6-field cron<escape>,type:<escape>STRING<escape>}"
+        ));
+        assert!(decl.contains(
+            "prompt:{description:<escape>Action to perform<escape>,type:<escape>STRING<escape>}"
+        ));
+        assert!(decl.contains("required:[<escape>cron<escape>,<escape>prompt<escape>]"));
     }
 }

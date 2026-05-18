@@ -137,13 +137,13 @@ pub trait FaceRecognition: Send + Sync {
 /// One pair from [`FaceRecognition::pairwise_similarities`].
 #[derive(Debug, Clone)]
 pub struct PairwiseSimilarity {
-    pub id_a:         String,
-    pub id_b:         String,
-    pub profile_a:    String,
-    pub profile_b:    String,
+    pub id_a: String,
+    pub id_b: String,
+    pub profile_a: String,
+    pub profile_b: String,
     /// Cosine similarity in \[-1.0, 1.0\].  Same profile → ideally 0.6–0.95;
     /// different profile → ideally below 0.4.
-    pub similarity:   f32,
+    pub similarity: f32,
     /// Convenience flag: `profile_a == profile_b`.
     pub same_profile: bool,
 }

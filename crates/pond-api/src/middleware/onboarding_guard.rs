@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-use pond_core::services::onboarding::OnboardingService;
 use pond_core::domain::onboarding::OnboardingStep;
+use pond_core::services::onboarding::OnboardingService;
 
 /// Checks whether onboarding is complete.
 /// If onboarding is NOT completed:
@@ -28,7 +28,6 @@ pub async fn require_onboarding_complete(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, Response> {
-
     if state.skip_onboarding {
         return Ok(next.run(req).await);
     }
@@ -53,5 +52,3 @@ pub async fn require_onboarding_complete(
             .into_response()),
     }
 }
-
-

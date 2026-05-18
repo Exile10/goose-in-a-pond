@@ -36,7 +36,10 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<SessionMessage, SessionStorageError>;
 
     /// Get all messages for a session.
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>, SessionStorageError>;
+    async fn get_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessage>, SessionStorageError>;
 
     /// Update the title of a session.
     async fn update_title(
@@ -68,4 +71,15 @@ pub trait SessionStorage: Send + Sync {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>, SessionStorageError>;
+
+    /// Increment the cumulative token usage for a session.
+    async fn increment_usage(
+        &self,
+        _session_id: &str,
+        _prompt_tokens: u32,
+        _completion_tokens: u32,
+        _model_name: Option<&str>,
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
 }

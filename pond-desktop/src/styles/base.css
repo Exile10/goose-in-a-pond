@@ -3,14 +3,21 @@
    Reset · Fonts · Typography · Scrollbars · Cross-platform
    ============================================================================= */
 
-/* ── Font Imports (offline-first via fontsource) ───────────── */
-@import "@fontsource-variable/quicksand";
-@import "@fontsource-variable/comfortaa";
-@import "@fontsource/jetbrains-mono/400.css";
-/* Inter kept for HeroUI component library compatibility */
-@import "@fontsource/inter/400.css";
-@import "@fontsource/inter/500.css";
-@import "@fontsource/inter/600.css";
+/* ── Font Faces (bundled TTFs in public/fonts/) ────────────── */
+@font-face {
+  font-family: "Quicksand";
+  src: url("/fonts/Quicksand-VariableFont_wght.ttf") format("truetype");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Comfortaa";
+  src: url("/fonts/Comfortaa-VariableFont_wght.ttf") format("truetype");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
 
 /* ── Reset ──────────────────────────────────────────────────── */
 *,
@@ -51,28 +58,74 @@ body {
   overflow: hidden;
 }
 
-/* ── Typography ─────────────────────────────────────────────── */
+/* ── Typography — Jarida Brand Type System ─────────────────── */
+/* Quicksand for everything. letter-spacing tightens at large sizes,
+   loosens for uppercase labels. Matches jarida.css spec. */
 
 h1, h2, h3, h4, h5, h6 {
-  font-family: var(--font-display);
+  font-family: var(--font-heading);
   font-weight: var(--weight-bold);
   line-height: var(--leading-tight);
   color: var(--color-text);
+  margin: 0;
 }
 
-h1 { font-size: var(--text-2xl); }
-h2 { font-size: var(--text-xl); }
-h3 { font-size: var(--text-lg); }
-h4 { font-size: var(--text-md); }
-h5 { font-size: var(--text-base); }
+h1 { font-size: var(--text-2xl); letter-spacing: -0.01em; }
+h2 { font-size: var(--text-xl);  letter-spacing: -0.005em; }
+h3 { font-size: var(--text-lg);  }
+h4 { font-size: var(--text-md);  }
+h5 { font-size: var(--text-base); font-weight: var(--weight-semibold); }
 
 p {
   line-height: var(--leading-base);
+  text-wrap: pretty;
 }
 
 code, pre, kbd {
   font-family: var(--font-mono);
   font-size: 0.9em;
+}
+
+/* ── Semantic Text Roles (from Jarida Design System) ─────── */
+
+.display-hero {
+  font-family: var(--font-display);
+  font-weight: var(--weight-bold);
+  font-size: 48px;
+  line-height: var(--leading-tight);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+}
+
+.display-xl {
+  font-family: var(--font-display);
+  font-weight: var(--weight-bold);
+  font-size: 36px;
+  line-height: var(--leading-tight);
+  letter-spacing: -0.015em;
+}
+
+.lead {
+  font-family: var(--font-body);
+  font-size: var(--text-lg);
+  line-height: var(--leading-base);
+  color: var(--color-text-secondary);
+}
+
+.eyebrow {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+.caption {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  line-height: var(--leading-snug);
 }
 
 /* ── Interactive Elements ───────────────────────────────────── */
