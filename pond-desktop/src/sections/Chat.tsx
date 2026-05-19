@@ -497,7 +497,15 @@ export function Chat() {
               <p className="chat-empty__hint">Ask Pond anything. Type a message or use voice mode.</p>
             </div>
           )}
-          {messages.map((msg) => (
+          {messages.map((msg) => {
+            // Skip agent bubbles that have no visible content yet — these are the
+            // empty assistant_with_tool_calls preambles that show during streaming
+            // before the synthesis response arrives.
+            const hasText = msg.text && msg.text.trim().length > 0;
+            const hasCards = (msg.cards?.length ?? 0) > 0;
+            const hasThinking = (msg.thinkingBlocks?.length ?? 0) > 0;
+            if (msg.role === "agent" && !hasText && !hasCards && !hasThinking) return null;
+            return (
             <div
               key={msg.id}
               className={`bubble ${msg.role === "user" ? "bubble--user" : "bubble--assistant"}`}
@@ -561,7 +569,8 @@ export function Chat() {
                 </span>
               )}
             </div>
-          ))}
+            );
+          })}
           <div ref={bottomRef} />
         </div>
       </div>

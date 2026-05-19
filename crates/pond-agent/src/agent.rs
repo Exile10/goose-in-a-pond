@@ -594,6 +594,14 @@ impl Agent for PondAgent {
                     messages.push(ChatMessage::tool_result(result_text.clone(), id.clone()));
                 }
 
+                // Small local models (Gemma 4 E4B/E2B) don't reliably synthesize
+                // after structured role:tool messages without an explicit prompt.
+                // This nudge keeps the structured history intact while giving the
+                // model a clear signal to produce a text answer.
+                messages.push(ChatMessage::user(
+                    "Using the tool results above, provide a helpful answer to the user's question.",
+                ));
+
                 // Loop back for next LLM call with tool results.
             }
 
