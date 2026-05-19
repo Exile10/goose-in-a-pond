@@ -504,7 +504,7 @@ export function Chat() {
             const hasText = msg.text && msg.text.trim().length > 0;
             const hasCards = (msg.cards?.length ?? 0) > 0;
             const hasThinking = (msg.thinkingBlocks?.length ?? 0) > 0;
-            if (msg.role === "agent" && !hasText && !hasCards && !hasThinking) return null;
+            if (msg.role === "agent" && !hasText && !hasCards && !hasThinking && !msg.streaming) return null;
             return (
             <div
               key={msg.id}
