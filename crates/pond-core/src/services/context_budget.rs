@@ -38,6 +38,8 @@ pub struct CompactionProfile {
     pub max_memory_fragments: usize,
     /// Max tokens for the full system prompt (base + extras + memories).
     pub system_prompt_budget: usize,
+    /// Max tokens to allocate for conversation history injection (per request).
+    pub history_token_budget: usize,
     /// The effective context window this profile was derived from.
     pub context_window_tokens: usize,
 }
@@ -58,6 +60,7 @@ impl CompactionProfile {
                 memory_token_budget: 200,
                 max_memory_fragments: 3,
                 system_prompt_budget: 1500,
+                history_token_budget: 1200,
                 context_window_tokens: context_tokens,
             }
         } else if context_tokens <= 12288 {
@@ -67,6 +70,7 @@ impl CompactionProfile {
                 memory_token_budget: 500,
                 max_memory_fragments: 5,
                 system_prompt_budget: 3000,
+                history_token_budget: 4000,
                 context_window_tokens: context_tokens,
             }
         } else if context_tokens <= 65536 {
@@ -76,6 +80,7 @@ impl CompactionProfile {
                 memory_token_budget: 1500,
                 max_memory_fragments: 10,
                 system_prompt_budget: 6000,
+                history_token_budget: 20000,
                 context_window_tokens: context_tokens,
             }
         } else {
@@ -85,6 +90,7 @@ impl CompactionProfile {
                 memory_token_budget: 4000,
                 max_memory_fragments: 15,
                 system_prompt_budget: 10000,
+                history_token_budget: 80000,
                 context_window_tokens: context_tokens,
             }
         }
@@ -97,6 +103,24 @@ impl CompactionProfile {
     pub fn use_compact_prompt(&self) -> bool {
         self.context_window_tokens <= 12288
     }
+}
+
+/// Calculate available history budget in characters after system prompt and tool schema overhead.
+///
+/// The returned value is the upper bound for the total length of message
+/// content that may be injected as conversation history. Always returns at
+/// least [`MIN_USABLE_HISTORY_CHARS`] so the agent can carry at least the
+/// most recent turn even when overhead is large.
+pub fn available_history_chars(
+    profile: &CompactionProfile,
+    system_prompt_chars: usize,
+    tool_schema_chars: usize,
+) -> usize {
+    let total_budget_chars = profile.history_token_budget * CHARS_PER_TOKEN;
+    let overhead = system_prompt_chars + tool_schema_chars;
+    total_budget_chars
+        .saturating_sub(overhead)
+        .max(MIN_USABLE_HISTORY_CHARS)
 }
 
 /// Maximum assistant tool-output size kept verbatim in history.
@@ -248,6 +272,8 @@ mod tests {
             role: Role::User,
             content: content.to_string(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -349,6 +375,8 @@ mod tests {
                     "x".repeat(TOOL_RESULT_MAX_CHARS + 300)
                 ),
                 images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             },
             msg("normal user message"),
         ];
@@ -366,6 +394,8 @@ mod tests {
             role: Role::Assistant,
             content: "This is a normal answer without tool payload markers.".to_string(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         };
         let result = truncate_tool_outputs(vec![plain_assistant.clone()]);
         assert_eq!(result[0].content, plain_assistant.content);
@@ -417,6 +447,7 @@ mod tests {
         assert_eq!(p.memory_token_budget, 200);
         assert_eq!(p.max_memory_fragments, 3);
         assert_eq!(p.system_prompt_budget, 1500);
+        assert_eq!(p.history_token_budget, 1200);
         assert!(p.use_compact_prompt());
     }
 
@@ -427,6 +458,7 @@ mod tests {
         assert_eq!(p.memory_token_budget, 500);
         assert_eq!(p.max_memory_fragments, 5);
         assert_eq!(p.system_prompt_budget, 3000);
+        assert_eq!(p.history_token_budget, 4000);
         assert!(p.use_compact_prompt());
     }
 
@@ -437,6 +469,7 @@ mod tests {
         assert_eq!(p.memory_token_budget, 1500);
         assert_eq!(p.max_memory_fragments, 10);
         assert_eq!(p.system_prompt_budget, 6000);
+        assert_eq!(p.history_token_budget, 20000);
         assert!(!p.use_compact_prompt());
     }
 
@@ -447,7 +480,24 @@ mod tests {
         assert_eq!(p.memory_token_budget, 4000);
         assert_eq!(p.max_memory_fragments, 15);
         assert_eq!(p.system_prompt_budget, 10000);
+        assert_eq!(p.history_token_budget, 80000);
         assert!(!p.use_compact_prompt());
+    }
+
+    #[test]
+    fn available_history_chars_subtracts_overhead() {
+        let profile = CompactionProfile::from_context_window(8192);
+        // 4000 tokens * 4 chars/token = 16000 chars total budget
+        let avail = available_history_chars(&profile, 1000, 500);
+        assert_eq!(avail, 16_000 - 1500);
+    }
+
+    #[test]
+    fn available_history_chars_clamps_to_min_when_overhead_exceeds_budget() {
+        let profile = CompactionProfile::from_context_window(3072);
+        // 1200 * 4 = 4800 budget, overhead 10000 → should clamp to MIN_USABLE_HISTORY_CHARS
+        let avail = available_history_chars(&profile, 6000, 4000);
+        assert_eq!(avail, MIN_USABLE_HISTORY_CHARS);
     }
 
     #[test]

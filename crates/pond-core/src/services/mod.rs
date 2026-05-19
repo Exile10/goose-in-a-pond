@@ -6,6 +6,7 @@ pub mod context_monitor;
 pub mod fallback_provider;
 pub mod fallback_voice_output;
 pub mod fast_responder;
+pub mod history_manager;
 pub mod instant_activation;
 pub mod marketplace;
 pub mod memory_cleanup;
