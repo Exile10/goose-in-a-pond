@@ -1373,13 +1373,27 @@ async fn get_session_messages(
                 Role::System => "system",
                 Role::Tool => "tool",
             };
-            json!({
+            let mut obj = json!({
                 "id": m.id,
                 "session_id": m.session_id,
                 "role": role,
                 "content": m.message.content,
                 "created_at": m.created_at.to_rfc3339(),
-            })
+            });
+            if let Some(tc_id) = &m.message.tool_call_id {
+                obj["tool_call_id"] = json!(tc_id);
+            }
+            if !m.message.tool_calls.is_empty() {
+                obj["tool_calls"] = json!(m.message.tool_calls
+                    .iter()
+                    .map(|tc| json!({
+                        "id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }))
+                    .collect::<Vec<_>>());
+            }
+            obj
         })
         .collect();
 
