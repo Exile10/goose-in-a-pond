@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Button, Chip } from "@heroui/react";
-import { ArrowUp, Brain, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Zap } from "lucide-react";
+import { ArrowUp, Brain, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Wrench, Zap } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -9,7 +9,7 @@ import { ContextCard } from "../components/ContextCard";
 import { ToolCallChip } from "../components/ToolCallChip";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
-import type { ChatEvent, ModelEntry, SessionSummary } from "../api/types";
+import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary } from "../api/types";
 import { filterThinking } from "../lib/thinkFilter";
 
 // Human-readable tool status for the chat bubble while a tool runs.
@@ -41,6 +41,52 @@ interface Message {
   modelRole?: string;         // which role answered (chat/think/task)
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
   error?: boolean;            // true when this bubble represents an error
+  historyToolNames?: string[]; // tool names used in a persisted history turn
+}
+
+/**
+ * Filter and transform persisted session messages into renderable Message objects.
+ *
+ * Rules:
+ * - Drop role="tool" messages entirely (raw tool results are internal).
+ * - Drop role="assistant" messages where content is empty/whitespace AND
+ *   tool_calls is non-empty (the "I'm about to call a tool" preamble).
+ * - For role="assistant" messages with tool_calls AND non-empty content,
+ *   carry the tool names so a subtle indicator can be shown.
+ */
+function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
+  const out: Message[] = [];
+  for (const m of raw) {
+    // Always drop raw tool result rows.
+    if (m.role === "tool") continue;
+
+    if (m.role === "assistant") {
+      const hasContent = m.content.trim().length > 0;
+      const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
+
+      // Drop the empty "about to call a tool" preamble.
+      if (!hasContent && hasToolCalls) continue;
+
+      const historyToolNames = hasToolCalls
+        ? m.tool_calls!.map((tc) => {
+            // Strip server prefix like "giap-weather__" → "get_current_weather"
+            const bare = tc.name.includes("__") ? tc.name.split("__").pop()! : tc.name;
+            return bare;
+          })
+        : undefined;
+
+      out.push({
+        id: ++msgId,
+        role: "agent",
+        text: m.content,
+        historyToolNames,
+      });
+    } else {
+      // role === "user"
+      out.push({ id: ++msgId, role: "user", text: m.content });
+    }
+  }
+  return out;
 }
 
 let msgId = 0;
@@ -74,13 +120,7 @@ export function Chat() {
     if (!wasExternal) return;
     api.getSessionMessages(newId!)
       .then((msgs) => {
-        setMessages(
-          (msgs ?? []).map((m) => ({
-            id: ++msgId,
-            role: m.role === "user" ? ("user" as const) : ("agent" as const),
-            text: m.content,
-          })),
-        );
+        setMessages(sessionMessagesToMessages(msgs ?? []));
       })
       .catch((err) => {
         console.warn("Could not load session history (non-fatal):", err);
@@ -197,13 +237,7 @@ export function Chat() {
       })
       .then((msgs) => {
         if (!msgs || msgs.length === 0) return;
-        setMessages(
-          msgs.map((m) => ({
-            id: ++msgId,
-            role: m.role === "user" ? "user" : "agent",
-            text: m.content,
-          })),
-        );
+        setMessages(sessionMessagesToMessages(msgs));
       })
       .catch((err) => {
         console.warn("Could not load session history (non-fatal):", err);
@@ -476,6 +510,18 @@ export function Chat() {
                 <div className="tool-call-chips" role="list" aria-label="Tools used">
                   {msg.cards.map((card) => (
                     <ToolCallChip key={card.id} card={card} />
+                  ))}
+                </div>
+              )}
+
+              {/* History tool indicator — for persisted messages that used tools */}
+              {msg.role === "agent" && msg.historyToolNames && msg.historyToolNames.length > 0 && (
+                <div className="tool-call-chips" role="list" aria-label="Tools used">
+                  {msg.historyToolNames.map((name) => (
+                    <span key={name} className="tool-history-chip">
+                      <Wrench size={10} aria-hidden />
+                      {name.replace(/_/g, " ")}
+                    </span>
                   ))}
                 </div>
               )}

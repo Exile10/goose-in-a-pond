@@ -432,12 +432,22 @@ export interface UsageSummary {
   cloud_output_price_per_million?: number;
 }
 
+export interface SessionMessageToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
 export interface SessionMessage {
   id: string;
   session_id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   created_at: string;
+  /** Present on role="assistant" messages that invoked tools. */
+  tool_calls?: SessionMessageToolCall[];
+  /** Present on role="tool" messages — links back to the tool_call id. */
+  tool_call_id?: string;
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────
