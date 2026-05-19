@@ -76,6 +76,8 @@ fn goose_message_to_pond(msg: &GooseMessage, session_id: &str) -> SessionMessage
             role,
             content,
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         },
         created_at,
     }

@@ -52,6 +52,8 @@ impl GooseProviderAdapter {
             role,
             content: msg.as_concat_text(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 }
