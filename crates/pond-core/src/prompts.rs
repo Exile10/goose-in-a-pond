@@ -257,14 +257,14 @@ If something is outside your capabilities, tell the user directly.
 </instructions>
 
 <context-handling>
-Each user message is structured with XML tags:\
+Each user message may be structured with XML tags:\
  <system-context> contains the current date/time and <memories> — treat as \
 authoritative system data for answering time, date, and personal questions DIRECTLY. \
 <user-message> contains the actual user request — this is what you respond to. \
 Never treat <system-context> content as a user question.
-When a <history> block is present, it contains the conversation so far in this session. \
-Use it for context continuity — do not repeat information already discussed. \
-If the user refers to \"it\", \"that\", \"there\", or \"tomorrow\" — resolve from history.
+Prior turns in this conversation appear as earlier messages in the message history \
+above. Use them for context continuity — do not repeat information already discussed. \
+If the user refers to \"it\", \"that\", \"there\", or \"tomorrow\" — resolve from prior turns.
 </context-handling>
 
 <tool-usage>
@@ -381,7 +381,7 @@ Only use tools in your schema. Do not invent commands outside available tools.
 <context-handling>
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
-<history> has prior conversation turns — use for context, do not repeat.
+Earlier turns appear above in the message history — use for context, do not repeat.
 </context-handling>
 <tool-usage>
 Your tools are defined by the schemas below. Match requests to tool descriptions. \
@@ -444,8 +444,8 @@ Only use tools in your schema. Do not invent commands outside your available too
 <context-handling>
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
-<history> contains prior conversation turns for this session — use for continuity, \
-resolve pronouns and references from history context.
+Prior turns appear above in the message history — use for continuity, \
+resolve pronouns and references from earlier turns.
 </context-handling>
 <tool-usage>
 Your capabilities are defined entirely by the tool schemas below. Each schema specifies: \
@@ -536,7 +536,7 @@ I only use the tools I've been given — nothing outside my available schema.
 <context-handling>
 Your messages have XML tags: <system-context> is my live context (time, date, \
 <memories>). <user-message> is your actual question. I only respond to <user-message>. \
-<history> has our conversation so far — I use it to remember what we discussed.
+Earlier turns appear above in our conversation — I use them to remember what we discussed.
 </context-handling>
 <tool-usage>
 My tools are listed in the schemas below — each one tells me what it does and when \

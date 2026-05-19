@@ -4,7 +4,7 @@
 //! Tables are created by `migrations/system/0001_initial.sql`.
 
 use async_trait::async_trait;
-use pond_core::domain::message::{ChatMessage, Role};
+use pond_core::domain::message::{ChatMessage, Role, ToolCallRecord};
 use pond_core::domain::session::{Session, SessionMessage};
 use pond_core::ports::session_storage::{SessionStorage, SessionStorageError};
 use sqlx::{Pool, Sqlite};
@@ -28,6 +28,8 @@ struct MessageRow {
     session_id: String,
     role: String,
     content: String,
+    tool_call_id: Option<String>,
+    tool_calls_json: Option<String>,
     created_at: String,
 }
 
@@ -80,6 +82,15 @@ impl TryFrom<SessionRow> for Session {
 impl TryFrom<MessageRow> for SessionMessage {
     type Error = SessionStorageError;
     fn try_from(r: MessageRow) -> Result<Self, Self::Error> {
+        // Tool-call metadata is stored as JSON. Malformed JSON degrades gracefully:
+        // we drop the tool_calls but keep the message rather than failing the read.
+        let tool_calls: Vec<ToolCallRecord> = r
+            .tool_calls_json
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
         Ok(SessionMessage {
             id: r.id,
             session_id: r.session_id,
@@ -87,6 +98,8 @@ impl TryFrom<MessageRow> for SessionMessage {
                 role: str_to_role(&r.role)?,
                 content: r.content,
                 images: Vec::new(),
+                tool_calls,
+                tool_call_id: r.tool_call_id,
             },
             created_at: parse_dt(&r.created_at),
         })
@@ -142,14 +155,25 @@ impl SessionStorage for SqliteSessionStorage {
     ) -> Result<SessionMessage, SessionStorageError> {
         self.get_session(&session_id).await?; // guard: session must exist
 
+        // Serialize tool_calls only when present — keeps storage compact for
+        // the common user/system path.
+        let tool_calls_json = if message.message.tool_calls.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&message.message.tool_calls).ok()
+        };
+
         sqlx::query(
-            "INSERT INTO session_messages (id, session_id, role, content, created_at) \
-             VALUES (?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO session_messages \
+                 (id, session_id, role, content, tool_call_id, tool_calls_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(&message.id)
         .bind(&session_id)
         .bind(role_to_str(&message.message.role))
         .bind(&message.message.content)
+        .bind(&message.message.tool_call_id)
+        .bind(&tool_calls_json)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
@@ -170,7 +194,7 @@ impl SessionStorage for SqliteSessionStorage {
         self.get_session(session_id).await?; // guard: session must exist
 
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -230,7 +254,7 @@ impl SessionStorage for SqliteSessionStorage {
         self.get_session(session_id).await?; // guard: session must exist
 
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -255,7 +279,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -543,6 +567,42 @@ mod tests {
         let recent = s.get_recent_messages("sess-1", 100).await.unwrap();
         assert_eq!(recent.len(), 3);
         assert_eq!(recent[0].message.content, "Msg 0");
+    }
+
+    #[tokio::test]
+    async fn tool_call_metadata_round_trips() {
+        use pond_core::domain::message::ToolCallRecord;
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+
+        let asst = SessionMessage::new(
+            "m-asst".to_string(),
+            "sess-1".to_string(),
+            ChatMessage::assistant_with_tool_calls(
+                "calling weather",
+                vec![ToolCallRecord {
+                    id: "call-42".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{\"city\":\"Nairobi\"}".to_string(),
+                }],
+            ),
+        );
+        s.add_message("sess-1".to_string(), asst).await.unwrap();
+
+        let tool = SessionMessage::new(
+            "m-tool".to_string(),
+            "sess-1".to_string(),
+            ChatMessage::tool_result("sunny, 24C", "call-42"),
+        );
+        s.add_message("sess-1".to_string(), tool).await.unwrap();
+
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message.tool_calls.len(), 1);
+        assert_eq!(msgs[0].message.tool_calls[0].id, "call-42");
+        assert_eq!(msgs[0].message.tool_calls[0].name, "get_weather");
+        assert_eq!(msgs[1].message.role, Role::Tool);
+        assert_eq!(msgs[1].message.tool_call_id.as_deref(), Some("call-42"));
     }
 
     #[tokio::test]

@@ -23,6 +23,21 @@ pub struct ImageAttachment {
     pub mime_type: String,
 }
 
+/// A record of a tool invocation embedded in an assistant message.
+///
+/// When the model emits a tool call during chat generation, the call metadata
+/// (id, name, arguments) is captured in this struct and attached to the
+/// assistant message. On subsequent turns, this lets us round-trip the
+/// assistant's tool calls back through the OpenAI-compatible
+/// `tool_calls` field so the model sees its own prior tool usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub name: String,
+    /// The raw JSON-stringified arguments the model produced.
+    pub arguments: String,
+}
+
 /// A single message in a chat conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -32,6 +47,14 @@ pub struct ChatMessage {
     /// Empty for text-only messages. Backwards-compatible via `serde(default)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
+    /// Tool calls invoked by an assistant message.
+    /// Empty for user/system/tool messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRecord>,
+    /// Identifier linking a tool-result message back to the originating
+    /// assistant `tool_calls[].id`. Set only on `Role::Tool` messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -40,6 +63,8 @@ impl ChatMessage {
             role: Role::User,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -48,6 +73,8 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -56,16 +83,41 @@ impl ChatMessage {
             role: Role::System,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
     /// Create a tool result message. In the chat template, this renders with
     /// `role: "tool"` so the model recognizes it as a tool response, not user input.
-    pub fn tool_result(content: impl Into<String>) -> Self {
+    ///
+    /// `tool_call_id` must match the `id` field of the originating
+    /// `ToolCallRecord` on the preceding assistant message.
+    pub fn tool_result(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    /// Create an assistant message that includes tool-call metadata.
+    ///
+    /// Use this when the assistant turn was a tool invocation step — `content`
+    /// may be empty if the model emitted only tool calls, or contain the
+    /// preamble text the model produced before the call.
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallRecord>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            images: Vec::new(),
+            tool_calls,
+            tool_call_id: None,
         }
     }
 

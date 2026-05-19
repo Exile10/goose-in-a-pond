@@ -109,7 +109,9 @@ fn generation_task(
     // ── Build the prompt ─────────────────────────────────────────────────
 
     let oai_messages_json = build_openai_messages_json(&system_prompt, &messages);
-    let compact_tools = options.compact_tools_json_override.clone()
+    let compact_tools = options
+        .compact_tools_json_override
+        .clone()
         .or_else(|| tool_calling::compact_tools_json(&tools));
 
     // On small-context platforms (Jetson ≤4096), full tool schemas always exceed
@@ -131,7 +133,11 @@ fn generation_task(
         tracing::warn!("no tools passed to generation_task — model will have no tool schemas");
         None
     } else if use_compact_directly {
-        tracing::debug!(n_ctx_train, tools = tools.len(), "small context — skipping full tool schema serialization");
+        tracing::debug!(
+            n_ctx_train,
+            tools = tools.len(),
+            "small context — skipping full tool schema serialization"
+        );
         None
     } else {
         let json = tool_calling::tools_to_json(&tools);
@@ -250,28 +256,25 @@ fn generation_task(
     // matches, we skip re-decoding thousands of tokens (system prompt + tools).
     // If no cached context exists (first call), create a fresh one.
 
-    let mut ctx_params =
-        LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
+    let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
     ctx_params = ctx_params.with_n_batch(512);
     ctx_params = ctx_params.with_flash_attention_policy(1);
 
     // Helper: create a fresh context sized for the current prompt.
-    let create_fresh_ctx =
-        |model: &llama_cpp_2::model::LlamaModel,
-         backend: &LlamaBackend,
-         ctx_size: usize|
-         -> Result<llama_cpp_2::context::LlamaContext<'static>> {
-            let mut params =
-                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
-            params = params.with_n_batch(512);
-            params = params.with_flash_attention_policy(1);
-            let ctx = model
-                .new_context(backend, params)
-                .map_err(|e| anyhow::anyhow!("failed to create context: {}", e))?;
-            // SAFETY: Context borrows from model which lives in the same LoadedModel struct.
-            // We guarantee it's dropped before the model (see LoadedModel docs).
-            Ok(unsafe { std::mem::transmute(ctx) })
-        };
+    let create_fresh_ctx = |model: &llama_cpp_2::model::LlamaModel,
+                            backend: &LlamaBackend,
+                            ctx_size: usize|
+     -> Result<llama_cpp_2::context::LlamaContext<'static>> {
+        let mut params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(ctx_size as u32));
+        params = params.with_n_batch(512);
+        params = params.with_flash_attention_policy(1);
+        let ctx = model
+            .new_context(backend, params)
+            .map_err(|e| anyhow::anyhow!("failed to create context: {}", e))?;
+        // SAFETY: Context borrows from model which lives in the same LoadedModel struct.
+        // We guarantee it's dropped before the model (see LoadedModel docs).
+        Ok(unsafe { std::mem::transmute(ctx) })
+    };
 
     // Check if we can reuse the persistent context.
     let (mut ctx, tokens_to_decode_start) = if let Some(ref cached) = loaded.cached_ctx {
@@ -357,8 +360,7 @@ fn generation_task(
             let mut batch = match LlamaBatch::get_one(chunk) {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ =
-                        tx.blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
+                    let _ = tx.blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
                     return;
                 }
             };
@@ -383,14 +385,13 @@ fn generation_task(
                 let mut batch = match LlamaBatch::get_one(chunk) {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = tx
-                            .blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
+                        let _ =
+                            tx.blocking_send(Err(anyhow::anyhow!("batch creation failed: {}", e)));
                         return;
                     }
                 };
                 if let Err(e) = ctx.decode(&mut batch) {
-                    let _ =
-                        tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
+                    let _ = tx.blocking_send(Err(anyhow::anyhow!("prefill decode failed: {}", e)));
                     return;
                 }
             }
@@ -411,7 +412,9 @@ fn generation_task(
     // (content, reasoning_content, tool_calls) from raw token output.
     let mut stream_parser = match template_result.streaming_state_oaicompat() {
         Ok(parser) => {
-            tracing::debug!("streaming parser initialized (same as Goose's native tool call parser)");
+            tracing::debug!(
+                "streaming parser initialized (same as Goose's native tool call parser)"
+            );
             Some(parser)
         }
         Err(e) => {
@@ -453,10 +456,7 @@ fn generation_task(
 
         output_token_count += 1;
 
-        let piece = match loaded
-            .model
-            .token_to_piece(token, &mut decoder, true, None)
-        {
+        let piece = match loaded.model.token_to_piece(token, &mut decoder, true, None) {
             Ok(p) => p,
             Err(e) => {
                 let _ = tx.blocking_send(Err(anyhow::anyhow!("token decode failed: {}", e)));
@@ -472,16 +472,23 @@ fn generation_task(
                 match parser.update(&piece, true) {
                     Ok(deltas) => {
                         for delta_json in deltas {
-                            if let Ok(delta) = serde_json::from_str::<serde_json::Value>(&delta_json) {
+                            if let Ok(delta) =
+                                serde_json::from_str::<serde_json::Value>(&delta_json)
+                            {
                                 // Stream text content immediately.
-                                if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                                {
                                     if !content.is_empty() {
-                                        let _ = tx.blocking_send(Ok(ChatEvent::Text(content.to_string())));
+                                        let _ = tx.blocking_send(Ok(ChatEvent::Text(
+                                            content.to_string(),
+                                        )));
                                     }
                                 }
                                 // Accumulate tool call deltas — DON'T parse args yet.
                                 // Arguments arrive as partial strings across deltas.
-                                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                if let Some(tool_calls) =
+                                    delta.get("tool_calls").and_then(|v| v.as_array())
+                                {
                                     for tc in tool_calls {
                                         raw_tool_deltas.push(tc.clone());
                                     }
@@ -807,6 +814,10 @@ fn build_grammar_sampler_lazy(
 }
 
 /// Build OpenAI-compatible messages JSON array.
+///
+/// Emits `tool_calls` on assistant messages and `tool_call_id` on tool messages
+/// per the OpenAI tools API. This is required for multi-turn tool round-tripping
+/// — without it the model only sees a flat history and forgets it called a tool.
 fn build_openai_messages_json(system_prompt: &str, messages: &[ChatMessage]) -> String {
     let mut arr: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
@@ -823,10 +834,35 @@ fn build_openai_messages_json(system_prompt: &str, messages: &[ChatMessage]) -> 
             // asking follow-up questions about tool results.
             Role::Tool => "tool",
         };
-        arr.push(serde_json::json!({
+
+        let mut obj = serde_json::json!({
             "role": role,
             "content": msg.content
-        }));
+        });
+
+        if !msg.tool_calls.is_empty() {
+            let tool_calls: Vec<serde_json::Value> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    })
+                })
+                .collect();
+            obj["tool_calls"] = serde_json::Value::Array(tool_calls);
+        }
+
+        if let Some(ref tc_id) = msg.tool_call_id {
+            obj["tool_call_id"] = serde_json::Value::String(tc_id.clone());
+        }
+
+        arr.push(obj);
     }
 
     serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
@@ -875,5 +911,43 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["content"], "sys");
+    }
+
+    #[test]
+    fn build_messages_json_emits_tool_calls_and_tool_call_id() {
+        use pond_core::domain::message::ToolCallRecord;
+
+        let messages = vec![
+            ChatMessage::user("weather?"),
+            ChatMessage::assistant_with_tool_calls(
+                "checking",
+                vec![ToolCallRecord {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: "{\"city\":\"NBO\"}".to_string(),
+                }],
+            ),
+            ChatMessage::tool_result("sunny", "call-1"),
+            ChatMessage::assistant("It's sunny."),
+        ];
+        let json = build_openai_messages_json("sys", &messages);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        // system + user + assistant(with calls) + tool + assistant
+        assert_eq!(parsed.len(), 5);
+        // Assistant tool-call entry
+        let asst = &parsed[2];
+        assert_eq!(asst["role"], "assistant");
+        let calls = asst["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call-1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"NBO\"}");
+        // Tool result entry
+        let tool = &parsed[3];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "call-1");
+        // Plain assistant has no tool_calls field
+        assert!(parsed[4].get("tool_calls").is_none());
     }
 }

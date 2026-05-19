@@ -88,6 +88,8 @@ impl ContextCompactor {
                         summary
                     ),
                     images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 };
                 let mut result = vec![summary_msg];
                 result.extend_from_slice(to_keep);
@@ -121,6 +123,8 @@ async fn summarise(provider: &dyn LlmProvider, messages: &[ChatMessage]) -> Resu
     let prompt_messages = vec![ChatMessage {
         role: Role::User,
         images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
         content: format!(
             "Summarise the following conversation concisely, preserving all important \
              facts, decisions, and context. Write 3-5 sentences maximum.\n\n{}",
@@ -159,6 +163,8 @@ mod tests {
                     role: Role::Assistant,
                     content: self.summary.clone(),
                     images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 })
             }
         }
@@ -173,6 +179,8 @@ mod tests {
             role,
             content: content.to_string(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
