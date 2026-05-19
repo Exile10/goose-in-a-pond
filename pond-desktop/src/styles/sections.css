@@ -540,53 +540,56 @@
   background: #fff;
 }
 
-.giap-model-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  transition: background var(--transition-fast);
+.giap-model-row, .model-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  transition: background 120ms;
   border: none;
 }
-.giap-model-row + .giap-model-row { border-top: 1px solid var(--grey-100); }
-.giap-model-row:hover { background: var(--grey-50); }
-.giap-model-row.is-active {
+.giap-model-row + .giap-model-row,
+.model-row + .model-row { border-top: 1px solid var(--grey-100); }
+.giap-model-row:hover, .model-row:hover { background: var(--grey-50); }
+.giap-model-row.is-active, .model-row.is-active {
   background: var(--purple-50);
   border-left: 3px solid var(--color-accent);
 }
-.giap-model-row__title-row {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-}
-.giap-model-row__name {
-  font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--fg);
-}
-.giap-model-row__meta {
-  font-size: var(--text-xs);
-  font-family: var(--font-mono);
-  color: var(--grey-400);
-  font-weight: var(--weight-regular);
-}
-.giap-model-row__file {
-  font-size: 10px;
-  color: var(--grey-300);
-  margin-top: 1px;
-}
-.giap-model-row__file code { font-family: var(--font-mono); }
-.giap-model-row__actions {
-  display: flex; align-items: center; gap: 6px;
-  opacity: 0;
-  transition: opacity var(--transition-fast);
-}
-.giap-model-row:hover .giap-model-row__actions,
-.giap-model-row.is-active .giap-model-row__actions,
-.giap-model-row.always-actions .giap-model-row__actions {
-  opacity: 1;
-}
-.giap-model-row__trash { color: var(--grey-400); transition: color var(--transition-fast); }
-.giap-model-row__trash:hover { color: var(--color-destructive); }
+.giap-model-row > div:first-child,
+.model-row > div:first-child { flex: 1; min-width: 0; }
 
-.role-select { display: flex; gap: 4px; }
+.giap-model-row__title-row, .model-row__title-row {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  margin-bottom: 3px;
+}
+.giap-model-row__name, .model-row__name {
+  font-size: 13px; font-weight: 600; color: var(--fg);
+  margin-right: 2px;
+}
+.giap-model-row__meta, .model-row__meta {
+  font-size: var(--text-xs); font-family: var(--font-mono);
+  color: var(--grey-400);
+}
+.giap-model-row__file, .model-row__file {
+  font-size: 10.5px; color: var(--grey-400); margin-top: 2px;
+}
+.giap-model-row__file code, .model-row__file code {
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--grey-400);
+}
+.giap-model-row__actions, .model-row__actions {
+  display: flex; align-items: center; gap: 6px;
+  flex-shrink: 0; padding-top: 2px;
+}
+.giap-model-row__trash, .model-row__trash {
+  color: var(--grey-300); transition: color var(--transition-fast);
+}
+.giap-model-row__trash:hover, .model-row__trash:hover { color: var(--color-destructive); }
+.model-row__size { flex-shrink: 0; font-size: 10px !important; }
+.model-row__tag { flex-shrink: 0; font-size: 10px !important; }
+
+.role-select { display: flex; gap: 3px; }
+.role-select__btn { font-size: 11px !important; padding: 0 8px !important; height: 26px !important; }
 
 /* Capability badges — lightweight alternative to HeroUI Chip */
 .cap-badge {
@@ -3090,6 +3093,21 @@
   flex-wrap: wrap;
   gap: 5px;
   margin-bottom: 6px;
+}
+
+/* Subtle non-interactive chip for persisted history tool names */
+.tool-history-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--grey-100);
+  color: var(--grey-500);
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 
 /* Chip variant: interactive, shows expand chevron */

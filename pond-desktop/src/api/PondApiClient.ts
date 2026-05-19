@@ -29,6 +29,7 @@ import {
   type ScheduleRun,
   type SecretRequirement,
   type SessionMessage,
+  type SessionMessageToolCall,
   type SessionSummary,
   type Settings,
   type UsageSummary,
@@ -445,11 +446,20 @@ export class PondApiClient {
   }
 
   getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
-    return this.get<{ messages: SessionMessage[] } | SessionMessage[]>(
+    return this.get<{ messages: Array<Record<string, unknown>> } | Array<Record<string, unknown>>>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
-    ).then((r) =>
-      Array.isArray(r) ? r : (r as { messages: SessionMessage[] }).messages ?? [],
-    );
+    ).then((r) => {
+      const raw = Array.isArray(r) ? r : (r as { messages: Array<Record<string, unknown>> }).messages ?? [];
+      return raw.map((m): SessionMessage => ({
+        id: m.id as string,
+        session_id: m.session_id as string,
+        role: m.role as SessionMessage["role"],
+        content: (m.content as string) ?? "",
+        created_at: m.created_at as string,
+        tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
+        tool_call_id: m.tool_call_id as string | undefined,
+      }));
+    });
   }
 
   // ── Prompts ───────────────────────────────────────────────
