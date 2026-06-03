@@ -39,18 +39,18 @@ use serde::Serialize;
 
 // ── Embedded template files ───────────────────────────────────────────────────
 
-const SYSTEM:              &str = include_str!("prompts/system.md");
-const COMPACTION:          &str = include_str!("prompts/compaction.md");
-const SUBAGENT_SYSTEM:     &str = include_str!("prompts/subagent_system.md");
-const RECIPE:              &str = include_str!("prompts/recipe.md");
-const APPS_CREATE:         &str = include_str!("prompts/apps_create.md");
-const APPS_ITERATE:        &str = include_str!("prompts/apps_iterate.md");
-const PERMISSION_JUDGE:    &str = include_str!("prompts/permission_judge.md");
-const PLAN:                &str = include_str!("prompts/plan.md");
-const TINY_MODEL_SYSTEM:   &str = include_str!("prompts/tiny_model_system.md");
-const SESSION_NAME:        &str = include_str!("prompts/session_name.md");
+const SYSTEM: &str = include_str!("prompts/system.md");
+const COMPACTION: &str = include_str!("prompts/compaction.md");
+const SUBAGENT_SYSTEM: &str = include_str!("prompts/subagent_system.md");
+const RECIPE: &str = include_str!("prompts/recipe.md");
+const APPS_CREATE: &str = include_str!("prompts/apps_create.md");
+const APPS_ITERATE: &str = include_str!("prompts/apps_iterate.md");
+const PERMISSION_JUDGE: &str = include_str!("prompts/permission_judge.md");
+const PLAN: &str = include_str!("prompts/plan.md");
+const TINY_MODEL_SYSTEM: &str = include_str!("prompts/tiny_model_system.md");
+const SESSION_NAME: &str = include_str!("prompts/session_name.md");
 const TINY_MODEL_DECISION: &str = include_str!("prompts/tiny_model_decision.md");
-const TOOL_GUIDANCE:       &str = include_str!("prompts/tool_guidance.md");
+const TOOL_GUIDANCE: &str = include_str!("prompts/tool_guidance.md");
 
 /// Registry of GIAP-specific prompt templates.
 ///
@@ -80,18 +80,18 @@ impl GiapPrompts {
     /// the name is not registered.
     pub fn get(name: &str) -> Option<&'static str> {
         match name {
-            "system.md"              => Some(SYSTEM),
-            "compaction.md"          => Some(COMPACTION),
-            "subagent_system.md"     => Some(SUBAGENT_SYSTEM),
-            "recipe.md"              => Some(RECIPE),
-            "apps_create.md"         => Some(APPS_CREATE),
-            "apps_iterate.md"        => Some(APPS_ITERATE),
-            "permission_judge.md"    => Some(PERMISSION_JUDGE),
-            "plan.md"                => Some(PLAN),
-            "tiny_model_system.md"   => Some(TINY_MODEL_SYSTEM),
-            "session_name.md"        => Some(SESSION_NAME),
+            "system.md" => Some(SYSTEM),
+            "compaction.md" => Some(COMPACTION),
+            "subagent_system.md" => Some(SUBAGENT_SYSTEM),
+            "recipe.md" => Some(RECIPE),
+            "apps_create.md" => Some(APPS_CREATE),
+            "apps_iterate.md" => Some(APPS_ITERATE),
+            "permission_judge.md" => Some(PERMISSION_JUDGE),
+            "plan.md" => Some(PLAN),
+            "tiny_model_system.md" => Some(TINY_MODEL_SYSTEM),
+            "session_name.md" => Some(SESSION_NAME),
             "tiny_model_decision.md" => Some(TINY_MODEL_DECISION),
-            "tool_guidance.md"       => Some(TOOL_GUIDANCE),
+            "tool_guidance.md" => Some(TOOL_GUIDANCE),
             _ => None,
         }
     }
@@ -243,7 +243,12 @@ mod tests {
         let ctx: HashMap<&str, serde_json::Value> = HashMap::new();
         for name in GiapPrompts::list() {
             let result = GiapPrompts::render(name, &ctx);
-            assert!(result.is_ok(), "Template '{}' failed to render: {:?}", name, result);
+            assert!(
+                result.is_ok(),
+                "Template '{}' failed to render: {:?}",
+                name,
+                result
+            );
         }
     }
 
@@ -258,6 +263,8 @@ mod tests {
                 "giap__get_forecast".to_string(),
             ],
             enabled: true,
+            status: "connected".to_string(),
+            last_error: None,
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);
@@ -274,6 +281,8 @@ mod tests {
             description: "No tools".to_string(),
             tools: vec![],
             enabled: true,
+            status: "connected".to_string(),
+            last_error: None,
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);

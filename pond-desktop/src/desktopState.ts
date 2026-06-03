@@ -7,6 +7,7 @@ export type GuiSection =
   | "schedules"
   | "memory"
   | "skills"
+  | "extensions"
   | "models"
   | "prompts"
   | "settings"
@@ -26,9 +27,8 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
   {
     label: "MAIN",
     sections: [
-      { section: "dashboard", label: "Dashboard", icon: "home" },
+      { section: "dashboard", label: "Dashboard", icon: "dashboard" },
       { section: "chat",      label: "Chat",      icon: "chat" },
-      { section: "canvas",   label: "Canvas",   icon: "canvas" },
     ],
   },
   {
@@ -44,16 +44,10 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
   {
     label: "CONFIGURE",
     sections: [
-      { section: "models",   label: "Models",   icon: "model" },
-      { section: "prompts",  label: "Prompts",  icon: "prompt" },
-      { section: "faces",    label: "Faces",    icon: "face" },
-      { section: "settings", label: "Settings", icon: "settings" },
-    ],
-  },
-  {
-    label: null,
-    sections: [
-      { section: "agent", label: "Agent", icon: "agent" },
+      { section: "models",     label: "Models",     icon: "model" },
+      { section: "prompts",    label: "Prompts",    icon: "prompt" },
+      { section: "settings",   label: "Settings",   icon: "settings" },
+      { section: "extensions", label: "Extensions", icon: "extensions" },
     ],
   },
 ];
@@ -62,7 +56,12 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
 export const DESKTOP_SECTIONS: Array<{ section: GuiSection; label: string }> =
   SIDEBAR_GROUPS.flatMap((g) => g.sections.map(({ section, label }) => ({ section, label })));
 
-const SECTION_SET = new Set<GuiSection>(DESKTOP_SECTIONS.map((s) => s.section));
+// Include all valid sections — some are routable but not in the sidebar
+const HIDDEN_SECTIONS: GuiSection[] = ["faces", "agent", "canvas"];
+const SECTION_SET = new Set<GuiSection>([
+  ...DESKTOP_SECTIONS.map((s) => s.section),
+  ...HIDDEN_SECTIONS,
+]);
 
 export function normalizeDesktopMode(value: string | null | undefined): DesktopMode {
   return value === "voice" || value === "canvas" || value === "gui" ? value : "gui";

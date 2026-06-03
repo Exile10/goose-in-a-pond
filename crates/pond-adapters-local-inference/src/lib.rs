@@ -29,7 +29,9 @@
 
 pub mod scheduler;
 pub mod tool_caller;
-pub use scheduler::{NoopScheduler, ResourceAwareModelScheduler, LLM_BUDGET_MB, JETSON_TOTAL_RAM_MB};
+pub use scheduler::{
+    NoopScheduler, ResourceAwareModelScheduler, JETSON_TOTAL_RAM_MB, LLM_BUDGET_MB,
+};
 pub use tool_caller::ToolCallerEngine;
 
 use anyhow::Result;
@@ -85,12 +87,18 @@ impl LocalInferenceLlmAdapter {
         #[cfg(not(feature = "cuda"))]
         Self::apply_platform_settings(model_id);
 
-        tracing::info!("initialising LocalInferenceProvider for model: {}", model_id);
+        tracing::info!(
+            "initialising LocalInferenceProvider for model: {}",
+            model_id
+        );
         let provider = LocalInferenceProvider::from_env(model_config, vec![]).await?;
         let session_id = uuid::Uuid::new_v4().to_string();
 
         Ok(Self {
-            inner: GooseProviderAdapter::new(Arc::new(provider) as Arc<dyn GooseProvider>, session_id),
+            inner: GooseProviderAdapter::new(
+                Arc::new(provider) as Arc<dyn GooseProvider>,
+                session_id,
+            ),
         })
     }
 
@@ -106,7 +114,7 @@ impl LocalInferenceLlmAdapter {
     /// - Raw filename: `"gemma-4-E2B-it-Q4_K_M.gguf"` (file must exist in `$data_dir/models/gguf/`)
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, ModelSettings, model_id_from_repo,
+            get_registry, model_id_from_repo, LocalModelEntry, ModelSettings,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -117,17 +125,18 @@ impl LocalInferenceLlmAdapter {
         // disk is {stem}.gguf in the gguf directory.  Normalise by appending
         // ".gguf" and falling through to the raw filename path below.
         let owned_with_ext;
-        let model_id = if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
-            let candidate = gguf_dir.join(format!("{}.gguf", model_id));
-            if candidate.exists() {
-                owned_with_ext = format!("{}.gguf", model_id);
-                owned_with_ext.as_str()
+        let model_id =
+            if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
+                let candidate = gguf_dir.join(format!("{}.gguf", model_id));
+                if candidate.exists() {
+                    owned_with_ext = format!("{}.gguf", model_id);
+                    owned_with_ext.as_str()
+                } else {
+                    model_id // not a local stem — fall through to HF path
+                }
             } else {
-                model_id // not a local stem — fall through to HF path
-            }
-        } else {
-            model_id
-        };
+                model_id
+            };
 
         // ── Raw filename (e.g. "gemma-4-E2B-it-Q4_K_M.gguf") ────────────────
         // Detected when: no ':' separator and ends with ".gguf".
@@ -154,15 +163,21 @@ impl LocalInferenceLlmAdapter {
                         if !registry.has_model(&stem) {
                             let mut settings = ModelSettings::default();
                             settings.native_tool_calling = true;
+                            settings.use_jinja = true;
+                            settings.enable_thinking = false;
                             let entry = LocalModelEntry {
-                                id:           stem.clone(),
-                                repo_id:      format!("local/{}", stem),
-                                filename:     filename.clone(),
+                                id: stem.clone(),
+                                repo_id: format!("local/{}", stem),
+                                filename: filename.clone(),
                                 quantization: String::new(),
                                 local_path,
-                                source_url:   String::new(),
+                                source_url: String::new(),
                                 settings,
-                                size_bytes:   0,
+                                size_bytes: 0,
+                                mmproj_path: None,
+                                mmproj_size_bytes: 0,
+                                mmproj_source_url: None,
+                                shard_files: vec![],
                             };
                             if let Err(e) = registry.add_model(entry) {
                                 tracing::warn!("Could not register GGUF model '{}': {}", stem, e);
@@ -184,16 +199,14 @@ impl LocalInferenceLlmAdapter {
 
         // ── HuggingFace format ("repo_id:quantization") ───────────────────────
         // Parse "repo_id:quantization" — e.g. "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"
-        let (repo_id, quantization) = model_id
-            .rsplit_once(':')
-            .unwrap_or((model_id, "Q4_K_M"));
+        let (repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
 
         let id = model_id_from_repo(repo_id, quantization);
 
         // Derive filename: strip "-GGUF" suffix from the repo name, append "-{quant}.gguf"
         let model_name = repo_id.split('/').last().unwrap_or(repo_id);
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         let local_path = gguf_dir.join(&filename);
         let source_url = format!(
@@ -209,15 +222,21 @@ impl LocalInferenceLlmAdapter {
                     if !registry.has_model(&id) {
                         let mut settings = ModelSettings::default();
                         settings.native_tool_calling = true;
+                        settings.use_jinja = true;
+                        settings.enable_thinking = false;
                         let entry = LocalModelEntry {
-                            id:           id.clone(),
-                            repo_id:      repo_id.to_string(),
-                            filename:     filename.clone(),
+                            id: id.clone(),
+                            repo_id: repo_id.to_string(),
+                            filename: filename.clone(),
                             quantization: quantization.to_string(),
                             local_path,
                             source_url,
                             settings,
-                            size_bytes:   0,
+                            size_bytes: 0,
+                            mmproj_path: None,
+                            mmproj_size_bytes: 0,
+                            mmproj_source_url: None,
+                            shard_files: vec![],
                         };
                         if let Err(e) = registry.add_model(entry) {
                             tracing::warn!("Could not register GGUF model '{}': {}", id, e);
@@ -252,16 +271,26 @@ impl LocalInferenceLlmAdapter {
             // Full GPU offload — Apple Silicon has unified memory so all layers
             // fit without any CPU/GPU split.
             n_gpu_layers: Some(99),
-            // 8K context balances memory usage and conversation depth.
-            // Fits ~6K tokens of history + system prompt + 2K generation headroom.
-            // On M4 with 18GB this uses ~322MB KV cache for E4B — very comfortable.
-            context_size: Some(8192),
+            // Dynamic: let Goose's estimate_max_context_for_memory() calculate
+            // from available RAM + model KV cache cost per token. No hardcoded cap.
+            context_size: None,
             // Batch 512 is optimal for Metal prefill throughput.
             n_batch: Some(512),
             // Flash attention reduces KV-cache memory by ~40%.
             flash_attention: Some(true),
             // Unified memory — mlock is unnecessary and can cause issues.
             use_mlock: false,
+            // Jinja ON — Gemma 4's GGUF embeds a Jinja2 template that renders
+            // tool schemas into its native <|tool>declaration:NAME{...}<tool|> format.
+            // Without this, the model never sees tools in the format it was trained on.
+            use_jinja: true,
+            // Native tool calling ON — Gemma 4 produces <|tool_call>call:NAME{...}<tool_call|>
+            // which Goose's tool_parsing.rs already recognizes.
+            native_tool_calling: true,
+            // Thinking OFF — GIAP handles thinking display through its own
+            // PromptState + ThoughtFilter pipeline, not llama.cpp's native
+            // reasoning_format which causes Gemma 4 E2B to produce immediate EOS.
+            enable_thinking: false,
             // Let llama.cpp auto-detect thread count (good on Apple Silicon).
             ..Default::default()
         };
@@ -271,17 +300,21 @@ impl LocalInferenceLlmAdapter {
                 if let Err(e) = registry.update_model_settings(model_id, settings) {
                     tracing::debug!(
                         "Platform settings not applied to '{}' (model not yet registered): {}",
-                        model_id, e
+                        model_id,
+                        e
                     );
                 } else {
                     tracing::info!(
-                        "Applied Metal/platform settings to model '{}' (n_gpu_layers=99, ctx=8192, flash_attn=true)",
+                        "Applied Metal/platform settings to model '{}' (n_gpu_layers=99, ctx=dynamic, flash_attn=true)",
                         model_id
                     );
                 }
             }
             Err(e) => {
-                tracing::warn!("Could not acquire model registry lock for platform settings: {}", e);
+                tracing::warn!(
+                    "Could not acquire model registry lock for platform settings: {}",
+                    e
+                );
             }
         }
     }
@@ -317,6 +350,12 @@ impl LocalInferenceLlmAdapter {
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
+            // Jinja ON — Gemma 4 needs Jinja for native tool declarations.
+            use_jinja: true,
+            // Native tool calling — Gemma 4 produces tool calls in its trained format.
+            native_tool_calling: true,
+            // Thinking OFF — GIAP handles thinking via PromptState + ThoughtFilter.
+            enable_thinking: false,
             ..Default::default()
         };
 
@@ -325,7 +364,8 @@ impl LocalInferenceLlmAdapter {
                 if let Err(e) = registry.update_model_settings(model_id, jetson_settings) {
                     tracing::debug!(
                         "Jetson settings not applied to '{}' (model not yet registered): {}",
-                        model_id, e
+                        model_id,
+                        e
                     );
                 } else {
                     tracing::info!(
@@ -335,7 +375,10 @@ impl LocalInferenceLlmAdapter {
                 }
             }
             Err(e) => {
-                tracing::warn!("Could not acquire model registry lock for Jetson settings: {}", e);
+                tracing::warn!(
+                    "Could not acquire model registry lock for Jetson settings: {}",
+                    e
+                );
             }
         }
     }
@@ -353,10 +396,35 @@ impl LocalInferenceLlmAdapter {
 ///
 /// If neither pattern is present the original text is returned unchanged.
 fn strip_thinking_tokens(text: &str) -> String {
-    // Gemma 4 format
+    // Gemma 4 format — return everything after the last <channel|>.
+    // If nothing follows the tag, return empty (the tag was the entire text).
     const CHANNEL_CLOSE: &str = "<channel|>";
     if let Some(pos) = text.rfind(CHANNEL_CLOSE) {
         return text[pos + CHANNEL_CLOSE.len()..].trim().to_string();
+    }
+
+    // Also handle <thought>…</thought> (alternate reasoning tag format)
+    if text.contains("<thought>") {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            if let Some(start) = rest.find("<thought>") {
+                out.push_str(&rest[..start]);
+                if let Some(end) = rest[start..].find("</thought>") {
+                    rest = &rest[start + end + "</thought>".len()..];
+                } else {
+                    break; // unclosed — discard tail
+                }
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        return String::new();
     }
 
     // <think>…</think> format — strip all blocks
@@ -393,11 +461,7 @@ impl LlmProvider for LocalInferenceLlmAdapter {
         pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
     }
 
-    async fn complete(
-        &self,
-        system: &str,
-        messages: Vec<ChatMessage>,
-    ) -> Result<ChatMessage> {
+    async fn complete(&self, system: &str, messages: Vec<ChatMessage>) -> Result<ChatMessage> {
         let mut msg = self.inner.complete(system, messages).await?;
         msg.content = strip_thinking_tokens(&msg.content);
         Ok(msg)
@@ -405,6 +469,19 @@ impl LlmProvider for LocalInferenceLlmAdapter {
 
     fn model_name(&self) -> String {
         self.inner.model_name()
+    }
+}
+
+impl LocalInferenceLlmAdapter {
+    /// Like `complete()` but returns the RAW model output WITHOUT applying
+    /// `strip_thinking_tokens()`. Useful for diagnostics — see what the model
+    /// actually emits before any post-processing.
+    pub async fn raw_complete(
+        &self,
+        system: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<ChatMessage> {
+        self.inner.complete(system, messages).await
     }
 }
 
@@ -461,8 +538,8 @@ mod tests {
         let model_id = "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M";
         let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
         let model_name = repo_id.split('/').last().unwrap();
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         assert_eq!(filename, "Llama-3.2-3B-Instruct-Q4_K_M.gguf");
     }
@@ -472,8 +549,8 @@ mod tests {
         let model_id = "bartowski/SomeModel:Q8_0";
         let (repo_id, quantization) = model_id.rsplit_once(':').unwrap();
         let model_name = repo_id.split('/').last().unwrap();
-        let base_name  = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
-        let filename   = format!("{}-{}.gguf", base_name, quantization);
+        let base_name = model_name.strip_suffix("-GGUF").unwrap_or(model_name);
+        let filename = format!("{}-{}.gguf", base_name, quantization);
 
         assert_eq!(filename, "SomeModel-Q8_0.gguf");
     }
@@ -532,13 +609,31 @@ mod tests {
     }
 
     #[test]
+    fn strip_thinking_tokens_channel_close_at_end_returns_empty() {
+        // Edge case: <channel|> at end with nothing after → should return empty,
+        // not the original text containing the tag.
+        let raw = "<|channel>thought reasoning here<channel|>";
+        assert_eq!(strip_thinking_tokens(raw), "");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_removes_thought_tags() {
+        let raw = "<thought>internal reasoning</thought>Hello!";
+        assert_eq!(strip_thinking_tokens(raw), "Hello!");
+    }
+
+    #[test]
+    fn strip_thinking_tokens_thought_only_returns_empty() {
+        let raw = "<thought>only reasoning</thought>";
+        assert_eq!(strip_thinking_tokens(raw), "");
+    }
+
+    #[test]
     fn model_id_rsplit_fallback_uses_q4_k_m() {
         // When no ':' quantization suffix is present, rsplit_once returns None
         // and the fallback "Q4_K_M" is used.
         let model_id = "some-model-without-quant";
-        let (_repo_id, quantization) = model_id
-            .rsplit_once(':')
-            .unwrap_or((model_id, "Q4_K_M"));
+        let (_repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
         assert_eq!(quantization, "Q4_K_M");
     }
 }

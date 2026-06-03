@@ -49,6 +49,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_prompt_addendum")]
     pub prompt_addendum: String,
 
+    // ── Fast path ──────────────────────────────────────────────────────────
+    /// When true, trivial messages (greetings, farewells, thanks, acknowledgments)
+    /// are answered deterministically in <10ms without invoking the LLM.
+    #[serde(default = "Settings::default_fast_path_enabled")]
+    pub fast_path_enabled: bool,
+
     // ── Model roles ────────────────────────────────────────────────────────
     /// Provider for the Chat role (fast, conversational). Default = llm_provider.
     #[serde(default = "Settings::default_llm_provider")]
@@ -143,6 +149,14 @@ pub struct Settings {
     #[serde(default = "Settings::default_active_tts_model")]
     pub active_tts_model: String,
 
+    /// Active embedding model name from the registry (e.g. "all-MiniLM-L6-v2")
+    #[serde(default)]
+    pub active_embedding_model: String,
+
+    /// Embedding provider: "fastembed" (default, local ONNX) or "none"
+    #[serde(default = "Settings::default_embedding_provider")]
+    pub embedding_provider: String,
+
     // ── Weather ────────────────────────────────────────────────────────────
     /// Whether to fetch live weather and inject it into the LLM system prompt.
     #[serde(default = "Settings::default_weather_enabled")]
@@ -209,6 +223,12 @@ pub struct Settings {
     pub context_window_override: u32,
 
     // ── Agent behaviour ────────────────────────────────────────────────────────
+    /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
+    /// "goose" uses Block's Goose framework with all MCP extensions, cloud provider support.
+    /// "pond" uses PondAgent + LlamaCppEngine directly for minimal latency on local models.
+    #[serde(default = "Settings::default_agent_backend")]
+    pub agent_backend: String,
+
     /// GooseMode for the agent loop: "auto" | "chat" | "smart"
     #[serde(default = "Settings::default_agent_goose_mode")]
     pub agent_goose_mode: String,
@@ -217,6 +237,20 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Maximum seconds for an entire agent turn (stream start to done).
+    /// When exceeded, the stream emits a timeout error and stops.
+    /// Default: 300 (5 minutes). Set to 0 to disable.
+    #[serde(default = "Settings::default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+
+    /// When true, the system prompt is partitioned into a stable static prefix
+    /// and a dynamic suffix. The static prefix is only rebuilt when settings,
+    /// capabilities, or device state change — allowing local inference providers
+    /// to reuse their KV-cache for the stable portion across turns.
+    /// Default: true (recommended for local models on memory-constrained devices).
+    #[serde(default = "Settings::default_prefix_cache_prompt")]
+    pub prefix_cache_prompt: bool,
+
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
     pub agent_memory_inject: bool,
@@ -224,98 +258,502 @@ pub struct Settings {
     /// How many memory fragments to inject (most recent first)
     #[serde(default = "Settings::default_agent_memory_limit")]
     pub agent_memory_limit: u32,
+
+    /// When true, tool outputs (weather, Wikipedia, schedules, devices) are
+    /// semantically compressed before injection into the LLM context. Saves
+    /// 50-80% of tokens on tool results with negligible information loss.
+    /// Disable only for debugging raw tool output.
+    #[serde(default = "Settings::default_tool_output_compaction")]
+    pub tool_output_compaction: bool,
+
+    /// When true, durable facts are automatically extracted from each conversation
+    /// turn and stored as categorised memories (segment, importance, decay).
+    #[serde(default = "Settings::default_memory_extraction_enabled")]
+    pub memory_extraction_enabled: bool,
+
+    /// When true, a background task periodically prunes/archives decayed memories.
+    #[serde(default = "Settings::default_memory_cleanup_enabled")]
+    pub memory_cleanup_enabled: bool,
+
+    /// When true, a background task periodically merges duplicate/contradicting memories.
+    #[serde(default)]
+    pub memory_consolidation_enabled: bool,
+
+    /// Consolidation mode: "single" (1 LLM call) or "adversarial" (3-stage Proposer/Adversary/Judge).
+    #[serde(default = "Settings::default_memory_consolidation_mode")]
+    pub memory_consolidation_mode: String,
+
+    /// When true, memory retrieval uses causal graph traversal (experimental).
+    /// Edges between memories are followed to inject causally relevant context
+    /// rather than only recency-based results.
+    #[serde(default)]
+    pub memory_graph_enabled: bool,
+
+    /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
+    #[serde(default = "Settings::default_schedule_result_notify")]
+    pub schedule_result_notify: bool,
+
+    // ── Memory tuning ────────────────────────────────────────────────────────
+    /// Base half-life for memory decay in days. Higher-importance memories get
+    /// a longer half-life: `adaptive_half_life = base * (1 + importance)`.
+    /// Default: 11.25 days.
+    #[serde(default = "Settings::default_memory_decay_base_half_life_days")]
+    pub memory_decay_base_half_life_days: f32,
+
+    /// Decay curve steepness factor. Lower = gentler decay. Default: 0.8.
+    #[serde(default = "Settings::default_memory_decay_beta")]
+    pub memory_decay_beta: f32,
+
+    /// Memory decay: effective score below this → prune (delete). Default 0.05.
+    #[serde(default = "Settings::default_memory_prune_threshold")]
+    pub memory_prune_threshold: f32,
+
+    /// Memory decay: effective score below this → archive (hide). Default 0.15.
+    #[serde(default = "Settings::default_memory_archive_threshold")]
+    pub memory_archive_threshold: f32,
+
+    /// Memory cleanup background task interval in hours. Default 6.
+    #[serde(default = "Settings::default_memory_cleanup_interval_hours")]
+    pub memory_cleanup_interval_hours: u32,
+
+    /// Memory consolidation background task interval in hours. Default 24.
+    #[serde(default = "Settings::default_memory_consolidation_interval_hours")]
+    pub memory_consolidation_interval_hours: u32,
+
+    /// Max memories to process per consolidation batch. Default 50.
+    #[serde(default = "Settings::default_memory_consolidation_batch_size")]
+    pub memory_consolidation_batch_size: u32,
+
+    /// Max facts to extract per conversation turn. Default 3.
+    #[serde(default = "Settings::default_memory_extraction_max_facts")]
+    pub memory_extraction_max_facts: u32,
+
+    /// Minimum seconds between extraction runs (rate limit). Default 10.
+    #[serde(default = "Settings::default_memory_extraction_interval_secs")]
+    pub memory_extraction_interval_secs: u32,
+
+    // ── Scheduling tuning ────────────────────────────────────────────────────
+    /// Max concurrent scheduled task executions. Default 2.
+    #[serde(default = "Settings::default_schedule_max_concurrent")]
+    pub schedule_max_concurrent: u32,
+
+    /// Max execution history entries retained per schedule. Default 50.
+    #[serde(default = "Settings::default_schedule_max_runs_per_task")]
+    pub schedule_max_runs_per_task: u32,
+
+    // ── Context monitoring ─────────────────────────────────────────────────
+    /// When true, tracks context window fill rate per session and emits
+    /// warnings before the context window saturates. Default true.
+    #[serde(default = "Settings::default_context_monitor_enabled")]
+    pub context_monitor_enabled: bool,
+
+    // ── Cost comparison ──────────────────────────────────────────────────────
+    /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
+    #[serde(default = "Settings::default_cloud_input_price_per_million")]
+    pub cloud_input_price_per_million: f64,
+
+    /// Cloud API output token price per million. Default 10.00 (GPT-4o).
+    #[serde(default = "Settings::default_cloud_output_price_per_million")]
+    pub cloud_output_price_per_million: f64,
+
+    // ── Tool cache ──────────────────────────────────────────────────────────
+    /// When true, deterministic tool results (weather, Wikipedia, devices, schedules)
+    /// are cached in memory with per-tool TTLs to avoid redundant API calls.
+    #[serde(default = "Settings::default_tool_cache_enabled")]
+    pub tool_cache_enabled: bool,
+
+    // ── Telemetry ─────────────────────────────────────────────────────────
+    /// When true, per-turn telemetry metrics (TTFT, token counts, tool latency,
+    /// context utilization) are recorded for each chat turn.
+    #[serde(default = "Settings::default_telemetry_enabled")]
+    pub telemetry_enabled: bool,
+
+    // ── Compact encoding ────────────────────────────────────────────────────
+    /// When true, structured data injected into LLM prompts (memories, tool
+    /// results) uses a compact TOON-style encoding that reduces token count
+    /// by 30-60%. Default: true.
+    #[serde(default = "Settings::default_compact_encoding")]
+    pub compact_encoding: bool,
+
+    // ── Experimental ────────────────────────────────────────────────────────
+    /// When true, the ToolAgent detects multiple tool intents per message
+    /// and dispatches them concurrently via `tokio::join_all`.
+    /// Experimental — off by default.
+    #[serde(default)]
+    pub multi_tool_enabled: bool,
+    // ── Tool call validation ────────────────────────────────────────────────
+    /// When true, LLM tool call outputs are validated and repaired before
+    /// execution. Catches common JSON formatting errors from small local models
+    /// (3B-4B). Disable if tool calls are already reliable or handled upstream.
+    #[serde(default = "Settings::default_tool_call_validation")]
+    pub tool_call_validation: bool,
+
+    // ── Post-inference tool request detection ──────────────────────────
+    /// When true, the LLM's response is scanned for natural language tool
+    /// requests (e.g. "Let me look up X"). If detected, the tool is executed
+    /// and the response is revised with the tool data.
+    #[serde(default = "Settings::default_tool_request_detection")]
+    pub tool_request_detection: bool,
+
+    // ── API keys ─────────────────────────────────────────────────────────
+    // Optional API keys for external data services. Tools degrade gracefully
+    // (fewer sources, rate-limited fallbacks) when keys are absent.
+    /// The Guardian Open Platform API key.
+    #[serde(default)]
+    pub api_key_guardian: Option<String>,
+
+    /// GNews API key.
+    #[serde(default)]
+    pub api_key_gnews: Option<String>,
+
+    /// Finnhub stock/market data API key.
+    #[serde(default)]
+    pub api_key_finnhub: Option<String>,
+
+    /// CoinGecko crypto API key (optional — demo tier works without one).
+    #[serde(default)]
+    pub api_key_coingecko: Option<String>,
+
+    /// Self-hosted SearXNG instance URL for web/news search.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
+
+    // ── Extension toggles ───────────────────────────────────────────────
+    // Controls which builtin MCP tool modules are registered at startup.
+    // External extensions are managed separately via the MCP server repository.
+    /// Enable the memory tools module (recall, save, forget).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_memory_enabled: bool,
+
+    /// Enable the scheduling tools module (create, delete, pause, resume, list, run_now, get_runs).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_schedule_enabled: bool,
+
+    /// Enable the weather tool module.
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_weather_enabled: bool,
+
+    /// Enable the knowledge tools module (Wikipedia search, article fetch).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_knowledge_enabled: bool,
+
+    /// Enable the system tools module (shell, files, system info, notifications).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_system_enabled: bool,
+
+    /// Enable the device/profile tools module (devices, profile, model config).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_device_enabled: bool,
+
+    /// Enable the news tools module (headlines, search, trending topics).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_news_enabled: bool,
+
+    /// Enable the finance tools module (stocks, crypto, market data).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_finance_enabled: bool,
+
+    /// Enable the discovery tools module (product search, recommendations).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_discovery_enabled: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            primary_profile_id:              None,
-            assistant_name:                  Self::default_assistant_name(),
-            assistant_personality:           Self::default_assistant_personality(),
-            user_name:                       Self::default_user_name(),
-            timezone:                        Self::default_timezone(),
-            prompt_style:                    Self::default_prompt_style(),
-            custom_system_prompt:            None,
-            prompt_addendum:                 Self::default_prompt_addendum(),
-            chat_provider:                   Self::default_llm_provider(),
-            chat_model:                      Self::default_active_llm_model(),
-            tool_model:                      None,
-            llm_max_tokens:                  Self::default_max_tokens(),
-            llm_temperature:                 Self::default_temperature(),
-            llm_provider:                    Self::default_llm_provider(),
-            voice_wake_word:                      Self::default_wake_word(),
-            voice_kws_whisper_url:                None,
-            voice_kws_energy_threshold:           Self::default_kws_energy_threshold(),
-            voice_kws_post_trigger_silence_ms:    Self::default_kws_post_trigger_silence_ms(),
-            voice_kws_cooldown_ms:                Self::default_kws_cooldown_ms(),
-            voice_wake_word_transcriptions:       Vec::new(),
-            voice_tts_voice:                      Self::default_tts_voice(),
-            voice_recording_duration_secs:   Self::default_recording_duration(),
-            voice_whisper_url:               Self::default_whisper_url(),
-            active_llm_model:                Self::default_active_llm_model(),
-            active_whisper_model:            Self::default_active_whisper_model(),
-            active_tts_model:                Self::default_active_tts_model(),
-            weather_enabled:                 Self::default_weather_enabled(),
-            weather_latitude:                Self::default_weather_latitude(),
-            weather_longitude:               Self::default_weather_longitude(),
-            weather_location_name:           Self::default_weather_location_name(),
-            retention_event_log_days:        Self::default_event_log_days(),
-            retention_sensor_days:           Self::default_sensor_days(),
+            primary_profile_id: None,
+            assistant_name: Self::default_assistant_name(),
+            assistant_personality: Self::default_assistant_personality(),
+            user_name: Self::default_user_name(),
+            timezone: Self::default_timezone(),
+            prompt_style: Self::default_prompt_style(),
+            custom_system_prompt: None,
+            prompt_addendum: Self::default_prompt_addendum(),
+            fast_path_enabled: Self::default_fast_path_enabled(),
+            chat_provider: Self::default_llm_provider(),
+            chat_model: Self::default_active_llm_model(),
+            tool_model: None,
+            llm_max_tokens: Self::default_max_tokens(),
+            llm_temperature: Self::default_temperature(),
+            llm_provider: Self::default_llm_provider(),
+            voice_wake_word: Self::default_wake_word(),
+            voice_kws_whisper_url: None,
+            voice_kws_energy_threshold: Self::default_kws_energy_threshold(),
+            voice_kws_post_trigger_silence_ms: Self::default_kws_post_trigger_silence_ms(),
+            voice_kws_cooldown_ms: Self::default_kws_cooldown_ms(),
+            voice_wake_word_transcriptions: Vec::new(),
+            voice_tts_voice: Self::default_tts_voice(),
+            voice_recording_duration_secs: Self::default_recording_duration(),
+            voice_whisper_url: Self::default_whisper_url(),
+            active_llm_model: Self::default_active_llm_model(),
+            active_whisper_model: Self::default_active_whisper_model(),
+            active_tts_model: Self::default_active_tts_model(),
+            active_embedding_model: String::new(),
+            embedding_provider: Self::default_embedding_provider(),
+            weather_enabled: Self::default_weather_enabled(),
+            weather_latitude: Self::default_weather_latitude(),
+            weather_longitude: Self::default_weather_longitude(),
+            weather_location_name: Self::default_weather_location_name(),
+            retention_event_log_days: Self::default_event_log_days(),
+            retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
-            thinking_mode:                   Self::default_thinking_mode(),
-            show_thinking:                   false,
-            review_mode:                     Self::default_review_mode(),
-            review_max_rounds:               Self::default_review_max_rounds(),
-            review_pass_threshold:           Self::default_review_pass_threshold(),
-            context_window_override:         0,
-            agent_goose_mode:                Self::default_agent_goose_mode(),
-            agent_max_turns:                 Self::default_agent_max_turns(),
-            agent_memory_inject:             Self::default_agent_memory_inject(),
-            agent_memory_limit:              Self::default_agent_memory_limit(),
+            thinking_mode: Self::default_thinking_mode(),
+            show_thinking: false,
+            review_mode: Self::default_review_mode(),
+            review_max_rounds: Self::default_review_max_rounds(),
+            review_pass_threshold: Self::default_review_pass_threshold(),
+            context_window_override: 0,
+            agent_backend: Self::default_agent_backend(),
+            agent_goose_mode: Self::default_agent_goose_mode(),
+            agent_max_turns: Self::default_agent_max_turns(),
+            agent_timeout_secs: Self::default_agent_timeout_secs(),
+            prefix_cache_prompt: Self::default_prefix_cache_prompt(),
+            agent_memory_inject: Self::default_agent_memory_inject(),
+            agent_memory_limit: Self::default_agent_memory_limit(),
+            tool_output_compaction: Self::default_tool_output_compaction(),
+            memory_extraction_enabled: true,
+            memory_cleanup_enabled: true,
+            memory_consolidation_enabled: false, // requires enough memories to be useful
+            memory_consolidation_mode: Self::default_memory_consolidation_mode(),
+            memory_graph_enabled: false, // experimental causal graph retrieval
+            schedule_result_notify: Self::default_schedule_result_notify(),
+            memory_decay_base_half_life_days: Self::default_memory_decay_base_half_life_days(),
+            memory_decay_beta: Self::default_memory_decay_beta(),
+            memory_prune_threshold: Self::default_memory_prune_threshold(),
+            memory_archive_threshold: Self::default_memory_archive_threshold(),
+            memory_cleanup_interval_hours: Self::default_memory_cleanup_interval_hours(),
+            memory_consolidation_interval_hours: Self::default_memory_consolidation_interval_hours(
+            ),
+            memory_consolidation_batch_size: Self::default_memory_consolidation_batch_size(),
+            memory_extraction_max_facts: Self::default_memory_extraction_max_facts(),
+            memory_extraction_interval_secs: Self::default_memory_extraction_interval_secs(),
+            schedule_max_concurrent: Self::default_schedule_max_concurrent(),
+            schedule_max_runs_per_task: Self::default_schedule_max_runs_per_task(),
+            context_monitor_enabled: Self::default_context_monitor_enabled(),
+            cloud_input_price_per_million: Self::default_cloud_input_price_per_million(),
+            cloud_output_price_per_million: Self::default_cloud_output_price_per_million(),
+            tool_cache_enabled: Self::default_tool_cache_enabled(),
+            telemetry_enabled: Self::default_telemetry_enabled(),
+            compact_encoding: Self::default_compact_encoding(),
+            multi_tool_enabled: false,
+            tool_call_validation: Self::default_tool_call_validation(),
+            tool_request_detection: Self::default_tool_request_detection(),
+            api_key_guardian: None,
+            api_key_gnews: None,
+            api_key_finnhub: None,
+            api_key_coingecko: None,
+            searxng_url: None,
+            ext_memory_enabled: true,
+            ext_schedule_enabled: true,
+            ext_weather_enabled: true,
+            ext_knowledge_enabled: true,
+            ext_system_enabled: true,
+            ext_device_enabled: true,
+            ext_news_enabled: true,
+            ext_finance_enabled: true,
+            ext_discovery_enabled: true,
         }
     }
 }
 
 impl Settings {
-    fn default_prompt_style()                -> String { "balanced".to_string() }
-    fn default_prompt_addendum()             -> String { "".to_string() }
-    fn default_assistant_name()             -> String { "Goose".to_string() }
-    fn default_assistant_personality()      -> String { "friendly and concise".to_string() }
-    fn default_user_name()                  -> String { "Friend".to_string() }
-    fn default_timezone()                   -> String { "UTC".to_string() }
+    fn default_fast_path_enabled() -> bool {
+        true
+    }
+    fn default_prompt_style() -> String {
+        "balanced".to_string()
+    }
+    fn default_prompt_addendum() -> String {
+        "".to_string()
+    }
+    fn default_assistant_name() -> String {
+        "Goose".to_string()
+    }
+    fn default_assistant_personality() -> String {
+        "friendly and concise".to_string()
+    }
+    fn default_user_name() -> String {
+        "Friend".to_string()
+    }
+    fn default_timezone() -> String {
+        "UTC".to_string()
+    }
     // 4096 covers most practical assistant replies.  The previous 1024 cap
     // truncated long answers mid-sentence — especially for Harmony-channel
     // models (Gemma 4 / gpt-oss) whose internal `<|channel>thought ...
     // <channel|>` reasoning preamble already eats hundreds of tokens before
     // the visible reply even starts, so 1024 left only ~500 for the answer.
-    fn default_max_tokens()                 -> u32    { 4096 }
-    fn default_temperature()                -> f32    { 0.7 }
-    fn default_llm_provider()               -> String { "".to_string() }
-    fn default_wake_word()                  -> String { "goose".to_string() }
-    fn default_kws_energy_threshold()       -> f32    { 0.01 }
-    fn default_kws_post_trigger_silence_ms() -> u64   { 400 }
-    fn default_kws_cooldown_ms()            -> u64    { 2000 }
-    fn default_tts_voice()                  -> String { "".to_string() }
-    fn default_recording_duration()         -> u32    { 3 }
-    fn default_whisper_url()                -> String { "http://127.0.0.1:9000".to_string() }
-    fn default_active_llm_model()           -> String { "".to_string() }
-    fn default_active_whisper_model()       -> String { "".to_string() }
-    fn default_active_tts_model()           -> String { "".to_string() }
-    fn default_weather_enabled()             -> bool   { false }
-    fn default_weather_latitude()            -> f64    { 0.0 }
-    fn default_weather_longitude()           -> f64    { 0.0 }
-    fn default_weather_location_name()       -> String { "".to_string() }
-    fn default_event_log_days()              -> u32    { 30 }
-    fn default_sensor_days()                -> u32    { 7 }
-    fn default_session_messages_keep()      -> u32    { 500 }
-    fn default_thinking_mode()              -> String { "auto".to_string() }
-    fn default_review_mode()               -> String { "off".to_string() }
-    fn default_review_max_rounds()         -> u32    { 1 }
-    fn default_review_pass_threshold()     -> u8     { 3 }
-    fn default_agent_goose_mode()           -> String { "auto".to_string() }
-    fn default_agent_max_turns()            -> u32    { 20 }
-    fn default_agent_memory_inject()        -> bool   { false }
-    fn default_agent_memory_limit()         -> u32    { 5 }
+    fn default_max_tokens() -> u32 {
+        4096
+    }
+    fn default_temperature() -> f32 {
+        0.7
+    }
+    fn default_llm_provider() -> String {
+        "".to_string()
+    }
+    fn default_wake_word() -> String {
+        "goose".to_string()
+    }
+    fn default_kws_energy_threshold() -> f32 {
+        0.003
+    }
+    fn default_kws_post_trigger_silence_ms() -> u64 {
+        400
+    }
+    fn default_kws_cooldown_ms() -> u64 {
+        2000
+    }
+    fn default_tts_voice() -> String {
+        "".to_string()
+    }
+    fn default_recording_duration() -> u32 {
+        3
+    }
+    fn default_whisper_url() -> String {
+        "http://127.0.0.1:9000".to_string()
+    }
+    fn default_active_llm_model() -> String {
+        "".to_string()
+    }
+    fn default_active_whisper_model() -> String {
+        "".to_string()
+    }
+    fn default_active_tts_model() -> String {
+        "".to_string()
+    }
+    fn default_embedding_provider() -> String {
+        "fastembed".to_string()
+    }
+    fn default_weather_enabled() -> bool {
+        false
+    }
+    fn default_weather_latitude() -> f64 {
+        0.0
+    }
+    fn default_weather_longitude() -> f64 {
+        0.0
+    }
+    fn default_weather_location_name() -> String {
+        "".to_string()
+    }
+    fn default_event_log_days() -> u32 {
+        30
+    }
+    fn default_sensor_days() -> u32 {
+        7
+    }
+    fn default_session_messages_keep() -> u32 {
+        500
+    }
+    fn default_thinking_mode() -> String {
+        "auto".to_string()
+    }
+    fn default_review_mode() -> String {
+        "off".to_string()
+    }
+    fn default_review_max_rounds() -> u32 {
+        1
+    }
+    fn default_review_pass_threshold() -> u8 {
+        3
+    }
+    fn default_agent_backend() -> String {
+        "goose".to_string()
+    }
+    fn default_agent_goose_mode() -> String {
+        "auto".to_string()
+    }
+    fn default_agent_max_turns() -> u32 {
+        20
+    }
+    fn default_agent_timeout_secs() -> u64 {
+        300
+    }
+    fn default_prefix_cache_prompt() -> bool {
+        true
+    }
+    fn default_agent_memory_inject() -> bool {
+        true
+    }
+    fn default_agent_memory_limit() -> u32 {
+        5
+    }
+    fn default_schedule_result_notify() -> bool {
+        true
+    }
+    fn default_memory_decay_base_half_life_days() -> f32 {
+        11.25
+    }
+    fn default_memory_decay_beta() -> f32 {
+        0.8
+    }
+    fn default_memory_prune_threshold() -> f32 {
+        0.05
+    }
+    fn default_memory_archive_threshold() -> f32 {
+        0.15
+    }
+    fn default_tool_output_compaction() -> bool {
+        true
+    }
+    fn default_memory_extraction_enabled() -> bool {
+        true
+    }
+    fn default_memory_cleanup_enabled() -> bool {
+        true
+    }
+    fn default_memory_consolidation_mode() -> String {
+        "single".to_string()
+    }
+    fn default_memory_cleanup_interval_hours() -> u32 {
+        6
+    }
+    fn default_memory_consolidation_interval_hours() -> u32 {
+        24
+    }
+    fn default_memory_consolidation_batch_size() -> u32 {
+        50
+    }
+    fn default_memory_extraction_max_facts() -> u32 {
+        3
+    }
+    fn default_memory_extraction_interval_secs() -> u32 {
+        10
+    }
+    fn default_schedule_max_concurrent() -> u32 {
+        2
+    }
+    fn default_schedule_max_runs_per_task() -> u32 {
+        50
+    }
+    fn default_context_monitor_enabled() -> bool {
+        true
+    }
+    fn default_cloud_input_price_per_million() -> f64 {
+        2.50
+    }
+    fn default_cloud_output_price_per_million() -> f64 {
+        10.00
+    }
+    fn default_tool_cache_enabled() -> bool {
+        true
+    }
+    fn default_telemetry_enabled() -> bool {
+        true
+    }
+    fn default_compact_encoding() -> bool {
+        true
+    }
+    fn default_tool_call_validation() -> bool {
+        true
+    }
+    fn default_tool_request_detection() -> bool {
+        true
+    }
+    fn default_ext_enabled() -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +768,7 @@ mod tests {
         assert_eq!(s.llm_temperature, 0.7);
         assert_eq!(s.voice_wake_word, "goose");
         assert_eq!(s.retention_event_log_days, 30);
+        assert!(s.tool_call_validation); // on by default
     }
 
     #[test]
@@ -366,7 +805,10 @@ mod tests {
     fn custom_system_prompt_roundtrips() {
         let json = r#"{"custom_system_prompt":"You are {{assistant_name}}."}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.custom_system_prompt, Some("You are {{assistant_name}}.".to_string()));
+        assert_eq!(
+            s.custom_system_prompt,
+            Some("You are {{assistant_name}}.".to_string())
+        );
         let json2 = serde_json::to_string(&s).unwrap();
         let s2: Settings = serde_json::from_str(&json2).unwrap();
         assert_eq!(s2.custom_system_prompt, s.custom_system_prompt);
@@ -378,6 +820,82 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.assistant_name, "Pond");
         assert_eq!(s.llm_max_tokens, 4096); // bumped from 1024 to fit Harmony preambles + long replies
-        assert_eq!(s.timezone, "UTC");       // default
+        assert_eq!(s.timezone, "UTC"); // default
+    }
+
+    #[test]
+    fn tool_call_validation_toggleable() {
+        let json = r#"{"tool_call_validation": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.tool_call_validation);
+        // Other fields keep defaults
+        assert!(s.memory_extraction_enabled);
+    }
+
+    #[test]
+    fn extension_toggles_default_to_true() {
+        let s = Settings::default();
+        assert!(s.ext_memory_enabled);
+        assert!(s.ext_schedule_enabled);
+        assert!(s.ext_weather_enabled);
+        assert!(s.ext_knowledge_enabled);
+        assert!(s.ext_system_enabled);
+        assert!(s.ext_device_enabled);
+    }
+
+    #[test]
+    fn extension_toggles_deserialize_from_partial_json() {
+        let json = r#"{"ext_memory_enabled": false, "ext_weather_enabled": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.ext_memory_enabled);
+        assert!(!s.ext_weather_enabled);
+        // Non-specified fields keep defaults
+        assert!(s.ext_schedule_enabled);
+        assert!(s.ext_knowledge_enabled);
+        assert!(s.ext_system_enabled);
+        assert!(s.ext_device_enabled);
+    }
+
+    #[test]
+    fn new_api_key_fields_default_to_none() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.api_key_guardian.is_none());
+        assert!(s.api_key_gnews.is_none());
+        assert!(s.api_key_finnhub.is_none());
+        assert!(s.api_key_coingecko.is_none());
+        assert!(s.searxng_url.is_none());
+    }
+
+    #[test]
+    fn new_extension_toggles_default_to_true() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.ext_news_enabled);
+        assert!(s.ext_finance_enabled);
+        assert!(s.ext_discovery_enabled);
+    }
+
+    #[test]
+    fn api_keys_deserialize_when_present() {
+        let json =
+            r#"{"api_key_guardian": "test-guardian-key", "searxng_url": "http://localhost:8888"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.api_key_guardian, Some("test-guardian-key".to_string()));
+        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
+        // Others still None
+        assert!(s.api_key_gnews.is_none());
+        assert!(s.api_key_finnhub.is_none());
+        assert!(s.api_key_coingecko.is_none());
+    }
+
+    #[test]
+    fn partial_overrides_preserve_new_defaults() {
+        let json = r#"{"ext_news_enabled": false}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.ext_news_enabled);
+        // Other new toggles keep their defaults
+        assert!(s.ext_finance_enabled);
+        assert!(s.ext_discovery_enabled);
+        // API keys still None
+        assert!(s.api_key_guardian.is_none());
     }
 }

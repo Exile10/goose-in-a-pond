@@ -1,29 +1,29 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { Button, Chip } from "@heroui/react";
 import {
-  Layers, Mic, RefreshCw, ExternalLink, Zap, X, Send,
-  MessageSquare, ChevronLeft, ChevronRight,
+  Layers, Mic, RefreshCw, ExternalLink, Zap, Send,
+  ChevronLeft, ChevronRight, Grid3X3, Rows3,
 } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
+import { api } from "../api/PondApiClient";
+import { nextCardId } from "../state/reducer";
+import type { ChatEvent } from "../api/types";
+import { ScheduleDebriefCard } from "../components/ScheduleDebriefCard";
+import {
+  encodeWav, downsampleTo16k, calculateRms,
+  createVadState, advanceVad, DEFAULT_VAD_CONFIG,
+} from "../modes/voice/webAudioUtils";
 
-// ── Design tokens ──────────────────────────────────────────────
-const C = {
-  purple: "#7C3AED",
-  purpleMid: "#8C4BFF",
-  purpleBg: "#F4ECFF",
-  purpleBorder: "rgba(140,75,255,0.25)",
-  grey50: "#FAFAFA",
-  grey100: "#F5F5F5",
-  grey200: "#EDEDED",
-  grey300: "#D4D4D4",
-  grey500: "#A3A3A3",
-  grey600: "#737373",
-  grey700: "#525252",
-  grey800: "#262626",
-  grey900: "#111111",
-  white: "#FFFFFF",
-  green: "#16A34A",
-};
+// Trigger MCP-UI card registrations
+import "../mcp-ui";
+import {
+  findCardRenderer,
+  findCardByHint,
+  McpCardShell,
+  GenericCard,
+  McpAppHost,
+} from "../mcp-ui";
+
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -32,6 +32,13 @@ interface CanvasCard {
   kind: string;
   tool: string;
   title: string;
+  data: Record<string, unknown>;
+  /** Explicit card type from MCP-APP UI hint — takes priority over tool name pattern matching */
+  renderHint?: string;
+  /** MCP App HTML content (standard protocol — rendered in sandboxed iframe) */
+  appHtml?: string;
+  /** MCP App resource URI for refetching */
+  appResourceUri?: string;
 }
 
 interface ChatMessage {
@@ -40,106 +47,6 @@ interface ChatMessage {
   tool?: string;
   status?: "running" | "ok";
 }
-
-// ── Placeholder card ───────────────────────────────────────────
-// Renders a generic empty card slot — actual MCP-UI rendering will
-// be wired later when the tool-call protocol is connected.
-
-function PlaceholderCard({ card, onClose }: { card: CanvasCard; onClose: () => void }) {
-  return (
-    <div style={cardStyles.root}>
-      <div style={cardStyles.chrome}>
-        <div style={cardStyles.chromeLeft}>
-          <Zap size={12} style={{ color: C.purple }} />
-          <code style={cardStyles.tool}>{card.tool}</code>
-        </div>
-        <button onClick={onClose} style={cardStyles.closeBtn} aria-label="Close card">
-          <X size={14} />
-        </button>
-      </div>
-      <div style={cardStyles.body}>
-        <div style={cardStyles.placeholder}>
-          <Layers size={32} style={{ color: C.grey300 }} />
-          <span style={cardStyles.placeholderTitle}>{card.title}</span>
-          <span style={cardStyles.placeholderHint}>
-            MCP tool result will render here
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const cardStyles: Record<string, React.CSSProperties> = {
-  root: {
-    background: C.white,
-    borderRadius: 14,
-    border: `1px solid ${C.grey200}`,
-    overflow: "hidden",
-    animation: "ob-fade 0.3s ease both",
-  },
-  chrome: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "8px 12px",
-    background: C.grey50,
-    borderBottom: `1px solid ${C.grey100}`,
-    fontSize: 12,
-  },
-  chromeLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-  },
-  tool: {
-    fontFamily: "var(--font-mono)",
-    fontSize: 11,
-    color: C.grey600,
-  },
-  closeBtn: {
-    background: "none",
-    border: "none",
-    cursor: "pointer",
-    color: C.grey500,
-    padding: 2,
-    borderRadius: 4,
-  },
-  body: {
-    padding: 24,
-  },
-  placeholder: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 10,
-    padding: "32px 16px",
-    textAlign: "center",
-  },
-  placeholderTitle: {
-    fontSize: 14,
-    fontWeight: 600,
-    color: C.grey700,
-  },
-  placeholderHint: {
-    fontSize: 12,
-    color: C.grey500,
-    maxWidth: "28ch",
-    lineHeight: 1.5,
-  },
-};
-
-// ── Suggestion chips ───────────────────────────────────────────
-// These are placeholders for the types of MCP-UI cards that can
-// render. When wired, clicking one would send a prompt to the LLM.
-
-const SUGGEST_CHIPS = [
-  { key: "ride", label: "Ride", icon: "🚗" },
-  { key: "bio", label: "Biography", icon: "📚" },
-  { key: "shop", label: "Shopping", icon: "🛒" },
-  { key: "weather", label: "Weather", icon: "🌤️" },
-  { key: "flight", label: "Flight", icon: "✈️" },
-];
 
 // ── Canvas section ─────────────────────────────────────────────
 
@@ -157,181 +64,541 @@ export function Canvas() {
   const [draft, setDraft] = useState("");
   const [dockOpen, setDockOpen] = useState(true);
   const [voiceMode, setVoiceMode] = useState(false);
+  const [layout, setLayout] = useState<"grid" | "stack">("grid");
+  const [streaming, setStreaming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const sessionIdRef = useRef<string | undefined>(undefined);
+  /** Track in-flight tool calls so tool_result can update the right card */
+  const pendingToolsRef = useRef<Map<string, number>>(new Map());
+
+  // ── Voice recording state ──────────────────────────────────
+  type VoiceRecState = "idle" | "recording" | "transcribing";
+  const [voiceRecState, setVoiceRecState] = useState<VoiceRecState>("idle");
+  const [audioLevel, setAudioLevel] = useState(0);
+  const voiceCancelledRef = useRef(false);
+  const micCtxRef = useRef<{
+    stream: MediaStream;
+    audioContext: AudioContext;
+    source: MediaStreamAudioSourceNode;
+    analyser: AnalyserNode;
+    processor: ScriptProcessorNode;
+    chunks: Float32Array[];
+    sampleRate: number;
+    pump: ReturnType<typeof setInterval> | null;
+  } | null>(null);
+
+  const closeMic = useCallback(() => {
+    const ctx = micCtxRef.current;
+    if (!ctx) return;
+    if (ctx.pump) clearInterval(ctx.pump);
+    try { ctx.processor.disconnect(); } catch { /* ok */ }
+    try { ctx.source.disconnect(); } catch { /* ok */ }
+    ctx.stream.getTracks().forEach((t) => t.stop());
+    if (ctx.audioContext.state !== "closed") ctx.audioContext.close().catch(() => {});
+    micCtxRef.current = null;
+    setAudioLevel(0);
+  }, []);
+
+  // Cleanup mic on unmount
+  useEffect(() => () => closeMic(), [closeMic]);
+
+  const startVoiceRecording = useCallback(async () => {
+    if (voiceRecState !== "idle" || streaming || !state.serverOnline) return;
+    voiceCancelledRef.current = false;
+    closeMic();
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: { ideal: 16000 }, channelCount: { exact: 1 }, echoCancellation: true, noiseSuppression: true } as MediaTrackConstraints,
+      });
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const chunks: Float32Array[] = [];
+      processor.onaudioprocess = (e) => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      const ctx = { stream, audioContext, source, analyser, processor, chunks, sampleRate: audioContext.sampleRate, pump: null as ReturnType<typeof setInterval> | null };
+      micCtxRef.current = ctx;
+      setVoiceRecState("recording");
+
+      // VAD-based auto-stop
+      const vad = createVadState();
+      const td = new Float32Array(analyser.fftSize);
+      const t0 = Date.now();
+
+      const wavBlob = await new Promise<Blob | null>((resolve) => {
+        ctx.pump = setInterval(() => {
+          if (voiceCancelledRef.current || !micCtxRef.current) {
+            if (ctx.pump) clearInterval(ctx.pump);
+            setAudioLevel(0);
+            resolve(null);
+            return;
+          }
+          analyser.getFloatTimeDomainData(td);
+          const rms = calculateRms(td);
+          setAudioLevel(rms);
+
+          if (Date.now() - t0 >= DEFAULT_VAD_CONFIG.maxDurationMs || advanceVad(vad, rms, Date.now(), DEFAULT_VAD_CONFIG)) {
+            if (ctx.pump) clearInterval(ctx.pump);
+            setAudioLevel(0);
+            // Collect WAV
+            const total = chunks.reduce((s, c) => s + c.length, 0);
+            const merged = new Float32Array(total);
+            let off = 0;
+            for (const c of chunks) { merged.set(c, off); off += c.length; }
+            const wav = encodeWav(downsampleTo16k(merged, ctx.sampleRate), 16000);
+            resolve(new Blob([wav], { type: "audio/wav" }));
+          }
+        }, 30);
+      });
+
+      closeMic();
+      if (!wavBlob || voiceCancelledRef.current) { setVoiceRecState("idle"); return; }
+
+      // Transcribe
+      setVoiceRecState("transcribing");
+      const result = await api.transcribe(await wavBlob.arrayBuffer());
+      const text = result.text?.trim();
+      setVoiceRecState("idle");
+
+      if (text) sendPrompt(text);
+    } catch (err) {
+      closeMic();
+      setVoiceRecState("idle");
+      console.warn("Canvas voice error:", err);
+    }
+  }, [voiceRecState, streaming, state.serverOnline, closeMic]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const cancelVoiceRecording = useCallback(() => {
+    voiceCancelledRef.current = true;
+    closeMic();
+    setVoiceRecState("idle");
+  }, [closeMic]);
+
+  // Cache of tool metadata (includes _meta.ui for MCP Apps detection)
+  const toolMetaRef = useRef<Map<string, { resourceUri?: string }>>(new Map());
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    api.listTools().then((tools: Array<{ name: string; _meta?: { ui?: { resourceUri?: string } } }>) => {
+      const map = new Map<string, { resourceUri?: string }>();
+      for (const t of tools) {
+        if (t._meta?.ui?.resourceUri) {
+          map.set(t.name, { resourceUri: t._meta.ui.resourceUri });
+        }
+      }
+      toolMetaRef.current = map;
+    }).catch(() => {});
+  }, [state.serverOnline]);
+
+  // Prompt suggestions that trigger real LLM tool calls
+  const promptSuggestions = useMemo(() => [
+    { key: "weather", label: "Weather", prompt: "What's the weather like right now?" },
+    { key: "schedules", label: "Schedules", prompt: "List my schedules" },
+    { key: "memories", label: "Memories", prompt: "What do you remember about me?" },
+    { key: "news", label: "News", prompt: "What's in the news today?" },
+    { key: "wikipedia", label: "Wikipedia", prompt: "Tell me about Nairobi on Wikipedia" },
+    { key: "time", label: "Time", prompt: "What time is it?" },
+  ], []);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [thread]);
 
-  function addPlaceholderCard(key: string) {
-    const chip = SUGGEST_CHIPS.find((c) => c.key === key);
-    if (!chip) return;
-    const tool = `mcp.${key}.placeholder`;
+  // Handle debrief context — when navigating from schedule runs
+  const debriefHandledRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!state.debriefContext) { debriefHandledRef.current = null; return; }
+    if (debriefHandledRef.current === state.debriefContext.run.id) return;
+    debriefHandledRef.current = state.debriefContext.run.id;
+    const { run } = state.debriefContext;
+    const debriefCard: CanvasCard = {
+      id: Date.now(),
+      kind: "debrief",
+      tool: "giap-schedule__debrief",
+      title: `Debrief: ${run.scheduleName}`,
+      data: {
+        schedule_id: run.scheduleId,
+        schedule_name: run.scheduleName,
+        status: run.status,
+        result: run.result,
+        error: run.error,
+        started_at: run.startedAt,
+        finished_at: run.finishedAt,
+        duration_ms: run.durationMs,
+        recipe: run.recipe,
+        excerpt: run.excerpt,
+      },
+    };
+    setCards((c) => [debriefCard, ...c]);
     setThread((t) => [
       ...t,
-      { role: "user", text: `Show ${chip.label.toLowerCase()} card` },
-      { role: "tool", text: "", tool, status: "ok" },
-      { role: "assistant", text: `Here's a placeholder for the ${chip.label} card. Connect the MCP tool to see real data.` },
+      { role: "tool", text: "", tool: "giap-schedule__debrief", status: "ok" as const },
+      { role: "assistant", text: `Here's the debrief for "${run.scheduleName}".` },
     ]);
-    setCards((c) => [{ id: Date.now(), kind: key, tool, title: `${chip.icon} ${chip.label}` }, ...c]);
-  }
+    dispatch({ type: "CLEAR_DEBRIEF_CONTEXT" });
+  }, [state.debriefContext, dispatch]);
+
+  function send() { sendPrompt(draft); }
 
   function closeCard(id: number) {
     setCards((c) => c.filter((card) => card.id !== id));
   }
 
-  function send() {
-    const text = draft.trim();
-    if (!text) return;
+  async function sendPrompt(prompt: string) {
+    const text = prompt.trim();
+    if (!text || streaming || !state.serverOnline) return;
     setDraft("");
+    setStreaming(true);
+
+    // Add user message + empty assistant placeholder
     setThread((t) => [
       ...t,
       { role: "user", text },
-      { role: "assistant", text: "Canvas is in placeholder mode. Try the suggestion chips to see card layouts." },
+      { role: "assistant", text: "" },
     ]);
+
+    try {
+      api.setToken(state.sessionToken);
+      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined, true)) {
+        const ev = event as ChatEvent;
+
+        if (ev.type === "text" && (ev.content ?? ev.token)) {
+          const raw = ev.content ?? ev.token ?? "";
+          setThread((t) => {
+            const last = t[t.length - 1];
+            if (!last || last.role !== "assistant") return t;
+            return [...t.slice(0, -1), { ...last, text: last.text + raw }];
+          });
+
+        } else if (ev.type === "status" && ev.content) {
+          setThread((t) => {
+            const last = t[t.length - 1];
+            if (!last || last.role !== "assistant") return t;
+            return [...t.slice(0, -1), { ...last, text: last.text || ev.content! }];
+          });
+
+        } else if (ev.type === "tool_call" && ev.tool) {
+          // Show tool call chip in thread
+          setThread((t) => [...t, { role: "tool", text: "", tool: ev.tool!, status: "running" }]);
+
+          // Create a canvas card for this tool
+          const cardId = nextCardId();
+          const toolName = ev.tool;
+          const reg = findCardByHint(toolName) ?? findCardRenderer(toolName);
+
+          // Check if this tool has an MCP App resource (standard protocol)
+          const meta = toolMetaRef.current.get(toolName);
+          let appHtml: string | undefined;
+          if (meta?.resourceUri) {
+            try {
+              appHtml = await api.getMcpResource(meta.resourceUri);
+            } catch {
+              // Fallback to React registry if resource fetch fails
+            }
+          }
+
+          setCards((c) => [{
+            id: cardId,
+            kind: reg?.key ?? "generic",
+            tool: toolName,
+            title: reg?.label ?? toolName,
+            data: {},
+            ...(appHtml ? { appHtml, appResourceUri: meta?.resourceUri } : {}),
+          }, ...c]);
+
+          // Track for tool_result matching (by tool name and MCP request ID)
+          pendingToolsRef.current.set(toolName, cardId);
+          if (ev.id) pendingToolsRef.current.set(`__id:${ev.id}`, cardId);
+
+        } else if (ev.type === "tool_result" && (ev.tool || ev.id)) {
+          // Update tool call chip status in thread
+          const matchTool = ev.tool || ev.id || "";
+          setThread((t) => t.map((m) =>
+            m.role === "tool" && (m.tool === ev.tool || m.tool === matchTool)
+              ? { ...m, status: "ok" as const }
+              : m
+          ));
+
+          // Update the canvas card with real data
+          const cardData = ev.ui?.data ?? { result: ev.content };
+          const renderHint = ev.ui?.card_type;
+          // Match by tool name first, then by MCP request ID
+          const cardId = (ev.tool && pendingToolsRef.current.get(ev.tool))
+            ?? (ev.id && pendingToolsRef.current.get(`__id:${ev.id}`));
+          if (cardId != null) {
+            setCards((c) => c.map((card) =>
+              card.id === cardId
+                ? { ...card, data: cardData, ...(renderHint ? { renderHint } : {}) }
+                : card
+            ));
+            if (ev.tool) pendingToolsRef.current.delete(ev.tool);
+            if (ev.id) pendingToolsRef.current.delete(`__id:${ev.id}`);
+          }
+
+        } else if (ev.type === "error" || ev.error) {
+          setThread((t) => {
+            const last = t[t.length - 1];
+            if (!last || last.role !== "assistant") return t;
+            return [...t.slice(0, -1), { ...last, text: `Error: ${ev.error ?? "Unknown error"}` }];
+          });
+
+        } else if (ev.done && ev.session_id) {
+          sessionIdRef.current = ev.session_id;
+          dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
+          if (ev.model_name && ev.model_role) {
+            dispatch({
+              type: "SET_LAST_RESPONSE_META",
+              payload: {
+                modelName: ev.model_name,
+                modelRole: ev.model_role,
+                completionTokens: ev.usage?.completion_tokens ?? 0,
+              },
+            });
+          }
+        }
+      }
+    } catch (e) {
+      setThread((t) => {
+        const last = t[t.length - 1];
+        if (!last || last.role !== "assistant") return t;
+        return [...t.slice(0, -1), { ...last, text: `Error: ${String(e)}` }];
+      });
+    } finally {
+      setStreaming(false);
+    }
+  }
+
+  function renderCard(card: CanvasCard) {
+    // 0a. MCP App (standard protocol — sandboxed iframe)
+    if (card.appHtml) {
+      const toolResult = Object.keys(card.data).length > 0
+        ? { content: [{ type: "text", text: JSON.stringify(card.data) }] }
+        : undefined;
+      return (
+        <McpAppHost
+          key={card.id}
+          html={card.appHtml}
+          toolName={card.tool}
+          toolResult={toolResult}
+          toolInput={card.data}
+          onClose={() => closeCard(card.id)}
+          onToolCall={async (name, args) => {
+            // Proxy tool calls from MCP App to server
+            const result = await api.callTool(name, args);
+            return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
+          }}
+          onOpenUrl={(url) => window.open(url, "_blank", "noopener,noreferrer")}
+        />
+      );
+    }
+
+    // 0b. Schedule debrief cards get their own rich renderer
+    if (card.kind === "debrief" && card.data) {
+      const run = {
+        id: String(card.data.schedule_id ?? card.id),
+        scheduleId: String(card.data.schedule_id ?? ""),
+        scheduleName: String(card.data.schedule_name ?? card.title),
+        status: (card.data.status as "completed" | "failed" | "running") ?? "completed",
+        result: (card.data.result as string) ?? null,
+        error: (card.data.error as string) ?? null,
+        startedAt: String(card.data.started_at ?? ""),
+        finishedAt: (card.data.finished_at as string) ?? null,
+        durationMs: (card.data.duration_ms as number) ?? null,
+        read: true,
+        excerpt: String(card.data.excerpt ?? ""),
+        recipe: (card.data.recipe as string) ?? null,
+      };
+      return (
+        <ScheduleDebriefCard key={card.id} run={run} onClose={() => closeCard(card.id)} />
+      );
+    }
+
+    // 1. Try explicit MCP-APP hint (highest priority)
+    const hintReg = card.renderHint ? findCardByHint(card.renderHint) : null;
+    // 2. Fall back to tool name pattern match
+    const reg = hintReg ?? findCardRenderer(card.tool);
+    if (reg) {
+      const Renderer = reg.component;
+      return (
+        <McpCardShell key={card.id} tool={card.tool} label={reg.label} onClose={() => closeCard(card.id)}>
+          <Renderer data={card.data} toolName={card.tool} variant="normal" />
+        </McpCardShell>
+      );
+    }
+    // 3. Fall back to GenericCard
+    return (
+      <McpCardShell key={card.id} tool={card.tool} label={card.title} onClose={() => closeCard(card.id)}>
+        <GenericCard data={card.data} toolName={card.tool} />
+      </McpCardShell>
+    );
   }
 
   return (
-    <div className="screen screen--canvas" style={layoutStyles.root}>
-      <style>{`
-        @keyframes ob-fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes pulse-ring { 0%, 100% { transform: scale(1); opacity: 0.3; } 50% { transform: scale(1.5); opacity: 0; } }
-      `}</style>
-
+    <div className="screen screen--canvas">
       {/* ── Toolbar ──────────────────────────────────────── */}
-      <div style={layoutStyles.toolbar}>
-        <div style={layoutStyles.toolbarLeft}>
-          <h1 style={layoutStyles.title}>Canvas</h1>
-          <Chip size="sm" variant="soft">
+      <div className="canvas-toolbar">
+        <div className="canvas-toolbar__left">
+          <h1 className="page-header__title">Canvas</h1>
+          <Chip size="sm" variant="flat">
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
               <Layers size={12} /> MCP-UI
             </span>
           </Chip>
-          <Chip size="sm" variant="soft" color={voiceMode ? "secondary" : "success"}>
+          <Chip size="sm" variant="flat" color={voiceMode ? undefined : "success"}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-              <span style={{
-                width: 6, height: 6, borderRadius: "50%",
-                background: voiceMode ? C.purpleMid : C.green,
-                display: "inline-block",
-              }} />
+              <span className={`status-dot ${voiceMode ? "" : "status-dot--online"}`} />
               {voiceMode ? "voice mode" : "live"}
             </span>
           </Chip>
         </div>
-        <div style={layoutStyles.toolbarRight}>
+        <div className="canvas-toolbar__right">
+          {/* Layout toggle */}
+          <div style={{ display: "flex", border: "1px solid var(--grey-200)", borderRadius: 8, overflow: "hidden" }}>
+            <button
+              onClick={() => setLayout("grid")}
+              title="Grid layout"
+              style={{
+                background: layout === "grid" ? "var(--purple-50)" : "#fff",
+                border: "none",
+                padding: "5px 8px",
+                cursor: "pointer",
+                color: layout === "grid" ? "var(--purple-500)" : "var(--grey-500)",
+                display: "flex",
+                alignItems: "center",
+              }}
+            >
+              <Grid3X3 size={14} />
+            </button>
+            <button
+              onClick={() => setLayout("stack")}
+              title="Stack layout"
+              style={{
+                background: layout === "stack" ? "var(--purple-50)" : "#fff",
+                border: "none",
+                padding: "5px 8px",
+                cursor: "pointer",
+                color: layout === "stack" ? "var(--purple-500)" : "var(--grey-500)",
+                display: "flex",
+                alignItems: "center",
+              }}
+            >
+              <Rows3 size={14} />
+            </button>
+          </div>
           <Button
             size="sm"
-            variant={voiceMode ? "solid" : "outline"}
+            variant={voiceMode ? "solid" : "bordered"}
             color={voiceMode ? "secondary" : "default"}
+            radius="md"
             onPress={() => setVoiceMode((v) => !v)}
           >
             <Mic size={14} /> Voice mode
           </Button>
           <Button
             size="sm"
-            variant="ghost"
+            variant="light"
             onPress={() => setCards([])}
             isDisabled={cards.length === 0}
           >
             <RefreshCw size={14} /> Clear
           </Button>
-          <Button size="sm" variant="outline">
+          <Button size="sm" variant="bordered" radius="md">
             <ExternalLink size={14} /> Pop out
           </Button>
         </div>
       </div>
 
       {/* ── Stage: canvas + floating dock ───────────────── */}
-      <div style={layoutStyles.stage}>
+      <div className={`canvas-stage${dockOpen ? "" : " dock-collapsed"}`}>
 
         {/* Full-bleed canvas pane */}
-        <div style={layoutStyles.canvasPane}>
-          <div style={layoutStyles.canvasHead}>
-            <div style={layoutStyles.canvasTitle}>
+        <div className="canvas-pane">
+          <div className="canvas-pane__head">
+            <div className="canvas-pane__title">
               <Layers size={14} />
               <span>Canvas</span>
-              <Chip size="sm" variant="soft">{cards.length}</Chip>
+              <Chip size="sm" variant="flat">{cards.length}</Chip>
             </div>
-            <span style={layoutStyles.canvasHint}>Auto-renders when tools return UI</span>
+            <span className="canvas-pane__hint">Auto-renders when tools return UI</span>
           </div>
 
-          <div style={layoutStyles.canvasBody}>
+          <div className="canvas-pane__body">
             {cards.length === 0 ? (
-              <div style={layoutStyles.emptyState}>
-                <Layers size={36} style={{ color: C.grey300 }} />
-                <div style={{ fontSize: 16, fontWeight: 600, color: C.grey700, marginTop: 8 }}>
-                  Nothing rendered yet
-                </div>
-                <div style={{ fontSize: 13, color: C.grey500, maxWidth: "34ch", lineHeight: 1.5 }}>
-                  Ask Pond for a ride, a biography, or shopping suggestions and the result will materialize here.
+              <div className="canvas-empty">
+                <div className="canvas-empty__icon"><Layers size={28} /></div>
+                <div className="canvas-empty__title">Nothing rendered yet</div>
+                <div className="canvas-empty__sub">
+                  Ask Pond a question or try a suggestion chip to see MCP tool results materialize here.
                 </div>
               </div>
             ) : (
-              <div style={layoutStyles.cardGrid}>
-                {cards.map((card) => (
-                  <PlaceholderCard key={card.id} card={card} onClose={() => closeCard(card.id)} />
-                ))}
+              <div className={`canvas-grid${layout === "stack" ? " canvas-grid--stack" : ""}`}>
+                {cards.map((card) => renderCard(card))}
               </div>
             )}
           </div>
         </div>
 
         {/* Floating chat dock */}
-        <div style={{
-          ...layoutStyles.dock,
-          ...(dockOpen ? layoutStyles.dockOpen : layoutStyles.dockCollapsed),
-        }}>
+        <div className={`chat-dock${dockOpen ? " is-open" : " is-collapsed"}`}>
           {dockOpen ? (
             <>
-              <div style={layoutStyles.dockHead}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <div style={layoutStyles.avatar}>P</div>
-                  <span style={{ fontWeight: 600, fontSize: 14, color: C.grey900 }}>Pond</span>
-                  <span style={{ fontSize: 12, color: C.grey500 }}>{voiceMode ? "voice" : "chat"}</span>
+              <div className="chat-dock__head">
+                <div className="chat-dock__title">
+                  <div className="bubble__avatar" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <span className="bubble__avatar-fallback">P</span>
+                  </div>
+                  <span>Pond</span>
+                  <span className="chat-dock__subtitle">{voiceMode ? "voice" : "chat"}</span>
                 </div>
-                <button onClick={() => setDockOpen(false)} style={layoutStyles.iconBtn} title="Hide chat">
+                <button className="chat-dock__icon-btn" onClick={() => setDockOpen(false)} title="Hide chat">
                   <ChevronLeft size={14} />
                 </button>
               </div>
 
-              <div ref={scrollRef} style={layoutStyles.dockBody}>
+              <div ref={scrollRef} className="chat-dock__body">
                 {thread.map((m, i) => {
                   if (m.role === "tool") {
                     return (
-                      <div key={i} style={layoutStyles.toolChip}>
-                        <Zap size={12} style={{ color: C.purple }} />
-                        <code style={{ fontSize: 11, color: C.grey600 }}>{m.tool}</code>
-                        <span style={{ fontSize: 11, color: m.status === "ok" ? C.green : C.grey500 }}>
-                          {m.status === "ok" ? "returned" : "running…"}
+                      <div key={i} className={`tool-call tool-call--${m.status}`}>
+                        <Zap size={12} />
+                        <code>{m.tool}</code>
+                        <span className="tool-call__status">
+                          {m.status === "running"
+                            ? <span className="dots"><span /><span /><span /></span>
+                            : "returned"}
                         </span>
                       </div>
                     );
                   }
                   return (
-                    <div key={i} style={{
-                      ...layoutStyles.bubble,
-                      ...(m.role === "user" ? layoutStyles.bubbleUser : layoutStyles.bubbleAssistant),
-                    }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: m.role === "user" ? C.purpleMid : C.grey500, marginBottom: 4 }}>
+                    <div key={i} className={`bubble bubble--${m.role}`}>
+                      <div className="bubble__author">
                         {m.role === "user" ? "You" : "Pond"}
                       </div>
-                      <div style={{ fontSize: 13, lineHeight: 1.55 }}>{m.text}</div>
+                      <div className="bubble__body">{m.text}</div>
                     </div>
                   );
                 })}
               </div>
 
-              {/* Suggest chips */}
+              {/* Suggest chips — send real prompts to the LLM */}
               {!voiceMode && (
-                <div style={layoutStyles.suggest}>
-                  <span style={{ fontSize: 11, color: C.grey500, fontWeight: 600 }}>Try</span>
-                  {SUGGEST_CHIPS.map((chip) => (
+                <div className="canvas-suggest">
+                  <span className="canvas-suggest__label">Try</span>
+                  {promptSuggestions.map((s) => (
                     <button
-                      key={chip.key}
-                      onClick={() => addPlaceholderCard(chip.key)}
-                      style={layoutStyles.suggestChip}
+                      key={s.key}
+                      className="canvas-suggest__chip"
+                      onClick={() => sendPrompt(s.prompt)}
+                      disabled={streaming}
                     >
-                      {chip.icon} {chip.label}
+                      {s.label}
                     </button>
                   ))}
                 </div>
@@ -339,17 +606,26 @@ export function Canvas() {
 
               {/* Composer or voice orb */}
               {voiceMode ? (
-                <div style={layoutStyles.voiceBar}>
-                  <div style={layoutStyles.voiceOrb}>
+                <div className="voice-bar">
+                  <button
+                    className={`voice-orb${voiceRecState === "recording" ? " is-recording" : ""}${voiceRecState === "transcribing" ? " is-transcribing" : ""}`}
+                    aria-label={voiceRecState === "recording" ? "Stop recording" : "Tap to speak"}
+                    onClick={voiceRecState === "recording" ? cancelVoiceRecording : startVoiceRecording}
+                    disabled={voiceRecState === "transcribing" || streaming}
+                  >
+                    <span className="voice-orb__ring" style={voiceRecState === "recording" ? { transform: `scale(${1 + audioLevel * 8})`, opacity: 0.6 } : undefined} />
+                    <span className="voice-orb__ring voice-orb__ring--2" style={voiceRecState === "recording" ? { transform: `scale(${1 + audioLevel * 12})`, opacity: 0.3 } : undefined} />
                     <Mic size={20} />
+                  </button>
+                  <div className="voice-bar__caption">
+                    {voiceRecState === "recording" ? "Listening..." : voiceRecState === "transcribing" ? "Transcribing..." : "Tap to speak"}
                   </div>
-                  <span style={{ fontSize: 12, color: C.grey500 }}>Tap to speak</span>
                 </div>
               ) : (
-                <div style={layoutStyles.composer}>
+                <div className="canvas-composer">
                   <input
-                    style={layoutStyles.composerInput}
-                    placeholder="Ask anything…"
+                    className="canvas-composer__input"
+                    placeholder="Ask anything..."
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") send(); }}
@@ -358,22 +634,25 @@ export function Canvas() {
                     isIconOnly
                     size="sm"
                     color="secondary"
+                    radius="md"
                     onPress={send}
-                    isDisabled={!draft.trim()}
+                    isDisabled={!draft.trim() || streaming}
                   >
-                    <Send size={14} />
+                    {streaming ? <Zap size={14} /> : <Send size={14} />}
                   </Button>
                 </div>
               )}
             </>
           ) : (
-            <button onClick={() => setDockOpen(true)} style={layoutStyles.dockPill} title="Show chat">
-              <div style={layoutStyles.avatar}>P</div>
-              <span style={{ fontWeight: 600, fontSize: 13 }}>Chat</span>
-              <span style={{ fontSize: 11, color: C.grey500, background: C.grey100, padding: "1px 6px", borderRadius: 999 }}>
+            <button className="chat-dock__pill" onClick={() => setDockOpen(true)} title="Show chat">
+              <div className="bubble__avatar" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <span className="bubble__avatar-fallback">P</span>
+              </div>
+              <span>Chat</span>
+              <span className="chat-dock__count">
                 {thread.filter((m) => m.role !== "tool").length}
               </span>
-              <ChevronRight size={12} style={{ color: C.grey500 }} />
+              <ChevronRight size={12} />
             </button>
           )}
         </div>
@@ -382,250 +661,3 @@ export function Canvas() {
   );
 }
 
-// ── Styles ──────────────────────────────────────────────────────
-
-const layoutStyles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    height: "100%",
-    maxWidth: "none",
-    background: C.grey50,
-  },
-  toolbar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "12px 20px",
-    borderBottom: `1px solid ${C.grey200}`,
-    background: C.white,
-    flexShrink: 0,
-  },
-  toolbarLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-  },
-  toolbarRight: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-  },
-  title: {
-    margin: 0,
-    fontSize: 18,
-    fontWeight: 700,
-    color: C.grey900,
-  },
-  stage: {
-    flex: 1,
-    display: "flex",
-    position: "relative",
-    overflow: "hidden",
-    minHeight: 0,
-  },
-  canvasPane: {
-    flex: 1,
-    display: "flex",
-    flexDirection: "column",
-    minWidth: 0,
-  },
-  canvasHead: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "10px 20px",
-    borderBottom: `1px solid ${C.grey100}`,
-    background: C.white,
-  },
-  canvasTitle: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    fontWeight: 600,
-    fontSize: 13,
-    color: C.grey700,
-  },
-  canvasHint: {
-    fontSize: 11,
-    color: C.grey500,
-  },
-  canvasBody: {
-    flex: 1,
-    overflowY: "auto",
-    padding: 24,
-  },
-  emptyState: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    height: "100%",
-    gap: 6,
-    textAlign: "center",
-  },
-  cardGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
-    gap: 16,
-  },
-  // ── Dock ──
-  dock: {
-    position: "absolute",
-    left: 0,
-    top: 0,
-    bottom: 0,
-    display: "flex",
-    flexDirection: "column",
-    zIndex: 10,
-    transition: "width 0.25s ease, opacity 0.2s",
-  },
-  dockOpen: {
-    width: 360,
-    background: "rgba(255,255,255,0.92)",
-    backdropFilter: "blur(18px)",
-    WebkitBackdropFilter: "blur(18px)",
-    borderRight: `1px solid ${C.grey200}`,
-  },
-  dockCollapsed: {
-    width: 52,
-    background: "transparent",
-  },
-  dockHead: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "12px 16px",
-    borderBottom: `1px solid ${C.grey100}`,
-    flexShrink: 0,
-  },
-  dockBody: {
-    flex: 1,
-    overflowY: "auto",
-    padding: "12px 14px",
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-  },
-  dockPill: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 8,
-    padding: "16px 8px",
-    background: "rgba(255,255,255,0.9)",
-    backdropFilter: "blur(12px)",
-    border: `1px solid ${C.grey200}`,
-    borderRadius: 12,
-    cursor: "pointer",
-    margin: "12px 4px",
-    fontSize: 12,
-    color: C.grey700,
-  },
-  avatar: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-    background: C.purpleBg,
-    color: C.purpleMid,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 13,
-    fontWeight: 700,
-    flexShrink: 0,
-  },
-  iconBtn: {
-    background: "none",
-    border: "none",
-    cursor: "pointer",
-    color: C.grey500,
-    padding: 4,
-    borderRadius: 6,
-  },
-  bubble: {
-    padding: "10px 14px",
-    borderRadius: 12,
-    maxWidth: "92%",
-    color: C.grey800,
-  },
-  bubbleUser: {
-    alignSelf: "flex-end",
-    background: C.purpleBg,
-    border: `1px solid ${C.purpleBorder}`,
-  },
-  bubbleAssistant: {
-    alignSelf: "flex-start",
-    background: C.white,
-    border: `1px solid ${C.grey200}`,
-  },
-  toolChip: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "5px 10px",
-    borderRadius: 8,
-    background: C.grey50,
-    border: `1px solid ${C.grey100}`,
-    alignSelf: "center",
-  },
-  suggest: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "8px 14px",
-    borderTop: `1px solid ${C.grey100}`,
-    flexWrap: "wrap",
-    flexShrink: 0,
-  },
-  suggestChip: {
-    padding: "4px 10px",
-    borderRadius: 999,
-    border: `1px solid ${C.grey200}`,
-    background: C.white,
-    fontSize: 12,
-    cursor: "pointer",
-    color: C.grey700,
-    fontWeight: 500,
-    whiteSpace: "nowrap",
-  },
-  voiceBar: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 10,
-    padding: "16px 14px",
-    borderTop: `1px solid ${C.grey100}`,
-    flexShrink: 0,
-  },
-  voiceOrb: {
-    width: 52,
-    height: 52,
-    borderRadius: "50%",
-    background: C.purpleMid,
-    color: C.white,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: "pointer",
-    boxShadow: "0 4px 16px rgba(124,58,237,0.3)",
-  },
-  composer: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "10px 14px",
-    borderTop: `1px solid ${C.grey100}`,
-    flexShrink: 0,
-  },
-  composerInput: {
-    flex: 1,
-    padding: "8px 12px",
-    borderRadius: 8,
-    border: `1px solid ${C.grey200}`,
-    background: C.white,
-    fontSize: 13,
-    color: C.grey800,
-    outline: "none",
-  },
-};

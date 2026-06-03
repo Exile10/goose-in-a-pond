@@ -12,10 +12,12 @@ license = "Apache-2.0"
 # Build in isolation: cargo build --manifest-path crates/pond-adapters-goose/Cargo.toml
 
 [dependencies]
-pond-core        = { path = "../pond-core" }
-pond-mcp-server  = { path = "../pond-mcp-server" }
+pond-core             = { path = "../pond-core" }
+pond-mcp-server       = { path = "../pond-mcp-server" }
+pond-adapters-weather = { path = "../pond-adapters-weather" }
 goose            = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls", "local-inference"] }
 rmcp             = { workspace = true }
+reqwest          = { workspace = true }
 anyhow = "1.0"
 tokio = { version = "1.49", features = ["full"] }
 async-stream = "0.3"
@@ -26,3 +28,4 @@ serde_json = "1.0"
 tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+tokio-util = "0.7"

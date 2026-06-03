@@ -49,7 +49,11 @@ impl LlmProvider for FallbackProvider {
     }
 
     fn model_name(&self) -> String {
-        format!("{} → {}", self.primary.model_name(), self.fallback.model_name())
+        format!(
+            "{} → {}",
+            self.primary.model_name(),
+            self.fallback.model_name()
+        )
     }
 }
 

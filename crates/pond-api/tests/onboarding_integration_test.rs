@@ -2,23 +2,23 @@
 //!
 //! Run: cargo test -p pond-api --test onboarding_integration_test
 
-use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use std::sync::Arc;
 use tower::ServiceExt;
 
-use pond_core::ports::onboarding::OnboardingRepository;
+use pond_api::{build_router, AppState};
 use pond_core::domain::onboarding::OnboardingStep;
-use pond_api::{AppState, build_router};
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::ports::onboarding::OnboardingRepository;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::mock_memory::MockMemoryRepository;
 use pond_core::services::mock_profile::MockProfileRepository;
 use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::services::mock_settings::MockSettingsRepository;
-use reqwest::Client as ReqwestClient;
 use pond_infra::mock_handshake::MockHandshake;
+use reqwest::Client as ReqwestClient;
 
 // ─────────────────────────────────────────────────────────────────
 // Minimal mock
@@ -30,7 +30,9 @@ struct MockRepo {
 
 impl MockRepo {
     fn new(step: Option<OnboardingStep>) -> Self {
-        Self { step: std::sync::Mutex::new(step) }
+        Self {
+            step: std::sync::Mutex::new(step),
+        }
     }
 }
 
@@ -68,10 +70,18 @@ impl DeviceRegistry for MockDeviceRegistry {
             is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _id: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _id: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _id: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile::TempDir) {
@@ -86,7 +96,8 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
 
     let state = Arc::new(AppState {
         db: Arc::new(db),
-        onboarding_repo: Arc::new(MockRepo::new(step)) as Arc<dyn OnboardingRepository + Send + Sync>,
+        onboarding_repo: Arc::new(MockRepo::new(step))
+            as Arc<dyn OnboardingRepository + Send + Sync>,
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         session_storage,
@@ -112,6 +123,9 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -124,10 +138,25 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -138,7 +167,12 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
 async fn health_is_accessible_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -148,7 +182,12 @@ async fn health_is_accessible_before_onboarding() {
 async fn onboard_status_is_accessible_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/onboard/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/onboard/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
@@ -158,7 +197,12 @@ async fn onboard_status_is_accessible_before_onboarding() {
 async fn system_info_is_accessible_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/system/info").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
@@ -172,9 +216,14 @@ async fn system_info_is_accessible_before_onboarding() {
 async fn chat_is_blocked_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().method("POST").uri("/api/v1/chat")
-            .header("Authorization", "Bearer test-token")
-            .body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -184,9 +233,13 @@ async fn chat_is_blocked_before_onboarding() {
 async fn devices_is_blocked_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/devices")
-            .header("Authorization", "Bearer test-token")
-            .body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -196,7 +249,12 @@ async fn devices_is_blocked_before_onboarding() {
 async fn settings_is_blocked_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/settings").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -210,7 +268,13 @@ async fn settings_is_blocked_before_onboarding() {
 async fn chat_is_accessible_after_onboarding() {
     let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
-        .oneshot(Request::builder().method("POST").uri("/api/v1/chat").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
@@ -220,7 +284,12 @@ async fn chat_is_accessible_after_onboarding() {
 async fn devices_is_accessible_after_onboarding() {
     let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/devices").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
@@ -230,7 +299,12 @@ async fn devices_is_accessible_after_onboarding() {
 async fn settings_is_accessible_after_onboarding() {
     let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
     let res: Response = app
-        .oneshot(Request::builder().uri("/api/v1/settings").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::FORBIDDEN);

@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weather</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --fg: #1C1C1C;
+    --fg-muted: #6B7280;
+    --bg: #ffffff;
+    --bg-card: #f9fafb;
+    --bg-detail: #f3f4f6;
+    --border: #e5e7eb;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    padding: 0;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    max-width: 420px;
+    margin: 0 auto;
+  }
+
+  /* -- Header: location + refresh -- */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .location {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--fg);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .location svg { flex-shrink: 0; }
+  .refresh-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .refresh-btn:hover {
+    background: var(--bg-detail);
+    border-color: var(--accent);
+  }
+  .refresh-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .refresh-btn svg {
+    transition: transform 0.3s;
+  }
+  .refresh-btn.loading svg {
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* -- Main temp display -- */
+  .main-display {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 18px;
+  }
+  .condition-icon {
+    flex-shrink: 0;
+    width: 56px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-detail);
+    border-radius: var(--radius-sm);
+  }
+  .condition-icon svg {
+    width: 32px;
+    height: 32px;
+    color: var(--fg);
+  }
+  .temp-block { flex: 1; }
+  .temp-value {
+    font-size: 42px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -1px;
+    color: var(--fg);
+  }
+  .temp-unit {
+    font-size: 20px;
+    font-weight: 400;
+    color: var(--fg-muted);
+    vertical-align: super;
+  }
+  .condition-text {
+    font-size: 14px;
+    color: var(--fg-muted);
+    margin-top: 4px;
+  }
+  .feels-like {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-top: 2px;
+  }
+
+  /* -- Detail grid -- */
+  .details {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .detail-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg-detail);
+    border-radius: var(--radius-sm);
+  }
+  .detail-icon {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    color: var(--fg-muted);
+  }
+  .detail-label {
+    font-size: 11px;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .detail-value {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  /* -- Sun times row -- */
+  .sun-times {
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .sun-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--fg-muted);
+  }
+  .sun-item svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  /* -- Loading / empty state -- */
+  .loading-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--fg-muted);
+    font-size: 14px;
+  }
+  .loading-state svg {
+    display: block;
+    margin: 0 auto 12px;
+    animation: spin 1.2s linear infinite;
+    color: var(--accent);
+  }
+  .error-state {
+    text-align: center;
+    padding: 24px 20px;
+    color: #dc2626;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="loading-state">
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+    Waiting for weather data...
+  </div>
+</div>
+
+<script>
+// ── Minimal MCP Apps client (no SDK dependency) ──────────────────────
+const APP_NAME = "GIAP Weather";
+const APP_VERSION = "1.0.0";
+let nextId = 1;
+let hostContext = null;
+
+function sendJsonRpc(method, params, id) {
+  window.parent.postMessage(
+    { jsonrpc: "2.0", method, params, ...(id != null ? { id } : {}) },
+    "*"
+  );
+}
+
+function sendRequest(method, params) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    const handler = (event) => {
+      const msg = event.data;
+      if (msg?.jsonrpc === "2.0" && msg.id === id) {
+        window.removeEventListener("message", handler);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolve(msg.result);
+      }
+    };
+    window.addEventListener("message", handler);
+    sendJsonRpc(method, params, id);
+  });
+}
+
+// ── Initialize ─────────────────────────────────────────────────────
+sendRequest("ui/initialize", {
+  capabilities: {},
+  clientInfo: { name: APP_NAME, version: APP_VERSION },
+  protocolVersion: "2026-01-26"
+}).then((result) => {
+  hostContext = result?.hostContext;
+  if (hostContext?.styles?.variables) {
+    for (const [key, val] of Object.entries(hostContext.styles.variables)) {
+      document.documentElement.style.setProperty(key, val);
+    }
+  }
+}).catch(() => {
+  // Host may not support initialize — continue gracefully
+});
+
+// ── Listen for notifications ───────────────────────────────────────
+window.addEventListener("message", (event) => {
+  const msg = event.data;
+  if (msg?.jsonrpc !== "2.0" || msg.id != null) return;
+
+  if (msg.method === "ui/notifications/tool-result") {
+    const text = msg.params?.content?.[0]?.text;
+    if (text) {
+      try { renderWeather(JSON.parse(text)); }
+      catch { renderWeather(parseTextResult(text)); }
+    }
+  }
+  if (msg.method === "ui/notifications/tool-input") {
+    // Tool arguments received — no action needed for weather
+  }
+  if (msg.method === "ui/resource-teardown") {
+    // Cleanup
+  }
+});
+
+// ── Refresh ─────────────────────────────────────────────────────────
+async function refresh() {
+  const btn = document.querySelector(".refresh-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+  }
+  try {
+    const result = await sendRequest("tools/call", {
+      name: "get_current_weather",
+      arguments: {}
+    });
+    const text = result?.content?.[0]?.text;
+    if (text) {
+      try { renderWeather(JSON.parse(text)); }
+      catch { renderWeather(parseTextResult(text)); }
+    }
+  } catch (e) {
+    document.getElementById("app").innerHTML =
+      '<div class="error-state">Failed to fetch weather: ' + escapeHtml(e.message) + '</div>';
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+    }
+  }
+}
+
+// ── Parse plain-text weather result (fallback) ──────────────────────
+function parseTextResult(text) {
+  const data = {};
+  const lines = text.split("\n");
+  for (const line of lines) {
+    const m = line.match(/^([^:]+):\s*(.+)$/);
+    if (!m) continue;
+    const key = m[1].trim().toLowerCase();
+    const val = m[2].trim();
+    if (key.includes("location")) data.location = val;
+    if (key.includes("temperature") && !key.includes("feels")) data.temperature = parseFloat(val);
+    if (key.includes("feels")) data.feels_like = parseFloat(val);
+    if (key.includes("condition") || key.includes("description")) data.condition = val;
+    if (key.includes("humidity")) data.humidity = parseFloat(val);
+    if (key.includes("wind") && key.includes("speed")) data.wind_speed = parseFloat(val);
+    if (key.includes("cloud")) data.cloud_cover = parseFloat(val);
+    if (key.includes("precipitation")) data.precipitation = parseFloat(val);
+    if (key === "sunrise") data.sunrise = val;
+    if (key === "sunset") data.sunset = val;
+  }
+  return data;
+}
+
+// ── Condition icon SVGs (inline, no external deps) ──────────────────
+const ICONS = {
+  sun: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>',
+  cloud: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>',
+  cloudSun: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="M20 12h2"/><path d="m19.07 4.93-1.41 1.41"/><path d="M15.947 12.65a4 4 0 0 0-5.925-4.128"/><path d="M13 22H7a5 5 0 1 1 4.9-6H13a3 3 0 0 1 0 6Z"/></svg>',
+  rain: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/></svg>',
+  snow: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M8 15h.01"/><path d="M8 19h.01"/><path d="M12 17h.01"/><path d="M12 21h.01"/><path d="M16 15h.01"/><path d="M16 19h.01"/></svg>',
+  thunder: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 16.326A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 .5 8.973"/><path d="m13 12-3 5h4l-3 5"/></svg>',
+  fog: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 17H7"/><path d="M17 21H9"/></svg>',
+  sunrise: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v8"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m8 6 4-4 4 4"/><path d="M16 18a4 4 0 0 0-8 0"/></svg>',
+  sunset: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10V2"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m8 6 4 4 4-4"/><path d="M16 18a4 4 0 0 0-8 0"/></svg>',
+  droplets: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 16.3c2.2 0 4-1.83 4-4.05 0-1.16-.57-2.26-1.71-3.19S7.29 6.75 7 5.3c-.29 1.45-1.14 2.84-2.29 3.76S3 11.1 3 12.25c0 2.22 1.8 4.05 4 4.05z"/><path d="M12.56 6.6A10.97 10.97 0 0 0 14 3.02c.5 2.5 2 4.9 4 6.5s3 3.5 3 5.5a6.98 6.98 0 0 1-11.91 4.97"/></svg>',
+  wind: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.7 7.7a2.5 2.5 0 1 1 1.8 4.3H2"/><path d="M9.6 4.6A2 2 0 1 1 11 8H2"/><path d="M12.6 19.4A2 2 0 1 0 14 16H2"/></svg>',
+  cloudCover: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 21H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><path d="M22 10a3 3 0 0 0-3-3h-2.207a5.502 5.502 0 0 0-10.702.5"/></svg>',
+  precip: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/></svg>',
+  pin: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>',
+  refresh: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>',
+};
+
+function pickConditionIcon(condition) {
+  if (!condition) return ICONS.sun;
+  const c = condition.toLowerCase();
+  if (c.includes("thunder") || c.includes("storm")) return ICONS.thunder;
+  if (c.includes("snow") || c.includes("sleet") || c.includes("ice")) return ICONS.snow;
+  if (c.includes("rain") || c.includes("drizzle") || c.includes("shower")) return ICONS.rain;
+  if (c.includes("fog") || c.includes("mist") || c.includes("haze")) return ICONS.fog;
+  if (c.includes("overcast")) return ICONS.cloud;
+  if (c.includes("cloud") || c.includes("partly")) return ICONS.cloudSun;
+  return ICONS.sun;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ── Render ──────────────────────────────────────────────────────────
+function renderWeather(data) {
+  if (!data || (!data.temperature && !data.location)) {
+    document.getElementById("app").innerHTML =
+      '<div class="error-state">No weather data available</div>';
+    return;
+  }
+
+  const temp = data.temperature != null ? Math.round(data.temperature) : "--";
+  const feelsLike = data.feels_like != null ? Math.round(data.feels_like) : null;
+  const condition = data.condition || data.description || "Unknown";
+  const location = data.location || "Unknown location";
+  const humidity = data.humidity != null ? Math.round(data.humidity) : "--";
+  const windSpeed = data.wind_speed != null ? Math.round(data.wind_speed) : "--";
+  const cloudCover = data.cloud_cover != null ? Math.round(data.cloud_cover) : "--";
+  const precip = data.precipitation != null ? data.precipitation : "--";
+  const sunrise = data.sunrise || null;
+  const sunset = data.sunset || null;
+
+  let html = '<div class="card">';
+
+  // Header
+  html += '<div class="header">';
+  html += '<div class="location">' + ICONS.pin + ' ' + escapeHtml(location) + '</div>';
+  html += '<button class="refresh-btn" onclick="refresh()">' + ICONS.refresh + ' Refresh</button>';
+  html += '</div>';
+
+  // Main display
+  html += '<div class="main-display">';
+  html += '<div class="condition-icon">' + pickConditionIcon(condition) + '</div>';
+  html += '<div class="temp-block">';
+  html += '<div class="temp-value">' + temp + '<span class="temp-unit">&deg;C</span></div>';
+  html += '<div class="condition-text">' + escapeHtml(condition) + '</div>';
+  if (feelsLike != null) {
+    html += '<div class="feels-like">Feels like ' + feelsLike + '&deg;C</div>';
+  }
+  html += '</div></div>';
+
+  // Details grid
+  html += '<div class="details">';
+  html += '<div class="detail-item">' + ICONS.droplets +
+    '<div><div class="detail-label">Humidity</div><div class="detail-value">' + humidity + '%</div></div></div>';
+  html += '<div class="detail-item">' + ICONS.wind +
+    '<div><div class="detail-label">Wind</div><div class="detail-value">' + windSpeed + ' km/h</div></div></div>';
+  html += '<div class="detail-item">' + ICONS.cloudCover +
+    '<div><div class="detail-label">Cloud</div><div class="detail-value">' + cloudCover + '%</div></div></div>';
+  html += '<div class="detail-item">' + ICONS.precip +
+    '<div><div class="detail-label">Precip</div><div class="detail-value">' + precip + ' mm</div></div></div>';
+  html += '</div>';
+
+  // Sun times
+  if (sunrise || sunset) {
+    html += '<div class="sun-times">';
+    if (sunrise) {
+      html += '<div class="sun-item">' + ICONS.sunrise + ' ' + escapeHtml(sunrise) + '</div>';
+    }
+    if (sunset) {
+      html += '<div class="sun-item">' + ICONS.sunset + ' ' + escapeHtml(sunset) + '</div>';
+    }
+    html += '</div>';
+  }
+
+  html += '</div>';
+  document.getElementById("app").innerHTML = html;
+}
+</script>
+</body>
+</html>

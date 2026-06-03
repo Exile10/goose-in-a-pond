@@ -153,7 +153,10 @@ fn env_f32(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
 }
 
 fn env_usize(name: &str, default: usize, lo: usize, hi: usize) -> usize {
-    match std::env::var(name).ok().and_then(|s| s.parse::<usize>().ok()) {
+    match std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         Some(v) => v.clamp(lo, hi),
         _ => default,
     }
@@ -190,7 +193,12 @@ impl SqliteFaceRecognition {
             extractor,
             detector: None,
             model_name: "arcface".to_string(),
-            threshold: env_f32("POND_FACE_MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD, 0.0, 1.0),
+            threshold: env_f32(
+                "POND_FACE_MATCH_THRESHOLD",
+                DEFAULT_MATCH_THRESHOLD,
+                0.0,
+                1.0,
+            ),
             runner_up_margin: env_f32(
                 "POND_FACE_RUNNER_UP_MARGIN",
                 DEFAULT_RUNNER_UP_MARGIN,
@@ -308,7 +316,9 @@ impl SqliteFaceRecognition {
     ///   - `Err(_)` if a detector is attached but found no face or the crop
     ///     is too small — this is surfaced as a user-actionable failure.
     async fn run_detector(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
-        let Some(det) = self.detector.as_ref() else { return Ok(None); };
+        let Some(det) = self.detector.as_ref() else {
+            return Ok(None);
+        };
         let found = det
             .detect_face(image_bytes)
             .await
@@ -316,12 +326,12 @@ impl SqliteFaceRecognition {
         match found {
             None => Err(anyhow!("no face detected in image")),
             Some(face) => {
-                if face.bbox.width < MIN_DETECTED_FACE_PX
-                    || face.bbox.height < MIN_DETECTED_FACE_PX
+                if face.bbox.width < MIN_DETECTED_FACE_PX || face.bbox.height < MIN_DETECTED_FACE_PX
                 {
                     return Err(anyhow!(
                         "detected face too small ({}×{} px); move closer to the camera",
-                        face.bbox.width, face.bbox.height
+                        face.bbox.width,
+                        face.bbox.height
                     ));
                 }
                 // Pose sanity: if landmarks are available, reject extreme
@@ -413,7 +423,7 @@ impl SqliteFaceRecognition {
 fn check_pose_sane(lms: &FaceLandmarks) -> Result<()> {
     let (lex, ley) = lms.left_eye;
     let (rex, rey) = lms.right_eye;
-    let (nx, _ny)  = lms.nose;
+    let (nx, _ny) = lms.nose;
     let dx = rex - lex;
     let dy = rey - ley;
     let inter_eye = (dx * dx + dy * dy).sqrt();
@@ -439,18 +449,16 @@ fn check_pose_sane(lms: &FaceLandmarks) -> Result<()> {
     let eye_hi = lex.max(rex);
     let slack = NOSE_CENTERING_SLACK * (eye_hi - eye_lo).abs().max(1.0);
     if nx < eye_lo - slack || nx > eye_hi + slack {
-        return Err(anyhow!(
-            "face not frontal enough; turn toward the camera"
-        ));
+        return Err(anyhow!("face not frontal enough; turn toward the camera"));
     }
     Ok(())
 }
 
 #[derive(sqlx::FromRow)]
 struct FaceRow {
-    id:         String,
+    id: String,
     profile_id: String,
-    embedding:  Vec<u8>,
+    embedding: Vec<u8>,
     model_dims: i64,
     created_at: String,
 }
@@ -463,13 +471,18 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
 
 fn pack_embedding(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
-    for f in v { out.extend_from_slice(&f.to_le_bytes()); }
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
     out
 }
 
 fn unpack_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % 4 != 0 {
-        return Err(anyhow!("embedding BLOB length {} not a multiple of 4", bytes.len()));
+        return Err(anyhow!(
+            "embedding BLOB length {} not a multiple of 4",
+            bytes.len()
+        ));
     }
     Ok(bytes
         .chunks_exact(4)
@@ -479,9 +492,9 @@ fn unpack_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
 
 fn row_to_embedding(row: FaceRow) -> Result<FaceEmbedding> {
     Ok(FaceEmbedding {
-        id:         row.id,
+        id: row.id,
         profile_id: row.profile_id,
-        embedding:  unpack_embedding(&row.embedding)?,
+        embedding: unpack_embedding(&row.embedding)?,
         model_dims: row.model_dims as u32,
         created_at: parse_dt(&row.created_at),
     })
@@ -495,28 +508,44 @@ fn row_to_embedding(row: FaceRow) -> Result<FaceEmbedding> {
 fn centroid_unit(embeddings: &[&Vec<f32>]) -> Option<Vec<f32>> {
     let first = embeddings.first()?;
     let dims = first.len();
-    if dims == 0 { return None; }
+    if dims == 0 {
+        return None;
+    }
     let mut acc = vec![0.0_f32; dims];
     for e in embeddings {
-        if e.len() != dims { return None; }
-        for i in 0..dims { acc[i] += e[i]; }
+        if e.len() != dims {
+            return None;
+        }
+        for i in 0..dims {
+            acc[i] += e[i];
+        }
     }
     let norm: f32 = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm <= 1e-8 { return None; }
-    for v in acc.iter_mut() { *v /= norm; }
+    if norm <= 1e-8 {
+        return None;
+    }
+    for v in acc.iter_mut() {
+        *v /= norm;
+    }
     Some(acc)
 }
 
 /// Cosine similarity in \[-1.0, 1.0\].  Returns 0.0 for zero-norm vectors.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() { return 0.0; }
-    let mut dot = 0.0_f32; let mut na = 0.0_f32; let mut nb = 0.0_f32;
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
     for i in 0..a.len() {
         dot += a[i] * b[i];
-        na  += a[i] * a[i];
-        nb  += b[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
     }
-    if na == 0.0 || nb == 0.0 { return 0.0; }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
     dot / (na.sqrt() * nb.sqrt())
 }
 
@@ -551,17 +580,20 @@ impl FaceRecognition for SqliteFaceRecognition {
             .extract_embedding(image_bytes, bbox, landmarks)
             .await
             .context("face embedding extraction failed")?
-            .ok_or_else(|| anyhow!(
-                "face failed quality gate during enrollment — check server log for the \
+            .ok_or_else(|| {
+                anyhow!(
+                    "face failed quality gate during enrollment — check server log for the \
                  specific gate (low-variance / extreme-brightness / blurry / anti-spoof). \
                  Common knobs: POND_FACE_ANTISPOOF=off, POND_FACE_ANTISPOOF_THRESHOLD=0.85"
-            ))?;
+                )
+            })?;
 
         let dims = self.extractor.embedding_dims();
         if embedding.len() != dims as usize {
             return Err(anyhow!(
                 "extractor returned {} dims but advertises {}",
-                embedding.len(), dims
+                embedding.len(),
+                dims
             ));
         }
 
@@ -681,11 +713,17 @@ impl FaceRecognition for SqliteFaceRecognition {
         for row in rows {
             let candidate = match unpack_embedding(&row.embedding) {
                 Ok(v) => v,
-                Err(e) => { warn!(id = %row.id, "skipping malformed embedding: {e}"); continue; }
+                Err(e) => {
+                    warn!(id = %row.id, "skipping malformed embedding: {e}");
+                    continue;
+                }
             };
             let score = cosine_similarity(&query_embedding, &candidate);
             raw_row_scores.push((row.profile_id.clone(), row.id.clone(), score));
-            by_profile.entry(row.profile_id).or_default().push((candidate, score));
+            by_profile
+                .entry(row.profile_id)
+                .or_default()
+                .push((candidate, score));
         }
         // Log raw cosines per enrollment — the single most useful signal
         // for operators diagnosing false positives / negatives.  If a
@@ -714,8 +752,7 @@ impl FaceRecognition for SqliteFaceRecognition {
                 } else {
                     topk_mean
                 };
-                let combined =
-                    CENTROID_WEIGHT * centroid_cos + (1.0 - CENTROID_WEIGHT) * topk_mean;
+                let combined = CENTROID_WEIGHT * centroid_cos + (1.0 - CENTROID_WEIGHT) * topk_mean;
                 (pid, combined)
             })
             .collect();
@@ -813,7 +850,7 @@ impl FaceRecognition for SqliteFaceRecognition {
 
         let passes_threshold = best_raw >= effective_threshold;
         let passes_runner_up = margin >= self.runner_up_margin;
-        let passes_open_set  = gap_to_mean >= self.open_set_gap_min;
+        let passes_open_set = gap_to_mean >= self.open_set_gap_min;
 
         // Verbose decision log — operators need every score + every gate
         // outcome to diagnose false positives in the field.
@@ -885,7 +922,9 @@ impl FaceRecognition for SqliteFaceRecognition {
         Ok(n)
     }
 
-    fn match_threshold(&self) -> f32 { self.threshold }
+    fn match_threshold(&self) -> f32 {
+        self.threshold
+    }
 
     async fn get_profile_threshold(&self, profile_id: &str) -> Result<Option<f32>> {
         self.lookup_profile_threshold(profile_id).await
@@ -940,11 +979,11 @@ impl FaceRecognition for SqliteFaceRecognition {
             for j in (i + 1)..items.len() {
                 let sim = cosine_similarity(&items[i].2, &items[j].2);
                 out.push(PairwiseSimilarity {
-                    id_a:         items[i].0.clone(),
-                    id_b:         items[j].0.clone(),
-                    profile_a:    items[i].1.clone(),
-                    profile_b:    items[j].1.clone(),
-                    similarity:   sim,
+                    id_a: items[i].0.clone(),
+                    id_b: items[j].0.clone(),
+                    profile_a: items[i].1.clone(),
+                    profile_b: items[j].1.clone(),
+                    similarity: sim,
                     same_profile: items[i].1 == items[j].1,
                 });
             }
@@ -966,7 +1005,9 @@ mod tests {
     use tempfile::tempdir;
 
     /// Deterministic stub extractor.
-    struct StubExtractor { dims: u32 }
+    struct StubExtractor {
+        dims: u32,
+    }
 
     #[async_trait]
     impl FaceEmbeddingExtractor for StubExtractor {
@@ -976,13 +1017,17 @@ mod tests {
             _bbox: Option<BoundingBox>,
             _landmarks: Option<FaceLandmarks>,
         ) -> Result<Option<Vec<f32>>> {
-            if image_bytes.is_empty() { return Ok(None); }
+            if image_bytes.is_empty() {
+                return Ok(None);
+            }
             let mut v = vec![0.0_f32; self.dims as usize];
             let slot = (image_bytes[0] as usize) % (self.dims as usize);
             v[slot] = 1.0;
             Ok(Some(v))
         }
-        fn embedding_dims(&self) -> u32 { self.dims }
+        fn embedding_dims(&self) -> u32 {
+            self.dims
+        }
     }
 
     async fn setup() -> (SqliteFaceRecognition, String, tempfile::TempDir) {
@@ -996,17 +1041,17 @@ mod tests {
             })
             .await
             .unwrap();
-        let svc = SqliteFaceRecognition::new(
-            db.system,
-            Arc::new(StubExtractor { dims: 128 }),
-        );
+        let svc = SqliteFaceRecognition::new(db.system, Arc::new(StubExtractor { dims: 128 }));
         (svc, profile.id, tmp)
     }
 
     #[tokio::test]
     async fn register_and_list_round_trip() {
         let (svc, profile_id, _tmp) = setup().await;
-        let stored = svc.register_face(&profile_id, &[7u8, 1, 2], None).await.unwrap();
+        let stored = svc
+            .register_face(&profile_id, &[7u8, 1, 2], None)
+            .await
+            .unwrap();
         assert_eq!(stored.profile_id, profile_id);
         assert_eq!(stored.embedding.len(), 128);
         let listed = svc.list_embeddings(&profile_id).await.unwrap();
@@ -1019,8 +1064,12 @@ mod tests {
         let (svc, profile_id, _tmp) = setup().await;
         // DEFAULT_MIN_SAMPLES_TO_IDENTIFY = 3 → need three enrollments.
         svc.register_face(&profile_id, &[42u8], None).await.unwrap();
-        svc.register_face(&profile_id, &[42u8, 5], None).await.unwrap();
-        svc.register_face(&profile_id, &[42u8, 7, 3], None).await.unwrap();
+        svc.register_face(&profile_id, &[42u8, 5], None)
+            .await
+            .unwrap();
+        svc.register_face(&profile_id, &[42u8, 7, 3], None)
+            .await
+            .unwrap();
 
         let result = svc.identify_face(&[42u8, 99, 100], None).await.unwrap();
         assert!(result.identified, "expected positive identification");
@@ -1059,8 +1108,12 @@ mod tests {
         // Three enrollments so MIN_SAMPLES_TO_IDENTIFY is met — the
         // rejection must come from the *threshold*, not the min-samples gate.
         svc.register_face(&profile_id, &[1u8], None).await.unwrap();
-        svc.register_face(&profile_id, &[1u8, 9], None).await.unwrap();
-        svc.register_face(&profile_id, &[1u8, 9, 7], None).await.unwrap();
+        svc.register_face(&profile_id, &[1u8, 9], None)
+            .await
+            .unwrap();
+        svc.register_face(&profile_id, &[1u8, 9, 7], None)
+            .await
+            .unwrap();
         // First byte differs → orthogonal embedding → similarity ≈ 0
         let result = svc.identify_face(&[200u8], None).await.unwrap();
         assert!(!result.identified);
@@ -1079,7 +1132,9 @@ mod tests {
     async fn identify_returns_no_face_on_empty_image() {
         let (svc, profile_id, _tmp) = setup().await;
         svc.register_face(&profile_id, &[1u8], None).await.unwrap();
-        svc.register_face(&profile_id, &[1u8, 2], None).await.unwrap();
+        svc.register_face(&profile_id, &[1u8, 2], None)
+            .await
+            .unwrap();
         let result = svc.identify_face(&[], None).await.unwrap();
         assert!(!result.identified);
         assert!(result.confidence.is_none());
@@ -1100,7 +1155,9 @@ mod tests {
     async fn pairwise_similarities_emits_all_unordered_pairs() {
         let (svc, profile_id, _tmp) = setup().await;
         svc.register_face(&profile_id, &[1u8], None).await.unwrap();
-        svc.register_face(&profile_id, &[1u8, 9], None).await.unwrap();
+        svc.register_face(&profile_id, &[1u8, 9], None)
+            .await
+            .unwrap();
         svc.register_face(&profile_id, &[2u8], None).await.unwrap();
         let pairs = svc.pairwise_similarities().await.unwrap();
         // 3 rows → C(3, 2) = 3 pairs.
@@ -1136,10 +1193,10 @@ mod tests {
     #[test]
     fn pose_gate_accepts_frontal_level_face() {
         let lms = FaceLandmarks {
-            left_eye:    (40.0, 50.0),
-            right_eye:   (80.0, 50.0),
-            nose:        (60.0, 70.0),
-            left_mouth:  (45.0, 90.0),
+            left_eye: (40.0, 50.0),
+            right_eye: (80.0, 50.0),
+            nose: (60.0, 70.0),
+            left_mouth: (45.0, 90.0),
             right_mouth: (75.0, 90.0),
         };
         assert!(check_pose_sane(&lms).is_ok());
@@ -1149,10 +1206,10 @@ mod tests {
     fn pose_gate_rejects_tilted_face() {
         // 45° tilt — way beyond 25° cutoff.
         let lms = FaceLandmarks {
-            left_eye:    (40.0, 50.0),
-            right_eye:   (80.0, 90.0),
-            nose:        (60.0, 70.0),
-            left_mouth:  (45.0, 110.0),
+            left_eye: (40.0, 50.0),
+            right_eye: (80.0, 90.0),
+            nose: (60.0, 70.0),
+            left_mouth: (45.0, 110.0),
             right_mouth: (75.0, 110.0),
         };
         assert!(check_pose_sane(&lms).is_err());
@@ -1162,10 +1219,10 @@ mod tests {
     fn pose_gate_rejects_profile_shot() {
         // Nose way to the left of both eyes.
         let lms = FaceLandmarks {
-            left_eye:    (40.0, 50.0),
-            right_eye:   (80.0, 50.0),
-            nose:        (10.0, 70.0),
-            left_mouth:  (45.0, 90.0),
+            left_eye: (40.0, 50.0),
+            right_eye: (80.0, 50.0),
+            nose: (10.0, 70.0),
+            left_mouth: (45.0, 90.0),
             right_mouth: (75.0, 90.0),
         };
         assert!(check_pose_sane(&lms).is_err());

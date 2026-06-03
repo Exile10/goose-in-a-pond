@@ -39,7 +39,101 @@ RUST_LOG=debug cargo run -p pond-server -- chat --provider llamafile
 RUST_LOG=pond_core=debug,pond_infra=info cargo run -p pond-server -- serve
 ```
 
-Log levels: `error` → `warn` → `info` → `debug` → `trace`
+Log levels: `error` -> `warn` -> `info` -> `debug` -> `trace`
+
+---
+
+## Prompt Debugging
+
+### GIAP_DUMP_PROMPT
+
+**File:** `crates/pond-inference/src/provider.rs:168`
+
+Dumps the fully-rendered prompt (after Jinja template application) to a file. This shows exactly what the model receives: system prompt, tool declarations rendered through the chat template, and all conversation messages.
+
+```bash
+# Dump to /tmp/giap-rendered-prompt.txt
+GIAP_DUMP_PROMPT=1 cargo run -p pond-server -- serve
+
+# Dump to a custom path
+GIAP_DUMP_PROMPT=/tmp/debug-prompt.txt cargo run -p pond-server -- serve
+```
+
+Inspect the output to verify:
+- Tools appear in the correct format for the model (e.g. Gemma 4's `<|tool>declaration:NAME{...}<tool|>`)
+- System prompt includes all expected sections (identity, instructions, context-handling)
+- User message has the `<system-context>` / `<user-message>` XML wrapper
+- Thinking mode configuration is applied
+
+### Tool Schema Logging (MCP Dispatcher)
+
+**File:** `crates/pond-mcp-server/src/dispatcher.rs:274`
+
+Enable debug logging on the MCP server crate to see the full JSON schema for every tool as it is collected from each MCP server:
+
+```bash
+RUST_LOG=pond_mcp_server=debug cargo run -p pond-server -- serve
+```
+
+Log lines to look for:
+
+```
+[DEBUG pond_mcp_server::dispatcher] tool schema — prefix="giap-weather__" tool="get_current_weather" description="..." schema={...}
+[INFO  pond_mcp_server::dispatcher] total tool definitions collected from MCP servers — total=35
+```
+
+Each tool's full parameter schema is logged, so you can verify the model receives correct parameter definitions (type, description, required fields).
+
+### Agent Tool Decision Logging
+
+**File:** `crates/pond-agent/src/agent.rs:405`
+
+Enable debug logging on the agent crate to see live tool schema fetching decisions:
+
+```bash
+RUST_LOG=pond_agent=debug cargo run -p pond-server -- serve
+```
+
+Log lines to look for:
+
+```
+[DEBUG pond_agent::agent] tool schemas fetched live from dispatcher — tool_calling=true tools_count=35 full_json_len=8234
+```
+
+This confirms:
+- Whether tool calling is enabled (based on model capabilities)
+- How many tools were passed to the provider
+- The size of the pre-formatted JSON override
+
+### Inference Engine Logging
+
+**File:** `crates/pond-inference/src/provider.rs`
+
+Enable debug logging on the inference crate to trace the full generation pipeline:
+
+```bash
+RUST_LOG=pond_inference=debug cargo run -p pond-server -- serve
+```
+
+Key log lines at each stage:
+
+| Stage | Log line pattern | What it tells you |
+|-------|-----------------|-------------------|
+| Template | `template applied -- tools_count=N has_tools_json=true` | Tools were included in the template |
+| Prompt tail | `prompt tail (last 500 chars)` | Whether tool declarations appear at the end |
+| KV cache | `KV cache partial hit (in-memory) -- tokens_saved=N` | How many tokens were reused |
+| Raw output | `raw model output (first 300 chars)` | What the model actually generated |
+| Tool parse | `generation complete, parsing tool calls` | Whether tool calls were detected |
+
+### Combined Debug Session
+
+For a full diagnostic session showing the complete flow from prompt to tool dispatch:
+
+```bash
+GIAP_DUMP_PROMPT=1 \
+RUST_LOG=pond_agent=debug,pond_inference=debug,pond_mcp_server=debug \
+  cargo run -p pond-server -- serve
+```
 
 ---
 

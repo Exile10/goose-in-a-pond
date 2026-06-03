@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calendar — MCP App</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Quicksand', sans-serif; background: transparent; }
+  .card { background: #fff; border-radius: 16px; border: 1px solid #EBEBF0; overflow: hidden; display: flex; flex-direction: column; }
+  .header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; gap: 8px; }
+  .header-left { display: flex; align-items: center; gap: 8px; }
+  .title { font-size: 13px; font-weight: 700; color: #18181B; }
+  .chip { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: #EDE9FE; color: #6D28D9; }
+  .next-chip { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: #7C3AED; background: #EDE9FE; padding: 3px 9px; border-radius: 999px; }
+  .divider { height: 1px; background: #F1F5F9; }
+  .events { padding: 10px 16px 14px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .event { display: flex; gap: 11px; align-items: stretch; }
+  .bar { width: 3px; border-radius: 3px; flex-shrink: 0; min-height: 48px; }
+  .body { flex: 1; background: #FAFAFA; border-radius: 10px; padding: 9px 12px; border: 1px solid #F1F5F9; }
+  .meta { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+  .time { font-size: 11px; font-weight: 700; color: #64748B; }
+  .dur { font-size: 10px; background: #F1F5F9; color: #94A3B8; padding: 1px 7px; border-radius: 6px; font-weight: 600; }
+  .ev-title { font-size: 13px; font-weight: 700; color: #18181B; }
+  .loc { font-size: 11px; color: #94A3B8; margin-top: 2px; display: flex; align-items: center; gap: 4px; font-weight: 500; }
+  .loading { padding: 40px; text-align: center; color: #94A3B8; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="root" class="card"><div class="loading">Loading events...</div></div>
+<script src="mcp-bridge.js"></script>
+<script>
+  const root = document.getElementById('root');
+  const app = new McpApp({ name: 'giap-calendar', version: '1.0.0' });
+  const COLORS = ['#7C3AED','#0072F5','#16A34A','#F59E0B','#EF4444','#0EA5E9'];
+  const pinSvg = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.75" stroke-linecap="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/></svg>';
+  const clockSvg = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="1.75" stroke-linecap="round"><path d="M12 7v5l3 2M12 2a9 9 0 1 0 0 18A9 9 0 0 0 12 2z"/></svg>';
+
+  function render(data) {
+    const events = data.events || [];
+    const date = data.date || 'Today';
+    const nextIn = data.next_in;
+    let html = `<div class="header"><div class="header-left"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="1.75" stroke-linecap="round"><path d="M8 2v3M16 2v3M3 8h18M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="title">${date}</span><span class="chip">${events.length} event${events.length!==1?'s':''}</span></div>`;
+    if (nextIn) html += `<span class="next-chip">${clockSvg}next in ${nextIn}</span>`;
+    html += `</div><div class="divider"></div><div class="events">`;
+    events.slice(0,6).forEach((ev, i) => {
+      const color = ev.color || COLORS[i % COLORS.length];
+      const loc = ev.location || ev.loc;
+      const dur = ev.duration || ev.dur;
+      html += `<div class="event"><div class="bar" style="background:${color}"></div><div class="body"><div class="meta"><span class="time">${ev.time||''}</span>${dur?`<span class="dur">${dur}</span>`:''}</div><div class="ev-title">${ev.title||''}</div>${loc?`<div class="loc">${pinSvg}${loc}</div>`:''}</div></div>`;
+    });
+    html += '</div>';
+    root.innerHTML = html;
+    app.reportSize(root.offsetWidth, root.offsetHeight);
+  }
+
+  app.ontoolresult = (result) => {
+    const text = result?.content?.find(c => c.type === 'text')?.text;
+    if (!text) return;
+    try { render(JSON.parse(text)); } catch {}
+  };
+  app.ontoolinput = (input) => { if (input?.arguments) render(input.arguments); };
+  app.connect();
+</script>
+</body>
+</html>

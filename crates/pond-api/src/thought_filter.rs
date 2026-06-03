@@ -22,13 +22,22 @@
 /// — we don't expect nesting in practice.
 const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
-    ("<|tool_call>",      "<tool_call|>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
 ];
 
 /// Standalone sentinels that get silently dropped wherever they appear in
 /// the stream. Some models (Gemma-family especially) keep emitting `<eos>`
 /// after the real reply ends; the chat UI then renders them literally.
-const STANDALONE_SENTINELS: &[&str] = &["<eos>", "<|eos|>", "<end_of_turn>"];
+const STANDALONE_SENTINELS: &[&str] = &[
+    "<eos>",
+    "<|eos|>",
+    "<end_of_turn>",
+    // Orphaned close tags (model emitted close without a matching open):
+    "</think>",
+    "</thought>",
+];
 
 /// Maximum tag length across PAIRED_TAGS (open + close) and STANDALONE_SENTINELS.
 /// Used to decide how many trailing bytes to hold back as lookahead. Computed
@@ -140,8 +149,10 @@ impl ThoughtFilter {
                         } else if self.capture_thinking {
                             // Thinking block — capture for SSE thinking events
                             let body = std::mem::take(&mut self.block_body);
-                            let trimmed = body.trim()
-                                .strip_prefix("thought").unwrap_or(body.trim())
+                            let trimmed = body
+                                .trim()
+                                .strip_prefix("thought")
+                                .unwrap_or(body.trim())
                                 .trim();
                             if !trimmed.is_empty() {
                                 self.captured_thinking.push(trimmed.to_string());
@@ -216,7 +227,9 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
         if !name.is_empty() {
             // Lift {} out of () wrapping if present.
             let raw_args = &s[open_idx..];
-            let args = if let Some(stripped) = raw_args.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+            let args = if let Some(stripped) =
+                raw_args.strip_prefix('(').and_then(|x| x.strip_suffix(')'))
+            {
                 stripped.to_string()
             } else {
                 raw_args.to_string()
@@ -228,7 +241,9 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
     // Form 4: full JSON object with `name` + `arguments`.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         if let (Some(name), args) = (v.get("name").and_then(|n| n.as_str()), v.get("arguments")) {
-            let args_str = args.map(|a| a.to_string()).unwrap_or_else(|| "{}".to_string());
+            let args_str = args
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "{}".to_string());
             return Some((name.to_string(), args_str));
         }
     }
@@ -240,7 +255,11 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
 /// ≥ longest standalone sentinel so neither can be missed when split.
 fn max_normal_lookahead() -> usize {
     let opens = PAIRED_TAGS.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
-    let stand = STANDALONE_SENTINELS.iter().map(|s| s.len()).max().unwrap_or(0);
+    let stand = STANDALONE_SENTINELS
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
     opens.max(stand)
 }
 
@@ -297,7 +316,14 @@ mod tests {
 
     #[test]
     fn strips_thought_split_across_chunks() {
-        let chunks = &["<|chan", "nel>thought ", "reason", "<chan", "nel|>", "Hello!"];
+        let chunks = &[
+            "<|chan",
+            "nel>thought ",
+            "reason",
+            "<chan",
+            "nel|>",
+            "Hello!",
+        ];
         assert_eq!(run(chunks), "Hello!");
     }
 
@@ -376,6 +402,96 @@ mod tests {
     fn strips_thought_then_tool_call_back_to_back() {
         let raw = "<|channel>thought planning<channel|>OK <|tool_call>call:x{}<tool_call|>";
         assert_eq!(run(&[raw]), "OK ");
+    }
+
+    // ── <think> / <thought> tag tests ──────────────────────────────────────
+
+    #[test]
+    fn strips_think_block_in_one_chunk() {
+        assert_eq!(
+            run(&["<think>reasoning here</think>The answer is 42."]),
+            "The answer is 42.",
+        );
+    }
+
+    #[test]
+    fn strips_thought_block_in_one_chunk() {
+        assert_eq!(
+            run(&["<thought>internal reasoning</thought>Hello!"]),
+            "Hello!",
+        );
+    }
+
+    #[test]
+    fn strips_think_block_split_across_chunks() {
+        let chunks = &["<thi", "nk>reason", "ing</thi", "nk>answer"];
+        assert_eq!(run(chunks), "answer");
+    }
+
+    #[test]
+    fn strips_thought_block_split_across_chunks() {
+        let chunks = &["<thou", "ght>reason", "</thou", "ght>ok"];
+        assert_eq!(run(chunks), "ok");
+    }
+
+    #[test]
+    fn strips_think_per_token_streaming() {
+        let raw = "<think>Let me think step by step.</think>The answer is 7.";
+        let chunks: Vec<String> = raw.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+        assert_eq!(run(&refs), "The answer is 7.");
+    }
+
+    #[test]
+    fn strips_mixed_channel_and_think_tags() {
+        let raw = "<|channel>thought planning<channel|>text <think>more reasoning</think> final";
+        assert_eq!(run(&[raw]), "text  final");
+    }
+
+    #[test]
+    fn strips_orphaned_close_think_tag() {
+        // Orphaned </think> without open — stripped as standalone sentinel.
+        assert_eq!(run(&["Hello!</think>"]), "Hello!");
+    }
+
+    #[test]
+    fn strips_orphaned_close_thought_tag() {
+        assert_eq!(run(&["result</thought> done"]), "result done");
+    }
+
+    #[test]
+    fn captures_think_block_when_capture_enabled() {
+        let mut f = ThoughtFilter::new().with_thinking_capture();
+        let out = f.push("<think>step by step reasoning</think>The answer.");
+        let out2 = f.flush();
+        assert_eq!(format!("{}{}", out, out2), "The answer.");
+        let thinking = f.take_thinking();
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0], "step by step reasoning");
+    }
+
+    #[test]
+    fn captures_thought_block_when_capture_enabled() {
+        let mut f = ThoughtFilter::new().with_thinking_capture();
+        let out = f.push("<thought>internal monologue</thought>Response.");
+        let out2 = f.flush();
+        assert_eq!(format!("{}{}", out, out2), "Response.");
+        let thinking = f.take_thinking();
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0], "internal monologue");
+    }
+
+    #[test]
+    fn drops_unclosed_think_block_on_flush() {
+        assert_eq!(run(&["<think>never closes"]), "");
+    }
+
+    #[test]
+    fn text_before_think_block() {
+        assert_eq!(
+            run(&["Sure! <think>hmm</think>Here you go."]),
+            "Sure! Here you go.",
+        );
     }
 
     #[test]

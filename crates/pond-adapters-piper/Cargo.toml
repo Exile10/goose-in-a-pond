@@ -14,6 +14,8 @@ tracing     = { workspace = true }
 # rodio is isolated here — not added to workspace deps to avoid pulling
 # audio playback into every crate.
 rodio = "0.19"
+# cpal for microphone input monitoring (barge-in speech energy detection).
+cpal = "0.15"
 
 [dev-dependencies]
 pond-core = { workspace = true }

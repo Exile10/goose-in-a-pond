@@ -83,10 +83,12 @@ impl RateLimiter {
     pub async fn check_rate_limit(&self, client_id: &str) -> bool {
         let mut clients = self.clients.write().await;
         let now = Instant::now();
-        let client = clients.entry(client_id.to_string()).or_insert(ClientRateLimit {
-            window_start: now,
-            request_count: 0,
-        });
+        let client = clients
+            .entry(client_id.to_string())
+            .or_insert(ClientRateLimit {
+                window_start: now,
+                request_count: 0,
+            });
         if now.duration_since(client.window_start) > self.window_duration {
             client.window_start = now;
             client.request_count = 0;
@@ -160,8 +162,8 @@ fn is_public_route(path: &str) -> bool {
 /// - `<--` line: HTTP method, path, response status code, elapsed time in ms
 pub async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    let uri    = req.uri().clone();
-    let start  = std::time::Instant::now();
+    let uri = req.uri().clone();
+    let start = std::time::Instant::now();
 
     tracing::debug!(
         method = %method,
@@ -244,14 +246,20 @@ mod tests {
 
     #[test]
     fn test_extract_bearer_token_missing() {
-        assert!(matches!(extract_bearer_token(&HeaderMap::new()), Err(AuthError::MissingToken)));
+        assert!(matches!(
+            extract_bearer_token(&HeaderMap::new()),
+            Err(AuthError::MissingToken)
+        ));
     }
 
     #[test]
     fn test_extract_bearer_token_invalid_format() {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "Basic my-token-123".parse().unwrap());
-        assert!(matches!(extract_bearer_token(&headers), Err(AuthError::InvalidFormat)));
+        assert!(matches!(
+            extract_bearer_token(&headers),
+            Err(AuthError::InvalidFormat)
+        ));
     }
 
     #[tokio::test]
@@ -285,7 +293,10 @@ mod tests {
         limiter.check_rate_limit("new-client").await;
 
         let clients = limiter.clients.read().await;
-        assert!(!clients.contains_key("stale-client"), "stale entry should have been evicted");
+        assert!(
+            !clients.contains_key("stale-client"),
+            "stale entry should have been evicted"
+        );
         assert_eq!(clients.len(), 1, "only the fresh entry should remain");
     }
 

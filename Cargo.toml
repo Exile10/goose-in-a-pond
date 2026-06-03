@@ -14,6 +14,9 @@ members = [
     "crates/pond-adapters-gotg",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
+    # Independent agent + inference engine (no Goose dependency — future primary path)
+    "crates/pond-agent",
+    "crates/pond-inference",
     # Goose-dependent crates — use goose with default-features=false to avoid
     # the rmcp version conflict (code-mode feature is not enabled).
     "crates/pond-adapters-goose",
@@ -23,6 +26,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.91.1"
 version = "0.1.0"
 authors = ["Jerry Anyumba <jerry@jarida.io>","Liz Wangui <liz@jarida.io>",
     "Purity Wanjiru <wanjiru@jarida.io>","Emmanuel Oyugi <oyugi@jarida.io>",
@@ -39,15 +43,17 @@ string_slice = "warn"
 # rmcp 1.2.0 — required by goose sub-crates when cargo resolves their
 # `workspace = true` deps against the outer (GIAP) workspace for path-dep builds.
 # No GIAP workspace member uses rmcp directly.
-rmcp = { version = "=1.2.0", features = ["schemars", "auth", "server", "client",
+rmcp = { version = "1.5.0", features = ["schemars", "auth", "server", "client",
     "transport-io", "macros", "transport-child-process",
-    "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+    "transport-streamable-http-client", "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-client-unix-socket"] }
 # ── Goose sub-workspace deps ──────────────────────────────────────────────────
 # Cargo resolves goose crates' `workspace = true` dependency entries against the
 # outermost workspace (GIAP) when those crates are reached via path deps.
 # These entries mirror goose/Cargo.toml [workspace.dependencies] for the deps
 # that are NOT already declared above in GIAP's own dep list.
-agent-client-protocol-schema = { version = "0.11", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.12", features = ["unstable"] }
+agent-client-protocol = "0.11"
 sacp             = "11.0.0"
 arboard          = "3"
 sha2             = "0.10"
@@ -75,6 +81,7 @@ axum = "0.8"
 base64 = "0.22.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+croner = "2.2"
 clap = { version = "4", features = ["derive"] }
 dirs = "5.0"
 dotenvy = "0.15"
@@ -134,6 +141,7 @@ hmac = "0.12"
 subtle = "2.5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ndarray = "0.16"
+fastembed = { version = "=5.8.0", default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
 
 # Internal workspace crates
 pond-core              = { path = "crates/pond-core" }
@@ -163,3 +171,4 @@ opentelemetry_sdk          = { git = "https://github.com/open-telemetry/opentele
 opentelemetry-appender-tracing = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
 opentelemetry-otlp         = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
 opentelemetry-stdout       = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "345cd74a" }
+temporal_rs                = { path = "vendor/temporal_rs" }

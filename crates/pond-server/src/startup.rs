@@ -24,8 +24,8 @@ use pond_core::ports::model_storage::ModelStorage;
 ///
 /// Returns the number of downloads triggered (useful for tests and status logs).
 pub async fn auto_download_assigned_models(
-    repo:       Arc<dyn ModelRepository + Send + Sync>,
-    storage:    Arc<dyn ModelStorage + Send + Sync>,
+    repo: Arc<dyn ModelRepository + Send + Sync>,
+    storage: Arc<dyn ModelStorage + Send + Sync>,
     downloader: Arc<dyn ModelDownloader + Send + Sync>,
 ) -> usize {
     let assignments = match repo.list_assignments().await {
@@ -55,7 +55,10 @@ pub async fn auto_download_assigned_models(
         };
 
         // Server-side models need no local file — skip silently.
-        if matches!(record.category, ModelCategory::Ollama | ModelCategory::TtsHttp) {
+        if matches!(
+            record.category,
+            ModelCategory::Ollama | ModelCategory::TtsHttp
+        ) {
             continue;
         }
 
@@ -64,7 +67,10 @@ pub async fn auto_download_assigned_models(
         // DB drift: file on disk but flag is false — correct without re-downloading.
         if on_disk && !record.downloaded {
             if let Err(e) = repo.set_downloaded(&record.id, true).await {
-                tracing::warn!("auto_download: failed to fix DB flag for '{}': {e}", record.id);
+                tracing::warn!(
+                    "auto_download: failed to fix DB flag for '{}': {e}",
+                    record.id
+                );
             } else {
                 tracing::info!(
                     "auto_download: corrected downloaded flag for '{}' (file already on disk)",
@@ -118,14 +124,18 @@ pub async fn auto_download_assigned_models(
         let path = match storage.path_for(&record) {
             Some(p) => p,
             None => {
-                tracing::warn!("auto_download: no local path for '{}' — skipping", record.id);
+                tracing::warn!(
+                    "auto_download: no local path for '{}' — skipping",
+                    record.id
+                );
                 continue;
             }
         };
 
         tracing::info!(
             "auto_download: '{}' assigned to role '{}' but not on disk — downloading…",
-            record.id, a.role
+            record.id,
+            a.role
         );
 
         // Ensure parent directory exists.

@@ -3,6 +3,7 @@ import React, {
   useContext,
   useReducer,
   useEffect,
+  useRef,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -17,13 +18,117 @@ import {
   type AppAction,
   type TranscriptMessage,
   type ContextCard,
+  type ScheduleToast,
 } from "./reducer";
+import type { ScheduleRunNotification } from "../api/types";
 
 const StateCtx = createContext<AppState | null>(null);
 const DispatchCtx = createContext<React.Dispatch<AppAction> | null>(null);
 
 export function AppContextProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, buildInitialState);
+  const scheduleEsRef = useRef<EventSource | null>(null);
+
+  // Global SSE listener for schedule result events.
+  // Opens once when the server comes online and stays open regardless of which
+  // section is active, so toasts work on any page.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+
+    // Close any existing connection before opening a new one.
+    if (scheduleEsRef.current) {
+      scheduleEsRef.current.close();
+      scheduleEsRef.current = null;
+    }
+
+    const baseUrl = state.serverUrl || "http://127.0.0.1:4000";
+    const url = `${baseUrl}/api/v1/schedules/events`;
+    const es = new EventSource(url);
+    scheduleEsRef.current = es;
+
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as {
+          id?: string;
+          schedule_id?: string;
+          schedule_label?: string;
+          status?: string;
+          result?: string;
+          error?: string;
+        };
+        const status = data.status;
+        if (status !== "completed" && status !== "failed" && status !== "running") return;
+        const toast: ScheduleToast = {
+          id: data.id || data.schedule_id || String(Date.now()),
+          schedule_id: data.schedule_id || data.id || "",
+          schedule_label: data.schedule_label || data.schedule_id || "Schedule",
+          status: status as "completed" | "failed" | "running",
+          result: data.result,
+          error: data.error,
+          timestamp: Date.now(),
+        };
+        dispatch({ type: "SCHEDULE_RESULT", payload: toast });
+
+        // Also feed the persistent notifications list
+        const notification: ScheduleRunNotification = {
+          id: toast.id,
+          scheduleId: toast.schedule_id,
+          scheduleName: toast.schedule_label,
+          status: toast.status,
+          result: toast.result ?? null,
+          error: toast.error ?? null,
+          startedAt: new Date().toISOString(),
+          finishedAt: toast.status !== "running" ? new Date().toISOString() : null,
+          durationMs: null,
+          read: false,
+          excerpt: (toast.result ?? toast.error ?? "").slice(0, 80),
+          recipe: inferRecipe(toast.schedule_label),
+        };
+
+        if (toast.status === "running") {
+          dispatch({ type: "ADD_SCHEDULE_RUN", payload: notification });
+        } else {
+          // Completion: update existing running entry or add new
+          dispatch({ type: "UPDATE_SCHEDULE_RUN", payload: {
+            id: toast.schedule_id,
+            status: toast.status,
+            result: toast.result,
+            error: toast.error,
+          }});
+          // Also add as new entry in case we missed the running event
+          dispatch({ type: "ADD_SCHEDULE_RUN", payload: notification });
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    // Fetch existing schedule run history on connect
+    api.getAllRecentRuns(5)
+      .then((runs) => {
+        const notifications: ScheduleRunNotification[] = runs.map((r) => ({
+          id: r.id,
+          scheduleId: r.schedule_id,
+          scheduleName: r.schedule_name,
+          status: r.status,
+          result: r.result ?? null,
+          error: r.error ?? null,
+          startedAt: r.started_at,
+          finishedAt: r.finished_at ?? null,
+          durationMs: r.duration_ms ?? null,
+          read: true, // historical runs start as read
+          excerpt: (r.result ?? r.error ?? "").slice(0, 80),
+          recipe: inferRecipe(r.schedule_name),
+        }));
+        dispatch({ type: "SET_SCHEDULE_RUNS", payload: notifications });
+      })
+      .catch(() => { /* schedule runs fetch failed — non-fatal */ });
+
+    return () => {
+      es.close();
+      scheduleEsRef.current = null;
+    };
+  }, [state.serverOnline, state.serverUrl]);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];
@@ -34,6 +139,14 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       // Browser dev / Playwright mode: mark server online immediately so
       // all sections can load. Auth token not needed (loopback bypass).
       dispatch({ type: "SERVER_ONLINE" });
+      // Still check onboarding status so the wizard shows for new setups.
+      api.getOnboardingStatus()
+        .then((status) => {
+          if (!status.onboarded) {
+            dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true });
+          }
+        })
+        .catch(() => {});
       return;
     }
 
@@ -61,7 +174,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SERVER_ONLINE" });
       api.handshake("pond-desktop")
         .then(async (res) => {
-          api.setToken(res.token);
+          api.setToken(res.token, res.expires_in);
           dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
           await ensureOnboarded();
         })
@@ -147,8 +260,8 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "APPEND_AGENT_TOKEN", payload: e.payload });
     }).then((u) => unlisten.push(u));
 
-    // Tool call results
-    listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number }>(
+    // Tool call results — may include MCP-APP UI hints from backend
+    listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number; renderHint?: string }>(
       "tool-result",
       (e) => {
         const card: ContextCard = {
@@ -156,6 +269,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
           tool: e.payload.tool,
           data: e.payload.data,
           timestamp_ms: e.payload.timestamp_ms,
+          ...(e.payload.renderHint ? { renderHint: e.payload.renderHint } : {}),
         };
         dispatch({ type: "PUSH_CONTEXT_CARD", payload: card });
       },
@@ -208,6 +322,15 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       </DispatchCtx.Provider>
     </StateCtx.Provider>
   );
+}
+
+/** Infer a recipe identifier from the schedule name for debrief card routing. */
+function inferRecipe(name: string): string | null {
+  const lower = name.toLowerCase();
+  if (/morning|briefing|daily.*summ/.test(lower)) return "daily-summary";
+  if (/weekly.*report|week.*summ/.test(lower)) return "weekly-report";
+  if (/compact|consolidat|memory.*clean/.test(lower)) return "compact-memory";
+  return null;
 }
 
 export function useAppState(): AppState {

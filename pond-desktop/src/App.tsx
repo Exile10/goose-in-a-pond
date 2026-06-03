@@ -1,7 +1,7 @@
 import { useAppState, useAppDispatch } from "./state/AppContext";
 import { GuiMode } from "./modes/GuiMode";
-import { VoiceMode } from "./modes/VoiceMode";
-import { OnboardingWizard } from "./components/OnboardingWizard";
+import { VoiceMode } from "./modes/voice";
+import { OnboardingWizard } from "./components/onboarding";
 import { api } from "./api/PondApiClient";
 
 export function App() {

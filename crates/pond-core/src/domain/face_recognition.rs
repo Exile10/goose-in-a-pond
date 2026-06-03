@@ -142,10 +142,10 @@ impl BoundingBox {
 /// "anyone passes the threshold" failure mode emerges.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FaceLandmarks {
-    pub left_eye:    (f32, f32),
-    pub right_eye:   (f32, f32),
-    pub nose:        (f32, f32),
-    pub left_mouth:  (f32, f32),
+    pub left_eye: (f32, f32),
+    pub right_eye: (f32, f32),
+    pub nose: (f32, f32),
+    pub left_mouth: (f32, f32),
     pub right_mouth: (f32, f32),
 }
 
@@ -169,7 +169,7 @@ impl FaceLandmarks {
 /// embedder can warp the crop to the canonical 112×112 pose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedFace {
-    pub bbox:      BoundingBox,
+    pub bbox: BoundingBox,
     pub landmarks: Option<FaceLandmarks>,
-    pub score:     f32,
+    pub score: f32,
 }

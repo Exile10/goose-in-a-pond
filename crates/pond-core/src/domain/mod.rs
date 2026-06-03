@@ -1,16 +1,25 @@
 pub mod agent;
+pub mod draft;
+pub mod external_tool;
 pub mod face_recognition;
+pub mod marketplace;
 pub mod memory;
 pub mod message;
 pub mod model_capabilities;
-pub mod model_record;  // re-exports ModelRecord, ModelCategory, ModelRoleAssignment, BinaryRecord
+pub mod model_record; // re-exports ModelRecord, ModelCategory, ModelRoleAssignment, BinaryRecord
 pub mod model_role;
+pub mod oauth_provider;
 pub mod onboarding;
 pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;
 pub mod recipe;
+pub mod schedule;
+pub mod secret;
 pub mod sensor;
 pub mod session;
 pub mod settings;
 pub mod skill;
+pub mod tool_cache;
+pub mod tool_result;
+pub mod turn_metrics;

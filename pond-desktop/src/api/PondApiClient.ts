@@ -1,10 +1,12 @@
 import {
   ApiError,
   type AddExtensionRequest,
+  type AgentChatStreamRequest,
   type AgentRecipe,
   type AgentTool,
   type CalibrateResponse,
   type ChatEvent,
+  type ChatStreamRequest,
   type Device,
   type DownloadEntry,
   type Extension,
@@ -15,6 +17,7 @@ import {
   type HfModelFile,
   type LlamafileRelease,
   type LogEntry,
+  type MarketplaceExtension,
   type MemoryFragment,
   type ModelActiveRoles,
   type ModelEntry,
@@ -23,9 +26,12 @@ import {
   type PromptExtra,
   type PromptTemplate,
   type Schedule,
+  type ScheduleRun,
+  type SecretRequirement,
   type SessionMessage,
   type SessionSummary,
   type Settings,
+  type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
 } from "./types";
@@ -44,14 +50,28 @@ declare global {
 export class PondApiClient {
   private readonly base: string;
   private token: string | null;
+  private tokenExpiresAt: number | null = null;
+  private refreshPromise: Promise<void> | null = null;
 
   constructor(base?: string, token?: string | null) {
     this.base = (base ?? window.__GIAP_SERVER_URL__ ?? "http://127.0.0.1:4000").replace(/\/$/, "");
     this.token = token ?? null;
   }
 
-  setToken(token: string | null): void {
+  setToken(token: string | null, expiresIn?: number): void {
     this.token = token;
+    this.tokenExpiresAt = token && expiresIn ? Date.now() + expiresIn * 1000 : null;
+  }
+
+  private async ensureTokenFresh(): Promise<void> {
+    if (!this.token || !this.tokenExpiresAt) return;
+    if (Date.now() < this.tokenExpiresAt - 60_000) return;
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.post<HandshakeResponse>("/api/v1/handshake", { client_id: "pond-desktop" })
+      .then((res) => { this.setToken(res.token, res.expires_in); })
+      .catch(() => { /* refresh failed — continue with current token */ })
+      .finally(() => { this.refreshPromise = null; });
+    return this.refreshPromise;
   }
 
   // ── Internal helpers ───────────────────────────────────────
@@ -62,21 +82,34 @@ export class PondApiClient {
     return h;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.base}${path}`, {
-      method,
-      headers: this.headers(),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
-      throw new ApiError(res.status, msg);
+  private async request<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
+    await this.ensureTokenFresh();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout ?? 30_000);
+    try {
+      const res = await fetch(`${this.base}${path}`, {
+        method,
+        headers: this.headers(),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        let msg = res.statusText;
+        try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+        throw new ApiError(res.status, msg);
+      }
+      // 204 No Content and any other empty body — return undefined cast to T
+      const ct = res.headers.get("content-type") ?? "";
+      if (res.status === 204 || !ct.includes("json")) return undefined as unknown as T;
+      return res.json() as Promise<T>;
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e instanceof DOMException && e.name === "AbortError") {
+        throw new ApiError(408, "Request timed out");
+      }
+      throw e;
     }
-    // 204 No Content and any other empty body — return undefined cast to T
-    const ct = res.headers.get("content-type") ?? "";
-    if (res.status === 204 || !ct.includes("json")) return undefined as unknown as T;
-    return res.json() as Promise<T>;
   }
 
   private get<T>(path: string): Promise<T>                       { return this.request<T>("GET", path); }
@@ -89,6 +122,10 @@ export class PondApiClient {
 
   health(): Promise<HealthResponse> {
     return this.get("/api/v1/health");
+  }
+
+  getSystemInfo(): Promise<{ hostname: string; version: string; platform: string; arch: string }> {
+    return this.get("/api/v1/system/info");
   }
 
   // ── Onboarding ────────────────────────────────────────────
@@ -120,39 +157,125 @@ export class PondApiClient {
   }
 
   // ── Schedules ─────────────────────────────────────────────
-  // Backend field mapping: label ↔ name, payload.prompt ↔ prompt, paused ↔ !enabled
 
   listSchedules(): Promise<Schedule[]> {
     return this.get<Array<Record<string, unknown>>>("/api/v1/schedules").then((items) =>
-      (Array.isArray(items) ? items : []).map((t) => ({
-        id: t.id as string,
-        name: (t.label ?? t.name ?? "") as string,
-        cron: t.cron as string,
-        prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? "",
-        enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
-        created_at: t.created_at as string | undefined,
-      })),
+      (Array.isArray(items) ? items : []).map((t) => {
+        // Extract prompt from kind.prompt or legacy payload.prompt
+        const kind = t.kind as Record<string, unknown> | undefined;
+        const payload = t.payload as Record<string, unknown> | undefined;
+        const prompt = (kind?.prompt as string) ?? (payload?.prompt as string) ?? "";
+        return {
+          id: t.id as string,
+          name: (t.label ?? t.name ?? "") as string,
+          cron: t.cron as string,
+          prompt,
+          enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
+          timezone: (t.timezone as string) ?? "UTC",
+          kind: t.kind as Schedule["kind"],
+          last_run: t.last_run as string | undefined,
+          next_run: t.next_run as string | undefined,
+          created_at: t.created_at as string | undefined,
+        };
+      }),
     );
   }
 
   createSchedule(body: Omit<Schedule, "id" | "created_at">): Promise<Schedule> {
-    const id = crypto.randomUUID();
     return this.post<Record<string, unknown>>("/api/v1/schedules", {
-      id,
-      label: body.name,
+      name: body.name,
       cron: body.cron,
-      payload: { prompt: body.prompt },
-    }).then((t) => ({
-      id: t.id as string,
-      name: (t.label ?? t.name ?? body.name) as string,
-      cron: t.cron as string,
-      prompt: ((t.payload as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? body.prompt,
-      enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
-    }));
+      prompt: body.prompt,
+      timezone: body.timezone ?? "UTC",
+    }).then((t) => {
+      const kind = t.kind as Record<string, unknown> | undefined;
+      const prompt = (kind?.prompt as string) ?? body.prompt;
+      return {
+        id: t.id as string,
+        name: (t.label ?? t.name ?? body.name) as string,
+        cron: t.cron as string,
+        prompt,
+        enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
+        timezone: (t.timezone as string) ?? body.timezone ?? "UTC",
+        kind: t.kind as Schedule["kind"],
+        created_at: t.created_at as string | undefined,
+      };
+    });
   }
 
   deleteSchedule(id: string): Promise<void> {
-    return this.del(`/api/v1/schedules/${id}`);
+    return this.del(`/api/v1/schedules/${encodeURIComponent(id)}`);
+  }
+
+  async updateSchedule(
+    id: string,
+    patch: { name?: string; cron?: string; prompt?: string; timezone?: string },
+  ): Promise<Schedule> {
+    const t = await this.put<Record<string, unknown>>(
+      `/api/v1/schedules/${encodeURIComponent(id)}`,
+      patch,
+    );
+    const kind = t.kind as Record<string, unknown> | undefined;
+    const prompt = (kind?.prompt as string) ?? patch.prompt ?? "";
+    return {
+      id: t.id as string,
+      name: ((t.label ?? t.name) as string) || "",
+      cron: t.cron as string,
+      prompt,
+      enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
+      timezone: (t.timezone as string) ?? "UTC",
+      kind: t.kind as Schedule["kind"],
+      last_run: t.last_run as string | undefined,
+      next_run: t.next_run as string | undefined,
+      created_at: t.created_at as string | undefined,
+    };
+  }
+
+  getScheduleRuns(id: string, limit = 10): Promise<ScheduleRun[]> {
+    return this.get<ScheduleRun[]>(`/api/v1/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`);
+  }
+
+  getUpcomingSchedules(limit = 10): Promise<Schedule[]> {
+    return this.get<Schedule[]>(`/api/v1/schedules/upcoming?limit=${limit}`);
+  }
+
+  /** Fetch recent runs across all schedules, merged and sorted by start time. */
+  async getAllRecentRuns(perScheduleLimit = 5): Promise<Array<ScheduleRun & { schedule_name: string }>> {
+    const schedules = await this.listSchedules();
+    const runSets = await Promise.all(
+      schedules.map(async (s) => {
+        try {
+          const runs = await this.getScheduleRuns(s.id, perScheduleLimit);
+          return runs.map((r) => ({ ...r, schedule_name: s.name || s.label || s.id }));
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return runSets
+      .flat()
+      .sort((a, b) => (a.started_at < b.started_at ? 1 : -1));
+  }
+
+  // ── MCP Apps ──────────────────────────────────────────────
+
+  /** Fetch an MCP App resource by its ui:// URI. Returns the HTML content. */
+  async getMcpResource(uri: string): Promise<string> {
+    const res = await this.get<{ contents: Array<{ text?: string }> }>(
+      `/api/v1/mcp/resources?uri=${encodeURIComponent(uri)}`,
+    );
+    return res.contents?.[0]?.text ?? "";
+  }
+
+  /** Execute an MCP tool by name with arguments. Returns the tool result. */
+  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    return this.post<unknown>("/api/v1/mcp/tools/call", { name, arguments: args });
+  }
+
+  // ── Usage ─────────────────────────────────────────────────
+
+  getUsageSummary(): Promise<UsageSummary> {
+    return this.get<UsageSummary>("/api/v1/usage/summary");
   }
 
   // ── Memory ────────────────────────────────────────────────
@@ -161,12 +284,58 @@ export class PondApiClient {
     return this.get(`/api/v1/memories?limit=${limit}`);
   }
 
-  addMemory(content: string, tags?: string[]): Promise<MemoryFragment> {
-    return this.post("/api/v1/memories", { content, tags });
+  addMemory(
+    content: string,
+    tags?: string[],
+    segment?: import("./types").MemorySegment,
+    importance?: number,
+    tier?: import("./types").MemoryTier,
+  ): Promise<MemoryFragment> {
+    return this.post("/api/v1/memories", {
+      content,
+      ...(tags !== undefined && { tags }),
+      ...(segment !== undefined && { segment }),
+      ...(importance !== undefined && { importance }),
+      ...(tier !== undefined && { tier }),
+    });
   }
 
   deleteMemory(id: string): Promise<void> {
     return this.del(`/api/v1/memories/${id}`);
+  }
+
+  // ── Consolidation ─────────────────────────────────────────
+
+  /** Start manual consolidation. Returns an SSE stream of ConsolidationEvent. */
+  async *streamConsolidation(): AsyncGenerator<import("./types").ConsolidationEvent> {
+    const res = await fetch(`${this.base}/api/v1/memory/consolidate`, {
+      method: "POST",
+      headers: this.headers(),
+    });
+    if (!res.ok || !res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (!data) continue;
+        try {
+          yield JSON.parse(data) as import("./types").ConsolidationEvent;
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+
+  /** Stop an in-progress consolidation. */
+  stopConsolidation(): Promise<void> {
+    return this.post("/api/v1/memory/consolidate/stop", {});
   }
 
   // ── Skills ────────────────────────────────────────────────
@@ -212,6 +381,16 @@ export class PondApiClient {
             is_active: (item.active as boolean | undefined) ?? false,
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
+            downloaded: item.downloaded as boolean | undefined,
+            description: item.description as string | undefined,
+            size_mb: item.size_mb as number | undefined,
+            category: (item.category as string | undefined) ?? category,
+            filename: item.filename as string | undefined,
+            url: item.url as string | undefined,
+            asr_language: item.asr_language as string | undefined,
+            asr_size: item.asr_size as string | undefined,
+            tts_engine: item.tts_engine as string | undefined,
+            config_filename: item.config_filename as string | undefined,
           });
         }
       }
@@ -244,10 +423,11 @@ export class PondApiClient {
         return null;
       }
       return {
-        chat:  normalize(raw.chat),
-        tool:  raw.tool ?? null,
-        asr:   normalize(raw.asr),
-        tts:   normalize(raw.tts),
+        chat:      normalize(raw.chat),
+        tool:      raw.tool ?? null,
+        asr:       normalize(raw.asr),
+        tts:       normalize(raw.tts),
+        embedding: normalize(raw.embedding),
       } as ModelActiveRoles;
     });
   }
@@ -339,16 +519,42 @@ export class PondApiClient {
     message: string,
     sessionId?: string,
     token?: string,
+    canvasMode?: boolean,
   ): AsyncGenerator<ChatEvent> {
+    await this.ensureTokenFresh();
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const tok = token ?? this.token;
     if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
-    const res = await fetch(`${this.base}/api/v1/chat/stream`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ message, session_id: sessionId }),
-    });
+    const reqBody: ChatStreamRequest = {
+      message,
+      session_id: sessionId,
+      canvas_mode: canvasMode ?? false,
+    };
+
+    // Retry initial connection on network-level failures (not HTTP errors).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120_000);
+    let res!: Response;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        res = await fetch(`${this.base}/api/v1/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        break;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        if (e instanceof DOMException && e.name === "AbortError") {
+          throw new ApiError(408, "Request timed out");
+        }
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
 
     if (!res.ok) {
       let msg = res.statusText;
@@ -428,6 +634,11 @@ export class PondApiClient {
   // Delete model file from disk (409 ApiError if model is active in a role)
   deleteModel(category: string, name: string): Promise<void> {
     return this.del(`/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}`);
+  }
+
+  // Trigger async download of a catalog model by category and name
+  downloadModel(category: string, name: string): Promise<{ status: string }> {
+    return this.post(`/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}/download`);
   }
 
   // ── Ollama ────────────────────────────────────────────────
@@ -525,17 +736,36 @@ export class PondApiClient {
   // ── Agent chat (agentic mode with tool calls) ─────────────
 
   async *agentChatStream(message: string, sessionId?: string): AsyncGenerator<ChatEvent> {
-    const body: Record<string, string> = { message };
-    if (sessionId) body.session_id = sessionId;
+    await this.ensureTokenFresh();
+    const reqBody: AgentChatStreamRequest = { message };
+    if (sessionId) reqBody.session_id = sessionId;
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
 
-    const res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+    // Retry initial connection on network-level failures (not HTTP errors).
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120_000);
+    let res!: Response;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        break;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        if (e instanceof DOMException && e.name === "AbortError") {
+          throw new ApiError(408, "Request timed out");
+        }
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
 
     if (!res.ok || !res.body) {
       let msg = res.statusText;
@@ -555,7 +785,10 @@ export class PondApiClient {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
+          if (!trimmed || trimmed === "data: [DONE]") {
+            if (trimmed === "data: [DONE]") yield { type: "done", done: true };
+            continue;
+          }
           const data = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
           try { yield JSON.parse(data) as ChatEvent; } catch { /* malformed */ }
         }
@@ -581,6 +814,46 @@ export class PondApiClient {
 
   removeExtension(name: string): Promise<void> {
     return this.del(`/api/v1/extensions/${encodeURIComponent(name)}`);
+  }
+
+  // ── Marketplace ─────────────────────────────────────────
+
+  async listMarketplace(): Promise<MarketplaceExtension[]> {
+    const res = await this.get<{ extensions: MarketplaceExtension[] }>("/api/v1/marketplace");
+    return res.extensions;
+  }
+
+  async installMarketplaceExtension(id: string, secrets?: Record<string, string>): Promise<Extension> {
+    const body = secrets ? { secrets } : undefined;
+    return this.post<Extension>(`/api/v1/marketplace/${encodeURIComponent(id)}/install`, body);
+  }
+
+  async getExtensionSecrets(name: string): Promise<{ requirements: SecretRequirement[]; fulfilled: Record<string, boolean> }> {
+    return this.get(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`);
+  }
+
+  async setExtensionSecrets(name: string, secrets: Record<string, string>): Promise<void> {
+    await this.post(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`, secrets);
+  }
+
+  // ── Secrets ──────────────────────────────────────────────
+
+  async listSecretKeys(): Promise<string[]> {
+    const res = await this.get<{ keys: string[] }>("/api/v1/secrets");
+    return res.keys;
+  }
+
+  async checkSecret(key: string): Promise<boolean> {
+    const res = await this.get<{ exists: boolean }>(`/api/v1/secrets/${encodeURIComponent(key)}/exists`);
+    return res.exists;
+  }
+
+  async setSecret(key: string, value: string): Promise<void> {
+    await this.put(`/api/v1/secrets/${encodeURIComponent(key)}`, { value });
+  }
+
+  async deleteSecret(key: string): Promise<void> {
+    await this.del(`/api/v1/secrets/${encodeURIComponent(key)}`);
   }
 
   // ── Logs ─────────────────────────────────────────────────
@@ -650,6 +923,24 @@ export class PondApiClient {
   /** Clear all calibration data. Detector reverts to raw wake-word phrase. */
   async resetWakeWordCalibration(): Promise<void> {
     await this.del("/api/v1/voice/calibrate");
+  }
+
+  // ── OAuth PKCE ──────────────────────────────────────────────
+
+  /** Start an OAuth PKCE flow. Returns the authorization URL to open in a browser. */
+  async initiateOAuth(provider: string, extensionId?: string): Promise<{ auth_url: string; state: string }> {
+    return this.post("/api/v1/oauth/authorize", { provider, extension_id: extensionId });
+  }
+
+  /** Refresh an expired OAuth access token. */
+  async refreshOAuth(provider: string): Promise<void> {
+    await this.post("/api/v1/oauth/refresh", { provider });
+  }
+
+  /** List supported OAuth providers. */
+  async listOAuthProviders(): Promise<{ id: string; display_name: string; scopes: string[] }[]> {
+    const res = await this.get<{ providers: { id: string; display_name: string; scopes: string[] }[] }>("/api/v1/oauth/providers");
+    return res.providers;
   }
 }
 

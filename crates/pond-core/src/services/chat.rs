@@ -4,14 +4,13 @@ use crate::domain::session::SessionMessage;
 use crate::ports::agent::Agent;
 use crate::ports::provider::LlmProvider;
 use crate::ports::session_storage::SessionStorage;
-use crate::ports::tool_agent::ToolAgent;
 use crate::ports::voice_input::VoiceInput;
 use crate::ports::voice_output::VoiceOutput;
 use crate::ports::wake_word::StreamingWakeWordDetector;
-use crate::services::instant_activation::InstantActivation;
-use crate::services::print_output::PrintOutput;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::services::context_compactor::ContextCompactor;
+use crate::services::instant_activation::InstantActivation;
+use crate::services::print_output::PrintOutput;
 use crate::services::stdin_input::StdinInput;
 use anyhow::Result;
 use futures::StreamExt as _;
@@ -21,18 +20,10 @@ use uuid::Uuid;
 
 // ── Voice helpers ─────────────────────────────────────────────────────────────
 
-/// Classify a voice message into a model role string.
-///
-/// Voice mode defaults Chat-classified messages to "chat" as well; the role
-/// is metadata for the GooseAdapter's model selection.
-fn resolve_voice_role(message: &str) -> String {
-    use crate::domain::model_role::ModelRole;
-    use crate::services::request_classifier::classify_request;
-    match classify_request(message) {
-        ModelRole::Think => "think".to_string(),
-        ModelRole::Task  => "task".to_string(),
-        ModelRole::Chat  => "chat".to_string(),
-    }
+/// Voice mode always uses the "chat" role. The LLM handles tool routing
+/// natively via MCP — no pre-classification needed.
+fn resolve_voice_role(_message: &str) -> String {
+    "chat".to_string()
 }
 
 /// Human-readable announcement spoken while an MCP tool is executing.
@@ -40,9 +31,9 @@ fn tool_announcement(tool: &str) -> String {
     let name = tool.split("__").last().unwrap_or(tool);
     match name {
         "get_current_weather" | "get_weather" => "Let me check the weather.".to_string(),
-        "get_devices" | "list_devices"        => "Checking your devices.".to_string(),
-        "set_schedule" | "create_schedule"    => "Setting that up.".to_string(),
-        "save_memory"                         => "Got it, I'll remember that.".to_string(),
+        "get_devices" | "list_devices" => "Checking your devices.".to_string(),
+        "set_schedule" | "create_schedule" => "Setting that up.".to_string(),
+        "save_memory" => "Got it, I'll remember that.".to_string(),
         other => format!("Let me {}.", other.replace('_', " ")),
     }
 }
@@ -103,7 +94,9 @@ fn split_sentences(text: &str) -> (Vec<String>, String) {
                 let after = &remainder[next..];
                 if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
                     sentences.push(remainder[..next].to_string());
-                    remainder = after.trim_start_matches(|c: char| c == ' ' || c == '\n').to_string();
+                    remainder = after
+                        .trim_start_matches(|c: char| c == ' ' || c == '\n')
+                        .to_string();
                     found = true;
                     break;
                 }
@@ -201,7 +194,8 @@ fn strip_line_prefix(line: &str) -> &str {
         return rest.trim_start();
     }
     // Unordered lists: - / * / +
-    if let Some(rest) = line.strip_prefix("- ")
+    if let Some(rest) = line
+        .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
         .or_else(|| line.strip_prefix("+ "))
     {
@@ -254,9 +248,7 @@ fn strip_inline_md(s: &str) -> String {
         }
 
         // Bold: **text** or __text__
-        if chars.get(i..i + 2) == Some(&['*', '*'])
-            || chars.get(i..i + 2) == Some(&['_', '_'])
-        {
+        if chars.get(i..i + 2) == Some(&['*', '*']) || chars.get(i..i + 2) == Some(&['_', '_']) {
             let marker = [chars[i], chars[i + 1]];
             if let Some(close) = find_marker_close(&chars, i + 2, &marker) {
                 out.push_str(&chars[i + 2..close].iter().collect::<String>());
@@ -317,7 +309,7 @@ fn find_link(chars: &[char], start: usize) -> Option<(usize, String)> {
         return None;
     }
     let text_end = j; // index of `]`
-    // Must be followed by `(`
+                      // Must be followed by `(`
     if chars.get(j + 1) != Some(&'(') {
         return None;
     }
@@ -357,110 +349,187 @@ fn find_marker_close(chars: &[char], start: usize, marker: &[char]) -> Option<us
 /// Unit suffixes matched after a number. Sorted longest-first for greedy matching.
 const UNIT_SUFFIXES: &[(&str, &str)] = &[
     // ── Compound / slash units ──
-    ("km/h",  " kilometers per hour"),
-    ("mi/h",  " miles per hour"),
-    ("KB/s",  " kilobytes per second"),
-    ("MB/s",  " megabytes per second"),
-    ("m/s",   " meters per second"),
-    ("ft/s",  " feet per second"),
+    ("km/h", " kilometers per hour"),
+    ("mi/h", " miles per hour"),
+    ("KB/s", " kilobytes per second"),
+    ("MB/s", " megabytes per second"),
+    ("m/s", " meters per second"),
+    ("ft/s", " feet per second"),
     ("fl oz", " fluid ounces"),
     // ── Data (IEC binary) ──
-    ("KiB", " kibibytes"), ("MiB", " mebibytes"), ("GiB", " gibibytes"), ("TiB", " tebibytes"),
+    ("KiB", " kibibytes"),
+    ("MiB", " mebibytes"),
+    ("GiB", " gibibytes"),
+    ("TiB", " tebibytes"),
     // ── Data speed ──
-    ("kbps", " kilobits per second"), ("Mbps", " megabits per second"), ("Gbps", " gigabits per second"),
+    ("kbps", " kilobits per second"),
+    ("Mbps", " megabits per second"),
+    ("Gbps", " gigabits per second"),
     // ── Energy (long) ──
-    ("kWh", " kilowatt hours"), ("kcal", " kilocalories"), ("BTU", " B T U"),
+    ("kWh", " kilowatt hours"),
+    ("kcal", " kilocalories"),
+    ("BTU", " B T U"),
     // ── Frequency ──
-    ("THz", " terahertz"), ("GHz", " gigahertz"), ("MHz", " megahertz"), ("kHz", " kilohertz"),
+    ("THz", " terahertz"),
+    ("GHz", " gigahertz"),
+    ("MHz", " megahertz"),
+    ("kHz", " kilohertz"),
     // ── Power ──
-    ("GW", " gigawatts"), ("MW", " megawatts"), ("kW", " kilowatts"), ("mW", " milliwatts"),
+    ("GW", " gigawatts"),
+    ("MW", " megawatts"),
+    ("kW", " kilowatts"),
+    ("mW", " milliwatts"),
     // ── Voltage ──
-    ("kV", " kilovolts"), ("mV", " millivolts"),
+    ("kV", " kilovolts"),
+    ("mV", " millivolts"),
     // ── Current ──
-    ("mA", " milliamps"), ("μA", " microamps"),
+    ("mA", " milliamps"),
+    ("μA", " microamps"),
     // ── Resistance ──
-    ("MΩ", " megaohms"), ("kΩ", " kilohms"),
+    ("MΩ", " megaohms"),
+    ("kΩ", " kilohms"),
     // ── Pressure ──
-    ("MPa", " megapascals"), ("kPa", " kilopascals"),
+    ("MPa", " megapascals"),
+    ("kPa", " kilopascals"),
     ("mmHg", " millimeters of mercury"),
-    ("atm", " atmospheres"), ("bar", " bar"), ("psi", " P S I"),
+    ("atm", " atmospheres"),
+    ("bar", " bar"),
+    ("psi", " P S I"),
     // ── Energy ──
-    ("MJ", " megajoules"), ("kJ", " kilojoules"),
-    ("cal", " calories"), ("eV", " electron volts"), ("Wh", " watt hours"),
+    ("MJ", " megajoules"),
+    ("kJ", " kilojoules"),
+    ("cal", " calories"),
+    ("eV", " electron volts"),
+    ("Wh", " watt hours"),
     // ── Sound ──
-    ("dBA", " D B A"), ("dB", " decibels"),
+    ("dBA", " D B A"),
+    ("dB", " decibels"),
     // ── Duration ──
-    ("hrs", " hours"), ("sec", " seconds"), ("min", " minutes"),
-    ("ms", " milliseconds"), ("ns", " nanoseconds"), ("μs", " microseconds"),
+    ("hrs", " hours"),
+    ("sec", " seconds"),
+    ("min", " minutes"),
+    ("ms", " milliseconds"),
+    ("ns", " nanoseconds"),
+    ("μs", " microseconds"),
     ("hr", " hours"),
     // ── Data storage ──
-    ("KB", " kilobytes"), ("MB", " megabytes"), ("GB", " gigabytes"),
-    ("TB", " terabytes"), ("PB", " petabytes"), ("EB", " exabytes"),
+    ("KB", " kilobytes"),
+    ("MB", " megabytes"),
+    ("GB", " gigabytes"),
+    ("TB", " terabytes"),
+    ("PB", " petabytes"),
+    ("EB", " exabytes"),
     // ── Speed ──
-    ("mph", " miles per hour"), ("bps", " bits per second"),
+    ("mph", " miles per hour"),
+    ("bps", " bits per second"),
     // ── Area (with superscript) ──
-    ("km²", " square kilometers"), ("cm²", " square centimeters"),
-    ("m²", " square meters"), ("ft²", " square feet"), ("in²", " square inches"),
-    ("cm³", " cubic centimeters"), ("m³", " cubic meters"),
+    ("km²", " square kilometers"),
+    ("cm²", " square centimeters"),
+    ("m²", " square meters"),
+    ("ft²", " square feet"),
+    ("in²", " square inches"),
+    ("cm³", " cubic centimeters"),
+    ("m³", " cubic meters"),
     ("ha", " hectares"),
     // ── Length ──
-    ("km", " kilometers"), ("cm", " centimeters"), ("mm", " millimeters"),
-    ("nm", " nanometers"), ("μm", " micrometers"),
-    ("mi", " miles"), ("ft", " feet"), ("yd", " yards"),
+    ("km", " kilometers"),
+    ("cm", " centimeters"),
+    ("mm", " millimeters"),
+    ("nm", " nanometers"),
+    ("μm", " micrometers"),
+    ("mi", " miles"),
+    ("ft", " feet"),
+    ("yd", " yards"),
     // ── Weight ──
-    ("kg", " kilograms"), ("mg", " milligrams"), ("μg", " micrograms"),
-    ("lbs", " pounds"), ("lb", " pounds"), ("oz", " ounces"), ("st", " stone"),
+    ("kg", " kilograms"),
+    ("mg", " milligrams"),
+    ("μg", " micrograms"),
+    ("lbs", " pounds"),
+    ("lb", " pounds"),
+    ("oz", " ounces"),
+    ("st", " stone"),
     // ── Volume ──
-    ("mL", " milliliters"), ("dL", " deciliters"), ("kL", " kiloliters"),
-    ("gal", " gallons"), ("qt", " quarts"), ("pt", " pints"),
+    ("mL", " milliliters"),
+    ("dL", " deciliters"),
+    ("kL", " kiloliters"),
+    ("gal", " gallons"),
+    ("qt", " quarts"),
+    ("pt", " pints"),
     // ── Single-char units (last — shortest match) ──
-    ("Hz", " hertz"), ("Pa", " pascals"),
-    ("W", " watts"), ("V", " volts"), ("A", " amps"),
-    ("J", " joules"), ("Ω", " ohms"), ("L", " liters"),
-    ("m", " meters"), ("g", " grams"),
+    ("Hz", " hertz"),
+    ("Pa", " pascals"),
+    ("W", " watts"),
+    ("V", " volts"),
+    ("A", " amps"),
+    ("J", " joules"),
+    ("Ω", " ohms"),
+    ("L", " liters"),
+    ("m", " meters"),
+    ("g", " grams"),
 ];
 
 /// Currency symbols: (char, singular, plural).
 const CURRENCY_SYMBOLS: &[(char, &str, &str)] = &[
-    ('$', "dollar",   "dollars"),
-    ('£', "pound",    "pounds"),
-    ('€', "euro",     "euros"),
-    ('¥', "yen",      "yen"),
-    ('₹', "rupee",    "rupees"),
-    ('₽', "ruble",    "rubles"),
-    ('₩', "won",      "won"),
-    ('₪', "shekel",   "shekels"),
-    ('₦', "naira",    "naira"),
-    ('₱', "peso",     "pesos"),
-    ('₺', "lira",     "lira"),
-    ('₴', "hryvnia",  "hryvnias"),
-    ('₵', "cedi",     "cedis"),
-    ('₡', "colon",    "colones"),
-    ('₫', "dong",     "dong"),
-    ('₭', "kip",      "kip"),
-    ('₮', "tugrik",   "tugriks"),
-    ('₧', "peseta",   "pesetas"),
-    ('₣', "franc",    "francs"),
+    ('$', "dollar", "dollars"),
+    ('£', "pound", "pounds"),
+    ('€', "euro", "euros"),
+    ('¥', "yen", "yen"),
+    ('₹', "rupee", "rupees"),
+    ('₽', "ruble", "rubles"),
+    ('₩', "won", "won"),
+    ('₪', "shekel", "shekels"),
+    ('₦', "naira", "naira"),
+    ('₱', "peso", "pesos"),
+    ('₺', "lira", "lira"),
+    ('₴', "hryvnia", "hryvnias"),
+    ('₵', "cedi", "cedis"),
+    ('₡', "colon", "colones"),
+    ('₫', "dong", "dong"),
+    ('₭', "kip", "kip"),
+    ('₮', "tugrik", "tugriks"),
+    ('₧', "peseta", "pesetas"),
+    ('₣', "franc", "francs"),
 ];
 
 /// Standalone single-character symbols.
 const STANDALONE_SYMBOLS: &[(char, &str)] = &[
     // Math
-    ('±', "plus or minus "), ('×', " times "), ('÷', " divided by "),
-    ('∞', "infinity"), ('≈', "approximately "), ('≤', "less than or equal to "),
-    ('≥', "greater than or equal to "), ('≠', "not equal to "),
-    ('√', "square root of "), ('π', "pi"),
-    ('²', " squared"), ('³', " cubed"),
+    ('±', "plus or minus "),
+    ('×', " times "),
+    ('÷', " divided by "),
+    ('∞', "infinity"),
+    ('≈', "approximately "),
+    ('≤', "less than or equal to "),
+    ('≥', "greater than or equal to "),
+    ('≠', "not equal to "),
+    ('√', "square root of "),
+    ('π', "pi"),
+    ('²', " squared"),
+    ('³', " cubed"),
     // Fractions
-    ('½', "one half"), ('⅓', "one third"), ('⅔', "two thirds"),
-    ('¼', "one quarter"), ('¾', "three quarters"),
-    ('⅕', "one fifth"), ('⅖', "two fifths"), ('⅗', "three fifths"), ('⅘', "four fifths"),
-    ('⅙', "one sixth"), ('⅚', "five sixths"),
-    ('⅛', "one eighth"), ('⅜', "three eighths"), ('⅝', "five eighths"), ('⅞', "seven eighths"),
+    ('½', "one half"),
+    ('⅓', "one third"),
+    ('⅔', "two thirds"),
+    ('¼', "one quarter"),
+    ('¾', "three quarters"),
+    ('⅕', "one fifth"),
+    ('⅖', "two fifths"),
+    ('⅗', "three fifths"),
+    ('⅘', "four fifths"),
+    ('⅙', "one sixth"),
+    ('⅚', "five sixths"),
+    ('⅛', "one eighth"),
+    ('⅜', "three eighths"),
+    ('⅝', "five eighths"),
+    ('⅞', "seven eighths"),
     // Legal / typographic
-    ('©', "copyright"), ('®', "registered"), ('™', "trademark"),
-    ('§', "section"), ('¶', "paragraph"),
-    ('†', ""), ('‡', ""),
+    ('©', "copyright"),
+    ('®', "registered"),
+    ('™', "trademark"),
+    ('§', "section"),
+    ('¶', "paragraph"),
+    ('†', ""),
+    ('‡', ""),
     ('•', ", "),
     ('—', ", "),
 ];
@@ -497,10 +566,26 @@ fn normalize_for_speech(text: &str) -> String {
         // ── Degree symbol ──────────────────────────────────────────────────────
         if ch == '°' {
             match chars.get(i + 1) {
-                Some('C') | Some('c') => { out.push_str(" degrees Celsius");    i += 2; continue; }
-                Some('F') | Some('f') => { out.push_str(" degrees Fahrenheit"); i += 2; continue; }
-                Some('K') | Some('k') => { out.push_str(" kelvin");             i += 2; continue; }
-                _                     => { out.push_str(" degrees");            i += 1; continue; }
+                Some('C') | Some('c') => {
+                    out.push_str(" degrees Celsius");
+                    i += 2;
+                    continue;
+                }
+                Some('F') | Some('f') => {
+                    out.push_str(" degrees Fahrenheit");
+                    i += 2;
+                    continue;
+                }
+                Some('K') | Some('k') => {
+                    out.push_str(" kelvin");
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    out.push_str(" degrees");
+                    i += 1;
+                    continue;
+                }
             }
         }
 
@@ -529,7 +614,9 @@ fn normalize_for_speech(text: &str) -> String {
             if prev_digit && next_digit {
                 // Peek ahead: find the end of the digit run after the dot
                 let mut j = i + 1;
-                while j < len && chars[j].is_ascii_digit() { j += 1; }
+                while j < len && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
                 // If a unit suffix follows the digits, keep the dot as-is (decimal)
                 let has_unit = try_read_unit_suffix(&chars, j).is_some();
                 if has_unit {
@@ -632,43 +719,50 @@ fn normalize_for_speech(text: &str) -> String {
 /// Common abbreviations with periods — matched case-insensitively.
 /// (abbreviation_lowercase, expansion, char_length_including_dots)
 const ABBREVIATIONS: &[(&str, &str)] = &[
-    ("e.g.",  "for example"),
-    ("i.e.",  "that is"),
-    ("etc.",  "etcetera"),
-    ("vs.",   "versus"),
+    ("e.g.", "for example"),
+    ("i.e.", "that is"),
+    ("etc.", "etcetera"),
+    ("vs.", "versus"),
     ("approx.", "approximately"),
     ("dept.", "department"),
     ("govt.", "government"),
     ("assn.", "association"),
-    ("inc.",  "incorporated"),
+    ("inc.", "incorporated"),
     ("corp.", "corporation"),
-    ("ltd.",  "limited"),
+    ("ltd.", "limited"),
     ("prof.", "professor"),
-    ("dr.",   "doctor"),
-    ("mr.",   "mister"),
-    ("mrs.",  "missus"),
-    ("ms.",   "miss"),
-    ("jr.",   "junior"),
-    ("sr.",   "senior"),
-    ("st.",   "saint"),
-    ("ave.",  "avenue"),
+    ("dr.", "doctor"),
+    ("mr.", "mister"),
+    ("mrs.", "missus"),
+    ("ms.", "miss"),
+    ("jr.", "junior"),
+    ("sr.", "senior"),
+    ("st.", "saint"),
+    ("ave.", "avenue"),
     ("blvd.", "boulevard"),
-    ("ft.",   "fort"),
-    ("mt.",   "mount"),
-    ("no.",   "number"),
-    ("vol.",  "volume"),
-    ("ch.",   "chapter"),
-    ("pg.",   "page"),
-    ("fig.",  "figure"),
+    ("ft.", "fort"),
+    ("mt.", "mount"),
+    ("no.", "number"),
+    ("vol.", "volume"),
+    ("ch.", "chapter"),
+    ("pg.", "page"),
+    ("fig.", "figure"),
     ("approx.", "approximately"),
-    ("max.",  "maximum"),
-    ("min.",  "minimum"),
+    ("max.", "maximum"),
+    ("min.", "minimum"),
     ("temp.", "temperature"),
-    ("est.",  "established"),
-    ("jan.",  "January"), ("feb.", "February"), ("mar.", "March"),
-    ("apr.",  "April"), ("jun.", "June"), ("jul.", "July"),
-    ("aug.",  "August"), ("sep.", "September"), ("oct.", "October"),
-    ("nov.",  "November"), ("dec.", "December"),
+    ("est.", "established"),
+    ("jan.", "January"),
+    ("feb.", "February"),
+    ("mar.", "March"),
+    ("apr.", "April"),
+    ("jun.", "June"),
+    ("jul.", "July"),
+    ("aug.", "August"),
+    ("sep.", "September"),
+    ("oct.", "October"),
+    ("nov.", "November"),
+    ("dec.", "December"),
 ];
 
 /// Try to match a common abbreviation starting at position `i`.
@@ -680,7 +774,9 @@ fn try_read_abbreviation(chars: &[char], i: usize) -> Option<(String, usize)> {
     let at_boundary = i == 0
         || chars[i - 1].is_whitespace()
         || matches!(chars[i - 1], '(' | ',' | '"' | '\'' | '[');
-    if !at_boundary { return None; }
+    if !at_boundary {
+        return None;
+    }
 
     // Build a lowercase window from position i (up to 10 chars)
     let window_end = (i + 10).min(len);
@@ -705,19 +801,30 @@ fn try_read_unit_suffix(chars: &[char], i: usize) -> Option<(String, usize)> {
     } else {
         (i, 0usize)
     };
-    if unit_start >= len { return None; }
+    if unit_start >= len {
+        return None;
+    }
 
     for &(suffix, spoken) in UNIT_SUFFIXES {
         let suffix_chars: Vec<char> = suffix.chars().collect();
         let slen = suffix_chars.len();
-        if unit_start + slen > len { continue; }
+        if unit_start + slen > len {
+            continue;
+        }
 
-        let matches = suffix_chars.iter().enumerate().all(|(j, &sc)| chars[unit_start + j] == sc);
-        if !matches { continue; }
+        let matches = suffix_chars
+            .iter()
+            .enumerate()
+            .all(|(j, &sc)| chars[unit_start + j] == sc);
+        if !matches {
+            continue;
+        }
 
         // Alphabetic continuation guard
         let after = unit_start + slen;
-        if after < len && chars[after].is_alphabetic() { continue; }
+        if after < len && chars[after].is_alphabetic() {
+            continue;
+        }
 
         return Some((spoken.to_string(), space_consumed + slen));
     }
@@ -762,9 +869,13 @@ fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
     while j < len && chars[j].is_ascii_digit() && j - h_start < 2 {
         j += 1;
     }
-    if j == h_start { return None; }
+    if j == h_start {
+        return None;
+    }
     let hour: u32 = chars[h_start..j].iter().collect::<String>().parse().ok()?;
-    if hour > 23 { return None; }
+    if hour > 23 {
+        return None;
+    }
     let hour_str: String = chars[h_start..j].iter().collect();
 
     // ── Optional :MM ─────────────────────────────────────────────────────────
@@ -774,7 +885,9 @@ fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
         let d2 = chars.get(j + 2)?;
         if d1.is_ascii_digit() && d2.is_ascii_digit() {
             let min: u32 = format!("{}{}", d1, d2).parse().ok()?;
-            if min > 59 { return None; }
+            if min > 59 {
+                return None;
+            }
             minute_str = Some(format!("{}{}", d1, d2));
             j += 3; // consume :MM
         } else {
@@ -904,9 +1017,6 @@ pub struct ChatService {
     /// Optional LLM-based context compactor.  When set, triggers at 80% of
     /// the context budget instead of falling straight to trim_to_budget.
     compactor: Option<ContextCompactor>,
-    /// Optional Tool Agent — classifies messages and pre-fetches tool data
-    /// (Wikipedia, weather, memory) before the main LLM runs.
-    tool_agent: Option<Arc<dyn ToolAgent>>,
     /// Optional Answer Reviewer — adversarial post-inference quality gate.
     answer_reviewer: Option<Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>>,
 }
@@ -927,19 +1037,15 @@ impl ChatService {
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
             compactor: None,
-            tool_agent: None,
             answer_reviewer: None,
         }
     }
 
-    /// Attach a Tool Agent for pre-inference tool classification and execution.
-    pub fn with_tool_agent(mut self, agent: Arc<dyn ToolAgent>) -> Self {
-        self.tool_agent = Some(agent);
-        self
-    }
-
     /// Attach an Answer Reviewer for post-inference adversarial quality review.
-    pub fn with_answer_reviewer(mut self, reviewer: Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>) -> Self {
+    pub fn with_answer_reviewer(
+        mut self,
+        reviewer: Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>,
+    ) -> Self {
         self.answer_reviewer = Some(reviewer);
         self
     }
@@ -1022,6 +1128,8 @@ impl ChatService {
             session_id: self.session_id.clone(),
             model_role: resolve_voice_role(&message),
             images: Vec::new(),
+            voice_mode: false,
+            canvas_mode: false,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1071,17 +1179,18 @@ impl ChatService {
 
         // Check if this is the first exchange (exactly 2 messages: user + assistant).
         // Fetch only 3 to avoid loading the entire history just for a count check.
-        if let Ok(msgs) = self.session_storage.get_messages_paginated(&self.session_id, 3, 0).await {
+        if let Ok(msgs) = self
+            .session_storage
+            .get_messages_paginated(&self.session_id, 3, 0)
+            .await
+        {
             if msgs.len() != 2 {
                 return;
             }
         }
 
         // Build context for the title generation LLM call
-        let context = format!(
-            "User: {}\nAssistant: {}",
-            user_text, assistant_text
-        );
+        let context = format!("User: {}\nAssistant: {}", user_text, assistant_text);
         let messages = vec![ChatMessage::user(&context)];
 
         match provider.complete(TITLE_GENERATION_PROMPT, messages).await {
@@ -1134,32 +1243,23 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        // ── Tool Agent: classify and pre-fetch if needed ─────────────────
-        let agent_message = if let Some(ref tool_agent) = self.tool_agent {
-            match tool_agent.process(&message).await {
-                Ok(Some(augmented)) => {
-                    println!("[voice-tool-agent] tool result injected ({} chars)", augmented.len());
-                    augmented
-                }
-                Ok(None) => {
-                    println!("[voice-tool-agent] no tool needed");
-                    message.clone()
-                }
-                Err(e) => {
-                    println!("[voice-tool-agent] error: {e}, using original message");
-                    message.clone()
-                }
-            }
-        } else {
-            message.clone()
-        };
-
+        // The LLM handles tool routing natively via MCP — no pre-classification needed.
         let request = AgentRequest {
-            message: agent_message,
+            message: message.clone(),
             session_id: self.session_id.clone(),
             model_role: "chat".to_string(),
             images: Vec::new(),
+            voice_mode: false,
+            canvas_mode: false,
         };
+
+        // ── Quip — fills silence while the LLM starts inference ──
+        // Speak a short reassurance phrase (e.g. "Let me think.") so the user
+        // hears immediate feedback after speaking. The quip plays, then the
+        // thinking tone fills the remaining silence until the first real sentence.
+        if let Some(quip) = self.voice_output.speak_quip().await {
+            tracing::debug!("Spoke quip: {:?}", quip);
+        }
 
         // Start a soft ambient thinking tone while the LLM infers.
         // Stopped as soon as the first speakable content arrives.
@@ -1179,7 +1279,8 @@ impl ChatService {
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
-        let mut in_think_block = false;
+        let mut barge_in_started = false;
+        let mut thought_filter = crate::services::thought_filter::ThoughtFilter::new();
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
         // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
@@ -1241,10 +1342,8 @@ impl ChatService {
                     }
                 }
                 AgentStreamEvent::Text { content } => {
-                    // Strip <think>…</think> reasoning blocks — not meant for TTS or transcript.
-                    let (visible, new_in_think) = filter_thinking(&content, in_think_block);
-                    in_think_block = new_in_think;
-                    let content = visible;
+                    // Strip all thinking/reasoning tags — not meant for TTS or transcript.
+                    let content = thought_filter.push(&content);
                     if content.is_empty() {
                         continue;
                     }
@@ -1264,10 +1363,22 @@ impl ChatService {
                             continue;
                         }
                         stop_tone!();
+                        // Start barge-in mic monitoring before first TTS playback.
+                        // If the user speaks during TTS, the listener sets the
+                        // interrupt flag and playback stops immediately.
+                        if !barge_in_started {
+                            self.voice_output.start_barge_in_listener();
+                            barge_in_started = true;
+                        }
                         speak_pipelined!(self, spoken, &mut pending_audio);
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
+                    // Flush any tail held back by the thought filter
+                    let tail = thought_filter.flush();
+                    if !tail.is_empty() {
+                        sentence_buf.push_str(&tail);
+                    }
                     // Flush any remaining buffer
                     let remainder = sentence_buf.trim().to_string();
                     if !remainder.is_empty() {
@@ -1300,6 +1411,11 @@ impl ChatService {
             }
         }
 
+        // Flush thought filter tail if stream ended without Done
+        let tail = thought_filter.flush();
+        if !tail.is_empty() {
+            sentence_buf.push_str(&tail);
+        }
         // Flush anything left if stream ended without Done
         let remainder = sentence_buf.trim().to_string();
         if !remainder.is_empty() {
@@ -1314,6 +1430,11 @@ impl ChatService {
 
         // Ensure the thinking tone is stopped even if no speakable text was produced.
         stop_tone!();
+
+        // Stop barge-in mic monitoring now that all TTS is complete.
+        if barge_in_started {
+            self.voice_output.stop_barge_in_listener();
+        }
 
         // Persist the assistant response
         let assistant_msg = ChatMessage::assistant(full_text.clone());
@@ -1343,14 +1464,31 @@ impl ChatService {
         // If the user doesn't speak (empty transcription), fall back to wake word.
         let mut first_turn = true;
 
+        // Pre-captured input from a wake-word interrupt.  When set, the next
+        // loop iteration skips the listen/wake-word phase and processes this
+        // text directly — but still wrapped in `tokio::select!` so it remains
+        // interruptible.
+        let mut pending_input: Option<String> = None;
+
         loop {
-            let input = if first_turn {
+            let input = if let Some(text) = pending_input.take() {
+                // Interrupt gave us pre-captured text — skip listen phase.
+                // Emit events so the UI/state machine stays consistent.
+                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                Some(text)
+            } else if first_turn {
                 // ── Wait for wake word ──
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
-                println!("\n  🟢 {} (type \"exit\" to quit)", self.wake_word_detector.activation_prompt());
+                println!(
+                    "\n  🟢 {} (type \"exit\" to quit)",
+                    self.wake_word_detector.activation_prompt()
+                );
                 io::stdout().flush()?;
 
-                let activation = self.wake_word_detector.wait_for_activation_with_audio().await?;
+                let activation = self
+                    .wake_word_detector
+                    .wait_for_activation_with_audio()
+                    .await?;
 
                 // ── Listen (one-breath or fresh recording) ──
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
@@ -1400,9 +1538,17 @@ impl ChatService {
             let lower = lower.trim_end_matches(|c: char| c == '.' || c == '!');
             if matches!(
                 lower,
-                "bye" | "goodbye" | "good bye" | "dismissed" | "go to sleep"
-                    | "that's all" | "thats all" | "never mind" | "nevermind"
-                    | "stop" | "stop listening"
+                "bye"
+                    | "goodbye"
+                    | "good bye"
+                    | "dismissed"
+                    | "go to sleep"
+                    | "that's all"
+                    | "thats all"
+                    | "never mind"
+                    | "nevermind"
+                    | "stop"
+                    | "stop listening"
             ) {
                 let farewell = "Until next time. Just say my name when you need me.";
                 println!("  🫡 {}", farewell);
@@ -1459,14 +1605,20 @@ impl ChatService {
                     // Wake word detected during inference/TTS — INTERRUPT
                     println!("\n  🔄 Interrupted! Listening for new request...");
 
-                    // Stop any in-progress TTS playback immediately
+                    // Stop any in-progress TTS playback and background listeners
                     self.voice_output.stop_speaking();
                     self.voice_output.stop_thinking_tone();
+                    self.voice_output.stop_barge_in_listener();
 
-                    // The chat_fut is dropped here, which drops the agent stream.
-                    // Goose may continue background inference but we won't consume it.
+                    // chat_fut is dropped here by tokio::select!, which drops the
+                    // agent stream.  The channel-receiver drop propagates into
+                    // Goose's spawn_blocking inference, causing TokenAction::Stop
+                    // within one token cycle.
 
-                    // Capture the user's new speech (wake word may include trailing audio)
+                    // Capture the user's new speech (wake word may include trailing audio).
+                    // Instead of processing inline (which would be non-interruptible),
+                    // stash the text in `pending_input` and `continue` the loop so
+                    // the next iteration wraps it in tokio::select! again.
                     match wake_result {
                         Ok(activation) => {
                             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
@@ -1479,27 +1631,19 @@ impl ChatService {
 
                             match self.voice_input.listen().await {
                                 Ok(Some(new_text)) if !new_text.is_empty() => {
-                                    // Process the new request immediately
-                                    self.emit_event(WorkflowEvent::UserInput(new_text.clone()));
-                                    self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
-                                    match self.chat_stream_once(new_text).await {
-                                        Ok(response_text) => {
-                                            self.emit_event(WorkflowEvent::AgentOutput(response_text));
-                                        }
-                                        Err(e) => {
-                                            eprintln!("  ❌ Error: {}", e);
-                                            first_turn = true;
-                                        }
-                                    }
+                                    // Stash for the next loop iteration (interruptible path)
+                                    pending_input = Some(new_text);
                                 }
                                 _ => {
-                                    // No speech after interrupt — return to conversational mode
+                                    // No speech after interrupt — return to wake word mode
                                     println!("  💤 No speech after interrupt.");
+                                    first_turn = true;
                                 }
                             }
                         }
                         Err(e) => {
                             tracing::warn!("Wake word interrupt error: {}", e);
+                            first_turn = true;
                         }
                     }
                 }
@@ -1555,7 +1699,10 @@ mod tests {
         storage.create_session(session_id.clone()).await.unwrap();
 
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
-        service.chat_once("First message".to_string()).await.unwrap();
+        service
+            .chat_once("First message".to_string())
+            .await
+            .unwrap();
 
         let messages = storage.get_messages(&session_id).await.unwrap();
         assert_eq!(messages.len(), 2); // User message + Assistant response
@@ -1592,15 +1739,21 @@ mod tests {
         let session_id = "title-test".to_string();
         storage.create_session(session_id.clone()).await.unwrap();
 
-        let service = ChatService::new(agent, session_id.clone(), storage.clone())
-            .with_provider(provider);
+        let service =
+            ChatService::new(agent, session_id.clone(), storage.clone()).with_provider(provider);
 
         // First message → triggers title generation
-        service.chat_once("What is the weather?".to_string()).await.unwrap();
+        service
+            .chat_once("What is the weather?".to_string())
+            .await
+            .unwrap();
 
         let session = storage.get_session(&session_id).await.unwrap();
         // MockProvider returns "Mock response to: ..." which becomes the title
-        assert!(session.title.is_some(), "Title should be auto-generated after first exchange");
+        assert!(
+            session.title.is_some(),
+            "Title should be auto-generated after first exchange"
+        );
         let title = session.title.unwrap();
         assert!(!title.is_empty(), "Title should not be empty");
     }
@@ -1613,18 +1766,31 @@ mod tests {
         let session_id = "title-stable".to_string();
         storage.create_session(session_id.clone()).await.unwrap();
 
-        let service = ChatService::new(agent, session_id.clone(), storage.clone())
-            .with_provider(provider);
+        let service =
+            ChatService::new(agent, session_id.clone(), storage.clone()).with_provider(provider);
 
         // First message → generates title
         service.chat_once("Hello".to_string()).await.unwrap();
-        let first_title = storage.get_session(&session_id).await.unwrap().title.clone();
+        let first_title = storage
+            .get_session(&session_id)
+            .await
+            .unwrap()
+            .title
+            .clone();
 
         // Second message → should NOT overwrite title
         service.chat_once("How are you?".to_string()).await.unwrap();
-        let second_title = storage.get_session(&session_id).await.unwrap().title.clone();
+        let second_title = storage
+            .get_session(&session_id)
+            .await
+            .unwrap()
+            .title
+            .clone();
 
-        assert_eq!(first_title, second_title, "Title should not change after first generation");
+        assert_eq!(
+            first_title, second_title,
+            "Title should not change after first generation"
+        );
     }
 
     #[tokio::test]
@@ -1639,7 +1805,10 @@ mod tests {
         service.chat_once("Hello".to_string()).await.unwrap();
 
         let session = storage.get_session(&session_id).await.unwrap();
-        assert!(session.title.is_none(), "No title should be set without a provider");
+        assert!(
+            session.title.is_none(),
+            "No title should be set without a provider"
+        );
     }
 
     #[tokio::test]
@@ -1656,24 +1825,39 @@ mod tests {
 
     #[test]
     fn markdown_bold_stripped() {
-        assert_eq!(strip_markdown_for_speech("The **quick** fox"), "The quick fox");
+        assert_eq!(
+            strip_markdown_for_speech("The **quick** fox"),
+            "The quick fox"
+        );
     }
 
     #[test]
     fn markdown_italic_stripped() {
-        assert_eq!(strip_markdown_for_speech("The _quick_ fox"), "The quick fox");
-        assert_eq!(strip_markdown_for_speech("The *quick* fox"), "The quick fox");
+        assert_eq!(
+            strip_markdown_for_speech("The _quick_ fox"),
+            "The quick fox"
+        );
+        assert_eq!(
+            strip_markdown_for_speech("The *quick* fox"),
+            "The quick fox"
+        );
     }
 
     #[test]
     fn markdown_header_stripped() {
         assert_eq!(strip_markdown_for_speech("## Hello"), "Hello");
-        assert_eq!(strip_markdown_for_speech("# Title\nBody text"), "Title Body text");
+        assert_eq!(
+            strip_markdown_for_speech("# Title\nBody text"),
+            "Title Body text"
+        );
     }
 
     #[test]
     fn markdown_inline_code_stripped() {
-        assert_eq!(strip_markdown_for_speech("Run `cargo build`"), "Run cargo build");
+        assert_eq!(
+            strip_markdown_for_speech("Run `cargo build`"),
+            "Run cargo build"
+        );
     }
 
     #[test]
@@ -1703,7 +1887,10 @@ mod tests {
 
     #[test]
     fn markdown_hr_dropped() {
-        assert_eq!(strip_markdown_for_speech("before\n---\nafter"), "before after");
+        assert_eq!(
+            strip_markdown_for_speech("before\n---\nafter"),
+            "before after"
+        );
     }
 
     #[test]
@@ -1747,9 +1934,8 @@ mod tests {
 
     #[test]
     fn filter_thinking_multiple_blocks() {
-        let (text, in_block) = filter_thinking(
-            "<think>a</think>first<think>b</think>second", false
-        );
+        let (text, in_block) =
+            filter_thinking("<think>a</think>first<think>b</think>second", false);
         assert_eq!(text, "firstsecond");
         assert!(!in_block);
     }
@@ -1758,12 +1944,18 @@ mod tests {
 
     #[test]
     fn normalize_temperature_celsius() {
-        assert_eq!(normalize_for_speech("It is 28°C today"), "It is 28 degrees Celsius today");
+        assert_eq!(
+            normalize_for_speech("It is 28°C today"),
+            "It is 28 degrees Celsius today"
+        );
     }
 
     #[test]
     fn normalize_temperature_fahrenheit() {
-        assert_eq!(normalize_for_speech("It is 82°F"), "It is 82 degrees Fahrenheit");
+        assert_eq!(
+            normalize_for_speech("It is 82°F"),
+            "It is 82 degrees Fahrenheit"
+        );
     }
 
     #[test]
@@ -1773,12 +1965,18 @@ mod tests {
 
     #[test]
     fn normalize_percent() {
-        assert_eq!(normalize_for_speech("Humidity is 72%"), "Humidity is 72 percent");
+        assert_eq!(
+            normalize_for_speech("Humidity is 72%"),
+            "Humidity is 72 percent"
+        );
     }
 
     #[test]
     fn normalize_dollars() {
-        assert_eq!(normalize_for_speech("That costs $50"), "That costs 50 dollars");
+        assert_eq!(
+            normalize_for_speech("That costs $50"),
+            "That costs 50 dollars"
+        );
     }
 
     #[test]
@@ -1961,7 +2159,10 @@ mod tests {
     }
     #[test]
     fn normalize_dot_ip_address() {
-        assert_eq!(normalize_for_speech("192.168.1.1"), "192 point 168 point 1 point 1");
+        assert_eq!(
+            normalize_for_speech("192.168.1.1"),
+            "192 point 168 point 1 point 1"
+        );
     }
     #[test]
     fn normalize_dot_version() {
@@ -1995,8 +2196,7 @@ mod tests {
         let session_id = "test-session".to_string();
         storage.create_session(session_id.clone()).await.unwrap();
 
-        let _service = ChatService::new(agent, session_id, storage)
-            .with_voice_output(Arc::new(PrintOutput));
+        let _service =
+            ChatService::new(agent, session_id, storage).with_voice_output(Arc::new(PrintOutput));
     }
-
 }

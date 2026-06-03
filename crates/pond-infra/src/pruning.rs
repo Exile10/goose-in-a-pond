@@ -78,28 +78,32 @@ pub async fn prune_once(logs: &Pool<Sqlite>, system: &Pool<Sqlite>, config: &Pru
 
 async fn prune_event_log(pool: &Pool<Sqlite>, days: u32) {
     let cutoff = format!("-{} days", days);
-    match sqlx::query(
-        "DELETE FROM event_log WHERE timestamp < datetime('now', ?)",
-    )
-    .bind(&cutoff)
-    .execute(pool)
-    .await
+    match sqlx::query("DELETE FROM event_log WHERE timestamp < datetime('now', ?)")
+        .bind(&cutoff)
+        .execute(pool)
+        .await
     {
-        Ok(r) => info!("pruning: deleted {} event_log rows older than {} days", r.rows_affected(), days),
+        Ok(r) => info!(
+            "pruning: deleted {} event_log rows older than {} days",
+            r.rows_affected(),
+            days
+        ),
         Err(e) => warn!("pruning: event_log failed: {}", e),
     }
 }
 
 async fn prune_sensor_readings(pool: &Pool<Sqlite>, days: u32) {
     let cutoff = format!("-{} days", days);
-    match sqlx::query(
-        "DELETE FROM sensor_readings WHERE created_at < datetime('now', ?)",
-    )
-    .bind(&cutoff)
-    .execute(pool)
-    .await
+    match sqlx::query("DELETE FROM sensor_readings WHERE created_at < datetime('now', ?)")
+        .bind(&cutoff)
+        .execute(pool)
+        .await
     {
-        Ok(r) => info!("pruning: deleted {} sensor_readings rows older than {} days", r.rows_affected(), days),
+        Ok(r) => info!(
+            "pruning: deleted {} sensor_readings rows older than {} days",
+            r.rows_affected(),
+            days
+        ),
         Err(e) => warn!("pruning: sensor_readings failed: {}", e),
     }
 }
@@ -115,7 +119,11 @@ async fn prune_camera_events(pool: &Pool<Sqlite>, days: u32) {
     .execute(pool)
     .await
     {
-        Ok(r) => info!("pruning: deleted {} camera_events rows older than {} days", r.rows_affected(), days),
+        Ok(r) => info!(
+            "pruning: deleted {} camera_events rows older than {} days",
+            r.rows_affected(),
+            days
+        ),
         Err(e) => warn!("pruning: camera_events failed: {}", e),
     }
 }
@@ -126,12 +134,11 @@ async fn prune_camera_events(pool: &Pool<Sqlite>, days: u32) {
 async fn prune_orphan_face_embeddings(pool: &Pool<Sqlite>) {
     // Skip silently on schemas that don't yet have the face_embeddings table
     // (older DBs, tests that mount partial schemas).
-    let exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_embeddings'",
-    )
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
+    let exists: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_embeddings'")
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
     if exists.is_none() {
         return;
     }
@@ -144,7 +151,10 @@ async fn prune_orphan_face_embeddings(pool: &Pool<Sqlite>) {
     .await
     {
         Ok(r) if r.rows_affected() > 0 => {
-            info!("pruning: deleted {} orphan face_embeddings rows", r.rows_affected())
+            info!(
+                "pruning: deleted {} orphan face_embeddings rows",
+                r.rows_affected()
+            )
         }
         Ok(_) => {}
         Err(e) => warn!("pruning: face_embeddings failed: {}", e),
@@ -166,7 +176,11 @@ async fn prune_session_messages(pool: &Pool<Sqlite>, keep: u32) {
     .execute(pool)
     .await
     {
-        Ok(r) => info!("pruning: deleted {} session_messages beyond per-session cap of {}", r.rows_affected(), keep),
+        Ok(r) => info!(
+            "pruning: deleted {} session_messages beyond per-session cap of {}",
+            r.rows_affected(),
+            keep
+        ),
         Err(e) => warn!("pruning: session_messages failed: {}", e),
     }
 }
@@ -212,11 +226,10 @@ mod tests {
         let config = PruningConfig::default();
         prune_once(&logs, &system, &config).await;
 
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM event_log")
-                .fetch_one(&logs)
-                .await
-                .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_log")
+            .fetch_one(&logs)
+            .await
+            .unwrap();
         assert_eq!(count, 2, "only fresh rows should remain");
     }
 
@@ -241,11 +254,10 @@ mod tests {
 
         prune_once(&logs, &system, &PruningConfig::default()).await;
 
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sensor_readings")
-                .fetch_one(&logs)
-                .await
-                .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sensor_readings")
+            .fetch_one(&logs)
+            .await
+            .unwrap();
         assert_eq!(count, 1, "old sensor reading should be pruned");
     }
 
@@ -272,11 +284,10 @@ mod tests {
 
         prune_once(&logs, &system, &PruningConfig::default()).await;
 
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM camera_events")
-                .fetch_one(&logs)
-                .await
-                .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM camera_events")
+            .fetch_one(&logs)
+            .await
+            .unwrap();
         assert_eq!(count, 1, "only unacknowledged alert should remain");
     }
 
@@ -301,7 +312,10 @@ mod tests {
             .unwrap();
         }
 
-        let config = PruningConfig { session_messages_keep: 3, ..Default::default() };
+        let config = PruningConfig {
+            session_messages_keep: 3,
+            ..Default::default()
+        };
         prune_once(&logs, &system, &config).await;
 
         let count: i64 =

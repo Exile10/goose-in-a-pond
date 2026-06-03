@@ -48,10 +48,11 @@ pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(&llm_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() { continue; }
+        if !path.is_file() {
+            continue;
+        }
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let is_llamafile = name.ends_with(".llamafile")
-            || name.ends_with(".llamafile.exe");
+        let is_llamafile = name.ends_with(".llamafile") || name.ends_with(".llamafile.exe");
         if is_llamafile {
             return Some(path);
         }
@@ -134,10 +135,7 @@ pub async fn try_start(
     let port = match crate::ports::find_free_port(base_port).await {
         Some(p) => p,
         None => {
-            println!(
-                "  ⚠  No free port found near {} for llamafile",
-                base_port
-            );
+            println!("  ⚠  No free port found near {} for llamafile", base_port);
             return None;
         }
     };
@@ -172,7 +170,10 @@ pub async fn try_start(
         let resolved_name = match resolved_name {
             Some(n) => Some(n),
             None => {
-                match model_service.list_by_category(&ModelCategory::Llamafile).await {
+                match model_service
+                    .list_by_category(&ModelCategory::Llamafile)
+                    .await
+                {
                     Ok(models) => {
                         // Prefer a downloaded model; otherwise take the first one
                         let downloaded = models.iter().find(|m| m.downloaded);

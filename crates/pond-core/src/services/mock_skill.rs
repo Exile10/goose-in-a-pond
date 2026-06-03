@@ -28,7 +28,10 @@ impl Default for MockSkillRepository {
 #[async_trait]
 impl UserSkillRepository for MockSkillRepository {
     async fn list_active(&self) -> Result<Vec<UserSkill>> {
-        let mut v: Vec<UserSkill> = self.skills.read().await
+        let mut v: Vec<UserSkill> = self
+            .skills
+            .read()
+            .await
             .iter()
             .filter(|s| s.active)
             .cloned()
@@ -44,7 +47,13 @@ impl UserSkillRepository for MockSkillRepository {
     }
 
     async fn get(&self, id: &str) -> Result<Option<UserSkill>> {
-        Ok(self.skills.read().await.iter().find(|s| s.id == id).cloned())
+        Ok(self
+            .skills
+            .read()
+            .await
+            .iter()
+            .find(|s| s.id == id)
+            .cloned())
     }
 
     async fn create(&self, skill: &UserSkill) -> Result<()> {

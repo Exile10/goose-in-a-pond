@@ -12,7 +12,9 @@
 
 use crate::domain::message::{ChatMessage, Role};
 use crate::ports::provider::LlmProvider;
-use crate::services::context_budget::{trim_to_budget, trim_to_budget_for_model, USABLE_HISTORY_CHARS};
+use crate::services::context_budget::{
+    trim_to_budget, trim_to_budget_for_model, USABLE_HISTORY_CHARS,
+};
 use anyhow::Result;
 
 /// 4 characters per token is a common heuristic for English text.
@@ -39,7 +41,10 @@ impl Default for ContextCompactor {
 
 impl ContextCompactor {
     pub fn new(threshold: f64, context_limit_tokens: usize) -> Self {
-        Self { threshold, context_limit_tokens }
+        Self {
+            threshold,
+            context_limit_tokens,
+        }
     }
 
     /// Returns `true` when the total history size has exceeded the threshold.
@@ -89,7 +94,9 @@ impl ContextCompactor {
                 result
             }
             Err(e) => {
-                tracing::warn!("ContextCompactor LLM call failed ({e}), falling back to trim_to_budget");
+                tracing::warn!(
+                    "ContextCompactor LLM call failed ({e}), falling back to trim_to_budget"
+                );
                 trim_to_budget(messages)
             }
         }
@@ -104,6 +111,7 @@ async fn summarise(provider: &dyn LlmProvider, messages: &[ChatMessage]) -> Resu
                 Role::User => "User",
                 Role::Assistant => "Assistant",
                 Role::System => "System",
+                Role::Tool => "Tool",
             };
             format!("{}: {}", role, m.content)
         })
@@ -161,13 +169,21 @@ mod tests {
     }
 
     fn msg(role: Role, content: &str) -> ChatMessage {
-        ChatMessage { role, content: content.to_string(), images: Vec::new() }
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            images: Vec::new(),
+        }
     }
 
     fn big_history(count: usize, payload_len: usize) -> Vec<ChatMessage> {
         (0..count)
             .map(|i| {
-                let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 msg(role, &format!("m{}:{}", i, "x".repeat(payload_len)))
             })
             .collect()

@@ -1,66 +1,129 @@
 import { useState, useEffect } from "react";
-import {
-  Button,
-  Card,
-  CardContent,
-  Switch,
-  Separator,
-  Kbd,
-} from "@heroui/react";
+import { Button, Card, CardContent, Chip, Switch } from "@heroui/react";
 import {
   Mic,
-  MessageSquare,
-  Cpu,
   Settings,
-  FileText,
-  Clock,
+  MessageCircle,
+  Box,
+  PenLine,
+  CalendarClock,
+  Coins,
   RefreshCw,
-  ChevronRight,
+  Cpu,
+  Headphones,
+  Wrench,
 } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { api } from "../api/PondApiClient";
-import type { SessionSummary } from "../api/types";
+import { NotificationsPanel } from "../components/NotificationsPanel";
+import { PageHeader, Metric, QuickAction, RoleChip } from "../components/shared";
+import type {
+  SessionSummary,
+  UsageSummary,
+  ModelActiveRoles,
+  ScheduleRunNotification,
+} from "../api/types";
 
-/* ── Helpers ─────────────────────────────────────────────────────────────────── */
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
 
-/** Abbreviate "org/model-name-long" to "model-name-long", max 32 chars. */
 function abbreviateModel(name: string): string {
   const bare = name.includes("/") ? name.split("/").pop() ?? name : name;
-  return bare.length > 32 ? bare.slice(0, 29) + "\u2026" : bare;
+  return bare.length > 28 ? bare.slice(0, 25) + "\u2026" : bare;
 }
 
-/** Human-friendly token count: 812 -> "812", 4200 -> "~4.2k", 14000 -> "~14k" */
 function formatTokens(n: number): string {
   if (n < 1000) return String(n);
-  if (n < 10000) return "~" + (n / 1000).toFixed(1) + "k";
-  return "~" + Math.round(n / 1000) + "k";
+  if (n < 10000) return `~${(n / 1000).toFixed(1)}k`;
+  return `~${Math.round(n / 1000)}k`;
 }
 
-/** Heights for each VU bar (tallest in the middle). */
-const VU_BAR_HEIGHTS = [8, 14, 20, 28, 20, 14, 8];
-const VU_BAR_COUNT = VU_BAR_HEIGHTS.length;
+function formatDollars(n: number): string {
+  if (n < 0.01) return "<$0.01";
+  return `$${n.toFixed(2)}`;
+}
 
-/* ── Component ───────────────────────────────────────────────────────────────── */
+function timeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+/* ── VU Meter ──────────────────────────────────────────────────────────────── */
+
+const VU_HEIGHTS = [8, 14, 20, 28, 20, 14, 8];
+
+function VuMeter({ level, active }: { level: number; active: boolean }) {
+  const lit = Math.round(level * VU_HEIGHTS.length);
+  return (
+    <div className="vu" data-active={active}>
+      {VU_HEIGHTS.map((h, i) => (
+        <span
+          key={i}
+          className={`vu__bar${i < lit ? " is-lit" : ""}`}
+          style={{ height: h }}
+        />
+      ))}
+    </div>
+  );
+}
+
+/* ── Component ─────────────────────────────────────────────────────────────── */
 
 export function Dashboard() {
   const state = useAppState();
   const dispatch = useAppDispatch();
 
-  /* Recent chat sessions */
   const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
+  const [usageData, setUsageData] = useState<UsageSummary | null>(null);
+  const [activeRoles, setActiveRoles] = useState<ModelActiveRoles | null>(null);
+  const [rolesLoading, setRolesLoading] = useState(false);
+
   useEffect(() => {
     if (!state.serverOnline || !state.sessionToken) return;
     let cancelled = false;
+
     api.listSessions()
       .then((sessions) => {
         if (cancelled) return;
-        const sorted = [...sessions]
-          .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
-          .slice(0, 5);
-        setRecentSessions(sorted);
+        setRecentSessions(
+          [...sessions]
+            .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+            .slice(0, 4),
+        );
       })
       .catch(() => {});
-    return () => { cancelled = true; };
+
+    const fetchUsage = () => {
+      api.getUsageSummary()
+        .then((data) => { if (!cancelled) setUsageData(data); })
+        .catch(() => {});
+      api.listSessions()
+        .then((sessions) => {
+          if (cancelled) return;
+          setRecentSessions(
+            [...sessions]
+              .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+              .slice(0, 4),
+          );
+        })
+        .catch(() => {});
+    };
+    fetchUsage();
+
+    // Poll every 15s so usage stays live while Dashboard is visible
+    const pollId = setInterval(fetchUsage, 15_000);
+
+    setRolesLoading(true);
+    api.getActiveRoles()
+      .then((roles) => { if (!cancelled) setActiveRoles(roles); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setRolesLoading(false); });
+
+    return () => { cancelled = true; clearInterval(pollId); };
   }, [state.serverOnline, state.sessionToken]);
 
   function openSession(id: string) {
@@ -68,60 +131,65 @@ export function Dashboard() {
     dispatch({ type: "SET_SECTION", payload: "chat" });
   }
 
-  /* VU meter animation state */
-  const [vuLevel, setVuLevel] = useState(0);
+  function handleOpenDebrief(run: ScheduleRunNotification) {
+    dispatch({ type: "MARK_RUN_READ", payload: run.id });
+    dispatch({ type: "SET_DEBRIEF_CONTEXT", payload: { type: "debrief", run } });
+    dispatch({ type: "SET_SECTION", payload: "canvas" });
+  }
 
-  const voiceEnabled =
+  /* VU meter — animates only while voice is active */
+  const [vuLevel, setVuLevel] = useState(0);
+  const voiceActive =
     state.voiceState === "recording" ||
     state.voiceState === "wait" ||
     state.voiceState === "thinking" ||
     state.voiceState === "speaking";
 
   useEffect(() => {
-    if (!voiceEnabled) {
-      setVuLevel(0);
-      return;
-    }
-    const id = setInterval(() => {
-      setVuLevel(Math.floor(Math.random() * (VU_BAR_COUNT + 1)));
-    }, 220);
+    if (!voiceActive) { setVuLevel(0); return; }
+    const id = setInterval(
+      () => setVuLevel(Math.random() * 0.5 + 0.15),
+      220,
+    );
     return () => clearInterval(id);
-  }, [voiceEnabled]);
+  }, [voiceActive]);
 
-  /* Resolve voice state label */
-  const voiceLabel = voiceEnabled
+  const voiceStateLabel = voiceActive
     ? state.voiceState.toUpperCase()
-    : state.voiceState === "idle"
-      ? "IDLE"
-      : "OFF";
+    : "IDLE";
 
-  /* Active model role data (fall back to mock when no response yet) */
-  const activeModel = state.lastResponseMeta
-    ? abbreviateModel(state.lastResponseMeta.modelName)
-    : "gemma-4-E4B";
+  /* Usage calculations */
+  const inputPrice  = usageData?.cloud_input_price_per_million  ?? 2.50;
+  const outputPrice = usageData?.cloud_output_price_per_million ?? 10.00;
+  const saved = usageData
+    ? (usageData.total_prompt_tokens / 1_000_000) * inputPrice
+      + (usageData.total_completion_tokens / 1_000_000) * outputPrice
+    : 0;
 
-  const roles: Array<{
-    label: string;
-    variant: "secondary" | "warning" | "success";
-    model: string;
-  }> = [
-    { label: "Chat", variant: "secondary", model: activeModel },
-    { label: "Think", variant: "warning", model: activeModel },
-    { label: "Task", variant: "success", model: activeModel },
-  ];
+  /* Active model roles — derive display list */
+  const roleItems = activeRoles
+    ? [
+        { role: "Chat",  model: activeRoles.chat?.model    ?? "—", color: "secondary", icon: <MessageCircle size={13} /> },
+        { role: "Think", model: activeRoles.tool?.model    ?? "—", color: "warning",   icon: <Cpu size={13} /> },
+        { role: "Task",  model: activeRoles.tool?.model    ?? "—", color: "primary",   icon: <Wrench size={13} /> },
+        { role: "ASR",   model: activeRoles.asr?.model     ?? "—", color: "success",   icon: <Mic size={13} /> },
+        { role: "TTS",   model: activeRoles.tts?.model     ?? "—", color: "danger",    icon: <Headphones size={13} /> },
+      ]
+    : [];
 
+  /* ── Render ── */
   return (
-    <div className="screen">
-      {/* ── Page header ──────────────────────────────────────── */}
-      <div className="page-header">
-        <h1 className="page-header__title">Dashboard</h1>
-      </div>
+    <div className="screen screen--dashboard">
+      {/* ── Page header ── */}
+      <PageHeader title="Dashboard" />
 
-      {/* ── Voice card ───────────────────────────────────────── */}
-      <Card shadow="none" className="card--voice">
+      {/* ── Notifications (card--notifs) ── */}
+      <NotificationsPanel onOpenDebrief={handleOpenDebrief} />
+
+      {/* ── Voice Mode (card--voice) ── */}
+      <Card className="card card--voice">
         <CardContent>
           <div className="voice-card">
-            {/* Left: icon + text */}
             <div className="voice-card__main">
               <div className="voice-card__icon">
                 <Mic size={20} />
@@ -129,28 +197,19 @@ export function Dashboard() {
               <div className="voice-card__text">
                 <h3>Voice Mode</h3>
                 <p>
-                  Talk to Pond hands-free. Uses your mic, whisper transcription,
+                  Talk to Pond hands-free. Uses your mic, Whisper transcription,
                   and a local TTS voice.
                 </p>
-                <span className="voice-card__hint">
-                  Press <Kbd>&#8984;&#8679;V</Kbd> or{" "}
-                  <Kbd>Ctrl+Shift+V</Kbd> from anywhere
-                </span>
+                <div className="voice-card__hint">
+                  Press <kbd>&#8984;&#8679;V</kbd> or <kbd>Ctrl+Shift+V</kbd>{" "}
+                  from anywhere to activate.
+                </div>
               </div>
             </div>
 
-            {/* Right: VU meter + state + switch */}
             <div className="voice-card__right">
-              <div className="vu">
-                {VU_BAR_HEIGHTS.map((h, i) => (
-                  <div
-                    key={i}
-                    className={`vu__bar${i < vuLevel ? " is-lit" : ""}`}
-                    style={{ height: h }}
-                  />
-                ))}
-              </div>
-              <span className="voice-card__state">{voiceLabel}</span>
+              <VuMeter level={vuLevel} active={voiceActive} />
+              <span className="voice-card__state">{voiceStateLabel}</span>
               <label
                 style={{
                   display: "flex",
@@ -162,24 +221,27 @@ export function Dashboard() {
                 <span className="voice-card__switch-label">Hands-free</span>
                 <Switch
                   size="sm"
-                  isSelected={voiceEnabled}
+                  // @ts-expect-error HeroUI Switch accepts color but types don't expose it
+                  color="secondary"
+                  isSelected={voiceActive}
                   onValueChange={() => {
-                    if (voiceEnabled) {
+                    if (voiceActive)
                       dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-                    } else {
-                      dispatch({ type: "VOICE_ACTIVATE" });
-                    }
+                    else dispatch({ type: "VOICE_ACTIVATE" });
                   }}
-                />
+                >
+                  <Switch.Control>
+                    <Switch.Thumb />
+                  </Switch.Control>
+                </Switch>
               </label>
             </div>
           </div>
 
-          {/* CTA buttons */}
           <div className="voice-card__cta">
             <Button
               size="sm"
-              color="secondary"
+              variant="secondary"
               isDisabled={!state.serverOnline}
               onPress={() => dispatch({ type: "SET_MODE", payload: "voice" })}
             >
@@ -187,8 +249,10 @@ export function Dashboard() {
             </Button>
             <Button
               size="sm"
-              variant="flat"
-              onPress={() => dispatch({ type: "SET_SECTION", payload: "settings" })}
+              variant="ghost"
+              onPress={() =>
+                dispatch({ type: "SET_SECTION", payload: "settings" })
+              }
             >
               <Settings size={14} /> Voice settings
             </Button>
@@ -196,216 +260,228 @@ export function Dashboard() {
         </CardContent>
       </Card>
 
-      {/* ── Dashboard grid (status + quick actions) ──────────── */}
-      <div className="dash-grid">
-        {/* Server status card */}
-        <Card shadow="none" className="giap-card">
-          <CardContent>
-            <div className="card-header" style={{ padding: 0 }}>
-              <span className="card__label">Server status</span>
-            </div>
+      {/* ── Usage & Savings (usage-card classes) ── */}
+      <div className="usage-card">
+        <div className="usage-card__head">
+          <span className="card__label">Usage &amp; Savings</span>
+          <Chip size="sm" variant="soft">This session</Chip>
+        </div>
 
-            <div className="server-row" style={{ marginTop: 10 }}>
-              <div className="server-row__state">
-                <span
-                  className="server-row__dot"
-                  style={{
-                    background: state.serverOnline
-                      ? "var(--color-success)"
-                      : state.serverStarting
-                        ? "var(--color-warning)"
+        <div className="usage-card__stats">
+          <div className="usage-stat">
+            <div className="usage-stat__num">
+              {formatTokens(usageData?.total_tokens ?? 0)}
+            </div>
+            <div className="usage-stat__label">Tokens total</div>
+          </div>
+          <div className="usage-stat">
+            <div className="usage-stat__num">{usageData?.session_count ?? 0}</div>
+            <div className="usage-stat__label">Sessions</div>
+          </div>
+        </div>
+
+        <div className="usage-savings">
+          <div className="usage-savings__icon">
+            <Coins size={16} />
+          </div>
+          <div>
+            <div className="usage-savings__amount">
+              ~{formatDollars(saved)} saved
+            </div>
+            <div className="usage-savings__sub">
+              vs cloud API (${inputPrice}/M input + ${outputPrice}/M output)
+            </div>
+          </div>
+        </div>
+
+        {recentSessions.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div className="card__label" style={{ marginBottom: 8 }}>
+              Recent conversations
+            </div>
+            <div className="quick-actions">
+              {recentSessions.map((s) => (
+                <button
+                  key={s.id}
+                  className="quick-action"
+                  onClick={() => openSession(s.id)}
+                >
+                  <span className="quick-action__icon">
+                    <MessageCircle size={14} />
+                  </span>
+                  <span
+                    className="quick-action__label"
+                    style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  >
+                    {s.title || `Session ${s.id.slice(0, 8)}`}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: "var(--grey-500)",
+                      whiteSpace: "nowrap",
+                      marginRight: 4,
+                    }}
+                  >
+                    {timeAgo(s.updated_at)}
+                  </span>
+                  <span className="quick-action__arrow" />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── dash-grid: Server Status + Quick Actions ── */}
+      <div className="dash-grid">
+        {/* Server Status */}
+        <Card className="card card--server">
+          <CardContent>
+            <div className="server-row">
+              <div>
+                <div className="card__label">Server status</div>
+                <div className="server-row__state">
+                  <span
+                    className="server-row__dot"
+                    style={{
+                      background: state.serverOnline
+                        ? "var(--color-success, #17c964)"
+                        : state.serverStarting
+                        ? "#f5a524"
                         : "var(--grey-400)",
-                    boxShadow: state.serverOnline
-                      ? "0 0 0 3px rgba(52,199,89,0.15)"
-                      : "none",
-                  }}
-                />
-                <span>
-                  {state.serverOnline
-                    ? "Connected"
-                    : state.serverStarting
+                      boxShadow: state.serverOnline
+                        ? "0 0 0 3px rgba(23,201,100,0.18)"
+                        : "none",
+                    }}
+                  />
+                  <span>
+                    {state.serverOnline
+                      ? "Connected"
+                      : state.serverStarting
                       ? "Starting\u2026"
                       : "Offline"}
-                </span>
+                  </span>
+                </div>
               </div>
               <code className="server-row__url" style={{ fontSize: 12 }}>
-                {state.serverUrl}
+                {state.serverUrl || "http://127.0.0.1:4000"}
               </code>
             </div>
 
-            <Separator className="card__divider" />
+            <div className="card__divider" />
 
             <div className="metrics">
-              <div className="metric">
-                <div className="metric__label">Uptime</div>
-                <div className={`metric__value${state.serverOnline ? " metric__value--ok" : ""}`}>
-                  {state.serverOnline ? "Online" : "--"}
-                </div>
-              </div>
-              <div className="metric">
-                <div className="metric__label">Latency</div>
-                <div className="metric__value">
-                  {state.serverOnline ? "<10ms" : "--"}
-                </div>
-              </div>
-              <div className="metric">
-                <div className="metric__label">Memory</div>
-                <div className="metric__value">
-                  {state.serverOnline ? "Normal" : "--"}
-                </div>
-              </div>
-              <div className="metric">
-                <div className="metric__label">Active model</div>
-                <div className="metric__value">
-                  {state.lastResponseMeta
+              <Metric
+                label="Uptime"
+                value={state.serverOnline ? "Online" : "--"}
+                trend={state.serverOnline ? "ok" : undefined}
+              />
+              <Metric
+                label="Latency"
+                value={state.serverOnline ? "<10ms" : "--"}
+                trend={state.serverOnline ? "ok" : undefined}
+              />
+              <Metric
+                label="Memory"
+                value={state.serverOnline ? "Normal" : "--"}
+              />
+              <Metric
+                label="Active model"
+                value={
+                  state.lastResponseMeta
                     ? abbreviateModel(state.lastResponseMeta.modelName)
                     : state.serverOnline
-                      ? "gemma-4-E4B"
-                      : "--"}
-                </div>
-              </div>
+                    ? "gemma-4-E4B"
+                    : "--"
+                }
+              />
             </div>
           </CardContent>
         </Card>
 
-        {/* Quick actions card */}
-        <Card shadow="none" className="giap-card">
+        {/* Quick Actions */}
+        <Card className="card card--actions">
           <CardContent>
-            <div className="card-header" style={{ padding: 0 }}>
-              <span className="card__label">Quick actions</span>
-            </div>
-
+            <div className="card__label">Quick actions</div>
             <div className="quick-actions">
-              <button
-                className="quick-action"
-                onClick={() => dispatch({ type: "SET_SECTION", payload: "chat" })}
-              >
-                <span className="quick-action__icon">
-                  <MessageSquare size={15} />
-                </span>
-                <span className="quick-action__label">Open Chat</span>
-                <ChevronRight size={14} className="quick-action__arrow" />
-              </button>
-
-              <button
-                className="quick-action"
-                onClick={() => dispatch({ type: "SET_SECTION", payload: "models" })}
-              >
-                <span className="quick-action__icon">
-                  <Cpu size={15} />
-                </span>
-                <span className="quick-action__label">Manage Models</span>
-                <ChevronRight size={14} className="quick-action__arrow" />
-              </button>
-
-              <button
-                className="quick-action"
-                onClick={() => dispatch({ type: "SET_SECTION", payload: "prompts" })}
-              >
-                <span className="quick-action__icon">
-                  <FileText size={15} />
-                </span>
-                <span className="quick-action__label">Edit Prompts</span>
-                <ChevronRight size={14} className="quick-action__arrow" />
-              </button>
-
-              <button
-                className="quick-action"
-                onClick={() =>
+              <QuickAction
+                icon={<MessageCircle size={16} />}
+                label="Open chat"
+                onPress={() =>
+                  dispatch({ type: "SET_SECTION", payload: "chat" })
+                }
+              />
+              <QuickAction
+                icon={<Box size={16} />}
+                label="Manage models"
+                onPress={() =>
+                  dispatch({ type: "SET_SECTION", payload: "models" })
+                }
+              />
+              <QuickAction
+                icon={<PenLine size={16} />}
+                label="Edit prompts"
+                onPress={() =>
+                  dispatch({ type: "SET_SECTION", payload: "prompts" })
+                }
+              />
+              <QuickAction
+                icon={<CalendarClock size={16} />}
+                label="Schedules"
+                onPress={() =>
                   dispatch({ type: "SET_SECTION", payload: "schedules" })
                 }
-              >
-                <span className="quick-action__icon">
-                  <Clock size={15} />
-                </span>
-                <span className="quick-action__label">Schedules</span>
-                <ChevronRight size={14} className="quick-action__arrow" />
-              </button>
+              />
             </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* ── Active model roles ───────────────────────────────── */}
-      <Card shadow="none" className="giap-card">
-        <CardContent>
-          <div
-            className="card-header"
-            style={{ padding: 0, marginBottom: 10 }}
+      {/* ── Active model roles ── */}
+      <Card className="card card--roles">
+        <div className="card-header">
+          <div className="card__label">Active model roles</div>
+          <Button
+            size="sm"
+            variant="ghost"
+            isIconOnly
+            onPress={() => {
+              setRolesLoading(true);
+              api.getActiveRoles()
+                .then((r) => setActiveRoles(r))
+                .catch(() => {})
+                .finally(() => setRolesLoading(false));
+            }}
+            aria-label="Refresh model roles"
           >
-            <span className="card__label">Active model roles</span>
-            <div className="card-header__right">
-              <Button
-                isIconOnly
-                size="sm"
-                variant="light"
-                aria-label="Refresh roles"
-              >
-                <RefreshCw size={14} />
-              </Button>
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+        <CardContent>
+          {rolesLoading ? (
+            <p style={{ color: "var(--grey-400)", fontSize: 13 }}>Loading\u2026</p>
+          ) : roleItems.length > 0 ? (
+            <div className="role-grid">
+              {roleItems.map((r) => (
+                <RoleChip
+                  key={r.role}
+                  role={r.role}
+                  model={r.model}
+                  color={r.color}
+                  icon={r.icon}
+                />
+              ))}
             </div>
-          </div>
-
-          <div className="role-grid">
-            {roles.map((r) => (
-              <div
-                key={r.label}
-                className={`role-chip role-chip--${r.variant}`}
-              >
-                <div className="role-chip__bar" />
-                <div className="role-chip__body">
-                  <div className="role-chip__head">
-                    <span className="role-chip__role">{r.label}</span>
-                  </div>
-                  <code style={{ fontSize: 12 }}>{r.model}</code>
-                </div>
-              </div>
-            ))}
-          </div>
+          ) : (
+            <p style={{ color: "var(--grey-400)", fontSize: 13 }}>
+              {state.serverOnline
+                ? "No roles assigned yet. Configure models in Settings."
+                : "Connect to the server to see active roles."}
+            </p>
+          )}
         </CardContent>
       </Card>
-
-      {/* ── Recent conversations ─────────────────────────────── */}
-      {state.serverOnline && recentSessions.length > 0 && (
-        <Card shadow="none" className="giap-card">
-          <CardContent>
-            <div className="card-header" style={{ padding: 0, marginBottom: 10 }}>
-              <span className="card__label">Recent conversations</span>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {recentSessions.map((s) => {
-                const ago = timeAgo(s.updated_at);
-                return (
-                  <button
-                    key={s.id}
-                    onClick={() => openSession(s.id)}
-                    className="quick-action"
-                    style={{ textAlign: "left" }}
-                  >
-                    <span className="quick-action__icon"><MessageSquare size={14} /></span>
-                    <span className="quick-action__label" style={{ flex: 1 }}>
-                      {s.title || `Session ${s.id.slice(0, 8)}`}
-                    </span>
-                    <span style={{ fontSize: 11, color: "var(--grey-500)", whiteSpace: "nowrap" }}>{ago}</span>
-                    <ChevronRight size={14} className="quick-action__arrow" />
-                  </button>
-                );
-              })}
-            </div>
-          </CardContent>
-        </Card>
-      )}
     </div>
   );
-}
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
 }

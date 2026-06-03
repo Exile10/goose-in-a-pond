@@ -34,8 +34,12 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn get_current_step(&self) -> Option<OnboardingStep> {
         Some(OnboardingStep::Completed)
     }
-    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> { Ok(()) }
-    async fn reset(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct MockDeviceRegistry;
@@ -55,10 +59,18 @@ impl DeviceRegistry for MockDeviceRegistry {
             is_online: false,
         })
     }
-    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(vec![]) }
-    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> { Ok(None) }
-    async fn unregister(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
-    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        Ok(vec![])
+    }
+    async fn get_device(&self, _: &str) -> anyhow::Result<Option<Device>> {
+        Ok(None)
+    }
+    async fn unregister(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn heartbeat(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Test fixture ───────────────────────────────────────────────────────────────
@@ -102,6 +114,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -114,10 +129,25 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         event_log_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: None,
         answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port: 4000,
     });
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 fn chat_request(body: serde_json::Value) -> Request<Body> {
@@ -174,7 +204,9 @@ async fn post_chat_auto_creates_session() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-    let session_id = json["session_id"].as_str().expect("session_id must be string");
+    let session_id = json["session_id"]
+        .as_str()
+        .expect("session_id must be string");
     // Auto-generated sessions are UUIDs (36 chars with hyphens)
     assert_eq!(session_id.len(), 36, "expected UUID-length session_id");
 }
@@ -201,7 +233,6 @@ async fn post_chat_reuses_provided_session_id() {
 
     assert_eq!(json["session_id"], session_id);
 }
-
 
 #[tokio::test]
 async fn post_chat_returns_400_for_invalid_json() {

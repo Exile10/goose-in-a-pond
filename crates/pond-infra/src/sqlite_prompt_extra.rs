@@ -21,9 +21,9 @@ impl SqlitePromptExtraRepository {
 
 fn row_to_extra(row: &sqlx::sqlite::SqliteRow) -> Result<PromptExtra> {
     Ok(PromptExtra {
-        key:        row.try_get("key")?,
+        key: row.try_get("key")?,
         instruction: row.try_get("instruction")?,
-        active:     row.try_get::<i64, _>("active")? != 0,
+        active: row.try_get::<i64, _>("active")? != 0,
         sort_order: row.try_get::<i64, _>("sort_order")? as i32,
     })
 }

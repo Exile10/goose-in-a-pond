@@ -17,67 +17,74 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
-mod filesystem_model_storage;
 mod composite_model_catalog_provider;
+mod filesystem_model_storage;
 mod http_model_downloader;
+mod inference_pool;
 mod llamafile_process;
+mod llm_memory_consolidator;
+mod llm_memory_extractor;
 mod model_download;
 mod piper_http;
 mod piper_process;
 mod ports;
 mod reqwest_model_downloader;
+mod schedule_executors;
 mod startup;
 mod system_deps;
+mod three_stage_consolidator;
 mod whisper_process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
+use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
-use pond_core::ports::voice_input::VoiceInput;
-use pond_core::ports::voice_output::VoiceOutput;
-use pond_core::services::instant_activation::InstantActivation;
-use pond_core::services::print_output::PrintOutput;
 use pond_api::{AppState, LlamafileManager};
+use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+use pond_core::domain::onboarding::OnboardingStep;
 use pond_core::ports::agent::Agent;
+use pond_core::ports::mcp_server::McpServerRepository as _;
+use pond_core::ports::model_repository::ModelRepository;
 use pond_core::ports::provider::LlmProvider;
 use pond_core::ports::session_storage::SessionStorage;
-use pond_core::ports::mcp_server::McpServerRepository as _;
 use pond_core::ports::settings::SettingsRepository as _;
+use pond_core::ports::voice_input::VoiceInput;
+use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
+use pond_core::services::instant_activation::InstantActivation;
 use pond_core::services::mock_agent::MockAgent;
+use pond_core::services::onboarding::OnboardingService;
+use pond_core::services::print_output::PrintOutput;
 use pond_core::services::stdin_input::StdinInput;
 use pond_infra::db::Database;
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_adapters_gotg::handshake_adapter::GotgHandshakeAdapter;
-use pond_infra_scheduler::{CronSchedulerAdapter, WebhookTaskExecutor};
-use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
+use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
-use pond_infra::sqlite_memory::SqliteMemoryRepository;
-use pond_infra::sqlite_profile::SqliteProfileRepository;
-use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
-use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_draft::SqliteDraftRepository;
+use pond_infra::sqlite_event_log::SqliteEventLogRepository;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
+use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use pond_infra::sqlite_model_repository::SqliteModelRepository;
+use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
 use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
+use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
+use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
-use pond_infra::sqlite_event_log::SqliteEventLogRepository;
-use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-use pond_core::ports::model_repository::ModelRepository;
-use std::sync::Arc;
-use pond_core::services::onboarding::OnboardingService;
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_infra::onboarding::SqlxOnboardingRepository;
-use futures::StreamExt as _;
-use std::io::{self, Write};
+use pond_infra_scheduler::CronSchedulerAdapter;
+use schedule_executors::{AgentScheduleExecutor, DeferredExecutor};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::net::UdpSocket;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "pond")]
@@ -111,8 +118,8 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
-        /// Agent backend: goose (default, Block's Goose with MCP tool calls) or mock (fast, no LLM).
-        /// Override: cargo run -p pond-server -- serve --agent mock
+        /// Agent backend: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse) | "mock".
+        /// Also configurable via PUT /api/v1/settings with agent_backend field.
         #[arg(long, default_value = "goose")]
         agent: String,
 
@@ -378,7 +385,11 @@ fn main() -> Result<()> {
         .unwrap_or(4);
     // On Jetson Orin Nano (6 cores), cap at 4 to leave headroom for OS + audio.
     // On dev machines, use all cores.
-    let workers = if num_cpus <= 6 { num_cpus.min(4) } else { num_cpus };
+    let workers = if num_cpus <= 6 {
+        num_cpus.min(4)
+    } else {
+        num_cpus
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -391,48 +402,60 @@ async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Setup { model }) => {
-            run_setup(&model).await
-        }
-        Some(Commands::Serve { static_dir, open, debug, agent, native }) => {
+        Some(Commands::Setup { model }) => run_setup(&model).await,
+        Some(Commands::Serve {
+            static_dir,
+            open,
+            debug,
+            agent,
+            native,
+        }) => {
             init_tracing(debug);
             run_server(static_dir, open, debug, &agent, native).await
         }
-        Some(Commands::Chat { provider, model, input, wake_word, no_wake_word, tts, tts_model }) => {
+        Some(Commands::Chat {
+            provider,
+            model,
+            input,
+            wake_word,
+            no_wake_word,
+            tts,
+            tts_model,
+        }) => {
             init_tracing(false);
-            run_chat(provider.as_deref(), model.as_deref(), &input, wake_word.as_deref(), no_wake_word, tts.as_deref(), tts_model).await
+            run_chat(
+                provider.as_deref(),
+                model.as_deref(),
+                &input,
+                wake_word.as_deref(),
+                no_wake_word,
+                tts.as_deref(),
+                tts_model,
+            )
+            .await
         }
-        Some(Commands::Status) => {
-            run_status().await
-        }
+        Some(Commands::Status) => run_status().await,
         Some(Commands::Onboard { reset }) => {
             if let Err(err) = run_onboard(reset).await {
                 eprintln!("Error: {:?}", err);
             }
             Ok(())
         }
-        Some(Commands::Models { action }) => {
-            run_models(action).await
-        }
+        Some(Commands::Models { action }) => run_models(action).await,
         Some(Commands::Agent { action }) => {
             init_tracing(false);
             run_agent_cmd(action).await
         }
-        Some(Commands::Prompts { action }) => {
-            run_prompts_cmd(action).await
-        }
-        Some(Commands::Skills { action }) => {
-            run_skills_cmd(action).await
-        }
-        Some(Commands::Recipes { action }) => {
-            run_recipes_cmd(action).await
-        }
-        Some(Commands::Memories { action }) => {
-            run_memories_cmd(action).await
-        }
-        Some(Commands::Calibrate { phrase, samples, whisper_url, reset }) => {
-            run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await
-        }
+        Some(Commands::Prompts { action }) => run_prompts_cmd(action).await,
+        Some(Commands::Skills { action }) => run_skills_cmd(action).await,
+        Some(Commands::Recipes { action }) => run_recipes_cmd(action).await,
+        Some(Commands::Memories { action }) => run_memories_cmd(action).await,
+        Some(Commands::Calibrate {
+            phrase,
+            samples,
+            whisper_url,
+            reset,
+        }) => run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await,
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             init_tracing(false);
@@ -456,8 +479,7 @@ fn init_tracing(debug: bool) {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .init();
 }
@@ -476,7 +498,9 @@ async fn run_setup(model: &str) -> Result<()> {
     if system_deps::ensure_system_deps().await {
         println!("  ✅ System dependencies OK");
     } else {
-        println!("  ⚠  Some system deps could not be installed — see docs/developer/linux-setup.md");
+        println!(
+            "  ⚠  Some system deps could not be installed — see docs/developer/linux-setup.md"
+        );
         println!("     Continuing setup; some features may not work until deps are installed.");
     }
 
@@ -498,18 +522,34 @@ async fn run_setup(model: &str) -> Result<()> {
 
         let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
         let built_ins = [
-            ("balanced",  PROMPT_BALANCED,  "Warm, practical, complete behaviour rules. Default for most households."),
-            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users who want brevity."),
-            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
-            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+            (
+                "balanced",
+                PROMPT_BALANCED,
+                "Warm, practical, complete behaviour rules. Default for most households.",
+            ),
+            (
+                "concise",
+                PROMPT_CONCISE,
+                "Minimal, action-first. For power users who want brevity.",
+            ),
+            (
+                "technical",
+                PROMPT_TECHNICAL,
+                "Verbose, tool-aware, narrates reasoning. For developers.",
+            ),
+            (
+                "warm",
+                PROMPT_WARM,
+                "Conversational, family-friendly, personality-forward.",
+            ),
         ];
         for (name, content, description) in built_ins {
             let t = PromptTemplate {
-                name:        name.to_string(),
-                content:     content.to_string(),
+                name: name.to_string(),
+                content: content.to_string(),
                 description: description.to_string(),
-                is_system:   true,
-                updated_at:  String::new(),
+                is_system: true,
+                updated_at: String::new(),
             };
             if let Err(e) = template_repo.insert_if_absent(&t).await {
                 println!("  ⚠  Failed to seed prompt template '{name}': {e}");
@@ -527,17 +567,25 @@ async fn run_setup(model: &str) -> Result<()> {
         let model_id = format!("whisper/{}", effective_model);
         match setup_model_repo.get_by_id(&model_id).await.ok().flatten() {
             Some(r) => {
-                let path = storage.path_for(&r)
-                    .unwrap_or_else(|| data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model)));
+                let path = storage.path_for(&r).unwrap_or_else(|| {
+                    data_dir
+                        .join("models")
+                        .join(format!("ggml-{}.en.bin", effective_model))
+                });
                 (path, r.url.unwrap_or_default(), r.size_mb)
             }
             None => {
-                let path = data_dir.join("models").join(format!("ggml-{}.en.bin", effective_model));
+                let path = data_dir
+                    .join("models")
+                    .join(format!("ggml-{}.en.bin", effective_model));
                 (path, String::new(), 0u64)
             }
         }
     };
-    println!("\n  [3/6] Downloading Whisper ASR model ({})...", effective_model);
+    println!(
+        "\n  [3/6] Downloading Whisper ASR model ({})...",
+        effective_model
+    );
     println!("  📁 Target: {}", expected_path.display());
     if expected_path.exists() {
         println!("  ✅ Already downloaded: {}", expected_path.display());
@@ -547,7 +595,10 @@ async fn run_setup(model: &str) -> Result<()> {
         }
         model_download::download_file(&whisper_dl_url, &expected_path, whisper_dl_mb).await?;
     } else {
-        println!("  ⚠  Model '{}' not found in catalog — skipping download", effective_model);
+        println!(
+            "  ⚠  Model '{}' not found in catalog — skipping download",
+            effective_model
+        );
     }
 
     // Step 4: Download whisper-server binary
@@ -556,13 +607,19 @@ async fn run_setup(model: &str) -> Result<()> {
 
     // Step 5: Piper TTS binary — voice model is selected via the web Settings page
     println!("\n  [5/6] Setting up Piper TTS...");
-    let piper_bin_ok = model_download::download_piper_binary(&data_dir).await.is_ok();
+    let piper_bin_ok = model_download::download_piper_binary(&data_dir)
+        .await
+        .is_ok();
     if !piper_bin_ok {
         println!("  ⚠  Piper binary unavailable — voice output will be text-only.");
         println!("     Install piper manually or retry setup.");
     } else {
         println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
     }
+
+    // Step 6: ONNX Runtime — detect or auto-download
+    println!("\n  [6/7] Checking ONNX Runtime...");
+    ensure_onnx_runtime();
 
     // Step 7 (face-onnx feature only): face recognition models
     #[cfg(feature = "face-onnx")]
@@ -599,7 +656,7 @@ async fn run_setup(model: &str) -> Result<()> {
 /// can start the process when the user switches to the "llamafile" provider
 /// without `pond-api` having any process-management knowledge.
 struct LlamafileManagerImpl {
-    data_dir:      std::path::PathBuf,
+    data_dir: std::path::PathBuf,
     model_service: Arc<pond_core::services::model_service::ModelService>,
     /// Holds the spawned process guard so it stays alive as long as AppState does.
     guard: Arc<tokio::sync::Mutex<Option<llamafile_process::LlamafileProcess>>>,
@@ -624,10 +681,10 @@ impl LlamafileManager for LlamafileManagerImpl {
         // by the 5–30 s model-loading time.  The process guard is stored inside
         // `LlamafileManagerImpl` (via the shared `Arc<Mutex<…>>`) so it lives
         // for the lifetime of AppState.
-        let data_dir       = self.data_dir.clone();
-        let model_service  = self.model_service.clone();
-        let model_hint     = model_name.map(|s| s.to_string());
-        let guard_arc      = Arc::clone(&self.guard);
+        let data_dir = self.data_dir.clone();
+        let model_service = self.model_service.clone();
+        let model_hint = model_name.map(|s| s.to_string());
+        let guard_arc = Arc::clone(&self.guard);
         let actual_port_arc = Arc::clone(&self.actual_port);
 
         tokio::spawn(async move {
@@ -638,14 +695,18 @@ impl LlamafileManager for LlamafileManagerImpl {
             if llamafile_process::is_running(cur).await {
                 return; // someone else already started it
             }
-            match llamafile_process::try_start(&data_dir, model_service, model_hint.as_deref()).await {
+            match llamafile_process::try_start(&data_dir, model_service, model_hint.as_deref())
+                .await
+            {
                 Some((proc, port)) => {
                     actual_port_arc.store(port, std::sync::atomic::Ordering::Release);
                     tracing::info!("llamafile started on port {}", port);
                     *guard = Some(proc);
                 }
                 None => {
-                    tracing::warn!("llamafile could not be started (no model found or already running)");
+                    tracing::warn!(
+                        "llamafile could not be started (no model found or already running)"
+                    );
                 }
             }
         });
@@ -663,7 +724,7 @@ impl LlamafileManager for LlamafileManagerImpl {
         timeout_secs: u64,
     ) -> (String, bool) {
         let port = self.effective_port();
-        let url  = llamafile_process::url_for(port);
+        let url = llamafile_process::url_for(port);
 
         // Fast path: already running
         if llamafile_process::is_running(port).await {
@@ -675,8 +736,7 @@ impl LlamafileManager for LlamafileManagerImpl {
 
         // Poll until ready or timeout, re-reading actual_port each iteration
         // in case a just-started process chose a different port.
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let cur_port = self.effective_port();
@@ -711,15 +771,29 @@ impl LlamafileManagerImpl {
     }
 }
 
-async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, agent_backend: &str, native: bool) -> Result<()> {
+async fn run_server(
+    static_dir: std::path::PathBuf,
+    open: bool,
+    debug: bool,
+    agent_backend: &str,
+    native: bool,
+) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
-    println!("  ║   🦆  Goose In A Pond  v{}         ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║   🦆  Goose In A Pond  v{}         ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ╚═══════════════════════════════════════╝");
 
+    // Ensure the ONNX Runtime shared library is available — check system
+    // paths first, then auto-download from GitHub Releases if needed.
+    // Must run before any ONNX-dependent init (face recognition, embeddings).
+    ensure_onnx_runtime();
+
     // Bake in the face-recognition runtime defaults so the server Just Works
-    // on a fresh macOS install without the operator having to remember a
-    // four-line env-var incantation.  Every var stays overridable — we only
-    // set it when it is currently *unset*.
+    // on a fresh install without the operator having to remember a four-line
+    // env-var incantation.  Every var stays overridable — we only set it
+    // when it is currently *unset*.
     apply_face_recognition_defaults();
 
     // Initialize databases
@@ -733,6 +807,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
 
+    // Override agent_backend from DB settings (UI can change it without CLI restart).
+    // CLI flag takes precedence only when explicitly set to something other than "goose".
+    let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {
+        &settings.agent_backend
+    } else {
+        agent_backend
+    };
+
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
@@ -743,31 +825,48 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         (None, ports::WHISPER)
     } else {
         // Derive filename and download URL from the model catalog DB.
-        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
-            .get_by_id(&format!("whisper/{}", settings.active_whisper_model)).await.ok().flatten()
-            .map(|r| (
-                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", &settings.active_whisper_model)),
-                r.url.unwrap_or_default(),
-                r.size_mb,
-            ))
-            .unwrap_or_else(|| (
-                format!("ggml-{}.en.bin", &settings.active_whisper_model),
-                String::new(),
-                0u64,
-            ));
+        let (whisper_filename, whisper_url, whisper_mb) =
+            SqliteModelRepository::new(db.system.clone())
+                .get_by_id(&format!("whisper/{}", settings.active_whisper_model))
+                .await
+                .ok()
+                .flatten()
+                .map(|r| {
+                    (
+                        r.filename.unwrap_or_else(|| {
+                            format!("ggml-{}.en.bin", &settings.active_whisper_model)
+                        }),
+                        r.url.unwrap_or_default(),
+                        r.size_mb,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        format!("ggml-{}.en.bin", &settings.active_whisper_model),
+                        String::new(),
+                        0u64,
+                    )
+                });
         let whisper_model = data_dir.join("models").join(&whisper_filename);
         if !whisper_model.exists() {
-            println!("  📥 STT model not found — downloading ({})...", settings.active_whisper_model);
+            println!(
+                "  📥 STT model not found — downloading ({})...",
+                settings.active_whisper_model
+            );
             if !whisper_url.is_empty() {
                 if let Some(parent) = whisper_model.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
-                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
+                {
                     Ok(_) => {}
                     Err(e) => println!("  ⚠  STT model download failed: {}", e),
                 }
             } else {
-                println!("  ⚠  STT model '{}' not in catalog — cannot download", settings.active_whisper_model);
+                println!(
+                    "  ⚠  STT model '{}' not in catalog — cannot download",
+                    settings.active_whisper_model
+                );
             }
         }
         if !model_download::whisper_binary_path(&data_dir).exists() {
@@ -813,7 +912,9 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                 // Look up the exact voice in the DB to get the correct download URL.
                 let voice_filename = &settings.voice_tts_voice;
                 let registry_entry = SqliteModelRepository::new(db.system.clone())
-                    .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                    .list_by_category(&ModelCategory::TtsPiper)
+                    .await
+                    .unwrap_or_default()
                     .into_iter()
                     .find(|m| m.filename.as_deref() == Some(voice_filename.as_str()))
                     .and_then(|m| {
@@ -824,9 +925,15 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                         Some((mf, cf, mu, cu, m.size_mb))
                     });
                 if let Some((mf, cf, mu, cu, sz)) = registry_entry {
-                    let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                    let _ = model_download::download_piper_model_entry(
+                        &data_dir, &mf, &cf, &mu, &cu, sz,
+                    )
+                    .await;
                 } else {
-                    println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                    println!(
+                        "  ⚠  Piper voice '{}' not in model catalog — cannot download",
+                        voice_filename
+                    );
                 }
             }
             model_download::ensure_espeak_ng_data(&data_dir).await;
@@ -839,7 +946,11 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     // Only starts when both the binary and a configured voice model are present on disk.
     let espeak_data = {
         let p = model_download::piper_espeak_data_path(&data_dir);
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     };
     let mut piper_http_port: Option<u16> = None;
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
@@ -851,13 +962,17 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                         println!("  ✅ Piper TTS running on port {}", port);
                         piper_http_port = Some(port);
                         let mut out = PiperOutput::new(bin, model_path.clone());
-                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        if let Some(d) = espeak_data.clone() {
+                            out = out.with_espeak_data(d);
+                        }
                         Some(Arc::new(out))
                     }
                     Err(e) => {
                         tracing::warn!("piper-http failed to start: {e}");
                         let mut out = PiperOutput::new(bin, model_path.clone());
-                        if let Some(d) = espeak_data.clone() { out = out.with_espeak_data(d); }
+                        if let Some(d) = espeak_data.clone() {
+                            out = out.with_espeak_data(d);
+                        }
                         Some(Arc::new(out))
                     }
                 }
@@ -876,17 +991,18 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     };
 
     // ── Persistent model catalog & ModelService ────────────────────────────────
-    let model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
-        SqliteModelRepository::new(db.system.clone())
-    );
+    let model_repo: Arc<dyn ModelRepository + Send + Sync> =
+        Arc::new(SqliteModelRepository::new(db.system.clone()));
     let model_service = Arc::new(pond_core::services::model_service::ModelService::new(
         model_repo.clone(),
-        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-            reqwest::Client::builder()
-                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_default()
-        )),
+        Arc::new(
+            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .unwrap_or_default(),
+            ),
+        ),
         Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
         Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
     ));
@@ -897,7 +1013,9 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     }
     // Correct any stale downloaded flags (files added/removed outside of GIAP)
     if let Ok(n) = model_service.sync_disk_flags().await {
-        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+        if n > 0 {
+            tracing::info!("sync_disk_flags: corrected {n} stale record(s)");
+        }
     }
     sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
 
@@ -908,12 +1026,13 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         use crate::reqwest_model_downloader::ReqwestModelDownloader;
         use crate::startup::auto_download_assigned_models;
 
-        let dl_repo:       Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync> =
+        let dl_repo: Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync> =
             model_repo.clone();
-        let dl_storage:    Arc<dyn pond_core::ports::model_storage::ModelStorage + Send + Sync> =
+        let dl_storage: Arc<dyn pond_core::ports::model_storage::ModelStorage + Send + Sync> =
             Arc::new(FilesystemModelStorage::new(&data_dir));
-        let dl_downloader: Arc<dyn pond_core::ports::model_downloader::ModelDownloader + Send + Sync> =
-            Arc::new(ReqwestModelDownloader);
+        let dl_downloader: Arc<
+            dyn pond_core::ports::model_downloader::ModelDownloader + Send + Sync,
+        > = Arc::new(ReqwestModelDownloader);
 
         tokio::spawn(async move {
             let n = auto_download_assigned_models(dl_repo, dl_storage, dl_downloader).await;
@@ -929,12 +1048,17 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
 
     let active_llm_name: String = settings.chat_model.clone();
     let (initial_llamafile_guard, llamafile_port) = if any_role_needs_llamafile {
-        match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name)).await {
+        match llamafile_process::try_start(&data_dir, model_service.clone(), Some(&active_llm_name))
+            .await
+        {
             Some((proc, port)) => (Some(proc), port),
             None => (None, ports::LLAMAFILE),
         }
     } else {
-        println!("  ⏭  LLM: llamafile skipped (provider = {})", settings.chat_provider);
+        println!(
+            "  ⏭  LLM: llamafile skipped (provider = {})",
+            settings.chat_provider
+        );
         (None, ports::LLAMAFILE)
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
@@ -962,6 +1086,8 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
     let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
         Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<dyn pond_core::ports::sensor_storage::SensorStorage + Send + Sync> =
         Arc::new(SqliteSensorStorage::new(db.logs.clone()));
     let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
@@ -990,10 +1116,12 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let face_recognition: Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> =
         build_face_recognition(&data_dir, db.system.clone());
 
-    let prompt_template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
-        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
-    let prompt_extra_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
-        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let prompt_template_repo: Arc<
+        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+    > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let prompt_extra_repo: Arc<
+        dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync,
+    > = Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
     let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
@@ -1006,18 +1134,34 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
         let built_ins = [
-            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
-            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
-            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
-            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+            (
+                "balanced",
+                PROMPT_BALANCED,
+                "Warm, practical, general-purpose. Default.",
+            ),
+            (
+                "concise",
+                PROMPT_CONCISE,
+                "Minimal, action-first. For power users.",
+            ),
+            (
+                "technical",
+                PROMPT_TECHNICAL,
+                "Verbose, tool-aware, narrates reasoning. For developers.",
+            ),
+            (
+                "warm",
+                PROMPT_WARM,
+                "Conversational, family-friendly, personality-forward.",
+            ),
         ];
         for (name, content, description) in built_ins {
             let t = PromptTemplate {
-                name:        name.to_string(),
-                content:     content.to_string(),
+                name: name.to_string(),
+                content: content.to_string(),
                 description: description.to_string(),
-                is_system:   true,
-                updated_at:  String::new(),
+                is_system: true,
+                updated_at: String::new(),
             };
             if let Err(e) = prompt_template_repo.upsert(&t).await {
                 tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
@@ -1027,7 +1171,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     }
 
     let effective_chat_provider = settings.chat_provider.clone();
-    let effective_chat_model    = settings.chat_model.clone();
+    let effective_chat_model = settings.chat_model.clone();
 
     // ── Build per-role LLM providers ────────────────────────────────────────
     // Each role (Chat / Think / Task) may use a different provider + model.
@@ -1056,7 +1200,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                 tracing::info!("Building LocalInferenceLlmAdapter for model: {}", model);
                 let result = match data_dir {
                     Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
-                    None      => LocalInferenceLlmAdapter::new(model).await,
+                    None => LocalInferenceLlmAdapter::new(model).await,
                 };
                 match result {
                     Ok(adapter) => {
@@ -1067,11 +1211,14 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                         tracing::warn!(
                             "Failed to build LocalInferenceLlmAdapter for '{}': {}; \
                              falling back to llamafile",
-                            model, e
+                            model,
+                            e
                         );
-                        Arc::new(LlamafileProvider::new(Some(llamafile_url))
-                            .with_max_tokens(max_tokens)
-                            .with_temperature(temperature)) as Arc<dyn LlmProvider>
+                        Arc::new(
+                            LlamafileProvider::new(Some(llamafile_url))
+                                .with_max_tokens(max_tokens)
+                                .with_temperature(temperature),
+                        ) as Arc<dyn LlmProvider>
                     }
                 }
             }
@@ -1086,35 +1233,76 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     }
 
     let data_dir_ref = Some(data_dir.as_path());
-    let max_tokens   = settings.llm_max_tokens;
-    let temperature  = settings.llm_temperature;
+    let max_tokens = settings.llm_max_tokens;
+    let temperature = settings.llm_temperature;
 
     let chat_provider_arc = build_provider(
-        &effective_chat_provider, &effective_chat_model,
-        &llamafile_url, data_dir_ref, max_tokens, temperature,
-    ).await;
+        &effective_chat_provider,
+        &effective_chat_model,
+        &llamafile_url,
+        data_dir_ref,
+        max_tokens,
+        temperature,
+    )
+    .await;
 
     let llm_provider = Arc::new(tokio::sync::RwLock::new(Some(
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build ToolAgent for the HTTP path — uses the LIVE provider (RwLock) so the
-    // classifier always uses whatever model is currently loaded. No model swap.
-    println!("  Tool Agent: using live provider (zero model-swap overhead)");
-    let tool_agent_for_http: Option<Arc<dyn pond_core::ports::tool_agent::ToolAgent>> =
-        Some(Arc::new(GiapToolAgent { live_provider: llm_provider.clone() }) as Arc<dyn pond_core::ports::tool_agent::ToolAgent>);
+    // Build InferencePool — concurrent LLM task submission with provider-aware
+    // concurrency limits. HTTP providers (Ollama/llamafile) get 3 concurrent
+    // slots; local GGUF gets 1 (serialized by Goose's model mutex anyway).
+    let inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>> = {
+        use pond_core::ports::inference_pool::InferencePool as _;
+        let pool = inference_pool::TokioInferencePool::for_provider(
+            llm_provider.clone(),
+            &effective_chat_provider,
+        );
+        println!(
+            "  Inference Pool: concurrency={} (provider={})",
+            pool.concurrency(),
+            effective_chat_provider
+        );
+        Some(Arc::new(pool))
+    };
 
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
     // The routes.rs handler checks review_mode at request time, not at startup.
-    println!("  Answer Reviewer: ready (mode={}, threshold={}/5, max_rounds={})",
-        settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds);
-    let answer_reviewer_for_http: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>> =
-        Some(Arc::new(GiapAnswerReviewer {
-            provider: chat_provider_arc,
-            pass_threshold: settings.review_pass_threshold,
-            max_rounds: settings.review_max_rounds,
-        }) as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
+    println!(
+        "  Answer Reviewer: ready (mode={}, threshold={}/5, max_rounds={})",
+        settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds
+    );
+    let answer_reviewer_for_http: Option<
+        Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>,
+    > = Some(Arc::new(GiapAnswerReviewer {
+        live_provider: llm_provider.clone(),
+        pass_threshold: settings.review_pass_threshold,
+        max_rounds: settings.review_max_rounds,
+    })
+        as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
+
+    // Memory extractor — background extraction of durable facts from conversations.
+    let (memory_extractor_for_http, memory_extraction_service_for_http) =
+        if settings.memory_extraction_enabled {
+            let extractor: Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor> =
+                Arc::new(llm_memory_extractor::LlmMemoryExtractor::new(
+                    llm_provider.clone(),
+                    settings.memory_extraction_max_facts,
+                ));
+            let service = Arc::new(
+                pond_core::services::memory_extraction::MemoryExtractionService::new(
+                    settings.memory_extraction_interval_secs,
+                ),
+            );
+            tracing::info!(
+                "memory extraction enabled — facts will be auto-extracted from conversations"
+            );
+            (Some(extractor), Some(service))
+        } else {
+            (None, None)
+        };
 
     let db = Arc::new(db);
 
@@ -1127,6 +1315,119 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         });
     }
 
+    // Spawn background memory decay/cleanup task
+    if settings.memory_cleanup_enabled {
+        let cleanup_repo = memory_repo.clone();
+        let cleanup_interval_secs = settings.memory_cleanup_interval_hours as u64 * 3600;
+        let prune_threshold = settings.memory_prune_threshold;
+        let archive_threshold = settings.memory_archive_threshold;
+        let base_half_life = settings.memory_decay_base_half_life_days;
+        let decay_beta = settings.memory_decay_beta;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
+            loop {
+                interval.tick().await;
+                match pond_core::services::memory_cleanup::run_cleanup(
+                    cleanup_repo.as_ref(),
+                    prune_threshold,
+                    archive_threshold,
+                    base_half_life,
+                    decay_beta,
+                )
+                .await
+                {
+                    Ok((scanned, archived, pruned)) => {
+                        if archived > 0 || pruned > 0 {
+                            tracing::info!(
+                                "memory cleanup: scanned={scanned}, archived={archived}, pruned={pruned}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("memory cleanup failed: {e}"),
+                }
+            }
+        });
+        tracing::info!("memory cleanup enabled — runs every 6 hours");
+    }
+
+    // ── Adversarial memory consolidation (inactivity-based) ──────────────
+    //
+    // Three shared pieces of state:
+    //   - last_user_activity: reset on every chat request
+    //   - consolidation_cancel: abort mid-run when the user comes back
+    //   - consolidation_event_tx: broadcast channel for SSE + background logs
+    let last_user_activity = Arc::new(tokio::sync::RwLock::new(std::time::Instant::now()));
+    let consolidation_cancel: Arc<
+        tokio::sync::RwLock<Option<tokio_util::sync::CancellationToken>>,
+    > = Arc::new(tokio::sync::RwLock::new(None));
+    let (consolidation_event_tx, _) = tokio::sync::broadcast::channel::<
+        pond_core::ports::memory_consolidator::ConsolidationEvent,
+    >(64);
+
+    // Build the ConsolidationRunner closure that pond-api will call from the
+    // POST /api/v1/memory/consolidate endpoint. Captures repo, provider, and
+    // the broadcast channel so pond-api never imports the consolidator crate.
+    let consolidation_runner: Option<pond_api::ConsolidationRunner> =
+        if settings.memory_consolidation_enabled {
+            let cr_repo = memory_repo.clone();
+            let cr_provider = llm_provider.clone();
+            let cr_broadcast_tx = consolidation_event_tx.clone();
+            Some(Arc::new(
+                move |cancel: tokio_util::sync::CancellationToken| {
+                    let repo = cr_repo.clone();
+                    let provider = cr_provider.clone();
+                    let broadcast_tx = cr_broadcast_tx.clone();
+                    Box::pin(async move {
+                        run_consolidation_pipeline(repo, provider, broadcast_tx, cancel).await;
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                },
+            ))
+        } else {
+            None
+        };
+
+    // Spawn inactivity-based consolidation scheduler
+    if settings.memory_consolidation_enabled {
+        let inact_repo = memory_repo.clone();
+        let inact_provider = llm_provider.clone();
+        let inact_activity = last_user_activity.clone();
+        let inact_cancel = consolidation_cancel.clone();
+        let inact_event_tx = consolidation_event_tx.clone();
+        let inactivity_secs = 15 * 60u64; // 15 minutes
+
+        tokio::spawn(async move {
+            loop {
+                // Poll every 60 seconds
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                // Check if 15 minutes of inactivity have passed
+                let elapsed = inact_activity.read().await.elapsed();
+                if elapsed < std::time::Duration::from_secs(inactivity_secs) {
+                    continue;
+                }
+
+                tracing::info!("15 minutes of inactivity — starting memory consolidation");
+
+                let cancel = tokio_util::sync::CancellationToken::new();
+                *inact_cancel.write().await = Some(cancel.clone());
+
+                run_consolidation_pipeline(
+                    inact_repo.clone(),
+                    inact_provider.clone(),
+                    inact_event_tx.clone(),
+                    cancel,
+                )
+                .await;
+
+                // Reset the activity timer so we don't immediately re-run
+                *inact_activity.write().await = std::time::Instant::now();
+            }
+        });
+        tracing::info!("memory consolidation enabled — triggers after 15 min inactivity");
+    }
+
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
     // terminal in real time. Polls every second and only surfaces rows added
     // after startup, so existing history is not replayed.
@@ -1137,20 +1438,25 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         });
     }
 
-    // Weather — fed into GiapServiceHandles (MCP tool), not AppState.
+    // Weather — used by the MCP weather module, not AppState.
     // The LLM calls giap__get_current_weather when it needs weather data.
     let weather: Option<Arc<dyn WeatherProvider>> = {
         if settings.weather_enabled
             && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
         {
             let loc = if settings.weather_location_name.is_empty() {
-                format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+                format!(
+                    "{:.3}, {:.3}",
+                    settings.weather_latitude, settings.weather_longitude
+                )
             } else {
                 settings.weather_location_name.clone()
             };
             tracing::info!(
                 "weather enabled: {} ({}, {})",
-                loc, settings.weather_latitude, settings.weather_longitude
+                loc,
+                settings.weather_latitude,
+                settings.weather_longitude
             );
             Some(Arc::new(OpenMeteoWeatherAdapter::new(
                 settings.weather_latitude,
@@ -1158,17 +1464,37 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
                 loc,
             )))
         } else {
-            tracing::info!("weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)");
+            tracing::info!(
+                "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)"
+            );
             None
         }
     };
 
-    // Scheduler — persist task list next to the databases
+    // Scheduler — persist task list next to the databases.
+    // Uses a DeferredExecutor so the scheduler can be created before the agent
+    // exists.  The real executor (AgentScheduleExecutor) is injected after the
+    // agent is constructed further below.
+    let deferred_executor = Arc::new(DeferredExecutor::new());
+    let (schedule_result_tx, _) =
+        tokio::sync::broadcast::channel::<pond_core::domain::schedule::ScheduleResultEvent>(32);
     let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
-        let exec = Arc::new(WebhookTaskExecutor::new());
-        match CronSchedulerAdapter::new(data_dir.join("schedules.json"), exec).await {
+        let exec: Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor> =
+            deferred_executor.clone();
+        match CronSchedulerAdapter::with_options(
+            data_dir.join("schedules.json"),
+            data_dir.join("schedule_runs.json"),
+            exec,
+            Some(schedule_result_tx.clone()),
+            settings.schedule_max_runs_per_task,
+        )
+        .await
+        {
             Ok(s) => {
-                tracing::info!("scheduler ready ({})", data_dir.join("schedules.json").display());
+                tracing::info!(
+                    "scheduler ready ({})",
+                    data_dir.join("schedules.json").display()
+                );
                 Some(Arc::new(s))
             }
             Err(e) => {
@@ -1187,30 +1513,149 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         Some(Arc::new(adapter))
     };
     #[cfg(not(feature = "mcp-memory"))]
-    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = None;
+    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> =
+        None;
+
+    // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
+    // Initialized before the agent backend so it can be wired into the memory
+    // MCP server for semantic search on recall/save.
+    let embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    > = {
+        use pond_core::ports::embedding::EmbeddingProvider as _;
+        if settings.embedding_provider == "none" {
+            tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
+            None
+        } else {
+            let emb_model = if settings.active_embedding_model.is_empty() {
+                "all-MiniLM-L6-v2"
+            } else {
+                &settings.active_embedding_model
+            };
+            let cache_dir = data_dir.join("models").join("embedding");
+            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                emb_model,
+                Some(cache_dir),
+            ) {
+                Ok(provider) => {
+                    tracing::info!(
+                        model = provider.model_name(),
+                        dims = provider.dimensions(),
+                        "embedding provider ready"
+                    );
+                    Some(Arc::new(provider)
+                        as Arc<
+                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
+                        >)
+                }
+                Err(e) => {
+                    tracing::warn!("embedding provider failed to init: {e:#}");
+                    None
+                }
+            }
+        }
+    };
 
     // ── Agent backend ────────────────────────────────────────────────────────────
+    // When "pond" is selected, skip Goose entirely to avoid the llama.cpp backend
+    // singleton conflict. PondAgent uses its own LlamaCppEngine directly.
+    #[cfg(feature = "pond-agent")]
+    let pond_agent_active = agent_backend == "pond";
+    #[cfg(not(feature = "pond-agent"))]
+    let pond_agent_active = false;
+
     #[cfg(feature = "goose-agent")]
-    let (agent, extension_manager, tool_caller) = build_goose_backend(
-        agent_backend,
-        &llamafile_url,
-        &data_dir,
-        weather.clone(),
-        device_registry.clone(),
-        scheduler.clone(),
-        settings_repo.clone(),
-        memory_repo.clone(),
-        skill_repo.clone(),
-        recipe_repo.clone(),
-        prompt_template_repo.clone(),
-        prompt_extra_repo.clone(),
-        false, // voice_mode — server mode, not voice
-    ).await;
+    let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
+        // Build PondAgent directly — no Goose, no llama backend conflict.
+        let default_registry: Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort> =
+            Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+
+        #[cfg(feature = "pond-agent")]
+        let agent: Arc<dyn Agent> = {
+            let settings = settings_repo.get().await.unwrap_or_default();
+            if let Ok(eng) = pond_inference::LlamaCppEngine::new(&data_dir) {
+                let model_id = &settings.chat_model;
+                if !model_id.is_empty() {
+                    if let Err(e) = eng.load_model(model_id, 99, true).await {
+                        tracing::error!("Failed to load model '{}': {e}", model_id);
+                    }
+                }
+                let dispatcher = pond_mcp_server::McpToolDispatcher::new(
+                    memory_repo.clone(),
+                    weather.clone(),
+                    scheduler.clone(),
+                    settings_repo.clone(),
+                    device_registry.clone(),
+                    skill_repo.clone(),
+                    recipe_repo.clone(),
+                    draft_repo.clone(),
+                    embedding_provider.clone(),
+                );
+                let disp: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+                    Arc::new(dispatcher);
+                let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = disp
+                    .available_tool_definitions()
+                    .await
+                    .into_iter()
+                    .map(|(name, desc, schema)| pond_core::ports::inference::ToolDefinition {
+                        name,
+                        description: desc,
+                        parameters_schema: schema,
+                    })
+                    .collect();
+                let agent = pond_agent::PondAgent::new(
+                    Arc::new(eng),
+                    tool_defs,
+                    settings_repo.clone(),
+                    Some(prompt_template_repo.clone()),
+                    Some(prompt_extra_repo.clone()),
+                    Some(skill_repo.clone()),
+                    device_registry.clone(),
+                    session_storage.clone(),
+                    Some(disp),
+                );
+                tracing::info!("PondAgent ready — independent inference with KV-cache reuse");
+                Arc::new(agent) as Arc<dyn Agent>
+            } else {
+                Arc::new(MockAgent::new()) as Arc<dyn Agent>
+            }
+        };
+        #[cfg(not(feature = "pond-agent"))]
+        let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+
+        (agent, None, None, default_registry)
+    } else {
+        build_goose_backend(
+            agent_backend,
+            &llamafile_url,
+            &data_dir,
+            weather.clone(),
+            device_registry.clone(),
+            scheduler.clone(),
+            settings_repo.clone(),
+            memory_repo.clone(),
+            embedding_provider.clone(),
+            skill_repo.clone(),
+            recipe_repo.clone(),
+            prompt_template_repo.clone(),
+            prompt_extra_repo.clone(),
+            draft_repo.clone(),
+            Some(session_storage.clone()),
+            false, // voice_mode — server mode, not voice
+        )
+        .await
+    };
 
     #[cfg(not(feature = "goose-agent"))]
     let tool_caller: Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>> = None;
     #[cfg(not(feature = "goose-agent"))]
-    let (agent, extension_manager): (Arc<dyn Agent>, Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>) = {
+    let tool_registry: Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort> =
+        Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+    #[cfg(not(feature = "goose-agent"))]
+    let (agent, extension_manager): (
+        Arc<dyn Agent>,
+        Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+    ) = {
         if agent_backend == "goose" {
             tracing::warn!(
                 "Goose agent backend requested but this binary was compiled without the `goose-agent` feature. \
@@ -1221,6 +1666,42 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         (Arc::new(MockAgent::new()), None)
     };
 
+    // ── Fill the deferred schedule executor now that the agent exists ─────────
+    {
+        let real_executor = Arc::new(AgentScheduleExecutor::new(
+            agent.clone(),
+            session_storage.clone(),
+            settings.schedule_max_concurrent,
+        ));
+        deferred_executor
+            .init(real_executor as Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor>)
+            .await;
+        tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
+    }
+
+    // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
+    // Initialized before MCP auto-connect so startup can resolve OAuth tokens.
+    let secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>> = {
+        match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
+            Ok(repo) => {
+                tracing::info!(
+                    "secret repository initialized at {}/secrets.json",
+                    data_dir.display()
+                );
+                Some(Arc::new(repo))
+            }
+            Err(e) => {
+                tracing::warn!("failed to initialize secret repository: {e}");
+                None
+            }
+        }
+    };
+
+    // Marketplace — curated registry of installable extensions.
+    // Initialized before MCP auto-connect so startup can look up required_secrets.
+    let marketplace: Arc<dyn pond_core::ports::extension_marketplace::ExtensionMarketplace> =
+        Arc::new(pond_core::services::marketplace::BundledMarketplace::new());
+
     // MCP client — load persisted server configs and auto-connect enabled ones.
     let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
         let repo = Arc::new(SqliteMcpServerRepository::new(db.system.clone()));
@@ -1228,20 +1709,44 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         if let Some(mgr) = &extension_manager {
             match repo.list().await {
                 Ok(servers) => {
-                    for srv in servers.into_iter().filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled) {
+                    for srv in servers
+                        .into_iter()
+                        .filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled)
+                    {
                         use pond_core::ports::extension_manager::AddExtensionRequest;
+
+                        // Start with persisted env, then resolve any secrets
+                        // from the secret repo that aren't already present.
+                        // This ensures OAuth tokens (stored in secrets.json,
+                        // not in mcp_servers.env) are injected at startup.
+                        let mut env = srv.env.clone();
+                        if let Some(sr) = &secret_repo {
+                            if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
+                                for secret_req in &ext.required_secrets {
+                                    if !env.contains_key(&secret_req.key) {
+                                        if let Ok(Some(val)) = sr.get(&secret_req.key).await {
+                                            env.insert(secret_req.key.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         let req = AddExtensionRequest {
-                            name:        srv.name.clone(),
-                            kind:        srv.kind.clone(),
+                            name: srv.name.clone(),
+                            kind: srv.kind.clone(),
                             description: srv.description.clone(),
-                            command:     srv.command.clone(),
-                            args:        srv.args.clone(),
-                            env:         srv.env.clone(),
-                            uri:         srv.uri.clone(),
+                            command: srv.command.clone(),
+                            args: srv.args.clone(),
+                            env,
+                            uri: srv.uri.clone(),
                         };
                         match mgr.add_extension(req).await {
                             Ok(_) => tracing::info!("auto-connected MCP server '{}'", srv.name),
-                            Err(e) => tracing::warn!("failed to auto-connect MCP server '{}': {e}", srv.name),
+                            Err(e) => tracing::warn!(
+                                "failed to auto-connect MCP server '{}': {e}",
+                                srv.name
+                            ),
                         }
                     }
                 }
@@ -1284,6 +1789,11 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
             SqliteHandshakeAdapter::new(db.system.clone()),
         )));
 
+    // Bind the API port early so we can thread it into AppState (needed for
+    // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
+    // consumes the listener happens further below.
+    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -1299,7 +1809,7 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         profile_repo,
         device_registry,
         memory_repo,
-        embedding_provider: None,
+        embedding_provider,
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -1311,15 +1821,20 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         mcp_memory,
         extension_manager,
         mcp_server_repo,
-        download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        tool_registry: Some(tool_registry),
+        marketplace: Some(marketplace),
+        secret_repo,
+        download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         piper_http_port,
         model_catalog_provider: Some(Arc::new(
             crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
                 reqwest::Client::builder()
                     .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
                     .build()
-                    .unwrap_or_default()
-            )
+                    .unwrap_or_default(),
+            ),
         )),
         model_storage_dir: Some(data_dir.clone()),
         prompt_template_repo: Some(prompt_template_repo),
@@ -1331,9 +1846,108 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-        tool_agent: tool_agent_for_http,
         answer_reviewer: answer_reviewer_for_http,
+        memory_extractor: memory_extractor_for_http,
+        memory_extraction_service: memory_extraction_service_for_http,
+        last_user_activity: last_user_activity.clone(),
+        consolidation_cancel: consolidation_cancel.clone(),
+        consolidation_event_tx: consolidation_event_tx.clone(),
+        consolidation_runner,
+        inference_pool,
+        schedule_result_tx: schedule_result_tx.clone(),
+        telemetry: Some(Arc::new(
+            pond_core::services::telemetry::InMemoryTelemetry::new(),
+        )),
+        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        mcp_app_resources: pond_mcp_server::all_app_resources()
+            .into_iter()
+            .map(|(uri, html)| (uri.to_string(), html))
+            .collect(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        api_port,
     });
+
+    // Spawn OAuth token auto-refresh worker.
+    // Proactively refreshes tokens every 45 minutes so extensions don't hit
+    // 401 errors mid-conversation. This worker only updates the secret store;
+    // it does NOT restart extensions (avoids disrupting active tool calls).
+    // Extensions get restarted on the next 401 retry or server restart.
+    {
+        let refresh_secret_repo = state.secret_repo.clone();
+        let refresh_http_client = reqwest::Client::new();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
+            interval.tick().await; // skip the initial immediate tick
+            loop {
+                interval.tick().await;
+                let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+                for provider in &providers {
+                    let Some(repo) = &refresh_secret_repo else {
+                        continue;
+                    };
+
+                    // Only refresh if we have a refresh token stored
+                    let has_refresh = repo.has(&provider.refresh_key).await.unwrap_or(false);
+                    if !has_refresh {
+                        continue;
+                    }
+
+                    let refresh_token = match repo.get(&provider.refresh_key).await {
+                        Ok(Some(t)) => t,
+                        _ => continue,
+                    };
+
+                    let client_id = repo
+                        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| provider.bundled_client_id.clone());
+
+                    match refresh_http_client
+                        .post(&provider.token_url)
+                        .form(&[
+                            ("grant_type", "refresh_token"),
+                            ("refresh_token", refresh_token.as_str()),
+                            ("client_id", client_id.as_str()),
+                        ])
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(at) = body["access_token"].as_str() {
+                                    let _ = repo.set(&provider.token_key, at).await;
+                                }
+                                if let Some(rt) = body["refresh_token"].as_str() {
+                                    let _ = repo.set(&provider.refresh_key, rt).await;
+                                }
+                                tracing::info!(
+                                    provider = %provider.id,
+                                    "auto-refreshed OAuth token"
+                                );
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                status = %resp.status(),
+                                "OAuth auto-refresh failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                error = %e,
+                                "OAuth auto-refresh error"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
+    }
 
     // Warn if static assets haven't been built yet
     if !static_dir.exists() {
@@ -1351,9 +1965,11 @@ async fn run_server(static_dir: std::path::PathBuf, open: bool, debug: bool, age
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "localhost".to_string());
-    let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
+    let hostname = hostname
+        .strip_suffix(".local")
+        .unwrap_or(&hostname)
+        .to_string();
 
-    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
     let display_url = if api_port == 80 {
         format!("http://pond.{}.local", hostname)
     } else {
@@ -1450,9 +2066,20 @@ fn spawn_desktop_app(server_port: u16) {
     }
 }
 
-async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake_word: Option<&str>, no_wake_word: bool, tts: Option<&str>, tts_model: Option<std::path::PathBuf>) -> Result<()> {
+async fn run_chat(
+    provider: Option<&str>,
+    model: Option<&str>,
+    input: &str,
+    wake_word: Option<&str>,
+    no_wake_word: bool,
+    tts: Option<&str>,
+    tts_model: Option<std::path::PathBuf>,
+) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
-    println!("  ║   🦆  Goose-in-a-Pond  v{}       ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║   🦆  Goose-in-a-Pond  v{}       ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ║   Wait → Listen → Think → Speak      ║");
     println!("  ╚═══════════════════════════════════════╝");
 
@@ -1483,38 +2110,57 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             &effective_tts_owned
         }
     };
-    println!("  Provider: {} (model: {})", effective_provider, effective_model);
+    println!(
+        "  Provider: {} (model: {})",
+        effective_provider, effective_model
+    );
 
     // Auto-start whisper.cpp when voice input is requested.
     let mut whisper_port = ports::WHISPER;
     let _whisper_guard = if input == "whisper" {
         let whisper_model_name = settings.active_whisper_model.as_str();
         // Look up filename and URL from the catalog DB.
-        let (whisper_filename, whisper_url, whisper_mb) = SqliteModelRepository::new(db.system.clone())
-            .get_by_id(&format!("whisper/{}", whisper_model_name)).await.ok().flatten()
-            .map(|r| (
-                r.filename.unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name)),
-                r.url.unwrap_or_default(),
-                r.size_mb,
-            ))
-            .unwrap_or_else(|| (
-                format!("ggml-{}.en.bin", whisper_model_name),
-                String::new(),
-                0u64,
-            ));
+        let (whisper_filename, whisper_url, whisper_mb) =
+            SqliteModelRepository::new(db.system.clone())
+                .get_by_id(&format!("whisper/{}", whisper_model_name))
+                .await
+                .ok()
+                .flatten()
+                .map(|r| {
+                    (
+                        r.filename
+                            .unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name)),
+                        r.url.unwrap_or_default(),
+                        r.size_mb,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        format!("ggml-{}.en.bin", whisper_model_name),
+                        String::new(),
+                        0u64,
+                    )
+                });
         let whisper_model = data_dir.join("models").join(&whisper_filename);
         if !whisper_model.exists() {
-            println!("  📥 STT model not found — downloading ({})...", whisper_model_name);
+            println!(
+                "  📥 STT model not found — downloading ({})...",
+                whisper_model_name
+            );
             if !whisper_url.is_empty() {
                 if let Some(parent) = whisper_model.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
-                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await {
-                    Ok(_)  => {}
+                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
+                {
+                    Ok(_) => {}
                     Err(e) => println!("  ⚠  STT model download failed: {}", e),
                 }
             } else {
-                println!("  ⚠  STT model '{}' not in catalog — cannot download", whisper_model_name);
+                println!(
+                    "  ⚠  STT model '{}' not in catalog — cannot download",
+                    whisper_model_name
+                );
             }
         }
         let (guard, port) = whisper_process::try_start(&data_dir, &whisper_model).await;
@@ -1526,17 +2172,18 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     let whisper_url = whisper_process::url_for(whisper_port);
 
     // ── Model catalog & ModelService (for autonomous downloading) ──────────────
-    let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> = Arc::new(
-        SqliteModelRepository::new(db.system.clone())
-    );
+    let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> =
+        Arc::new(SqliteModelRepository::new(db.system.clone()));
     let chat_model_service = Arc::new(pond_core::services::model_service::ModelService::new(
         chat_model_repo.clone(),
-        Arc::new(crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-            reqwest::Client::builder()
-                .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_default()
-        )),
+        Arc::new(
+            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                reqwest::Client::builder()
+                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .unwrap_or_default(),
+            ),
+        ),
         Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
         Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
     ));
@@ -1546,15 +2193,22 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         tracing::warn!("Failed to seed model catalog: {e}");
     }
     if let Ok(n) = chat_model_service.sync_disk_flags().await {
-        if n > 0 { tracing::info!("sync_disk_flags: corrected {n} stale record(s)"); }
+        if n > 0 {
+            tracing::info!("sync_disk_flags: corrected {n} stale record(s)");
+        }
     }
 
     // Auto-start llamafile only when the provider is explicitly "llamafile".
     // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
     let mut llamafile_port = ports::LLAMAFILE;
     let _llamafile_guard = if effective_provider == "llamafile" {
-        match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model)).await {
-            Some((proc, port)) => { llamafile_port = port; Some(proc) }
+        match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model))
+            .await
+        {
+            Some((proc, port)) => {
+                llamafile_port = port;
+                Some(proc)
+            }
             None => None,
         }
     } else {
@@ -1573,12 +2227,16 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
         Arc::new(SqliteRecipeRepository::new(db.system.clone()));
-    let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
-        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let template_repo: Arc<
+        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+    > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
     let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
         Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
-    let device_registry_arc: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
-        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let device_registry_arc: Arc<
+        dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync,
+    > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
@@ -1589,18 +2247,34 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
         let built_ins = [
-            ("balanced",  PROMPT_BALANCED,  "Warm, practical, general-purpose. Default."),
-            ("concise",   PROMPT_CONCISE,   "Minimal, action-first. For power users."),
-            ("technical", PROMPT_TECHNICAL, "Verbose, tool-aware, narrates reasoning. For developers."),
-            ("warm",      PROMPT_WARM,      "Conversational, family-friendly, personality-forward."),
+            (
+                "balanced",
+                PROMPT_BALANCED,
+                "Warm, practical, general-purpose. Default.",
+            ),
+            (
+                "concise",
+                PROMPT_CONCISE,
+                "Minimal, action-first. For power users.",
+            ),
+            (
+                "technical",
+                PROMPT_TECHNICAL,
+                "Verbose, tool-aware, narrates reasoning. For developers.",
+            ),
+            (
+                "warm",
+                PROMPT_WARM,
+                "Conversational, family-friendly, personality-forward.",
+            ),
         ];
         for (name, content, description) in built_ins {
             let t = PromptTemplate {
-                name:        name.to_string(),
-                content:     content.to_string(),
+                name: name.to_string(),
+                content: content.to_string(),
                 description: description.to_string(),
-                is_system:   true,
-                updated_at:  String::new(),
+                is_system: true,
+                updated_at: String::new(),
             };
             if let Err(e) = template_repo.upsert(&t).await {
                 tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
@@ -1614,7 +2288,10 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
     {
         let loc = if settings.weather_location_name.is_empty() {
-            format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+            format!(
+                "{:.3}, {:.3}",
+                settings.weather_latitude, settings.weather_longitude
+            )
         } else {
             settings.weather_location_name.clone()
         };
@@ -1640,10 +2317,10 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         if provider.is_some() || model.is_some() {
             let mut s = settings.clone();
             s.chat_provider = effective_provider.to_string();
-            s.chat_model    = effective_model.to_string();
+            s.chat_model = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
-        let (a, _ext_mgr, _tc) = build_goose_backend(
+        let (a, _ext_mgr, _tc, _tr) = build_goose_backend(
             "goose",
             &llamafile_url,
             &data_dir,
@@ -1652,12 +2329,16 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             None, // scheduler not used in voice mode
             settings_repo_arc,
             memory_repo,
+            None, // embedding_provider — not used in voice/chat CLI mode
             skill_repo,
             recipe_repo,
             template_repo,
             extras_repo,
+            draft_repo,
+            None, // session_storage — not needed for goose backend
             input == "whisper", // voice_mode
-        ).await;
+        )
+        .await;
         a
     };
 
@@ -1668,29 +2349,39 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     // 1. File at $DATA_DIR/prompts/system.md (deployment override, rendered with all vars)
     // 2. build_system_prompt(&settings) — honours custom_system_prompt + prompt_style + addendum
     let system_prompt = {
-        let prompt_dir    = data_dir.join("prompts");
+        let prompt_dir = data_dir.join("prompts");
         let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
         match file_template {
             Some(tmpl) => {
-                println!("  Prompt:   custom ({})", prompt_dir.join("system.md").display());
-                let name     = pond_core::prompts::sanitize_field(&settings.assistant_name, 50);
-                let user     = pond_core::prompts::sanitize_field(&settings.user_name, 50);
-                let persona  = pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
-                let tz       = pond_core::prompts::sanitize_field(&settings.timezone, 50);
+                println!(
+                    "  Prompt:   custom ({})",
+                    prompt_dir.join("system.md").display()
+                );
+                let name = pond_core::prompts::sanitize_field(&settings.assistant_name, 50);
+                let user = pond_core::prompts::sanitize_field(&settings.user_name, 50);
+                let persona =
+                    pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
+                let tz = pond_core::prompts::sanitize_field(&settings.timezone, 50);
                 let location = if settings.weather_location_name.is_empty() {
                     String::new()
                 } else {
-                    format!("\nLocation: {}.", pond_core::prompts::sanitize_field(&settings.weather_location_name, 100))
+                    format!(
+                        "\nLocation: {}.",
+                        pond_core::prompts::sanitize_field(&settings.weather_location_name, 100)
+                    )
                 };
                 let addendum = pond_core::prompts::sanitize_field(&settings.prompt_addendum, 500);
-                pond_core::prompts::render_template(&tmpl, &[
-                    ("assistant_name",  name.as_str()),
-                    ("user_name",       user.as_str()),
-                    ("personality",     persona.as_str()),
-                    ("timezone",        tz.as_str()),
-                    ("location",        location.as_str()),
-                    ("prompt_addendum", addendum.as_str()),
-                ])
+                pond_core::prompts::render_template(
+                    &tmpl,
+                    &[
+                        ("assistant_name", name.as_str()),
+                        ("user_name", user.as_str()),
+                        ("personality", persona.as_str()),
+                        ("timezone", tz.as_str()),
+                        ("location", location.as_str()),
+                        ("prompt_addendum", addendum.as_str()),
+                    ],
+                )
             }
             None => {
                 println!(
@@ -1703,7 +2394,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
 
     let db_system = db.system.clone();
-    let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system));
+    let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
         match e {
@@ -1715,8 +2406,8 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
         }
     }
 
-    let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
-        .with_system_prompt(system_prompt);
+    let mut chat_service =
+        ChatService::new(agent, session_id.clone(), storage).with_system_prompt(system_prompt);
 
     // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
     // When GooseAdapter is active it selects the provider internally via the DB.
@@ -1751,7 +2442,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
                     .unwrap_or_else(|| effective_model.to_string());
                 println!("  Model:    {} (local GGUF in-process)", hf_model_id);
                 let llm = Arc::new(
-                    LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?
+                    LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?,
                 );
                 chat_service = chat_service.with_provider(llm);
             }
@@ -1781,10 +2472,7 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
             // "llamafile" and any unrecognised value — use the llamafile process started above.
             println!(
                 "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
-                effective_model,
-                llamafile_url,
-                settings.llm_max_tokens,
-                settings.llm_temperature,
+                effective_model, llamafile_url, settings.llm_max_tokens, settings.llm_temperature,
             );
             let llm = Arc::new(
                 LlamafileProvider::new(Some(&llamafile_url))
@@ -1812,37 +2500,47 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     if no_wake_word || input != "whisper" {
         chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
-        let trigger        = wake_word.unwrap_or(settings.voice_wake_word.as_str());
+        let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
         // Tiered model: use a separate (fast, tiny) whisper server for KWS when configured.
-        let kws_url = settings.voice_kws_whisper_url
+        let kws_url = settings
+            .voice_kws_whisper_url
             .as_deref()
             .unwrap_or(&whisper_url);
 
         if transcriptions.is_empty() {
-            println!("  Wake word: \"{}\" (no calibration — using raw phrase)", trigger);
+            println!(
+                "  Wake word: \"{}\" (no calibration — using raw phrase)",
+                trigger
+            );
         } else {
-            println!("  Wake word: \"{}\" ({} calibrated variants)", trigger, transcriptions.len());
+            println!(
+                "  Wake word: \"{}\" ({} calibrated variants)",
+                trigger,
+                transcriptions.len()
+            );
         }
         println!("  KWS whisper:   {}", kws_url);
         println!("  ASR whisper:   {}", whisper_url);
-        println!("  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
+        println!(
+            "  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
             settings.voice_kws_energy_threshold,
             settings.voice_kws_cooldown_ms,
-            settings.voice_kws_post_trigger_silence_ms);
+            settings.voice_kws_post_trigger_silence_ms
+        );
 
         use pond_adapters_whisper::KeywordDetectorConfig;
         let kws_config = KeywordDetectorConfig {
-            energy_threshold:        settings.voice_kws_energy_threshold,
+            energy_threshold: settings.voice_kws_energy_threshold,
             post_trigger_silence_ms: settings.voice_kws_post_trigger_silence_ms,
-            cooldown_ms:             settings.voice_kws_cooldown_ms,
+            cooldown_ms: settings.voice_kws_cooldown_ms,
             ..KeywordDetectorConfig::default()
         };
 
         let detector = Arc::new(
             WhisperKeywordDetector::new(Some(kws_url), trigger)
                 .with_transcriptions(transcriptions)
-                .with_config(kws_config)
+                .with_config(kws_config),
         );
         chat_service = chat_service.with_wake_word_detector(detector);
     };
@@ -1866,16 +2564,15 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
                     if piper_process::find_binary(&data_dir).is_none() {
                         println!("  📥 TTS binary not found — downloading...");
                         match model_download::download_piper_binary(&data_dir).await {
-                            Ok(_)  => {}
+                            Ok(_) => {}
                             Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
                         }
                     }
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
                     // downloaded in an earlier version that didn't fetch the config.
-                    let config_path = std::path::PathBuf::from(
-                        format!("{}.json", model_path.display())
-                    );
+                    let config_path =
+                        std::path::PathBuf::from(format!("{}.json", model_path.display()));
                     if !model_path.exists() || !config_path.exists() {
                         if model_path.exists() {
                             println!("  📥 TTS model config (.json) missing — downloading...");
@@ -1885,7 +2582,9 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
                         // Look up in DB by filename to get the correct download URL.
                         let voice_filename = settings.voice_tts_voice.as_str();
                         let registry_entry = SqliteModelRepository::new(db_system.clone())
-                            .list_by_category(&ModelCategory::TtsPiper).await.unwrap_or_default()
+                            .list_by_category(&ModelCategory::TtsPiper)
+                            .await
+                            .unwrap_or_default()
                             .into_iter()
                             .find(|m| m.filename.as_deref() == Some(voice_filename))
                             .and_then(|m| {
@@ -1896,14 +2595,23 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
                                 Some((mf, cf, mu, cu, m.size_mb))
                             });
                         if let Some((mf, cf, mu, cu, sz)) = registry_entry {
-                            let _ = model_download::download_piper_model_entry(&data_dir, &mf, &cf, &mu, &cu, sz).await;
+                            let _ = model_download::download_piper_model_entry(
+                                &data_dir, &mf, &cf, &mu, &cu, sz,
+                            )
+                            .await;
                         } else {
-                            println!("  ⚠  Piper voice '{}' not in model catalog — cannot download", voice_filename);
+                            println!(
+                                "  ⚠  Piper voice '{}' not in model catalog — cannot download",
+                                voice_filename
+                            );
                         }
                     }
                     match piper_process::find_binary(&data_dir) {
                         Some(bin) => {
-                            println!("  TTS:      piper ({})", model_path.file_name().unwrap_or_default().to_string_lossy());
+                            println!(
+                                "  TTS:      piper ({})",
+                                model_path.file_name().unwrap_or_default().to_string_lossy()
+                            );
                             Arc::new(PiperOutput::new(bin, model_path))
                         }
                         None => {
@@ -1921,175 +2629,9 @@ async fn run_chat(provider: Option<&str>, model: Option<&str>, input: &str, wake
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
-    // ── Wire Tool Agent for voice mode ──
-    // Build a provider for the tool classifier. When goose-agent is active,
-    // ChatService.provider is None (GooseAdapter manages its own provider),
-    // so we construct one explicitly for classification calls.
-    {
-        let classifier_provider: Option<Arc<dyn pond_core::ports::provider::LlmProvider>> =
-            if let Some(ref p) = chat_service.provider_ref() {
-                Some(p.clone())
-            } else {
-                // GooseAdapter mode — build a provider from settings for classification
-                match effective_provider {
-                    "local" | "gguf" => {
-                        #[cfg(feature = "local-inference")]
-                        {
-                            use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-                            LocalInferenceLlmAdapter::new_with_data_dir(effective_model, &data_dir)
-                                .await
-                                .ok()
-                                .map(|p| Arc::new(p) as Arc<dyn pond_core::ports::provider::LlmProvider>)
-                        }
-                        #[cfg(not(feature = "local-inference"))]
-                        { None }
-                    }
-                    "ollama" => Some(Arc::new(
-                        OllamaProvider::new(None, Some(effective_model))
-                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
-                    _ => Some(Arc::new(
-                        LlamafileProvider::new(Some(&llamafile_url))
-                    ) as Arc<dyn pond_core::ports::provider::LlmProvider>),
-                }
-            };
-
-        if let Some(provider) = classifier_provider {
-            let live = Arc::new(tokio::sync::RwLock::new(
-                Some(provider as Arc<dyn pond_core::ports::provider::LlmProvider>)
-            ));
-            let ta = GiapToolAgent { live_provider: live };
-            chat_service = chat_service.with_tool_agent(Arc::new(ta));
-            println!("  Tool Agent: active (classifier + wikipedia/weather/memory)");
-        } else {
-            println!("  Tool Agent: inactive (no provider available for classification)");
-        }
-    }
-
     chat_service.run_loop().await?;
 
     Ok(())
-}
-
-/// Tool Agent implementation for both HTTP and CLI voice paths.
-/// Uses the LIVE LLM provider (from the RwLock) for classification so it always
-/// uses the currently loaded model — no model swap, no unload/reload overhead.
-///
-/// Before this fix, the classifier held a startup-time Arc snapshot. When the user
-/// hot-reloaded the model via the UI, the classifier still used the old model,
-/// causing a full model unload/reload on every message.
-struct GiapToolAgent {
-    /// Live provider reference — reads from the RwLock on each call so it always
-    /// uses whatever model is currently loaded. Zero model-swap overhead.
-    live_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
-}
-
-#[async_trait::async_trait]
-impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
-    async fn process(&self, message: &str) -> anyhow::Result<Option<String>> {
-        // Read the LIVE provider — always uses whatever model is currently loaded.
-        // No model swap, no unload/reload overhead.
-        let provider = {
-            let guard = self.live_provider.read().await;
-            match guard.as_ref() {
-                Some(p) => p.clone(),
-                None => {
-                    println!("[tool-classifier] no provider available, skipping classification");
-                    return Ok(None);
-                }
-            }
-        };
-
-        let classify_prompt = pond_core::prompts::build_classifier_prompt();
-
-        // Retry classifier up to 3 times — thinking models sometimes generate
-        // only reasoning tokens without the required JSON output.
-        const MAX_CLASSIFIER_RETRIES: usize = 3;
-        let mut text = String::new();
-        let mut classified = false;
-
-        for attempt in 1..=MAX_CLASSIFIER_RETRIES {
-            println!("[tool-classifier] classifying (attempt {}/{}, model={}): {:?}",
-                attempt, MAX_CLASSIFIER_RETRIES, provider.model_name(), message);
-
-            let classify_msg_retry = vec![pond_core::domain::message::ChatMessage::user(message)];
-            let response = match provider.complete(&classify_prompt, classify_msg_retry).await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("[tool-classifier] inference error on attempt {}: {}", attempt, e);
-                    continue;
-                }
-            };
-
-            // Strip thinking tokens — models like Gemma 4 emit
-            // <|channel>thought...<channel|> preambles even in classifier mode.
-            let raw = &response.content;
-            let stripped = strip_thinking_from_classifier(raw);
-            text = stripped.to_lowercase();
-            println!("[tool-classifier] response (attempt {}, stripped): {:?}",
-                attempt, &text[..text.len().min(200)]);
-
-            // Check if we got valid JSON with needs_tool field
-            if text.contains("needs_tool") {
-                classified = true;
-                break;
-            }
-
-            // Also accept empty JSON {} as "no tool needed"
-            if text.trim() == "{}" {
-                classified = true;
-                break;
-            }
-
-            println!("[tool-classifier] attempt {} produced no valid JSON, retrying...", attempt);
-        }
-
-        if !classified {
-            println!("[tool-classifier] all {} attempts failed to produce valid JSON, skipping tool", MAX_CLASSIFIER_RETRIES);
-            return Ok(None);
-        }
-
-        let needs_tool = text.contains("\"needs_tool\": true")
-            || text.contains("\"needs_tool\":true")
-            || text.contains("needs_tool\": true");
-
-        if !needs_tool {
-            return Ok(None);
-        }
-
-        let tool = if text.contains("weather") { "weather" }
-            else if text.contains("save_memory") { "save_memory" }
-            else if text.contains("recall_memory") { "recall_memory" }
-            else if text.contains("devices") { "devices" }
-            else if text.contains("schedules") { "schedules" }
-            else { "wikipedia" };
-
-        println!("[voice-tool-agent] tool={}, executing...", tool);
-
-        match pond_mcp_server::try_tool_agent(tool, message).await {
-            Some(info) => {
-                println!("[voice-tool-agent] got result ({} chars)", info.len());
-                Ok(Some(format!(
-                    "{}\n\n\
-                    [Retrieved information — USE THIS AS YOUR PRIMARY SOURCE]\n\
-                    {}\n\n\
-                    INSTRUCTIONS: Answer the user's question using the retrieved information above as \
-                    your authoritative source. Be thorough and detailed — include specific facts, numbers, \
-                    dates, and comparisons from the retrieved data. If the user asked to compare things, \
-                    highlight concrete differences and similarities. If they asked how something works, \
-                    explain the mechanism step by step. \
-                    Do NOT give a vague or generic answer when you have specific information available. \
-                    Do NOT mention tools, Wikipedia, APIs, or that anything was looked up — present \
-                    the information naturally as your own knowledge. \
-                    Match the personality and style from your system prompt.",
-                    message, info
-                )))
-            }
-            None => {
-                println!("[voice-tool-agent] tool returned no result");
-                Ok(None)
-            }
-        }
-    }
 }
 
 // ── Adversarial Answer Reviewer ───────────────────────────────────────────────
@@ -2100,7 +2642,10 @@ impl pond_core::ports::tool_agent::ToolAgent for GiapToolAgent {
 /// Reviews the completed answer, and if it scores below threshold, sends
 /// the critique back to the LLM for revision.
 struct GiapAnswerReviewer {
-    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    /// Live provider reference — reads from the RwLock so it always uses
+    /// whatever model is currently loaded.
+    live_provider:
+        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
     pass_threshold: u8,
     max_rounds: u32,
 }
@@ -2113,8 +2658,17 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
         answer: &str,
         tool_context: Option<&str>,
     ) -> anyhow::Result<pond_core::ports::answer_reviewer::ReviewResult> {
-        use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
         use pond_core::domain::message::ChatMessage;
+        use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
+
+        // Read the LIVE provider — always uses whatever model is currently loaded.
+        let provider = {
+            let guard = self.live_provider.read().await;
+            match guard.as_ref() {
+                Some(p) => p.clone(),
+                None => return Err(anyhow::anyhow!("no LLM provider available for review")),
+            }
+        };
 
         let mut current_answer = answer.to_string();
         let mut rounds = 0u32;
@@ -2138,12 +2692,15 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
 
             println!("[answer-reviewer] reviewing (round {})...", rounds);
             let review_msg = vec![ChatMessage::user(review_input)];
-            let review_response = self.provider
+            let review_response = provider
                 .complete(pond_core::prompts::REVIEW_SYSTEM_PROMPT, review_msg)
                 .await?;
 
             let verdict = parse_review_verdict(&review_response.content);
-            println!("[answer-reviewer] verdict: pass={}, score={}/5", verdict.pass, verdict.score);
+            println!(
+                "[answer-reviewer] verdict: pass={}, score={}/5",
+                verdict.pass, verdict.score
+            );
 
             if verdict.pass || verdict.score >= self.pass_threshold {
                 return Ok(ReviewResult {
@@ -2170,11 +2727,14 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
 
             println!("[answer-reviewer] revising...");
             let revision_msg = vec![ChatMessage::user(revision_input)];
-            let revision_response = self.provider
+            let revision_response = provider
                 .complete(pond_core::prompts::REVISION_SYSTEM_PROMPT, revision_msg)
                 .await?;
 
-            current_answer = revision_response.content.clone();
+            // Strip thinking tags — the revision model (same GGUF provider)
+            // may emit <think>/<thought>/<|channel>thought reasoning in its
+            // revision, and this bypasses the SSE ThoughtFilter.
+            current_answer = strip_thinking_tags(&revision_response.content);
             last_verdict = Some(verdict);
         }
 
@@ -2193,12 +2753,11 @@ impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
     }
 }
 
-/// Strip thinking tokens from classifier output so JSON can be parsed.
+/// Strip reasoning-channel tags from model output.
 ///
-/// Handles Gemma 4 (`<|channel>thought...<channel|>JSON`) and Qwen3/DeepSeek
-/// (`<think>...</think>JSON`). Also extracts JSON from mixed text by finding
-/// the first `{` and last `}`.
-fn strip_thinking_from_classifier(raw: &str) -> String {
+/// Handles Gemma 4 (`<|channel>thought...<channel|>`), Qwen3/DeepSeek
+/// (`<think>...</think>`), and alternate `<thought>...</thought>` format.
+fn strip_thinking_tags(raw: &str) -> String {
     let mut text = raw.to_string();
 
     // Gemma 4: everything after last <channel|>
@@ -2206,30 +2765,31 @@ fn strip_thinking_from_classifier(raw: &str) -> String {
         text = text[pos + "<channel|>".len()..].trim().to_string();
     }
 
-    // Qwen3/DeepSeek: remove <think>...</think> blocks
+    // <think>...</think> blocks
     while let Some(start) = text.find("<think>") {
         if let Some(end) = text[start..].find("</think>") {
             let before = &text[..start];
             let after = &text[start + end + "</think>".len()..];
             text = format!("{}{}", before, after);
         } else {
-            // Unclosed think block — take everything before it
             text = text[..start].to_string();
             break;
         }
     }
 
-    // Try to extract JSON object from remaining text
-    let trimmed = text.trim();
-    if let Some(json_start) = trimmed.find('{') {
-        if let Some(json_end) = trimmed.rfind('}') {
-            if json_end > json_start {
-                return trimmed[json_start..=json_end].to_string();
-            }
+    // <thought>...</thought> blocks
+    while let Some(start) = text.find("<thought>") {
+        if let Some(end) = text[start..].find("</thought>") {
+            let before = &text[..start];
+            let after = &text[start + end + "</thought>".len()..];
+            text = format!("{}{}", before, after);
+        } else {
+            text = text[..start].to_string();
+            break;
         }
     }
 
-    trimmed.to_string()
+    text.trim().to_string()
 }
 
 /// Parse a review verdict from LLM output.
@@ -2250,8 +2810,10 @@ fn parse_review_verdict(text: &str) -> pond_core::ports::answer_reviewer::Review
     }
 
     // Fallback — unparseable output defaults to pass
-    println!("[answer-reviewer] WARNING: unparseable verdict, defaulting to pass: {:?}",
-        &text[..text.len().min(100)]);
+    println!(
+        "[answer-reviewer] WARNING: unparseable verdict, defaulting to pass: {:?}",
+        &text[..text.len().min(100)]
+    );
     ReviewVerdict {
         pass: true,
         score: 3,
@@ -2282,6 +2844,261 @@ fn has_display() -> bool {
 /// history is not replayed. It then polls every second and prints any new rows
 /// to stdout. This is intentionally a plain `println!` rather than a tracing
 /// event so the output is always visible alongside the tracing output, making
+/// Run the three-stage adversarial consolidation pipeline, apply accepted
+/// actions, and broadcast events. Shared by the inactivity scheduler and the
+/// manual `POST /api/v1/memory/consolidate` endpoint (via `ConsolidationRunner`).
+async fn run_consolidation_pipeline(
+    repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    broadcast_tx: tokio::sync::broadcast::Sender<
+        pond_core::ports::memory_consolidator::ConsolidationEvent,
+    >,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use pond_core::domain::memory::MemoryLifecycle;
+    use pond_core::ports::memory_consolidator::{ConsolidationAction, ConsolidationEvent};
+
+    let memories = match repo.search_scoreable(None).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("consolidation: failed to load memories: {e}");
+            let _ = broadcast_tx.send(ConsolidationEvent::Error {
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    if memories.len() < 6 {
+        tracing::debug!(
+            "consolidation: skipped — only {} memories (need >= 6)",
+            memories.len()
+        );
+        let _ = broadcast_tx.send(ConsolidationEvent::Error {
+            message: format!(
+                "Need at least 6 memories to consolidate, found {}",
+                memories.len()
+            ),
+        });
+        return;
+    }
+
+    // Bridge: mpsc -> broadcast so the consolidator writes to mpsc and the
+    // SSE stream (if any) reads from broadcast.
+    let (mpsc_tx, mut mpsc_rx) = tokio::sync::mpsc::channel::<ConsolidationEvent>(64);
+    let bridge_tx = broadcast_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = mpsc_rx.recv().await {
+            let _ = bridge_tx.send(event);
+        }
+    });
+
+    let memory_count = memories.len();
+    let consolidator = three_stage_consolidator::ThreeStageConsolidator::new(provider);
+    let result = consolidator.run(&memories, cancel, Some(mpsc_tx)).await;
+
+    match result {
+        Ok(ref result) => {
+            // Build lookup for source memory metadata (corrects, segment)
+            let memory_map: std::collections::HashMap<
+                &str,
+                &pond_core::domain::memory::MemoryFragment,
+            > = memories.iter().map(|m| (m.id.as_str(), m)).collect();
+
+            for exchange in &result.exchanges {
+                if !exchange.judgment.accepted {
+                    continue;
+                }
+                match &exchange.proposal.action {
+                    ConsolidationAction::Merge {
+                        source_ids,
+                        merged_content,
+                        segment,
+                        importance,
+                    } => {
+                        // Guard: if any source is a correction, preserve its metadata
+                        let any_correction = source_ids
+                            .iter()
+                            .filter_map(|id| memory_map.get(id.as_str()))
+                            .any(|m| m.is_correction());
+
+                        let effective_segment = if any_correction {
+                            pond_core::domain::memory::MemorySegment::Correction
+                        } else {
+                            segment.clone()
+                        };
+
+                        let corrects = source_ids
+                            .iter()
+                            .filter_map(|id| memory_map.get(id.as_str()))
+                            .filter_map(|m| m.corrects.clone())
+                            .next();
+
+                        if any_correction {
+                            tracing::info!(
+                                "[consolidation] merge includes correction source — forcing segment=Correction"
+                            );
+                        }
+
+                        let new_frag = pond_core::domain::memory::MemoryFragment::from_extraction(
+                            uuid::Uuid::new_v4().to_string(),
+                            None,
+                            merged_content.clone(),
+                            effective_segment,
+                            *importance,
+                            corrects,
+                        );
+                        let new_id = new_frag.id.clone();
+                        let _ = repo.add(new_frag).await;
+                        for src_id in source_ids {
+                            let _ = repo.mark_superseded(src_id, &new_id).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    src_id,
+                                    None,
+                                    Some(&new_id),
+                                )
+                                .await;
+                        }
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                &new_id,
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
+                    ConsolidationAction::Prune { id } => {
+                        // Guard: never prune correction memories
+                        if let Some(mem) = memory_map.get(id.as_str()) {
+                            if mem.is_correction() {
+                                tracing::warn!(
+                                    "[consolidation] blocked prune of correction memory {id}"
+                                );
+                                continue;
+                            }
+                        }
+
+                        let _ = repo.update_lifecycle(id, MemoryLifecycle::Archived).await;
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Pruned,
+                                id,
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
+                    ConsolidationAction::Recategorize {
+                        id,
+                        new_segment,
+                        new_importance,
+                    } => {
+                        let _ = repo
+                            .update_segment(id, new_segment.clone(), *new_importance)
+                            .await;
+                        let _ = repo
+                            .log_event(
+                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                id,
+                                None,
+                                Some("recategorized"),
+                            )
+                            .await;
+                    }
+                    ConsolidationAction::Split {
+                        source_id,
+                        new_memories,
+                    } => {
+                        // If source is a correction, propagate corrects to split entries
+                        let source_corrects = memory_map
+                            .get(source_id.as_str())
+                            .and_then(|m| m.corrects.clone());
+
+                        let mut first_new_id = String::new();
+                        let mut corrects_assigned = false;
+
+                        for entry in new_memories {
+                            let entry_corrects = if !corrects_assigned
+                                && source_corrects.is_some()
+                                && entry.segment
+                                    == pond_core::domain::memory::MemorySegment::Correction
+                            {
+                                corrects_assigned = true;
+                                source_corrects.clone()
+                            } else {
+                                None
+                            };
+
+                            let new_frag =
+                                pond_core::domain::memory::MemoryFragment::from_extraction(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    None,
+                                    entry.content.clone(),
+                                    entry.segment.clone(),
+                                    entry.importance,
+                                    entry_corrects,
+                                );
+                            let nid = new_frag.id.clone();
+                            if first_new_id.is_empty() {
+                                first_new_id = nid.clone();
+                            }
+                            let _ = repo.add(new_frag).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                    &nid,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                        }
+                        if !first_new_id.is_empty() {
+                            let _ = repo.mark_superseded(source_id, &first_new_id).await;
+                            let _ = repo
+                                .log_event(
+                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    source_id,
+                                    None,
+                                    Some(&first_new_id),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            if result.accepted_count > 0 || result.rejected_count > 0 {
+                tracing::info!(
+                    accepted = result.accepted_count,
+                    rejected = result.rejected_count,
+                    duration_ms = result.duration_ms,
+                    "adversarial consolidation complete"
+                );
+                // Persist audit trail
+                let details_json = serde_json::to_string(&result).ok();
+                let _ = repo
+                    .log_consolidation_run(
+                        "adversarial",
+                        memory_count,
+                        result.accepted_count,
+                        result.rejected_count,
+                        result.duration_ms,
+                        details_json.as_deref(),
+                    )
+                    .await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("consolidation failed: {e}");
+            let _ = broadcast_tx.send(ConsolidationEvent::Error {
+                message: e.to_string(),
+            });
+        }
+    }
+}
+
 /// it easy to correlate API activity with DB-level events in a single terminal.
 ///
 /// Output format:
@@ -2296,20 +3113,22 @@ async fn tail_event_log(pool: sqlx::Pool<sqlx::Sqlite>) {
         .await
         .unwrap_or(0);
 
-    println!("  [debug] tailing pond_logs.db event_log (cursor = {})...", cursor);
+    println!(
+        "  [debug] tailing pond_logs.db event_log (cursor = {})...",
+        cursor
+    );
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let rows: Vec<(i64, String, String, String, String, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id, timestamp, level, source, message, metadata \
+        let rows: Vec<(i64, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, timestamp, level, source, message, metadata \
                  FROM event_log WHERE id > ? ORDER BY id ASC",
-            )
-            .bind(cursor)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
+        )
+        .bind(cursor)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
 
         for (id, timestamp, level, source, message, metadata) in rows {
             match metadata.as_deref().filter(|m| !m.is_empty()) {
@@ -2317,10 +3136,7 @@ async fn tail_event_log(pool: sqlx::Pool<sqlx::Sqlite>) {
                     "  [db] {} {:>5} [{}] {} — {}",
                     timestamp, level, source, message, meta
                 ),
-                None => println!(
-                    "  [db] {} {:>5} [{}] {}",
-                    timestamp, level, source, message
-                ),
+                None => println!("  [db] {} {:>5} [{}] {}", timestamp, level, source, message),
             }
             cursor = id;
         }
@@ -2331,13 +3147,20 @@ async fn run_status() -> Result<()> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let hostname = hostname.strip_suffix(".local").unwrap_or(&hostname).to_string();
+    let hostname = hostname
+        .strip_suffix(".local")
+        .unwrap_or(&hostname)
+        .to_string();
 
     println!("  🦆 Goose In A Pond — Status");
     println!("  ─────────────────────────────");
     println!("  Version:   {}", env!("CARGO_PKG_VERSION"));
     println!("  Hostname:  {}", hostname);
-    println!("  Platform:  {} / {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  Platform:  {} / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
 
     let data_dir = default_data_dir();
     let db_path = data_dir.join("pond_system.db");
@@ -2346,8 +3169,10 @@ async fn run_status() -> Result<()> {
         if let Ok(db) = Database::init(&data_dir).await {
             let settings_repo = SqliteSettingsRepository::new(db.system.clone());
             if let Ok(s) = settings_repo.get().await {
-                println!("  Assistant: {} | Provider: {} | Model: {}",
-                    s.assistant_name, s.chat_provider, s.active_llm_model);
+                println!(
+                    "  Assistant: {} | Provider: {} | Model: {}",
+                    s.assistant_name, s.chat_provider, s.active_llm_model
+                );
                 println!("  Wake word: {}", s.voice_wake_word);
             }
             let onboard_repo = SqlxOnboardingRepository::new(db.system.clone());
@@ -2361,20 +3186,259 @@ async fn run_status() -> Result<()> {
     Ok(())
 }
 
-/// Populate the face-recognition env vars with values that are known to
-/// work end-to-end on a fresh macOS dev install, so the operator no longer
-/// has to remember:
+// ── ONNX Runtime version pinned for auto-download ────────────────────────────
+//
+// v1.21.0 is the latest release with pre-built tarballs for all four
+// platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
+// Bump this when upgrading — the archive layout is stable across releases.
+const ORT_VERSION: &str = "1.22.0";
+
+/// Approximate size of the platform library in MB (for the progress message).
+const ORT_APPROX_SIZE_MB: u64 = 30;
+
+/// Ensure that `ORT_DYLIB_PATH` points at a usable ONNX Runtime shared
+/// library.  Resolution order:
 ///
-/// ```bash
-/// ORT_DYLIB_PATH=… POND_FACE_ANTISPOOF_PATH=… \
-/// POND_FACE_ANTISPOOF_LIVE_INDEX=2 \
-/// POND_FACE_ANTISPOOF_PIXEL_SCALE=unit \
-/// cargo run … serve
+///   1. Explicit env var — operator knows best; skip everything.
+///   2. Well-known system paths (Homebrew, system `/usr/lib`).
+///   3. Previously-downloaded local copy in `$DATA_DIR/lib/`.
+///   4. Auto-download from GitHub Releases into `$DATA_DIR/lib/`.
+///
+/// Runs synchronously before tokio starts, so it shells out to `curl`+`tar`
+/// instead of using async I/O.  Failures are non-fatal — the server starts
+/// without ONNX-dependent features (face recognition, embeddings).
+fn ensure_onnx_runtime() {
+    // ── 1. Explicit env var ──────────────────────────────────────────────
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+
+    // ── 2. Well-known system locations ───────────────────────────────────
+    let system_candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/lib/libonnxruntime.dylib",
+            "/usr/local/lib/libonnxruntime.dylib",
+        ]
+    } else {
+        &[
+            "/usr/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            "/usr/lib/aarch64-linux-gnu/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+        ]
+    };
+
+    for p in system_candidates {
+        if std::path::Path::new(p).exists() {
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+            return;
+        }
+    }
+
+    // ── 3. Previously-downloaded local copy ──────────────────────────────
+    let data_dir = default_data_dir();
+    let (lib_name, versioned_name) = ort_lib_names();
+    let lib_dir = data_dir.join("lib");
+    let local_versioned = lib_dir.join(versioned_name);
+    let local_unversioned = lib_dir.join(lib_name);
+
+    // Prefer the versioned file (it is the real binary); fall back to the
+    // unversioned name in case someone placed it there manually.
+    for candidate in [&local_versioned, &local_unversioned] {
+        if candidate.exists() {
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", candidate) };
+            return;
+        }
+    }
+
+    // ── 4. Auto-download ─────────────────────────────────────────────────
+    let (os_tag, arch_tag) = match ort_platform_tags() {
+        Some(tags) => tags,
+        None => {
+            eprintln!(
+                "  ⚠  ONNX Runtime auto-download: unsupported platform \
+                 (not macOS/Linux, or unsupported arch)"
+            );
+            return;
+        }
+    };
+
+    let archive_stem = format!("onnxruntime-{os_tag}-{arch_tag}-{ORT_VERSION}");
+    let url = format!(
+        "https://github.com/microsoft/onnxruntime/releases/download/\
+         v{ORT_VERSION}/{archive_stem}.tgz"
+    );
+
+    println!(
+        "  ⬇  ONNX Runtime v{ORT_VERSION} not found — downloading (~{ORT_APPROX_SIZE_MB} MB)..."
+    );
+
+    match download_and_extract_ort(&url, &lib_dir, &archive_stem) {
+        Ok(lib_path) => {
+            println!("  ✅ ONNX Runtime installed to {}", lib_path.display());
+            // SAFETY: single-threaded setup, before any worker spawns.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib_path) };
+        }
+        Err(e) => {
+            eprintln!("  ⚠  Failed to download ONNX Runtime: {e}");
+            eprintln!("     Embedding models and face recognition will be unavailable.");
+            eprintln!("     Install manually: brew install onnxruntime");
+        }
+    }
+}
+
+/// Returns `(lib_name, versioned_name)` for the current platform.
+///
+/// - macOS: `("libonnxruntime.dylib", "libonnxruntime.{ver}.dylib")`
+/// - Linux: `("libonnxruntime.so",    "libonnxruntime.so.{ver}")`
+fn ort_lib_names() -> (&'static str, String) {
+    if cfg!(target_os = "macos") {
+        (
+            "libonnxruntime.dylib",
+            format!("libonnxruntime.{ORT_VERSION}.dylib"),
+        )
+    } else {
+        (
+            "libonnxruntime.so",
+            format!("libonnxruntime.so.{ORT_VERSION}"),
+        )
+    }
+}
+
+/// Returns `(os_tag, arch_tag)` matching the GitHub release archive naming
+/// convention, e.g. `("osx", "arm64")` or `("linux", "x64")`.
+fn ort_platform_tags() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "osx"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return None;
+    };
+
+    let arch = if cfg!(target_arch = "aarch64") {
+        if cfg!(target_os = "macos") {
+            "arm64"
+        } else {
+            "aarch64"
+        }
+    } else if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "macos") {
+            "x86_64"
+        } else {
+            "x64"
+        }
+    } else {
+        return None;
+    };
+
+    Some((os, arch))
+}
+
+/// Download an ONNX Runtime release tarball and extract the shared library
+/// into `lib_dir`.  Uses `curl` + `tar` which are available on both macOS
+/// and Linux without pulling in extra Rust dependencies.
+///
+/// Archive layout (stable across ORT releases):
+/// ```text
+/// onnxruntime-{os}-{arch}-{ver}/
+///   lib/
+///     libonnxruntime.{ver}.dylib   ← real file  (macOS)
+///     libonnxruntime.dylib         ← symlink     (macOS)
+///     libonnxruntime.so.{ver}      ← real file  (Linux)
+///     libonnxruntime.so.1          ← symlink     (Linux)
+///     libonnxruntime.so            ← symlink     (Linux)
 /// ```
 ///
+/// We extract only the `lib/` subtree with `--strip-components=1`, which
+/// places the files directly into `lib_dir/lib/…` → we then just point at
+/// the versioned file.
+fn download_and_extract_ort(
+    url: &str,
+    lib_dir: &std::path::Path,
+    archive_stem: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::process::Command;
+
+    // Ensure the target directory exists.
+    std::fs::create_dir_all(lib_dir)?;
+
+    let tmp_dir = std::env::temp_dir().join("giap-ort-download");
+    // Clean up any leftover from a previous failed attempt.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let tgz = tmp_dir.join("ort.tgz");
+
+    // ── Download ─────────────────────────────────────────────────────────
+    let status = Command::new("curl")
+        .args([
+            "-fSL",           // fail on HTTP errors, show errors, follow redirects
+            "--progress-bar", // minimal progress indicator
+            url,
+            "-o",
+        ])
+        .arg(&tgz)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run curl: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("curl exited with status {status} for {url}");
+    }
+
+    // ── Extract lib/ subtree directly into lib_dir ───────────────────────
+    // `--strip-components=1` removes the top-level `onnxruntime-{os}-…/`
+    // prefix, so `lib/libonnxruntime.*` lands at `{lib_dir}/lib/…`.
+    //
+    // We use `--include` (GNU tar) / `--include` (bsdtar, macOS default) to
+    // extract only the library files, skipping headers and pkgconfig.
+    let status = Command::new("tar")
+        .args(["xzf"])
+        .arg(&tgz)
+        .args(["-C"])
+        .arg(&tmp_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!("tar extraction failed with status {status}");
+    }
+
+    // ── Copy the library files into lib_dir ──────────────────────────────
+    let extracted_lib_dir = tmp_dir.join(archive_stem).join("lib");
+    let (_, versioned_name) = ort_lib_names();
+
+    let src = extracted_lib_dir.join(&versioned_name);
+    if !src.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "{versioned_name} not found in extracted archive at {}",
+            extracted_lib_dir.display()
+        );
+    }
+
+    let dest = lib_dir.join(&versioned_name);
+    std::fs::copy(&src, &dest).map_err(|e| {
+        anyhow::anyhow!("failed to copy {} → {}: {e}", src.display(), dest.display())
+    })?;
+
+    // Clean up the temp directory.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    Ok(dest)
+}
+
+/// Populate the face-recognition-specific env vars with values that are
+/// known to work end-to-end on a fresh install.
+///
+/// **Does not touch `ORT_DYLIB_PATH`** — that is handled by
+/// `ensure_onnx_runtime()`, which must run first.
+///
 /// Each var is only set when currently **unset** — explicit values from
-/// the operator's shell keep taking precedence, so nothing a power user
-/// has configured gets clobbered.
+/// the operator's shell keep taking precedence.
 ///
 /// The anti-spoof tuning (`LIVE_INDEX=2`, `PIXEL_SCALE=unit`) reflects the
 /// specific 3-class Silent-Face ONNX file we shipped install instructions
@@ -2382,27 +3446,13 @@ async fn run_status() -> Result<()> {
 /// expects `[0, 1]` pixels.  Other exports need different values; override
 /// at the shell if you swap the model file.
 fn apply_face_recognition_defaults() {
-    // ONNX Runtime dylib — Homebrew installs to /opt/homebrew on Apple
-    // Silicon and /usr/local on Intel.  Try both.
-    let ort_candidates = [
-        "/opt/homebrew/lib/libonnxruntime.dylib",
-        "/usr/local/lib/libonnxruntime.dylib",
-    ];
-    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-        for p in ort_candidates {
-            if std::path::Path::new(p).exists() {
-                // SAFETY: single-threaded setup, before any worker spawns.
-                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
-                break;
-            }
-        }
-    }
-
     // Anti-spoof ONNX model — default to the canonical location under the
     // platform data dir so users who followed the README land here too.
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
         let default_path = default_data_dir()
-            .join("models").join("face").join("antispoof.onnx");
+            .join("models")
+            .join("face")
+            .join("antispoof.onnx");
         if default_path.exists() {
             // SAFETY: single-threaded setup, before any worker spawns.
             unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
@@ -2422,7 +3472,9 @@ fn apply_face_recognition_defaults() {
     // is reachable under different launch flows (`setup` vs `serve`).
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
         let default_path = default_data_dir()
-            .join("models").join("face").join("OULU_Protocol_2_model_0_0.onnx");
+            .join("models")
+            .join("face")
+            .join("OULU_Protocol_2_model_0_0.onnx");
         if default_path.exists() {
             // SAFETY: single-threaded setup, before any worker spawns.
             unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
@@ -2464,7 +3516,10 @@ async fn run_calibrate(
         println!("  ✓  Previous calibration data cleared.");
         println!();
     } else if !settings.voice_wake_word_transcriptions.is_empty() {
-        println!("  Existing variants ({}):", settings.voice_wake_word_transcriptions.len());
+        println!(
+            "  Existing variants ({}):",
+            settings.voice_wake_word_transcriptions.len()
+        );
         for v in &settings.voice_wake_word_transcriptions {
             println!("    • {}", v);
         }
@@ -2478,11 +3533,15 @@ async fn run_calibrate(
 
     let whisper = WhisperInput::new(Some(&whisper_url));
     let mut collected = 0usize;
-    let mut attempt  = 0usize;
+    let mut attempt = 0usize;
 
     while collected < target_samples {
         attempt += 1;
-        println!("  ── Sample {} / {} ─────────────────────────────────", collected + 1, target_samples);
+        println!(
+            "  ── Sample {} / {} ─────────────────────────────────",
+            collected + 1,
+            target_samples
+        );
         println!("  Press Enter, then say \"{}\"...", phrase);
         {
             let mut buf = String::new();
@@ -2523,17 +3582,25 @@ async fn run_calibrate(
             continue;
         }
 
-        if settings.voice_wake_word_transcriptions.contains(&normalized) {
+        if settings
+            .voice_wake_word_transcriptions
+            .contains(&normalized)
+        {
             println!("  (already stored as a variant — skipping duplicate)");
             collected += 1;
             continue;
         }
 
-        settings.voice_wake_word_transcriptions.push(normalized.clone());
+        settings
+            .voice_wake_word_transcriptions
+            .push(normalized.clone());
         settings_repo.update(&settings).await?;
         collected += 1;
 
-        println!("  ✓  Stored: \"{}\"  ({}/{})", normalized, collected, target_samples);
+        println!(
+            "  ✓  Stored: \"{}\"  ({}/{})",
+            normalized, collected, target_samples
+        );
         println!();
     }
 
@@ -2541,7 +3608,10 @@ async fn run_calibrate(
     println!("  ║   ✅  Calibration Complete!                   ║");
     println!("  ╚═══════════════════════════════════════════════╝");
     println!("  Phrase:    \"{}\"", settings.voice_wake_word);
-    println!("  Variants ({}):", settings.voice_wake_word_transcriptions.len());
+    println!(
+        "  Variants ({}):",
+        settings.voice_wake_word_transcriptions.len()
+    );
     for v in &settings.voice_wake_word_transcriptions {
         println!("    • {}", v);
     }
@@ -2593,12 +3663,16 @@ fn build_face_recognition(
     let model_path = match std::env::var("POND_FACE_MODEL_PATH") {
         Ok(p) => std::path::PathBuf::from(p),
         Err(_) => {
-            let adaface  = data_dir.join("models/face/adaface_ir101.onnx");
-            let arcface  = data_dir.join("models/face/w600k_r50.onnx");
-            let legacy   = data_dir.join("models/face/arcface.onnx");
-            if adaface.exists() { adaface }
-            else if arcface.exists() { arcface }
-            else { legacy }
+            let adaface = data_dir.join("models/face/adaface_ir101.onnx");
+            let arcface = data_dir.join("models/face/w600k_r50.onnx");
+            let legacy = data_dir.join("models/face/arcface.onnx");
+            if adaface.exists() {
+                adaface
+            } else if arcface.exists() {
+                arcface
+            } else {
+                legacy
+            }
         }
     };
 
@@ -2609,10 +3683,7 @@ fn build_face_recognition(
         if antispoof_default.exists() {
             // SAFETY: single-threaded init phase before any task scheduling.
             unsafe {
-                std::env::set_var(
-                    "POND_FACE_ANTISPOOF_PATH",
-                    antispoof_default.as_os_str(),
-                );
+                std::env::set_var("POND_FACE_ANTISPOOF_PATH", antispoof_default.as_os_str());
             }
         }
     }
@@ -2621,7 +3692,9 @@ fn build_face_recognition(
     // (live is index 2), but the in-tree default is `auto` which assumes
     // index 0.  Pin the default to 2 so the model works out-of-the-box.
     if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
-        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2"); }
+        unsafe {
+            std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2");
+        }
     }
 
     // Secondary PAD (DeepPixBis) for the ensemble path in
@@ -2634,10 +3707,7 @@ fn build_face_recognition(
         if secondary_default.exists() {
             // SAFETY: single-threaded init phase before any task scheduling.
             unsafe {
-                std::env::set_var(
-                    "POND_FACE_ANTISPOOF_PATH_2",
-                    secondary_default.as_os_str(),
-                );
+                std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", secondary_default.as_os_str());
             }
         }
     }
@@ -2662,29 +3732,30 @@ fn build_face_recognition(
     // `catch_unwind` so a missing libonnxruntime.dylib downgrades to
     // "face disabled" instead of taking down the whole server.  This makes
     // the misconfigured-ORT case behave the same as the missing-model case.
-    let extractor: Arc<dyn FaceEmbeddingExtractor> = match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| OnnxFaceEmbeddingExtractor::new(&model_path, model_kind)),
-    ) {
-        Ok(Ok(e)) => Arc::new(e),
-        Ok(Err(e)) => {
-            tracing::warn!("face recognition disabled: {e:#}");
-            return None;
-        }
-        Err(panic) => {
-            // Best-effort: ort's panic payload is a String; surface it.
-            let msg = panic
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "ort init panicked (unknown payload)".to_string());
-            tracing::warn!(
-                "face recognition disabled: ONNX Runtime failed to initialise — {} \
+    let extractor: Arc<dyn FaceEmbeddingExtractor> =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            OnnxFaceEmbeddingExtractor::new(&model_path, model_kind)
+        })) {
+            Ok(Ok(e)) => Arc::new(e),
+            Ok(Err(e)) => {
+                tracing::warn!("face recognition disabled: {e:#}");
+                return None;
+            }
+            Err(panic) => {
+                // Best-effort: ort's panic payload is a String; surface it.
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "ort init panicked (unknown payload)".to_string());
+                tracing::warn!(
+                    "face recognition disabled: ONNX Runtime failed to initialise — {} \
                  (hint: install onnxruntime and set ORT_DYLIB_PATH)",
-                msg
-            );
-            return None;
-        }
-    };
+                    msg
+                );
+                return None;
+            }
+        };
 
     // Detector resolution order:
     //   1. SCRFD at $POND_FACE_SCRFD_PATH or $DATA_DIR/models/face/scrfd.onnx
@@ -2716,7 +3787,8 @@ fn build_face_recognition(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ScrfdDetector::new(&scrfd_path, 0.5, 0.4)
         }))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("SCRFD ort init panicked"))) {
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("SCRFD ort init panicked")))
+        {
             Ok(d) => {
                 tracing::info!(
                     "SCRFD face detector loaded from {} — landmark alignment enabled",
@@ -2775,11 +3847,11 @@ fn build_face_recognition(
     // path does NOT call `.with_threshold()` — see below.
     let threshold = match (&detector, model_kind) {
         (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
-        (Some(_), EmbeddingModel::ArcFace512)                            => 0.72,
-        (None, EmbeddingModel::ArcFace512)                                => 0.85,
+        (Some(_), EmbeddingModel::ArcFace512) => 0.72,
+        (None, EmbeddingModel::ArcFace512) => 0.85,
         (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
-        (Some(_), EmbeddingModel::MobileFaceNet128)                      => 0.72,
-        (None, EmbeddingModel::MobileFaceNet128)                         => 0.85,
+        (Some(_), EmbeddingModel::MobileFaceNet128) => 0.72,
+        (None, EmbeddingModel::MobileFaceNet128) => 0.85,
     };
     // Allow a shell-level override to take precedence over the
     // model-aware default — useful when a power user has tuned the gate
@@ -2794,7 +3866,10 @@ fn build_face_recognition(
         "face recognition enabled (model={:?}, threshold={}, aligned={})",
         model_kind,
         threshold,
-        detector.as_ref().map(|d| d.produces_landmarks()).unwrap_or(false),
+        detector
+            .as_ref()
+            .map(|d| d.produces_landmarks())
+            .unwrap_or(false),
     );
 
     let mut svc = SqliteFaceRecognition::new(pool, extractor)
@@ -2803,7 +3878,9 @@ fn build_face_recognition(
             EmbeddingModel::ArcFace512 => "arcface-512",
             EmbeddingModel::MobileFaceNet128 => "mobilefacenet-128",
         });
-    if let Some(d) = detector { svc = svc.with_detector(d); }
+    if let Some(d) = detector {
+        svc = svc.with_detector(d);
+    }
     Some(Arc::new(svc))
 }
 
@@ -2823,7 +3900,6 @@ fn get_local_ip() -> Option<String> {
 }
 
 fn prompt_nonempty(prompt: &str) -> Result<String> {
-
     loop {
         print!("{}", prompt);
         io::stdout().flush()?;
@@ -2857,7 +3933,14 @@ async fn run_main_menu() -> Result<()> {
                 run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
             }
             "2" => {
-                run_server(std::path::PathBuf::from("web/dist"), false, false, "goose", false).await?;
+                run_server(
+                    std::path::PathBuf::from("web/dist"),
+                    false,
+                    false,
+                    "goose",
+                    false,
+                )
+                .await?;
             }
             "3" => {
                 run_status().await?;
@@ -2975,7 +4058,11 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 let mut name = String::new();
                 let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut name);
-                let name = if name.trim().is_empty() { "Goose".to_string() } else { name.trim().to_string() };
+                let name = if name.trim().is_empty() {
+                    "Goose".to_string()
+                } else {
+                    name.trim().to_string()
+                };
                 user_data.insert("assistant_name".to_string(), name);
 
                 service.advance().await?;
@@ -3004,7 +4091,10 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 println!("Step: AI Model");
                 // Show LLM models available in the catalog DB so users can pick by number.
                 let model_repo = SqliteModelRepository::new(db.system.clone());
-                let catalog_models: Vec<_> = model_repo.list_all().await.unwrap_or_default()
+                let catalog_models: Vec<_> = model_repo
+                    .list_all()
+                    .await
+                    .unwrap_or_default()
                     .into_iter()
                     .filter(|m| m.category.is_llm())
                     .collect();
@@ -3015,11 +4105,18 @@ async fn run_onboard(reset: bool) -> Result<()> {
                     println!("Available models (✓ = downloaded):");
                     for (i, m) in catalog_models.iter().enumerate() {
                         let dl = if m.downloaded { "✓" } else { " " };
-                        println!("  {}) [{}] {} ({}, {} MB)",
-                            i + 1, dl, m.name, m.category.as_str(), m.size_mb);
+                        println!(
+                            "  {}) [{}] {} ({}, {} MB)",
+                            i + 1,
+                            dl,
+                            m.name,
+                            m.category.as_str(),
+                            m.size_mb
+                        );
                     }
                     println!();
-                    let input = prompt_nonempty("Enter number to select, or type a name directly: ")?;
+                    let input =
+                        prompt_nonempty("Enter number to select, or type a name directly: ")?;
                     match input.parse::<usize>() {
                         Ok(idx) if idx >= 1 && idx <= catalog_models.len() => {
                             catalog_models[idx - 1].name.clone()
@@ -3044,11 +4141,21 @@ async fn run_onboard(reset: bool) -> Result<()> {
                 } else {
                     println!("\nOnboarding complete! Saving your settings...\n");
                     let mut settings = settings_repo.get().await.unwrap_or_default();
-                    if let Some(v) = user_data.get("user_name")       { settings.user_name = v.clone(); }
-                    if let Some(v) = user_data.get("timezone")        { settings.timezone = v.clone(); }
-                    if let Some(v) = user_data.get("prompt_style")    { settings.prompt_style = v.clone(); }
-                    if let Some(v) = user_data.get("assistant_name")  { settings.assistant_name = v.clone(); }
-                    if let Some(v) = user_data.get("voice_wake_word") { settings.voice_wake_word = v.clone(); }
+                    if let Some(v) = user_data.get("user_name") {
+                        settings.user_name = v.clone();
+                    }
+                    if let Some(v) = user_data.get("timezone") {
+                        settings.timezone = v.clone();
+                    }
+                    if let Some(v) = user_data.get("prompt_style") {
+                        settings.prompt_style = v.clone();
+                    }
+                    if let Some(v) = user_data.get("assistant_name") {
+                        settings.assistant_name = v.clone();
+                    }
+                    if let Some(v) = user_data.get("voice_wake_word") {
+                        settings.voice_wake_word = v.clone();
+                    }
                     if let Some(v) = user_data.get("chat_model") {
                         settings.chat_model = v.clone();
                         settings.active_llm_model = v.clone();
@@ -3081,68 +4188,152 @@ async fn build_goose_backend(
     scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
     settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
     memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    embedding_provider: Option<
+        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+    >,
     skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync>,
     recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
-    template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync>,
+    template_repo: Arc<
+        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+    >,
     extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
+    draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync>,
+    session_storage: Option<Arc<dyn pond_core::ports::session_storage::SessionStorage>>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
     Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
+    Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>,
 ) {
-    use pond_adapters_goose::{GiapServiceHandles, GooseAdapter, register_giap_extension};
+    use pond_adapters_goose::GooseAdapter;
     use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::ports::extension_manager::ExtensionManagerPort;
     use pond_core::ports::tool_caller::ToolCaller;
+    use pond_core::ports::tool_registry::ToolRegistryPort;
+
+    let default_registry: Arc<dyn ToolRegistryPort> =
+        Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+
+    // ── PondAgent backend (independent, no Goose dependency) ──────────────
+    #[cfg(feature = "pond-agent")]
+    if agent_backend == "pond" {
+        tracing::info!("Building PondAgent backend (independent, KV-cache enabled)");
+
+        let settings = settings_repo.get().await.unwrap_or_default();
+
+        // Build LlamaCppEngine as the inference provider.
+        let engine = match pond_inference::LlamaCppEngine::new(data_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("LlamaCppEngine init failed: {e} — falling back to mock");
+                return (Arc::new(MockAgent::new()), None, None, default_registry);
+            }
+        };
+
+        // Load the configured model.
+        let model_id = &settings.chat_model;
+        if !model_id.is_empty() {
+            if let Err(e) = engine.load_model(model_id, 99, true).await {
+                tracing::error!("Failed to load model '{}': {e}", model_id);
+                return (Arc::new(MockAgent::new()), None, None, default_registry);
+            }
+        }
+
+        // Build the McpToolDispatcher for direct MCP tool routing.
+        let dispatcher = pond_mcp_server::McpToolDispatcher::new(
+            memory_repo.clone(),
+            weather,
+            scheduler,
+            settings_repo.clone(),
+            device_registry.clone(),
+            skill_repo.clone(),
+            recipe_repo.clone(),
+            draft_repo,
+            embedding_provider,
+        );
+
+        let dispatcher: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+            Arc::new(dispatcher);
+
+        // Get tool definitions from the dispatcher for prompt injection.
+        let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = dispatcher
+            .available_tools()
+            .await
+            .into_iter()
+            .map(|name| pond_core::ports::inference::ToolDefinition {
+                name: name.clone(),
+                description: format!("GIAP tool: {}", name),
+                parameters_schema: serde_json::json!({}),
+            })
+            .collect();
+
+        let ss = session_storage.expect(
+            "session_storage is required for pond-agent backend — pass it from the server scope",
+        );
+        let agent = pond_agent::PondAgent::new(
+            Arc::new(engine),
+            tool_defs,
+            settings_repo.clone(),
+            Some(template_repo),
+            Some(extras_repo),
+            Some(skill_repo),
+            device_registry,
+            ss,
+            Some(dispatcher),
+        );
+
+        tracing::info!("PondAgent ready — independent inference with KV-cache reuse");
+        return (Arc::new(agent), None, None, default_registry);
+    }
 
     if agent_backend != "goose" {
-        return (Arc::new(MockAgent::new()), None, None);
+        return (Arc::new(MockAgent::new()), None, None, default_registry);
     }
 
     // Build tool-calling specialist (FunctionGemma) if configured.
-    // The Tool Agent runs BEFORE the main LLM — model swap overhead is
-    // accepted because the main model never attempts tool calls itself.
     let tool_caller: Option<Arc<dyn ToolCaller>> = {
         let settings = settings_repo.get().await.unwrap_or_default();
         match settings.tool_model.as_deref() {
             Some(model_name) if !model_name.is_empty() => {
                 match ToolCallerEngine::new(model_name, data_dir).await {
                     Ok(engine) => {
-                        println!("[tool-agent] FunctionGemma specialist loaded: {}", model_name);
                         tracing::info!("Tool-calling specialist loaded: {}", model_name);
                         Some(Arc::new(engine) as Arc<dyn ToolCaller>)
                     }
                     Err(e) => {
-                        println!("[tool-agent] FAILED to load specialist '{}': {e}", model_name);
                         tracing::warn!("Failed to load tool specialist '{}': {e}", model_name);
                         None
                     }
                 }
             }
-            _ => {
-                println!("[tool-agent] no tool_model configured, using code-path fallback");
-                None
-            }
+            _ => None,
         }
     };
 
-    // Register the GIAP MCP server into Goose's builtin extension registry.
-    let handles = Arc::new(GiapServiceHandles {
-        weather,
-        device_registry: device_registry.clone(),
+    // Register all GIAP MCP servers into Goose's builtin extension registry.
+    // Extension toggles (ext_*_enabled) are read from settings to gate registration.
+    let settings = settings_repo.get().await.unwrap_or_default();
+    match pond_adapters_goose::register_giap_extensions(
+        &settings,
+        memory_repo.clone(),
+        embedding_provider,
         scheduler,
-        settings_repo: settings_repo.clone(),
-        memory_repo: memory_repo.clone(),
-        skill_repo: skill_repo.clone(),
-        recipe_repo: recipe_repo.clone(),
-        http_client: reqwest::Client::new(),
-        tool_caller: tool_caller.clone(),
-        last_user_message: tokio::sync::RwLock::new(String::new()),
-    });
-    if let Err(e) = register_giap_extension(handles) {
-        tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
-        return (Arc::new(MockAgent::new()), None, None);
+        weather,
+        settings_repo.clone(),
+        device_registry.clone(),
+        skill_repo.clone(),
+        recipe_repo.clone(),
+        draft_repo,
+        tool_caller.clone(),
+    ) {
+        Ok(ext_names) => {
+            tracing::info!(extensions = ?ext_names, "GIAP MCP registration complete");
+        }
+        Err(e) => {
+            tracing::error!("GIAP MCP registration failed: {e} — falling back to mock agent");
+            return (Arc::new(MockAgent::new()), None, None, default_registry);
+        }
     }
 
     // Build the adapter with all repos injected.
@@ -3155,20 +4346,22 @@ async fn build_goose_backend(
         device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
-    ).await {
+        Some(default_registry.clone()),
+    )
+    .await
+    {
         Ok(adapter) => {
             if voice_mode {
                 adapter.set_voice_mode(true);
             }
-            let ext_mgr: Arc<dyn ExtensionManagerPort> =
-                adapter.extension_manager();
+            let ext_mgr: Arc<dyn ExtensionManagerPort> = adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
             let agent: Arc<dyn Agent> = Arc::new(adapter);
-            (agent, Some(ext_mgr), tool_caller)
+            (agent, Some(ext_mgr), tool_caller, default_registry)
         }
         Err(e) => {
             tracing::error!("GooseAdapter init failed: {e} — falling back to mock agent");
-            (Arc::new(MockAgent::new()), None, None)
+            (Arc::new(MockAgent::new()), None, None, default_registry)
         }
     }
 }
@@ -3180,10 +4373,7 @@ async fn build_goose_backend(
 /// Upserts all returned records (preserving `is_custom` rows) and sets `downloaded`
 /// by checking the filesystem.  A failure to fetch is non-fatal — the server starts
 /// with whatever models are already in the DB.
-async fn seed_model_catalog(
-    repo: &dyn ModelRepository,
-    data_dir: &std::path::Path,
-) {
+async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Path) {
     use crate::composite_model_catalog_provider::CompositeModelCatalogProvider;
     use crate::filesystem_model_storage::FilesystemModelStorage;
     use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
@@ -3194,12 +4384,14 @@ async fn seed_model_catalog(
         .build()
         .unwrap_or_default();
     let provider = CompositeModelCatalogProvider::new(client);
-    let storage  = FilesystemModelStorage::new(data_dir);
+    let storage = FilesystemModelStorage::new(data_dir);
 
     let (models, _binaries) = match provider.fetch().await {
         Ok(result) => result,
         Err(e) => {
-            tracing::warn!("Failed to fetch model catalog: {e}. Starting with existing DB records.");
+            tracing::warn!(
+                "Failed to fetch model catalog: {e}. Starting with existing DB records."
+            );
             return;
         }
     };
@@ -3235,29 +4427,44 @@ async fn sync_assignments_to_settings(
     for a in &assignments {
         // model_id format: "{category}/{name}"
         let model_name = a.model_id.split('/').nth(1).unwrap_or(&a.model_id);
-        let category   = a.model_id.split('/').next().unwrap_or("");
+        let category = a.model_id.split('/').next().unwrap_or("");
 
         match a.role.as_str() {
             "chat" => {
                 let provider = category_to_provider(category);
                 let _ = settings_repo.set_key("chat_provider", provider).await;
-                let _ = settings_repo.set_key("chat_model",    model_name.to_string()).await;
+                let _ = settings_repo
+                    .set_key("chat_model", model_name.to_string())
+                    .await;
             }
             "think" => {
                 let provider = category_to_provider(category);
                 let _ = settings_repo.set_key("think_provider", provider).await;
-                let _ = settings_repo.set_key("think_model",    model_name.to_string()).await;
+                let _ = settings_repo
+                    .set_key("think_model", model_name.to_string())
+                    .await;
             }
             "task" => {
                 let provider = category_to_provider(category);
                 let _ = settings_repo.set_key("task_provider", provider).await;
-                let _ = settings_repo.set_key("task_model",    model_name.to_string()).await;
+                let _ = settings_repo
+                    .set_key("task_model", model_name.to_string())
+                    .await;
+            }
+            "tool" => {
+                let _ = settings_repo
+                    .set_key("tool_model", model_name.to_string())
+                    .await;
             }
             "asr" => {
-                let _ = settings_repo.set_key("active_whisper_model", model_name.to_string()).await;
+                let _ = settings_repo
+                    .set_key("active_whisper_model", model_name.to_string())
+                    .await;
             }
             "tts" => {
-                let _ = settings_repo.set_key("active_tts_model", model_name.to_string()).await;
+                let _ = settings_repo
+                    .set_key("active_tts_model", model_name.to_string())
+                    .await;
                 // For piper models also sync voice_tts_voice to the .onnx filename.
                 if category == "tts_piper" {
                     if let Ok(Some(record)) = repo.get_by_id(&a.model_id).await {
@@ -3267,6 +4474,11 @@ async fn sync_assignments_to_settings(
                     }
                 }
             }
+            "embedding" => {
+                let _ = settings_repo
+                    .set_key("active_embedding_model", model_name.to_string())
+                    .await;
+            }
             other => {
                 tracing::debug!("sync_assignments_to_settings: unknown role '{other}', skipping");
             }
@@ -3274,15 +4486,18 @@ async fn sync_assignments_to_settings(
     }
 
     if !assignments.is_empty() {
-        tracing::info!("synced {} role assignment(s) to settings KV", assignments.len());
+        tracing::info!(
+            "synced {} role assignment(s) to settings KV",
+            assignments.len()
+        );
     }
 }
 
 fn category_to_provider(category: &str) -> String {
     match category {
-        "ollama"    => "ollama".to_string(),
-        "gguf"      => "local".to_string(),
-        _           => "llamafile".to_string(),
+        "ollama" => "ollama".to_string(),
+        "gguf" => "local".to_string(),
+        _ => "llamafile".to_string(),
     }
 }
 
@@ -3298,7 +4513,7 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 match ModelCategory::from_str(cat_str) {
                     Some(cat) => repo.list_by_category(&cat).await?,
                     None => {
-                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama");
+                        eprintln!("Unknown category '{cat_str}'. Valid: gguf, llamafile, whisper, tts, ollama, embedding");
                         std::process::exit(1);
                     }
                 }
@@ -3308,43 +4523,59 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
             let assignments = repo.list_assignments().await.unwrap_or_default();
 
-            println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  Role",
-                "Category", "Name", "Size(MB)", "DL?", "RAM(MB)");
+            println!(
+                "{:<12} {:<28} {:>8}  {:>6}  {:>10}  Role",
+                "Category", "Name", "Size(MB)", "DL?", "RAM(MB)"
+            );
             println!("{}", "─".repeat(78));
 
             for m in &models {
-                let role = assignments.iter()
+                let role = assignments
+                    .iter()
                     .find(|a| a.model_id == m.id)
                     .map(|a| a.role.as_str())
                     .unwrap_or("—");
-                let dl  = if m.downloaded { "✓" } else { "✗" };
-                let ram = m.ram_estimate_mb
+                let dl = if m.downloaded { "✓" } else { "✗" };
+                let ram = m
+                    .ram_estimate_mb
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "—".to_string());
-                println!("{:<12} {:<28} {:>8}  {:>6}  {:>10}  {}",
-                    m.category.as_str(), m.name, m.size_mb, dl, ram, role);
+                println!(
+                    "{:<12} {:<28} {:>8}  {:>6}  {:>10}  {}",
+                    m.category.as_str(),
+                    m.name,
+                    m.size_mb,
+                    dl,
+                    ram,
+                    role
+                );
             }
         }
 
         ModelAction::Download { category, name } => {
-            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
-                anyhow::anyhow!("Unknown category '{category}'")
-            })?;
+            let cat = ModelCategory::from_str(&category)
+                .ok_or_else(|| anyhow::anyhow!("Unknown category '{category}'"))?;
             let id = ModelRecord::id_for(&cat, &name);
-            let record = repo.get_by_id(&id).await?
+            let record = repo
+                .get_by_id(&id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
 
-            let url = record.url.as_deref()
+            let url = record
+                .url
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no download URL"))?;
-            let filename = record.filename.as_deref()
+            let filename = record
+                .filename
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no filename"))?;
 
             let subdir = match cat {
-                ModelCategory::Whisper  => "models",
+                ModelCategory::Whisper => "models",
                 ModelCategory::Llamafile => "models/llm",
-                ModelCategory::Gguf     => "models/gguf",
+                ModelCategory::Gguf => "models/gguf",
                 ModelCategory::TtsPiper => "models/tts",
-                _                       => "models",
+                _ => "models",
             };
             let dest = data_dir.join(subdir).join(filename);
             if let Some(parent) = dest.parent() {
@@ -3374,27 +4605,29 @@ async fn run_models(action: ModelAction) -> Result<()> {
         }
 
         ModelAction::Delete { category, name } => {
-            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
-                anyhow::anyhow!("Unknown category '{category}'")
-            })?;
+            let cat = ModelCategory::from_str(&category)
+                .ok_or_else(|| anyhow::anyhow!("Unknown category '{category}'"))?;
             let id = ModelRecord::id_for(&cat, &name);
-            let record = repo.get_by_id(&id).await?
+            let record = repo
+                .get_by_id(&id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
 
             let assignments = repo.list_assignments().await?;
             if let Some(a) = assignments.iter().find(|a| a.model_id == id) {
                 anyhow::bail!(
-                    "Model is assigned to role '{}'. Deactivate it first.", a.role
+                    "Model is assigned to role '{}'. Deactivate it first.",
+                    a.role
                 );
             }
 
             if let Some(filename) = &record.filename {
                 let subdir = match cat {
-                    ModelCategory::Whisper   => "models",
+                    ModelCategory::Whisper => "models",
                     ModelCategory::Llamafile => "models/llm",
-                    ModelCategory::Gguf      => "models/gguf",
-                    ModelCategory::TtsPiper  => "models/tts",
-                    _                        => "models",
+                    ModelCategory::Gguf => "models/gguf",
+                    ModelCategory::TtsPiper => "models/tts",
+                    _ => "models",
                 };
                 let path = data_dir.join(subdir).join(filename);
                 if path.exists() {
@@ -3407,12 +4640,16 @@ async fn run_models(action: ModelAction) -> Result<()> {
             repo.set_downloaded(&id, false).await?;
         }
 
-        ModelAction::Activate { category, name, role } => {
-            let cat = ModelCategory::from_str(&category).ok_or_else(|| {
-                anyhow::anyhow!("Unknown category '{category}'")
-            })?;
+        ModelAction::Activate {
+            category,
+            name,
+            role,
+        } => {
+            let cat = ModelCategory::from_str(&category)
+                .ok_or_else(|| anyhow::anyhow!("Unknown category '{category}'"))?;
             let id = ModelRecord::id_for(&cat, &name);
-            repo.get_by_id(&id).await?
+            repo.get_by_id(&id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
 
             use pond_core::domain::model_record::ModelRoleAssignment;
@@ -3420,7 +4657,8 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 anyhow::bail!(
                     "Category '{}' is not compatible with role '{}'. \
                      (whisper→asr, tts_piper/tts_http→tts, gguf/llamafile/ollama→chat|think|task)",
-                    cat.as_str(), role
+                    cat.as_str(),
+                    role
                 );
             }
 
@@ -3436,15 +4674,11 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
 // ── Agent CLI ─────────────────────────────────────────────────────────────────
 
-/// Resolve the model role string from a `--role` flag value and the message text.
-fn resolve_role(role_arg: &str, message: &str) -> String {
-    use pond_core::services::request_classifier::classify_request;
+/// Resolve the model role string from a `--role` flag value.
+/// All requests default to "chat" — the LLM handles tool routing natively via MCP.
+fn resolve_role(role_arg: &str, _message: &str) -> String {
     match role_arg {
-        "auto" => match classify_request(message) {
-            pond_core::domain::model_role::ModelRole::Think => "think".to_string(),
-            pond_core::domain::model_role::ModelRole::Task  => "task".to_string(),
-            pond_core::domain::model_role::ModelRole::Chat  => "chat".to_string(),
-        },
+        "auto" | "chat" => "chat".to_string(),
         other => other.to_string(),
     }
 }
@@ -3453,7 +4687,10 @@ fn resolve_role(role_arg: &str, message: &str) -> String {
 ///
 /// Text tokens are printed as they arrive. Tool calls and results are shown
 /// on stderr so they don't pollute piped output. Returns when the stream ends.
-async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domain::agent::AgentRequest) -> Result<()> {
+async fn stream_agent_response(
+    agent: &Arc<dyn Agent>,
+    request: pond_core::domain::agent::AgentRequest,
+) -> Result<()> {
     use pond_core::domain::agent::AgentStreamEvent;
 
     let mut stream = agent.chat_stream(request).await?;
@@ -3504,9 +4741,15 @@ async fn stream_agent_response(agent: &Arc<dyn Agent>, request: pond_core::domai
                 eprint!("\r\x1b[K\x1b[33m  🔍 {content}\x1b[0m");
                 let _ = io::stderr().flush();
             }
-            AgentStreamEvent::ReviewRevision { content, score, rounds } => {
+            AgentStreamEvent::ReviewRevision {
+                content,
+                score,
+                rounds,
+            } => {
                 // Clear previous answer and print revised version
-                eprintln!("\r\x1b[K\x1b[33m  📝 Revised (score: {score}/5, rounds: {rounds})\x1b[0m");
+                eprintln!(
+                    "\r\x1b[K\x1b[33m  📝 Revised (score: {score}/5, rounds: {rounds})\x1b[0m"
+                );
                 println!("{content}");
                 printed_newline = content.ends_with('\n');
             }
@@ -3536,12 +4779,15 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
         Arc::new(SqliteRecipeRepository::new(db.system.clone()));
-    let template_repo: Arc<dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync> =
-        Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    let template_repo: Arc<
+        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+    > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
     let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
         Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
     let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
@@ -3553,7 +4799,10 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
     {
         let loc = if settings.weather_location_name.is_empty() {
-            format!("{:.3}, {:.3}", settings.weather_latitude, settings.weather_longitude)
+            format!(
+                "{:.3}, {:.3}",
+                settings.weather_latitude, settings.weather_longitude
+            )
         } else {
             settings.weather_location_name.clone()
         };
@@ -3567,14 +4816,20 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     };
 
     match action {
-        AgentAction::Chat { message, session, role } => {
+        AgentAction::Chat {
+            message,
+            session,
+            role,
+        } => {
             use pond_core::domain::agent::AgentRequest;
 
             let model_role = resolve_role(&role, &message);
-            eprintln!("  {} | provider: {}  model: {}  role: {}",
-                settings.assistant_name, settings.chat_provider, settings.chat_model, model_role);
+            eprintln!(
+                "  {} | provider: {}  model: {}  role: {}",
+                settings.assistant_name, settings.chat_provider, settings.chat_model, model_role
+            );
 
-            let (agent, _ext_mgr, _tc) = build_goose_backend(
+            let (agent, _ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3583,18 +4838,24 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI chat
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
-            ).await;
+            )
+            .await;
 
             let request = AgentRequest {
                 message,
                 session_id: session,
                 model_role,
                 images: Vec::new(),
+                voice_mode: false,
+                canvas_mode: false,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -3603,7 +4864,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             use pond_core::domain::agent::AgentRequest;
             use tokio::io::AsyncBufReadExt as _;
 
-            let (agent, _ext_mgr, _tc) = build_goose_backend(
+            let (agent, _ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3612,15 +4873,21 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI repl
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
-            ).await;
+            )
+            .await;
 
-            eprintln!("  {} — session: {}  (Ctrl+C or 'exit' to quit)",
-                settings.assistant_name, session);
+            eprintln!(
+                "  {} — session: {}  (Ctrl+C or 'exit' to quit)",
+                settings.assistant_name, session
+            );
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             let mut lines = stdin.lines();
@@ -3650,6 +4917,8 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     session_id: session.clone(),
                     model_role,
                     images: Vec::new(),
+                    voice_mode: false,
+                    canvas_mode: false,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -3658,7 +4927,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         }
 
         AgentAction::Tools => {
-            let (_agent, ext_mgr, _tc) = build_goose_backend(
+            let (_agent, ext_mgr, _tc, _tr) = build_goose_backend(
                 "goose",
                 &llamafile_url,
                 &data_dir,
@@ -3667,19 +4936,25 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None,
                 settings_repo,
                 memory_repo,
+                None, // embedding_provider — not used in CLI tools listing
                 skill_repo,
                 recipe_repo,
                 template_repo,
                 extras_repo,
+                draft_repo,
+                None, // session_storage — not needed for goose backend
                 false,
-            ).await;
+            )
+            .await;
 
             match ext_mgr {
                 None => println!("No extension manager available (agent backend may be 'mock')."),
                 Some(mgr) => {
                     let extensions = mgr.list_extensions().await.unwrap_or_default();
                     if extensions.is_empty() {
-                        println!("No extensions loaded yet (start the server to initialise sessions).");
+                        println!(
+                            "No extensions loaded yet (start the server to initialise sessions)."
+                        );
                     } else {
                         println!("{:<20} {}", "Extension", "Tools");
                         println!("{}", "─".repeat(60));
@@ -3698,7 +4973,10 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 println!("No prompt extras defined. Add via POST /api/v1/agent/extras");
                 return Ok(());
             }
-            println!("{:<4} {:<20} {:<6} {}", "Ord", "Key", "Active", "Instruction");
+            println!(
+                "{:<4} {:<20} {:<6} {}",
+                "Ord", "Key", "Active", "Instruction"
+            );
             println!("{}", "─".repeat(72));
             for e in &extras {
                 let active = if e.active { "✓" } else { "✗" };
@@ -3707,7 +4985,10 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 } else {
                     e.instruction.clone()
                 };
-                println!("{:<4} {:<20} {:<6} {}", e.sort_order, e.key, active, preview);
+                println!(
+                    "{:<4} {:<20} {:<6} {}",
+                    e.sort_order, e.key, active, preview
+                );
             }
         }
     }
@@ -3739,28 +5020,40 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
             }
         }
 
-        PromptAction::Show { name } => {
-            match repo.get(&name).await? {
-                None => {
-                    eprintln!("Template '{name}' not found.");
-                    std::process::exit(1);
-                }
-                Some(t) => {
-                    println!("─── {} ─── (system={})", t.name, t.is_system);
-                    println!("{}", t.content);
-                }
+        PromptAction::Show { name } => match repo.get(&name).await? {
+            None => {
+                eprintln!("Template '{name}' not found.");
+                std::process::exit(1);
             }
-        }
+            Some(t) => {
+                println!("─── {} ─── (system={})", t.name, t.is_system);
+                println!("{}", t.content);
+            }
+        },
 
         PromptAction::Reset { name } => {
             use pond_core::domain::prompt_template::PromptTemplate;
-            use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+            use pond_core::prompts::{
+                PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
+            };
 
             let (content, description) = match name.as_str() {
-                "balanced"  => (PROMPT_BALANCED, "Warm, practical, complete behaviour rules. Default for most households."),
-                "concise"   => (PROMPT_CONCISE,  "Minimal, action-first. For power users who want brevity."),
-                "technical" => (PROMPT_TECHNICAL,"Verbose, tool-aware, narrates reasoning. For developers."),
-                "warm"      => (PROMPT_WARM,     "Conversational, family-friendly, personality-forward."),
+                "balanced" => (
+                    PROMPT_BALANCED,
+                    "Warm, practical, complete behaviour rules. Default for most households.",
+                ),
+                "concise" => (
+                    PROMPT_CONCISE,
+                    "Minimal, action-first. For power users who want brevity.",
+                ),
+                "technical" => (
+                    PROMPT_TECHNICAL,
+                    "Verbose, tool-aware, narrates reasoning. For developers.",
+                ),
+                "warm" => (
+                    PROMPT_WARM,
+                    "Conversational, family-friendly, personality-forward.",
+                ),
                 other => {
                     eprintln!("'{other}' is not a built-in template. Only balanced | concise | technical | warm can be reset.");
                     std::process::exit(1);
@@ -3798,7 +5091,11 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
                 repo.list_active().await?
             };
             if skills.is_empty() {
-                let hint = if all { "" } else { " (use --all to include inactive)" };
+                let hint = if all {
+                    ""
+                } else {
+                    " (use --all to include inactive)"
+                };
                 println!("No skills found{hint}.");
                 return Ok(());
             }
@@ -3842,14 +5139,20 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
         SkillAction::Toggle { id } => {
             use pond_core::ports::skill::UserSkillRepository as _;
 
-            let skill = repo.get(&id).await?
+            let skill = repo
+                .get(&id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Skill '{id}' not found"))?;
             let updated = pond_core::domain::skill::UserSkill {
                 active: !skill.active,
                 ..skill.clone()
             };
             repo.update(&updated).await?;
-            let state = if updated.active { "enabled" } else { "disabled" };
+            let state = if updated.active {
+                "enabled"
+            } else {
+                "disabled"
+            };
             println!("✓ Skill '{}' {state}", skill.name);
         }
 
@@ -3875,10 +5178,15 @@ async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
         RecipeAction::List => {
             let recipes = repo.list().await?;
             if recipes.is_empty() {
-                println!("No recipes found. Import one with `pond recipes import <name> <file.yaml>`");
+                println!(
+                    "No recipes found. Import one with `pond recipes import <name> <file.yaml>`"
+                );
                 return Ok(());
             }
-            println!("{:<38} {:<6} {:<20} {}", "ID", "Active", "Name", "Description");
+            println!(
+                "{:<38} {:<6} {:<20} {}",
+                "ID", "Active", "Name", "Description"
+            );
             println!("{}", "─".repeat(80));
             for r in &recipes {
                 let active = if r.active { "✓" } else { "✗" };
@@ -3891,26 +5199,29 @@ async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
             }
         }
 
-        RecipeAction::Show { name } => {
-            match repo.get_by_name(&name).await? {
-                None => {
-                    eprintln!("Recipe '{name}' not found.");
-                    std::process::exit(1);
-                }
-                Some(r) => {
-                    println!("─── {} ─── (active={})", r.name, r.active);
-                    if !r.description.is_empty() {
-                        println!("# {}\n", r.description);
-                    }
-                    println!("{}", r.yaml);
-                }
+        RecipeAction::Show { name } => match repo.get_by_name(&name).await? {
+            None => {
+                eprintln!("Recipe '{name}' not found.");
+                std::process::exit(1);
             }
-        }
+            Some(r) => {
+                println!("─── {} ─── (active={})", r.name, r.active);
+                if !r.description.is_empty() {
+                    println!("# {}\n", r.description);
+                }
+                println!("{}", r.yaml);
+            }
+        },
 
-        RecipeAction::Import { name, file, description } => {
+        RecipeAction::Import {
+            name,
+            file,
+            description,
+        } => {
             use pond_core::domain::recipe::AgentRecipe;
 
-            let yaml = tokio::fs::read_to_string(&file).await
+            let yaml = tokio::fs::read_to_string(&file)
+                .await
                 .map_err(|e| anyhow::anyhow!("Cannot read '{}': {e}", file.display()))?;
 
             let id = uuid::Uuid::new_v4().to_string();
@@ -3926,18 +5237,16 @@ async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
             println!("✓ Recipe '{name}' imported (id: {id})");
         }
 
-        RecipeAction::Remove { name } => {
-            match repo.get_by_name(&name).await? {
-                None => {
-                    eprintln!("Recipe '{name}' not found.");
-                    std::process::exit(1);
-                }
-                Some(r) => {
-                    repo.delete(&r.id).await?;
-                    println!("✓ Recipe '{name}' deleted.");
-                }
+        RecipeAction::Remove { name } => match repo.get_by_name(&name).await? {
+            None => {
+                eprintln!("Recipe '{name}' not found.");
+                std::process::exit(1);
             }
-        }
+            Some(r) => {
+                repo.delete(&r.id).await?;
+                println!("✓ Recipe '{name}' deleted.");
+            }
+        },
     }
 
     Ok(())
@@ -3985,6 +5294,15 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
                 source: "cli".to_string(),
                 tags: vec![],
                 created_at: chrono::Utc::now(),
+                segment: None,
+                importance: None,
+                tier: None,
+                decay_rate: None,
+                access_count: 0,
+                last_accessed_at: None,
+                lifecycle: None,
+                superseded_by: None,
+                corrects: None,
             };
             repo.add(fragment).await?;
             println!("✓ Memory saved (id: {id})");
@@ -4025,8 +5343,8 @@ mod tests {
     #[test]
     fn unknown_category_defaults_to_llamafile() {
         assert_eq!(category_to_provider("tts_piper"), "llamafile");
-        assert_eq!(category_to_provider("whisper"),   "llamafile");
-        assert_eq!(category_to_provider("unknown"),   "llamafile");
+        assert_eq!(category_to_provider("whisper"), "llamafile");
+        assert_eq!(category_to_provider("unknown"), "llamafile");
     }
 
     // ── sync_assignments_to_settings ──────────────────────────────────────────
@@ -4041,32 +5359,44 @@ mod tests {
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
 
         let tmp = tempfile::tempdir().unwrap();
-        let db  = Database::init(tmp.path()).await.unwrap();
-        let repo          = SqliteModelRepository::new(db.system.clone());
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
         let settings_repo = SqliteSettingsRepository::new(db.system.clone());
 
         let model = ModelRecord {
-            id:               "ollama/llama3.2".to_string(),
-            category:         ModelCategory::Ollama,
-            name:             "llama3.2".to_string(),
-            filename:         None,
-            description:      "Ollama Llama 3.2".to_string(),
-            size_mb:          0,
-            url:              None,
-            hf_id:            None, ram_estimate_mb: None, recommended_role: None,
-            context_length:   None, quantization: None, asr_language: None,
-            asr_size:         None, tts_engine: None, tts_voice_name: None,
-            config_filename:  None, config_url: None, tts_url: None,
-            sample_rate:      None, downloaded: true, is_custom: false,
+            id: "ollama/llama3.2".to_string(),
+            category: ModelCategory::Ollama,
+            name: "llama3.2".to_string(),
+            filename: None,
+            description: "Ollama Llama 3.2".to_string(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
         };
         repo.upsert(&model).await.unwrap();
-        repo.set_assignment("chat", "ollama/llama3.2").await.unwrap();
+        repo.set_assignment("chat", "ollama/llama3.2")
+            .await
+            .unwrap();
 
         sync_assignments_to_settings(&repo, &settings_repo).await;
 
         let settings = settings_repo.get().await.unwrap();
         assert_eq!(settings.chat_provider, "ollama");
-        assert_eq!(settings.chat_model,    "llama3.2");
+        assert_eq!(settings.chat_model, "llama3.2");
     }
 
     #[tokio::test]
@@ -4079,23 +5409,33 @@ mod tests {
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
 
         let tmp = tempfile::tempdir().unwrap();
-        let db  = Database::init(tmp.path()).await.unwrap();
-        let repo          = SqliteModelRepository::new(db.system.clone());
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
         let settings_repo = SqliteSettingsRepository::new(db.system.clone());
 
         let model = ModelRecord {
-            id:               "gguf/llama-3b".to_string(),
-            category:         ModelCategory::Gguf,
-            name:             "llama-3b".to_string(),
-            filename:         Some("llama-3b.gguf".to_string()),
-            description:      "GGUF Llama 3B".to_string(),
-            size_mb:          2000,
-            url:              Some("https://example.com/llama-3b.gguf".to_string()),
-            hf_id:            None, ram_estimate_mb: Some(3000), recommended_role: None,
-            context_length:   None, quantization: Some("Q4_K_M".to_string()),
-            asr_language:     None, asr_size: None, tts_engine: None, tts_voice_name: None,
-            config_filename:  None, config_url: None, tts_url: None,
-            sample_rate:      None, downloaded: false, is_custom: false,
+            id: "gguf/llama-3b".to_string(),
+            category: ModelCategory::Gguf,
+            name: "llama-3b".to_string(),
+            filename: Some("llama-3b.gguf".to_string()),
+            description: "GGUF Llama 3B".to_string(),
+            size_mb: 2000,
+            url: Some("https://example.com/llama-3b.gguf".to_string()),
+            hf_id: None,
+            ram_estimate_mb: Some(3000),
+            recommended_role: None,
+            context_length: None,
+            quantization: Some("Q4_K_M".to_string()),
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
         };
         repo.upsert(&model).await.unwrap();
         repo.set_assignment("chat", "gguf/llama-3b").await.unwrap();
@@ -4103,8 +5443,14 @@ mod tests {
         sync_assignments_to_settings(&repo, &settings_repo).await;
 
         let settings = settings_repo.get().await.unwrap();
-        assert_eq!(settings.chat_provider, "local",    "gguf category should map to 'local' provider");
-        assert_eq!(settings.chat_model,    "llama-3b", "model name should be extracted from id");
+        assert_eq!(
+            settings.chat_provider, "local",
+            "gguf category should map to 'local' provider"
+        );
+        assert_eq!(
+            settings.chat_model, "llama-3b",
+            "model name should be extracted from id"
+        );
     }
 
     #[tokio::test]
@@ -4117,30 +5463,129 @@ mod tests {
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
 
         let tmp = tempfile::tempdir().unwrap();
-        let db  = Database::init(tmp.path()).await.unwrap();
-        let repo          = SqliteModelRepository::new(db.system.clone());
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
         let settings_repo = SqliteSettingsRepository::new(db.system.clone());
 
         let model = ModelRecord {
-            id: "ollama/gemma2".to_string(), category: ModelCategory::Ollama,
-            name: "gemma2".to_string(), filename: None,
-            description: String::new(), size_mb: 0, url: None,
-            hf_id: None, ram_estimate_mb: None, recommended_role: None,
-            context_length: None, quantization: None, asr_language: None,
-            asr_size: None, tts_engine: None, tts_voice_name: None,
-            config_filename: None, config_url: None, tts_url: None,
-            sample_rate: None, downloaded: true, is_custom: false,
+            id: "ollama/gemma2".to_string(),
+            category: ModelCategory::Ollama,
+            name: "gemma2".to_string(),
+            filename: None,
+            description: String::new(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
         };
         repo.upsert(&model).await.unwrap();
         repo.set_assignment("think", "ollama/gemma2").await.unwrap();
-        repo.set_assignment("task",  "ollama/gemma2").await.unwrap();
+        repo.set_assignment("task", "ollama/gemma2").await.unwrap();
 
         sync_assignments_to_settings(&repo, &settings_repo).await;
 
-        let settings = settings_repo.get().await.unwrap();
-        assert_eq!(settings.think_provider.as_deref(), Some("ollama"));
-        assert_eq!(settings.think_model.as_deref(),    Some("gemma2"));
-        assert_eq!(settings.task_provider.as_deref(),  Some("ollama"));
-        assert_eq!(settings.task_model.as_deref(),     Some("gemma2"));
+        // think_provider/think_model and task_provider/task_model are KV-only
+        // (not first-class fields on Settings), so read via get_key().
+        assert_eq!(
+            settings_repo
+                .get_key("think_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("think_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_provider")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ollama"),
+        );
+        assert_eq!(
+            settings_repo
+                .get_key("task_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma2"),
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_tool_assignment_updates_settings() {
+        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::ports::model_repository::ModelRepository;
+        use pond_core::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+
+        let model = ModelRecord {
+            id: "ollama/gemma3:4b".to_string(),
+            category: ModelCategory::Ollama,
+            name: "gemma3:4b".to_string(),
+            filename: None,
+            description: String::new(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
+        };
+        repo.upsert(&model).await.unwrap();
+        repo.set_assignment("tool", "ollama/gemma3:4b")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        assert_eq!(
+            settings_repo
+                .get_key("tool_model")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("gemma3:4b"),
+            "tool_model should be synced from tool role assignment"
+        );
     }
 }

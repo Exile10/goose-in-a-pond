@@ -34,6 +34,10 @@ impl GooseProviderAdapter {
                 // We treat System messages as User messages with a note.
                 GooseMessage::user().with_text(&msg.content)
             }
+            Role::Tool => {
+                // Tool results are treated as user messages in the Goose provider adapter.
+                GooseMessage::user().with_text(&msg.content)
+            }
         }
     }
 

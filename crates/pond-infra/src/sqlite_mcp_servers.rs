@@ -31,24 +31,27 @@ impl McpServerRepository for SqliteMcpServerRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.iter().map(|row| {
-            let args_json: String = row.try_get("args")?;
-            let env_json: String = row.try_get("env")?;
-            let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-            let env: HashMap<String, String> = serde_json::from_str(&env_json).unwrap_or_default();
-            Ok(McpServerConfig {
-                id:          row.try_get("id")?,
-                name:        row.try_get("name")?,
-                kind:        row.try_get("kind")?,
-                description: row.try_get("description")?,
-                command:     row.try_get("command")?,
-                args,
-                env,
-                uri:         row.try_get("uri")?,
-                enabled:     row.try_get::<i64, _>("enabled")? != 0,
-                created_at:  row.try_get("created_at")?,
+        rows.iter()
+            .map(|row| {
+                let args_json: String = row.try_get("args")?;
+                let env_json: String = row.try_get("env")?;
+                let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
+                let env: HashMap<String, String> =
+                    serde_json::from_str(&env_json).unwrap_or_default();
+                Ok(McpServerConfig {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    kind: row.try_get("kind")?,
+                    description: row.try_get("description")?,
+                    command: row.try_get("command")?,
+                    args,
+                    env,
+                    uri: row.try_get("uri")?,
+                    enabled: row.try_get::<i64, _>("enabled")? != 0,
+                    created_at: row.try_get("created_at")?,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     async fn save(&self, cfg: &McpServerConfig) -> Result<()> {
@@ -85,6 +88,15 @@ impl McpServerRepository for SqliteMcpServerRepository {
 
     async fn delete(&self, name: &str) -> Result<()> {
         sqlx::query("DELETE FROM mcp_servers WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE mcp_servers SET enabled = ? WHERE name = ?")
+            .bind(if enabled { 1i64 } else { 0i64 })
             .bind(name)
             .execute(&self.pool)
             .await?;
