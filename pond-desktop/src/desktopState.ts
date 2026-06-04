@@ -14,7 +14,8 @@ export type GuiSection =
   | "faces"
   | "agent"
   | "canvas"
-  | "logs";
+  | "logs"
+  | "hub";
 
 export const DESKTOP_MODES: DesktopMode[] = ["gui", "voice", "canvas"];
 
@@ -57,7 +58,8 @@ export const DESKTOP_SECTIONS: Array<{ section: GuiSection; label: string }> =
   SIDEBAR_GROUPS.flatMap((g) => g.sections.map(({ section, label }) => ({ section, label })));
 
 // Include all valid sections — some are routable but not in the sidebar
-const HIDDEN_SECTIONS: GuiSection[] = ["faces", "agent", "canvas"];
+// "hub" is hidden from the classic sidebar; entry is via Settings > "Preview Goose Hub"
+const HIDDEN_SECTIONS: GuiSection[] = ["faces", "agent", "canvas", "hub"];
 const SECTION_SET = new Set<GuiSection>([
   ...DESKTOP_SECTIONS.map((s) => s.section),
   ...HIDDEN_SECTIONS,

@@ -1,0 +1,55 @@
+// ─── HP Icon Dictionary ────────────────────────────────────────
+// Ported verbatim from home-v2-components.jsx HP constant.
+// Values are SVG path strings (d attribute) unless noted with JSX comment.
+// For icons that were JSX fragments in the design (multiple elements),
+// use the exported React components in HubIco.tsx instead.
+
+export const HP_PATHS = {
+  bulb:        "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z",
+  bulbOff:     "M9 18h6M10 22h4M8.5 8.5A7 7 0 0 1 12 2a7 7 0 0 1 4 12.7c-.6.5-1 1.2-1 2V17H9M3 3l18 18",
+  flame:       "M12 2c1 3 4 4.5 4 8a4 4 0 0 1-8 0c0-1 .3-1.8.7-2.5C9 9 9.5 10 10.5 10 9.8 7.5 11 4 12 2z M8.5 13a3.5 3.5 0 0 0 7 0c0-2-1.5-3-2-4.5",
+  plug:        "M9 2v6M15 2v6M7 8h10v3a5 5 0 0 1-10 0V8zM12 16v6",
+  cctv:        "M3 7l14-4 1.5 4.5L4.5 12 3 7zM4.2 11.5L6 17M9 9.5V13a2 2 0 0 1-2 2H4M19 17h2M20 15v4",
+  shield:      "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
+  shieldCheck: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4",
+  thermo:      "M14 14.76V4.5a2.5 2.5 0 0 0-5 0v10.26a4.5 4.5 0 1 0 5 0z",
+  cloudSun:    "M10 4a4 4 0 0 0-1.8 7.6M16 6a1 1 0 0 0-1 0M6 16a4 4 0 0 1 1-7.9 5 5 0 0 1 9.6-1A4 4 0 0 1 17 15H7a3 3 0 0 1-1-.2z",
+  cloud:       "M17.5 19H9a7 7 0 1 1 6.7-9h.8a4.5 4.5 0 0 1 1 9z",
+  rain:        "M16 13a5 5 0 0 0 0-10 6 6 0 0 0-11.5 2A4.5 4.5 0 0 0 5 14M8 18l-1 3M12 18l-1 3M16 18l-1 3",
+  music:       "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+  play:        "M6 4l14 8-14 8V4z",
+  skipF:       "M5 4l10 8-10 8V4zM19 5v14",
+  skipB:       "M19 20L9 12l10-8v16zM5 19V5",
+  chevR:       "M9 6l6 6-6 6",
+  chevL:       "M15 6l-6 6 6 6",
+  chevD:       "M6 9l6 6 6-6",
+  wifi:        "M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 19.5h.01M2 9a15 15 0 0 1 20 0",
+  check:       "M20 6L9 17l-5-5",
+  plus:        "M12 5v14M5 12h14",
+  sliders:     "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
+  home:        "M3 11l9-8 9 8M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10",
+  sofa:        "M4 11V8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v3M2 13a2 2 0 0 1 2-2 2 2 0 0 1 2 2v3h12v-3a2 2 0 0 1 4 0v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1zM6 19v2M18 19v2",
+  bed:         "M3 7v13M3 12h18a2 2 0 0 1 2 2v6M3 16h20M6 10h5a2 2 0 0 1 2 2",
+  utensils:    "M3 2v7a3 3 0 0 0 3 3 3 3 0 0 0 3-3V2M6 2v20M16 2c-1.5 0-3 2-3 6s1.5 4 3 4v10",
+  tree:        "M12 2L7 9h3l-4 6h5v5h2v-5h5l-4-6h3z",
+  moon:        "M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z",
+  away:        "M13 4l-2 5h4l-2 5M5 21l3-7M19 21l-3-7M9 14h6",
+  droplet:     "M12 2.7l5.7 5.7a8 8 0 1 1-11.4 0z",
+  wind:        "M9.6 4.6A2 2 0 1 1 11 8H2m10.6 11.4A2 2 0 1 0 14 16H2m15.7-8.3A2.5 2.5 0 1 1 19.5 12H2",
+  note:        "M21 3H3v18h12l6-6V3zM15 21v-6h6",
+  list:        "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+  bell:        "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
+  goose:       "M15.5 7.5a3.5 3.5 0 0 0-7 0c0 1 .3 1.7.8 2.5L4 16c-.6 1 .2 2.3 1.4 2.3H15a4 4 0 0 0 4-4c0-2.2-1.5-3.5-3.5-3.5M16 7h.01",
+  mic:         "rect:9,2,6,12,3 path:M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8", // compound — use HubIco's micEl
+  // Extra icons used in home view header (HX in goose-hub-home.jsx)
+  chat:        "M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.4A8 8 0 1 1 21 12z",
+  keyboard:    "M4 6h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM7 10h.01M11 10h.01M15 10h.01M17 10h.01M7 13h.01M17 13h.01M9 13h6",
+  // Rail icons (exact RAIL paths from goose-hub-shell.jsx)
+  railHome:     "M3 9.6L12 3l9 6.6V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z",
+  railChat:     "M21 11.5a8.4 8.4 0 0 1-12.6 7.3L3 21l2.2-5.4A8.4 8.4 0 1 1 21 11.5z",
+  railCanvas:   "M4 4h7v7H4zM13 4h7v7h-7zM13 13h7v7h-7zM4 13h7v7H4z",
+  railRoutines: "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z",
+  railSettings: "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM19.4 13a7.7 7.7 0 0 0 0-2l2-1.5-2-3.5-2.4 1a7.5 7.5 0 0 0-1.7-1L15 3H9l-.3 2.5a7.5 7.5 0 0 0-1.7 1l-2.4-1-2 3.5 2 1.5a7.7 7.7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7.5 7.5 0 0 0 1.7 1L9 21h6l.3-2.5a7.5 7.5 0 0 0 1.7-1l2.4 1 2-3.5z",
+} as const;
+
+export type HpIconKey = keyof typeof HP_PATHS;

@@ -1,0 +1,275 @@
+/* ════════════════════════════════════════════════════════════
+   NOTIFICATIONS VIEW — top-level notification feed
+   DO NOT append to hub.css — isolated to avoid conflicts.
+   Tokens: uses --pp, --pp-50, --ink, --ink-2, --line, --tile-bg, --mut
+   ════════════════════════════════════════════════════════════ */
+
+/* ── wrapper ── */
+.nfeed {
+  padding: 26px 30px 40px;
+  max-width: 860px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ── view head ── */
+.nfeed__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.nfeed__title {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--ink);
+  letter-spacing: -0.3px;
+}
+
+.nfeed__sub {
+  font-size: 13px;
+  color: var(--mut);
+  margin-top: 3px;
+}
+
+.nfeed__mark-all {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pp);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.nfeed__mark-all:hover {
+  background: var(--pp-50);
+}
+
+.nfeed__mark-all:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── empty state ── */
+.nfeed__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 64px 24px;
+  color: var(--mut);
+  text-align: center;
+}
+
+.nfeed__empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 18px;
+  background: var(--pp-50);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nfeed__empty-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.nfeed__empty-body {
+  font-size: 13px;
+  color: var(--mut);
+  max-width: 280px;
+}
+
+/* ── group ── */
+.nfeed__group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.nfeed__group-label {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--mut);
+  padding: 4px 0 2px;
+}
+
+/* ── notification card ── */
+.ncard {
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  position: relative;
+}
+
+.ncard:hover {
+  background: var(--pp-50);
+  border-color: color-mix(in srgb, var(--pp) 20%, transparent);
+}
+
+.ncard[data-read="false"] {
+  border-left: 3px solid var(--pp);
+}
+
+/* ── icon square ── */
+.ncard__icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* ── body ── */
+.ncard__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ncard__title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ncard__sub {
+  font-size: 12px;
+  color: var(--mut);
+  line-height: 1.4;
+  /* allow up to 2 lines */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── time + CTA ── */
+.ncard__right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.ncard__time {
+  font-size: 11px;
+  color: var(--mut);
+  white-space: nowrap;
+}
+
+.ncard__cta {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--pp);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+
+.ncard__cta:hover {
+  background: var(--pp-50);
+}
+
+/* ── unread dot ── */
+.ncard__dot {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pp);
+  flex-shrink: 0;
+}
+
+/* ── schedule offline note ── */
+.nfeed__offline-note {
+  font-size: 12px;
+  color: var(--mut);
+  padding: 8px 12px;
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+/* ── BellShortcut (in IconRail foot) ── */
+.bell-shortcut {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+  margin-bottom: 8px;
+}
+
+.bell-shortcut:hover {
+  background: var(--pp-50);
+}
+
+.bell-shortcut[data-active="true"] {
+  background: var(--pp-50);
+}
+
+.bell-shortcut__count {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  background: var(--pp);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(140, 75, 255, 0.4);
+}

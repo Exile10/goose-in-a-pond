@@ -1,9 +1,14 @@
+// Theme bootstrap: reads localStorage and applies data-theme/data-density/--pp
+// to <html> before React renders, preventing flash of unstyled content.
+import "./hub/state/themeBootstrap";
+
 import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
 
 import "./styles/design-tokens.css";
 import "./styles/base.css";
 import "./styles/sections.css";
+import "./hub/hub.css";
 
 import { StartupScreen } from "./components/StartupScreen";
 import { AppContextProvider } from "./state/AppContext";

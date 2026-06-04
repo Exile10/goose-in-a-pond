@@ -1205,9 +1205,17 @@ export function Settings() {
       <PageHeader
         title="Settings"
         action={
-          <Button variant="primary" onPress={save} isDisabled={saving || loading}>
-            {saving ? "Saving..." : saved ? "Saved" : "Save Settings"}
-          </Button>
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)" }}>
+            <Button
+              variant="outline"
+              onPress={() => dispatch({ type: "SET_SECTION", payload: "hub" })}
+            >
+              Preview Goose Hub redesign
+            </Button>
+            <Button variant="primary" onPress={save} isDisabled={saving || loading}>
+              {saving ? "Saving..." : saved ? "Saved" : "Save Settings"}
+            </Button>
+          </div>
         }
       />
 
