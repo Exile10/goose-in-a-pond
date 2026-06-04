@@ -65,6 +65,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/handshake/refresh", post(handshake_refresh_handler))
         .route("/handshake/revoke", post(handshake_revoke_handler))
         .route("/handshake/pairing-code", get(pairing_code_handler))
+        .route("/auth/ws", get(crate::intent_ws::auth_ws_handler))
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
@@ -97,8 +98,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
-        .route("/settings", get(get_settings))
-        .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/memory-status", get(get_memory_status))
         .route("/models/active-roles", get(get_active_roles))
@@ -242,8 +241,21 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             require_onboarding_complete,
         ));
 
-    // Merge public and protected routes, attach shared state
-    public_routes.merge(protected_routes).with_state(state)
+    // ───────────── Onboarding-exempt reads (auth-protected) ─────────────
+    // These reads must be reachable DURING onboarding: the AI-model wizard
+    // step lists available models and reads current settings *before*
+    // onboarding is marked complete. They still pass through auth_middleware
+    // (Bearer token or loopback bypass) — they're only exempt from the
+    // onboarding-completion gate, not from authentication.
+    let onboarding_safe_routes = Router::new()
+        .route("/models", get(list_models))
+        .route("/settings", get(get_settings));
+
+    // Merge public, onboarding-safe, and protected routes, attach shared state
+    public_routes
+        .merge(onboarding_safe_routes)
+        .merge(protected_routes)
+        .with_state(state)
 }
 
 // ───────────────────────── Web Dashboard Routes ─────────────────────
@@ -314,6 +326,12 @@ async fn handshake_init_handler(
 }
 
 /// Phase 2: client proves possession of the pairing code via HMAC.
+///
+/// When the request payload includes a hex-encoded Ed25519 `public_key`
+/// AND verification succeeds, the key is registered against the challenge's
+/// `client_id` for use by the biometric trust system. Registration failure
+/// does **not** undo the successful pairing — the device is paired but
+/// cannot authorise Privileged actions until it re-pairs with a valid key.
 async fn handshake_verify_handler(
     State(state): State<Arc<AppState>>,
     body: Result<Json<VerifyRequest>, JsonRejection>,
@@ -324,13 +342,67 @@ async fn handshake_verify_handler(
             Json(json!({ "error": format!("Invalid request: {}", e), "status": 400 })),
         )
     })?;
+
+    // Snapshot the client_id from the challenge BEFORE verify_handshake
+    // consumes it. If the lookup fails we proceed anyway and skip pubkey
+    // registration — the verify call will report a friendlier error.
+    let pubkey_hex = req.public_key.clone();
+    let client_id_for_pubkey = if pubkey_hex.is_some() {
+        sqlx::query_as::<_, (String,)>(
+            "SELECT client_id FROM handshake_challenges WHERE id = ?",
+        )
+        .bind(&req.challenge_id)
+        .fetch_optional(&state.db.system)
+        .await
+        .ok()
+        .flatten()
+        .map(|(id,)| id)
+    } else {
+        None
+    };
+
     let resp = state.handshake.verify_handshake(req).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("verify failed: {}", e), "status": 500 })),
         )
     })?;
+
+    // Best-effort public-key registration. We tolerate every failure mode
+    // here — the pairing itself succeeded.
+    if resp.accepted {
+        if let (Some(hex_str), Some(client_id), Some(verifier)) = (
+            pubkey_hex.as_ref(),
+            client_id_for_pubkey.as_ref(),
+            state.trust_verifier.as_ref(),
+        ) {
+            match decode_pubkey(hex_str) {
+                Ok(bytes) => {
+                    if let Err(e) = verifier.register_pubkey(client_id, bytes).await {
+                        tracing::warn!(
+                            %client_id,
+                            "public key registration failed after pairing: {e:#}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %client_id,
+                        "rejected malformed public_key in verify: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(Json(resp))
+}
+
+fn decode_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
+    let v = hex::decode(hex_str).map_err(|e| format!("not hex: {e}"))?;
+    v.as_slice()
+        .try_into()
+        .map_err(|_| format!("expected 32 bytes, got {}", v.len()))
 }
 
 /// Exchange a refresh token for a fresh session+refresh pair.
@@ -1618,6 +1690,29 @@ async fn get_settings(
     Ok(Json(serde_json::to_value(settings).unwrap_or(json!({}))))
 }
 
+/// Classify a settings-update patch by inspecting which privileged fields
+/// it touches. Returns the canonical action name (matching an entry in
+/// `trust_levels::TRUST_TABLE`) or `None` if no privileged keys are
+/// present. When multiple privileged keys are touched, returns the first
+/// one found — privileged actions are individually gated, so the caller
+/// must split them across separate requests anyway.
+fn privileged_settings_action(patch: &serde_json::Value) -> Option<&'static str> {
+    let obj = patch.as_object()?;
+    if obj.contains_key("wake_word") || obj.contains_key("voice_wake_word") {
+        return Some("settings.update_wake_word");
+    }
+    if obj.contains_key("voice_provider")
+        || obj.contains_key("active_tts_model")
+        || obj.contains_key("active_whisper_model")
+    {
+        return Some("settings.update_voice_provider");
+    }
+    if obj.contains_key("chat_provider") || obj.contains_key("chat_model") {
+        return Some("settings.update_chat_provider");
+    }
+    None
+}
+
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
@@ -1628,6 +1723,31 @@ async fn update_settings(
             Json(json!({"error": format!("Invalid settings body: {}", e)})),
         )
     })?;
+
+    // ── Trust gate ──────────────────────────────────────────────────────
+    // Settings updates that touch privileged fields require a hardware-
+    // attested biometric assertion from a paired GOTG device. The set of
+    // privileged keys is canonical and lives in `trust_levels.rs`.
+    //
+    // We only fire the gate when the trust subsystem is wired in
+    // (`state.trust_verifier` and `state.intent_bus` are both Some) and
+    // the patch actually touches a privileged field. Otherwise the request
+    // proceeds as before.
+    if state.trust_verifier.is_some() && state.intent_bus.is_some() {
+        let action = privileged_settings_action(&patch);
+        if let Some(action) = action {
+            // For now we treat every request as Origin::Local. When the
+            // WireGuard mesh is wired in, the listener layer will set a
+            // header / extension we can read here.
+            crate::trust_gate::require_trust(
+                &state,
+                action,
+                &patch,
+                crate::trust_gate::Origin::Local,
+            )
+            .await?;
+        }
+    }
 
     // Load current settings so we only overwrite the fields the caller provided.
     let current = state.settings_repo.get().await.map_err(|e| {

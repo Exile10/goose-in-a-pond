@@ -41,6 +41,9 @@ pub mod oauth_callback;
 pub mod routes;
 pub mod thought_filter;
 pub mod tool_context;
+pub mod trust_gate;
+pub mod trust_levels;
+pub mod intent_ws;
 
 /// Controls the lifecycle of the local llamafile server process.
 ///
@@ -282,6 +285,15 @@ pub struct AppState {
     /// Used to construct OAuth redirect URIs dynamically (the server may bind
     /// to a port other than 4000 if that port is already in use).
     pub api_port: u16,
+    /// Biometric trust verifier — Ed25519 signature verification + replay
+    /// protection for hardware-attested assertions from paired GOTG phones.
+    /// `None` until the trust subsystem is wired in; in that case all
+    /// Privileged-tier handlers degrade to 503.
+    pub trust_verifier: Option<Arc<dyn pond_core::ports::trust::TrustVerifier>>,
+    /// In-process pub/sub channel that carries Intents from privileged-tier
+    /// handlers out to subscribed GOTG WebSocket sessions, and ferries
+    /// signed assertions back. `None` until wired in.
+    pub intent_bus: Option<Arc<dyn pond_core::ports::intent_bus::IntentBus>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

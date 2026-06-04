@@ -22,4 +22,5 @@ pub mod settings;
 pub mod skill;
 pub mod tool_cache;
 pub mod tool_result;
+pub mod trust;
 pub mod turn_metrics;

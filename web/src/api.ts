@@ -14,6 +14,21 @@ const BASE = window.__GIAP_SERVER_URL__
 export const DEV_MOCK_TOKEN = 'dev-mock-token'
 export const isPreviewMode = (token: string) => token === DEV_MOCK_TOKEN
 
+/// True when the pond-server we talk to runs on this same machine (loopback).
+/// The server's auth middleware exempts loopback requests from Bearer-token
+/// validation, so first-party clients can operate without a session token even
+/// though the GOTG handshake only mints tokens for paired remote devices.
+export function isLoopbackHost(): boolean {
+  try {
+    const host = window.__GIAP_SERVER_URL__
+      ? new URL(window.__GIAP_SERVER_URL__).hostname
+      : window.location.hostname
+    return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host)
+  } catch {
+    return false
+  }
+}
+
 // ── Types matching pond-core domain ──────────────────────────────────────────
 
 export interface HandshakeRequest {
@@ -182,6 +197,10 @@ export interface Settings {
   // Model role assignments
   chat_provider:  string
   chat_model:     string
+  think_provider: string | null
+  think_model:    string | null
+  task_provider:  string | null
+  task_model:     string | null
   tool_model:     string | null
 }
 

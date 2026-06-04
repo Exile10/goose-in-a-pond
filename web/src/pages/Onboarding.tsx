@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { api, isPreviewMode, DEV_MOCK_TOKEN } from '../api'
+import { api, isPreviewMode, DEV_MOCK_TOKEN, isLoopbackHost } from '../api'
 import logo from '../assets/logo.png'
 import '../onboarding.css'
 
@@ -1066,12 +1066,20 @@ export default function Onboarding({ onComplete }: Props) {
       }
 
       const res = await api.handshake({ client_id: clientId, client_type: 'web', client_version: '1.0.0' })
-      if (!res.accepted || !res.session_token) {
+      if (res.accepted && res.session_token) {
+        localStorage.setItem('pond_session_token', res.session_token)
+        patch({ token: res.session_token, clientId })
+      } else if (isLoopbackHost()) {
+        // First-party web clients use client_type "web", which the GOTG
+        // handshake gate rejects (it only mints tokens for paired GOTG
+        // devices via a pairing code). On loopback the server's auth
+        // middleware exempts same-machine requests from token validation,
+        // so a rejected handshake is expected and fine — proceed tokenless.
+        localStorage.removeItem('pond_session_token')
+        patch({ token: '', clientId })
+      } else {
         throw new Error(res.rejection_reason ?? 'Server rejected the connection.')
       }
-
-      localStorage.setItem('pond_session_token', res.session_token)
-      patch({ token: res.session_token, clientId })
       try { await api.startOnboarding() } catch { /* fine — may already be started */ }
       setStep(1)
     })

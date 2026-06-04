@@ -77,6 +77,14 @@ pub struct VerifyRequest {
     /// Hex-encoded HMAC-SHA256(pairing_code, challenge || client_id).
     pub mac: String,
     pub device_name: Option<String>,
+    /// Optional Ed25519 public key for the biometric trust system, hex-
+    /// encoded (32 bytes → 64 hex chars). When present and verification
+    /// succeeds, the pond stores it against the client_id and the device
+    /// becomes eligible to authorise Privileged-tier actions. Optional for
+    /// backwards compatibility with already-paired devices that pre-date
+    /// the trust system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

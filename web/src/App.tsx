@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { api } from "./api";
+import { api, isLoopbackHost } from "./api";
 import { SettingsProvider } from "./context/SettingsContext";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
@@ -212,10 +212,15 @@ function App() {
     const [displayName, setDisplayName] = useState<string>(
         () => localStorage.getItem("pond_display_name") ?? ""
     );
-    // null = still checking, false = show onboarding, true = show dashboard
-    const [onboarded, setOnboarded] = useState<boolean | null>(
-        () => localStorage.getItem("pond_session_token") ? true : null
-    );
+    // null = still checking, false = show onboarding, true = show dashboard.
+    //
+    // Always start as `null` so `autoConnect()` verifies onboarding status
+    // against the backend. Previously this initialised to `true` whenever a
+    // `pond_session_token` existed in localStorage — but a stale token (e.g.
+    // after the DB was re-initialised) made the app skip the server check,
+    // render the dashboard, and surface "Complete onboarding before using this
+    // feature" APIErrors. The token is not proof that the pond is onboarded.
+    const [onboarded, setOnboarded] = useState<boolean | null>(null);
     const [loggedOut, setLoggedOut] = useState(false);
     const [menuOpen, setMenuOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
@@ -243,6 +248,18 @@ function App() {
                 localStorage.setItem("pond_session_token", res.session_token);
                 setToken(res.session_token);
                 const settings = await api.getSettings(res.session_token);
+                const name = settings.user_name ?? "";
+                localStorage.setItem("pond_display_name", name);
+                setDisplayName(name);
+                setOnboarded(true);
+            } else if (isLoopbackHost()) {
+                // The GOTG handshake only mints tokens for paired remote
+                // devices; first-party "web" clients are rejected. On loopback
+                // the server exempts same-machine requests from token auth, so
+                // an onboarded pond can go straight to the dashboard tokenless.
+                localStorage.removeItem("pond_session_token");
+                setToken("");
+                const settings = await api.getSettings("");
                 const name = settings.user_name ?? "";
                 localStorage.setItem("pond_display_name", name);
                 setDisplayName(name);
@@ -300,23 +317,30 @@ function App() {
             localStorage.setItem("pond_client_id", clientId);
         }
         const res = await api.handshake({ client_id: clientId, client_type: "web", client_version: "1.0.0" });
-        if (res.accepted && res.session_token) {
-            localStorage.setItem("pond_session_token", res.session_token);
-            setToken(res.session_token);
-            setLoggedOut(false);
-            const status = await api.onboardingStatus();
-            if (!status.onboarded) {
-                setOnboarded(false);
-            } else {
-                const settings = await api.getSettings(res.session_token);
-                const name = settings.user_name ?? "";
-                localStorage.setItem("pond_display_name", name);
-                setDisplayName(name);
-                setOnboarded(true);
-                setPage("chat");
-            }
-        } else {
+        const accepted = res.accepted && res.session_token;
+        if (!accepted && !isLoopbackHost()) {
             throw new Error(res.rejection_reason ?? "Handshake rejected");
+        }
+        // On loopback, a rejected GOTG handshake is expected — proceed
+        // tokenless (the server exempts same-machine requests from auth).
+        const sessionToken = accepted ? res.session_token! : "";
+        if (sessionToken) {
+            localStorage.setItem("pond_session_token", sessionToken);
+        } else {
+            localStorage.removeItem("pond_session_token");
+        }
+        setToken(sessionToken);
+        setLoggedOut(false);
+        const status = await api.onboardingStatus();
+        if (!status.onboarded) {
+            setOnboarded(false);
+        } else {
+            const settings = await api.getSettings(sessionToken);
+            const name = settings.user_name ?? "";
+            localStorage.setItem("pond_display_name", name);
+            setDisplayName(name);
+            setOnboarded(true);
+            setPage("chat");
         }
     }, []);
 

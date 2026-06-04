@@ -1794,6 +1794,33 @@ async fn run_server(
     // consumes the listener happens further below.
     let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
 
+    // ── Biometric trust subsystem ────────────────────────────────────────
+    // SqliteTrustVerifier owns the device_pubkeys + replay_nonces tables;
+    // InMemoryIntentBus is the in-process pub/sub for "approve this?"
+    // intents and signed assertions over the auth WebSocket.
+    let trust_verifier: Option<
+        Arc<dyn pond_core::ports::trust::TrustVerifier>,
+    > = Some(Arc::new(
+        pond_adapters_trust::SqliteTrustVerifier::new(db.system.clone()),
+    ));
+    let intent_bus: Option<Arc<dyn pond_core::ports::intent_bus::IntentBus>> =
+        Some(Arc::new(pond_adapters_trust::InMemoryIntentBus::new(
+            db.system.clone(),
+        )));
+
+    // Periodic prune of stale replay nonces — bounded table size.
+    if let Some(v) = trust_verifier.clone() {
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                t.tick().await;
+                if let Err(e) = v.prune_replay().await {
+                    tracing::warn!("replay_nonces prune failed: {e:#}");
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -1865,6 +1892,8 @@ async fn run_server(
             .collect(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         api_port,
+        trust_verifier,
+        intent_bus,
     });
 
     // Spawn OAuth token auto-refresh worker.

@@ -1,0 +1,28 @@
+[package]
+name        = "pond-adapters-trust"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hardware-bound biometric trust verifier (FIDO2-pattern, all-local) for Goose In A Pond."
+
+[lints]
+workspace = true
+
+[dependencies]
+pond-core     = { path = "../pond-core" }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+chrono        = { workspace = true }
+sqlx          = { workspace = true }
+uuid          = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+sha2          = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand_core     = { version = "0.6", features = ["std"] }
+tempfile      = "3"
+tokio         = { workspace = true, features = ["macros", "rt-multi-thread"] }

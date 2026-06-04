@@ -18,7 +18,7 @@ pond-adapters-local-inference = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "ws"] }
 futures = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
@@ -34,8 +34,10 @@ tower = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 tower-http = { workspace = true, features = ["fs"] }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 urlencoding = { workspace = true }
+sqlx = { workspace = true }
+hex = "0.4"
 
 [dev-dependencies]
 async-trait = { workspace = true }

@@ -173,12 +173,20 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       onlineHandled = true;
       dispatch({ type: "SERVER_ONLINE" });
       api.handshake("pond-desktop")
-        .then(async (res) => {
+        .then((res) => {
           api.setToken(res.token, res.expires_in);
           dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
-          await ensureOnboarded();
         })
-        .catch((err) => console.warn("Handshake failed (non-fatal):", err));
+        .catch((err) => console.warn("Handshake failed (non-fatal):", err))
+        // The onboarding check must run regardless of handshake outcome.
+        // First-party clients (desktop/web) on loopback don't need a session
+        // token (auth middleware exempts loopback), and the handshake is
+        // rejected for non-"gotg" client types — so chaining the onboarding
+        // check behind handshake success meant the wizard never showed and the
+        // app fell through to the dashboard ("Complete onboarding" APIError).
+        .finally(() => {
+          void ensureOnboarded();
+        });
     };
 
     // Server online/offline status — reactive path.

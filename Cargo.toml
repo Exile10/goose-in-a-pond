@@ -12,6 +12,7 @@ members = [
     "crates/pond-adapters-piper",
     "crates/pond-adapters-face-onnx",
     "crates/pond-adapters-gotg",
+    "crates/pond-adapters-trust",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
     # Independent agent + inference engine (no Goose dependency — future primary path)
@@ -43,7 +44,7 @@ string_slice = "warn"
 # rmcp 1.2.0 — required by goose sub-crates when cargo resolves their
 # `workspace = true` deps against the outer (GIAP) workspace for path-dep builds.
 # No GIAP workspace member uses rmcp directly.
-rmcp = { version = "1.5.0", features = ["schemars", "auth", "server", "client",
+rmcp = { version = "=1.5.0", features = ["schemars", "auth", "server", "client",
     "transport-io", "macros", "transport-child-process",
     "transport-streamable-http-client", "transport-streamable-http-client-reqwest",
     "transport-streamable-http-client-unix-socket"] }
