@@ -608,9 +608,16 @@ impl Agent for PondAgent {
             // ── Persist this turn to SessionStorage ────────────────────────
             // Capture everything appended during this request: the current user
             // message (pushed before the loop) and every assistant/tool message
-            // produced inside the loop. Spawn fire-and-forget so persistence
-            // never blocks the SSE stream tail.
-            let turn_messages: Vec<ChatMessage> = messages[history_messages_len..].to_vec();
+            // produced inside the loop. The synthesis nudge is an internal
+            // loop artifact — skip it so it never shows as a YOU bubble in
+            // history. Spawn fire-and-forget so persistence never blocks SSE.
+            const SYNTHESIS_NUDGE: &str =
+                "Using the tool results above, provide a helpful answer to the user's question.";
+            let turn_messages: Vec<ChatMessage> = messages[history_messages_len..]
+                .iter()
+                .filter(|m| m.content.trim() != SYNTHESIS_NUDGE)
+                .cloned()
+                .collect();
             let storage_ref = storage.clone();
             let session_id_persist = session_id.clone();
             tokio::spawn(async move {
