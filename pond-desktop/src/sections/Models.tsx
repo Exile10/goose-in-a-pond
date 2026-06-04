@@ -2,8 +2,8 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Button, Tabs, Chip } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
-  ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Wrench, Play,
-  ScanFace, Loader2, Puzzle, Cpu,
+  ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Play,
+  ScanFace, Loader2, Cpu,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
@@ -71,7 +71,7 @@ const CAT_COLOR = {
 
 /** Maps role keys to role-chip CSS modifier classes */
 const ROLE_CHIP_VARIANT: Record<string, string> = {
-  chat: "secondary", tool: "success", asr: "primary", tts: "danger", embedding: "accent",
+  chat: "secondary", asr: "primary", tts: "danger", embedding: "accent",
 };
 
 /** Infer embedding dimension from well-known model names. */
@@ -114,8 +114,6 @@ function ActiveRolesBanner({
     { key: "tts",       label: "TTS",       icon: <Volume2 size={12} strokeWidth={1.8} />,        category: "tts" },
     { key: "embedding", label: "Embedding", icon: <Cpu size={12} strokeWidth={1.8} />,            category: "embedding" },
   ];
-  const toolModel = roles?.tool?.model;
-
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       <div className="role-grid">
@@ -195,24 +193,6 @@ function ActiveRolesBanner({
             </div>
           );
         })}
-        {/* Tool Caller chip */}
-        <div
-          className={`role-chip role-chip--success${toolModel ? " is-set" : ""}`}
-          onClick={!toolModel && onNavigate ? () => onNavigate("llm") : undefined}
-          style={{ cursor: !toolModel && onNavigate ? "pointer" : "default" }}
-          title={!toolModel ? "Click to set a tool-calling specialist model" : undefined}
-        >
-          <div className="role-chip__bar" />
-          <div className="role-chip__body">
-            <div className="role-chip__head">
-              <Puzzle size={12} strokeWidth={1.8} />
-              <span className="role-chip__role">Tool Caller</span>
-            </div>
-            <span className={`role-chip__value ${toolModel ? "role-chip__value--set" : "role-chip__value--empty"}`}>
-              {toolModel ?? "---"}
-            </span>
-          </div>
-        </div>
       </div>
 
       {/* Active model capabilities -- shown inline when set */}
@@ -286,10 +266,10 @@ function DownloadProgress({ downloads, onScanModels }: { downloads: DownloadEntr
 
 // ── Shared ModelList ──────────────────────────────────────────
 
-type RoleKey = "chat" | "tool" | "asr" | "tts" | "embedding";
+type RoleKey = "chat" | "asr" | "tts" | "embedding";
 
 const ROLE_LABELS: Record<RoleKey, string> = {
-  chat: "Main LLM", tool: "Tool Caller", asr: "ASR", tts: "TTS", embedding: "Embedding",
+  chat: "Main LLM", asr: "ASR", tts: "TTS", embedding: "Embedding",
 };
 
 function ModelList({
@@ -318,9 +298,6 @@ function ModelList({
   if (models.length === 0) return <p style={hint}>{emptyMessage}</p>;
 
   function isRoleActive(m: ModelEntry, role: RoleKey) {
-    if (role === "tool") {
-      return activeRoles?.tool?.model === m.name;
-    }
     const a = activeRoles?.[role];
     if (!a) return false;
     return a.provider === m.provider && a.model === m.name;
@@ -349,7 +326,7 @@ function ModelList({
                 )}
                 {activeFor.map((r) => (
                   <Chip key={r} size="sm" variant="flat"
-                    color={r === "chat" ? "secondary" : r === "tool" ? "success" : r === "asr" ? "primary" : r === "tts" ? "danger" : "default"}
+                    color={r === "chat" ? "secondary" : r === "asr" ? "primary" : r === "tts" ? "danger" : "default"}
                     className="model-row__tag">
                     {ROLE_LABELS[r]}
                   </Chip>
@@ -763,7 +740,7 @@ function OllamaPanel({
         loading={modelsLoading && ollamaLoading}
         error={modelsError}
         activeRoles={activeRoles}
-        availableRoles={["chat", "tool"]}
+        availableRoles={["chat"]}
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
@@ -876,7 +853,7 @@ function LlmTab({
                 loading={modelsLoading}
                 error={modelsError}
                 activeRoles={activeRoles}
-                availableRoles={["chat", "tool"]}
+                availableRoles={["chat"]}
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
@@ -934,7 +911,7 @@ function LlmTab({
                 loading={modelsLoading}
                 error={modelsError}
                 activeRoles={activeRoles}
-                availableRoles={["chat", "tool"]}
+                availableRoles={["chat"]}
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
@@ -1604,14 +1581,8 @@ export function Models() {
 
   async function handleActivate(provider: string, name: string, role: string) {
     try {
-      if (role === "tool") {
-        // Tool caller is a settings field, not a model-role assignment
-        await api.updateSettings({ tool_model: name });
-        flash(`${name} set as Tool Caller.`);
-      } else {
-        await api.activateModel(provider, name, role);
-        flash(`${name} set as ${ROLE_LABELS[role as RoleKey] ?? role} model.`);
-      }
+      await api.activateModel(provider, name, role);
+      flash(`${name} set as ${ROLE_LABELS[role as RoleKey] ?? role} model.`);
       await loadRoles();
     } catch (e) { flash(String(e), false); }
   }
