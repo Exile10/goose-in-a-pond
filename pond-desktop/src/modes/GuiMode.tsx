@@ -2,6 +2,7 @@ import { Sidebar } from "../components/Sidebar";
 import { ToastContainer } from "../components/Toast";
 import { useAppState } from "../state/AppContext";
 import type { GuiSection } from "../desktopState";
+import { Hub } from "../hub/Hub";
 
 // Lazy section imports
 import { Dashboard } from "../sections/Dashboard";
@@ -35,11 +36,17 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "agent":     return <Agent />;
     case "canvas":    return <Canvas />;
     case "logs":      return <Logs />;
+    case "hub":       return null; // rendered by GuiMode before this switch
   }
 }
 
 export function GuiMode() {
   const state = useAppState();
+
+  // Hub mode: render the full Hub shell (no sidebar, no app-shell chrome)
+  if (state.section === "hub") {
+    return <Hub />;
+  }
 
   return (
     <div className="app-shell">

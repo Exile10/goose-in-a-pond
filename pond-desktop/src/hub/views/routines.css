@@ -1,0 +1,149 @@
+/* ════════════════════════════════════════════════════════════
+   ROUTINES VIEW
+   Ported from goose-hub.css lines 101-116 + responsive rules.
+   DO NOT append to hub.css — keep contention-free with Settings IA agent.
+   ════════════════════════════════════════════════════════════ */
+
+/* ── wrapper ── */
+.rt {
+  padding: 26px 30px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* ── grid ── */
+.rt__grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+/* ── card base ── */
+.rt-card {
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+/* ── card top row (icon + name + time) ── */
+.rt-card__top {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+
+.rt-card__icon {
+  width: 50px;
+  height: 50px;
+  border-radius: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.12);
+}
+
+.rt-card__name {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.rt-card__time {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mut);
+  margin-top: 2px;
+}
+
+/* ── does chips ── */
+.rt-card__does {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  flex: 1;
+  align-content: flex-start;
+}
+
+.rt-card__chip {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-2);
+  background: var(--pp-50);
+  padding: 5px 11px;
+  border-radius: 999px;
+}
+
+/* ── run button ── */
+.rt-card__run {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 11px;
+  border-radius: 13px;
+  border: 1.5px solid currentColor;
+  background: var(--tile-bg);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.rt-card__run:hover {
+  background: var(--pp-50);
+}
+
+.rt-card__run[data-running="true"]:hover {
+  filter: brightness(0.96);
+}
+
+/* ── dashed "Create a routine" tile ── */
+.rt-card--new {
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #9a8fb8;
+  font-size: 14px;
+  font-weight: 700;
+  border-style: dashed;
+  border-color: #d8d2e6;
+  cursor: pointer;
+  background: transparent;
+  min-height: 180px;
+  font-family: inherit;
+}
+
+.rt-card--new:hover {
+  background: var(--pp-50);
+  border-color: var(--pp-100);
+  color: var(--pp);
+}
+
+/* dark-mode chip background tweak */
+:root[data-theme="dark"] .rt-card__chip {
+  background: rgba(140, 75, 255, 0.12);
+}
+
+/* ── responsive: narrow viewport collapses to 2 cols, then 1 ── */
+@media (max-width: 1080px) {
+  .rt__grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 680px) {
+  .rt__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rt {
+    padding: 18px 16px;
+  }
+}
