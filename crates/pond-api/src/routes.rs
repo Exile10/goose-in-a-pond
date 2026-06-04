@@ -725,23 +725,6 @@ async fn chat_stream(
 
         let model_role = "chat";
 
-        // ── Persist user message ────────────────────────────────────────────
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let user_msg = ChatMessage::user(req.message.clone());
-            let sm = SessionMessage::new(
-                Uuid::new_v4().to_string(),
-                session_id.clone(),
-                user_msg,
-            );
-            if let Err(e) = storage.add_message(session_id.clone(), sm).await {
-                let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
-            }
-        }
-
         // ── On-demand llamafile startup ─────────────────────────────────────
         // If any role uses llamafile and the process is not responding, emit a
         // status event and wait up to 90 s before attempting to stream.
@@ -1042,15 +1025,6 @@ async fn chat_stream(
             tokio::spawn(async move {
                 svc.run(ext.as_ref(), repo.as_ref(), &user_msg, &asst_resp, Some(&sid)).await;
             });
-        }
-
-        // Persist full assistant response (uses revised text if review triggered revision)
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let assistant_msg = ChatMessage::assistant(full_text);
-            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
-            let _ = storage.add_message(session_id.clone(), sm).await;
         }
 
         // Persist token usage to session
