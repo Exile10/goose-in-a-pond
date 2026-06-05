@@ -13,6 +13,7 @@ pub mod memory_consolidation;
 pub mod memory_extraction;
 pub mod memory_graph;
 pub mod mock_agent;
+pub mod mock_device_controller;
 pub mod mock_device_registry;
 pub mod mock_memory;
 pub mod mock_model_catalog_provider;
