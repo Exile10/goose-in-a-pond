@@ -114,6 +114,15 @@ impl RateLimiter {
 /// Routes that don't require authentication.
 ///
 /// Must stay in sync with the public route set in `routes::api_routes()`.
+/// Whether to allow unauthenticated loopback clients (local-dev escape hatch).
+/// Off unless `POND_DEV_ALLOW_LOOPBACK` is set to a truthy value.
+fn dev_allow_loopback() -> bool {
+    matches!(
+        std::env::var("POND_DEV_ALLOW_LOOPBACK").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 fn is_public_route(path: &str) -> bool {
     // Non-API paths are static web assets — always public
     if !path.starts_with("/api/") {
@@ -127,6 +136,11 @@ fn is_public_route(path: &str) -> bool {
         path,
         "/health"
             | "/handshake"
+            | "/handshake/init"
+            | "/handshake/verify"
+            | "/handshake/refresh"
+            | "/handshake/revoke"
+            | "/handshake/pairing-code"
             | "/onboard"
             | "/onboard/complete"
             | "/onboard/status"
@@ -197,20 +211,25 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // Same-device clients (loopback 127.0.0.1 / ::1) skip token validation —
-    // mirrors the rate limiter exemption in lib.rs. The desktop app and server
-    // always run on the same machine, so requiring a Bearer token that is lost
-    // on every server restart creates unnecessary friction.
+    // Local-dev convenience: same-device clients (loopback 127.0.0.1 / ::1)
+    // MAY skip token validation, but ONLY when the operator explicitly opts in
+    // with `POND_DEV_ALLOW_LOOPBACK=1`. This is OFF by default (#94): the old
+    // blanket loopback bypass meant any process on the host — not just the
+    // desktop app — reached every protected route unauthenticated. With it off,
+    // even loopback clients (including the desktop app) must present a valid
+    // token obtained via the handshake.
     //
     // Axum stores the peer address as ConnectInfo<SocketAddr> (not bare SocketAddr)
     // when the server is started with into_make_service_with_connect_info.
-    let is_loopback = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
-    if is_loopback {
-        return Ok(next.run(req).await);
+    if dev_allow_loopback() {
+        let is_loopback = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip().is_loopback())
+            .unwrap_or(false);
+        if is_loopback {
+            return Ok(next.run(req).await);
+        }
     }
 
     let token = extract_bearer_token(&headers)?;
