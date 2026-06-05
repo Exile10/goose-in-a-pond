@@ -172,13 +172,18 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       if (onlineHandled) return;
       onlineHandled = true;
       dispatch({ type: "SERVER_ONLINE" });
-      api.handshake("pond-desktop")
-        .then(async (res) => {
-          api.setToken(res.token, res.expires_in);
-          dispatch({ type: "SET_SESSION_TOKEN", payload: res.token });
+      // connect() reuses a persisted token / refresh across restarts and only
+      // falls back to a fresh pairing-code pair when neither is usable.
+      api.connect("pond-desktop")
+        .then(async (token) => {
+          if (token) {
+            dispatch({ type: "SET_SESSION_TOKEN", payload: token });
+          } else {
+            console.warn("Could not establish a session (pairing rejected).");
+          }
           await ensureOnboarded();
         })
-        .catch((err) => console.warn("Handshake failed (non-fatal):", err));
+        .catch((err) => console.warn("Connect failed (non-fatal):", err));
     };
 
     // Server online/offline status — reactive path.
