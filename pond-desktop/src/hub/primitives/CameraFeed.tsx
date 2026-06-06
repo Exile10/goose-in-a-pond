@@ -52,7 +52,14 @@ export function CameraFeed({ cam, h = 120, big = false, interactive = true }: Ca
           <span className="cam__time">{cam.time}</span>
         </div>
         {big && (
-          <button className="cam__expand" aria-label="Expand camera">
+          <button
+            className="cam__expand"
+            aria-label="Expand camera"
+            onClick={(e) => {
+              e.stopPropagation();
+              window.dispatchEvent(new CustomEvent("hub:camera", { detail: cam.id }));
+            }}
+          >
             <HubIco d={cameraEl} size={16} color="#fff" />
           </button>
         )}
