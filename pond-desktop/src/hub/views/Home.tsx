@@ -79,7 +79,7 @@ export function HomeView({ go }: HomeViewProps) {
             <PanelHead
               title={room === "home" ? "Favorites" : roomName}
               action={
-                <button className="ghost-btn">
+                <button className="ghost-btn" onClick={() => go?.("rooms")}>
                   <HubIco d={HP_PATHS.sliders} size={13} color="var(--pp)" /> Manage
                 </button>
               }
@@ -100,7 +100,7 @@ export function HomeView({ go }: HomeViewProps) {
             <PanelHead
               title="Cameras"
               action={
-                <button className="ghost-btn">
+                <button className="ghost-btn" onClick={() => go?.("cameras")}>
                   All <HubIco d={HP_PATHS.chevR} size={13} color="var(--pp)" />
                 </button>
               }

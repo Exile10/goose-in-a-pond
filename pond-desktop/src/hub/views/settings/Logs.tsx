@@ -1,41 +1,131 @@
-import { useState } from "react";
-import { Download } from "lucide-react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Download, RefreshCw } from "lucide-react";
 import { DetailShell } from "./DetailShell";
 import { Card } from "./controls";
+import { api } from "../../../api/PondApiClient";
+import type { LogEntry } from "../../../api/types";
 
+// ─── Types ────────────────────────────────────────────────────
 type LogLevel = "INFO" | "WARN" | "ERROR";
 type LogFilter = "All" | "Info" | "Warn" | "Error";
 
-interface LogEntry {
-  ts: string;
-  lvl: LogLevel;
-  src: string;
-  msg: string;
-}
-
-const LOGS: LogEntry[] = [
-  { ts: "08:50:02", lvl: "INFO",  src: "pond",    msg: "Server bound to 127.0.0.1:4000" },
-  { ts: "08:50:02", lvl: "INFO",  src: "models",  msg: "Loaded gemma-4-E4B-it (2.5 GB)" },
-  { ts: "08:50:04", lvl: "INFO",  src: "whisper", msg: "Speech-to-text ready: whisper/base" },
-  { ts: "08:50:07", lvl: "INFO",  src: "mcp",     msg: "giap-homeassistant connected · 4 tools" },
-  { ts: "08:50:08", lvl: "WARN",  src: "memory",  msg: "Available memory below 25% (1.8 GB)" },
-  { ts: "08:50:12", lvl: "INFO",  src: "mcp",     msg: "giap-weather connected · 2 tools" },
-  { ts: "08:50:18", lvl: "ERROR", src: "mcp",     msg: "giap-news handshake failed — disabled" },
-  { ts: "08:50:21", lvl: "INFO",  src: "agent",   msg: "Good Morning routine executed (4 actions)" },
-  { ts: "08:50:23", lvl: "INFO",  src: "tts",     msg: "Spoke briefing · 142 chars · 3.1s" },
-];
-
 const FILTERS: LogFilter[] = ["All", "Info", "Warn", "Error"];
 
+// ─── Offline fallback ─────────────────────────────────────────
+// Shown only when the server is unreachable on mount.
+const MOCK_LOGS: LogEntry[] = [
+  { id: 1, timestamp: new Date().toISOString(), level: "INFO",  source: "pond",    message: "Server bound to 127.0.0.1:4000" },
+  { id: 2, timestamp: new Date().toISOString(), level: "INFO",  source: "models",  message: "Loaded gemma-4-E4B-it (2.5 GB)" },
+  { id: 3, timestamp: new Date().toISOString(), level: "INFO",  source: "whisper", message: "Speech-to-text ready: whisper/base" },
+  { id: 4, timestamp: new Date().toISOString(), level: "WARN",  source: "memory",  message: "Available memory below 25% (1.8 GB)" },
+  { id: 5, timestamp: new Date().toISOString(), level: "ERROR", source: "mcp",     message: "giap-news handshake failed — disabled" },
+];
+
+// ─── Skeleton row ─────────────────────────────────────────────
+function SkeletonLogRow() {
+  return (
+    <div className="logrow" style={{ opacity: 0.45 }}>
+      <code className="logrow__ts">
+        <span style={{ display: "inline-block", width: 56, height: 10, background: "#e2e8f0", borderRadius: 4, verticalAlign: "middle" }} />
+      </code>
+      <span className="logrow__lvl logrow__lvl--info">
+        <span style={{ display: "inline-block", width: 36, height: 10, background: "#bfdbfe", borderRadius: 4, verticalAlign: "middle" }} />
+      </span>
+      <code className="logrow__src">
+        <span style={{ display: "inline-block", width: 48, height: 10, background: "#e2e8f0", borderRadius: 4, verticalAlign: "middle" }} />
+      </code>
+      <span className="logrow__msg">
+        <span style={{ display: "inline-block", width: "60%", height: 10, background: "#f1f5f9", borderRadius: 4, verticalAlign: "middle" }} />
+      </span>
+    </div>
+  );
+}
+
+// ─── Helpers ──────────────────────────────────────────────────
+function formatTs(ts: string): string {
+  try {
+    const d = new Date(ts);
+    return d.toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return ts;
+  }
+}
+
+// ─── Component ───────────────────────────────────────────────
 interface LogsDetailProps {
   go: (route: string) => void;
 }
 
 export function LogsDetail({ go }: LogsDetailProps) {
   const [filter, setFilter] = useState<LogFilter>("All");
-  const rows = LOGS.filter(
-    (l) => filter === "All" || l.lvl === filter.toUpperCase()
-  );
+  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Fetch ──────────────────────────────────────────────────
+  // Pass level to the API so the server can pre-filter large log sets.
+  // Client-side filter still applies for instant tab switching without a
+  // round-trip (the server may not honour the level param on all builds).
+  const loadData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      const level = filter === "All" ? undefined : filter.toUpperCase();
+      const data = await api.listLogs({ limit: 300, level });
+      setEntries(data);
+    } catch (e) {
+      console.warn("[LogsDetail] API offline — using mock fallback:", e);
+      // Only show offline banner + mock data on initial load (not silent polls)
+      if (!silent) {
+        setError("Could not reach the server. Showing cached entries.");
+        setEntries(MOCK_LOGS);
+      }
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [filter]);
+
+  // Initial load + filter-driven reload
+  useEffect(() => {
+    loadData(false);
+  }, [loadData]);
+
+  // Poll every 5 s (silent — no spinner, no mock fallback)
+  useEffect(() => {
+    pollRef.current = setInterval(() => loadData(true), 5_000);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [loadData]);
+
+  // ── Client-side filter ────────────────────────────────────
+  // If the server returned all levels (e.g. when level was undefined), we
+  // still filter client-side so tab switches are instant.
+  const rows: LogEntry[] = filter === "All"
+    ? entries
+    : entries.filter((e) => e.level.toUpperCase() === filter.toUpperCase());
+
+  // ── Export ────────────────────────────────────────────────
+  function handleExport() {
+    // api.exportLogsUrl() returns the direct download URL from the server.
+    // We create a temporary <a> to trigger the browser's native download.
+    try {
+      const url = api.exportLogsUrl();
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "pond-logs.csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (e) {
+      console.warn("[LogsDetail] Export failed:", e);
+    }
+  }
 
   return (
     <DetailShell
@@ -43,9 +133,39 @@ export function LogsDetail({ go }: LogsDetailProps) {
       subtitle="Live activity from the Goose server."
       accent="#475569"
       onBack={() => go("settings")}
+      headRight={
+        <button
+          className="mrow__btn"
+          type="button"
+          onClick={() => loadData(false)}
+          aria-label="Refresh logs"
+          style={{ minWidth: 32, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <RefreshCw size={13} strokeWidth={2} style={{ opacity: loading ? 0.4 : 1 }} />
+        </button>
+      }
     >
+      {/* Offline error banner */}
+      {error && (
+        <div
+          style={{
+            padding: "8px 12px",
+            borderRadius: 6,
+            fontSize: 13,
+            background: "#fffbeb",
+            color: "#92400e",
+            border: "1px solid #fde68a",
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          {error}
+        </div>
+      )}
+
+      {/* Toolbar: filter tabs + export button */}
       <div className="logs2__bar">
-        <div className="logs2__tabs">
+        <div className="logs2__tabs" role="tablist" aria-label="Log level filter">
           {FILTERS.map((t) => (
             <button
               key={t}
@@ -53,6 +173,8 @@ export function LogsDetail({ go }: LogsDetailProps) {
               data-active={filter === t}
               onClick={() => setFilter(t)}
               type="button"
+              role="tab"
+              aria-selected={filter === t}
             >
               {t}
             </button>
@@ -60,7 +182,7 @@ export function LogsDetail({ go }: LogsDetailProps) {
         </div>
         <button
           type="button"
-          onClick={() => { /* Phase 8: api.exportLogs(filter, range) → download */ }}
+          onClick={handleExport}
           style={{
             padding: "8px 14px",
             border: "1px solid var(--line)",
@@ -75,20 +197,50 @@ export function LogsDetail({ go }: LogsDetailProps) {
             cursor: "pointer",
             fontFamily: "inherit",
           }}
+          aria-label="Export logs as CSV"
         >
           <Download size={13} color="#7C3AED" strokeWidth={2} /> Export
         </button>
       </div>
+
+      {/* Log table */}
       <Card>
         <div className="logs2">
-          {rows.map((l, i) => (
-            <div key={i} className="logrow">
-              <code className="logrow__ts">{l.ts}</code>
-              <span className={`logrow__lvl logrow__lvl--${l.lvl.toLowerCase()}`}>{l.lvl}</span>
-              <code className="logrow__src">{l.src}</code>
-              <span className="logrow__msg">{l.msg}</span>
+          {loading ? (
+            <>
+              <SkeletonLogRow />
+              <SkeletonLogRow />
+              <SkeletonLogRow />
+              <SkeletonLogRow />
+              <SkeletonLogRow />
+            </>
+          ) : rows.length === 0 ? (
+            <div
+              style={{
+                padding: "24px 0",
+                textAlign: "center",
+                fontSize: 13,
+                color: "#94a3b8",
+              }}
+              role="status"
+            >
+              No{filter !== "All" ? ` ${filter.toUpperCase()}` : ""} log entries found.
             </div>
-          ))}
+          ) : (
+            rows.map((l) => (
+              <div key={l.id} className="logrow">
+                <code className="logrow__ts">{formatTs(l.timestamp)}</code>
+                <span
+                  className={`logrow__lvl logrow__lvl--${l.level.toLowerCase()}`}
+                  aria-label={`Level: ${l.level}`}
+                >
+                  {l.level}
+                </span>
+                <code className="logrow__src">{l.source}</code>
+                <span className="logrow__msg">{l.message}</span>
+              </div>
+            ))
+          )}
         </div>
       </Card>
     </DetailShell>

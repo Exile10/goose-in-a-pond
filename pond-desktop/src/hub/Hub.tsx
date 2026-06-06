@@ -88,6 +88,18 @@ export function Hub() {
     return () => window.removeEventListener("hub:device", onDeviceCtrl);
   }, []);
 
+  // CameraFeed expand buttons dispatch "hub:camera" with the camera id.
+  // TODO Phase 8 wave 6: open a full-screen camera-feed modal overlay.
+  useEffect(() => {
+    function onCameraExpand(e: Event) {
+      const id = (e as CustomEvent<string>).detail;
+      // eslint-disable-next-line no-console
+      console.info("[Hub] camera expand requested for %s — overlay UI is wave 6", id);
+    }
+    window.addEventListener("hub:camera", onCameraExpand);
+    return () => window.removeEventListener("hub:camera", onCameraExpand);
+  }, []);
+
   function go(r: string) {
     setRoute(r);
     writeStoredRoute(r);

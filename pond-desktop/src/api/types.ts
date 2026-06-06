@@ -144,6 +144,14 @@ export interface Settings {
   retention_event_log_days?: number;
   retention_sensor_days?: number;
   retention_session_messages_keep?: number;
+
+  // Privacy / sensor access
+  mic_enabled?: boolean;
+  cameras_enabled?: boolean;
+  cloud_fallback_enabled?: boolean;
+
+  // Identity — home name
+  home_name?: string;
 }
 
 // ── Consolidation ────────────────────────────────────────────
