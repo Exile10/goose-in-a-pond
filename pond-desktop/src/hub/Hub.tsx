@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { ComponentType } from "react";
 import { IconRail } from "./IconRail";
 import { HomeView } from "./views/Home";
@@ -21,6 +21,7 @@ import { NotificationsDetail } from "./views/settings/Notifications";
 // wrapper below silently drops the `go` prop.
 import { AppearanceView } from "./views/settings/Appearance";
 import { AccountDetail } from "./views/settings/Account";
+import { HubOverlay } from "./overlays/HubOverlay";
 import type { SettingsRowId } from "./data/settingsConfig";
 
 // ─── Route types ──────────────────────────────────────────────
@@ -74,31 +75,9 @@ function writeStoredRoute(route: string): void {
 export function Hub() {
   const [route, setRoute] = useState<string>(readStoredRoute);
 
-  // DeviceTile kebabs dispatch "hub:device" with the device id. Phase 8 will
-  // open a HubOverlay control panel (brightness slider, thermostat dial, etc.)
-  // for the dispatched device. For now we log the intent so the click isn't a
-  // silent no-op for users opening devtools.
-  useEffect(() => {
-    function onDeviceCtrl(e: Event) {
-      const id = (e as CustomEvent<string>).detail;
-      // eslint-disable-next-line no-console
-      console.info(`[Hub] device-control requested for "${id}" — overlay UI is Phase 8.`);
-    }
-    window.addEventListener("hub:device", onDeviceCtrl);
-    return () => window.removeEventListener("hub:device", onDeviceCtrl);
-  }, []);
-
-  // CameraFeed expand buttons dispatch "hub:camera" with the camera id.
-  // TODO Phase 8 wave 6: open a full-screen camera-feed modal overlay.
-  useEffect(() => {
-    function onCameraExpand(e: Event) {
-      const id = (e as CustomEvent<string>).detail;
-      // eslint-disable-next-line no-console
-      console.info("[Hub] camera expand requested for %s — overlay UI is wave 6", id);
-    }
-    window.addEventListener("hub:camera", onCameraExpand);
-    return () => window.removeEventListener("hub:camera", onCameraExpand);
-  }, []);
+  // hub:device / hub:camera / hub:category CustomEvents are now handled by
+  // <HubOverlay /> below, which mounts the appropriate modal (DeviceControl,
+  // CameraModal, CategorySheet).
 
   function go(r: string) {
     setRoute(r);
@@ -136,6 +115,7 @@ export function Hub() {
       <main className="ghub__main" key={route}>
         {renderView()}
       </main>
+      <HubOverlay />
     </div>
   );
 }
