@@ -795,6 +795,7 @@ async fn chat_stream(
         };
 
         let mut full_text = String::new();
+        let mut tool_results: Vec<String> = Vec::new();
         let mut ttft_instant: Option<std::time::Instant> = None;
         // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
         // preambles and `<think>…</think>` blocks out of the per-token stream.
@@ -853,6 +854,11 @@ async fn chat_stream(
                                     if let Some(ui) = ui_hint {
                                         ev["ui"] = ui;
                                     }
+                                    tool_results.push(json!({
+                                        "tool_call_id": id,
+                                        "tool": tool,
+                                        "content": clean_content,
+                                    }).to_string());
                                     Some(ev.to_string())
                                 }
                                 AgentStreamEvent::Text { content } => {
@@ -1042,6 +1048,20 @@ async fn chat_stream(
             tokio::spawn(async move {
                 svc.run(ext.as_ref(), repo.as_ref(), &user_msg, &asst_resp, Some(&sid)).await;
             });
+        }
+
+        // Persist tool results (in call order, before the assistant message)
+        {
+            use pond_core::domain::message::ChatMessage;
+            use pond_core::domain::session::SessionMessage;
+            for content in tool_results {
+                let sm = SessionMessage::new(
+                    Uuid::new_v4().to_string(),
+                    session_id.clone(),
+                    ChatMessage::tool_result(content),
+                );
+                let _ = storage.add_message(session_id.clone(), sm).await;
+            }
         }
 
         // Persist full assistant response (uses revised text if review triggered revision)
@@ -1940,6 +1960,8 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     };
 
     let extras = scan_filesystem_extras(data_dir, model_repo).await;
+    sync_ollama_models(&state.http_client, model_repo).await;
+
     let count = extras.len();
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
     let entries: Vec<Value> = extras
@@ -1948,6 +1970,70 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .collect();
 
     Json(json!({"found": count, "entries": entries}))
+}
+
+/// Fetch installed Ollama models from the local daemon and upsert them into the model repo.
+/// Only models Ollama actually has are registered — `downloaded` is always accurate.
+async fn sync_ollama_models(
+    client: &reqwest::Client,
+    model_repo: &Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+) {
+    let resp = match client
+        .get("http://localhost:11434/api/tags")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let Some(models) = body["models"].as_array() else {
+        return;
+    };
+
+    for m in models {
+        let Some(model_name) = m["name"].as_str() else {
+            continue;
+        };
+        let size_mb = m["size"].as_u64().unwrap_or(0) / (1024 * 1024);
+        let model_id = ModelRecord::id_for(&ModelCategory::Ollama, model_name);
+
+        let existing = model_repo.get_by_id(&model_id).await.unwrap_or(None);
+        let record = ModelRecord {
+            id: model_id,
+            category: ModelCategory::Ollama,
+            name: model_name.to_string(),
+            filename: None,
+            description: String::new(),
+            size_mb,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: existing
+                .as_ref()
+                .and_then(|e| e.recommended_role.clone())
+                .or_else(|| Some("chat".to_string())),
+            context_length: existing.as_ref().and_then(|e| e.context_length),
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: existing.as_ref().map(|e| e.is_custom).unwrap_or(true),
+        };
+        let _ = model_repo.upsert(&record).await;
+    }
 }
 
 /// POST /api/v1/models/registry/refresh — refresh the model catalog from upstream sources.

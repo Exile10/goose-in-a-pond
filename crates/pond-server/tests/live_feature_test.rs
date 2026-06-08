@@ -285,7 +285,7 @@ async fn live_consolidation_merges_duplicates() {
     );
 
     let (merged, pruned) =
-        pond_core::services::memory_consolidation::run_consolidation(&consolidator, &repo)
+        pond_core::services::memory_consolidation::run_consolidation(&consolidator, &repo, 50)
             .await
             .unwrap();
 
