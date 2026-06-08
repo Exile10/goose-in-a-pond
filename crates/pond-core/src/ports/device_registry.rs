@@ -4,13 +4,17 @@
 //! other pond instances, etc.
 //!
 //! # TODO
-//! - [ ] Add device status (online/offline/last_seen)
 //! - [ ] Add device grouping / rooms
-//! - [ ] Add device capabilities discovery
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::domain::device::DeviceCapability;
+
+fn default_transport() -> String {
+    "http".to_string()
+}
 
 /// A registered device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +25,17 @@ pub struct Device {
     pub device_type: String,
     pub hostname: Option<String>,
     pub ip_address: Option<String>,
+    /// Simple capability tags (e.g. "chat", "tts"). Kept for labelling / filtering.
     pub capabilities: Vec<String>,
+    /// Wire protocol used to reach the device: "http", "mqtt", "ws", "gotg", "matter", …
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Protocol-specific endpoint: URL, MQTT broker+topic, hostname:port, etc.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Structured control descriptors for use by a DeviceController adapter.
+    #[serde(default)]
+    pub structured_capabilities: Vec<DeviceCapability>,
     pub registered_at: String,
     pub last_seen: Option<String>,
     pub is_online: bool,
@@ -34,6 +48,15 @@ pub struct RegisterDeviceRequest {
     pub device_type: String,
     pub hostname: Option<String>,
     pub capabilities: Vec<String>,
+    /// Wire protocol used to reach the device (defaults to "http").
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Protocol-specific endpoint address.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Structured control descriptors.
+    #[serde(default)]
+    pub structured_capabilities: Vec<DeviceCapability>,
 }
 
 /// Driven Port: device lifecycle management.
