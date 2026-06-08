@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS session_messages (
     id         TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
     content    TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

@@ -334,3 +334,75 @@ async fn health_endpoint_accessible_without_auth() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── Persistence regression ─────────────────────────────────────────────────────
+
+/// Regression: chat/stream must persist user + assistant messages to
+/// pond_system.db so they are readable via GET /sessions/{id}/messages.
+///
+/// The stream body must be fully drained before querying — persistence
+/// happens inside the async_stream generator and only runs when polled.
+#[tokio::test]
+async fn chat_stream_persists_messages_readable_via_sessions_endpoint() {
+    let (app, _tmp) = make_app().await;
+
+    let session_id = "stream-persist-test";
+
+    // POST /api/v1/chat/stream — drain the full SSE body so the stream
+    // generator runs to completion and both add_message calls execute.
+    let stream_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": session_id,
+                        "message": "hello"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stream_resp.status(), StatusCode::OK);
+    axum::body::to_bytes(stream_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // GET /api/v1/sessions/{id}/messages — must return the persisted rows.
+    let get_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/sessions/{}/messages", session_id))
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let messages = json["messages"].as_array().expect("messages array");
+
+    assert_eq!(messages.len(), 2, "expected user + assistant message, got: {}", json);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "hello");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(
+        messages[1]["content"].as_str().unwrap_or("").contains("Echo"),
+        "assistant message should contain echo response, got: {}",
+        messages[1]["content"]
+    );
+}
