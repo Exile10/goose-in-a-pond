@@ -3,6 +3,8 @@
 //! Uses the `devices` table in `pond_system.db`.
 //! Columns `device_type`, `ip_address`, `capabilities`, `last_seen`, `is_online`
 //! are added by migration `0004_devices_enhanced.sql`.
+//! Columns `transport`, `address`, `structured_capabilities`
+//! are added by migration `0022_device_transport.sql`.
 //!
 //! `is_online` is derived at read-time by comparing `last_seen` to `now - 5 min`
 //! (heartbeat threshold). The stored `is_online` column is used as a fallback
@@ -11,6 +13,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use pond_core::domain::device::DeviceCapability;
 use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use serde_json;
 use sqlx::{Pool, Sqlite};
@@ -38,12 +41,17 @@ struct DeviceRow {
     device_type: String,
     ip_address: Option<String>,
     capabilities: String,
+    transport: String,
+    address: Option<String>,
+    structured_capabilities: String,
     created_at: String,
     last_seen: Option<String>,
 }
 
 fn row_to_device(row: DeviceRow) -> Device {
     let capabilities: Vec<String> = serde_json::from_str(&row.capabilities).unwrap_or_default();
+    let structured_capabilities: Vec<DeviceCapability> =
+        serde_json::from_str(&row.structured_capabilities).unwrap_or_default();
 
     // Compute is_online by comparing last_seen to now - threshold
     let is_online = row
@@ -64,6 +72,9 @@ fn row_to_device(row: DeviceRow) -> Device {
         hostname: row.hostname,
         ip_address: row.ip_address,
         capabilities,
+        transport: row.transport,
+        address: row.address,
+        structured_capabilities,
         registered_at: row.created_at,
         last_seen: row.last_seen,
         is_online,
@@ -75,18 +86,24 @@ impl DeviceRegistry for SqliteDeviceRegistry {
     async fn register(&self, request: RegisterDeviceRequest) -> Result<Device> {
         let id = Uuid::new_v4().to_string();
         let caps_json = serde_json::to_string(&request.capabilities)?;
+        let structured_caps_json = serde_json::to_string(&request.structured_capabilities)?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         sqlx::query(
-            "INSERT INTO devices (id, name, hostname, device_type, ip_address, capabilities, \
-             is_online, created_at, updated_at, last_seen) \
-             VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?)",
+            "INSERT INTO devices \
+             (id, name, hostname, device_type, ip_address, capabilities, \
+              transport, address, structured_capabilities, \
+              is_online, created_at, updated_at, last_seen) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 1, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&request.name)
         .bind(&request.hostname)
         .bind(&request.device_type)
         .bind(&caps_json)
+        .bind(&request.transport)
+        .bind(&request.address)
+        .bind(&structured_caps_json)
         .bind(&now_str)
         .bind(&now_str)
         .bind(&now_str)
@@ -100,6 +117,9 @@ impl DeviceRegistry for SqliteDeviceRegistry {
             hostname: request.hostname,
             ip_address: None,
             capabilities: request.capabilities,
+            transport: request.transport,
+            address: request.address,
+            structured_capabilities: request.structured_capabilities,
             registered_at: now_str.clone(),
             last_seen: Some(now_str),
             is_online: true,
@@ -108,7 +128,8 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
     async fn list_devices(&self) -> Result<Vec<Device>> {
         let rows: Vec<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, \
+              transport, address, structured_capabilities, created_at, last_seen \
              FROM devices ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -118,7 +139,8 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
     async fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
         let row: Option<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, \
+              transport, address, structured_capabilities, created_at, last_seen \
              FROM devices WHERE id = ?",
         )
         .bind(device_id)
@@ -165,6 +187,9 @@ mod tests {
             device_type: "gotg".to_string(),
             hostname: Some("phone.local".to_string()),
             capabilities: vec!["chat".to_string(), "tts".to_string()],
+            transport: "gotg".to_string(),
+            address: Some("192.168.1.42:8080".to_string()),
+            structured_capabilities: vec![],
         }
     }
 
@@ -193,6 +218,19 @@ mod tests {
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.unregister(&dev.id).await.unwrap();
         assert!(reg.get_device(&dev.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_and_address_round_trip() {
+        let (reg, _tmp) = make_registry().await;
+        let dev = reg.register(req("Phone")).await.unwrap();
+        assert_eq!(dev.transport, "gotg");
+        assert_eq!(dev.address.as_deref(), Some("192.168.1.42:8080"));
+        assert!(dev.structured_capabilities.is_empty());
+
+        let fetched = reg.get_device(&dev.id).await.unwrap().unwrap();
+        assert_eq!(fetched.transport, "gotg");
+        assert_eq!(fetched.address.as_deref(), Some("192.168.1.42:8080"));
     }
 
     #[tokio::test]
