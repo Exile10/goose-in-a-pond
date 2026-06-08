@@ -43,11 +43,10 @@ interface Message {
   error?: boolean;            // true when this bubble represents an error
 }
 
-let msgId = 0;
-
 export function Chat() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
+  const msgIdRef = useRef(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -76,7 +75,7 @@ export function Chat() {
       .then((msgs) => {
         setMessages(
           (msgs ?? []).map((m) => ({
-            id: ++msgId,
+            id: ++msgIdRef.current,
             role: m.role === "user" ? ("user" as const) : ("agent" as const),
             text: m.content,
           })),
@@ -199,7 +198,7 @@ export function Chat() {
         if (!msgs || msgs.length === 0) return;
         setMessages(
           msgs.map((m) => ({
-            id: ++msgId,
+            id: ++msgIdRef.current,
             role: m.role === "user" ? "user" : "agent",
             text: m.content,
           })),
@@ -236,8 +235,8 @@ export function Chat() {
     setBusy(true);
 
     inThinkBlockRef.current = false; // reset for new stream
-    const userMsg: Message = { id: ++msgId, role: "user", text };
-    const agentMsg: Message = { id: ++msgId, role: "agent", text: "", streaming: true };
+    const userMsg: Message = { id: ++msgIdRef.current, role: "user", text };
+    const agentMsg: Message = { id: ++msgIdRef.current, role: "agent", text: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, agentMsg]);
 
     try {
