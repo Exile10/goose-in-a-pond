@@ -62,6 +62,22 @@ pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
+/// Returns true if the llamafile binary supports the `--jinja` flag.
+///
+/// Older builds (≤ v0.9.0 / build ~1500) do not have this flag and will crash
+/// if it is passed.  Running `--help` and checking the output is safe and fast.
+fn supports_jinja(binary: &Path) -> bool {
+    std::process::Command::new(binary)
+        .arg("--help")
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr);
+            out.contains("--jinja")
+        })
+        .unwrap_or(false)
+}
+
 /// Spawn the llamafile server and wait up to 60 s for it to become ready.
 ///
 /// Flags:
@@ -69,17 +85,28 @@ pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
 ///   `--port <port>`   — listen port
 ///   `--host 127.0.0.1` — loopback only (local privacy, matches GIAP policy)
 ///   `--nobrowser`     — don't open a browser tab
+///   `--jinja`         — Jinja2 chat templates (only passed on compatible builds)
 ///
 /// Loading a 1–2 GB model typically takes 5–30 seconds depending on hardware.
 async fn spawn(binary: &Path, port: u16) -> Result<LlamafileProcess> {
-    let child = tokio::process::Command::new(binary)
-        .arg("--server")
-        .arg("--jinja")
+    let jinja = supports_jinja(binary);
+    if jinja {
+        println!("  ✅ llamafile supports --jinja — Jinja2 chat templates enabled");
+    } else {
+        println!("  ⚠  llamafile does not support --jinja (old build) — skipping flag; upgrade for better chat template support");
+    }
+
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.arg("--server")
         .args(["--port", &port.to_string()])
         .args(["--host", "127.0.0.1"])
         .arg("--nobrowser")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if jinja {
+        cmd.arg("--jinja");
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn {}", binary.display()))?;
 
