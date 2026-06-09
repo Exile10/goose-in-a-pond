@@ -202,6 +202,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Recipes ───────────────────────────────────────────────────────────
         .route("/recipes", get(list_recipes).post(create_recipe))
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
+        .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics (Phase 2) ─────────────────────────────────────────
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
@@ -592,9 +593,6 @@ async fn chat_stream(
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
-    use futures::StreamExt;
-    use pond_core::ports::agent::AgentStreamEvent;
-
     // Update activity timestamp — resets the consolidation inactivity timer
     *state.last_user_activity.write().await = std::time::Instant::now();
     // Cancel any in-progress consolidation
@@ -618,6 +616,23 @@ async fn chat_stream(
             Json(json!({"error": e.to_string()})),
         )
     })?;
+
+    Ok(chat_stream_inner(state, permit, req))
+}
+
+/// Shared SSE pipeline used by both `chat_stream` and `run_recipe`.
+///
+/// Callers handle activity touching, body parsing, and semaphore acquisition;
+/// this helper owns the full agent turn — session creation, system-prompt
+/// build, llamafile startup wait, ThoughtFilter, telemetry, memory extraction —
+/// and emits the same SSE event shape regardless of entry point.
+fn chat_stream_inner(
+    state: Arc<AppState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    req: ChatRequest,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    use futures::StreamExt;
+    use pond_core::ports::agent::AgentStreamEvent;
 
     let stream = async_stream::stream! {
         let _permit = permit;
@@ -1129,7 +1144,7 @@ async fn chat_stream(
         yield Ok(Event::default().data(data));
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// List all sessions, ordered by most recently updated first.
@@ -6893,6 +6908,93 @@ async fn delete_recipe(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize, Default)]
+struct RunRecipeRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    voice_mode: bool,
+    #[serde(default)]
+    canvas_mode: bool,
+}
+
+/// Execute a recipe by name. Looks up the AgentRecipe, parses its YAML to
+/// extract the prompt, and delegates to the shared chat-stream pipeline so
+/// the response matches `POST /api/v1/chat/stream` event-for-event.
+async fn run_recipe(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    body: Option<Json<RunRecipeRequest>>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
+    let repo = state.recipe_repo.as_ref().ok_or_else(|| {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "Recipe repository not configured"})),
+        )
+    })?;
+
+    let recipe = match repo.get_by_name(&name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Recipe '{}' not found", name)})),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            ))
+        }
+    };
+
+    if !recipe.active {
+        tracing::warn!(name = %name, "running inactive recipe");
+    }
+
+    let prompt = match goose::recipe::Recipe::from_content(&recipe.yaml) {
+        Ok(parsed) => parsed
+            .prompt
+            .or(parsed.instructions)
+            .unwrap_or_else(|| format!("Run routine: {}", name)),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "failed to parse recipe YAML; using fallback prompt");
+            format!("Run routine: {}", name)
+        }
+    };
+
+    // Update activity timestamp — resets the consolidation inactivity timer
+    *state.last_user_activity.write().await = std::time::Instant::now();
+    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
+        cancel.cancel();
+    }
+
+    let permit = state
+        .sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Too many concurrent streams"})),
+            )
+        })?;
+
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    let chat_req = ChatRequest {
+        session_id: body.session_id,
+        message: prompt,
+        images: Vec::new(),
+        voice_mode: body.voice_mode,
+        canvas_mode: body.canvas_mode,
+    };
+
+    Ok(chat_stream_inner(state, permit, chat_req))
 }
 
 // ───────────────────────── Face Biometrics (Phase 2) ────────────────────────

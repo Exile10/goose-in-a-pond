@@ -531,16 +531,47 @@ export class PondApiClient {
     token?: string,
     canvasMode?: boolean,
   ): AsyncGenerator<ChatEvent> {
-    await this.ensureTokenFresh();
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    const tok = token ?? this.token;
-    if (tok) headers["Authorization"] = `Bearer ${tok}`;
-
     const reqBody: ChatStreamRequest = {
       message,
       session_id: sessionId,
       canvas_mode: canvasMode ?? false,
     };
+    yield* this.streamSse("/api/v1/chat/stream", reqBody, token);
+  }
+
+  /**
+   * Execute a recipe by name. Server resolves the recipe's prompt and streams
+   * the agent's response using the same SSE event shape as `chatStream`.
+   */
+  async *runRecipe(
+    name: string,
+    opts?: { sessionId?: string; voiceMode?: boolean; canvasMode?: boolean; token?: string },
+  ): AsyncGenerator<ChatEvent> {
+    const reqBody = {
+      session_id: opts?.sessionId,
+      voice_mode: opts?.voiceMode ?? false,
+      canvas_mode: opts?.canvasMode ?? false,
+    };
+    yield* this.streamSse(
+      `/api/v1/recipes/${encodeURIComponent(name)}/run`,
+      reqBody,
+      opts?.token,
+    );
+  }
+
+  /**
+   * POST a JSON body to an SSE endpoint and yield each parsed event.
+   * Shared by chatStream and runRecipe.
+   */
+  private async *streamSse(
+    path: string,
+    body: unknown,
+    token?: string,
+  ): AsyncGenerator<ChatEvent> {
+    await this.ensureTokenFresh();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const tok = token ?? this.token;
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
     // Retry initial connection on network-level failures (not HTTP errors).
     const controller = new AbortController();
@@ -548,10 +579,10 @@ export class PondApiClient {
     let res!: Response;
     for (let attempt = 0; attempt <= 2; attempt++) {
       try {
-        res = await fetch(`${this.base}/api/v1/chat/stream`, {
+        res = await fetch(`${this.base}${path}`, {
           method: "POST",
           headers,
-          body: JSON.stringify(reqBody),
+          body: JSON.stringify(body),
           signal: controller.signal,
         });
         clearTimeout(timeoutId);

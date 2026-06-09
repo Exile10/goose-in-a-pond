@@ -8,9 +8,9 @@ import { api } from "../../api/PondApiClient";
 
 async function executeRoutine(name: string): Promise<void> {
   try {
-    // Drive the chat stream so the agent dispatches the routine; consume
-    // the events to completion without surfacing them to the UI.
-    for await (const _ of api.chatStream(`Run routine: ${name}`)) {
+    // Server resolves the recipe's prompt and streams the agent turn; we
+    // consume the events to completion but don't surface them in the UI.
+    for await (const _ of api.runRecipe(name)) {
       void _;
     }
   } catch {
@@ -20,8 +20,8 @@ async function executeRoutine(name: string): Promise<void> {
 
 // ─── RoutinesView ──────────────────────────────────────────────
 // One-tap scene cards backed by AgentRecipe records from the backend.
-// Run dispatches a chat-stream message "Run routine: <name>" so the
-// agent executes the recipe; we don't await the stream — fire and forget.
+// Run posts to /api/v1/recipes/:name/run; we don't await the stream —
+// fire and forget while the visual "Running…" toast plays.
 
 export function RoutinesView() {
   const routines = useRoutines();
