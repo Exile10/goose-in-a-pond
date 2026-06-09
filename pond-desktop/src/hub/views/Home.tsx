@@ -13,7 +13,7 @@ import { NowPlaying } from "../primitives/NowPlaying";
 import { HubClock } from "../primitives/HubClock";
 import { PanelHead } from "../primitives/PanelHead";
 import { AskGoose } from "../primitives/AskGoose";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 // Extra icons used only in the Home view header
 const HX = {
@@ -25,14 +25,24 @@ interface HomeViewProps {
   go?: (route: string) => void;
 }
 
+function greetingForHour(h: number): string {
+  if (h < 5)  return "Good night";
+  if (h < 12) return "Good morning";
+  if (h < 18) return "Good afternoon";
+  return "Good evening";
+}
+
 export function HomeView({ go }: HomeViewProps) {
   const [room, setRoom] = useState("home");
+  const home = useHomeData();
 
-  const roomName = HOME.rooms.find((r) => r.id === room)?.name ?? "Home";
+  const roomName = home.rooms.find((r) => r.id === room)?.name ?? "Home";
   const favorites =
     room === "home"
-      ? HOME.devices.slice(0, 6)
-      : HOME.devices.filter((d) => d.room === roomName);
+      ? home.devices.slice(0, 6)
+      : home.devices.filter((d) => d.room === roomName);
+
+  const greeting = greetingForHour(new Date().getHours());
 
   return (
     <div className="home2">
@@ -40,10 +50,10 @@ export function HomeView({ go }: HomeViewProps) {
       <header className="home2__head">
         <div>
           <div className="hub-greet">
-            Good morning, <span>{HOME.user}</span>
+            {greeting}, <span>{home.user}</span>
           </div>
           <div className="home2__sub">
-            {HOME.date} · {HOME.weather.cond}, {HOME.weather.temp}°
+            {home.date} · {home.weather.cond}, {home.weather.temp}°
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
@@ -106,7 +116,7 @@ export function HomeView({ go }: HomeViewProps) {
               }
             />
             <div className="home2__cams">
-              {HOME.cameras.map((c) => (
+              {home.cameras.map((c) => (
                 <CameraFeed key={c.id} cam={c} h={132} big />
               ))}
             </div>

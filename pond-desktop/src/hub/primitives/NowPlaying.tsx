@@ -2,7 +2,7 @@ import { useState } from "react";
 import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
 import { pauseEl } from "./HubIco";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 type NowPlayingVariant = "bar" | "tile";
 
@@ -11,7 +11,7 @@ interface NowPlayingProps {
 }
 
 export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
-  const np = HOME.nowPlaying;
+  const np = useHomeData().nowPlaying;
   const [playing, setPlaying] = useState(true);
 
   return (

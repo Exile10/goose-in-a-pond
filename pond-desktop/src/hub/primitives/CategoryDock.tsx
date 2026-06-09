@@ -1,15 +1,16 @@
 import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 interface CategoryDockProps {
   scroll?: boolean;
 }
 
 export function CategoryDock({ scroll = false }: CategoryDockProps) {
+  const { categories } = useHomeData();
   return (
     <div className={`cdock${scroll ? " cdock--scroll" : ""}`}>
-      {HOME.categories.map((c) => {
+      {categories.map((c) => {
         const iconPath = HP_PATHS[c.icon as keyof typeof HP_PATHS];
         return (
           <button
