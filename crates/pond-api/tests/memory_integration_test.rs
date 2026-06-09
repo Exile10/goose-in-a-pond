@@ -64,6 +64,9 @@ impl DeviceRegistry for NoDevices {
             capabilities: req.capabilities,
             registered_at: "2024-01-01T00:00:00Z".into(),
             last_seen: None,
+            transport: req.transport,
+            address: req.address,
+            structured_capabilities: req.structured_capabilities,
             is_online: false,
         })
     }
@@ -107,6 +110,7 @@ async fn make_app_with_real_memory(
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
+        device_controller: None,
         memory_repo: memory_repo.clone(),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),

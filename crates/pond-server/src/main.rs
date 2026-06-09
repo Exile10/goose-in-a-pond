@@ -39,6 +39,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
+use pond_adapters_mqtt::{MqttConfig, MqttDeviceController};
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
@@ -1083,6 +1084,32 @@ async fn run_server(
         Arc::new(SqliteProfileRepository::new(db.system.clone()));
     let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+
+    // ── MQTT device controller ─────────────────────────────────────────────────
+    // Enabled when MQTT_HOST is set. Connects to the broker and subscribes to
+    // zigbee2mqtt/+ and stat/+/STATE for state caching.
+    let device_controller: Option<
+        Arc<dyn pond_core::ports::device_controller::DeviceController + Send + Sync>,
+    > = if MqttConfig::is_configured() {
+        match MqttDeviceController::new(MqttConfig::from_env(), Arc::clone(&device_registry)).await
+        {
+            Ok(ctrl) => {
+                tracing::info!(
+                    host = %std::env::var("MQTT_HOST").unwrap_or_default(),
+                    "MQTT device controller connected"
+                );
+                Some(Arc::new(ctrl))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect MQTT controller: {e:#}; device control disabled");
+                None
+            }
+        }
+    } else {
+        tracing::debug!("MQTT_HOST not set; device controller disabled");
+        None
+    };
+
     let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
         Arc::new(SqliteMemoryRepository::new(db.system.clone()));
     let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
@@ -1802,6 +1829,7 @@ async fn run_server(
         settings_repo,
         profile_repo,
         device_registry,
+        device_controller,
         memory_repo,
         embedding_provider,
         sensor_storage,

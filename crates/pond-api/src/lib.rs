@@ -76,6 +76,7 @@ pub trait LlamafileManager: Send + Sync {
 use axum::{middleware::Next, Router};
 use pond_core::ports::agent::Agent;
 use pond_core::ports::camera_storage::CameraStorage;
+use pond_core::ports::device_controller::DeviceController;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::embedding::EmbeddingProvider;
 use pond_core::ports::extension_manager::ExtensionManagerPort;
@@ -146,6 +147,8 @@ pub struct AppState {
     pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
     /// Device registry for GOTG devices and other connected hardware.
     pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    /// Protocol-agnostic device controller. `None` until an adapter (MQTT, Matter, …) is wired in.
+    pub device_controller: Option<Arc<dyn DeviceController + Send + Sync>>,
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.

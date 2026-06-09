@@ -22,6 +22,7 @@ use pond_core::domain::profile::CreateProfileRequest;
 use pond_core::domain::schedule::TaskKind;
 use pond_core::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::domain::settings::Settings;
+use pond_core::domain::device::StateValue;
 use pond_core::ports::device_registry::RegisterDeviceRequest;
 use pond_core::ports::extension_manager::ExtensionInfo;
 use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
@@ -90,6 +91,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
+        .route("/devices/{id}/power", post(device_set_power))
+        .route("/devices/{id}/state", post(device_set_state).get(device_query_state))
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
@@ -1480,6 +1483,106 @@ async fn device_heartbeat(
         )
     })?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+// ── Device control ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SetPowerRequest {
+    on: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SetStateRequest {
+    key: String,
+    value: serde_json::Value,
+}
+
+fn require_controller(
+    state: &AppState,
+) -> Result<&(dyn pond_core::ports::device_controller::DeviceController + Send + Sync), (StatusCode, Json<Value>)>
+{
+    state
+        .device_controller
+        .as_deref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "No device controller configured (set MQTT_HOST to enable)"})),
+            )
+        })
+}
+
+async fn device_set_power(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<SetPowerRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+    })?;
+    let ctrl = require_controller(&state)?;
+    ctrl.set_power(&id, req.on).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn device_set_state(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<SetStateRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+    })?;
+    let sv = json_to_state_value(req.value).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+    })?;
+    let ctrl = require_controller(&state)?;
+    ctrl.set_state(&id, &req.key, sv).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn device_query_state(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ctrl = require_controller(&state)?;
+    let device_state = ctrl.query_state(&id).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+    })?;
+    let values: serde_json::Map<String, serde_json::Value> = device_state
+        .values
+        .into_iter()
+        .map(|(k, v)| {
+            let jv = match v {
+                StateValue::Bool(b) => serde_json::Value::Bool(b),
+                StateValue::Number(n) => serde_json::json!(n),
+                StateValue::Text(s) => serde_json::Value::String(s),
+            };
+            (k, jv)
+        })
+        .collect();
+    Ok(Json(json!({
+        "device_id": device_state.device_id,
+        "state": serde_json::Value::Object(values),
+    })))
+}
+
+fn json_to_state_value(v: serde_json::Value) -> anyhow::Result<StateValue> {
+    match v {
+        serde_json::Value::Bool(b) => Ok(StateValue::Bool(b)),
+        serde_json::Value::Number(n) => {
+            n.as_f64()
+                .map(StateValue::Number)
+                .ok_or_else(|| anyhow::anyhow!("number out of f64 range"))
+        }
+        serde_json::Value::String(s) => Ok(StateValue::Text(s)),
+        other => anyhow::bail!("unsupported value type: {other}"),
+    }
 }
 
 async fn get_settings(
