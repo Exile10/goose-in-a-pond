@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { HubIco, lockEl, unlockEl } from "../primitives/HubIco";
+import { HubIco, lockEl, unlockEl, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { CameraFeed } from "../primitives/CameraFeed";
-import { HOME, type DeviceData, type DeviceKind } from "../data/mockHome";
+import { type DeviceData, type DeviceKind } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 import { useDeviceState, hubSetDevice } from "../state/hubStore";
 
 // ─── Modal shell ──────────────────────────────────────────────
@@ -289,7 +290,8 @@ interface DeviceControlProps {
 }
 
 function DeviceControl({ deviceId, onClose }: DeviceControlProps) {
-  const device = HOME.devices.find((d) => d.id === deviceId);
+  const home = useHomeData();
+  const device = home.devices.find((d) => d.id === deviceId);
   const [st, set] = useDeviceState(deviceId);
   if (!device) return null;
   const k = device.kind;
@@ -341,9 +343,11 @@ interface CameraModalProps {
 }
 
 function CameraModal({ camId, onClose }: CameraModalProps) {
+  const home = useHomeData();
   const [cur, setCur] = useState(camId);
   const [muted, setMuted] = useState(false);
-  const cam = HOME.cameras.find((c) => c.id === cur) ?? HOME.cameras[0];
+  const cam = home.cameras.find((c) => c.id === cur) ?? home.cameras[0];
+  if (!cam) return null;
   const events = [
     { t: "8:48 AM", label: "Motion", icon: HP_PATHS.person },
     { t: "8:12 AM", label: "Person", icon: HP_PATHS.person },
@@ -363,7 +367,7 @@ function CameraModal({ camId, onClose }: CameraModalProps) {
               <HubIco d={HP_PATHS.cam} size={18} color="#7C3AED" /><span>Snapshot</span>
             </button>
             <button className="camm__btn" type="button">
-              <HubIco d={HP_PATHS.mic} size={18} color="#7C3AED" /><span>Talk</span>
+              <HubIco d={micEl} size={18} color="#7C3AED" /><span>Talk</span>
             </button>
             <button className="camm__btn" type="button" onClick={() => setMuted((m) => !m)}>
               <HubIco d={muted ? HP_PATHS.micOff : HP_PATHS.speaker} size={18} color="#7C3AED" />
@@ -386,7 +390,7 @@ function CameraModal({ camId, onClose }: CameraModalProps) {
             ))}
           </div>
           <div className="camm__switch">
-            {HOME.cameras.map((c) => (
+            {home.cameras.map((c) => (
               <button
                 key={c.id}
                 className="camm__thumb"
@@ -483,12 +487,13 @@ const CAT_KIND: Record<string, DeviceKind | undefined> = {
 };
 
 function CategorySheet({ catId, onClose }: CategorySheetProps) {
-  const cat = HOME.categories.find((c) => c.id === catId);
+  const home = useHomeData();
+  const cat = home.categories.find((c) => c.id === catId);
   const [armed, setArmed] = useState(false);
   if (!cat) return null;
 
   const kindFor = CAT_KIND[catId];
-  const devices = kindFor ? HOME.devices.filter((d) => d.kind === kindFor) : [];
+  const devices = kindFor ? home.devices.filter((d) => d.kind === kindFor) : [];
 
   function allOn(val: boolean) {
     devices.forEach((d) =>
@@ -570,7 +575,7 @@ function CategorySheet({ catId, onClose }: CategorySheetProps) {
 
         {catId === "cameras" && (
           <div className="cat-camgrid">
-            {HOME.cameras.map((c) => (
+            {home.cameras.map((c) => (
               <div
                 key={c.id}
                 onClick={() =>

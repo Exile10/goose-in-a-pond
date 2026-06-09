@@ -1,7 +1,7 @@
 import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
 import { sunEl } from "./HubIco";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 interface WeatherWidgetProps {
   variant?: "card" | "hero";
@@ -14,7 +14,7 @@ function getForecastIcon(iconKey: string): string | React.ReactNode {
 }
 
 export function WeatherWidget({ variant = "card" }: WeatherWidgetProps) {
-  const w = HOME.weather;
+  const w = useHomeData().weather;
 
   return (
     <div className={`wx wx--${variant}`}>

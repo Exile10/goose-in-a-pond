@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { HubIco, sunEl, pauseEl, filmEl, focusEl } from "./HubIco";
 import { HP_PATHS } from "./icons";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 type SceneLayout = "row" | "col" | "grid";
 
@@ -22,11 +22,12 @@ function getSceneIcon(iconKey: string): string | React.ReactNode {
 }
 
 export function Scenes({ layout = "row" }: ScenesProps) {
-  const [active, setActive] = useState("morning");
+  const { scenes } = useHomeData();
+  const [active, setActive] = useState(() => scenes[0]?.id ?? "morning");
 
   return (
     <div className={`scenes scenes--${layout}`}>
-      {HOME.scenes.map((s) => {
+      {scenes.map((s) => {
         const isActive = active === s.id;
         return (
           <button

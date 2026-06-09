@@ -1,7 +1,7 @@
 import { WeatherWidget } from "../../primitives/WeatherWidget";
 import { DeviceTile } from "../../primitives/DeviceTile";
 import { HubIco, filmEl } from "../../primitives/HubIco";
-import { HOME } from "../../data/mockHome";
+import { useHomeData } from "../../state/hubDataStore";
 
 export type CardKind = "weather" | "lock" | "movie";
 
@@ -10,6 +10,7 @@ interface ResultCardProps {
 }
 
 export function ResultCard({ kind }: ResultCardProps) {
+  const home = useHomeData();
   if (kind === "weather") {
     return (
       <div style={{ maxWidth: 320 }}>
@@ -19,7 +20,7 @@ export function ResultCard({ kind }: ResultCardProps) {
   }
 
   if (kind === "lock") {
-    const lock = HOME.devices.find((d) => d.kind === "lock");
+    const lock = home.devices.find((d) => d.kind === "lock");
     if (!lock) return null;
     return (
       <div style={{ width: 160 }}>

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
-import { HOME } from "../data/mockHome";
+import { useHomeData } from "../state/hubDataStore";
 
 interface RoomPillsProps {
   value?: string;
@@ -11,6 +11,7 @@ interface RoomPillsProps {
 export function RoomPills({ value, onChange }: RoomPillsProps) {
   const [internal, setInternal] = useState("home");
   const active = value ?? internal;
+  const { rooms } = useHomeData();
 
   function pick(id: string) {
     setInternal(id);
@@ -19,7 +20,7 @@ export function RoomPills({ value, onChange }: RoomPillsProps) {
 
   return (
     <div className="rpills">
-      {HOME.rooms.map((r) => {
+      {rooms.map((r) => {
         const isActive = active === r.id;
         const iconPath = HP_PATHS[r.icon as keyof typeof HP_PATHS];
         return (
