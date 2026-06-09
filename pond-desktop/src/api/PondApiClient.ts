@@ -517,6 +517,18 @@ export class PondApiClient {
     return this.get(`/api/v1/recipes/${name}`);
   }
 
+  createRecipe(req: {
+    name: string;
+    description?: string;
+    yaml: string;
+  }): Promise<AgentRecipe> {
+    return this.post("/api/v1/recipes", {
+      name: req.name,
+      description: req.description ?? "",
+      yaml: req.yaml,
+    });
+  }
+
   // ── Chat streaming ────────────────────────────────────────
   //
   // Returns an AsyncGenerator that yields ChatEvent objects.
