@@ -57,6 +57,7 @@ impl DeviceRegistry for MockDeviceRegistry {
             registered_at: "2024-01-01 00:00:00".to_string(),
             last_seen: None,
             is_online: false,
+            room: req.room,
         })
     }
     async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {

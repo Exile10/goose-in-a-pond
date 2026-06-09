@@ -64,6 +64,7 @@ impl DeviceRegistry for NoDevices {
             registered_at: "2024-01-01T00:00:00Z".to_string(),
             last_seen: None,
             is_online: false,
+            room: req.room,
         })
     }
     async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {

@@ -5,7 +5,6 @@
 //!
 //! # TODO
 //! - [ ] Add device status (online/offline/last_seen)
-//! - [ ] Add device grouping / rooms
 //! - [ ] Add device capabilities discovery
 
 use anyhow::Result;
@@ -25,6 +24,10 @@ pub struct Device {
     pub registered_at: String,
     pub last_seen: Option<String>,
     pub is_online: bool,
+    /// Optional room grouping for hub UI ("Living Room", "Kitchen", …).
+    /// `None` means the device shows under the default "Home" room.
+    #[serde(default)]
+    pub room: Option<String>,
 }
 
 /// Request to register a new device.
@@ -34,6 +37,8 @@ pub struct RegisterDeviceRequest {
     pub device_type: String,
     pub hostname: Option<String>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub room: Option<String>,
 }
 
 /// Driven Port: device lifecycle management.
