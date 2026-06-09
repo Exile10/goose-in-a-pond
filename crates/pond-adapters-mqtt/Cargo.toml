@@ -1,0 +1,21 @@
+[package]
+name = "pond-adapters-mqtt"
+description = "MQTT DeviceController adapter — zigbee2mqtt, Tasmota, and generic MQTT devices"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core    = { workspace = true }
+anyhow       = { workspace = true }
+async-trait  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+rumqttc      = "0.24"
+
+[dev-dependencies]
+tokio = { workspace = true }
