@@ -40,6 +40,7 @@ struct DeviceRow {
     capabilities: String,
     created_at: String,
     last_seen: Option<String>,
+    room: Option<String>,
 }
 
 fn row_to_device(row: DeviceRow) -> Device {
@@ -67,6 +68,7 @@ fn row_to_device(row: DeviceRow) -> Device {
         registered_at: row.created_at,
         last_seen: row.last_seen,
         is_online,
+        room: row.room,
     }
 }
 
@@ -79,8 +81,8 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
         sqlx::query(
             "INSERT INTO devices (id, name, hostname, device_type, ip_address, capabilities, \
-             is_online, created_at, updated_at, last_seen) \
-             VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?)",
+             is_online, created_at, updated_at, last_seen, room) \
+             VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&request.name)
@@ -90,6 +92,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
         .bind(&now_str)
         .bind(&now_str)
         .bind(&now_str)
+        .bind(&request.room)
         .execute(&self.pool)
         .await?;
 
@@ -103,12 +106,13 @@ impl DeviceRegistry for SqliteDeviceRegistry {
             registered_at: now_str.clone(),
             last_seen: Some(now_str),
             is_online: true,
+            room: request.room,
         })
     }
 
     async fn list_devices(&self) -> Result<Vec<Device>> {
         let rows: Vec<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room \
              FROM devices ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -118,7 +122,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
     async fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
         let row: Option<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room \
              FROM devices WHERE id = ?",
         )
         .bind(device_id)
@@ -165,6 +169,7 @@ mod tests {
             device_type: "gotg".to_string(),
             hostname: Some("phone.local".to_string()),
             capabilities: vec!["chat".to_string(), "tts".to_string()],
+            room: None,
         }
     }
 
@@ -203,5 +208,32 @@ mod tests {
         let updated = reg.get_device(&dev.id).await.unwrap().unwrap();
         assert!(updated.last_seen.is_some());
         assert!(updated.is_online);
+    }
+
+    #[tokio::test]
+    async fn register_persists_room() {
+        let (reg, _tmp) = make_registry().await;
+        let with_room = RegisterDeviceRequest {
+            room: Some("Living Room".to_string()),
+            ..req("Living Room Lamp")
+        };
+        let dev = reg.register(with_room).await.unwrap();
+        assert_eq!(dev.room.as_deref(), Some("Living Room"));
+
+        let listed = reg.list_devices().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].room.as_deref(), Some("Living Room"));
+
+        let fetched = reg.get_device(&dev.id).await.unwrap().unwrap();
+        assert_eq!(fetched.room.as_deref(), Some("Living Room"));
+    }
+
+    #[tokio::test]
+    async fn register_without_room_keeps_none() {
+        let (reg, _tmp) = make_registry().await;
+        let dev = reg.register(req("Roomless")).await.unwrap();
+        assert!(dev.room.is_none());
+        let listed = reg.list_devices().await.unwrap();
+        assert!(listed[0].room.is_none());
     }
 }

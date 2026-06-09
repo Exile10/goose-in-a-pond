@@ -1424,6 +1424,7 @@ async fn list_devices(
                 "registered_at": d.registered_at,
                 "last_seen":     d.last_seen,
                 "is_online":     d.is_online,
+                "room":          d.room,
             })
         })
         .collect();
@@ -1455,6 +1456,7 @@ async fn register_device(
             "capabilities":  device.capabilities,
             "registered_at": device.registered_at,
             "is_online":     device.is_online,
+            "room":          device.room,
         })),
     ))
 }

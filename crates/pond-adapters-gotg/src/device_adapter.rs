@@ -37,6 +37,7 @@ impl DeviceRegistry for GotgDeviceAdapter {
             registered_at: chrono::Utc::now().to_rfc3339(),
             last_seen: Some(chrono::Utc::now().to_rfc3339()),
             is_online: true,
+            room: request.room,
         };
 
         tracing::info!("Registered device: {} ({})", device.name, device.id);

@@ -91,7 +91,7 @@ impl DeviceMcpServer {
                                 "name": d.name,
                                 "is_online": d.is_online,
                                 "device_type": d.device_type,
-                                "room": "",
+                                "room": d.room.clone().unwrap_or_default(),
                             })
                         })
                         .collect();
