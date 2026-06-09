@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { api } from "../../api/PondApiClient";
-import type { Device, Schedule, Settings } from "../../api/types";
+import type { AgentRecipe, Device, Schedule, Settings } from "../../api/types";
 import {
   HOME as MOCK_HOME,
   type CameraData,
@@ -11,6 +11,9 @@ import {
   type RoomData,
   type SceneData,
 } from "../data/mockHome";
+import { ROUTINES as MOCK_ROUTINES, type RoutineDetail } from "../data/routines";
+import { sunEl, filmEl, focusEl } from "../primitives/HubIco";
+import { HP_PATHS } from "../primitives/icons";
 
 // Reactive store that loads real data from PondApiClient and exposes it in the
 // HomeData shape used by Hub primitives. Falls back to mock data when the API
@@ -20,6 +23,7 @@ type Subscriber = () => void;
 
 interface InternalState {
   data: HomeData;
+  routines: RoutineDetail[];
   loaded: boolean;
   loading: boolean;
   subs: Set<Subscriber>;
@@ -27,6 +31,7 @@ interface InternalState {
 
 const state: InternalState = {
   data: MOCK_HOME,
+  routines: MOCK_ROUTINES,
   loaded: false,
   loading: false,
   subs: new Set(),
@@ -185,6 +190,51 @@ function scenesFromSchedules(schedules: Schedule[]): SceneData[] {
   }));
 }
 
+// ─── Recipe → RoutineDetail mapping ───────────────────────────
+
+const ROUTINE_TEMPLATES: Array<Omit<RoutineDetail, "id" | "name" | "does" | "time">> = [
+  { iconPath: sunEl,         color: "#F59E0B", bg: "linear-gradient(150deg,#FCD34D,#F59E0B)" },
+  { iconPath: HP_PATHS.moon, color: "#6366F1", bg: "linear-gradient(150deg,#818CF8,#4F46E5)" },
+  { iconPath: filmEl,        color: "#7C3AED", bg: "linear-gradient(150deg,#A78BFA,#7C3AED)" },
+  { iconPath: HP_PATHS.away, color: "#0D9488", bg: "linear-gradient(150deg,#2DD4BF,#0D9488)" },
+  { iconPath: focusEl,       color: "#EC4899", bg: "linear-gradient(150deg,#F472B6,#DB2777)" },
+];
+
+function recipeIdHash(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffff;
+  return h;
+}
+
+function routinesFromRecipes(recipes: AgentRecipe[]): RoutineDetail[] {
+  if (!recipes.length) return MOCK_ROUTINES;
+  return recipes.map((r) => {
+    // Re-use the mock visual template when the recipe name matches a known one
+    const known = MOCK_ROUTINES.find((m) => m.name.toLowerCase() === r.name.toLowerCase());
+    const template = known ?? {
+      iconPath: ROUTINE_TEMPLATES[recipeIdHash(r.name) % ROUTINE_TEMPLATES.length].iconPath,
+      color:    ROUTINE_TEMPLATES[recipeIdHash(r.name) % ROUTINE_TEMPLATES.length].color,
+      bg:       ROUTINE_TEMPLATES[recipeIdHash(r.name) % ROUTINE_TEMPLATES.length].bg,
+    };
+    // Pull `does` chips from description (split on commas/semicolons), fallback to known
+    const desc = (r.description ?? "").trim();
+    const does = known
+      ? known.does
+      : desc
+        ? desc.split(/[,;]/).map((s) => s.trim()).filter(Boolean).slice(0, 4)
+        : ["On demand"];
+    return {
+      id:       r.name as RoutineDetail["id"],
+      name:     known?.name ?? r.name,
+      iconPath: template.iconPath,
+      color:    template.color,
+      bg:       template.bg,
+      does:     does.length ? does : ["On demand"],
+      time:     known?.time ?? "On demand",
+    };
+  });
+}
+
 function todayDateStr(): string {
   // "Monday, June 1"
   const d = new Date();
@@ -197,15 +247,17 @@ async function load() {
   if (state.loading) return;
   state.loading = true;
   try {
-    const [settings, devices, schedules] = await Promise.allSettled([
+    const [settings, devices, schedules, recipes] = await Promise.allSettled([
       api.getSettings(),
       api.listDevices(),
       api.listSchedules(),
+      api.listRecipes(),
     ]);
 
     const sOK = settings.status === "fulfilled" ? (settings.value as Settings) : null;
     const dOK = devices.status === "fulfilled" ? devices.value : [];
     const schOK = schedules.status === "fulfilled" ? schedules.value : [];
+    const rcOK = recipes.status === "fulfilled" ? recipes.value : [];
 
     // Partition devices into controllable + cameras
     const ctlDevices: DeviceData[] = [];
@@ -239,6 +291,7 @@ async function load() {
       categories,
       scenes,
     };
+    state.routines = routinesFromRecipes(rcOK);
     state.loaded = true;
     emit();
   } catch {
@@ -264,6 +317,14 @@ export function getHomeData(): HomeData {
   return state.data;
 }
 
+function getRoutinesSnapshot(): RoutineDetail[] {
+  return state.routines;
+}
+
+export function useRoutines(): RoutineDetail[] {
+  return useSyncExternalStore(subscribe, getRoutinesSnapshot, getRoutinesSnapshot);
+}
+
 export function refreshHomeData(): Promise<void> {
   return load();
 }
@@ -271,6 +332,11 @@ export function refreshHomeData(): Promise<void> {
 // Test hook: reset to mock data and clear subscribers — used by vitest tests.
 export function __resetHubDataForTests(): void {
   state.data = MOCK_HOME;
+  state.routines = MOCK_ROUTINES;
   state.loaded = false;
   state.loading = false;
+}
+
+export function __getRoutinesForTests(): RoutineDetail[] {
+  return state.routines;
 }
