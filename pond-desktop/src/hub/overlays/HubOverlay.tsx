@@ -1,38 +1,11 @@
 import { useEffect, useState } from "react";
 import { HubIco, lockEl, unlockEl, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
+import { HubModal as Modal } from "../primitives/HubModal";
 import { CameraFeed } from "../primitives/CameraFeed";
 import { type DeviceData, type DeviceKind } from "../data/mockHome";
 import { useHomeData } from "../state/hubDataStore";
 import { useDeviceState, hubSetDevice } from "../state/hubStore";
-
-// ─── Modal shell ──────────────────────────────────────────────
-interface ModalProps {
-  onClose: () => void;
-  wide?: boolean;
-  children: React.ReactNode;
-}
-
-function Modal({ onClose, wide, children }: ModalProps) {
-  useEffect(() => {
-    const k = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", k);
-    return () => window.removeEventListener("keydown", k);
-  }, [onClose]);
-  return (
-    <div className="hubmodal-backdrop" onClick={onClose}>
-      <div
-        className={`hubmodal${wide ? " hubmodal--wide" : ""}`}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <button className="hubmodal__close" onClick={onClose} aria-label="Close">
-          <HubIco d={HP_PATHS.x} size={18} color="currentColor" />
-        </button>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 // ─── Light control ────────────────────────────────────────────
 const TEMPS: Array<{ k: string; c: string; label: string }> = [

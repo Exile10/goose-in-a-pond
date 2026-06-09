@@ -147,3 +147,148 @@
     padding: 18px 16px;
   }
 }
+
+/* ── recipe builder modal form ─────────────────────────────── */
+.rb-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 4px 2px;
+}
+
+.rb-form__head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding-right: 36px;
+}
+
+.rb-form__icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--pp), var(--pp-700, #6e2bff));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 6px 14px rgba(140, 75, 255, 0.25);
+}
+
+.rb-form__title {
+  font-size: 19px;
+  font-weight: 800;
+  color: var(--ink);
+  margin: 0;
+}
+
+.rb-form__sub {
+  font-size: 13px;
+  color: var(--mut);
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
+.rb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rb-field__label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rb-field__input {
+  width: 100%;
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 11px 13px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+}
+
+.rb-field__input:focus {
+  outline: none;
+  border-color: var(--pp);
+  box-shadow: 0 0 0 3px rgba(140, 75, 255, 0.15);
+}
+
+.rb-field__input--area {
+  resize: vertical;
+  min-height: 90px;
+  line-height: 1.45;
+}
+
+.rb-field__hint {
+  font-size: 11.5px;
+  color: var(--mut);
+}
+
+.rb-field__hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--pp-50);
+  color: var(--ink-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.rb-form__error {
+  font-size: 13px;
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.08);
+  border: 1px solid rgba(192, 57, 43, 0.2);
+  border-radius: 10px;
+  padding: 9px 12px;
+}
+
+.rb-form__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.rb-form__btn {
+  padding: 10px 18px;
+  border-radius: 12px;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+}
+
+.rb-form__btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.rb-form__btn--ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink-2);
+}
+
+.rb-form__btn--ghost:hover:not(:disabled) {
+  background: var(--pp-50);
+}
+
+.rb-form__btn--primary {
+  background: var(--pp);
+  color: #fff;
+}
+
+.rb-form__btn--primary:hover:not(:disabled) {
+  filter: brightness(1.05);
+}

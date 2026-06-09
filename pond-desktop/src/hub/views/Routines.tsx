@@ -5,6 +5,7 @@ import { HP_PATHS } from "../primitives/icons";
 import type { RoutineId } from "../data/routines";
 import { useRoutines } from "../state/hubDataStore";
 import { api } from "../../api/PondApiClient";
+import { RecipeBuilderModal } from "./RecipeBuilderModal";
 
 async function executeRoutine(name: string): Promise<void> {
   try {
@@ -26,6 +27,7 @@ async function executeRoutine(name: string): Promise<void> {
 export function RoutinesView() {
   const routines = useRoutines();
   const [running, setRunning] = useState<RoutineId | null>(null);
+  const [builderOpen, setBuilderOpen] = useState(false);
 
   const handleRun = (id: RoutineId, name: string) => {
     setRunning(id);
@@ -33,15 +35,8 @@ export function RoutinesView() {
     setTimeout(() => setRunning(null), 1600);
   };
 
-  const handleNewRoutine = () => {
-    // TODO: open recipe builder modal — creates an AgentRecipe
-    console.info("TODO: open recipe builder modal");
-  };
-
-  const handleCreateCard = () => {
-    // TODO: open recipe builder modal — creates an AgentRecipe
-    console.info("TODO: open recipe builder modal");
-  };
+  const openBuilder = () => setBuilderOpen(true);
+  const closeBuilder = () => setBuilderOpen(false);
 
   return (
     <div className="rt">
@@ -52,7 +47,7 @@ export function RoutinesView() {
             One tap to set the whole house. Goose runs these for you.
           </p>
         </div>
-        <button className="primary-btn" onClick={handleNewRoutine}>
+        <button className="primary-btn" onClick={openBuilder}>
           <HubIco d={HP_PATHS.plus} size={16} color="#fff" />
           + New routine
         </button>
@@ -123,11 +118,13 @@ export function RoutinesView() {
         })}
 
         {/* dashed "Create a routine" placeholder tile */}
-        <button className="rt-card rt-card--new" onClick={handleCreateCard}>
+        <button className="rt-card rt-card--new" onClick={openBuilder}>
           <HubIco d={HP_PATHS.plus} size={26} color="#9A8FB8" />
           <span>Create a routine</span>
         </button>
       </div>
+
+      {builderOpen && <RecipeBuilderModal onClose={closeBuilder} />}
     </div>
   );
 }
