@@ -651,6 +651,112 @@ async fn recipe_create_missing_yaml_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ── Recipe run tests ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_recipe_returns_404_for_unknown_name() {
+    let (app, _tmp) = make_app().await;
+    let resp = app
+        .oneshot(post(
+            "/api/v1/recipes/no-such-recipe/run",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn run_recipe_streams_sse_for_existing_recipe() {
+    let (app, _tmp) = make_app().await;
+
+    // Seed a valid recipe whose prompt field will become the user message.
+    let yaml = "title: Lights On\ndescription: Turn the lights on.\nprompt: turn the lights on please";
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/recipes",
+            serde_json::json!({
+                "name": "lights_on",
+                "description": "Turn on lights",
+                "yaml": yaml,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(post(
+            "/api/v1/recipes/lights_on/run",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "expected SSE content-type, got {content_type:?}"
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("\"done\":true"),
+        "expected a done event in SSE body, got: {body}"
+    );
+    // MockAgent echoes the input — the resolved prompt should reach the agent.
+    // The text stream is chunked, so we look for a fragment unlikely to straddle
+    // a chunk boundary instead of the whole prompt.
+    assert!(
+        body.contains("lights on please"),
+        "expected the recipe prompt to be echoed by MockAgent, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn run_recipe_falls_back_when_yaml_invalid() {
+    let (app, _tmp) = make_app().await;
+
+    // create_recipe doesn't validate yaml, so we can persist garbage and still
+    // run the recipe — the handler must fall back to the literal prompt.
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/recipes",
+            serde_json::json!({
+                "name": "broken",
+                "description": "intentionally broken yaml",
+                "yaml": ":::: not yaml :::: \n  - ?? !!",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(post("/api/v1/recipes/broken/run", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("routine: broken"),
+        "expected fallback prompt in echoed body, got: {body}"
+    );
+}
+
 // ── 501 when repos are None ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -725,6 +831,7 @@ async fn returns_501_when_repos_not_configured() {
         (Method::GET, "/api/v1/agent/extras"),
         (Method::GET, "/api/v1/skills"),
         (Method::GET, "/api/v1/recipes"),
+        (Method::POST, "/api/v1/recipes/anything/run"),
     ] {
         let req = Request::builder()
             .method(method.clone())

@@ -7886,6 +7886,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "goose",
  "hostname",
  "pond-adapters-llamafile",
  "pond-adapters-local-inference",
