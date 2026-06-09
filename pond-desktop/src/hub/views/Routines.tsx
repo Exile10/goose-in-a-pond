@@ -2,28 +2,44 @@ import React, { useState } from "react";
 import "./routines.css";
 import { HubIco } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
-import { ROUTINES, type RoutineId } from "../data/routines";
+import type { RoutineId } from "../data/routines";
+import { useRoutines } from "../state/hubDataStore";
+import { api } from "../../api/PondApiClient";
+
+async function executeRoutine(name: string): Promise<void> {
+  try {
+    // Drive the chat stream so the agent dispatches the routine; consume
+    // the events to completion without surfacing them to the UI.
+    for await (const _ of api.chatStream(`Run routine: ${name}`)) {
+      void _;
+    }
+  } catch {
+    // Best-effort: surfacing errors here would block the visual "Running" toast.
+  }
+}
 
 // ─── RoutinesView ──────────────────────────────────────────────
-// Phase 6: one-tap scene cards. These are on-demand macros, NOT
-// time-triggered schedules. Future Phase 8 wires Run to api.executeRecipe().
+// One-tap scene cards backed by AgentRecipe records from the backend.
+// Run dispatches a chat-stream message "Run routine: <name>" so the
+// agent executes the recipe; we don't await the stream — fire and forget.
 
 export function RoutinesView() {
+  const routines = useRoutines();
   const [running, setRunning] = useState<RoutineId | null>(null);
 
-  const handleRun = (id: RoutineId) => {
+  const handleRun = (id: RoutineId, name: string) => {
     setRunning(id);
-    // TODO (Phase 8): wire to api.executeRecipe(id) — AgentRecipe execution
+    void executeRoutine(name);
     setTimeout(() => setRunning(null), 1600);
   };
 
   const handleNewRoutine = () => {
-    // TODO (Phase 8): open recipe builder modal — creates an AgentRecipe
+    // TODO: open recipe builder modal — creates an AgentRecipe
     console.info("TODO: open recipe builder modal");
   };
 
   const handleCreateCard = () => {
-    // TODO (Phase 8): open recipe builder modal — creates an AgentRecipe
+    // TODO: open recipe builder modal — creates an AgentRecipe
     console.info("TODO: open recipe builder modal");
   };
 
@@ -43,7 +59,7 @@ export function RoutinesView() {
       </header>
 
       <div className="rt__grid">
-        {ROUTINES.map((routine) => {
+        {routines.map((routine) => {
           const isRunning = running === routine.id;
           return (
             <div key={routine.id} className="rt-card">
@@ -83,7 +99,7 @@ export function RoutinesView() {
                       }
                     : { color: routine.color }
                 }
-                onClick={() => handleRun(routine.id)}
+                onClick={() => handleRun(routine.id, routine.name)}
               >
                 {isRunning ? (
                   <>
