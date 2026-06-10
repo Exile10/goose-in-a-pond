@@ -48,6 +48,7 @@ pond-adapters-local-inference = { workspace = true, optional = true }
 pond-adapters-face-onnx       = { workspace = true, optional = true }
 pond-core              = { workspace = true }
 pond-api               = { workspace = true }
+pond-hf-cache          = { workspace = true }
 pond-infra             = { workspace = true }
 pond-infra-scheduler   = { workspace = true }
 pond-adapters-weather  = { workspace = true }
@@ -83,6 +84,8 @@ webbrowser = { workspace = true }
 zip = "2"
 flate2 = "1"
 tar = "0.4"
+url = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 wiremock   = { workspace = true }

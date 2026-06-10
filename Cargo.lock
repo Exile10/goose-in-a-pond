@@ -7892,6 +7892,7 @@ dependencies = [
  "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-core",
+ "pond-hf-cache",
  "pond-infra",
  "rand 0.8.6",
  "reqwest 0.13.3",
@@ -7927,6 +7928,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pond-hf-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "reqwest 0.13.3",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -8038,6 +8053,7 @@ dependencies = [
  "pond-agent",
  "pond-api",
  "pond-core",
+ "pond-hf-cache",
  "pond-inference",
  "pond-infra",
  "pond-infra-scheduler",
@@ -8046,6 +8062,7 @@ dependencies = [
  "reqwest 0.13.3",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tar",
  "tempfile",
@@ -8053,6 +8070,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webbrowser",
  "wiremock",

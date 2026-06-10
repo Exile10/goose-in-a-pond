@@ -1083,12 +1083,113 @@ fn hugging_face_token() -> Option<String> {
     None
 }
 
+/// Mirrors `main::default_data_dir()` — kept here because `model_download` runs
+/// inside the binary AND as a library helper without access to main's privates.
+fn resolve_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("POND_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("goose-in-a-pond")
+}
+
+/// Stream a Hugging Face URL through the hf_cache (resumable, etag-aware,
+/// auth survives redirects). Symlinks the legacy flat `dest` path to the
+/// content-addressed blob so `filesystem_model_storage::path_for()` still
+/// returns the same on-disk location.
+async fn download_via_hf_cache(
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+    dest: &Path,
+    approx_size_mb: u64,
+) -> Result<()> {
+    let data_dir = resolve_data_dir();
+    let cache = pond_hf_cache::HfCache::new(&data_dir);
+
+    // Token precedence: existing env-var helper first, then HfCache's token file.
+    let token: Option<String> = hugging_face_token().or_else(|| cache.token().map(String::from));
+
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref())?;
+
+    let repo = cache
+        .repo(repo_id.to_string())
+        .with_revision(revision.to_string());
+    let fetch = repo.file(filename.to_string());
+
+    // Progress closure: reuses the verbatim CLI progress line from the legacy path.
+    let approx_total = approx_size_mb * 1_048_576;
+    let mut last_printed = 0u64;
+    let progress = |downloaded: u64, total: u64| {
+        let effective_total = if total == 0 {
+            approx_total.max(1)
+        } else {
+            total
+        };
+        // Throttle stdout updates to ~256 KiB to avoid flooding.
+        if downloaded < effective_total && downloaded.saturating_sub(last_printed) < 262_144 {
+            return;
+        }
+        last_printed = downloaded;
+        let pct = (downloaded * 100) / effective_total.max(1);
+        print!(
+            "\r  ⬇  {} / {} MB  ({}%)",
+            downloaded / 1_048_576,
+            effective_total / 1_048_576,
+            pct
+        );
+        std::io::stdout().flush().ok();
+    };
+
+    let blob_path = fetch
+        .download_to_blob(&client, token.as_deref(), progress)
+        .await
+        .with_context(|| format!("hf_cache fetch {repo_id}/{filename}@{revision}"))?;
+    println!();
+
+    // Symlink (or copy fallback on non-unix) the legacy dest path to the blob.
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let _ = tokio::fs::remove_file(dest).await;
+    link_or_copy(&blob_path, dest).await?;
+
+    println!("  ✅ Saved: {}", dest.display());
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::os::unix::fs::symlink(&src, &dest)
+            .with_context(|| format!("symlink {} -> {}", dest.display(), src.display()))
+    })
+    .await
+    .map_err(|e| anyhow!("symlink task panicked: {e}"))?
+}
+
+#[cfg(not(unix))]
+async fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
+    tokio::fs::copy(src, dest)
+        .await
+        .map(|_| ())
+        .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))
+}
+
 pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
     println!(
         "  ⬇  {} (~{} MB)",
         dest.file_name().unwrap_or_default().to_string_lossy(),
         approx_size_mb
     );
+
+    // ── HF dispatch: route HF URLs through the hardened cache path ───────────
+    if let Some((repo_id, revision, filename)) = pond_hf_cache::parse_hf_url(url) {
+        return download_via_hf_cache(&repo_id, &revision, &filename, dest, approx_size_mb).await;
+    }
 
     let client = reqwest::Client::builder().build()?;
     // Hugging Face gates models behind both repo-level licenses (e.g. Gemma)

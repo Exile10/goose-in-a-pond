@@ -11,6 +11,7 @@ local-inference = ["dep:pond-adapters-local-inference"]
 
 [dependencies]
 pond-core = { workspace = true }
+pond-hf-cache = { workspace = true }
 pond-infra = { workspace = true }
 pond-adapters-llamafile = { workspace = true }
 pond-adapters-ollama = { path = "../pond-adapters-ollama" }
