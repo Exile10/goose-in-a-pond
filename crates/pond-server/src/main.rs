@@ -25,7 +25,9 @@ mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
 mod model_download;
+#[cfg(feature = "legacy-subprocess")]
 mod piper_http;
+#[cfg(feature = "legacy-subprocess")]
 mod piper_process;
 mod ports;
 mod reqwest_model_downloader;
@@ -41,7 +43,9 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
+#[cfg(feature = "legacy-subprocess")]
 use pond_adapters_piper::PiperOutput;
+use pond_adapters_piper::PiperRsOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 #[cfg(feature = "legacy-subprocess")]
 use pond_adapters_whisper::WhisperInput;
@@ -958,12 +962,22 @@ async fn run_server(
 
     // Only download/install piper components when piper is the configured active TTS
     // AND a specific voice model has been chosen by the user.
+    //
+    // In-process build (default): download the .onnx + .onnx.json voice model
+    // and the espeak-ng-data directory. No `piper` binary needed any more —
+    // piper-rs loads the ONNX model directly via ort.
+    //
+    // Legacy build (--features legacy-subprocess): additionally download the
+    // `piper` executable.
     let piper_is_primary = settings.active_tts_model.starts_with("piper");
     if piper_is_primary {
         if let Some(ref piper_model_path) = piper_model {
-            if !model_download::piper_binary_path(&data_dir).exists() {
-                println!("  📥 Piper binary not found — downloading...");
-                let _ = model_download::download_piper_binary(&data_dir).await;
+            #[cfg(feature = "legacy-subprocess")]
+            {
+                if !model_download::piper_binary_path(&data_dir).exists() {
+                    println!("  📥 Piper binary not found — downloading...");
+                    let _ = model_download::download_piper_binary(&data_dir).await;
+                }
             }
             if !piper_model_path.exists() {
                 // Look up the exact voice in the DB to get the correct download URL.
@@ -999,8 +1013,10 @@ async fn run_server(
         }
     }
 
-    // Start piper as a persistent HTTP server so it shows up in the service list.
-    // Only starts when both the binary and a configured voice model are present on disk.
+    // espeak-ng phoneme data directory. Used by both backends:
+    // - Legacy subprocess: passed to piper as `--espeak_data <dir>`.
+    // - In-process: set as the `PIPER_ESPEAKNG_DATA_DIRECTORY` env var that
+    //   espeak-rs consults during its lazy init.
     let espeak_data = {
         let p = model_download::piper_espeak_data_path(&data_dir);
         if p.exists() {
@@ -1009,7 +1025,51 @@ async fn run_server(
             None
         }
     };
+
+    // ── Construct the TTS backend ──
+    //
+    // Default: in-process `PiperRsOutput`. Loads the .onnx + .onnx.json once
+    // and synthesises with zero subprocess overhead.
+    //
+    // Legacy: `PiperOutput` (subprocess) plus a `piper_http` HTTP wrapper on a
+    // background port for backwards compatibility with the old `piper_http_port`
+    // status report.
+    #[allow(unused_mut)]
     let mut piper_http_port: Option<u16> = None;
+
+    #[cfg(not(feature = "legacy-subprocess"))]
+    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
+        match &piper_model {
+            Some(model_path) if model_path.exists() => {
+                let config_path =
+                    std::path::PathBuf::from(format!("{}.json", model_path.display()));
+                if !config_path.exists() {
+                    println!(
+                        "  ⚠  Piper voice config (.onnx.json) missing at {}",
+                        config_path.display()
+                    );
+                    None
+                } else {
+                    match PiperRsOutput::new(model_path.clone(), config_path) {
+                        Ok(out) => {
+                            let out = match espeak_data.clone() {
+                                Some(d) => out.with_espeak_data(d),
+                                None => out,
+                            };
+                            println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
+                            Some(Arc::new(out) as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("PiperRsOutput failed to load voice: {e}");
+                            None
+                        }
+                    }
+                }
+            }
+            _ => None,
+        };
+
+    #[cfg(feature = "legacy-subprocess")]
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
         match (piper_process::find_binary(&data_dir), &piper_model) {
             (Some(bin), Some(model_path)) if model_path.exists() => {
@@ -2628,13 +2688,6 @@ async fn run_chat(
             match model_path_opt {
                 None => Arc::new(PrintOutput),
                 Some(model_path) => {
-                    if piper_process::find_binary(&data_dir).is_none() {
-                        println!("  📥 TTS binary not found — downloading...");
-                        match model_download::download_piper_binary(&data_dir).await {
-                            Ok(_) => {}
-                            Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
-                        }
-                    }
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
                     // downloaded in an earlier version that didn't fetch the config.
@@ -2673,17 +2726,75 @@ async fn run_chat(
                             );
                         }
                     }
-                    match piper_process::find_binary(&data_dir) {
-                        Some(bin) => {
-                            println!(
-                                "  TTS:      piper ({})",
-                                model_path.file_name().unwrap_or_default().to_string_lossy()
-                            );
-                            Arc::new(PiperOutput::new(bin, model_path))
+
+                    // espeak-ng-data: in-process backend uses the env var
+                    // path; legacy subprocess passes it as --espeak_data.
+                    let espeak_data_dir = {
+                        let p = model_download::piper_espeak_data_path(&data_dir);
+                        if p.exists() {
+                            Some(p)
+                        } else {
+                            None
                         }
-                        None => {
-                            println!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                            Arc::new(PrintOutput)
+                    };
+
+                    // Default: in-process. Loads the .onnx + .onnx.json via
+                    // piper-rs and synthesises with zero subprocess overhead.
+                    #[cfg(not(feature = "legacy-subprocess"))]
+                    {
+                        if !model_path.exists() || !config_path.exists() {
+                            println!("  TTS:      piper unavailable (model or config missing) — falling back to print");
+                            Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                        } else {
+                            match PiperRsOutput::new(model_path.clone(), config_path) {
+                                Ok(out) => {
+                                    let out = match espeak_data_dir {
+                                        Some(d) => out.with_espeak_data(d),
+                                        None => out,
+                                    };
+                                    println!(
+                                        "  TTS:      piper-rs ({})",
+                                        model_path.file_name().unwrap_or_default().to_string_lossy()
+                                    );
+                                    Arc::new(out) as Arc<dyn VoiceOutput>
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "  TTS:      piper unavailable (load failed: {}) — falling back to print",
+                                        e
+                                    );
+                                    Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                                }
+                            }
+                        }
+                    }
+
+                    // Legacy: subprocess `piper` binary.
+                    #[cfg(feature = "legacy-subprocess")]
+                    {
+                        if piper_process::find_binary(&data_dir).is_none() {
+                            println!("  📥 TTS binary not found — downloading...");
+                            match model_download::download_piper_binary(&data_dir).await {
+                                Ok(_) => {}
+                                Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                            }
+                        }
+                        match piper_process::find_binary(&data_dir) {
+                            Some(bin) => {
+                                println!(
+                                    "  TTS:      piper ({})",
+                                    model_path.file_name().unwrap_or_default().to_string_lossy()
+                                );
+                                let mut out = PiperOutput::new(bin, model_path);
+                                if let Some(d) = espeak_data_dir {
+                                    out = out.with_espeak_data(d);
+                                }
+                                Arc::new(out) as Arc<dyn VoiceOutput>
+                            }
+                            None => {
+                                println!("  TTS:      piper unavailable (binary not found) — falling back to print");
+                                Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                            }
                         }
                     }
                 }
