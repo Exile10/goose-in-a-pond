@@ -22,7 +22,7 @@ ndarray     = { workspace = true }
 # Expects `ORT_DYLIB_PATH` to point at `libonnxruntime.so` (Linux/Jetson) or
 # `libonnxruntime.dylib` (macOS). Falls back to the default library search
 # path if unset.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

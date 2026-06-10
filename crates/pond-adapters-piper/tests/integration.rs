@@ -1,7 +1,12 @@
-//! Integration tests for PiperOutput.
+//! Integration tests for the legacy subprocess `PiperOutput`.
+//!
+//! Entire file gated on `--features legacy-subprocess`; the default in-process
+//! `PiperRsOutput` build has nothing to integration-test here (panic-free
+//! constructor and file-not-found Err paths are covered by unit tests in
+//! `src/in_process.rs`).
 //!
 //! These tests exercise the subprocess-based TTS adapter without requiring a
-//! real piper binary or audio device.  They verify:
+//! real piper binary or audio device. They verify:
 //!
 //!   1. `speak()` surfaces a useful error when the binary path is wrong.
 //!   2. `speak()` propagates a non-zero subprocess exit code as an `Err`.
@@ -9,6 +14,8 @@
 //!
 //! The live smoke test at the bottom requires a real piper binary and model
 //! and is ignored by default.
+
+#![cfg(feature = "legacy-subprocess")]
 
 use pond_adapters_piper::PiperOutput;
 use pond_core::ports::voice_output::VoiceOutput;
