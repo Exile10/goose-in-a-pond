@@ -13,6 +13,11 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 // ── whisper-server binary download ────────────────────────────────────────────
+//
+// The subprocess path is gated behind `legacy-subprocess` at the call site
+// (main.rs, whisper_process.rs). These helpers stay compiled in both builds
+// because gating each item individually would noise up the module; the
+// dead-code warnings on the default build are accepted as a known trade-off.
 
 /// Pinned stable release — repo moved from ggerganov → ggml-org at v1.8.x.
 const WHISPER_RELEASE_TAG: &str = "v1.8.4";
