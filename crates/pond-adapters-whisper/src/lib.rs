@@ -1,35 +1,35 @@
 //! Whisper ASR adapter for Goose In A Pond.
 //!
 //! Exports:
-//! - `WhisperInput`           — `VoiceInput` port: record mic → whisper → text
+//! - `WhisperRsInput`         — in-process `VoiceInput` port (whisper-rs, default)
+//! - `WhisperInput`           — legacy HTTP `VoiceInput` port (gated by `legacy-subprocess`)
 //! - `WhisperKeywordDetector` — `WakeWordDetector` port: poll mic until trigger phrase heard
+//! - `WhisperBackend`         — backend trait the detector uses to transcribe windows
 //!
-//! Implements the `VoiceInput` port by:
-//!   1. Recording audio from the default microphone via `cpal`
-//!   2. Encoding the captured PCM as a WAV file in memory
-//!   3. POSTing the WAV to a local [whisper.cpp server] at `POST /inference`
-//!      (the whisper.cpp server API — not the OpenAI `/v1/audio/transcriptions` path)
-//!   4. Returning the transcribed text
+//! ## Default — in-process (`WhisperRsInput`)
 //!
-//! This keeps the same "local HTTP server" pattern as `pond-adapters-llamafile`
-//! — no native Rust bindings, no long compile times.
+//! Loads a ggml `.bin` model directly via the whisper.cpp bindings. No port,
+//! no subprocess, no multipart HTTP. Shares the ggml CUDA primary context with
+//! `llama-cpp-2` on Jetson.
 //!
-//! ## Running the whisper.cpp server
+//! ## Legacy — HTTP (`WhisperInput`)
 //!
-//! ```bash
-//! # Download a model (e.g. ggml-base.en.bin from huggingface)
-//! ./server -m models/ggml-base.en.bin --port 9000
-//! ```
-//!
-//! [whisper.cpp server]: https://github.com/ggerganov/whisper.cpp/tree/master/examples/server
+//! Behind `#[cfg(feature = "legacy-subprocess")]`. Records via `cpal`, encodes
+//! to WAV, POSTs multipart to a local whisper.cpp server at `:9000`. Kept as a
+//! one-release escape valve.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "legacy-subprocess")]
+use pond_core::ports::voice_input::VoiceInput;
+
+mod in_process;
+pub use in_process::WhisperRsInput;
 
 /// Play a short two-tone confirmation ping (C6→E6, ~220ms).
 /// Called when the wake word is detected so the user gets immediate audio feedback.
@@ -65,12 +65,31 @@ fn play_wake_ping() {
 }
 
 /// Default whisper.cpp server URL.
+#[cfg(feature = "legacy-subprocess")]
 pub const DEFAULT_HOST: &str = "http://127.0.0.1:9000";
 
-// ── WhisperInput ─────────────────────────────────────────────────────────────
+// ── WhisperBackend trait ──────────────────────────────────────────────────────
+
+/// Synchronous transcription backend.
+///
+/// Both the in-process `WhisperRsInput` and the legacy HTTP `WhisperInput`
+/// implement this trait. The `WhisperKeywordDetector` holds an
+/// `Arc<dyn WhisperBackend>` and calls `transcribe_pcm_blocking` on each window
+/// during the wake-word detection loop.
+///
+/// Called from inside `tokio::task::spawn_blocking`, so a blocking call is fine.
+pub trait WhisperBackend: Send + Sync {
+    /// Transcribe 16 kHz mono f32 PCM. Implementations should pass the result
+    /// through `strip_whisper_artifacts`. Returns an empty string for silence /
+    /// no detected speech (never panics).
+    fn transcribe_pcm_blocking(&self, samples: &[f32]) -> Result<String>;
+}
+
+// ── WhisperInput (legacy HTTP) ───────────────────────────────────────────────
 
 /// VoiceInput adapter that records from the microphone and transcribes via
 /// a local whisper.cpp HTTP server.
+#[cfg(feature = "legacy-subprocess")]
 pub struct WhisperInput {
     client: reqwest::Client,
     transcription_url: String,
@@ -83,6 +102,7 @@ pub struct WhisperInput {
     captured: Mutex<Option<Vec<u8>>>,
 }
 
+#[cfg(feature = "legacy-subprocess")]
 impl WhisperInput {
     /// Create a new adapter pointing at `server_url` (e.g. `"http://127.0.0.1:9000"`).
     /// Defaults to `DEFAULT_HOST` when `server_url` is `None`.
@@ -110,6 +130,7 @@ impl WhisperInput {
     }
 }
 
+#[cfg(feature = "legacy-subprocess")]
 #[async_trait]
 impl VoiceInput for WhisperInput {
     async fn listen(&self) -> Result<Option<String>> {
@@ -190,6 +211,7 @@ impl VoiceInput for WhisperInput {
     }
 }
 
+#[cfg(feature = "legacy-subprocess")]
 impl WhisperInput {
     /// POST pre-encoded WAV bytes to the whisper server and return the transcript.
     ///
@@ -233,9 +255,24 @@ impl WhisperInput {
     }
 }
 
+#[cfg(feature = "legacy-subprocess")]
+impl WhisperBackend for WhisperInput {
+    fn transcribe_pcm_blocking(&self, samples: &[f32]) -> Result<String> {
+        let wav = encode_wav_mono_16k(samples);
+        let server_url = self
+            .transcription_url
+            .strip_suffix("/inference")
+            .unwrap_or(&self.transcription_url);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        Ok(transcribe_blocking(&client, server_url, wav)?.unwrap_or_default())
+    }
+}
+
 /// Remove Whisper non-speech tags (`[BLANK_AUDIO]`, `[MUSIC]`, `[NOISE]`, …)
 /// and return the remaining text trimmed.  If nothing real remains, returns "".
-fn strip_whisper_artifacts(text: &str) -> String {
+pub(crate) fn strip_whisper_artifacts(text: &str) -> String {
     // Strip all [BRACKETED_TAGS] — Whisper uses these for non-speech events.
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -323,7 +360,7 @@ fn strip_whisper_artifacts(text: &str) -> String {
 
 /// Decode a 16-bit mono PCM WAV (as produced by `encode_wav_mono_16k`) back to
 /// f32 samples.  Returns `(samples, sample_rate)`.
-fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
+pub(crate) fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
     if wav.len() < 44 {
         return Err(anyhow!("WAV too short ({} bytes)", wav.len()));
     }
@@ -348,7 +385,10 @@ fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 ///
 /// Stops when `silence_ms` consecutive milliseconds of silence are detected,
 /// or after `max_record_secs` total recording time.
-fn record_mono_f32_until_silence(max_record_secs: u32, silence_ms: u64) -> Result<(Vec<f32>, u32)> {
+pub(crate) fn record_mono_f32_until_silence(
+    max_record_secs: u32,
+    silence_ms: u64,
+) -> Result<(Vec<f32>, u32)> {
     const SILENCE_RMS: f32 = 0.005;
     const POLL_MS: u64 = 30;
 
@@ -470,7 +510,7 @@ fn record_mono_f32_until_silence(max_record_secs: u32, silence_ms: u64) -> Resul
 ///
 /// Returns mono f32 PCM samples and the device's sample rate.
 /// Returns `Ok((empty, rate))` if no speech was detected within the wait period.
-fn record_mono_f32_vad(
+pub(crate) fn record_mono_f32_vad(
     max_wait_secs: u32,
     max_record_secs: u32,
     silence_ms: u64,
@@ -621,7 +661,7 @@ fn record_mono_f32_vad(
 // ── DSP helpers ───────────────────────────────────────────────────────────────
 
 /// Linear interpolation resample to 16 000 Hz (whisper's expected rate).
-fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
+pub(crate) fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
     if src_rate == 16_000 {
         return samples.to_vec();
     }
@@ -642,7 +682,7 @@ fn resample_to_16k(samples: &[f32], src_rate: u32) -> Vec<f32> {
 
 /// Encode mono 16-bit PCM at 16 kHz as a WAV byte vector.
 /// Avoids any external WAV crate dependency.
-fn encode_wav_mono_16k(samples: &[f32]) -> Vec<u8> {
+pub(crate) fn encode_wav_mono_16k(samples: &[f32]) -> Vec<u8> {
     let sample_rate: u32 = 16_000;
     let channels: u16 = 1;
     let bits_per_sample: u16 = 16;
@@ -749,7 +789,9 @@ impl Default for KeywordDetectorConfig {
 /// Implements `StreamingWakeWordDetector`; the blanket impl provides
 /// `WakeWordDetector` automatically.
 pub struct WhisperKeywordDetector {
-    server_url: String,
+    /// Transcription backend — `WhisperRsInput` (in-process) by default,
+    /// `WhisperInput` (HTTP) when `legacy-subprocess` is the backend wired in.
+    backend: Arc<dyn WhisperBackend>,
     /// All normalized trigger variants. A transcript matching *any* of these fires detection.
     triggers: Vec<String>,
     prompt: String,
@@ -757,13 +799,13 @@ pub struct WhisperKeywordDetector {
 }
 
 impl WhisperKeywordDetector {
-    /// Create a detector listening for `trigger` (e.g. `"goose"`).
-    /// Uses `server_url` for whisper (defaults to `DEFAULT_HOST`).
-    pub fn new(server_url: Option<&str>, trigger: impl Into<String>) -> Self {
+    /// Create a detector that calls `backend` to transcribe each window.
+    /// `trigger` is the wake phrase (e.g. `"goose"`).
+    pub fn new(backend: Arc<dyn WhisperBackend>, trigger: impl Into<String>) -> Self {
         let raw = trigger.into();
         let prompt = format!("Say \"{}\" to activate...", raw);
         Self {
-            server_url: server_url.unwrap_or(DEFAULT_HOST).to_string(),
+            backend,
             triggers: vec![normalize_transcript(&raw)],
             prompt,
             config: KeywordDetectorConfig::default(),
@@ -869,11 +911,11 @@ fn rms_energy(samples: &[f32]) -> f32 {
 #[async_trait]
 impl StreamingWakeWordDetector for WhisperKeywordDetector {
     async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
-        let server_url = self.server_url.clone();
+        let backend = self.backend.clone();
         let triggers = self.triggers.clone();
         let config = self.config.clone();
 
-        tokio::task::spawn_blocking(move || detection_loop(server_url, triggers, config))
+        tokio::task::spawn_blocking(move || detection_loop(backend, triggers, config))
             .await
             .map_err(|e| anyhow!("detection thread panicked: {}", e))?
     }
@@ -889,7 +931,7 @@ impl StreamingWakeWordDetector for WhisperKeywordDetector {
 /// detection window over it, sending each window to whisper.cpp for
 /// transcription.  Returns when the trigger phrase is confirmed.
 fn detection_loop(
-    server_url: String,
+    backend: Arc<dyn WhisperBackend>,
     triggers: Vec<String>,
     config: KeywordDetectorConfig,
 ) -> Result<WakeWordActivation> {
@@ -963,10 +1005,6 @@ fn detection_loop(
     let mut slide_ms = config.slide_ms;
     let mut hysteresis = false;
 
-    let blocking_client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
     loop {
         std::thread::sleep(std::time::Duration::from_millis(slide_ms));
 
@@ -990,13 +1028,14 @@ fn detection_loop(
             }
         }
 
-        // Transcribe the window.
+        // Transcribe the window via the backend (in-process or HTTP).
         let resampled = resample_to_16k(&snapshot, sample_rate);
-        let wav = encode_wav_mono_16k(&resampled);
 
-        let transcript = match transcribe_blocking(&blocking_client, &server_url, wav) {
-            Ok(Some(t)) => {
-                // Strip artifacts first so [BLANK_AUDIO] etc. don't pollute matching.
+        let transcript = match backend.transcribe_pcm_blocking(&resampled) {
+            Ok(t) if !t.is_empty() => {
+                // Backend implementations already strip artifacts, but call
+                // it again so a stray bracketed tag never makes it into the
+                // trigger-matching path.
                 let cleaned = strip_whisper_artifacts(&t);
                 if cleaned.is_empty() {
                     tracing::debug!("KWS: artifact-only transcript stripped: {:?}", t);
@@ -1004,7 +1043,7 @@ fn detection_loop(
                 }
                 normalize_transcript(&cleaned)
             }
-            Ok(None) => {
+            Ok(_) => {
                 tracing::debug!("No speech in window");
                 continue;
             }
@@ -1103,6 +1142,7 @@ fn detection_loop(
 }
 
 /// POST WAV bytes to whisper.cpp using a blocking HTTP client.
+#[cfg(feature = "legacy-subprocess")]
 fn transcribe_blocking(
     client: &reqwest::blocking::Client,
     server_url: &str,
@@ -1138,11 +1178,14 @@ fn transcribe_blocking(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "legacy-subprocess")]
     #[test]
     fn whisper_input_default_prompt() {
+        use pond_core::ports::voice_input::VoiceInput;
         assert_eq!(WhisperInput::new(None).prompt(), "🎤 ");
     }
 
+    #[cfg(feature = "legacy-subprocess")]
     #[test]
     fn whisper_input_custom_url() {
         let w = WhisperInput::new(Some("http://192.168.1.100:9000"));
@@ -1181,6 +1224,7 @@ mod tests {
         assert!((out.len() as i32 - 32).abs() <= 1, "len was {}", out.len());
     }
 
+    #[cfg(feature = "legacy-subprocess")]
     #[test]
     fn duration_builder() {
         let w = WhisperInput::new(None).with_duration(10);

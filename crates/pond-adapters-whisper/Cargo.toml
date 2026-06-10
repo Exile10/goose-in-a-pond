@@ -5,18 +5,47 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+# ── Build note ────────────────────────────────────────────────────────────────
+# Default build is CPU-only `whisper-rs`. To enable hardware acceleration:
+#   macOS:   cargo build -p pond-adapters-whisper --features metal
+#   Jetson:  cargo build -p pond-adapters-whisper --features cuda
+# On macOS targets `metal` is auto-enabled below via a target-specific dep entry.
+#
+# `legacy-subprocess` keeps the old HTTP whisper-server adapter compilable as a
+# one-release escape valve. Default builds omit it (and `reqwest`).
+
+[features]
+default = []
+# Enable CUDA kernel compilation for Jetson Orin Nano / NVIDIA GPUs.
+cuda = ["whisper-rs/cuda"]
+# Enable Metal acceleration on macOS (also auto-enabled on macOS targets via
+# the `[target.'cfg(target_os = "macos")']` dependency entry below).
+metal = ["whisper-rs/metal"]
+# Keep the legacy HTTP `WhisperInput` (multipart POST to whisper-server :9000)
+# compilable. Default builds omit it and drop the `reqwest` dependency entirely.
+legacy-subprocess = ["dep:reqwest", "dep:serde_json"]
+
 [dependencies]
 pond-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { workspace = true, features = ["json", "multipart", "blocking"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 cpal = "0.15"
 # Audio feedback (wake-word confirmation ping)
 rodio = "0.19"
+# In-process whisper.cpp bindings.
+whisper-rs = { version = "0.16", default-features = false, features = ["log_backend"] }
+
+# Optional — only pulled in when `legacy-subprocess` is on.
+reqwest = { workspace = true, features = ["json", "multipart", "blocking"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+# Auto-enable Metal acceleration on macOS targets so a plain
+# `cargo build -p pond-adapters-whisper` on a Mac gets GPU offload.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", default-features = false, features = ["log_backend", "metal"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }

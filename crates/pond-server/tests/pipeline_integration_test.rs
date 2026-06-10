@@ -19,6 +19,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use pond_adapters_ollama::OllamaProvider;
+#[cfg(feature = "legacy-subprocess")]
 use pond_adapters_whisper::WhisperInput;
 use pond_core::domain::message::Role;
 use pond_core::ports::session_storage::SessionStorage;
@@ -216,6 +217,10 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
 /// a real microphone — the test feeds a pre-recorded WAV file directly to
 /// `WhisperInput::transcribe_wav()`, then passes the transcript to
 /// `ChatService::chat_once()`.
+///
+/// Gated on `legacy-subprocess` because the test exercises the HTTP backend.
+/// The in-process backend has its own coverage in `pond-adapters-whisper`.
+#[cfg(feature = "legacy-subprocess")]
 #[tokio::test]
 async fn voice_mode_whisper_to_ollama_pipeline() {
     // ── Mock whisper.cpp ──
@@ -318,6 +323,7 @@ async fn pipeline_message_roles_are_correct() {
 ///
 /// The test runs a single chat turn: you speak a sentence, it gets transcribed
 /// by Whisper, answered by Ollama, and spoken back via Piper.
+#[cfg(feature = "legacy-subprocess")]
 #[tokio::test]
 #[ignore = "requires microphone, whisper.cpp, Ollama, and piper — full hardware stack"]
 async fn live_full_voice_loop() {
@@ -354,6 +360,7 @@ async fn live_full_voice_loop() {
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "legacy-subprocess")]
 fn load_jfk_wav() -> Vec<u8> {
     let wav_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");

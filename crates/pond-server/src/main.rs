@@ -33,16 +33,19 @@ mod schedule_executors;
 mod startup;
 mod system_deps;
 mod three_stage_consolidator;
+#[cfg(feature = "legacy-subprocess")]
 mod whisper_process;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
-use pond_adapters_whisper::{WhisperInput, WhisperKeywordDetector};
+#[cfg(feature = "legacy-subprocess")]
+use pond_adapters_whisper::WhisperInput;
+use pond_adapters_whisper::{WhisperKeywordDetector, WhisperRsInput};
 use pond_api::{AppState, LlamafileManager};
 use pond_core::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::domain::onboarding::OnboardingStep;
@@ -859,13 +862,13 @@ async fn run_server(
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
-    // STT — whisper.cpp binary + model (only when active_whisper_model is configured)
-    // Guard is held for the server lifetime; port is used to build the URL below.
-    let (_whisper_guard, whisper_port) = if settings.active_whisper_model.is_empty() {
+    // STT — whisper ggml model download (the in-process backend reads the
+    // same `.bin` files the legacy subprocess used).
+    let whisper_model_path: Option<std::path::PathBuf> = if settings.active_whisper_model.is_empty()
+    {
         println!("  ⏭  STT: whisper skipped (no whisper model configured in Settings)");
-        (None, ports::WHISPER)
+        None
     } else {
-        // Derive filename and download URL from the model catalog DB.
         let (whisper_filename, whisper_url, whisper_mb) =
             SqliteModelRepository::new(db.system.clone())
                 .get_by_id(&format!("whisper/{}", settings.active_whisper_model))
@@ -910,25 +913,38 @@ async fn run_server(
                 );
             }
         }
+        Some(whisper_model)
+    };
+
+    // Optional legacy subprocess — only compiled in with the escape-valve feature.
+    #[allow(unused_mut, unused_assignments)]
+    let mut whisper_port = ports::WHISPER;
+    #[cfg(feature = "legacy-subprocess")]
+    let _whisper_guard = if let Some(ref whisper_model) = whisper_model_path {
         if !model_download::whisper_binary_path(&data_dir).exists() {
             println!("  📥 STT binary not found — downloading...");
-            match model_download::download_whisper_binary(&data_dir).await {
-                Ok(_) => {}
-                Err(e) => println!("  ⚠  STT binary download failed: {}", e),
+            if let Err(e) = model_download::download_whisper_binary(&data_dir).await {
+                println!("  ⚠  STT binary download failed: {}", e);
             }
         }
-        whisper_process::try_start(&data_dir, &whisper_model).await
+        let (guard, port) = whisper_process::try_start(&data_dir, whisper_model).await;
+        whisper_port = port;
+        guard
+    } else {
+        None
     };
-    // When the user has set a custom whisper URL (not the default 127.0.0.1:9000),
-    // honour it — this lets users point at an external whisper server.
-    // Otherwise use the auto-started local process URL.
+    #[cfg(not(feature = "legacy-subprocess"))]
+    let _whisper_guard: Option<()> = None;
+
+    // Honour an explicit settings override; otherwise compose the loopback URL.
+    // Used by the (legacy) audio-transcribe / calibrate HTTP routes in pond-api.
     const DEFAULT_WHISPER_URL: &str = "http://127.0.0.1:9000";
     let whisper_url = if !settings.voice_whisper_url.is_empty()
         && settings.voice_whisper_url != DEFAULT_WHISPER_URL
     {
         settings.voice_whisper_url.clone()
     } else {
-        whisper_process::url_for(whisper_port)
+        format!("http://127.0.0.1:{}", whisper_port)
     };
 
     // Piper voice path — None when no voice is configured (skips all piper startup).
@@ -2136,11 +2152,11 @@ async fn run_chat(
         effective_provider, effective_model
     );
 
-    // Auto-start whisper.cpp when voice input is requested.
-    let mut whisper_port = ports::WHISPER;
-    let _whisper_guard = if input == "whisper" {
+    // Resolve the whisper ggml model path (used by both the in-process backend
+    // and the legacy HTTP subprocess). When voice input is not requested we
+    // still resolve the path to surface a clear download-needed message.
+    let whisper_model_path: Option<std::path::PathBuf> = if input == "whisper" {
         let whisper_model_name = settings.active_whisper_model.as_str();
-        // Look up filename and URL from the catalog DB.
         let (whisper_filename, whisper_url, whisper_mb) =
             SqliteModelRepository::new(db.system.clone())
                 .get_by_id(&format!("whisper/{}", whisper_model_name))
@@ -2184,13 +2200,30 @@ async fn run_chat(
                 );
             }
         }
-        let (guard, port) = whisper_process::try_start(&data_dir, &whisper_model).await;
+        Some(whisper_model)
+    } else {
+        None
+    };
+
+    // Optionally start the legacy whisper.cpp subprocess. Default build skips
+    // this entirely — `WhisperRsInput` handles inference in-process.
+    #[allow(unused_mut, unused_assignments)]
+    let mut whisper_port = ports::WHISPER;
+    #[cfg(feature = "legacy-subprocess")]
+    let _whisper_guard = if let Some(ref whisper_model) = whisper_model_path {
+        let (guard, port) = whisper_process::try_start(&data_dir, whisper_model).await;
         whisper_port = port;
         guard
     } else {
         None
     };
-    let whisper_url = whisper_process::url_for(whisper_port);
+    #[cfg(not(feature = "legacy-subprocess"))]
+    let _whisper_guard: Option<()> = None;
+
+    // The URL is only meaningful when the legacy subprocess is running; the
+    // in-process backend ignores it. Kept here to populate AppState.whisper_url
+    // for the (legacy) audio-transcribe / calibrate HTTP routes.
+    let whisper_url = format!("http://127.0.0.1:{}", whisper_port);
 
     // ── Model catalog & ModelService (for autonomous downloading) ──────────────
     let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> =
@@ -2505,10 +2538,29 @@ async fn run_chat(
     }
 
     // ── Wire voice input ──
-    let voice: Arc<dyn VoiceInput> = match input {
-        "whisper" => {
-            println!("  Input:    whisper (@ {})", whisper_url);
-            Arc::new(WhisperInput::new(Some(&whisper_url)))
+    // Build a shared in-process Whisper backend once per session. It powers
+    // both the `VoiceInput` adapter and the wake-word detector — no separate
+    // KWS subprocess needed any more.
+    let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
+        match &whisper_model_path {
+            Some(p) => match WhisperRsInput::new(p.clone()) {
+                Ok(w) => Some(Arc::new(w)),
+                Err(e) => {
+                    println!("  ⚠  In-process whisper load failed: {}", e);
+                    println!("     Falling back to stdin input.");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
+        ("whisper", Some(backend)) => {
+            println!("  Input:    whisper (in-process via whisper.cpp)");
+            backend.clone() as Arc<dyn VoiceInput>
         }
         _ => {
             println!("  Input:    stdin");
@@ -2518,16 +2570,12 @@ async fn run_chat(
     chat_service = chat_service.with_voice_input(voice);
 
     // ── Wire wake word detector ──
-    if no_wake_word || input != "whisper" {
+    if no_wake_word || input != "whisper" || whisper_backend.is_none() {
         chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
+        let backend = whisper_backend.clone().expect("checked above");
         let trigger = wake_word.unwrap_or(settings.voice_wake_word.as_str());
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
-        // Tiered model: use a separate (fast, tiny) whisper server for KWS when configured.
-        let kws_url = settings
-            .voice_kws_whisper_url
-            .as_deref()
-            .unwrap_or(&whisper_url);
 
         if transcriptions.is_empty() {
             println!(
@@ -2541,8 +2589,6 @@ async fn run_chat(
                 transcriptions.len()
             );
         }
-        println!("  KWS whisper:   {}", kws_url);
-        println!("  ASR whisper:   {}", whisper_url);
         println!(
             "  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
             settings.voice_kws_energy_threshold,
@@ -2550,7 +2596,7 @@ async fn run_chat(
             settings.voice_kws_post_trigger_silence_ms
         );
 
-        use pond_adapters_whisper::KeywordDetectorConfig;
+        use pond_adapters_whisper::{KeywordDetectorConfig, WhisperBackend};
         let kws_config = KeywordDetectorConfig {
             energy_threshold: settings.voice_kws_energy_threshold,
             post_trigger_silence_ms: settings.voice_kws_post_trigger_silence_ms,
@@ -2559,7 +2605,7 @@ async fn run_chat(
         };
 
         let detector = Arc::new(
-            WhisperKeywordDetector::new(Some(kws_url), trigger)
+            WhisperKeywordDetector::new(backend as Arc<dyn WhisperBackend>, trigger)
                 .with_transcriptions(transcriptions)
                 .with_config(kws_config),
         );
@@ -3507,7 +3553,7 @@ fn apply_face_recognition_defaults() {
 async fn run_calibrate(
     phrase_arg: Option<&str>,
     target_samples: usize,
-    whisper_url_arg: Option<&str>,
+    _whisper_url_arg: Option<&str>,
     reset: bool,
 ) -> Result<()> {
     let data_dir = default_data_dir();
@@ -3518,16 +3564,36 @@ async fn run_calibrate(
     let phrase = phrase_arg
         .unwrap_or(settings.voice_wake_word.as_str())
         .to_string();
-    let whisper_url = whisper_url_arg
-        .unwrap_or(settings.voice_whisper_url.as_str())
-        .to_string();
+
+    // Resolve the ggml model path used by the in-process whisper backend.
+    let whisper_model_name = settings.active_whisper_model.clone();
+    if whisper_model_name.is_empty() {
+        anyhow::bail!(
+            "No whisper model configured in Settings. Pick a model in the Models UI \
+             before running calibrate."
+        );
+    }
+    let whisper_filename = SqliteModelRepository::new(db.system.clone())
+        .get_by_id(&format!("whisper/{}", whisper_model_name))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.filename)
+        .unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name));
+    let whisper_model_path = data_dir.join("models").join(&whisper_filename);
+    if !whisper_model_path.exists() {
+        anyhow::bail!(
+            "Whisper model not downloaded yet: {}\nRun `pond-server setup` first.",
+            whisper_model_path.display()
+        );
+    }
 
     println!();
     println!("  ╔═══════════════════════════════════════════════╗");
     println!("  ║   🎤  Wake-Word Calibration                   ║");
     println!("  ╚═══════════════════════════════════════════════╝");
     println!("  Phrase:       \"{}\"", phrase);
-    println!("  Whisper URL:  {}", whisper_url);
+    println!("  Model:        {} (in-process)", whisper_filename);
     println!("  Samples:      {}", target_samples);
     println!();
 
@@ -3552,7 +3618,8 @@ async fn run_calibrate(
         settings.voice_wake_word = phrase.clone();
     }
 
-    let whisper = WhisperInput::new(Some(&whisper_url));
+    let whisper = WhisperRsInput::new(whisper_model_path.clone())
+        .with_context(|| format!("loading whisper model: {}", whisper_model_path.display()))?;
     let mut collected = 0usize;
     let mut attempt = 0usize;
 
@@ -3579,7 +3646,7 @@ async fn run_calibrate(
                 continue;
             }
             Err(e) => {
-                println!(" (error: {} — is whisper running at {}?)", e, whisper_url);
+                println!(" (error: {})", e);
                 if attempt >= target_samples * 3 {
                     anyhow::bail!("Too many failed attempts — aborting calibration.");
                 }
