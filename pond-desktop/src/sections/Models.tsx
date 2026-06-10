@@ -3,14 +3,14 @@ import { Button, Tabs, Chip } from "@heroui/react";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Play,
-  ScanFace, Loader2, Cpu,
+  ScanFace, Loader2, Cpu, Sparkles,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
 import { PageHeader, useConfirm } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
-  HfModel, HfModelFile, DownloadEntry,
+  HfModel, HfModelFile, DownloadEntry, DiskUsage,
   OllamaModel, LlamafileRelease, FaceModelsResponse,
 } from "../api/types";
 import { ApiError } from "../api/types";
@@ -1521,7 +1521,10 @@ export function Models() {
   const [actionMsg, setActionMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [capabilities, setCapabilities] = useState<ModelCapabilities | null>(null);
+  const [diskUsage, setDiskUsage] = useState<DiskUsage | null>(null);
+  const [cleaning, setCleaning] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const diskPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadRoles = useCallback(async () => {
     setRolesLoading(true);
@@ -1567,10 +1570,15 @@ export function Models() {
   }, [loadDownloads, loadModels]);
 
   useEffect(() => {
-    loadRoles(); loadModels(); loadDownloads();
+    loadRoles(); loadModels(); loadDownloads(); loadDiskUsage();
     api.getMemoryStatus().then(setMemoryStatus).catch(() => {/* non-fatal */});
     api.getModelCapabilities().then(setCapabilities).catch(() => {/* non-fatal */});
-    return () => { if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; } };
+    // Refresh disk usage every 30s while the section is open.
+    diskPollRef.current = setInterval(() => { loadDiskUsage(); }, 30_000);
+    return () => {
+      if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; }
+      if (diskPollRef.current) { clearInterval(diskPollRef.current); diskPollRef.current = null; }
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1610,6 +1618,24 @@ export function Models() {
     } catch (e) { flash(String(e), false); }
   }
 
+  const loadDiskUsage = useCallback(async () => {
+    try { setDiskUsage(await api.getDiskUsage()); }
+    catch { /* non-fatal */ }
+  }, []);
+
+  async function handleCleanup() {
+    if (cleaning) return;
+    setCleaning(true);
+    flash("Reclaiming disk space...");
+    try {
+      const res = await api.cleanupModels();
+      const n = res.removed.length;
+      flash(`Reclaimed ${fmtBytes(res.reclaimed_bytes)}${n ? ` (${n} item${n === 1 ? "" : "s"})` : ""}.`);
+      await Promise.all([loadModels(), loadDiskUsage()]);
+    } catch (e) { flash(String(e), false); }
+    finally { setCleaning(false); }
+  }
+
   const asrModels       = models.filter((m) => m.provider === "whisper");
   const ttsModels       = models.filter((m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http");
   const embeddingModels = models.filter((m) => m.provider === "embedding" || m.category === "embedding");
@@ -1623,9 +1649,28 @@ export function Models() {
       <PageHeader
         title="Models"
         action={
-          <Button size="sm" variant="ghost" onPress={handleScan}>
-            <RefreshCw size={14} strokeWidth={1.8} /> Scan
-          </Button>
+          <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+            {diskUsage && (
+              <span
+                style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)" }}
+                data-testid="models-disk-usage"
+              >
+                {fmtBytes(diskUsage.total_bytes)} used · {fmtBytes(diskUsage.hf_cache_bytes)} in cache
+              </span>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={handleCleanup}
+              isDisabled={cleaning || downloads.some((d) => d.status === "downloading")}
+              data-testid="models-cleanup-btn"
+            >
+              <Sparkles size={14} strokeWidth={1.8} /> {cleaning ? "Cleaning…" : "Free up space"}
+            </Button>
+            <Button size="sm" variant="ghost" onPress={handleScan}>
+              <RefreshCw size={14} strokeWidth={1.8} /> Scan
+            </Button>
+          </div>
         }
       />
 

@@ -482,6 +482,25 @@ export interface DownloadEntry {
   error?: string;
 }
 
+// ── Disk cleanup / usage ─────────────────────────────────────
+export interface RemovedBlob {
+  path: string;
+  category: string;
+  bytes: number;
+}
+
+export interface CleanupResponse {
+  reclaimed_bytes: number;
+  removed: RemovedBlob[];
+}
+
+export interface DiskUsage {
+  total_bytes: number;
+  by_category: Record<string, number>;
+  hf_cache_bytes: number;
+  incomplete_bytes: number;
+}
+
 // ── Ollama ────────────────────────────────────────────────────
 export interface OllamaModel {
   name: string;

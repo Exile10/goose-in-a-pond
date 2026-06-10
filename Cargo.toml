@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pond-core",
     "crates/pond-api",
+    "crates/pond-hf-cache",
     "crates/pond-infra",
     "crates/pond-infra-scheduler",
     "crates/pond-server",
@@ -144,6 +145,7 @@ fastembed = { version = "=5.8.0", default-features = false, features = ["ort-loa
 # Internal workspace crates
 pond-core              = { path = "crates/pond-core" }
 pond-api               = { path = "crates/pond-api" }
+pond-hf-cache          = { path = "crates/pond-hf-cache" }
 pond-infra             = { path = "crates/pond-infra" }
 pond-infra-scheduler   = { path = "crates/pond-infra-scheduler" }
 pond-adapters-llamafile = { path = "crates/pond-adapters-llamafile" }

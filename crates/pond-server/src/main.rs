@@ -508,6 +508,26 @@ async fn run_setup(model: &str) -> Result<()> {
     let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
+    // One-shot HF cache migration — moves pre-existing flat model files into
+    // the content-addressed blob layout so subsequent downloads dedupe. Errors
+    // are logged but never block startup. Idempotent via filesystem marker.
+    match pond_server::hf_cache_migration::migrate_flat_files_to_blobs(&data_dir).await {
+        Ok(r) if r.is_empty() => {}
+        Ok(r) => {
+            println!(
+                "  📦 HF cache migration: scanned {}, migrated {}, skipped {} symlinks, {} errors",
+                r.scanned,
+                r.migrated,
+                r.skipped_symlinks,
+                r.errors.len()
+            );
+            for e in &r.errors {
+                tracing::warn!(target: "hf_cache_migration", "{e}");
+            }
+        }
+        Err(e) => tracing::warn!(target: "hf_cache_migration", "migration failed: {e}"),
+    }
+
     let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
     println!("  📋 Fetching model catalog from upstream sources...");
     seed_model_catalog(&setup_model_repo, &data_dir).await;
@@ -798,6 +818,28 @@ async fn run_server(
     // Initialize databases
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+
+    // One-shot HF cache migration — moves pre-existing flat model files into
+    // the content-addressed blob layout. Idempotent via filesystem marker; on
+    // a migrated install the call costs one stat() and returns immediately.
+    // Errors per-file are logged but never block startup.
+    match pond_server::hf_cache_migration::migrate_flat_files_to_blobs(&data_dir).await {
+        Ok(r) if r.is_empty() => {}
+        Ok(r) => {
+            tracing::info!(
+                target: "hf_cache_migration",
+                scanned = r.scanned,
+                migrated = r.migrated,
+                skipped_symlinks = r.skipped_symlinks,
+                errors = r.errors.len(),
+                "flat-file migration complete"
+            );
+            for e in &r.errors {
+                tracing::warn!(target: "hf_cache_migration", "{e}");
+            }
+        }
+        Err(e) => tracing::warn!(target: "hf_cache_migration", "migration failed: {e}"),
+    }
 
     // Soft system-dep check (non-fatal — just warn if something looks wrong)
     system_deps::warn_if_missing();
@@ -1596,11 +1638,13 @@ async fn run_server(
                     .available_tool_definitions()
                     .await
                     .into_iter()
-                    .map(|(name, desc, schema)| pond_core::ports::inference::ToolDefinition {
-                        name,
-                        description: desc,
-                        parameters_schema: schema,
-                    })
+                    .map(
+                        |(name, desc, schema)| pond_core::ports::inference::ToolDefinition {
+                            name,
+                            description: desc,
+                            parameters_schema: schema,
+                        },
+                    )
                     .collect();
                 let agent = pond_agent::PondAgent::new(
                     Arc::new(eng),
@@ -2312,7 +2356,7 @@ async fn run_chat(
             template_repo,
             extras_repo,
             draft_repo,
-            None, // session_storage — not needed for goose backend
+            None,               // session_storage — not needed for goose backend
             input == "whisper", // voice_mode
         )
         .await;

@@ -7,7 +7,9 @@ import {
   type CalibrateResponse,
   type ChatEvent,
   type ChatStreamRequest,
+  type CleanupResponse,
   type Device,
+  type DiskUsage,
   type DownloadEntry,
   type Extension,
   type FaceModelsResponse,
@@ -682,6 +684,16 @@ export class PondApiClient {
 
   scanModels(): Promise<{ found: number }> {
     return this.post("/api/v1/models/scan");
+  }
+
+  // Sweep unreferenced HF-cache blobs and stale resume files.
+  cleanupModels(): Promise<CleanupResponse> {
+    return this.post("/api/v1/models/cleanup");
+  }
+
+  // Per-category disk usage report (model dirs + hf_cache totals).
+  getDiskUsage(): Promise<DiskUsage> {
+    return this.get("/api/v1/models/disk-usage");
   }
 
   // Delete model file from disk (409 ApiError if model is active in a role)

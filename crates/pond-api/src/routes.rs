@@ -104,6 +104,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/models/download/url", post(download_model_from_url))
         .route("/models/download/progress", get(get_download_progress))
         .route("/models/scan", post(scan_models))
+        .route("/models/cleanup", post(cleanup_models))
+        .route("/models/disk-usage", get(disk_usage))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model))
         .route("/models/{category}/{name}", delete(delete_model))
@@ -2120,6 +2122,7 @@ async fn download_model(
     let cfg_filename = m.config_filename.clone();
     let cfg_client = state.http_client.clone();
     let cfg_data_dir = data_dir.clone();
+    let dl_data_dir = data_dir.clone();
 
     tokio::spawn(async move {
         spawn_tracked_download(
@@ -2129,6 +2132,7 @@ async fn download_model(
             dl_category,
             tracker,
             dl_client,
+            dl_data_dir,
             async move {
                 // Download config file before marking as downloaded
                 if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
@@ -2246,6 +2250,89 @@ async fn delete_model(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/models/cleanup — sweep unreferenced HF-cache blobs.
+///
+/// Walks `{data_dir}/hf_cache/hub/models--*/blobs/*`, removes blobs that no
+/// flat-path symlink under `{data_dir}/models/**` points at AND whose
+/// basename does not appear in `model_role_assignments`. Also clears stale
+/// `.incomplete` resume files (> 24h) and fully-broken snapshot dirs.
+///
+/// Returns `{reclaimed_bytes, removed: [{path, category, bytes}]}`.
+async fn cleanup_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(data_dir) = state.data_dir.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "data_dir not configured"})),
+        ));
+    };
+
+    // Protected filenames = every currently-assigned model's `filename`.
+    // We never delete a blob whose basename matches an active role.
+    let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(model_repo) = &state.model_repo {
+        if let Ok(assignments) = model_repo.list_assignments().await {
+            for a in &assignments {
+                if let Ok(Some(m)) = model_repo.get_by_id(&a.model_id).await {
+                    if let Some(fname) = m.filename {
+                        protected.insert(fname);
+                    }
+                    // Also protect by the bare model name — covers blobs whose
+                    // basename matches `{name}` (e.g. legacy migrations).
+                    protected.insert(m.name.clone());
+                    if let Some(cfg) = m.config_filename {
+                        protected.insert(cfg);
+                    }
+                }
+            }
+        }
+    }
+
+    let report = crate::cleanup::run_cleanup(&data_dir, &protected)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
+        json!({"reclaimed_bytes": 0, "removed": []})
+    })))
+}
+
+/// GET /api/v1/models/disk-usage — per-category bytes plus HF cache totals.
+///
+/// Walks `{data_dir}/models/**` and `{data_dir}/hf_cache/**`, returning
+/// `{total_bytes, by_category, hf_cache_bytes, incomplete_bytes}`. The flat
+/// paths under `models/<cat>` resolve through symlinks so the same blob is
+/// counted once per category bucket, never duplicated.
+async fn disk_usage(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(data_dir) = state.data_dir.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "data_dir not configured"})),
+        ));
+    };
+
+    let usage = crate::cleanup::collect_disk_usage(&data_dir)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    Ok(Json(serde_json::to_value(&usage).unwrap_or_else(|_| {
+        json!({"total_bytes": 0, "by_category": {}, "hf_cache_bytes": 0, "incomplete_bytes": 0})
+    })))
 }
 
 /// POST /api/v1/models/{category}/{name}/activate — assign model to a role.
@@ -2640,8 +2727,19 @@ async fn download_model_from_url(
     let resp_category = category.clone();
 
     let dl_client = state.http_client.clone();
+    let dl_data_dir = data_dir.clone();
     tokio::spawn(async move {
-        spawn_tracked_download(url, dest, filename, category, tracker, dl_client, async {}).await;
+        spawn_tracked_download(
+            url,
+            dest,
+            filename,
+            category,
+            tracker,
+            dl_client,
+            dl_data_dir,
+            async {},
+        )
+        .await;
     });
 
     (
@@ -2654,6 +2752,8 @@ async fn download_model_from_url(
 
 /// Shared streaming download with progress tracking.
 /// Streams the URL to `dest`, updating `tracker` as each chunk arrives.
+/// HF URLs route through `pond_hf_cache` for resumable + etag-aware fetches with
+/// auth surviving HF→CDN redirects. Non-HF URLs use the existing reqwest path.
 /// Calls `on_done` (an async closure) when the download completes successfully.
 async fn spawn_tracked_download<F>(
     url: String,
@@ -2662,6 +2762,7 @@ async fn spawn_tracked_download<F>(
     category: String,
     tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
     client: reqwest::Client,
+    data_dir: std::path::PathBuf,
     on_done: F,
 ) where
     F: std::future::Future<Output = ()> + Send,
@@ -2690,38 +2791,53 @@ async fn spawn_tracked_download<F>(
 
     tracing::info!("Downloading {} from {}", filename, url);
 
-    let result: Result<(), String> = async {
-        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-
-        let total = resp.content_length();
-        {
-            let mut t = tracker.write().await;
-            if let Some(e) = t.get_mut(&filename) {
-                e.total_bytes = total;
+    let result: Result<(), String> = if let Some((repo_id, revision, fname)) =
+        pond_hf_cache::parse_hf_url(&url)
+    {
+        download_via_hf_cache_tracked(
+            &repo_id,
+            &revision,
+            &fname,
+            &dest,
+            &data_dir,
+            &filename,
+            &tracker,
+        )
+        .await
+    } else {
+        async {
+            let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
             }
-        }
 
-        let mut file = tokio::fs::File::create(&dest)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut downloaded: u64 = 0;
-        let mut resp = resp;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-            downloaded += chunk.len() as u64;
-            let mut t = tracker.write().await;
-            if let Some(e) = t.get_mut(&filename) {
-                e.downloaded_bytes = downloaded;
+            let total = resp.content_length();
+            {
+                let mut t = tracker.write().await;
+                if let Some(e) = t.get_mut(&filename) {
+                    e.total_bytes = total;
+                }
             }
+
+            let mut file = tokio::fs::File::create(&dest)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut downloaded: u64 = 0;
+            let mut resp = resp;
+            while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                downloaded += chunk.len() as u64;
+                let mut t = tracker.write().await;
+                if let Some(e) = t.get_mut(&filename) {
+                    e.downloaded_bytes = downloaded;
+                }
+            }
+            file.flush().await.map_err(|e| e.to_string())?;
+            Ok(())
         }
-        file.flush().await.map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    .await;
+        .await
+    };
 
     match result {
         Ok(()) => {
@@ -2744,6 +2860,88 @@ async fn spawn_tracked_download<F>(
             }
         }
     }
+}
+
+/// HF URL → hardened resumable fetch, with progress mirrored to the same
+/// `DownloadEntry` tracker that the legacy reqwest path updates. After the blob
+/// lands in `hf_cache/blobs/{etag}`, we symlink `dest` to it so existing
+/// filesystem lookups keep returning the same flat path.
+async fn download_via_hf_cache_tracked(
+    repo_id: &str,
+    revision: &str,
+    fname: &str,
+    dest: &std::path::Path,
+    data_dir: &std::path::Path,
+    tracker_key: &str,
+    tracker: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+) -> Result<(), String> {
+    let cache = pond_hf_cache::HfCache::new(data_dir);
+    let token: Option<String> = hf_token_from_env().or_else(|| cache.token().map(String::from));
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    let repo = cache
+        .repo(repo_id.to_string())
+        .with_revision(revision.to_string());
+    let fetch = repo.file(fname.to_string());
+
+    let tracker_owned = Arc::clone(tracker);
+    let tracker_key_owned = tracker_key.to_string();
+    let progress = move |downloaded: u64, total: u64| {
+        let tracker_owned = Arc::clone(&tracker_owned);
+        let key = tracker_key_owned.clone();
+        tokio::spawn(async move {
+            let mut t = tracker_owned.write().await;
+            if let Some(e) = t.get_mut(&key) {
+                e.downloaded_bytes = downloaded;
+                if total > 0 && e.total_bytes != Some(total) {
+                    e.total_bytes = Some(total);
+                }
+            }
+        });
+    };
+
+    let blob_path = fetch
+        .download_to_blob(&client, token.as_deref(), progress)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(parent) = dest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::remove_file(dest).await;
+    link_or_copy_blob(&blob_path, dest).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn hf_token_from_env() -> Option<String> {
+    for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+async fn link_or_copy_blob(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    let label = format!("symlink {} -> {}", dest.display(), src.display());
+    tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(&src, &dest))
+        .await
+        .map_err(|e| anyhow::anyhow!("symlink task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("{label}: {e}"))
+}
+
+#[cfg(not(unix))]
+async fn link_or_copy_blob(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    tokio::fs::copy(src, dest)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("copy {} -> {}: {e}", dest.display(), src.display()))
 }
 
 // ── Profile handlers ──────────────────────────────────────────────────────────
