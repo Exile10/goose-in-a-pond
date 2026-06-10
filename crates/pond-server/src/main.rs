@@ -627,20 +627,38 @@ async fn run_setup(model: &str) -> Result<()> {
         );
     }
 
-    // Step 4: Download whisper-server binary
-    println!("\n  [4/6] Downloading whisper-server binary...");
-    let _ = model_download::download_whisper_binary(&data_dir).await;
+    // Step 4: whisper-server binary — only with the legacy-subprocess escape valve.
+    // Default build runs Whisper in-process via whisper-rs; no second binary needed.
+    #[cfg(feature = "legacy-subprocess")]
+    {
+        println!("\n  [4/6] Downloading whisper-server binary (legacy-subprocess)...");
+        let _ = model_download::download_whisper_binary(&data_dir).await;
+    }
+    #[cfg(not(feature = "legacy-subprocess"))]
+    {
+        println!("\n  [4/6] Whisper runs in-process — no binary download needed.");
+    }
 
-    // Step 5: Piper TTS binary — voice model is selected via the web Settings page
-    println!("\n  [5/6] Setting up Piper TTS...");
-    let piper_bin_ok = model_download::download_piper_binary(&data_dir)
-        .await
-        .is_ok();
-    if !piper_bin_ok {
-        println!("  ⚠  Piper binary unavailable — voice output will be text-only.");
-        println!("     Install piper manually or retry setup.");
-    } else {
-        println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
+    // Step 5: Piper TTS binary — only with the legacy-subprocess escape valve.
+    // Default build runs Piper in-process via piper-rs.
+    #[cfg(feature = "legacy-subprocess")]
+    {
+        println!("\n  [5/6] Setting up Piper TTS subprocess (legacy-subprocess)...");
+        let piper_bin_ok = model_download::download_piper_binary(&data_dir)
+            .await
+            .is_ok();
+        if !piper_bin_ok {
+            println!("  ⚠  Piper binary unavailable — voice output will be text-only.");
+            println!("     Install piper manually or retry setup.");
+        } else {
+            println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
+        }
+    }
+    #[cfg(not(feature = "legacy-subprocess"))]
+    {
+        println!(
+            "\n  [5/6] Piper runs in-process — select a voice model in the web Settings page."
+        );
     }
 
     // Step 6: ONNX Runtime — detect or auto-download
