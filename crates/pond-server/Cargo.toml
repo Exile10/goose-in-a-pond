@@ -33,6 +33,10 @@ local-inference = ["dep:pond-adapters-local-inference", "pond-api/local-inferenc
 # (set ORT_DYLIB_PATH, or place libonnxruntime in the system library path).
 # cargo run -p pond-server --features face-onnx -- serve
 face-onnx = ["dep:pond-adapters-face-onnx"]
+# Keep the legacy whisper-server / piper subprocess paths compilable. This is
+# a one-release escape valve while the in-process backends bed in. Default
+# builds omit it — the subprocess module is fully cfg'd out.
+legacy-subprocess = ["pond-adapters-whisper/legacy-subprocess"]
 
 [dependencies]
 # Optional: only compiled when --features goose-agent is passed.
