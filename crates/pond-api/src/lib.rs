@@ -90,6 +90,7 @@ use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
 use pond_core::ports::model_repository::ModelRepository;
 use pond_core::ports::model_scheduler::ModelScheduler;
 use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::ports::policy::SecurityPolicy;
 use pond_core::ports::profile::ProfileRepository;
 use pond_core::ports::prompt_extra::PromptExtraRepository;
 use pond_core::ports::prompt_template::PromptTemplateRepository;
@@ -279,6 +280,12 @@ pub struct AppState {
     pub mcp_app_resources: std::collections::HashMap<String, &'static str>,
     /// In-memory OAuth PKCE sessions (state nonce -> verifier + provider).
     pub oauth_state: crate::oauth_callback::OAuthState,
+    /// Authorization + audit hook at the privacy/security boundary.
+    ///
+    /// A hook, not a gate: the default implementation allows everything and
+    /// only records audits. Routes opt in by calling `allow`/`audit`; until a
+    /// route does, behaviour is unchanged. `None` in tests.
+    pub security_policy: Option<Arc<dyn SecurityPolicy>>,
     /// The port the API server is actually listening on.
     /// Used to construct OAuth redirect URIs dynamically (the server may bind
     /// to a port other than 4000 if that port is already in use).

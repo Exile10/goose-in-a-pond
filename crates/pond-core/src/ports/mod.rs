@@ -26,6 +26,7 @@ pub mod model_scheduler;
 pub mod model_storage;
 pub mod notification;
 pub mod onboarding;
+pub mod policy;
 pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;

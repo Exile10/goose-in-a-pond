@@ -16,6 +16,7 @@ pub mod memory_graph;
 pub mod model_service;
 pub mod oauth_providers;
 pub mod onboarding;
+pub mod policy;
 pub mod print_output;
 pub mod prompt_builder;
 pub mod stdin_input;
