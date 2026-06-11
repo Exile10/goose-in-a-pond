@@ -1,0 +1,13 @@
+pub mod draft;
+pub mod face_recognition;
+pub mod memory;
+pub mod onboarding;
+pub mod profile;
+pub mod prompt_extra;
+pub mod prompt_template;
+pub mod recipe;
+pub mod schedule;
+pub mod sensor;
+pub mod session;
+pub mod settings;
+pub mod skill;
