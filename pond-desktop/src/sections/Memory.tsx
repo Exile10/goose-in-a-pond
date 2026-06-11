@@ -24,7 +24,7 @@ import {
   Brain,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader, useConfirm } from "../components/shared";
+import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
 import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
 
 // ── Segment metadata ──────────────────────────────────────────
@@ -1033,12 +1033,14 @@ function MemorySettingsCard({ settings, onToggle }: {
 export function Memory() {
   const confirm = useConfirm();
   const [items, setItems]           = useState<MemoryFragment[]>([]);
+  const PAGE = 20;
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
   const [activeSegment, setSegment] = useState<SegmentKey>("all");
   const [activeTier, setTier]       = useState<TierKey>("all");
   const [activeSource, setSource]   = useState<SourceKey>("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [visibleCount, setVisibleCount] = useState(PAGE);
   const [inlineDraft, setInlineDraft] = useState("");
   const [inlineAdding, setInlineAdding] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -1384,7 +1386,7 @@ export function Memory() {
             type="search"
             placeholder="Search memories…"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setVisibleCount(PAGE); }}
             aria-label="Search memories"
           />
           {searchQuery && (
@@ -1410,15 +1412,15 @@ export function Memory() {
           tierCounts={tierCounts}
           sourceCounts={sourceCounts}
           total={visibleItems.length}
-          onSegmentChange={setSegment}
-          onTierChange={setTier}
-          onSourceChange={setSource}
+          onSegmentChange={(v) => { setSegment(v); setVisibleCount(PAGE); }}
+          onTierChange={(v) => { setTier(v); setVisibleCount(PAGE); }}
+          onSourceChange={(v) => { setSource(v); setVisibleCount(PAGE); }}
         />
       )}
 
       {/* Memory list card */}
       {loading ? (
-        <p className="muted-12">Loading…</p>
+        <SkeletonList rows={5} />
       ) : visibleItems.length === 0 ? (
         <Card className="card">
           <CardContent>
@@ -1457,18 +1459,26 @@ export function Memory() {
           </span>
         </div>
       ) : (
-        <Card className="card">
-          <CardContent className="card-body--list">
-            {filtered.map((m) => (
-              <MemRow
-                key={m.id}
-                mem={m}
-                onDelete={handleDelete}
-                onUpdate={handleUpdate}
-              />
-            ))}
-          </CardContent>
-        </Card>
+        <>
+          <Card className="card">
+            <CardContent className="card-body--list">
+              {filtered.slice(0, visibleCount).map((m) => (
+                <MemRow
+                  key={m.id}
+                  mem={m}
+                  onDelete={handleDelete}
+                  onUpdate={handleUpdate}
+                />
+              ))}
+            </CardContent>
+          </Card>
+          {filtered.length > visibleCount && (
+            <button className="empty-state__cta" style={{ alignSelf: "center" }} onClick={() => setVisibleCount((c) => c + PAGE)}>
+              Show {Math.min(PAGE, filtered.length - visibleCount)} more
+              <span style={{ color: "var(--grey-400)", fontWeight: "normal" }}> · {filtered.length - visibleCount} remaining</span>
+            </button>
+          )}
+        </>
       )}
 
       {/* Memory lifecycle settings */}

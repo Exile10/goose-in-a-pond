@@ -8,7 +8,7 @@ import {
 } from "@heroui/react";
 import { Trash2, Plus, Send, Wrench, Terminal, FileText, ChefHat } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
+import { PageHeader, ErrorBanner, SkeletonList } from "../components/shared";
 import type { AgentTool, AgentRecipe, PromptExtra, ChatEvent } from "../api/types";
 
 type Tab = "chat" | "tools" | "extras" | "recipes";
@@ -174,8 +174,10 @@ function ToolsPanel() {
     api.listTools().then(setTools).catch((e) => setError(String(e))).finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <p className="muted-12">Loading tools...</p>;
-  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
+  function reload() { setError(null); setLoading(true); api.listTools().then(setTools).catch((e) => setError(String(e))).finally(() => setLoading(false)); }
+
+  if (loading) return <SkeletonList rows={5} />;
+  if (error)   return <ErrorBanner error={error} onRetry={reload} />;
   if (!tools.length) return (
     <div className="empty-state">
       <Wrench size={28} />
@@ -277,10 +279,10 @@ function ExtrasPanel() {
         aria-label="Extra content"
       />
 
-      {error && <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>}
+      {error && <ErrorBanner error={error} onRetry={load} />}
 
       {loading ? (
-        <p className="muted-12">Loading...</p>
+        <SkeletonList rows={3} />
       ) : extras.length === 0 ? (
         <div className="empty-state--inline">
           <FileText size={18} />
@@ -331,8 +333,10 @@ function RecipesPanel() {
 
   const current = recipes.find((r) => r.name === selected);
 
-  if (loading) return <p className="muted-12">Loading recipes...</p>;
-  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
+  function reloadRecipes() { setError(null); setLoading(true); api.listRecipes().then((r) => { setRecipes(r); if (r.length) setSelected(r[0].name); }).catch((e) => setError(String(e))).finally(() => setLoading(false)); }
+
+  if (loading) return <SkeletonList rows={3} />;
+  if (error)   return <ErrorBanner error={error} onRetry={reloadRecipes} />;
   if (!recipes.length) return (
     <Card className="card">
       <CardContent>
