@@ -209,39 +209,165 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("active_embedding_model", &settings.active_embedding_model);
         upsert!("embedding_provider", &settings.embedding_provider);
         // Fast path
-        upsert!("fast_path_enabled", if settings.fast_path_enabled { "true" } else { "false" });
+        upsert!(
+            "fast_path_enabled",
+            if settings.fast_path_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Agent tuning
-        upsert!("agent_timeout_secs", settings.agent_timeout_secs.to_string());
-        upsert!("prefix_cache_prompt", if settings.prefix_cache_prompt { "true" } else { "false" });
-        upsert!("tool_output_compaction", if settings.tool_output_compaction { "true" } else { "false" });
+        upsert!(
+            "agent_timeout_secs",
+            settings.agent_timeout_secs.to_string()
+        );
+        upsert!(
+            "prefix_cache_prompt",
+            if settings.prefix_cache_prompt {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "tool_output_compaction",
+            if settings.tool_output_compaction {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Memory tuning
-        upsert!("memory_consolidation_mode", &settings.memory_consolidation_mode);
-        upsert!("memory_graph_enabled", if settings.memory_graph_enabled { "true" } else { "false" });
-        upsert!("memory_decay_base_half_life_days", settings.memory_decay_base_half_life_days.to_string());
+        upsert!(
+            "memory_consolidation_mode",
+            &settings.memory_consolidation_mode
+        );
+        upsert!(
+            "memory_graph_enabled",
+            if settings.memory_graph_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "memory_decay_base_half_life_days",
+            settings.memory_decay_base_half_life_days.to_string()
+        );
         upsert!("memory_decay_beta", settings.memory_decay_beta.to_string());
-        upsert!("memory_prune_threshold", settings.memory_prune_threshold.to_string());
-        upsert!("memory_archive_threshold", settings.memory_archive_threshold.to_string());
-        upsert!("memory_cleanup_interval_hours", settings.memory_cleanup_interval_hours.to_string());
-        upsert!("memory_consolidation_interval_hours", settings.memory_consolidation_interval_hours.to_string());
-        upsert!("memory_consolidation_batch_size", settings.memory_consolidation_batch_size.to_string());
-        upsert!("memory_extraction_max_facts", settings.memory_extraction_max_facts.to_string());
-        upsert!("memory_extraction_interval_secs", settings.memory_extraction_interval_secs.to_string());
+        upsert!(
+            "memory_prune_threshold",
+            settings.memory_prune_threshold.to_string()
+        );
+        upsert!(
+            "memory_archive_threshold",
+            settings.memory_archive_threshold.to_string()
+        );
+        upsert!(
+            "memory_cleanup_interval_hours",
+            settings.memory_cleanup_interval_hours.to_string()
+        );
+        upsert!(
+            "memory_consolidation_interval_hours",
+            settings.memory_consolidation_interval_hours.to_string()
+        );
+        upsert!(
+            "memory_consolidation_batch_size",
+            settings.memory_consolidation_batch_size.to_string()
+        );
+        upsert!(
+            "memory_extraction_max_facts",
+            settings.memory_extraction_max_facts.to_string()
+        );
+        upsert!(
+            "memory_extraction_interval_secs",
+            settings.memory_extraction_interval_secs.to_string()
+        );
         // Scheduling
-        upsert!("schedule_result_notify", if settings.schedule_result_notify { "true" } else { "false" });
-        upsert!("schedule_max_concurrent", settings.schedule_max_concurrent.to_string());
-        upsert!("schedule_max_runs_per_task", settings.schedule_max_runs_per_task.to_string());
+        upsert!(
+            "schedule_result_notify",
+            if settings.schedule_result_notify {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "schedule_max_concurrent",
+            settings.schedule_max_concurrent.to_string()
+        );
+        upsert!(
+            "schedule_max_runs_per_task",
+            settings.schedule_max_runs_per_task.to_string()
+        );
         // Monitoring & cost
-        upsert!("context_monitor_enabled", if settings.context_monitor_enabled { "true" } else { "false" });
-        upsert!("cloud_input_price_per_million", settings.cloud_input_price_per_million.to_string());
-        upsert!("cloud_output_price_per_million", settings.cloud_output_price_per_million.to_string());
+        upsert!(
+            "context_monitor_enabled",
+            if settings.context_monitor_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "cloud_input_price_per_million",
+            settings.cloud_input_price_per_million.to_string()
+        );
+        upsert!(
+            "cloud_output_price_per_million",
+            settings.cloud_output_price_per_million.to_string()
+        );
         // Tool behaviour
-        upsert!("tool_cache_enabled", if settings.tool_cache_enabled { "true" } else { "false" });
-        upsert!("multi_tool_enabled", if settings.multi_tool_enabled { "true" } else { "false" });
-        upsert!("tool_call_validation", if settings.tool_call_validation { "true" } else { "false" });
-        upsert!("tool_request_detection", if settings.tool_request_detection { "true" } else { "false" });
+        upsert!(
+            "tool_cache_enabled",
+            if settings.tool_cache_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "multi_tool_enabled",
+            if settings.multi_tool_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "tool_call_validation",
+            if settings.tool_call_validation {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "tool_request_detection",
+            if settings.tool_request_detection {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Data
-        upsert!("telemetry_enabled", if settings.telemetry_enabled { "true" } else { "false" });
-        upsert!("compact_encoding", if settings.compact_encoding { "true" } else { "false" });
+        upsert!(
+            "telemetry_enabled",
+            if settings.telemetry_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "compact_encoding",
+            if settings.compact_encoding {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Extension toggles
         upsert!(
             "ext_memory_enabled",
@@ -489,7 +615,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // Fast path
         "fast_path_enabled" => s.fast_path_enabled = value == "true",
         // Agent tuning
-        "agent_timeout_secs" => { if let Ok(v) = value.parse() { s.agent_timeout_secs = v; } }
+        "agent_timeout_secs" => {
+            if let Ok(v) = value.parse() {
+                s.agent_timeout_secs = v;
+            }
+        }
         "prefix_cache_prompt" => s.prefix_cache_prompt = value == "true",
         "tool_output_compaction" => s.tool_output_compaction = value == "true",
         // Memory lifecycle
@@ -499,23 +629,75 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // Memory tuning
         "memory_consolidation_mode" => s.memory_consolidation_mode = value.to_string(),
         "memory_graph_enabled" => s.memory_graph_enabled = value == "true",
-        "memory_decay_base_half_life_days" => { if let Ok(v) = value.parse() { s.memory_decay_base_half_life_days = v; } }
-        "memory_decay_beta" => { if let Ok(v) = value.parse() { s.memory_decay_beta = v; } }
-        "memory_prune_threshold" => { if let Ok(v) = value.parse() { s.memory_prune_threshold = v; } }
-        "memory_archive_threshold" => { if let Ok(v) = value.parse() { s.memory_archive_threshold = v; } }
-        "memory_cleanup_interval_hours" => { if let Ok(v) = value.parse() { s.memory_cleanup_interval_hours = v; } }
-        "memory_consolidation_interval_hours" => { if let Ok(v) = value.parse() { s.memory_consolidation_interval_hours = v; } }
-        "memory_consolidation_batch_size" => { if let Ok(v) = value.parse() { s.memory_consolidation_batch_size = v; } }
-        "memory_extraction_max_facts" => { if let Ok(v) = value.parse() { s.memory_extraction_max_facts = v; } }
-        "memory_extraction_interval_secs" => { if let Ok(v) = value.parse() { s.memory_extraction_interval_secs = v; } }
+        "memory_decay_base_half_life_days" => {
+            if let Ok(v) = value.parse() {
+                s.memory_decay_base_half_life_days = v;
+            }
+        }
+        "memory_decay_beta" => {
+            if let Ok(v) = value.parse() {
+                s.memory_decay_beta = v;
+            }
+        }
+        "memory_prune_threshold" => {
+            if let Ok(v) = value.parse() {
+                s.memory_prune_threshold = v;
+            }
+        }
+        "memory_archive_threshold" => {
+            if let Ok(v) = value.parse() {
+                s.memory_archive_threshold = v;
+            }
+        }
+        "memory_cleanup_interval_hours" => {
+            if let Ok(v) = value.parse() {
+                s.memory_cleanup_interval_hours = v;
+            }
+        }
+        "memory_consolidation_interval_hours" => {
+            if let Ok(v) = value.parse() {
+                s.memory_consolidation_interval_hours = v;
+            }
+        }
+        "memory_consolidation_batch_size" => {
+            if let Ok(v) = value.parse() {
+                s.memory_consolidation_batch_size = v;
+            }
+        }
+        "memory_extraction_max_facts" => {
+            if let Ok(v) = value.parse() {
+                s.memory_extraction_max_facts = v;
+            }
+        }
+        "memory_extraction_interval_secs" => {
+            if let Ok(v) = value.parse() {
+                s.memory_extraction_interval_secs = v;
+            }
+        }
         // Scheduling
         "schedule_result_notify" => s.schedule_result_notify = value == "true",
-        "schedule_max_concurrent" => { if let Ok(v) = value.parse() { s.schedule_max_concurrent = v; } }
-        "schedule_max_runs_per_task" => { if let Ok(v) = value.parse() { s.schedule_max_runs_per_task = v; } }
+        "schedule_max_concurrent" => {
+            if let Ok(v) = value.parse() {
+                s.schedule_max_concurrent = v;
+            }
+        }
+        "schedule_max_runs_per_task" => {
+            if let Ok(v) = value.parse() {
+                s.schedule_max_runs_per_task = v;
+            }
+        }
         // Monitoring & cost
         "context_monitor_enabled" => s.context_monitor_enabled = value == "true",
-        "cloud_input_price_per_million" => { if let Ok(v) = value.parse() { s.cloud_input_price_per_million = v; } }
-        "cloud_output_price_per_million" => { if let Ok(v) = value.parse() { s.cloud_output_price_per_million = v; } }
+        "cloud_input_price_per_million" => {
+            if let Ok(v) = value.parse() {
+                s.cloud_input_price_per_million = v;
+            }
+        }
+        "cloud_output_price_per_million" => {
+            if let Ok(v) = value.parse() {
+                s.cloud_output_price_per_million = v;
+            }
+        }
         // Tool behaviour
         "tool_cache_enabled" => s.tool_cache_enabled = value == "true",
         "multi_tool_enabled" => s.multi_tool_enabled = value == "true",

@@ -1,1 +1,1 @@
-pub use crate::user_data::services::mock_session::*;
+pub use crate::user_data::mocks::mock_session::*;

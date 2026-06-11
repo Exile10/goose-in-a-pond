@@ -83,7 +83,7 @@ use pond_core::ports::extension_manager::ExtensionManagerPort;
 use pond_core::ports::extension_marketplace::ExtensionMarketplace;
 use pond_core::ports::face_recognition::FaceRecognition;
 use pond_core::ports::handshake::Handshake;
-use pond_core::ports::mcp_memory::McpMemoryPort;
+use pond_core::ports::mcp_knowledge::McpKnowledgePort;
 use pond_core::ports::mcp_server::McpServerRepository;
 use pond_core::ports::memory_repository::MemoryRepository;
 use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
@@ -173,7 +173,7 @@ pub struct AppState {
     /// Memory-aware model scheduler. `None` when all roles use external providers.
     pub model_scheduler: Option<Arc<dyn ModelScheduler>>,
     /// MCP-style persistent memory. `None` until `pond-adapters-mcp-memory` is wired in.
-    pub mcp_memory: Option<Arc<dyn McpMemoryPort + Send + Sync>>,
+    pub mcp_memory: Option<Arc<dyn McpKnowledgePort + Send + Sync>>,
     /// MCP extension manager — manages Goose extensions for tool calling.
     /// `None` until a Goose agent with extension support is wired in.
     pub extension_manager: Option<Arc<dyn ExtensionManagerPort>>,

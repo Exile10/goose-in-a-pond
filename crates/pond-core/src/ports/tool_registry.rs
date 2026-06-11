@@ -1,1 +1,1 @@
-pub use crate::mcp::ports::tool_registry::*;
+pub use crate::mcp::ports::tools::tool_registry::*;

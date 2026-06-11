@@ -989,11 +989,7 @@ impl GooseAdapter {
         // Strip Goose default extensions that would pollute the prompt.
         // Only do this once per session — subsequent turns skip the strip loop.
         {
-            let already_stripped = self
-                .defaults_stripped
-                .lock()
-                .unwrap()
-                .contains(&goose_sid);
+            let already_stripped = self.defaults_stripped.lock().unwrap().contains(&goose_sid);
             if !already_stripped {
                 let strip_list: &[&str] = &[
                     "developer",
@@ -1369,16 +1365,15 @@ impl AgentPort for GooseAdapter {
             .map_err(|e| anyhow!("Failed to get session: {e}"))?;
 
         // Parse the JSON args into the Map that rmcp expects.
-        let arguments: serde_json::Map<String, serde_json::Value> = if args_json.is_empty()
-            || args_json == "{}"
-        {
-            serde_json::Map::new()
-        } else {
-            serde_json::from_str(args_json).unwrap_or_default()
-        };
+        let arguments: serde_json::Map<String, serde_json::Value> =
+            if args_json.is_empty() || args_json == "{}" {
+                serde_json::Map::new()
+            } else {
+                serde_json::from_str(args_json).unwrap_or_default()
+            };
 
-        let tool_call =
-            rmcp::model::CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments);
+        let tool_call = rmcp::model::CallToolRequestParams::new(tool_name.to_string())
+            .with_arguments(arguments);
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (_req_id, dispatch_result) = self

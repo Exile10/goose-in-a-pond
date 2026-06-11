@@ -328,8 +328,8 @@ fn split_xml_tool_calls(
             .split_once("</tool_call>")
             .unwrap_or((remaining, ""));
 
-        if let Some(tc) = parse_xml_function_format(block)
-            .or_else(|| parse_xml_arg_key_value_format(block))
+        if let Some(tc) =
+            parse_xml_function_format(block).or_else(|| parse_xml_arg_key_value_format(block))
         {
             tool_calls.push(tc);
         }
@@ -377,9 +377,7 @@ fn parse_xml_function_format(block: &str) -> Option<(String, serde_json::Map<Str
 }
 
 /// Parse GLM-style: `NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`
-fn parse_xml_arg_key_value_format(
-    block: &str,
-) -> Option<(String, serde_json::Map<String, Value>)> {
+fn parse_xml_arg_key_value_format(block: &str) -> Option<(String, serde_json::Map<String, Value>)> {
     let func_name_end = block.find("<arg_key>").unwrap_or(block.len());
     #[allow(clippy::string_slice)]
     let func_name = block[..func_name_end].trim().to_string();
@@ -508,8 +506,8 @@ fn split_llama3_tool_calls(
 
                 // Convert Gemma 4 native format to JSON, then parse.
                 let json_str = gemma4_args_to_json(raw_args);
-                let args: serde_json::Map<String, Value> =
-                    serde_json::from_str(&json_str).unwrap_or_else(|e| {
+                let args: serde_json::Map<String, Value> = serde_json::from_str(&json_str)
+                    .unwrap_or_else(|e| {
                         tracing::warn!(
                             raw = %raw_args,
                             normalized = %json_str,
@@ -562,7 +560,8 @@ mod tests {
 
     #[test]
     fn parse_json_tool_calls_native_format() {
-        let text = r#"{"tool_calls": [{"name": "shell", "arguments": {"command": "ls"}, "id": "x"}]}"#;
+        let text =
+            r#"{"tool_calls": [{"name": "shell", "arguments": {"command": "ls"}, "id": "x"}]}"#;
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
@@ -589,7 +588,8 @@ mod tests {
 
     #[test]
     fn parse_gemma4_tool_call() {
-        let text = "Sure!\n<|tool_call>call:giap__get_weather{\"location\":\"Nairobi\"}<tool_call|>";
+        let text =
+            "Sure!\n<|tool_call>call:giap__get_weather{\"location\":\"Nairobi\"}<tool_call|>";
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "giap__get_weather");
@@ -827,8 +827,16 @@ mod tests {
         let parsed: Vec<Value> = serde_json::from_str(&full_json).unwrap();
         for tool in &parsed {
             let params = &tool["function"]["parameters"];
-            assert!(params.is_object(), "tool '{}' missing parameters schema!", tool["function"]["name"]);
-            assert!(params.get("properties").is_some(), "tool '{}' has no properties!", tool["function"]["name"]);
+            assert!(
+                params.is_object(),
+                "tool '{}' missing parameters schema!",
+                tool["function"]["name"]
+            );
+            assert!(
+                params.get("properties").is_some(),
+                "tool '{}' has no properties!",
+                tool["function"]["name"]
+            );
         }
     }
 }

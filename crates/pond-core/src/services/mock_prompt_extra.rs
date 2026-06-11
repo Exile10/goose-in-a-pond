@@ -1,1 +1,1 @@
-pub use crate::user_data::services::mock_prompt_extra::*;
+pub use crate::user_data::mocks::mock_prompt_extra::*;

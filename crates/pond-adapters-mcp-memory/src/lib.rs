@@ -1,6 +1,6 @@
 //! Flat-file persistent memory adapter for GIAP.
 //!
-//! Implements [`McpMemoryPort`] using the same storage format as Goose's
+//! Implements [`McpKnowledgePort`] using the same storage format as Goose's
 //! built-in `MemoryServer` so memories are portable between the two systems.
 //!
 //! **Storage layout** (`memory_dir/`):
@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pond_core::ports::mcp_memory::McpMemoryPort;
+use pond_core::ports::mcp_knowledge::McpKnowledgePort;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -117,7 +117,7 @@ impl GooseMcpMemoryAdapter {
 }
 
 #[async_trait]
-impl McpMemoryPort for GooseMcpMemoryAdapter {
+impl McpKnowledgePort for GooseMcpMemoryAdapter {
     async fn remember(
         &self,
         category: &str,

@@ -12,7 +12,10 @@ license = "Apache-2.0"
 # Build in isolation: cargo build --manifest-path crates/pond-adapters-goose/Cargo.toml
 
 [dependencies]
-pond-core             = { path = "../pond-core" }
+# `test-mocks` is required at the normal dependency level because
+# `goose_agent.rs::with_llamafile()` (a non-test public factory for CLI
+# one-shots) constructs the in-core mock repositories.
+pond-core             = { path = "../pond-core", features = ["test-mocks"] }
 pond-mcp-server       = { path = "../pond-mcp-server" }
 pond-adapters-weather = { path = "../pond-adapters-weather" }
 goose            = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls", "local-inference"] }

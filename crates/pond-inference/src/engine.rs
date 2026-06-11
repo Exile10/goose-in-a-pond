@@ -158,14 +158,22 @@ impl LlamaCppEngine {
         // Load in a blocking thread -- LlamaModel::load_from_file is a heavy
         // CPU/GPU operation that must not block the tokio runtime.
         let loaded = tokio::task::spawn_blocking(move || {
-            load_model_sync(&backend, &model_path, &model_id_owned, n_gpu_layers, flash_attention)
+            load_model_sync(
+                &backend,
+                &model_path,
+                &model_id_owned,
+                n_gpu_layers,
+                flash_attention,
+            )
         })
         .await
         .context("model loading task panicked")??;
 
         // Update lock-free capabilities cache before acquiring the model lock.
-        *self.capabilities.write().expect("capabilities lock poisoned") =
-            loaded.capabilities.clone();
+        *self
+            .capabilities
+            .write()
+            .expect("capabilities lock poisoned") = loaded.capabilities.clone();
 
         // Swap: unload previous, install new.
         let mut guard = self.model.lock().await;
@@ -179,8 +187,10 @@ impl LlamaCppEngine {
     /// invariant (context borrows from model).
     pub async fn unload_model(&self) {
         // Reset capabilities cache first.
-        *self.capabilities.write().expect("capabilities lock poisoned") =
-            ModelCapabilities::default();
+        *self
+            .capabilities
+            .write()
+            .expect("capabilities lock poisoned") = ModelCapabilities::default();
 
         let mut guard = self.model.lock().await;
         if let Some(loaded) = guard.as_mut() {

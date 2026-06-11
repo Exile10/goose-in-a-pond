@@ -672,7 +672,8 @@ async fn run_recipe_streams_sse_for_existing_recipe() {
     let (app, _tmp) = make_app().await;
 
     // Seed a valid recipe whose prompt field will become the user message.
-    let yaml = "title: Lights On\ndescription: Turn the lights on.\nprompt: turn the lights on please";
+    let yaml =
+        "title: Lights On\ndescription: Turn the lights on.\nprompt: turn the lights on please";
     let resp = app
         .clone()
         .oneshot(post(
@@ -688,10 +689,7 @@ async fn run_recipe_streams_sse_for_existing_recipe() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let resp = app
-        .oneshot(post(
-            "/api/v1/recipes/lights_on/run",
-            serde_json::json!({}),
-        ))
+        .oneshot(post("/api/v1/recipes/lights_on/run", serde_json::json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

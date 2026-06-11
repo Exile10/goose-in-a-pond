@@ -119,7 +119,9 @@ pub async fn run_cleanup_with_threshold(
             if name.ends_with(".incomplete") || name.ends_with(".lock") {
                 continue;
             }
-            let canonical = fs::canonicalize(&path).await.unwrap_or_else(|_| path.clone());
+            let canonical = fs::canonicalize(&path)
+                .await
+                .unwrap_or_else(|_| path.clone());
             if referenced.contains(&canonical) {
                 continue;
             }
@@ -339,7 +341,9 @@ fn walk_collect_symlink_targets<'a>(
 /// snapshot symlink that targets it. Used during cleanup so we can
 /// protect blobs whose declared filename matches an assigned-but-
 /// unsymlinked role.
-async fn collect_snapshot_basenames(hub_dir: &Path) -> std::collections::HashMap<PathBuf, HashSet<String>> {
+async fn collect_snapshot_basenames(
+    hub_dir: &Path,
+) -> std::collections::HashMap<PathBuf, HashSet<String>> {
     let mut out: std::collections::HashMap<PathBuf, HashSet<String>> =
         std::collections::HashMap::new();
     let mut repo_dirs = match fs::read_dir(hub_dir).await {
@@ -480,7 +484,11 @@ mod tests {
     /// Create a synthetic HF-cache repo dir with a blob, returning the
     /// blob path. `repo_folder` is the full `models--…` folder name.
     fn make_blob(root: &Path, repo_folder: &str, etag: &str, body: &[u8]) -> PathBuf {
-        let blobs = root.join("hf_cache").join("hub").join(repo_folder).join("blobs");
+        let blobs = root
+            .join("hf_cache")
+            .join("hub")
+            .join(repo_folder)
+            .join("blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let blob = blobs.join(etag);
         std::fs::write(&blob, body).unwrap();
@@ -561,7 +569,10 @@ mod tests {
         protected.insert("assigned.gguf".to_string());
 
         let report = run_cleanup(tmp.path(), &protected).await.unwrap();
-        assert!(blob.exists(), "assigned blob must survive even without flat symlink");
+        assert!(
+            blob.exists(),
+            "assigned blob must survive even without flat symlink"
+        );
         assert!(report.removed.is_empty());
     }
 
@@ -618,10 +629,17 @@ mod tests {
             .join("main");
         std::fs::create_dir_all(&snap_dir).unwrap();
         // Symlink whose target does not exist.
-        symlink(snap_dir.join("nonexistent-blob"), snap_dir.join("file.gguf")).unwrap();
+        symlink(
+            snap_dir.join("nonexistent-blob"),
+            snap_dir.join("file.gguf"),
+        )
+        .unwrap();
 
         let _ = run_cleanup(tmp.path(), &HashSet::new()).await.unwrap();
-        assert!(!snap_dir.exists(), "fully-orphaned snapshot dir should be deleted");
+        assert!(
+            !snap_dir.exists(),
+            "fully-orphaned snapshot dir should be deleted"
+        );
     }
 
     #[tokio::test]
@@ -629,12 +647,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // GGUF: one 5-byte symlink-to-blob.
-        let gguf_blob = make_blob(
-            tmp.path(),
-            "models--giap-local--m.gguf",
-            "blob1",
-            b"AAAAA",
-        );
+        let gguf_blob = make_blob(tmp.path(), "models--giap-local--m.gguf", "blob1", b"AAAAA");
         link_flat(tmp.path(), "gguf/m.gguf", &gguf_blob);
 
         // TTS: a real .onnx file (no blob — flat file).
@@ -663,5 +676,4 @@ mod tests {
         assert_eq!(usage.incomplete_bytes, 4);
         assert_eq!(usage.hf_cache_bytes, 5); // only the real blob1, not incomplete
     }
-
 }

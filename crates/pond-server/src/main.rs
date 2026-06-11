@@ -1056,36 +1056,35 @@ async fn run_server(
     let mut piper_http_port: Option<u16> = None;
 
     #[cfg(not(feature = "legacy-subprocess"))]
-    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
-        match &piper_model {
-            Some(model_path) if model_path.exists() => {
-                let config_path =
-                    std::path::PathBuf::from(format!("{}.json", model_path.display()));
-                if !config_path.exists() {
-                    println!(
-                        "  ⚠  Piper voice config (.onnx.json) missing at {}",
-                        config_path.display()
-                    );
-                    None
-                } else {
-                    match PiperRsOutput::new(model_path.clone(), config_path) {
-                        Ok(out) => {
-                            let out = match espeak_data.clone() {
-                                Some(d) => out.with_espeak_data(d),
-                                None => out,
-                            };
-                            println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
-                            Some(Arc::new(out) as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
-                        }
-                        Err(e) => {
-                            tracing::warn!("PiperRsOutput failed to load voice: {e}");
-                            None
-                        }
+    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = match &piper_model
+    {
+        Some(model_path) if model_path.exists() => {
+            let config_path = std::path::PathBuf::from(format!("{}.json", model_path.display()));
+            if !config_path.exists() {
+                println!(
+                    "  ⚠  Piper voice config (.onnx.json) missing at {}",
+                    config_path.display()
+                );
+                None
+            } else {
+                match PiperRsOutput::new(model_path.clone(), config_path) {
+                    Ok(out) => {
+                        let out = match espeak_data.clone() {
+                            Some(d) => out.with_espeak_data(d),
+                            None => out,
+                        };
+                        println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
+                        Some(Arc::new(out) as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
+                    }
+                    Err(e) => {
+                        tracing::warn!("PiperRsOutput failed to load voice: {e}");
+                        None
                     }
                 }
             }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
 
     #[cfg(feature = "legacy-subprocess")]
     let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
@@ -1641,15 +1640,18 @@ async fn run_server(
 
     // MCP Memory — enabled when --features mcp-memory is passed at build time.
     #[cfg(feature = "mcp-memory")]
-    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> = {
+    let mcp_memory: Option<
+        Arc<dyn pond_core::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
+    > = {
         use pond_adapters_mcp_memory::GooseMcpMemoryAdapter;
         let adapter = GooseMcpMemoryAdapter::new(data_dir.join("memory"));
         tracing::info!("MCP memory enabled ({})", data_dir.join("memory").display());
         Some(Arc::new(adapter))
     };
     #[cfg(not(feature = "mcp-memory"))]
-    let mcp_memory: Option<Arc<dyn pond_core::ports::mcp_memory::McpMemoryPort + Send + Sync>> =
-        None;
+    let mcp_memory: Option<
+        Arc<dyn pond_core::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
+    > = None;
 
     // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
     // Initialized before the agent backend so it can be wired into the memory
@@ -2772,7 +2774,10 @@ async fn run_chat(
                                     };
                                     println!(
                                         "  TTS:      piper-rs ({})",
-                                        model_path.file_name().unwrap_or_default().to_string_lossy()
+                                        model_path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
                                     );
                                     Arc::new(out) as Arc<dyn VoiceOutput>
                                 }
