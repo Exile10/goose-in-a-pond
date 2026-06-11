@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
-import { PageHeader, useConfirm } from "../components/shared";
+import { PageHeader, useConfirm, ErrorBanner } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
   HfModel, HfModelFile, DownloadEntry,
@@ -314,7 +314,7 @@ function ModelList({
   const state = useAppState();
 
   if (loading) return <p style={hint}>Loading…</p>;
-  if (error) return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
+  if (error) return <ErrorBanner error={error} />;
   if (models.length === 0) return <p style={hint}>{emptyMessage}</p>;
 
   function isRoleActive(m: ModelEntry, role: RoleKey) {
@@ -564,7 +564,7 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
       {open && (
         <div style={accordionSt.body}>
           {loading && <p style={hint}>Fetching releases…</p>}
-          {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
+          {error && <ErrorBanner error={error} onRetry={() => { setLoaded(false); load(); }} retryLabel="Retry fetch" />}
           {dlMsg && <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>{dlMsg}</p>}
           {!loading && releases.length === 0 && !error && <p className="gh-empty"><Download size={14} /> No llamafile releases found.</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>

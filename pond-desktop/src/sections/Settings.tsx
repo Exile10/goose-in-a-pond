@@ -15,7 +15,7 @@ import { api } from "../api/PondApiClient";
 import { useAppDispatch, useAppState } from "../state/AppContext";
 import type { Settings as SettingsType, Extension } from "../api/types";
 import { ModelPickerModal, type ModelRole } from "../components/ModelPickerModal";
-import { PageHeader, Section, Row } from "../components/shared";
+import { PageHeader, Section, Row, ErrorBanner, SkeletonList } from "../components/shared";
 const WakeWordCalibration = lazy(() => import("../components/WakeWordCalibration").then(m => ({ default: m.WakeWordCalibration })));
 
 // ── Tab definitions ───────────────────────────────────────────
@@ -1228,13 +1228,12 @@ export function Settings() {
         </Tabs.ListContainer>
       </Tabs>
 
-      {/* Error banner */}
-      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0, flexShrink: 0 }}>{error}</p>}
+      {error && <ErrorBanner error={error} onRetry={() => { setError(null); setLoading(true); api.getSettings().then(setSettings).catch((e) => setError(String(e))).finally(() => setLoading(false)); }} />}
 
       {/* Panel area */}
       <div className="settings-body">
         {loading ? (
-          <p className="muted-12">Loading settings...</p>
+          <SkeletonList rows={5} />
         ) : (
           <>
             {tab === "identity"  && <IdentityTab  s={settings} patch={patch} />}
@@ -1442,12 +1441,15 @@ function ToolsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof Set
         </Card>
       )}
 
-      {error && <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>{error}</p>}
+      {error && <ErrorBanner error={error} onRetry={() => { setError(null); load(); }} />}
 
       {loading ? (
-        <p className="muted-12">Loading extensions...</p>
+        <SkeletonList rows={3} />
       ) : extensions.length === 0 ? (
-        <p className="muted-12">No extensions configured. Add one above to enable tool use.</p>
+        <div className="empty-state empty-state--inline">
+          <span>No extensions yet.</span>
+          <button className="empty-state__cta" onClick={() => setShowForm(true)}>Add your first extension</button>
+        </div>
       ) : (
         <div className="ext-list">
           {extensions.map((ext) => (
