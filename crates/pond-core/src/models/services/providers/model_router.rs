@@ -13,9 +13,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::debug;
 
-use crate::domain::message::ChatMessage;
-use crate::domain::model_role::ModelRole;
-use crate::ports::provider::LlmProvider;
+use crate::models::domain::message::ChatMessage;
+use crate::models::domain::model_role::ModelRole;
+use crate::models::ports::provider::LlmProvider;
 
 pub struct ModelRouter {
     chat:  Arc<dyn LlmProvider>,
@@ -78,7 +78,7 @@ impl LlmProvider for ModelRouter {
         &'a self,
         system_prompt: &'a str,
         messages: Vec<ChatMessage>,
-    ) -> crate::ports::provider::TokenStream<'a> {
+    ) -> crate::models::ports::provider::TokenStream<'a> {
         // All requests route to the chat provider.
         let role = ModelRole::Chat;
         self.provider_for(role).stream_complete(system_prompt, messages)

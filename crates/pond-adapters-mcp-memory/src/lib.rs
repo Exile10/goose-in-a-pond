@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pond_core::ports::mcp_knowledge::McpKnowledgePort;
+use pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

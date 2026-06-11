@@ -1,6 +1,6 @@
 //! Profile port — driven port for household member profile persistence.
 
-use crate::domain::profile::{CreateProfileRequest, Profile};
+use crate::user_data::domain::profile::{CreateProfileRequest, Profile};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

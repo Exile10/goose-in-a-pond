@@ -14,8 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
-use pond_core::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
-use pond_core::ports::model_storage::ModelStorage;
+use pond_core::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
+use pond_core::models::ports::model_storage::ModelStorage;
 
 pub struct FilesystemModelStorage {
     data_dir: PathBuf,

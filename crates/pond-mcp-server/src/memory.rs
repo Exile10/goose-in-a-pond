@@ -3,11 +3,11 @@
 //! Provides 3 tools: `recall_memories`, `save_memory`, `forget_memory`.
 //! Depends only on [`MemoryRepository`] — no god-struct.
 
-use pond_core::domain::memory::{
+use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::user_data::domain::memory::{
     MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
 };
-use pond_core::ports::embedding::EmbeddingProvider;
-use pond_core::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -613,8 +613,8 @@ pub fn spawn_memory_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pond_core::domain::memory::MemoryFragment;
-    use pond_core::ports::memory_repository::MemoryRepository;
+    use pond_core::user_data::domain::memory::MemoryFragment;
+    use pond_core::user_data::ports::memory_repository::MemoryRepository;
 
     struct StubMemory;
     #[async_trait]

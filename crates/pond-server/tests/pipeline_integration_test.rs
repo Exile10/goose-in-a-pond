@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use pond_adapters_ollama::OllamaProvider;
 #[cfg(feature = "legacy-subprocess")]
 use pond_adapters_whisper::WhisperInput;
-use pond_core::domain::message::Role;
-use pond_core::ports::session_storage::SessionStorage;
-use pond_core::ports::voice_input::VoiceInput;
-use pond_core::ports::voice_output::VoiceOutput;
-use pond_core::services::chat::ChatService;
-use pond_core::services::mock_agent::MockAgent;
-use pond_core::services::mock_session::InMemorySessionStorage;
+use pond_core::models::domain::message::Role;
+use pond_core::models::ports::voice_input::VoiceInput;
+use pond_core::models::ports::voice_output::VoiceOutput;
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::shared::services::chat::ChatService;
+use pond_core::user_data::mocks::mock_session::InMemorySessionStorage;
+use pond_core::user_data::ports::session_storage::SessionStorage;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
@@ -328,7 +328,7 @@ async fn pipeline_message_roles_are_correct() {
 #[ignore = "requires microphone, whisper.cpp, Ollama, and piper — full hardware stack"]
 async fn live_full_voice_loop() {
     use pond_adapters_piper::PiperOutput;
-    use pond_core::services::instant_activation::InstantActivation;
+    use pond_core::models::services::instant_activation::InstantActivation;
     use std::path::PathBuf;
 
     let agent = Arc::new(MockAgent::new());

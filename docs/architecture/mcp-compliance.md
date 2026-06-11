@@ -107,7 +107,7 @@ Extensions can be registered through two paths:
 
 1. **REST API** -- `POST /api/v1/extensions` accepts an `ExtensionConfig` payload (stdio or streamable_http). The adapter validates the command/URI before connecting, persists the config to SQLite (`mcp_servers` table), and syncs the tool registry. Enabled extensions auto-reconnect on server restart.
 
-2. **Marketplace registry** -- `BundledMarketplace` service in `crates/pond-core/src/services/marketplace.rs` parses `marketplace_registry.json` (embedded at compile time via `include_str!`). Contains 6 curated extensions: Filesystem, GitHub, Brave Search, Memory, Puppeteer, Slack. Installed via `POST /api/v1/marketplace/{id}/install`.
+2. **Marketplace registry** -- `BundledMarketplace` service in `crates/pond-core/src/mcp/services/marketplace.rs` parses `marketplace_registry.json` (embedded at compile time via `include_str!`). Contains 6 curated extensions: Filesystem, GitHub, Brave Search, Memory, Puppeteer, Slack. Installed via `POST /api/v1/marketplace/{id}/install`.
 
 ---
 

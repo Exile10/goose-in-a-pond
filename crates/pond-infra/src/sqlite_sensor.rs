@@ -6,9 +6,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::sensor::{CameraEvent, SensorReading};
-use pond_core::ports::camera_storage::CameraStorage;
-use pond_core::ports::sensor_storage::SensorStorage;
+use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::ports::camera_storage::CameraStorage;
+use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use sqlx::{Pool, Sqlite};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ impl CameraStorage for SqliteCameraStorage {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use pond_core::domain::sensor::{CameraEvent, SensorReading};
+    use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
     use tempfile::tempdir;
 
     async fn make_logs_pool() -> (Pool<Sqlite>, tempfile::TempDir) {

@@ -10,9 +10,9 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::inference_pool::{InferencePool, InferenceResult, TaskPriority};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::inference_pool::{InferencePool, InferenceResult, TaskPriority};
+use pond_core::models::ports::provider::LlmProvider;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::marketplace::MarketplaceExtension;
+use crate::mcp::domain::marketplace::MarketplaceExtension;
 
 /// Read-only catalogue of curated MCP extensions available for installation.
 #[async_trait]

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::ports::secret::SecretRepository;
+use pond_core::security::ports::secret::SecretRepository;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;

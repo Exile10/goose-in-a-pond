@@ -10,7 +10,7 @@ before sending text to the Piper TTS engine. This ensures the TTS pronounces "5k
 
 The normalization runs in `normalize_for_speech()` which exists in two identical copies:
 
-- **CLI:** `crates/pond-core/src/services/chat.rs`
+- **CLI:** `crates/pond-core/src/shared/services/chat.rs`
 - **Desktop:** `pond-desktop/src-tauri/src/tts_text.rs`
 
 Both must be kept in sync. The desktop can't import pond-core (separate Cargo workspace).
@@ -158,7 +158,7 @@ Matched case-insensitively at word boundaries only.
 ## Adding New Entries
 
 1. Add to the appropriate `const` table in BOTH files:
-   - `crates/pond-core/src/services/chat.rs`
+   - `crates/pond-core/src/shared/services/chat.rs`
    - `pond-desktop/src-tauri/src/tts_text.rs`
 2. For `UNIT_SUFFIXES`: sort by length descending (longest first)
 3. Add a test in `chat.rs` (the `#[cfg(test)]` module)

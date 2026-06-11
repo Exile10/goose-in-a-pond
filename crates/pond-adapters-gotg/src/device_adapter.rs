@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 
 /// GOTG-specific device registry adapter.
 pub struct GotgDeviceAdapter {

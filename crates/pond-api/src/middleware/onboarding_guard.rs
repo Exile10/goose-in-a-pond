@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::services::onboarding::OnboardingService;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::services::onboarding::OnboardingService;
 
 /// Checks whether onboarding is complete.
 /// If onboarding is NOT completed:

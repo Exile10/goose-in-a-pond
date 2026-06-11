@@ -93,15 +93,15 @@ GIAP enforces a strict **Ports & Adapters** structure. Before writing code, unde
 - `axum::*`
 - Any HTTP client or filesystem library
 
-If the core needs an external capability, define a `trait` in `pond-core/src/ports/` and implement it in a separate adapter crate.
+If the core needs an external capability, define a `trait` in `pond-core/src/<quadrant>/ports/` and implement it in a separate adapter crate.
 
 ### Port/Adapter sequence
 
 When adding a new capability, follow this order (see [Creating Ports & Adapters](./creating-ports-and-adapters.md)):
 
-1. **Domain types** — `pond-core/src/domain/<name>.rs`
-2. **Port trait** — `pond-core/src/ports/<name>.rs` with `async_trait`
-3. **Mock implementation** — `pond-core/src/services/mock_<name>.rs` (test this first)
+1. **Domain types** — `pond-core/src/<quadrant>/domain/<name>.rs`
+2. **Port trait** — `pond-core/src/<quadrant>/ports/<name>.rs` with `async_trait`
+3. **Mock implementation** — `pond-core/src/<quadrant>/mocks/mock_<name>.rs` (test this first)
 4. **Real adapter** — `crates/pond-adapters-<name>/src/lib.rs`
 5. **Wire** — `pond-server/src/main.rs`
 

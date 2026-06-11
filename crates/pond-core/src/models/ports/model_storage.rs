@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::domain::model_record::{BinaryRecord, ModelRecord};
+use crate::models::domain::model_record::{BinaryRecord, ModelRecord};
 
 /// Resolve on-disk locations for models and tool binaries.
 pub trait ModelStorage: Send + Sync {

@@ -10,9 +10,11 @@ use crate::run_history::JsonRunHistory;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
-use pond_core::ports::schedule_execution::ScheduleExecutor;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
+use pond_core::user_data::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
+use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
+use pond_core::user_data::ports::scheduler::{
+    CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -64,8 +66,9 @@ pub struct CronSchedulerAdapter {
     executor: Arc<dyn ScheduleExecutor>,
     run_history: Arc<JsonRunHistory>,
     /// Optional broadcast sender for schedule result events (SSE delivery).
-    result_tx:
-        Option<tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>>,
+    result_tx: Option<
+        tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    >,
 }
 
 impl CronSchedulerAdapter {
@@ -88,7 +91,9 @@ impl CronSchedulerAdapter {
         runs_path: PathBuf,
         executor: Arc<dyn ScheduleExecutor>,
         result_tx: Option<
-            tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
+            tokio::sync::broadcast::Sender<
+                pond_core::user_data::domain::schedule::ScheduleResultEvent,
+            >,
         >,
         max_runs_per_task: u32,
     ) -> Result<Self> {
@@ -196,7 +201,7 @@ impl CronSchedulerAdapter {
         cron: &str,
         kind: TaskKind,
     ) -> Result<uuid::Uuid> {
-        use pond_core::domain::schedule::ScheduleResultEvent;
+        use pond_core::user_data::domain::schedule::ScheduleResultEvent;
 
         let executor = self.executor.clone();
         let tasks = self.tasks.clone();
@@ -508,7 +513,7 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn run_now(&self, id: &str) -> Result<()> {
-        use pond_core::domain::schedule::ScheduleResultEvent;
+        use pond_core::user_data::domain::schedule::ScheduleResultEvent;
 
         let (kind, label) = {
             let guard = self.tasks.lock().await;
@@ -695,7 +700,7 @@ impl Drop for CronSchedulerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::ports::schedule_execution::ScheduleExecutor;
+    use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct CountingExecutor(Arc<AtomicU32>);
@@ -923,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_task_changes_fields() {
-        use pond_core::ports::scheduler::UpdateScheduleRequest;
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
 
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
@@ -958,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_with_invalid_cron_preserves_old_schedule() {
-        use pond_core::ports::scheduler::UpdateScheduleRequest;
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
 
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;
@@ -995,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_nonexistent_errors() {
-        use pond_core::ports::scheduler::UpdateScheduleRequest;
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
 
         let tmp = tempfile::tempdir().unwrap();
         let sched = make_scheduler(tmp.path()).await;

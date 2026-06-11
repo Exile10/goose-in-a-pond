@@ -4,8 +4,8 @@
 //! Production deployments can later swap this for a SQLite-backed adapter
 //! writing to `pond_logs.db` without changing any consumer code.
 
-use crate::domain::turn_metrics::{TelemetrySummary, TurnMetrics};
-use crate::ports::telemetry::TelemetryPort;
+use crate::security::domain::turn_metrics::{TelemetrySummary, TurnMetrics};
+use crate::security::ports::telemetry::TelemetryPort;
 use tokio::sync::RwLock;
 
 /// In-memory telemetry store backed by a `RwLock<Vec<TurnMetrics>>`.

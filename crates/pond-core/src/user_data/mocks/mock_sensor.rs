@@ -1,8 +1,8 @@
 //! In-memory mock implementations of `SensorStorage` and `CameraStorage`.
 
-use crate::domain::sensor::{CameraEvent, SensorReading};
-use crate::ports::camera_storage::CameraStorage;
-use crate::ports::sensor_storage::SensorStorage;
+use crate::user_data::domain::sensor::{CameraEvent, SensorReading};
+use crate::user_data::ports::camera_storage::CameraStorage;
+use crate::user_data::ports::sensor_storage::SensorStorage;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;

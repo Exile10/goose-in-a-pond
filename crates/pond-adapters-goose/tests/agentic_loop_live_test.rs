@@ -2,10 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pond_adapters_goose::GooseAdapter;
-use pond_core::domain::agent::AgentRequest;
-use pond_core::domain::agent::AgentStreamEvent;
-use pond_core::domain::settings::Settings;
-use pond_core::ports::settings::SettingsRepository;
+use pond_core::shared::domain::agent::AgentRequest;
+use pond_core::shared::domain::agent::AgentStreamEvent;
+use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use std::sync::Arc;
 
 struct TestSettingsRepo {
@@ -49,12 +49,12 @@ async fn live_action_loop_ollama_executes_tool_call() {
     let adapter = GooseAdapter::new(
         settings_repo,
         Arc::new(
-            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+            pond_core::user_data::mocks::mock_prompt_template::MockPromptTemplateRepository::default(),
         ),
-        Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
-        Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
-        Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
+        Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry
@@ -116,12 +116,12 @@ async fn live_action_loop_llamafile_executes_tool_call() {
     let adapter = GooseAdapter::new(
         settings_repo,
         Arc::new(
-            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+            pond_core::user_data::mocks::mock_prompt_template::MockPromptTemplateRepository::default(),
         ),
-        Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
-        Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
-        Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
+        Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry
@@ -179,12 +179,12 @@ async fn live_action_loop_local_executes_tool_call() {
     let adapter = GooseAdapter::new(
         settings_repo,
         Arc::new(
-            pond_core::services::mock_prompt_template::MockPromptTemplateRepository::default(),
+            pond_core::user_data::mocks::mock_prompt_template::MockPromptTemplateRepository::default(),
         ),
-        Arc::new(pond_core::services::mock_prompt_extra::MockPromptExtraRepository::default()),
-        Arc::new(pond_core::services::mock_skill::MockSkillRepository::default()),
-        Arc::new(pond_core::services::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::services::mock_device_registry::MockDeviceRegistry),
+        Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
+        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry

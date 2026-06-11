@@ -10,7 +10,7 @@ use goose::conversation::message::Message;
 use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
-use pond_core::ports::tool_caller::ToolCaller;
+use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
 use std::path::Path;
 use std::sync::Arc;
 

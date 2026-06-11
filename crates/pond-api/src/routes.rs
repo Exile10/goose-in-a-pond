@@ -16,23 +16,23 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
-use pond_core::domain::message::ChatMessage;
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::domain::profile::CreateProfileRequest;
-use pond_core::domain::schedule::TaskKind;
-use pond_core::domain::sensor::{CameraEvent, SensorReading};
-use pond_core::domain::settings::Settings;
-use pond_core::ports::device_registry::RegisterDeviceRequest;
-use pond_core::ports::extension_manager::ExtensionInfo;
-use pond_core::ports::handshake::{HandshakeRequest, HandshakeResponse};
-use pond_core::ports::provider::LlmProvider;
-use pond_core::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
+use pond_core::mcp::ports::extension_manager::ExtensionInfo;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
 use pond_core::prompts::{
     build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
     ProfileContext,
 };
-use pond_core::services::chat::ChatService;
-use pond_core::services::onboarding::OnboardingService;
+use pond_core::security::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::shared::services::chat::ChatService;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::profile::CreateProfileRequest;
+use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
+use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
+use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -40,12 +40,12 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
-use pond_core::domain::memory::MemoryFragment;
-use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
-use pond_core::domain::prompt_extra::PromptExtra;
-use pond_core::domain::prompt_template::PromptTemplate;
-use pond_core::domain::recipe::AgentRecipe;
-use pond_core::domain::skill::UserSkill;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::user_data::domain::memory::MemoryFragment;
+use pond_core::user_data::domain::prompt_extra::PromptExtra;
+use pond_core::user_data::domain::prompt_template::PromptTemplate;
+use pond_core::user_data::domain::recipe::AgentRecipe;
+use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
@@ -380,7 +380,7 @@ struct ChatRequest {
     message: String,
     /// Optional image attachments for multimodal models (base64-encoded).
     #[serde(default)]
-    images: Vec<pond_core::domain::message::ImageAttachment>,
+    images: Vec<pond_core::models::domain::message::ImageAttachment>,
     /// When true, disable thinking and use voice-friendly responses.
     #[serde(default)]
     voice_mode: bool,
@@ -634,7 +634,7 @@ fn chat_stream_inner(
     req: ChatRequest,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    use pond_core::ports::agent::AgentStreamEvent;
+    use pond_core::models::ports::agent::AgentStreamEvent;
 
     let stream = async_stream::stream! {
         let _permit = permit;
@@ -783,7 +783,7 @@ fn chat_stream_inner(
 
         let model_name_for_done = settings.chat_model.clone();
 
-        use pond_core::domain::agent::AgentRequest;
+        use pond_core::shared::domain::agent::AgentRequest;
 
         let agent_req = AgentRequest {
             message: req.message.clone(),
@@ -1069,7 +1069,7 @@ fn chat_stream_inner(
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
 
-                let metrics = pond_core::domain::turn_metrics::TurnMetrics {
+                let metrics = pond_core::security::domain::turn_metrics::TurnMetrics {
                     session_id: session_id.clone(),
                     turn_number: existing_turns + 1,
                     prompt_tokens: usage_prompt_tokens,
@@ -1301,7 +1301,7 @@ async fn rename_session(
         .await
         .map_err(|e| {
             let status = match &e {
-                pond_core::ports::session_storage::SessionStorageError::SessionNotFound(_) => {
+                pond_core::user_data::ports::session_storage::SessionStorageError::SessionNotFound(_) => {
                     StatusCode::NOT_FOUND
                 }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1330,8 +1330,8 @@ async fn get_session_messages(
     Path(session_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    use pond_core::domain::message::Role;
-    use pond_core::ports::session_storage::SessionStorageError;
+    use pond_core::models::domain::message::Role;
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
 
     let limit: usize = params
         .get("limit")
@@ -1593,7 +1593,7 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
     use pond_adapters_llamafile::LlamafileProvider;
     use pond_adapters_ollama::OllamaProvider;
     #[allow(unused_imports)]
-    use pond_core::ports::provider::LlmProvider as _;
+    use pond_core::models::ports::provider::LlmProvider as _;
 
     let url = &state.llamafile_url;
     let data_dir = state.data_dir.clone();
@@ -1803,7 +1803,7 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
 /// the newly discovered records.
 async fn scan_filesystem_extras(
     data_dir: &std::path::Path,
-    model_repo: &Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+    model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
 ) -> Vec<ModelRecord> {
     let all = model_repo.list_all().await.unwrap_or_default();
     let known_filenames: std::collections::HashSet<String> =
@@ -1986,24 +1986,24 @@ async fn refresh_model_registry(
                         .filename
                         .as_ref()
                         .map(|f| match m.category {
-                            pond_core::domain::model_record::ModelCategory::Whisper => {
+                            pond_core::models::domain::model_record::ModelCategory::Whisper => {
                                 data_dir.join("models").join(f).exists()
                             }
-                            pond_core::domain::model_record::ModelCategory::Llamafile => {
+                            pond_core::models::domain::model_record::ModelCategory::Llamafile => {
                                 data_dir.join("models").join("llm").join(f).exists()
                             }
-                            pond_core::domain::model_record::ModelCategory::Gguf => {
+                            pond_core::models::domain::model_record::ModelCategory::Gguf => {
                                 data_dir.join("models").join("gguf").join(f).exists()
                             }
-                            pond_core::domain::model_record::ModelCategory::TtsPiper => {
+                            pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
                                 data_dir.join("models").join("tts").join(f).exists()
                             }
                             _ => false,
                         })
                         .unwrap_or(matches!(
                             m.category,
-                            pond_core::domain::model_record::ModelCategory::TtsHttp
-                                | pond_core::domain::model_record::ModelCategory::Ollama
+                            pond_core::models::domain::model_record::ModelCategory::TtsHttp
+                                | pond_core::models::domain::model_record::ModelCategory::Ollama
                         ));
                     if let Err(e) = model_repo.upsert(&m).await {
                         tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
@@ -5036,8 +5036,8 @@ async fn agent_chat_stream(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::stream::StreamExt;
-    use pond_core::domain::agent::AgentRequest;
-    use pond_core::ports::agent::AgentStreamEvent;
+    use pond_core::models::ports::agent::AgentStreamEvent;
+    use pond_core::shared::domain::agent::AgentRequest;
 
     // Update activity timestamp — resets the consolidation inactivity timer
     *state.last_user_activity.write().await = std::time::Instant::now();
@@ -5338,7 +5338,7 @@ async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::re
 /// `POST /api/v1/extensions` — register a new MCP extension and persist it.
 async fn add_extension_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<pond_core::ports::extension_manager::AddExtensionRequest>,
+    Json(req): Json<pond_core::mcp::ports::extension_manager::AddExtensionRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(manager) = &state.extension_manager else {
@@ -5352,7 +5352,7 @@ async fn add_extension_handler(
         Ok(info) => {
             // Persist so the server reconnects on restart.
             if let Some(repo) = &state.mcp_server_repo {
-                let cfg = pond_core::ports::mcp_server::McpServerConfig {
+                let cfg = pond_core::mcp::ports::mcp_server::McpServerConfig {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: req.name.clone(),
                     kind: req.kind.clone(),
@@ -5579,7 +5579,8 @@ async fn install_marketplace_handler(
     if !ext.required_secrets.is_empty() {
         let mut missing = Vec::new();
         for sr in &ext.required_secrets {
-            if !sr.required || sr.kind == pond_core::domain::secret::SecretKind::OAuthFlow {
+            if !sr.required || sr.kind == pond_core::security::domain::secret::SecretKind::OAuthFlow
+            {
                 continue;
             }
             if secrets.contains_key(&sr.key) {
@@ -5634,7 +5635,7 @@ async fn install_marketplace_handler(
         }
     }
 
-    let req = pond_core::ports::extension_manager::AddExtensionRequest {
+    let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
         name: ext.id.clone(),
         kind: ext.kind.clone(),
         description: ext.description.clone(),
@@ -5648,7 +5649,7 @@ async fn install_marketplace_handler(
         Ok(info) => {
             // Persist so the extension reconnects on restart
             if let Some(repo) = &state.mcp_server_repo {
-                let cfg = pond_core::ports::mcp_server::McpServerConfig {
+                let cfg = pond_core::mcp::ports::mcp_server::McpServerConfig {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: ext.id.clone(),
                     kind: ext.kind,
@@ -5927,7 +5928,7 @@ async fn oauth_authorize_handler(
     let extension_id = body["extension_id"].as_str().map(String::from);
 
     // Find provider config by ID or by token_key (frontend may send the secret key name)
-    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = match providers
         .iter()
         .find(|p| p.id == provider_id || p.token_key == provider_id)
@@ -6029,7 +6030,7 @@ async fn oauth_callback_handler(
     };
 
     // Find provider config
-    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = match providers.iter().find(|p| p.id == session.provider_id) {
         Some(p) => p,
         None => {
@@ -6102,7 +6103,7 @@ async fn oauth_callback_handler(
                         // Remove the running extension and re-add with new env
                         let _ = mgr.remove_extension(ext_id).await;
 
-                        let req = pond_core::ports::extension_manager::AddExtensionRequest {
+                        let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
                             name: ext.id.clone(),
                             kind: ext.kind.clone(),
                             description: ext.description.clone(),
@@ -6172,7 +6173,7 @@ async fn oauth_refresh_handler(
     use axum::response::IntoResponse;
 
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
-    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = match providers.iter().find(|p| p.id == provider_id) {
         Some(p) => p,
         None => {
@@ -6262,7 +6263,7 @@ async fn oauth_refresh_handler(
                                 }
                                 let _ = mgr.remove_extension(&ext.id).await;
                                 let req =
-                                    pond_core::ports::extension_manager::AddExtensionRequest {
+                                    pond_core::mcp::ports::extension_manager::AddExtensionRequest {
                                         name: ext.id.clone(),
                                         kind: ext.kind.clone(),
                                         description: ext.description.clone(),
@@ -6322,7 +6323,7 @@ async fn oauth_refresh_handler(
 async fn oauth_providers_handler(
     State(_state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
-    let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let list: Vec<serde_json::Value> = providers
         .iter()
         .map(|p| {
@@ -6641,11 +6642,11 @@ struct SaveMemoryRequest {
     #[serde(default = "default_source")]
     source: String,
     #[serde(default)]
-    segment: Option<pond_core::domain::memory::MemorySegment>,
+    segment: Option<pond_core::user_data::domain::memory::MemorySegment>,
     #[serde(default)]
     importance: Option<f32>,
     #[serde(default)]
-    tier: Option<pond_core::domain::memory::MemoryTier>,
+    tier: Option<pond_core::user_data::domain::memory::MemoryTier>,
 }
 fn default_source() -> String {
     "api".to_string()
@@ -6697,7 +6698,7 @@ async fn save_memory(
         decay_rate,
         access_count: 0,
         last_accessed_at: None,
-        lifecycle: Some(pond_core::domain::memory::MemoryLifecycle::Active),
+        lifecycle: Some(pond_core::user_data::domain::memory::MemoryLifecycle::Active),
         superseded_by: None,
         corrects: None,
     };
@@ -6732,7 +6733,7 @@ async fn delete_memory(
 /// show live progress (proposer -> adversary -> judge).
 async fn start_consolidation(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    use pond_core::ports::memory_consolidator::ConsolidationEvent;
+    use pond_core::user_data::ports::memory_consolidator::ConsolidationEvent;
 
     let runner = match &state.consolidation_runner {
         Some(r) => r.clone(),
@@ -7227,13 +7228,13 @@ async fn read_face_multipart(
     (
         Option<String>,
         Vec<u8>,
-        Option<pond_core::domain::face_recognition::BoundingBox>,
+        Option<pond_core::user_data::domain::face_recognition::BoundingBox>,
     ),
     (StatusCode, Json<Value>),
 > {
     let mut profile_id: Option<String> = None;
     let mut image_bytes: Option<Vec<u8>> = None;
-    let mut bbox: Option<pond_core::domain::face_recognition::BoundingBox> = None;
+    let mut bbox: Option<pond_core::user_data::domain::face_recognition::BoundingBox> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (
@@ -7267,7 +7268,8 @@ async fn read_face_multipart(
                         Json(json!({"error": format!("read error: {}", e)})),
                     )
                 })?;
-                bbox = pond_core::domain::face_recognition::BoundingBox::parse_csv(&text);
+                bbox =
+                    pond_core::user_data::domain::face_recognition::BoundingBox::parse_csv(&text);
                 if bbox.is_none() {
                     return Err((
                         StatusCode::BAD_REQUEST,
@@ -7729,12 +7731,12 @@ async fn read_face_multipart_burst(
 ) -> Result<
     (
         Vec<Vec<u8>>,
-        Option<pond_core::domain::face_recognition::BoundingBox>,
+        Option<pond_core::user_data::domain::face_recognition::BoundingBox>,
     ),
     (StatusCode, Json<Value>),
 > {
     let mut frames: Vec<Vec<u8>> = Vec::new();
-    let mut bbox: Option<pond_core::domain::face_recognition::BoundingBox> = None;
+    let mut bbox: Option<pond_core::user_data::domain::face_recognition::BoundingBox> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (
@@ -7761,7 +7763,8 @@ async fn read_face_multipart_burst(
                         Json(json!({"error": format!("read error: {}", e)})),
                     )
                 })?;
-                bbox = pond_core::domain::face_recognition::BoundingBox::parse_csv(&text);
+                bbox =
+                    pond_core::user_data::domain::face_recognition::BoundingBox::parse_csv(&text);
             }
             _ => {}
         }
@@ -7882,7 +7885,7 @@ async fn burst_identify_face_handler(
     // produces 12 near-identical embeddings and zero landmark jitter; a
     // real face does not.
     let mut frame_embeddings: Vec<Vec<f32>> = Vec::with_capacity(n);
-    let mut frame_landmarks: Vec<pond_core::domain::face_recognition::FaceLandmarks> =
+    let mut frame_landmarks: Vec<pond_core::user_data::domain::face_recognition::FaceLandmarks> =
         Vec::with_capacity(n);
 
     for (idx, bytes) in frames.iter().enumerate() {
@@ -8163,7 +8166,7 @@ impl LivenessReport {
 ///    changes this by ≥ 0.5 %; a still photo keeps it flat.
 fn compute_liveness_report(
     embeddings: &[Vec<f32>],
-    landmarks: &[pond_core::domain::face_recognition::FaceLandmarks],
+    landmarks: &[pond_core::user_data::domain::face_recognition::FaceLandmarks],
 ) -> LivenessReport {
     // (1) Inter-frame cosine similarity (mean over adjacent pairs).
     let mean_inter_cos = if embeddings.len() >= 2 {
@@ -8194,15 +8197,16 @@ fn compute_liveness_report(
         let mut total = 0.0_f32;
         let mut pts = 0_u32;
         for i in 0..5 {
-            let point_of = |lm: &pond_core::domain::face_recognition::FaceLandmarks| -> (f32, f32) {
-                match i {
-                    0 => lm.left_eye,
-                    1 => lm.right_eye,
-                    2 => lm.nose,
-                    3 => lm.left_mouth,
-                    _ => lm.right_mouth,
-                }
-            };
+            let point_of =
+                |lm: &pond_core::user_data::domain::face_recognition::FaceLandmarks| -> (f32, f32) {
+                    match i {
+                        0 => lm.left_eye,
+                        1 => lm.right_eye,
+                        2 => lm.nose,
+                        3 => lm.left_mouth,
+                        _ => lm.right_mouth,
+                    }
+                };
             let (mx, my) = landmarks.iter().fold((0.0_f32, 0.0_f32), |(sx, sy), lm| {
                 let (x, y) = point_of(lm);
                 (sx + x, sy + y)
@@ -8498,7 +8502,7 @@ async fn enroll_quality_handler(
     // Fetch existing embeddings for this profile to score self-consistency.
     // Any error here is non-fatal — we still want to return the basic
     // quality verdict.
-    let existing: Vec<pond_core::domain::face_recognition::FaceEmbedding> =
+    let existing: Vec<pond_core::user_data::domain::face_recognition::FaceEmbedding> =
         match profile_id.as_deref() {
             Some(pid) => face.list_embeddings(pid).await.unwrap_or_default(),
             None => Vec::new(),

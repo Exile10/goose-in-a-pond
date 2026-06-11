@@ -6,16 +6,18 @@ use goose::config::GooseMode;
 use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
-use pond_core::ports::agent::{Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent};
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::prompt_extra::PromptExtraRepository;
-use pond_core::ports::prompt_template::PromptTemplateRepository;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
-use pond_core::ports::tool_registry::ToolRegistryPort;
+use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
+use pond_core::models::ports::agent::{
+    Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
+};
+use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
-use pond_core::services::prompt_builder::build_prompt_partition;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
+use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -96,7 +98,7 @@ pub struct GooseAdapter {
     /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
     voice_mode: std::sync::atomic::AtomicBool,
     /// Runtime capabilities of the currently loaded model.
-    model_capabilities: Mutex<pond_core::domain::model_capabilities::ModelCapabilities>,
+    model_capabilities: Mutex<pond_core::models::domain::model_capabilities::ModelCapabilities>,
     /// Hash of the last static prefix sent via `override_system_prompt()`.
     /// When the current partition's `prefix_hash` matches this value, the static
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
@@ -188,7 +190,7 @@ impl GooseAdapter {
             user_extensions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             voice_mode: std::sync::atomic::AtomicBool::new(false),
             model_capabilities: Mutex::new(
-                pond_core::domain::model_capabilities::ModelCapabilities::default(),
+                pond_core::models::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
             cached_tools: tokio::sync::RwLock::new(None),
@@ -206,12 +208,12 @@ impl GooseAdapter {
     /// Convenience factory for non-server use (tests, CLI one-shots).
     /// Uses mock repos and connects to llamafile at `host`.
     pub async fn with_llamafile(host: Option<&str>) -> Result<Self> {
-        use pond_core::services::mock_device_registry::MockDeviceRegistry;
-        use pond_core::services::mock_memory::MockMemoryRepository;
-        use pond_core::services::mock_prompt_extra::MockPromptExtraRepository;
-        use pond_core::services::mock_prompt_template::MockPromptTemplateRepository;
-        use pond_core::services::mock_settings::MockSettingsRepository;
-        use pond_core::services::mock_skill::MockSkillRepository;
+        use pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry;
+        use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
+        use pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository;
+        use pond_core::user_data::mocks::mock_prompt_template::MockPromptTemplateRepository;
+        use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+        use pond_core::user_data::mocks::mock_skill::MockSkillRepository;
 
         let url = host.unwrap_or("http://127.0.0.1:8080").to_string();
         Self::new(
@@ -358,7 +360,7 @@ impl GooseAdapter {
             _ => {
                 // HTTP providers — use model-reported context window.
                 let caps =
-                    pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(
+                    pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                         model,
                     );
                 caps.context_window_tokens as usize
@@ -369,7 +371,7 @@ impl GooseAdapter {
     /// Hot-swap the Goose provider when `chat_provider` / `chat_model` in settings changes.
     async fn ensure_provider_current(
         &self,
-        settings: &pond_core::domain::settings::Settings,
+        settings: &pond_core::user_data::domain::settings::Settings,
         session_id: &str,
     ) -> Result<()> {
         let key = format!("{}:{}", settings.chat_provider, settings.chat_model);
@@ -540,9 +542,10 @@ impl GooseAdapter {
             *self.last_provider_key.lock().unwrap() = key.clone();
 
             // Update model capabilities from the new model name
-            let caps = pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(
-                &settings.chat_model,
-            );
+            let caps =
+                pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
+                    &settings.chat_model,
+                );
             println!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
@@ -735,7 +738,7 @@ impl GooseAdapter {
         );
 
         // Merge recent + relevant, deduplicate by ID
-        let memories_result: Result<Vec<pond_core::domain::memory::MemoryFragment>> = {
+        let memories_result: Result<Vec<pond_core::user_data::domain::memory::MemoryFragment>> = {
             let mut merged = recent_memories.unwrap_or_default();
             let relevant = relevant_memories.unwrap_or_default();
             let seen: std::collections::HashSet<String> =
@@ -790,7 +793,7 @@ impl GooseAdapter {
             let effective_ctx =
                 Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
             let compact_prompt =
-                pond_core::services::context_budget::CompactionProfile::from_context_window(
+                pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                     effective_ctx,
                 )
                 .use_compact_prompt();
@@ -903,7 +906,7 @@ impl GooseAdapter {
         let effective_ctx =
             Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
         let compaction_profile =
-            pond_core::services::context_budget::CompactionProfile::from_context_window(
+            pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                 effective_ctx,
             );
 
@@ -924,7 +927,8 @@ impl GooseAdapter {
                 // chars/4 heuristic, keep fragments until the budget is spent.
                 let token_budget = compaction_profile.memory_token_budget;
                 let mut tokens_used: usize = 0;
-                let mut budgeted: Vec<&pond_core::domain::memory::MemoryFragment> = Vec::new();
+                let mut budgeted: Vec<&pond_core::user_data::domain::memory::MemoryFragment> =
+                    Vec::new();
                 for m in &memories {
                     let estimated_tokens = m.content.len() / 4 + 1;
                     if tokens_used + estimated_tokens > token_budget && !budgeted.is_empty() {
@@ -1274,12 +1278,12 @@ impl GooseAdapter {
                     let output = goose_session.accumulated_output_tokens
                         .map(|t| t.max(0) as u32)
                         .unwrap_or((total_output_chars / 4).max(1) as u32);
-                    pond_core::ports::provider::UsageStats {
+                    pond_core::models::ports::provider::UsageStats {
                         prompt_tokens: input,
                         completion_tokens: output,
                     }
                 }
-                Err(_) => pond_core::ports::provider::UsageStats {
+                Err(_) => pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: (user_msg_len / 4).max(1) as u32,
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
                 },
@@ -1293,7 +1297,7 @@ impl GooseAdapter {
 
 #[async_trait]
 impl AgentPort for GooseAdapter {
-    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
+    fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
         let mut caps = self.model_capabilities.lock().unwrap().clone();
         // Voice mode disables expensive/leaky capabilities: thinking tokens
         // waste TTS time, vision/audio inputs aren't used in voice flow.

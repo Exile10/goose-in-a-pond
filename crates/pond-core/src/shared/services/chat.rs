@@ -1,17 +1,17 @@
-use crate::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
-use crate::domain::message::ChatMessage;
-use crate::domain::session::SessionMessage;
-use crate::ports::agent::Agent;
-use crate::ports::provider::LlmProvider;
-use crate::ports::session_storage::SessionStorage;
-use crate::ports::voice_input::VoiceInput;
-use crate::ports::voice_output::VoiceOutput;
-use crate::ports::wake_word::StreamingWakeWordDetector;
+use crate::models::domain::message::ChatMessage;
+use crate::models::ports::agent::Agent;
+use crate::models::ports::provider::LlmProvider;
+use crate::models::ports::voice_input::VoiceInput;
+use crate::models::ports::voice_output::VoiceOutput;
+use crate::models::ports::wake_word::StreamingWakeWordDetector;
+use crate::models::services::context_compactor::ContextCompactor;
+use crate::models::services::instant_activation::InstantActivation;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
-use crate::services::context_compactor::ContextCompactor;
-use crate::services::instant_activation::InstantActivation;
-use crate::services::print_output::PrintOutput;
-use crate::services::stdin_input::StdinInput;
+use crate::shared::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
+use crate::shared::services::print_output::PrintOutput;
+use crate::shared::services::stdin_input::StdinInput;
+use crate::user_data::domain::session::SessionMessage;
+use crate::user_data::ports::session_storage::SessionStorage;
 use anyhow::Result;
 use futures::StreamExt as _;
 use std::io::{self, Write};
@@ -1018,7 +1018,7 @@ pub struct ChatService {
     /// the context budget instead of falling straight to trim_to_budget.
     compactor: Option<ContextCompactor>,
     /// Optional Answer Reviewer — adversarial post-inference quality gate.
-    answer_reviewer: Option<Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>>,
+    answer_reviewer: Option<Arc<dyn crate::models::ports::answer_reviewer::AnswerReviewer>>,
 }
 
 impl ChatService {
@@ -1044,7 +1044,7 @@ impl ChatService {
     /// Attach an Answer Reviewer for post-inference adversarial quality review.
     pub fn with_answer_reviewer(
         mut self,
-        reviewer: Arc<dyn crate::ports::answer_reviewer::AnswerReviewer>,
+        reviewer: Arc<dyn crate::models::ports::answer_reviewer::AnswerReviewer>,
     ) -> Self {
         self.answer_reviewer = Some(reviewer);
         self
@@ -1280,7 +1280,7 @@ impl ChatService {
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
         let mut barge_in_started = false;
-        let mut thought_filter = crate::services::thought_filter::ThoughtFilter::new();
+        let mut thought_filter = crate::models::services::thought_filter::ThoughtFilter::new();
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
         // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
@@ -1675,9 +1675,9 @@ impl ChatService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mock_agent::MockAgent;
-    use crate::services::mock_provider::MockProvider;
-    use crate::services::mock_session::InMemorySessionStorage;
+    use crate::models::mocks::mock_provider::MockProvider;
+    use crate::shared::mocks::mock_agent::MockAgent;
+    use crate::user_data::mocks::mock_session::InMemorySessionStorage;
 
     #[tokio::test]
     async fn chat_once_returns_echo() {
@@ -1813,7 +1813,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_voice_input_builder_compiles() {
-        use crate::services::stdin_input::StdinInput;
+        use crate::shared::services::stdin_input::StdinInput;
         let agent = Arc::new(MockAgent::new());
         let storage = Arc::new(InMemorySessionStorage::new());
         let session_id = "test-session".to_string();
@@ -2190,7 +2190,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_voice_output_builder_compiles() {
-        use crate::services::print_output::PrintOutput;
+        use crate::shared::services::print_output::PrintOutput;
         let agent = Arc::new(MockAgent::new());
         let storage = Arc::new(InMemorySessionStorage::new());
         let session_id = "test-session".to_string();

@@ -5,8 +5,8 @@
 //! are accepted. This adversarial protocol is more conservative than single-
 //! pass consolidation, reducing the risk of losing valuable memories.
 
-use crate::domain::memory::MemoryFragment;
-use crate::ports::memory_consolidator::{AdversarialConsolidationResult, ConsolidationEvent};
+use crate::user_data::domain::memory::MemoryFragment;
+use crate::user_data::ports::memory_consolidator::{AdversarialConsolidationResult, ConsolidationEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::agents::extension::Envs;
 use goose::agents::{Agent as GooseAgent, ExtensionConfig};
-use pond_core::ports::extension_manager::{
+use pond_core::mcp::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
 };
 use std::collections::{HashMap, HashSet};

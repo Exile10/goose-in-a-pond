@@ -3,7 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use crate::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 
 /// Driven port for persisting the model catalog and role assignments.
 ///

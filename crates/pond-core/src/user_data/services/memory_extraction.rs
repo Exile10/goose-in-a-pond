@@ -4,9 +4,9 @@
 //! durable facts, deduplicates against existing memories, and stores them.
 //! Runs asynchronously — must never block the SSE chat stream.
 
-use crate::domain::memory::{MemoryEventKind, MemoryFragment};
-use crate::ports::memory_extractor::MemoryExtractor;
-use crate::ports::memory_repository::MemoryRepository;
+use crate::user_data::domain::memory::{MemoryEventKind, MemoryFragment};
+use crate::user_data::ports::memory_extractor::MemoryExtractor;
+use crate::user_data::ports::memory_repository::MemoryRepository;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

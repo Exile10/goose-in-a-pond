@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use crate::domain::external_tool::ExternalToolDescription;
+use crate::mcp::domain::external_tool::ExternalToolDescription;
 
 /// Registry of all tool descriptions available to the agent pipeline.
 ///

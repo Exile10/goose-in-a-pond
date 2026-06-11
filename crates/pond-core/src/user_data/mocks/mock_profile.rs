@@ -1,7 +1,7 @@
 //! In-memory mock implementation of `ProfileRepository` for tests.
 
-use crate::domain::profile::{CreateProfileRequest, Profile};
-use crate::ports::profile::ProfileRepository;
+use crate::user_data::domain::profile::{CreateProfileRequest, Profile};
+use crate::user_data::ports::profile::ProfileRepository;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;

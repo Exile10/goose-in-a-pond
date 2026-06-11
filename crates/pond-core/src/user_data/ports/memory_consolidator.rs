@@ -3,7 +3,7 @@
 //! Runs periodically as a background task. The adapter uses the LLM
 //! to propose merge/prune actions on the current memory set.
 
-use crate::domain::memory::{MemoryFragment, MemorySegment};
+use crate::user_data::domain::memory::{MemoryFragment, MemorySegment};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

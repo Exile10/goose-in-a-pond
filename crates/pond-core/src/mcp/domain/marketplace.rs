@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::secret::SecretRequirement;
+use crate::security::domain::secret::SecretRequirement;
 
 /// A curated MCP extension available for one-click installation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

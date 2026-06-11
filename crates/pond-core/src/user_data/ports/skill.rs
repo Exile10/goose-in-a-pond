@@ -1,4 +1,4 @@
-use crate::domain::skill::UserSkill;
+use crate::user_data::domain::skill::UserSkill;
 use anyhow::Result;
 use async_trait::async_trait;
 

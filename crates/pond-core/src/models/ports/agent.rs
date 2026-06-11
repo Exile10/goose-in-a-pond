@@ -1,5 +1,5 @@
-pub use crate::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
-use crate::domain::model_capabilities::ModelCapabilities;
+use crate::models::domain::model_capabilities::ModelCapabilities;
+pub use crate::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;

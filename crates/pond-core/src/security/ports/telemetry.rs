@@ -1,6 +1,6 @@
 //! Port trait for recording and querying per-turn telemetry metrics.
 
-use crate::domain::turn_metrics::{TelemetrySummary, TurnMetrics};
+use crate::security::domain::turn_metrics::{TelemetrySummary, TurnMetrics};
 
 /// Driven port for turn-level telemetry storage and retrieval.
 ///

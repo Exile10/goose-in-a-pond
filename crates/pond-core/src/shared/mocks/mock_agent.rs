@@ -1,4 +1,4 @@
-use crate::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
+use crate::models::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};

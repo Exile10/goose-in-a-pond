@@ -13,8 +13,8 @@
 //! a pulled model; it is ignored by default.
 
 use pond_adapters_ollama::OllamaProvider;
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -243,7 +243,7 @@ async fn model_name_in_request_body_matches_configured_model() {
 #[tokio::test]
 async fn stream_complete_yields_full_text_as_one_chunk() {
     use futures::StreamExt;
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
 
     let server = MockServer::start().await;
     mount_ok(&server, "Hello from Ollama!").await;
@@ -266,7 +266,7 @@ async fn stream_complete_yields_full_text_as_one_chunk() {
 #[tokio::test]
 async fn stream_complete_yields_usage_from_response() {
     use futures::StreamExt;
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))

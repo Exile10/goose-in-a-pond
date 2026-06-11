@@ -1,8 +1,8 @@
 //! FaceRecognition port — public biometric identity differentiation.
 //!
 //! Exposes register / identify / delete operations over household-member face
-//! embeddings.  Implementors compose a [`crate::ports::face_embedding_extractor::FaceEmbeddingExtractor`]
-//! with an optional [`crate::ports::face_detector::FaceDetector`] and a
+//! embeddings.  Implementors compose a [`crate::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor`]
+//! with an optional [`crate::user_data::ports::face_detector::FaceDetector`] and a
 //! persistent store (typically SQLite).  Matching uses top-K mean cosine
 //! similarity with a runner-up margin to suppress the "everyone ~0.6"
 //! failure mode.
@@ -14,7 +14,7 @@
 //! - `delete_embeddings` removes every row for a profile to satisfy the
 //!   "forget all biometric data" requirement of the onboarding contract.
 
-use crate::domain::face_recognition::{
+use crate::user_data::domain::face_recognition::{
     BoundingBox, FaceEmbedding, FaceIdentification, FaceLandmarks,
 };
 use anyhow::Result;

@@ -9,8 +9,8 @@
 //! Output is always in chronological (oldest-first) order so it can be
 //! consumed directly by `InferenceProvider::stream_chat`.
 
-use crate::domain::message::{ChatMessage, Role};
-use crate::domain::session::SessionMessage;
+use crate::models::domain::message::{ChatMessage, Role};
+use crate::user_data::domain::session::SessionMessage;
 
 /// Builds conversation history for context injection.
 pub struct HistoryManager {
@@ -85,8 +85,8 @@ fn group_into_turns(messages: &[ChatMessage]) -> Vec<&[ChatMessage]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::message::{ChatMessage, Role, ToolCallRecord};
-    use crate::domain::session::SessionMessage;
+    use crate::models::domain::message::{ChatMessage, Role, ToolCallRecord};
+    use crate::user_data::domain::session::SessionMessage;
 
     fn session_msg(role: Role, content: &str) -> SessionMessage {
         SessionMessage {

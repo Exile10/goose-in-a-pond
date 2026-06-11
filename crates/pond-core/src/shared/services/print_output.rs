@@ -4,7 +4,7 @@
 //! Moves the bare `println!` from the Speak state into the port so
 //! `ChatService` never has a hard dependency on stdout.
 
-use crate::ports::voice_output::VoiceOutput;
+use crate::models::ports::voice_output::VoiceOutput;
 use anyhow::Result;
 use async_trait::async_trait;
 

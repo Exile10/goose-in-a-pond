@@ -10,8 +10,8 @@
 //! );
 //! ```
 
-use crate::domain::message::ChatMessage;
-use crate::ports::provider::LlmProvider;
+use crate::models::domain::message::ChatMessage;
+use crate::models::ports::provider::LlmProvider;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -60,7 +60,7 @@ impl LlmProvider for FallbackProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mock_provider::MockProvider;
+    use crate::models::mocks::mock_provider::MockProvider;
 
     /// A provider that always fails, used to test fallback triggering.
     struct FailingProvider;

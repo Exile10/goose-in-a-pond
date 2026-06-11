@@ -7,16 +7,16 @@
 use anyhow::Result;
 use goose::builtin_extension::register_builtin_extension;
 use pond_adapters_weather::WeatherProvider;
-use pond_core::domain::settings::Settings;
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::draft::DraftRepository;
-use pond_core::ports::embedding::EmbeddingProvider;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::recipe::AgentRecipeRepository;
-use pond_core::ports::scheduler::SchedulerPort;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
-use pond_core::ports::tool_caller::ToolCaller;
+use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
+use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::draft::DraftRepository;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::ports::scheduler::SchedulerPort;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use std::sync::{Arc, OnceLock};
 
 /// Registered extension names — populated at startup by `register_giap_extensions()`.

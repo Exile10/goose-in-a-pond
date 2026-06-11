@@ -6,8 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Pool, Sqlite};
 
-use pond_core::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
-use pond_core::ports::model_repository::ModelRepository;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::models::ports::model_repository::ModelRepository;
 
 // ── Repo struct ───────────────────────────────────────────────────────────────
 

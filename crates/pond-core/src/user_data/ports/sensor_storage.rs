@@ -1,6 +1,6 @@
 //! SensorStorage port — driven port for recording IoT sensor readings.
 
-use crate::domain::sensor::SensorReading;
+use crate::user_data::domain::sensor::SensorReading;
 use anyhow::Result;
 use async_trait::async_trait;
 

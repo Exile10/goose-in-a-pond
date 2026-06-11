@@ -3,7 +3,7 @@
 //! Bridges between MCP server tool listings and the `InferenceProvider`
 //! tool format. Called at startup after listing tools from the MCP server.
 
-use pond_core::ports::inference::ToolDefinition;
+use pond_core::models::ports::inference::ToolDefinition;
 
 /// Convert an MCP tool (name + description + JSON Schema) into a `ToolDefinition`.
 ///

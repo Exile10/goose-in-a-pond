@@ -6,8 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Pool, Row, Sqlite};
 
-use pond_core::domain::prompt_template::PromptTemplate;
-use pond_core::ports::prompt_template::PromptTemplateRepository;
+use pond_core::user_data::domain::prompt_template::PromptTemplate;
+use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 
 pub struct SqlitePromptTemplateRepository {
     pool: Pool<Sqlite>,

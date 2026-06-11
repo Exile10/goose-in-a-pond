@@ -18,8 +18,8 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -253,8 +253,10 @@ impl OllamaProvider {
 
 #[async_trait]
 impl LlmProvider for OllamaProvider {
-    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
-        pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&self.model)
+    fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
+        pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
+            &self.model,
+        )
     }
 
     async fn complete(

@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::conversation::message::Message as GooseMessage;
 use goose::providers::base::Provider as GooseProvider;
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::ports::provider::LlmProvider;
 use std::sync::Arc;
 
 /// Adapter: GooseProviderAdapter
@@ -60,9 +60,9 @@ impl GooseProviderAdapter {
 
 #[async_trait]
 impl LlmProvider for GooseProviderAdapter {
-    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
+    fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
         let name = self.provider.get_model_config().model_name.clone();
-        pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
+        pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
     }
 
     async fn complete(

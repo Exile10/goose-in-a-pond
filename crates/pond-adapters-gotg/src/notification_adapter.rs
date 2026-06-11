@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::ports::notification::{Notification, NotificationSender};
+use pond_core::mcp::ports::notification::{Notification, NotificationSender};
 
 /// GOTG-specific notification adapter.
 ///

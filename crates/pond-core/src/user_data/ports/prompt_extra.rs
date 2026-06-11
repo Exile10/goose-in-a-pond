@@ -1,4 +1,4 @@
-use crate::domain::prompt_extra::PromptExtra;
+use crate::user_data::domain::prompt_extra::PromptExtra;
 use anyhow::Result;
 use async_trait::async_trait;
 

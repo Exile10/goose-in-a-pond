@@ -1,8 +1,8 @@
 //! Application service for onboarding use cases.
 //! This orchestrates onboarding progression logic.
 
-use crate::domain::onboarding::OnboardingStep;
-use crate::ports::onboarding::OnboardingRepository;
+use crate::user_data::domain::onboarding::OnboardingStep;
+use crate::user_data::ports::onboarding::OnboardingRepository;
 use anyhow::Result;
 
 pub struct OnboardingService<R: OnboardingRepository> {

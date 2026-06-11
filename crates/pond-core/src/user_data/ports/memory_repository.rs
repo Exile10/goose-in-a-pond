@@ -1,6 +1,6 @@
 //! MemoryRepository port — driven port for semantic memory persistence.
 
-use crate::domain::memory::{
+use crate::user_data::domain::memory::{
     MemoryEdge, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryGraph, MemoryLifecycle,
     MemorySegment,
 };

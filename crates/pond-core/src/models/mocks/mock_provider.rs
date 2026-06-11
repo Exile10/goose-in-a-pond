@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::message::{ChatMessage, Role};
-use crate::ports::provider::LlmProvider;
+use crate::models::domain::message::{ChatMessage, Role};
+use crate::models::ports::provider::LlmProvider;
 
 /// Mock LLM provider for testing.
 ///

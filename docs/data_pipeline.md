@@ -65,8 +65,8 @@ New migration files:
 
 | File | Purpose |
 |---|---|
-| `crates/pond-core/src/services/context_budget.rs` | Budget constants + `trim_to_budget()` |
-| `crates/pond-core/src/services/fallback_provider.rs` | `FallbackProvider` struct + `LlmProvider` impl |
+| `crates/pond-core/src/models/services/context_budget.rs` | Budget constants + `trim_to_budget()` |
+| `crates/pond-core/src/models/services/fallback_provider.rs` | `FallbackProvider` struct + `LlmProvider` impl |
 | `crates/pond-infra/src/pruning.rs` | `PruningConfig`, `run_pruning()`, `prune_once()` |
 | `crates/pond-infra/migrations/logs/0002_sensor_readings.sql` | `sensor_readings` table |
 | `crates/pond-infra/migrations/logs/0003_camera_events.sql` | `camera_events` table |
@@ -75,10 +75,10 @@ New migration files:
 
 | File | Change |
 |---|---|
-| `crates/pond-core/src/ports/session_storage.rs` | Added `get_recent_messages()` to trait |
-| `crates/pond-core/src/services/mock_session.rs` | Implemented `get_recent_messages()` |
-| `crates/pond-core/src/services/chat.rs` | Replaced unbounded load with budget-aware load |
-| `crates/pond-core/src/services/mod.rs` | Exposed `context_budget`, `fallback_provider` |
+| `crates/pond-core/src/user_data/ports/session_storage.rs` | Added `get_recent_messages()` to trait |
+| `crates/pond-core/src/user_data/mocks/mock_session.rs` | Implemented `get_recent_messages()` |
+| `crates/pond-core/src/shared/services/chat.rs` | Replaced unbounded load with budget-aware load |
+| `crates/pond-core/src/<quadrant>/services/mod.rs` | Exposed `context_budget`, `fallback_provider` |
 | `crates/pond-infra/src/sqlite_session_storage.rs` | Implemented `get_recent_messages()` (DESC LIMIT + reverse) |
 | `crates/pond-infra/src/lib.rs` | Exposed `pruning` module |
 | `crates/pond-adapters-llamafile/src/lib.rs` | Added `max_tokens`, `temperature` builders |

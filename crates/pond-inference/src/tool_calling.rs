@@ -6,7 +6,7 @@
 //! 2. **XML / Qwen-style**: `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`
 //! 3. **Llama3 / Gemma4**: `<|tool_call|>call:NAME{...}<tool_call|>` or `<|tool_call>call:NAME{...}<tool_call|>`
 
-use pond_core::ports::inference::ToolDefinition;
+use pond_core::models::ports::inference::ToolDefinition;
 use serde_json::Value;
 
 /// A tool call parsed from model output.

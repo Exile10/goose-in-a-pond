@@ -31,7 +31,7 @@
 //! Weather Check|*/6h|paused
 //! ```
 
-use crate::domain::memory::MemoryFragment;
+use crate::user_data::domain::memory::MemoryFragment;
 
 /// Encode memory fragments into a compact, one-line-per-memory format.
 ///
@@ -386,7 +386,7 @@ fn parse_json_value(input: &str, pos: &mut usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryFragment, MemorySegment};
+    use crate::user_data::domain::memory::{MemoryFragment, MemorySegment};
 
     fn make_memory(
         content: &str,

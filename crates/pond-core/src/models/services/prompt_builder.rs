@@ -23,11 +23,11 @@
 //! agent.extend_system_prompt("temporal", partition.dynamic_suffix);
 //! ```
 
-use crate::domain::settings::Settings;
 use crate::prompts::{
     render_jinja_template, sanitize_field, ProfileContext, PromptState, PROMPT_BALANCED,
     PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
 };
+use crate::user_data::domain::settings::Settings;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

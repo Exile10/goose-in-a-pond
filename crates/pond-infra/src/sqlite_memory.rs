@@ -7,10 +7,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::memory::{
+use pond_core::user_data::domain::memory::{
     MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
 };
-use pond_core::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
 
@@ -505,7 +505,7 @@ impl MemoryRepository for SqliteMemoryRepository {
     async fn update_segment(
         &self,
         id: &str,
-        segment: pond_core::domain::memory::MemorySegment,
+        segment: pond_core::user_data::domain::memory::MemorySegment,
         importance: f32,
     ) -> anyhow::Result<()> {
         let seg_str = format!("{:?}", segment).to_lowercase();

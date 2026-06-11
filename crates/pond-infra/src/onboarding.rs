@@ -1,8 +1,8 @@
 //! SQLx implementation of the OnboardingRepository port.
 //! Connects Core logic to SQLite persistence.
 
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::ports::onboarding::OnboardingRepository;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
 

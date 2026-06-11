@@ -16,7 +16,7 @@ We will implement a **Driven Port** (the interface for weather), a **Service** (
 
 The Port is the contract. It lives in `pond-core`.
 
-**File:** `crates/pond-core/src/ports/weather.rs`
+**File:** `crates/pond-core/src/mcp/ports/weather.rs`
 
 ```rust
 use anyhow::Result;
@@ -31,7 +31,7 @@ pub trait WeatherProvider: Send + Sync {
 Register it:
 
 ```rust
-// crates/pond-core/src/ports/mod.rs
+// crates/pond-core/src/mcp/ports/mod.rs
 pub mod weather;
 ```
 
@@ -39,7 +39,7 @@ pub mod weather;
 
 ## Step 2: Define Domain Types
 
-**File:** `crates/pond-core/src/domain/weather.rs` (or within `pond-adapters-weather` if the type is adapter-specific)
+**File:** `crates/pond-core/src/mcp/domain/weather.rs` (or within `pond-adapters-weather` if the type is adapter-specific)
 
 ```rust
 pub struct WeatherData {
@@ -55,12 +55,12 @@ pub struct WeatherData {
 
 ## Step 3: Write a Mock and Tests (TDD first)
 
-**File:** `crates/pond-core/src/services/mock_weather.rs`
+**File:** `crates/pond-core/src/mcp/mocks/mock_weather.rs`
 
 ```rust
 use async_trait::async_trait;
 use anyhow::Result;
-use crate::ports::weather::{WeatherProvider, WeatherData};
+use crate::mcp::ports::weather::{WeatherProvider, WeatherData};
 
 pub struct MockWeather;
 

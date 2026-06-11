@@ -15,10 +15,10 @@
 //!   cargo test -p pond-server --test live_feature_test -- --ignored
 //! ```
 
-use pond_core::domain::memory::{MemoryFragment, MemorySegment, MemoryTier};
-use pond_core::ports::memory_extractor::MemoryExtractor;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment, MemoryTier};
+use pond_core::user_data::ports::memory_extractor::MemoryExtractor;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_infra::db::Database;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use std::sync::Arc;
@@ -148,7 +148,7 @@ async fn live_extraction_stores_to_sqlite() {
     let extractor = pond_server::llm_memory_extractor::LlmMemoryExtractor::new(live, 3);
 
     let extraction_service =
-        pond_core::services::memory_extraction::MemoryExtractionService::new(1);
+        pond_core::user_data::services::memory_extraction::MemoryExtractionService::new(1);
 
     extraction_service
         .run(
@@ -210,7 +210,8 @@ async fn live_extraction_then_cleanup_cycle() {
     let db = Database::init(tmp.path()).await.unwrap();
     let repo = SqliteMemoryRepository::new(db.system);
     let extractor = pond_server::llm_memory_extractor::LlmMemoryExtractor::new(live, 3);
-    let service = pond_core::services::memory_extraction::MemoryExtractionService::new(1);
+    let service =
+        pond_core::user_data::services::memory_extraction::MemoryExtractionService::new(1);
 
     // Extract from a conversation
     service
@@ -228,7 +229,7 @@ async fn live_extraction_then_cleanup_cycle() {
 
     // Run cleanup — fresh memories should NOT be pruned
     let (scanned, archived, pruned) =
-        pond_core::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15, 11.25, 0.8)
+        pond_core::user_data::services::memory_cleanup::run_cleanup(&repo, 0.05, 0.15, 11.25, 0.8)
             .await
             .unwrap();
     println!("[live-test] cleanup: scanned={scanned}, archived={archived}, pruned={pruned}");
@@ -284,10 +285,13 @@ async fn live_consolidation_merges_duplicates() {
         before.len()
     );
 
-    let (merged, pruned) =
-        pond_core::services::memory_consolidation::run_consolidation(&consolidator, &repo)
-            .await
-            .unwrap();
+    let (merged, pruned) = pond_core::user_data::services::memory_consolidation::run_consolidation(
+        &consolidator,
+        &repo,
+        50,
+    )
+    .await
+    .unwrap();
 
     println!("[live-test] consolidation: merged={merged}, pruned={pruned}");
 
@@ -324,7 +328,7 @@ async fn live_chat_produces_nonzero_token_estimate() {
     let response = provider
         .complete(
             "You are a helpful assistant.",
-            vec![pond_core::domain::message::ChatMessage::user(
+            vec![pond_core::models::domain::message::ChatMessage::user(
                 "What is 2 + 2?".to_string(),
             )],
         )

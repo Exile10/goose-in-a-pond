@@ -10,9 +10,9 @@
 //! If the LLM call fails for any reason, `compact` falls back to
 //! `trim_to_budget` so the chat loop is never interrupted.
 
-use crate::domain::message::{ChatMessage, Role};
-use crate::ports::provider::LlmProvider;
-use crate::services::context_budget::{
+use crate::models::domain::message::{ChatMessage, Role};
+use crate::models::ports::provider::LlmProvider;
+use crate::models::services::context_budget::{
     trim_to_budget, trim_to_budget_for_model, USABLE_HISTORY_CHARS,
 };
 use anyhow::Result;
@@ -140,8 +140,8 @@ async fn summarise(provider: &dyn LlmProvider, messages: &[ChatMessage]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::provider::LlmProvider;
-    use crate::services::context_budget::USABLE_HISTORY_CHARS;
+    use crate::models::ports::provider::LlmProvider;
+    use crate::models::services::context_budget::USABLE_HISTORY_CHARS;
     use async_trait::async_trait;
 
     struct StubProvider {

@@ -51,23 +51,23 @@ use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_adapters_whisper::WhisperInput;
 use pond_adapters_whisper::{WhisperKeywordDetector, WhisperRsInput};
 use pond_api::{AppState, LlamafileManager};
-use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::ports::agent::Agent;
-use pond_core::ports::mcp_server::McpServerRepository as _;
-use pond_core::ports::model_repository::ModelRepository;
-use pond_core::ports::provider::LlmProvider;
-use pond_core::ports::session_storage::SessionStorage;
-use pond_core::ports::settings::SettingsRepository as _;
-use pond_core::ports::voice_input::VoiceInput;
-use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::mcp::ports::mcp_server::McpServerRepository as _;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+use pond_core::models::ports::agent::Agent;
+use pond_core::models::ports::model_repository::ModelRepository;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::models::ports::voice_input::VoiceInput;
+use pond_core::models::ports::voice_output::VoiceOutput;
+use pond_core::models::services::instant_activation::InstantActivation;
 use pond_core::prompts::build_system_prompt;
-use pond_core::services::chat::ChatService;
-use pond_core::services::instant_activation::InstantActivation;
-use pond_core::services::mock_agent::MockAgent;
-use pond_core::services::onboarding::OnboardingService;
-use pond_core::services::print_output::PrintOutput;
-use pond_core::services::stdin_input::StdinInput;
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::shared::services::chat::ChatService;
+use pond_core::shared::services::print_output::PrintOutput;
+use pond_core::shared::services::stdin_input::StdinInput;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::ports::session_storage::SessionStorage;
+use pond_core::user_data::ports::settings::SettingsRepository as _;
+use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
@@ -541,10 +541,10 @@ async fn run_setup(model: &str) -> Result<()> {
 
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
-        use pond_core::domain::prompt_template::PromptTemplate;
-        #[allow(unused_imports)]
-        use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::user_data::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 
         let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
         let built_ins = [
@@ -588,7 +588,7 @@ async fn run_setup(model: &str) -> Result<()> {
     let effective_model = if model.is_empty() { "base" } else { model };
     let (expected_path, whisper_dl_url, whisper_dl_mb) = {
         use crate::filesystem_model_storage::FilesystemModelStorage;
-        use pond_core::ports::model_storage::ModelStorage as _;
+        use pond_core::models::ports::model_storage::ModelStorage as _;
         let storage = FilesystemModelStorage::new(&data_dir);
         let model_id = format!("whisper/{}", effective_model);
         match setup_model_repo.get_by_id(&model_id).await.ok().flatten() {
@@ -701,7 +701,7 @@ async fn run_setup(model: &str) -> Result<()> {
 /// without `pond-api` having any process-management knowledge.
 struct LlamafileManagerImpl {
     data_dir: std::path::PathBuf,
-    model_service: Arc<pond_core::services::model_service::ModelService>,
+    model_service: Arc<pond_core::models::services::model_service::ModelService>,
     /// Holds the spawned process guard so it stays alive as long as AppState does.
     guard: Arc<tokio::sync::Mutex<Option<llamafile_process::LlamafileProcess>>>,
     /// The port the process actually bound to.
@@ -797,7 +797,7 @@ impl LlamafileManagerImpl {
     /// initial startup (or the base port if the process was not started yet).
     fn new(
         data_dir: std::path::PathBuf,
-        model_service: Arc<pond_core::services::model_service::ModelService>,
+        model_service: Arc<pond_core::models::services::model_service::ModelService>,
         initial_guard: Option<llamafile_process::LlamafileProcess>,
         initial_port: u16,
     ) -> Self {
@@ -1056,38 +1056,42 @@ async fn run_server(
     let mut piper_http_port: Option<u16> = None;
 
     #[cfg(not(feature = "legacy-subprocess"))]
-    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = match &piper_model
-    {
-        Some(model_path) if model_path.exists() => {
-            let config_path = std::path::PathBuf::from(format!("{}.json", model_path.display()));
-            if !config_path.exists() {
-                println!(
-                    "  ⚠  Piper voice config (.onnx.json) missing at {}",
-                    config_path.display()
-                );
-                None
-            } else {
-                match PiperRsOutput::new(model_path.clone(), config_path) {
-                    Ok(out) => {
-                        let out = match espeak_data.clone() {
-                            Some(d) => out.with_espeak_data(d),
-                            None => out,
-                        };
-                        println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
-                        Some(Arc::new(out) as Arc<dyn pond_core::ports::voice_output::VoiceOutput>)
-                    }
-                    Err(e) => {
-                        tracing::warn!("PiperRsOutput failed to load voice: {e}");
-                        None
+    let piper_tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
+        match &piper_model {
+            Some(model_path) if model_path.exists() => {
+                let config_path =
+                    std::path::PathBuf::from(format!("{}.json", model_path.display()));
+                if !config_path.exists() {
+                    println!(
+                        "  ⚠  Piper voice config (.onnx.json) missing at {}",
+                        config_path.display()
+                    );
+                    None
+                } else {
+                    match PiperRsOutput::new(model_path.clone(), config_path) {
+                        Ok(out) => {
+                            let out = match espeak_data.clone() {
+                                Some(d) => out.with_espeak_data(d),
+                                None => out,
+                            };
+                            println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
+                            Some(Arc::new(out)
+                                as Arc<
+                                    dyn pond_core::models::ports::voice_output::VoiceOutput,
+                                >)
+                        }
+                        Err(e) => {
+                            tracing::warn!("PiperRsOutput failed to load voice: {e}");
+                            None
+                        }
                     }
                 }
             }
-        }
-        _ => None,
-    };
+            _ => None,
+        };
 
     #[cfg(feature = "legacy-subprocess")]
-    let piper_tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> =
+    let piper_tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
         match (piper_process::find_binary(&data_dir), &piper_model) {
             (Some(bin), Some(model_path)) if model_path.exists() => {
                 let ed = espeak_data.clone();
@@ -1113,7 +1117,8 @@ async fn run_server(
             }
             _ => None,
         };
-    let tts: Option<Arc<dyn pond_core::ports::voice_output::VoiceOutput>> = match piper_tts {
+    let tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> = match piper_tts
+    {
         Some(piper) => {
             println!("  ✅ TTS: piper");
             Some(piper)
@@ -1127,19 +1132,21 @@ async fn run_server(
     // ── Persistent model catalog & ModelService ────────────────────────────────
     let model_repo: Arc<dyn ModelRepository + Send + Sync> =
         Arc::new(SqliteModelRepository::new(db.system.clone()));
-    let model_service = Arc::new(pond_core::services::model_service::ModelService::new(
-        model_repo.clone(),
-        Arc::new(
-            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-                reqwest::Client::builder()
-                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-                    .build()
-                    .unwrap_or_default(),
+    let model_service = Arc::new(
+        pond_core::models::services::model_service::ModelService::new(
+            model_repo.clone(),
+            Arc::new(
+                crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                    reqwest::Client::builder()
+                        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                        .build()
+                        .unwrap_or_default(),
+                ),
             ),
+            Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+            Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
         ),
-        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
-        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
-    ));
+    );
 
     // Seed catalog from upstream sources (idempotent, safe to call every startup)
     if let Err(e) = model_service.seed_catalog().await {
@@ -1160,12 +1167,14 @@ async fn run_server(
         use crate::reqwest_model_downloader::ReqwestModelDownloader;
         use crate::startup::auto_download_assigned_models;
 
-        let dl_repo: Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync> =
-            model_repo.clone();
-        let dl_storage: Arc<dyn pond_core::ports::model_storage::ModelStorage + Send + Sync> =
-            Arc::new(FilesystemModelStorage::new(&data_dir));
+        let dl_repo: Arc<
+            dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync,
+        > = model_repo.clone();
+        let dl_storage: Arc<
+            dyn pond_core::models::ports::model_storage::ModelStorage + Send + Sync,
+        > = Arc::new(FilesystemModelStorage::new(&data_dir));
         let dl_downloader: Arc<
-            dyn pond_core::ports::model_downloader::ModelDownloader + Send + Sync,
+            dyn pond_core::models::ports::model_downloader::ModelDownloader + Send + Sync,
         > = Arc::new(ReqwestModelDownloader);
 
         tokio::spawn(async move {
@@ -1210,22 +1219,28 @@ async fn run_server(
 
     // Build app state
     let onboarding_repo = Arc::new(SqlxOnboardingRepository::new(db.system.clone()));
-    let session_storage: Arc<dyn pond_core::ports::session_storage::SessionStorage> =
+    let session_storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage> =
         Arc::new(SqliteSessionStorage::new(db.system.clone()));
-    let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
-        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
-    let profile_repo: Arc<dyn pond_core::ports::profile::ProfileRepository + Send + Sync> =
-        Arc::new(SqliteProfileRepository::new(db.system.clone()));
-    let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
-        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
-        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+    let settings_repo: Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let profile_repo: Arc<
+        dyn pond_core::user_data::ports::profile::ProfileRepository + Send + Sync,
+    > = Arc::new(SqliteProfileRepository::new(db.system.clone()));
+    let device_registry: Arc<
+        dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
+    > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let memory_repo: Arc<
+        dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
+    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
-    let sensor_storage: Arc<dyn pond_core::ports::sensor_storage::SensorStorage + Send + Sync> =
-        Arc::new(SqliteSensorStorage::new(db.logs.clone()));
-    let camera_storage: Arc<dyn pond_core::ports::camera_storage::CameraStorage + Send + Sync> =
-        Arc::new(SqliteCameraStorage::new(db.logs.clone()));
+    let sensor_storage: Arc<
+        dyn pond_core::user_data::ports::sensor_storage::SensorStorage + Send + Sync,
+    > = Arc::new(SqliteSensorStorage::new(db.logs.clone()));
+    let camera_storage: Arc<
+        dyn pond_core::user_data::ports::camera_storage::CameraStorage + Send + Sync,
+    > = Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
     // ── Face recognition (Phase 2) ──────────────────────────────────────────
     // Built only when the --features face-onnx build flag is enabled AND an
@@ -1247,26 +1262,28 @@ async fn run_server(
         // pass was a no-op.  Idempotent — only sets unset vars.
         apply_face_recognition_defaults();
     }
-    let face_recognition: Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> =
-        build_face_recognition(&data_dir, db.system.clone());
+    let face_recognition: Option<
+        Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>,
+    > = build_face_recognition(&data_dir, db.system.clone());
 
     let prompt_template_repo: Arc<
-        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+        dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
     let prompt_extra_repo: Arc<
-        dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync,
+        dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
     > = Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
-    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+    let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
-    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
-        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+    let recipe_repo: Arc<
+        dyn pond_core::user_data::ports::recipe::AgentRecipeRepository + Send + Sync,
+    > = Arc::new(SqliteRecipeRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates with latest Jinja2 general-purpose content.
     {
-        use pond_core::domain::prompt_template::PromptTemplate;
-        #[allow(unused_imports)]
-        use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::user_data::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
         let built_ins = [
             (
                 "balanced",
@@ -1387,8 +1404,8 @@ async fn run_server(
     // Build InferencePool — concurrent LLM task submission with provider-aware
     // concurrency limits. HTTP providers (Ollama/llamafile) get 3 concurrent
     // slots; local GGUF gets 1 (serialized by Goose's model mutex anyway).
-    let inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>> = {
-        use pond_core::ports::inference_pool::InferencePool as _;
+    let inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>> = {
+        use pond_core::models::ports::inference_pool::InferencePool as _;
         let pool = inference_pool::TokioInferencePool::for_provider(
             llm_provider.clone(),
             &effective_chat_provider,
@@ -1409,24 +1426,26 @@ async fn run_server(
         settings.review_mode, settings.review_pass_threshold, settings.review_max_rounds
     );
     let answer_reviewer_for_http: Option<
-        Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>,
+        Arc<dyn pond_core::models::ports::answer_reviewer::AnswerReviewer>,
     > = Some(Arc::new(GiapAnswerReviewer {
         live_provider: llm_provider.clone(),
         pass_threshold: settings.review_pass_threshold,
         max_rounds: settings.review_max_rounds,
     })
-        as Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>);
+        as Arc<
+            dyn pond_core::models::ports::answer_reviewer::AnswerReviewer,
+        >);
 
     // Memory extractor — background extraction of durable facts from conversations.
     let (memory_extractor_for_http, memory_extraction_service_for_http) =
         if settings.memory_extraction_enabled {
-            let extractor: Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor> =
+            let extractor: Arc<dyn pond_core::user_data::ports::memory_extractor::MemoryExtractor> =
                 Arc::new(llm_memory_extractor::LlmMemoryExtractor::new(
                     llm_provider.clone(),
                     settings.memory_extraction_max_facts,
                 ));
             let service = Arc::new(
-                pond_core::services::memory_extraction::MemoryExtractionService::new(
+                pond_core::user_data::services::memory_extraction::MemoryExtractionService::new(
                     settings.memory_extraction_interval_secs,
                 ),
             );
@@ -1462,7 +1481,7 @@ async fn run_server(
                 tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
             loop {
                 interval.tick().await;
-                match pond_core::services::memory_cleanup::run_cleanup(
+                match pond_core::user_data::services::memory_cleanup::run_cleanup(
                     cleanup_repo.as_ref(),
                     prune_threshold,
                     archive_threshold,
@@ -1496,7 +1515,7 @@ async fn run_server(
         tokio::sync::RwLock<Option<tokio_util::sync::CancellationToken>>,
     > = Arc::new(tokio::sync::RwLock::new(None));
     let (consolidation_event_tx, _) = tokio::sync::broadcast::channel::<
-        pond_core::ports::memory_consolidator::ConsolidationEvent,
+        pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
     >(64);
 
     // Build the ConsolidationRunner closure that pond-api will call from the
@@ -1610,10 +1629,11 @@ async fn run_server(
     // exists.  The real executor (AgentScheduleExecutor) is injected after the
     // agent is constructed further below.
     let deferred_executor = Arc::new(DeferredExecutor::new());
-    let (schedule_result_tx, _) =
-        tokio::sync::broadcast::channel::<pond_core::domain::schedule::ScheduleResultEvent>(32);
-    let scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>> = {
-        let exec: Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor> =
+    let (schedule_result_tx, _) = tokio::sync::broadcast::channel::<
+        pond_core::user_data::domain::schedule::ScheduleResultEvent,
+    >(32);
+    let scheduler: Option<Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>> = {
+        let exec: Arc<dyn pond_core::user_data::ports::schedule_execution::ScheduleExecutor> =
             deferred_executor.clone();
         match CronSchedulerAdapter::with_options(
             data_dir.join("schedules.json"),
@@ -1641,7 +1661,7 @@ async fn run_server(
     // MCP Memory — enabled when --features mcp-memory is passed at build time.
     #[cfg(feature = "mcp-memory")]
     let mcp_memory: Option<
-        Arc<dyn pond_core::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
+        Arc<dyn pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
     > = {
         use pond_adapters_mcp_memory::GooseMcpMemoryAdapter;
         let adapter = GooseMcpMemoryAdapter::new(data_dir.join("memory"));
@@ -1650,16 +1670,16 @@ async fn run_server(
     };
     #[cfg(not(feature = "mcp-memory"))]
     let mcp_memory: Option<
-        Arc<dyn pond_core::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
+        Arc<dyn pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
     > = None;
 
     // ── Embedding provider (fastembed / ONNX) ────────────────────────────────
     // Initialized before the agent backend so it can be wired into the memory
     // MCP server for semantic search on recall/save.
     let embedding_provider: Option<
-        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+        Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync>,
     > = {
-        use pond_core::ports::embedding::EmbeddingProvider as _;
+        use pond_core::models::ports::embedding::EmbeddingProvider as _;
         if settings.embedding_provider == "none" {
             tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
             None
@@ -1682,7 +1702,9 @@ async fn run_server(
                     );
                     Some(Arc::new(provider)
                         as Arc<
-                            dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync,
+                            dyn pond_core::models::ports::embedding::EmbeddingProvider
+                                + Send
+                                + Sync,
                         >)
                 }
                 Err(e) => {
@@ -1704,8 +1726,9 @@ async fn run_server(
     #[cfg(feature = "goose-agent")]
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
-        let default_registry: Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort> =
-            Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+        let default_registry: Arc<
+            dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
+        > = Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
 
         #[cfg(feature = "pond-agent")]
         let agent: Arc<dyn Agent> = {
@@ -1728,19 +1751,19 @@ async fn run_server(
                     draft_repo.clone(),
                     embedding_provider.clone(),
                 );
-                let disp: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+                let disp: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
                     Arc::new(dispatcher);
-                let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = disp
+                let tool_defs: Vec<pond_core::models::ports::inference::ToolDefinition> = disp
                     .available_tool_definitions()
                     .await
                     .into_iter()
-                    .map(
-                        |(name, desc, schema)| pond_core::ports::inference::ToolDefinition {
+                    .map(|(name, desc, schema)| {
+                        pond_core::models::ports::inference::ToolDefinition {
                             name,
                             description: desc,
                             parameters_schema: schema,
-                        },
-                    )
+                        }
+                    })
                     .collect();
                 let agent = pond_agent::PondAgent::new(
                     Arc::new(eng),
@@ -1786,14 +1809,14 @@ async fn run_server(
     };
 
     #[cfg(not(feature = "goose-agent"))]
-    let tool_caller: Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>> = None;
+    let tool_caller: Option<Arc<dyn pond_core::mcp::ports::tools::tool_caller::ToolCaller>> = None;
     #[cfg(not(feature = "goose-agent"))]
-    let tool_registry: Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort> =
-        Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+    let tool_registry: Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort> =
+        Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
     #[cfg(not(feature = "goose-agent"))]
     let (agent, extension_manager): (
         Arc<dyn Agent>,
-        Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
+        Option<Arc<dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort>>,
     ) = {
         if agent_backend == "goose" {
             tracing::warn!(
@@ -1813,14 +1836,19 @@ async fn run_server(
             settings.schedule_max_concurrent,
         ));
         deferred_executor
-            .init(real_executor as Arc<dyn pond_core::ports::schedule_execution::ScheduleExecutor>)
+            .init(
+                real_executor
+                    as Arc<dyn pond_core::user_data::ports::schedule_execution::ScheduleExecutor>,
+            )
             .await;
         tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
     }
 
     // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
     // Initialized before MCP auto-connect so startup can resolve OAuth tokens.
-    let secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>> = {
+    let secret_repo: Option<
+        Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>,
+    > = {
         match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
             Ok(repo) => {
                 tracing::info!(
@@ -1838,11 +1866,11 @@ async fn run_server(
 
     // Marketplace — curated registry of installable extensions.
     // Initialized before MCP auto-connect so startup can look up required_secrets.
-    let marketplace: Arc<dyn pond_core::ports::extension_marketplace::ExtensionMarketplace> =
-        Arc::new(pond_core::services::marketplace::BundledMarketplace::new());
+    let marketplace: Arc<dyn pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace> =
+        Arc::new(pond_core::mcp::services::marketplace::BundledMarketplace::new());
 
     // MCP client — load persisted server configs and auto-connect enabled ones.
-    let mcp_server_repo: Option<Arc<dyn pond_core::ports::mcp_server::McpServerRepository>> = {
+    let mcp_server_repo: Option<Arc<dyn pond_core::mcp::ports::mcp_server::McpServerRepository>> = {
         let repo = Arc::new(SqliteMcpServerRepository::new(db.system.clone()));
         // Auto-connect saved external MCP servers if the extension manager is available.
         if let Some(mgr) = &extension_manager {
@@ -1850,9 +1878,9 @@ async fn run_server(
                 Ok(servers) => {
                     for srv in servers
                         .into_iter()
-                        .filter(|s: &pond_core::ports::mcp_server::McpServerConfig| s.enabled)
+                        .filter(|s: &pond_core::mcp::ports::mcp_server::McpServerConfig| s.enabled)
                     {
-                        use pond_core::ports::extension_manager::AddExtensionRequest;
+                        use pond_core::mcp::ports::extension_manager::AddExtensionRequest;
 
                         // Start with persisted env, then resolve any secrets
                         // from the secret repo that aren't already present.
@@ -1900,7 +1928,9 @@ async fn run_server(
     // and spawn a background pre-loader that warms the model slot on wake-word detection.
     // For llamafile / Ollama those backends manage their own memory; use None there.
     #[cfg(feature = "local-inference")]
-    let model_scheduler: Option<Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>> = {
+    let model_scheduler: Option<
+        Arc<dyn pond_core::models::ports::model_scheduler::ModelScheduler>,
+    > = {
         use pond_adapters_local_inference::ResourceAwareModelScheduler;
         let (sched, mut wake_rx) = ResourceAwareModelScheduler::new();
         let sched_arc = Arc::new(sched);
@@ -1914,18 +1944,20 @@ async fn run_server(
                 }
             }
         });
-        Some(sched_arc as Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>)
+        Some(sched_arc as Arc<dyn pond_core::models::ports::model_scheduler::ModelScheduler>)
     };
     #[cfg(not(feature = "local-inference"))]
-    let model_scheduler: Option<Arc<dyn pond_core::ports::model_scheduler::ModelScheduler>> = None;
+    let model_scheduler: Option<
+        Arc<dyn pond_core::models::ports::model_scheduler::ModelScheduler>,
+    > = None;
 
     // Capture logs pool before `db` is moved into AppState
-    let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
+    let event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
     // Privacy/security boundary hook — wraps the event log as its audit sink.
     // Default-allow; routes opt in to calling `allow`/`audit`.
-    let security_policy: Option<Arc<dyn pond_core::ports::policy::SecurityPolicy>> =
+    let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
         Some(Arc::new(
             pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
                 SqliteEventLogRepository::new(db.logs.clone()),
@@ -1999,9 +2031,11 @@ async fn run_server(
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
         telemetry: Some(Arc::new(
-            pond_core::services::telemetry::InMemoryTelemetry::new(),
+            pond_core::security::services::telemetry::InMemoryTelemetry::new(),
         )),
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: pond_mcp_server::all_app_resources()
             .into_iter()
             .map(|(uri, html)| (uri.to_string(), html))
@@ -2024,7 +2058,8 @@ async fn run_server(
             interval.tick().await; // skip the initial immediate tick
             loop {
                 interval.tick().await;
-                let providers = pond_core::services::oauth_providers::builtin_oauth_providers();
+                let providers =
+                    pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
                 for provider in &providers {
                     let Some(repo) = &refresh_secret_repo else {
                         continue;
@@ -2318,19 +2353,21 @@ async fn run_chat(
     // ── Model catalog & ModelService (for autonomous downloading) ──────────────
     let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> =
         Arc::new(SqliteModelRepository::new(db.system.clone()));
-    let chat_model_service = Arc::new(pond_core::services::model_service::ModelService::new(
-        chat_model_repo.clone(),
-        Arc::new(
-            crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-                reqwest::Client::builder()
-                    .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
-                    .build()
-                    .unwrap_or_default(),
+    let chat_model_service = Arc::new(
+        pond_core::models::services::model_service::ModelService::new(
+            chat_model_repo.clone(),
+            Arc::new(
+                crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
+                    reqwest::Client::builder()
+                        .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
+                        .build()
+                        .unwrap_or_default(),
+                ),
             ),
+            Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
+            Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
         ),
-        Arc::new(crate::http_model_downloader::HttpModelDownloader::new()),
-        Arc::new(crate::filesystem_model_storage::FilesystemModelStorage::new(&data_dir)),
-    ));
+    );
 
     // Seed catalog so model records exist for resolution
     if let Err(e) = chat_model_service.seed_catalog().await {
@@ -2363,33 +2400,37 @@ async fn run_chat(
     let session_id = "default-session".to_string();
 
     // ── Build repos for GooseAdapter (before db.system is consumed) ───────────────
-    let settings_repo_arc: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
-        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
-    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
-        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
-    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+    let settings_repo_arc: Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let memory_repo: Arc<
+        dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
+    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
-    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
-        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+    let recipe_repo: Arc<
+        dyn pond_core::user_data::ports::recipe::AgentRecipeRepository + Send + Sync,
+    > = Arc::new(SqliteRecipeRepository::new(db.system.clone()));
     let template_repo: Arc<
-        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+        dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
-    let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
-        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let extras_repo: Arc<
+        dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
+    > = Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
     let device_registry_arc: Arc<
-        dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync,
+        dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
     // User-created templates (is_system = false) are never touched.
     {
-        use pond_core::domain::prompt_template::PromptTemplate;
-        #[allow(unused_imports)]
-        use pond_core::ports::prompt_template::PromptTemplateRepository;
         use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::user_data::domain::prompt_template::PromptTemplate;
+        #[allow(unused_imports)]
+        use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
         let built_ins = [
             (
                 "balanced",
@@ -2542,7 +2583,7 @@ async fn run_chat(
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
         match e {
-            pond_core::ports::session_storage::SessionStorageError::StorageError(_) => {
+            pond_core::user_data::ports::session_storage::SessionStorageError::StorageError(_) => {
                 // Likely a duplicate key — session already exists, which is fine
                 tracing::debug!("Session already exists, reusing: {}", session_id);
             }
@@ -2856,21 +2897,21 @@ struct GiapAnswerReviewer {
     /// Live provider reference — reads from the RwLock so it always uses
     /// whatever model is currently loaded.
     live_provider:
-        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::ports::provider::LlmProvider>>>>,
+        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>>>,
     pass_threshold: u8,
     max_rounds: u32,
 }
 
 #[async_trait::async_trait]
-impl pond_core::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
+impl pond_core::models::ports::answer_reviewer::AnswerReviewer for GiapAnswerReviewer {
     async fn review(
         &self,
         question: &str,
         answer: &str,
         tool_context: Option<&str>,
-    ) -> anyhow::Result<pond_core::ports::answer_reviewer::ReviewResult> {
-        use pond_core::domain::message::ChatMessage;
-        use pond_core::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
+    ) -> anyhow::Result<pond_core::models::ports::answer_reviewer::ReviewResult> {
+        use pond_core::models::domain::message::ChatMessage;
+        use pond_core::models::ports::answer_reviewer::{ReviewResult, ReviewVerdict};
 
         // Read the LIVE provider — always uses whatever model is currently loaded.
         let provider = {
@@ -3007,8 +3048,8 @@ fn strip_thinking_tags(raw: &str) -> String {
 ///
 /// Tries to extract JSON from the response text. If parsing fails,
 /// defaults to `pass: true` — review must never block the user.
-fn parse_review_verdict(text: &str) -> pond_core::ports::answer_reviewer::ReviewVerdict {
-    use pond_core::ports::answer_reviewer::ReviewVerdict;
+fn parse_review_verdict(text: &str) -> pond_core::models::ports::answer_reviewer::ReviewVerdict {
+    use pond_core::models::ports::answer_reviewer::ReviewVerdict;
 
     let json_start = text.find('{');
     let json_end = text.rfind('}');
@@ -3059,15 +3100,17 @@ fn has_display() -> bool {
 /// actions, and broadcast events. Shared by the inactivity scheduler and the
 /// manual `POST /api/v1/memory/consolidate` endpoint (via `ConsolidationRunner`).
 async fn run_consolidation_pipeline(
-    repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    repo: Arc<dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync>,
     provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
     broadcast_tx: tokio::sync::broadcast::Sender<
-        pond_core::ports::memory_consolidator::ConsolidationEvent,
+        pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
     >,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    use pond_core::domain::memory::MemoryLifecycle;
-    use pond_core::ports::memory_consolidator::{ConsolidationAction, ConsolidationEvent};
+    use pond_core::user_data::domain::memory::MemoryLifecycle;
+    use pond_core::user_data::ports::memory_consolidator::{
+        ConsolidationAction, ConsolidationEvent,
+    };
 
     let memories = match repo.search_scoreable(None).await {
         Ok(m) => m,
@@ -3113,7 +3156,7 @@ async fn run_consolidation_pipeline(
             // Build lookup for source memory metadata (corrects, segment)
             let memory_map: std::collections::HashMap<
                 &str,
-                &pond_core::domain::memory::MemoryFragment,
+                &pond_core::user_data::domain::memory::MemoryFragment,
             > = memories.iter().map(|m| (m.id.as_str(), m)).collect();
 
             for exchange in &result.exchanges {
@@ -3134,7 +3177,7 @@ async fn run_consolidation_pipeline(
                             .any(|m| m.is_correction());
 
                         let effective_segment = if any_correction {
-                            pond_core::domain::memory::MemorySegment::Correction
+                            pond_core::user_data::domain::memory::MemorySegment::Correction
                         } else {
                             segment.clone()
                         };
@@ -3151,21 +3194,22 @@ async fn run_consolidation_pipeline(
                             );
                         }
 
-                        let new_frag = pond_core::domain::memory::MemoryFragment::from_extraction(
-                            uuid::Uuid::new_v4().to_string(),
-                            None,
-                            merged_content.clone(),
-                            effective_segment,
-                            *importance,
-                            corrects,
-                        );
+                        let new_frag =
+                            pond_core::user_data::domain::memory::MemoryFragment::from_extraction(
+                                uuid::Uuid::new_v4().to_string(),
+                                None,
+                                merged_content.clone(),
+                                effective_segment,
+                                *importance,
+                                corrects,
+                            );
                         let new_id = new_frag.id.clone();
                         let _ = repo.add(new_frag).await;
                         for src_id in source_ids {
                             let _ = repo.mark_superseded(src_id, &new_id).await;
                             let _ = repo
                                 .log_event(
-                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    pond_core::user_data::domain::memory::MemoryEventKind::Superseded,
                                     src_id,
                                     None,
                                     Some(&new_id),
@@ -3174,7 +3218,7 @@ async fn run_consolidation_pipeline(
                         }
                         let _ = repo
                             .log_event(
-                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
                                 &new_id,
                                 None,
                                 None,
@@ -3195,7 +3239,7 @@ async fn run_consolidation_pipeline(
                         let _ = repo.update_lifecycle(id, MemoryLifecycle::Archived).await;
                         let _ = repo
                             .log_event(
-                                pond_core::domain::memory::MemoryEventKind::Pruned,
+                                pond_core::user_data::domain::memory::MemoryEventKind::Pruned,
                                 id,
                                 None,
                                 None,
@@ -3212,7 +3256,7 @@ async fn run_consolidation_pipeline(
                             .await;
                         let _ = repo
                             .log_event(
-                                pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
                                 id,
                                 None,
                                 Some("recategorized"),
@@ -3235,7 +3279,7 @@ async fn run_consolidation_pipeline(
                             let entry_corrects = if !corrects_assigned
                                 && source_corrects.is_some()
                                 && entry.segment
-                                    == pond_core::domain::memory::MemorySegment::Correction
+                                    == pond_core::user_data::domain::memory::MemorySegment::Correction
                             {
                                 corrects_assigned = true;
                                 source_corrects.clone()
@@ -3244,7 +3288,7 @@ async fn run_consolidation_pipeline(
                             };
 
                             let new_frag =
-                                pond_core::domain::memory::MemoryFragment::from_extraction(
+                                pond_core::user_data::domain::memory::MemoryFragment::from_extraction(
                                     uuid::Uuid::new_v4().to_string(),
                                     None,
                                     entry.content.clone(),
@@ -3259,7 +3303,7 @@ async fn run_consolidation_pipeline(
                             let _ = repo.add(new_frag).await;
                             let _ = repo
                                 .log_event(
-                                    pond_core::domain::memory::MemoryEventKind::Consolidated,
+                                    pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
                                     &nid,
                                     None,
                                     None,
@@ -3270,7 +3314,7 @@ async fn run_consolidation_pipeline(
                             let _ = repo.mark_superseded(source_id, &first_new_id).await;
                             let _ = repo
                                 .log_event(
-                                    pond_core::domain::memory::MemoryEventKind::Superseded,
+                                    pond_core::user_data::domain::memory::MemoryEventKind::Superseded,
                                     source_id,
                                     None,
                                     Some(&first_new_id),
@@ -3879,12 +3923,12 @@ fn default_data_dir() -> std::path::PathBuf {
 fn build_face_recognition(
     data_dir: &std::path::Path,
     pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
     use pond_adapters_face_onnx::{
         EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
     };
-    use pond_core::ports::face_detector::FaceDetector;
-    use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+    use pond_core::user_data::ports::face_detector::FaceDetector;
+    use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
     use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
 
     // Embedder lookup, preferred → fallback:
@@ -4120,7 +4164,7 @@ fn build_face_recognition(
 fn build_face_recognition(
     _data_dir: &std::path::Path,
     _pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::ports::face_recognition::FaceRecognition>> {
+) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
     None
 }
 
@@ -4416,36 +4460,42 @@ async fn build_goose_backend(
     llamafile_url: &str,
     data_dir: &std::path::Path,
     weather: Option<Arc<dyn WeatherProvider>>,
-    device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
-    scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
-    settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
-    memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
+    device_registry: Arc<
+        dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
+    >,
+    scheduler: Option<Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>>,
+    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
+    memory_repo: Arc<
+        dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
+    >,
     embedding_provider: Option<
-        Arc<dyn pond_core::ports::embedding::EmbeddingProvider + Send + Sync>,
+        Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync>,
     >,
-    skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync>,
+    skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync>,
+    recipe_repo: Arc<dyn pond_core::user_data::ports::recipe::AgentRecipeRepository + Send + Sync>,
     template_repo: Arc<
-        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+        dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     >,
-    extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync>,
-    draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync>,
-    session_storage: Option<Arc<dyn pond_core::ports::session_storage::SessionStorage>>,
+    extras_repo: Arc<
+        dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
+    >,
+    draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync>,
+    session_storage: Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
-    Option<Arc<dyn pond_core::ports::extension_manager::ExtensionManagerPort>>,
-    Option<Arc<dyn pond_core::ports::tool_caller::ToolCaller>>,
-    Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>,
+    Option<Arc<dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort>>,
+    Option<Arc<dyn pond_core::mcp::ports::tools::tool_caller::ToolCaller>>,
+    Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>,
 ) {
     use pond_adapters_goose::GooseAdapter;
     use pond_adapters_local_inference::ToolCallerEngine;
-    use pond_core::ports::extension_manager::ExtensionManagerPort;
-    use pond_core::ports::tool_caller::ToolCaller;
-    use pond_core::ports::tool_registry::ToolRegistryPort;
+    use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
+    use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
+    use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
 
     let default_registry: Arc<dyn ToolRegistryPort> =
-        Arc::new(pond_core::services::tool_registry::InMemoryToolRegistry::new());
+        Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
 
     // ── PondAgent backend (independent, no Goose dependency) ──────────────
     #[cfg(feature = "pond-agent")]
@@ -4485,15 +4535,15 @@ async fn build_goose_backend(
             embedding_provider,
         );
 
-        let dispatcher: Arc<dyn pond_core::ports::tool_dispatcher::ToolDispatcher> =
+        let dispatcher: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
             Arc::new(dispatcher);
 
         // Get tool definitions from the dispatcher for prompt injection.
-        let tool_defs: Vec<pond_core::ports::inference::ToolDefinition> = dispatcher
+        let tool_defs: Vec<pond_core::models::ports::inference::ToolDefinition> = dispatcher
             .available_tools()
             .await
             .into_iter()
-            .map(|name| pond_core::ports::inference::ToolDefinition {
+            .map(|name| pond_core::models::ports::inference::ToolDefinition {
                 name: name.clone(),
                 description: format!("GIAP tool: {}", name),
                 parameters_schema: serde_json::json!({}),
@@ -4608,8 +4658,8 @@ async fn build_goose_backend(
 async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Path) {
     use crate::composite_model_catalog_provider::CompositeModelCatalogProvider;
     use crate::filesystem_model_storage::FilesystemModelStorage;
-    use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
-    use pond_core::ports::model_storage::ModelStorage;
+    use pond_core::models::ports::model_catalog_provider::ModelCatalogProvider;
+    use pond_core::models::ports::model_storage::ModelStorage;
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
@@ -4646,7 +4696,7 @@ async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Pa
 /// that only have the legacy single-model settings fields).
 async fn sync_assignments_to_settings(
     repo: &dyn ModelRepository,
-    settings_repo: &dyn pond_core::ports::settings::SettingsRepository,
+    settings_repo: &dyn pond_core::user_data::ports::settings::SettingsRepository,
 ) {
     let assignments = match repo.list_assignments().await {
         Ok(a) => a,
@@ -4884,7 +4934,7 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' not found in catalog"))?;
 
-            use pond_core::domain::model_record::ModelRoleAssignment;
+            use pond_core::models::domain::model_record::ModelRoleAssignment;
             if !ModelRoleAssignment::category_matches_role(&cat, &role) {
                 anyhow::bail!(
                     "Category '{}' is not compatible with role '{}'. \
@@ -4921,9 +4971,9 @@ fn resolve_role(role_arg: &str, _message: &str) -> String {
 /// on stderr so they don't pollute piped output. Returns when the stream ends.
 async fn stream_agent_response(
     agent: &Arc<dyn Agent>,
-    request: pond_core::domain::agent::AgentRequest,
+    request: pond_core::shared::domain::agent::AgentRequest,
 ) -> Result<()> {
-    use pond_core::domain::agent::AgentStreamEvent;
+    use pond_core::shared::domain::agent::AgentStreamEvent;
 
     let mut stream = agent.chat_stream(request).await?;
     let mut printed_newline = false;
@@ -5003,22 +5053,27 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let db = Database::init(&data_dir).await?;
 
     // Build all repos once — shared across Chat, Tools, and Extras arms.
-    let settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync> =
-        Arc::new(SqliteSettingsRepository::new(db.system.clone()));
-    let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
-        Arc::new(SqliteMemoryRepository::new(db.system.clone()));
-    let skill_repo: Arc<dyn pond_core::ports::skill::UserSkillRepository + Send + Sync> =
+    let settings_repo: Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    let memory_repo: Arc<
+        dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
+    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
-    let recipe_repo: Arc<dyn pond_core::ports::recipe::AgentRecipeRepository + Send + Sync> =
-        Arc::new(SqliteRecipeRepository::new(db.system.clone()));
+    let recipe_repo: Arc<
+        dyn pond_core::user_data::ports::recipe::AgentRecipeRepository + Send + Sync,
+    > = Arc::new(SqliteRecipeRepository::new(db.system.clone()));
     let template_repo: Arc<
-        dyn pond_core::ports::prompt_template::PromptTemplateRepository + Send + Sync,
+        dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
-    let extras_repo: Arc<dyn pond_core::ports::prompt_extra::PromptExtraRepository + Send + Sync> =
-        Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
-    let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
-        Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::ports::draft::DraftRepository + Send + Sync> =
+    let extras_repo: Arc<
+        dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
+    > = Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    let device_registry: Arc<
+        dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
+    > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
@@ -5053,7 +5108,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
             session,
             role,
         } => {
-            use pond_core::domain::agent::AgentRequest;
+            use pond_core::shared::domain::agent::AgentRequest;
 
             let model_role = resolve_role(&role, &message);
             eprintln!(
@@ -5093,7 +5148,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         }
 
         AgentAction::Repl { session, role } => {
-            use pond_core::domain::agent::AgentRequest;
+            use pond_core::shared::domain::agent::AgentRequest;
             use tokio::io::AsyncBufReadExt as _;
 
             let (agent, _ext_mgr, _tc, _tr) = build_goose_backend(
@@ -5231,7 +5286,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
 // ── Prompts CLI ───────────────────────────────────────────────────────────────
 
 async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
-    use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+    use pond_core::user_data::ports::prompt_template::PromptTemplateRepository as _;
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -5264,10 +5319,10 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
         },
 
         PromptAction::Reset { name } => {
-            use pond_core::domain::prompt_template::PromptTemplate;
             use pond_core::prompts::{
                 PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
             };
+            use pond_core::user_data::domain::prompt_template::PromptTemplate;
 
             let (content, description) = match name.as_str() {
                 "balanced" => (
@@ -5309,7 +5364,7 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
 // ── Skills CLI ────────────────────────────────────────────────────────────────
 
 async fn run_skills_cmd(action: SkillAction) -> Result<()> {
-    use pond_core::ports::skill::UserSkillRepository as _;
+    use pond_core::user_data::ports::skill::UserSkillRepository as _;
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -5340,7 +5395,7 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
         }
 
         SkillAction::Add { name, content } => {
-            use pond_core::domain::skill::UserSkill;
+            use pond_core::user_data::domain::skill::UserSkill;
 
             let content = match content {
                 Some(c) => c,
@@ -5369,13 +5424,13 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
         }
 
         SkillAction::Toggle { id } => {
-            use pond_core::ports::skill::UserSkillRepository as _;
+            use pond_core::user_data::ports::skill::UserSkillRepository as _;
 
             let skill = repo
                 .get(&id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Skill '{id}' not found"))?;
-            let updated = pond_core::domain::skill::UserSkill {
+            let updated = pond_core::user_data::domain::skill::UserSkill {
                 active: !skill.active,
                 ..skill.clone()
             };
@@ -5400,7 +5455,7 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
 // ── Recipes CLI ───────────────────────────────────────────────────────────────
 
 async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
-    use pond_core::ports::recipe::AgentRecipeRepository as _;
+    use pond_core::user_data::ports::recipe::AgentRecipeRepository as _;
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -5450,7 +5505,7 @@ async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
             file,
             description,
         } => {
-            use pond_core::domain::recipe::AgentRecipe;
+            use pond_core::user_data::domain::recipe::AgentRecipe;
 
             let yaml = tokio::fs::read_to_string(&file)
                 .await
@@ -5487,7 +5542,7 @@ async fn run_recipes_cmd(action: RecipeAction) -> Result<()> {
 // ── Memories CLI ──────────────────────────────────────────────────────────────
 
 async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
-    use pond_core::ports::memory_repository::MemoryRepository as _;
+    use pond_core::user_data::ports::memory_repository::MemoryRepository as _;
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -5514,7 +5569,7 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
         }
 
         MemoryAction::Add { content } => {
-            use pond_core::domain::memory::MemoryFragment;
+            use pond_core::user_data::domain::memory::MemoryFragment;
 
             let id = uuid::Uuid::new_v4().to_string();
             let fragment = MemoryFragment {
@@ -5583,9 +5638,9 @@ mod tests {
 
     #[tokio::test]
     async fn sync_ollama_chat_assignment_updates_settings() {
-        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-        use pond_core::ports::model_repository::ModelRepository;
-        use pond_core::ports::settings::SettingsRepository;
+        use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
         use pond_infra::db::Database;
         use pond_infra::sqlite_model_repository::SqliteModelRepository;
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
@@ -5633,9 +5688,9 @@ mod tests {
 
     #[tokio::test]
     async fn sync_gguf_chat_assignment_sets_local_provider() {
-        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-        use pond_core::ports::model_repository::ModelRepository;
-        use pond_core::ports::settings::SettingsRepository;
+        use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
         use pond_infra::db::Database;
         use pond_infra::sqlite_model_repository::SqliteModelRepository;
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
@@ -5687,9 +5742,9 @@ mod tests {
 
     #[tokio::test]
     async fn sync_think_and_task_roles_are_also_synced() {
-        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-        use pond_core::ports::model_repository::ModelRepository;
-        use pond_core::ports::settings::SettingsRepository;
+        use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
         use pond_infra::db::Database;
         use pond_infra::sqlite_model_repository::SqliteModelRepository;
         use pond_infra::sqlite_settings::SqliteSettingsRepository;
@@ -5767,9 +5822,9 @@ mod tests {
 
     #[tokio::test]
     async fn sync_tool_assignment_updates_settings() {
-        use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-        use pond_core::ports::model_repository::ModelRepository;
-        use pond_core::ports::settings::SettingsRepository;
+        use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
         use pond_infra::db::Database;
         use pond_infra::sqlite_model_repository::SqliteModelRepository;
         use pond_infra::sqlite_settings::SqliteSettingsRepository;

@@ -163,7 +163,7 @@ The dump includes the complete Jinja-rendered output including tool schemas, thi
 
 ## tools_json_override Passthrough
 
-**File:** `crates/pond-inference/src/provider.rs:123`, `crates/pond-core/src/ports/inference.rs:51`
+**File:** `crates/pond-inference/src/provider.rs:123`, `crates/pond-core/src/models/ports/inference.rs:51`
 
 The `InferenceOptions` struct has two override fields:
 
@@ -246,7 +246,7 @@ Parameters are set at context creation time in `generation_task()` (provider.rs:
 
 ### Dynamic Context Budgeting
 
-**File:** `crates/pond-core/src/services/context_budget.rs`
+**File:** `crates/pond-core/src/models/services/context_budget.rs`
 
 ```rust
 pub fn trim_to_budget_for_model(

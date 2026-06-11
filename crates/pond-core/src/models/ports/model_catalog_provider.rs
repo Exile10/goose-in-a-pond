@@ -11,7 +11,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::model_record::{BinaryRecord, ModelRecord};
+use crate::models::domain::model_record::{BinaryRecord, ModelRecord};
 
 /// Fetch a model + binary catalog from upstream sources.
 #[async_trait]

@@ -11,7 +11,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use serde_json;
 use sqlx::{Pool, Sqlite};
 use uuid::Uuid;

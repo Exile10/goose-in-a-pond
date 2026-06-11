@@ -8,7 +8,7 @@ Last updated: April 29, 2026
 
 ## ModelCapabilities Struct
 
-**File:** `crates/pond-core/src/domain/model_capabilities.rs`
+**File:** `crates/pond-core/src/models/domain/model_capabilities.rs`
 
 ```rust
 pub struct ModelCapabilities {
@@ -44,7 +44,7 @@ Heuristic detection from model identifier strings:
 
 ### LlmProvider
 
-**File:** `crates/pond-core/src/ports/provider.rs`
+**File:** `crates/pond-core/src/models/ports/provider.rs`
 
 ```rust
 pub trait LlmProvider: Send + Sync {
@@ -57,7 +57,7 @@ pub trait LlmProvider: Send + Sync {
 
 ### Agent
 
-**File:** `crates/pond-core/src/ports/agent.rs`
+**File:** `crates/pond-core/src/models/ports/agent.rs`
 
 ```rust
 pub trait Agent: Send + Sync {

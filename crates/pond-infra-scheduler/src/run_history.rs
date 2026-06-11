@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use pond_core::domain::schedule::{RunStatus, ScheduleRun};
+use pond_core::user_data::domain::schedule::{RunStatus, ScheduleRun};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::Mutex;

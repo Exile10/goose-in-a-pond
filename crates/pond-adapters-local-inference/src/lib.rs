@@ -40,8 +40,8 @@ use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
 use pond_adapters_goose::provider_adapter::GooseProviderAdapter;
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
 use std::sync::Arc;
 
 /// Default GGUF model for Jetson Orin Nano (8 GB).
@@ -456,9 +456,9 @@ fn strip_thinking_tokens(text: &str) -> String {
 
 #[async_trait]
 impl LlmProvider for LocalInferenceLlmAdapter {
-    fn capabilities(&self) -> pond_core::domain::model_capabilities::ModelCapabilities {
+    fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
         let name = self.inner.model_name();
-        pond_core::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
+        pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
     }
 
     async fn complete(&self, system: &str, messages: Vec<ChatMessage>) -> Result<ChatMessage> {

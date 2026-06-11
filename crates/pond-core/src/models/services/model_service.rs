@@ -19,11 +19,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
-use crate::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord, ModelRoleAssignment};
-use crate::ports::model_catalog_provider::ModelCatalogProvider;
-use crate::ports::model_downloader::ModelDownloader;
-use crate::ports::model_repository::ModelRepository;
-use crate::ports::model_storage::ModelStorage;
+use crate::models::domain::model_record::{
+    BinaryRecord, ModelCategory, ModelRecord, ModelRoleAssignment,
+};
+use crate::models::ports::model_catalog_provider::ModelCatalogProvider;
+use crate::models::ports::model_downloader::ModelDownloader;
+use crate::models::ports::model_repository::ModelRepository;
+use crate::models::ports::model_storage::ModelStorage;
 
 pub struct ModelService {
     repo: Arc<dyn ModelRepository>,
@@ -504,13 +506,15 @@ mod tests {
     /// Validate that the shared mock infrastructure from services/ integrates
     /// correctly with ModelService — these mocks are the ones used in integration tests.
     mod shared_mocks {
-        use crate::domain::model_record::{ModelCategory, ModelRecord};
-        use crate::ports::{model_repository::ModelRepository, model_storage::ModelStorage};
-        use crate::services::mock_model_catalog_provider::MockModelCatalogProvider;
-        use crate::services::mock_model_downloader::MockModelDownloader;
-        use crate::services::mock_model_repository::MockModelRepository as SharedMockRepo;
-        use crate::services::mock_model_storage::MockModelStorage;
-        use crate::services::model_service::ModelService;
+        use crate::models::domain::model_record::{ModelCategory, ModelRecord};
+        use crate::models::mocks::mock_model_catalog_provider::MockModelCatalogProvider;
+        use crate::models::mocks::mock_model_downloader::MockModelDownloader;
+        use crate::models::mocks::mock_model_repository::MockModelRepository as SharedMockRepo;
+        use crate::models::mocks::mock_model_storage::MockModelStorage;
+        use crate::models::ports::{
+            model_repository::ModelRepository, model_storage::ModelStorage,
+        };
+        use crate::models::services::model_service::ModelService;
         use std::sync::Arc;
 
         fn gguf(name: &str, downloaded: bool, url: Option<&str>) -> ModelRecord {

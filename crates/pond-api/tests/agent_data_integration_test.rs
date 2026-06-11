@@ -20,14 +20,14 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use pond_api::{build_router, AppState};
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::services::mock_agent::MockAgent;
-use pond_core::services::mock_memory::MockMemoryRepository;
-use pond_core::services::mock_profile::MockProfileRepository;
-use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
-use pond_core::services::mock_settings::MockSettingsRepository;
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
+use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
+use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
@@ -150,7 +150,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
@@ -283,8 +285,8 @@ async fn prompt_template_delete_user_defined() {
 
 #[tokio::test]
 async fn prompt_template_delete_system_returns_403() {
-    use pond_core::domain::prompt_template::PromptTemplate;
-    use pond_core::ports::prompt_template::PromptTemplateRepository as _;
+    use pond_core::user_data::domain::prompt_template::PromptTemplate;
+    use pond_core::user_data::ports::prompt_template::PromptTemplateRepository as _;
 
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
@@ -358,7 +360,9 @@ async fn prompt_template_delete_system_returns_403() {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
@@ -820,7 +824,9 @@ async fn returns_501_when_repos_not_configured() {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,

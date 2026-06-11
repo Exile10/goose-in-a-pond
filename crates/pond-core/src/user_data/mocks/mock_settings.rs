@@ -1,7 +1,7 @@
 //! In-memory mock implementation of `SettingsRepository` for tests.
 
-use crate::domain::settings::Settings;
-use crate::ports::settings::SettingsRepository;
+use crate::user_data::domain::settings::Settings;
+use crate::user_data::ports::settings::SettingsRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

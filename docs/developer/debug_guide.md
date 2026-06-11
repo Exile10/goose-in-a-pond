@@ -142,12 +142,12 @@ RUST_LOG=pond_agent=debug,pond_inference=debug,pond_mcp_server=debug \
 The state machine logs each transition at `DEBUG` level:
 
 ```
-[DEBUG pond_core::services::chat] Workflow state: Wait
-[DEBUG pond_core::services::chat] Workflow state: Listen
-[DEBUG pond_core::services::chat] User input: "hello world"
-[DEBUG pond_core::services::chat] Workflow state: Thinking
-[DEBUG pond_core::services::chat] Workflow state: Speak
-[DEBUG pond_core::services::chat] Agent output: "Echo: hello world"
+[DEBUG pond_core::shared::services::chat] Workflow state: Wait
+[DEBUG pond_core::shared::services::chat] Workflow state: Listen
+[DEBUG pond_core::shared::services::chat] User input: "hello world"
+[DEBUG pond_core::shared::services::chat] Workflow state: Thinking
+[DEBUG pond_core::shared::services::chat] Workflow state: Speak
+[DEBUG pond_core::shared::services::chat] Agent output: "Echo: hello world"
 ```
 
 If you see `Wait` but never `Listen`, the wake word detector is not activating.
@@ -161,12 +161,12 @@ If you see `Listen` but no `Thinking`, the voice input returned `None` (EOF / em
 
 ```bash
 # See the fallback chain in logs
-RUST_LOG=pond_core::services::fallback_provider=debug cargo run -p pond-server -- serve
+RUST_LOG=pond_core::models::services::fallback_provider=debug cargo run -p pond-server -- serve
 ```
 
 Fallback log lines look like:
 ```
-[WARN  pond_core::services::fallback_provider] Primary provider 'LLaMA_CPP' failed (...), falling back to 'llama3.2'
+[WARN  pond_core::models::services::fallback_provider] Primary provider 'LLaMA_CPP' failed (...), falling back to 'llama3.2'
 ```
 
 ### llamafile not responding

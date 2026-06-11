@@ -1,5 +1,5 @@
-use crate::domain::session::{Session, SessionMessage};
-use crate::ports::session_storage::{SessionStorage, SessionStorageError};
+use crate::user_data::domain::session::{Session, SessionMessage};
+use crate::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -155,7 +155,7 @@ impl InMemorySessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::message::{ChatMessage, Role};
+    use crate::models::domain::message::{ChatMessage, Role};
 
     #[tokio::test]
     async fn test_create_session() {

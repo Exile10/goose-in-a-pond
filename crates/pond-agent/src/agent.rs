@@ -16,25 +16,25 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use pond_core::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
-use pond_core::domain::message::{ChatMessage, ToolCallRecord};
-use pond_core::domain::model_capabilities::ModelCapabilities;
-use pond_core::domain::session::SessionMessage;
-use pond_core::domain::settings::Settings;
-use pond_core::ports::agent::Agent;
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::inference::{InferenceOptions, InferenceProvider, ToolDefinition};
-use pond_core::ports::prompt_extra::PromptExtraRepository;
-use pond_core::ports::prompt_template::PromptTemplateRepository;
-use pond_core::ports::provider::UsageStats;
-use pond_core::ports::session_storage::SessionStorage;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
-use pond_core::ports::tool_dispatcher::ToolDispatcher;
+use pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher;
+use pond_core::models::domain::message::{ChatMessage, ToolCallRecord};
+use pond_core::models::domain::model_capabilities::ModelCapabilities;
+use pond_core::models::ports::agent::Agent;
+use pond_core::models::ports::inference::{InferenceOptions, InferenceProvider, ToolDefinition};
+use pond_core::models::ports::provider::UsageStats;
+use pond_core::models::services::context_budget::{available_history_chars, CompactionProfile};
+use pond_core::models::services::history_manager::HistoryManager;
+use pond_core::models::services::prompt_builder;
 use pond_core::prompts;
-use pond_core::services::context_budget::{available_history_chars, CompactionProfile};
-use pond_core::services::history_manager::HistoryManager;
-use pond_core::services::prompt_builder;
+use pond_core::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
+use pond_core::user_data::domain::session::SessionMessage;
+use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
+use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
+use pond_core::user_data::ports::session_storage::SessionStorage;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -468,20 +468,20 @@ impl Agent for PondAgent {
 
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(pond_core::ports::inference::ChatEvent::Text(t)) => {
+                        Ok(pond_core::models::ports::inference::ChatEvent::Text(t)) => {
                             text_buf.push_str(&t);
                             // Stream immediately so ThoughtFilter sees tokens in real-time
                             let _ = tx.send(Ok(AgentStreamEvent::Text { content: t })).await;
                             streamed_any_text = true;
                         }
-                        Ok(pond_core::ports::inference::ChatEvent::ToolCall {
+                        Ok(pond_core::models::ports::inference::ChatEvent::ToolCall {
                             id,
                             name,
                             arguments,
                         }) => {
                             tool_calls.push((id, name, arguments));
                         }
-                        Ok(pond_core::ports::inference::ChatEvent::Usage(u)) => {
+                        Ok(pond_core::models::ports::inference::ChatEvent::Usage(u)) => {
                             total_usage.prompt_tokens += u.prompt_tokens;
                             total_usage.completion_tokens += u.completion_tokens;
                         }
@@ -662,11 +662,11 @@ impl Agent for PondAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::domain::session::{Session, SessionMessage};
-    use pond_core::ports::device_registry::{Device, RegisterDeviceRequest};
-    use pond_core::ports::inference::ChatEventStream;
-    use pond_core::ports::session_storage::SessionStorageError;
-    use pond_core::ports::settings::SettingsRepository;
+    use pond_core::models::ports::inference::ChatEventStream;
+    use pond_core::user_data::domain::session::{Session, SessionMessage};
+    use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    use pond_core::user_data::ports::settings::SettingsRepository;
 
     // ── Mock implementations ─────────────────────────────────────────────────
 
@@ -780,8 +780,8 @@ mod tests {
             let reply = format!("Echo: {}", last_msg);
 
             Box::pin(async_stream::stream! {
-                yield Ok(pond_core::ports::inference::ChatEvent::Text(reply));
-                yield Ok(pond_core::ports::inference::ChatEvent::Usage(UsageStats {
+                yield Ok(pond_core::models::ports::inference::ChatEvent::Text(reply));
+                yield Ok(pond_core::models::ports::inference::ChatEvent::Usage(UsageStats {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                 }));

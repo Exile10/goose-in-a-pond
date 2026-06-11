@@ -51,7 +51,7 @@ pond-core = { workspace = true }
 
 Then in `pond-server/src/main.rs`:
 ```rust
-use pond_core::services::AssistantService;
+use pond_core::<quadrant>::services::AssistantService;
 ```
 
 ---
@@ -62,10 +62,10 @@ Clean code in this project means keeping the **Brain** (Logic) separate from the
 
 ### Rule 1: The Core is "Pure"
 - **Don't** add database or network libraries (like `sqlx` or `reqwest`) to `pond-core`.
-- **Do** define a **Port** (Trait) in `pond-core/src/ports/`.
+- **Do** define a **Port** (Trait) in `pond-core/src/<quadrant>/ports/`.
 
 ```rust
-// In pond-core/src/ports/storage.rs
+// In pond-core/src/<quadrant>/ports/storage.rs
 pub trait UserStorage {
     fn save_user(&self, name: &str);
 }

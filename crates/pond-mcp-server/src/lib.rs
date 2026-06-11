@@ -17,7 +17,7 @@ pub mod http;
 
 // ── Shared state for tool param generation ──────────────────────────────────
 
-use pond_core::ports::tool_caller::ToolCaller;
+use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
 use std::sync::{Arc, OnceLock, RwLock};
 
 // -- User message: set by GooseAdapter before each turn --

@@ -6,9 +6,9 @@
 //! Changing those settings still requires a restart (architectural limitation:
 //! `LlmProvider::complete` does not accept per-call overrides).
 
-use crate::domain::message::ChatMessage;
-use crate::ports::provider::LlmProvider;
-use crate::ports::settings::SettingsRepository;
+use crate::models::domain::message::ChatMessage;
+use crate::models::ports::provider::LlmProvider;
+use crate::user_data::ports::settings::SettingsRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

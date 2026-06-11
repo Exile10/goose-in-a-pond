@@ -6,8 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Pool, Row, Sqlite};
 
-use pond_core::domain::skill::UserSkill;
-use pond_core::ports::skill::UserSkillRepository;
+use pond_core::user_data::domain::skill::UserSkill;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 
 pub struct SqliteSkillRepository {
     pool: Pool<Sqlite>,

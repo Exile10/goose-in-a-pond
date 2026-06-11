@@ -9,8 +9,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::settings::Settings;
-use pond_core::ports::settings::SettingsRepository;
+use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
 

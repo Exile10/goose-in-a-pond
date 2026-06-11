@@ -1,4 +1,4 @@
-use crate::domain::message::ChatMessage;
+use crate::models::domain::message::ChatMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

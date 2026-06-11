@@ -27,12 +27,12 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::face_recognition::{
+use pond_core::user_data::domain::face_recognition::{
     BoundingBox, DetectedFace, FaceEmbedding, FaceIdentification, FaceLandmarks,
 };
-use pond_core::ports::face_detector::FaceDetector;
-use pond_core::ports::face_embedding_extractor::FaceEmbeddingExtractor;
-use pond_core::ports::face_recognition::{FaceRecognition, PairwiseSimilarity};
+use pond_core::user_data::ports::face_detector::FaceDetector;
+use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+use pond_core::user_data::ports::face_recognition::{FaceRecognition, PairwiseSimilarity};
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -533,8 +533,8 @@ impl FaceRecognition for SqliteFaceRecognition {
         &self,
         image_bytes: &[u8],
         bbox_override: Option<BoundingBox>,
-    ) -> Result<pond_core::ports::face_recognition::FaceIdentificationDetails> {
-        use pond_core::ports::face_recognition::FaceIdentificationDetails;
+    ) -> Result<pond_core::user_data::ports::face_recognition::FaceIdentificationDetails> {
+        use pond_core::user_data::ports::face_recognition::FaceIdentificationDetails;
 
         let (bbox, landmarks) = match self.run_detector(image_bytes).await {
             Ok(Some(face)) => (Some(face.bbox), face.landmarks),
@@ -853,8 +853,8 @@ mod tests {
     use crate::db::Database;
     use crate::sqlite_profile::SqliteProfileRepository;
     use async_trait::async_trait;
-    use pond_core::domain::profile::CreateProfileRequest;
-    use pond_core::ports::profile::ProfileRepository;
+    use pond_core::user_data::domain::profile::CreateProfileRequest;
+    use pond_core::user_data::ports::profile::ProfileRepository;
     use tempfile::tempdir;
 
     /// Deterministic stub extractor.

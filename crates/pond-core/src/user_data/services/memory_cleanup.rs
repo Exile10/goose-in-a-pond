@@ -6,8 +6,10 @@
 //!
 //! Adapted from boop-agent's adaptive decay formula.
 
-use crate::domain::memory::{MemoryEventKind, MemoryFragment, MemoryLifecycle, MemoryTier};
-use crate::ports::memory_repository::MemoryRepository;
+use crate::user_data::domain::memory::{
+    MemoryEventKind, MemoryFragment, MemoryLifecycle, MemoryTier,
+};
+use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 
 /// Default base half-life in days (used when no config provided).
@@ -135,7 +137,7 @@ pub async fn run_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemorySegment, MemoryTier};
+    use crate::user_data::domain::memory::{MemorySegment, MemoryTier};
 
     fn make_memory(
         importance: f32,

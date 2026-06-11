@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::draft::{Draft, DraftStatus};
-use pond_core::ports::draft::DraftRepository;
+use pond_core::user_data::domain::draft::{Draft, DraftStatus};
+use pond_core::user_data::ports::draft::DraftRepository;
 use sqlx::{Pool, Sqlite};
 
 pub struct SqliteDraftRepository {

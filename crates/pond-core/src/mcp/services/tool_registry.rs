@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::domain::external_tool::ExternalToolDescription;
-use crate::ports::tool_registry::ToolRegistryPort;
+use crate::mcp::domain::external_tool::ExternalToolDescription;
+use crate::mcp::ports::tools::tool_registry::ToolRegistryPort;
 
 /// Maximum description length in compact mode (characters, not bytes).
 const COMPACT_DESC_LIMIT: usize = 80;

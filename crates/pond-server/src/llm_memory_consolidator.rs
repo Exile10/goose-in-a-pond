@@ -5,10 +5,10 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pond_core::domain::memory::{MemoryFragment, MemorySegment};
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment};
+use pond_core::user_data::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

@@ -158,8 +158,8 @@ These changes build with `cargo build`. Do this phase first.
 
 ### 1A. `SchedulerPort` trait — `pond-core`
 
-**New file:** `crates/pond-core/src/ports/scheduler.rs`
-**Modify:** `crates/pond-core/src/ports/mod.rs` — add `pub mod scheduler;`
+**New file:** `crates/pond-core/src/user_data/ports/scheduler.rs`
+**Modify:** `crates/pond-core/src/user_data/ports/mod.rs` — add `pub mod scheduler;`
 
 ```rust
 use anyhow::Result;
@@ -201,8 +201,8 @@ pub trait SchedulerPort: Send + Sync {
 
 ### 1B. `McpMemoryPort` trait — `pond-core`
 
-**New file:** `crates/pond-core/src/ports/mcp_memory.rs`
-**Modify:** `crates/pond-core/src/ports/mod.rs` — add `pub mod mcp_memory;`
+**New file:** `crates/pond-core/src/mcp/ports/mcp_knowledge.rs`
+**Modify:** `crates/pond-core/src/mcp/ports/mod.rs` — add `pub mod mcp_knowledge;`
 
 ```rust
 use anyhow::Result;
@@ -222,7 +222,7 @@ pub trait McpMemoryPort: Send + Sync {
 
 ### 1C. `ContextCompactor` service — `pond-core`
 
-**New file:** `crates/pond-core/src/services/context_compactor.rs`
+**New file:** `crates/pond-core/src/models/services/context_compactor.rs`
 
 Depends only on `LlmProvider` (already in pond-core). No external deps.
 
@@ -250,7 +250,7 @@ impl ContextCompactor {
 }
 ```
 
-**Modify `ChatService`** (`crates/pond-core/src/services/chat.rs`):
+**Modify `ChatService`** (`crates/pond-core/src/shared/services/chat.rs`):
 - Add `compactor: Option<ContextCompactor>` field
 - Add `pub fn with_context_compactor(mut self, c: ContextCompactor) -> Self`
 - In `chat_once`, call `compactor.compact()` before `provider.complete()`, with `trim_to_budget` as hard fallback
@@ -542,8 +542,8 @@ cargo run  -p pond-server --features "local-inference,local-inference/cuda" -- c
 | File | What changes |
 |---|---|
 | `Cargo.toml` (workspace) | Members, excludes, workspace deps (`pond-infra-scheduler`, `tokio-cron-scheduler`) |
-| `crates/pond-core/src/ports/mod.rs` | `pub mod scheduler; pub mod mcp_memory;` |
-| `crates/pond-core/src/services/chat.rs` | `compactor` field + `with_context_compactor` builder |
+| `crates/pond-core/src/user_data/ports/mod.rs` + `crates/pond-core/src/mcp/ports/mod.rs` | `pub mod scheduler;` (user_data) · `pub mod mcp_knowledge;` (mcp) |
+| `crates/pond-core/src/shared/services/chat.rs` | `compactor` field + `with_context_compactor` builder |
 | `crates/pond-api/src/lib.rs` | `mcp_memory` + `scheduler` fields in `AppState` |
 | `crates/pond-api/src/routes.rs` | Schedule routes + memory injection in chat handler |
 | `crates/pond-server/Cargo.toml` | Optional deps + feature flags |
@@ -566,7 +566,7 @@ cargo run  -p pond-server --features "local-inference,local-inference/cuda" -- c
 | `GooseProviderAdapter` | `crates/pond-adapters-goose/src/provider_adapter.rs` | `pond-adapters-local-inference` takes a path dep on it — no message conversion duplication |
 | `InferenceRuntime::get_or_init()` | `goose/crates/goose/src/providers/local_inference.rs:63` | Called by `LocalInferenceProvider::from_env()` — global singleton, thread-safe |
 | `MemoryServer::new()` | `goose/crates/goose-mcp/src/` | Used directly in `GooseMcpMemoryAdapter` — no MCP transport layer needed |
-| `trim_to_budget()` | `crates/pond-core/src/services/context_budget.rs` | Kept as hard fallback inside `ContextCompactor::compact()` |
+| `trim_to_budget()` | `crates/pond-core/src/models/services/context_budget.rs` | Kept as hard fallback inside `ContextCompactor::compact()` |
 
 ---
 
