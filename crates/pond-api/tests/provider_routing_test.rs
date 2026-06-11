@@ -248,6 +248,7 @@ async fn make_app_with_provider(
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
         api_port: 4000,
     });
     (
@@ -564,6 +565,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
         api_port: 4000,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -653,6 +655,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
         api_port: 4000,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));

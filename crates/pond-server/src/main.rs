@@ -1923,6 +1923,15 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
+    // Privacy/security boundary hook — wraps the event log as its audit sink.
+    // Default-allow; routes opt in to calling `allow`/`audit`.
+    let security_policy: Option<Arc<dyn pond_core::ports::policy::SecurityPolicy>> =
+        Some(Arc::new(
+            pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
+                SqliteEventLogRepository::new(db.logs.clone()),
+            )),
+        ));
+
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1998,6 +2007,7 @@ async fn run_server(
             .map(|(uri, html)| (uri.to_string(), html))
             .collect(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy,
         api_port,
     });
 

@@ -143,6 +143,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
         api_port: 4000,
     });
     (
