@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::ports::model_downloader::ModelDownloader;
+use crate::models::ports::model_downloader::ModelDownloader;
 
 /// Spy `ModelDownloader` that records calls and optionally creates placeholder files.
 pub struct MockModelDownloader {

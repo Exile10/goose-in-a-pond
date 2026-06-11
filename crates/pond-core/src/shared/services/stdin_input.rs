@@ -6,7 +6,7 @@
 //!
 //! This is the default input source for `ChatService`.
 
-use crate::ports::voice_input::VoiceInput;
+use crate::models::ports::voice_input::VoiceInput;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::io::BufRead;

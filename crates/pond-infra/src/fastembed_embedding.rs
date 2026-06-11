@@ -16,7 +16,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use pond_core::ports::embedding::EmbeddingProvider;
+use pond_core::models::ports::embedding::EmbeddingProvider;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

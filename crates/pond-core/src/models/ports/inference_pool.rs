@@ -4,7 +4,7 @@
 //! control concurrency via semaphores: HTTP providers (Ollama, llamafile)
 //! allow 3+ concurrent requests, while local GGUF serializes to 1.
 
-use crate::domain::message::ChatMessage;
+use crate::models::domain::message::ChatMessage;
 use anyhow::Result;
 use async_trait::async_trait;
 

@@ -122,7 +122,7 @@ pub fn url_for(port: u16) -> String {
 /// on, or `None` if already running (port = base) or no model was found.
 pub async fn try_start(
     data_dir: &Path,
-    model_service: std::sync::Arc<pond_core::services::model_service::ModelService>,
+    model_service: std::sync::Arc<pond_core::models::services::model_service::ModelService>,
     model_name: Option<&str>,
 ) -> Option<(LlamafileProcess, u16)> {
     let base_port = crate::ports::LLAMAFILE;
@@ -144,7 +144,7 @@ pub async fn try_start(
     // When the name is empty/None, try to resolve from the assigned chat role
     // or the first available llamafile model in the catalog.
     let preferred_model = {
-        use pond_core::domain::model_record::ModelCategory;
+        use pond_core::models::domain::model_record::ModelCategory;
 
         let resolved_name: Option<String> = match model_name {
             Some(name) if !name.is_empty() => Some(name.to_string()),

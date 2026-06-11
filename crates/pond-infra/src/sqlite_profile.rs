@@ -6,8 +6,8 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::domain::profile::{CreateProfileRequest, Profile};
-use pond_core::ports::profile::ProfileRepository;
+use pond_core::user_data::domain::profile::{CreateProfileRequest, Profile};
+use pond_core::user_data::ports::profile::ProfileRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;

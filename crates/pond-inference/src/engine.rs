@@ -8,7 +8,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::LogOptions;
-use pond_core::domain::model_capabilities::ModelCapabilities;
+use pond_core::models::domain::model_capabilities::ModelCapabilities;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::sync::Mutex;

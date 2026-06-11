@@ -3,8 +3,8 @@
 //! Loads recent messages for a session, converting `SessionMessage` to
 //! `ChatMessage` for injection into the inference context.
 
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::session_storage::SessionStorage;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::user_data::ports::session_storage::SessionStorage;
 
 /// Load the most recent `limit` messages for a session.
 ///
@@ -28,9 +28,9 @@ pub async fn load_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::domain::message::Role;
-    use pond_core::domain::session::{Session, SessionMessage};
-    use pond_core::ports::session_storage::SessionStorageError;
+    use pond_core::models::domain::message::Role;
+    use pond_core::user_data::domain::session::{Session, SessionMessage};
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
 
     /// Mock session storage for testing.
     struct MockSessionStorage {

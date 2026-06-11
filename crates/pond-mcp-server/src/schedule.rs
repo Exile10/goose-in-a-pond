@@ -5,9 +5,11 @@
 //! `get_schedule_runs`, `world_clock`.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
-use pond_core::domain::schedule::TaskKind;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
-use pond_core::ports::settings::SettingsRepository;
+use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::ports::scheduler::{
+    CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
+};
+use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -426,7 +428,7 @@ impl ScheduleMcpServer {
                                 .map(|d| format!(" ({d}ms)"))
                                 .unwrap_or_default();
                             let detail = match &r.status {
-                                pond_core::domain::schedule::RunStatus::Completed => {
+                                pond_core::user_data::domain::schedule::RunStatus::Completed => {
                                     let preview = r
                                         .result
                                         .as_deref()
@@ -436,11 +438,11 @@ impl ScheduleMcpServer {
                                         .collect::<String>();
                                     format!("completed{duration}: {preview}")
                                 }
-                                pond_core::domain::schedule::RunStatus::Failed => {
+                                pond_core::user_data::domain::schedule::RunStatus::Failed => {
                                     let err = r.error.as_deref().unwrap_or("unknown error");
                                     format!("failed{duration}: {err}")
                                 }
-                                pond_core::domain::schedule::RunStatus::Running => {
+                                pond_core::user_data::domain::schedule::RunStatus::Running => {
                                     "running...".to_string()
                                 }
                             };
@@ -454,9 +456,9 @@ impl ScheduleMcpServer {
                     .iter()
                     .map(|r| {
                         let status_str = match &r.status {
-                            pond_core::domain::schedule::RunStatus::Completed => "completed",
-                            pond_core::domain::schedule::RunStatus::Failed => "failed",
-                            pond_core::domain::schedule::RunStatus::Running => "running",
+                            pond_core::user_data::domain::schedule::RunStatus::Completed => "completed",
+                            pond_core::user_data::domain::schedule::RunStatus::Failed => "failed",
+                            pond_core::user_data::domain::schedule::RunStatus::Running => "running",
                         };
                         serde_json::json!({
                             "started_at": r.started_at.format("%Y-%m-%dT%H:%M:%S").to_string(),

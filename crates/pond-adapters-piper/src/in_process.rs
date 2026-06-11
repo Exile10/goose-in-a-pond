@@ -28,7 +28,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use piper_rs::Piper;
-use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::models::ports::voice_output::VoiceOutput;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

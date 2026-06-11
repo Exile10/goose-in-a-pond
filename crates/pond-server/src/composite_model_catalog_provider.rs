@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
-use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
+use pond_core::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
+use pond_core::models::ports::model_catalog_provider::ModelCatalogProvider;
 
 // ── Composite ─────────────────────────────────────────────────────────────────
 

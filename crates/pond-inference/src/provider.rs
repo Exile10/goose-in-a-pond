@@ -18,12 +18,12 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, GrammarTrigger, GrammarTriggerType};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::domain::model_capabilities::ModelCapabilities;
-use pond_core::ports::inference::{
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::domain::model_capabilities::ModelCapabilities;
+use pond_core::models::ports::inference::{
     ChatEvent, ChatEventStream, InferenceOptions, InferenceProvider, ToolDefinition,
 };
-use pond_core::ports::provider::UsageStats;
+use pond_core::models::ports::provider::UsageStats;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn build_messages_json_emits_tool_calls_and_tool_call_id() {
-        use pond_core::domain::message::ToolCallRecord;
+        use pond_core::models::domain::message::ToolCallRecord;
 
         let messages = vec![
             ChatMessage::user("weather?"),

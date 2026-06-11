@@ -6,7 +6,7 @@ How a request travels through GIAP from the client to the LLM and back.
 
 ## Voice Pipeline: Wait → Listen → Think → Speak
 
-The core state machine is implemented in `pond-core/src/services/chat.rs`:
+The core state machine is implemented in `pond-core/src/shared/services/chat.rs`:
 
 ```
 ┌─────────────┐   wake word    ┌─────────────┐   ASR transcript  ┌─────────────┐

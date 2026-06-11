@@ -14,10 +14,10 @@
 //! [`NoopFaceDetector`] implements the trait by always returning `Ok(None)`,
 //! which is semantically "I don't know where the face is — let the embedder
 //! fall back to its default crop".  Use it as a placeholder when wiring
-//! [`crate::ports::face_recognition`] in environments that do not bundle a
+//! [`crate::user_data::ports::face_recognition`] in environments that do not bundle a
 //! detection model.
 
-use crate::domain::face_recognition::DetectedFace;
+use crate::user_data::domain::face_recognition::DetectedFace;
 use anyhow::Result;
 use async_trait::async_trait;
 

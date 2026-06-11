@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::tool_result::ToolResult;
+use crate::mcp::domain::tool_result::ToolResult;
 
 /// Driven Port: pre-inference tool agent.
 ///

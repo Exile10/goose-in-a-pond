@@ -1,6 +1,6 @@
 //! Settings port — driven port for persisting and loading GIAP configuration.
 
-use crate::domain::settings::Settings;
+use crate::user_data::domain::settings::Settings;
 use anyhow::Result;
 use async_trait::async_trait;
 

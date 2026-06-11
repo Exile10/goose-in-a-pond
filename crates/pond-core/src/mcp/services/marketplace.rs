@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::marketplace::MarketplaceExtension;
-use crate::ports::extension_marketplace::ExtensionMarketplace;
+use crate::mcp::domain::marketplace::MarketplaceExtension;
+use crate::mcp::ports::extension_marketplace::ExtensionMarketplace;
 
 /// Top-level registry structure matching the JSON schema.
 #[derive(serde::Deserialize)]

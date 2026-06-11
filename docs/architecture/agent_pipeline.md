@@ -39,7 +39,7 @@ User (via SSE stream or TTS)
 
 ### Port Trait
 
-**File:** `crates/pond-core/src/ports/tool_agent.rs`
+**File:** `crates/pond-core/src/mcp/ports/tools/tool_agent.rs`
 
 ```rust
 #[async_trait]
@@ -93,7 +93,7 @@ The prompt is **cached** via `OnceLock` -- built once, reused for all subsequent
 
 ### Port Trait
 
-**File:** `crates/pond-core/src/ports/answer_reviewer.rs`
+**File:** `crates/pond-core/src/models/ports/answer_reviewer.rs`
 
 ```rust
 #[async_trait]
@@ -174,7 +174,7 @@ chat_stream handler:
   7. Emit done event
 ```
 
-### Voice CLI Path (`crates/pond-core/src/services/chat.rs`)
+### Voice CLI Path (`crates/pond-core/src/shared/services/chat.rs`)
 
 Same pipeline in `chat_stream_once()`, with TTS output instead of SSE.
 

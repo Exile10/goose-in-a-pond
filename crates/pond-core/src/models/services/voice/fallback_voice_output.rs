@@ -11,7 +11,7 @@
 //! ));
 //! ```
 
-use crate::ports::voice_output::VoiceOutput;
+use crate::models::ports::voice_output::VoiceOutput;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;

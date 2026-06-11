@@ -5,10 +5,10 @@
 //! Depends on [`DeviceRegistry`], [`SettingsRepository`],
 //! [`UserSkillRepository`], and [`AgentRecipeRepository`].
 
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::recipe::AgentRecipeRepository;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -287,10 +287,10 @@ pub fn spawn_device_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pond_core::domain::recipe::AgentRecipe;
-    use pond_core::domain::settings::Settings;
-    use pond_core::domain::skill::UserSkill;
-    use pond_core::ports::device_registry::{Device, RegisterDeviceRequest};
+    use pond_core::user_data::domain::recipe::AgentRecipe;
+    use pond_core::user_data::domain::settings::Settings;
+    use pond_core::user_data::domain::skill::UserSkill;
+    use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
 
     struct StubDeviceRegistry;
     #[async_trait]

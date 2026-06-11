@@ -7,7 +7,7 @@
 //! Implements `StreamingWakeWordDetector`; the blanket impl provides `WakeWordDetector`
 //! automatically.
 
-use crate::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
+use crate::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -33,7 +33,7 @@ impl StreamingWakeWordDetector for InstantActivation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::wake_word::WakeWordDetector;
+    use crate::models::ports::wake_word::WakeWordDetector;
 
     #[tokio::test]
     async fn instant_activation_returns_ok_immediately() {

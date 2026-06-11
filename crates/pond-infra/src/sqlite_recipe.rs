@@ -6,8 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Pool, Row, Sqlite};
 
-use pond_core::domain::recipe::AgentRecipe;
-use pond_core::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::domain::recipe::AgentRecipe;
+use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 
 pub struct SqliteRecipeRepository {
     pool: Pool<Sqlite>,

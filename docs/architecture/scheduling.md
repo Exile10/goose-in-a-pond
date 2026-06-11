@@ -33,7 +33,7 @@ Cron-based automation engine that executes LLM prompts or webhooks on recurring 
               └─────────────────────┘
 ```
 
-## Domain Types (`pond-core/src/domain/schedule.rs`)
+## Domain Types (`pond-core/src/user_data/domain/schedule.rs`)
 
 - **`TaskKind`** — `AgentPrompt { prompt }` (sends to LLM) or `Webhook { webhook_url }` (HTTP POST)
 - **`Schedule`** — id, label, cron (6-field), timezone (IANA), kind, paused, currently_running, last_run, next_run, created_at

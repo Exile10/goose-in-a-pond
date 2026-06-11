@@ -7,11 +7,11 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use pond_core::domain::agent::AgentRequest;
-use pond_core::domain::schedule::TaskKind;
-use pond_core::ports::agent::Agent;
-use pond_core::ports::schedule_execution::ScheduleExecutor;
-use pond_core::ports::session_storage::SessionStorage;
+use pond_core::models::ports::agent::Agent;
+use pond_core::shared::domain::agent::AgentRequest;
+use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
+use pond_core::user_data::ports::session_storage::SessionStorage;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, Semaphore};
 

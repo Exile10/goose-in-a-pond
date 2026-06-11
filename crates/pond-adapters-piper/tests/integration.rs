@@ -18,7 +18,7 @@
 #![cfg(feature = "legacy-subprocess")]
 
 use pond_adapters_piper::PiperOutput;
-use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::models::ports::voice_output::VoiceOutput;
 use std::path::PathBuf;
 
 // ── Error handling ────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ fn espeak_data_absent_by_default() {
 /// is how `ChatService` holds it at runtime.
 #[test]
 fn piper_output_is_voice_output_trait_object() {
-    use pond_core::ports::voice_output::VoiceOutput;
+    use pond_core::models::ports::voice_output::VoiceOutput;
     use std::sync::Arc;
     let _: Arc<dyn VoiceOutput> = Arc::new(PiperOutput::new(
         PathBuf::from("piper"),

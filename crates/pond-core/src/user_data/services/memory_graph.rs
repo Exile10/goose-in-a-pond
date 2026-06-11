@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::domain::memory::{MemoryEdge, MemoryFragment};
+use crate::user_data::domain::memory::{MemoryEdge, MemoryFragment};
 
 /// Bonus score added per hop *closer* to the root.
 ///
@@ -134,7 +134,7 @@ pub fn retrieve_relevant_memories(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{EdgeRelation, MemoryFragment};
+    use crate::user_data::domain::memory::{EdgeRelation, MemoryFragment};
 
     /// Helper: create a minimal MemoryFragment with given id and importance.
     fn mem(id: &str, importance: f32) -> MemoryFragment {

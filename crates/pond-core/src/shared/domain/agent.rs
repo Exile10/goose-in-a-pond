@@ -8,7 +8,7 @@ pub struct AgentRequest {
     pub model_role: String, // "chat" | "think" | "task"
     /// Optional image attachments for multimodal models.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<crate::domain::message::ImageAttachment>,
+    pub images: Vec<crate::models::domain::message::ImageAttachment>,
     /// When true, the request originates from voice mode. The agent should
     /// disable thinking, keep responses concise, and avoid formatting.
     #[serde(default)]
@@ -65,7 +65,7 @@ pub enum AgentStreamEvent {
         session_id: String,
         model_role: String,
         /// Token usage for this response (estimated if real counts unavailable).
-        usage: Option<crate::ports::provider::UsageStats>,
+        usage: Option<crate::models::ports::provider::UsageStats>,
     },
     Error {
         content: String,

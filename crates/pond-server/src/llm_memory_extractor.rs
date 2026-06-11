@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pond_core::domain::memory::{MemorySegment, MemoryTier};
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::memory_extractor::{ExtractedFact, MemoryExtractor};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::user_data::domain::memory::{MemorySegment, MemoryTier};
+use pond_core::user_data::ports::memory_extractor::{ExtractedFact, MemoryExtractor};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

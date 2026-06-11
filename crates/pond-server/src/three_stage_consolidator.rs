@@ -8,10 +8,10 @@
 //! tokens so the three calls complete within a single context window budget.
 
 use anyhow::{anyhow, Result};
-use pond_core::domain::memory::MemoryFragment;
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::memory_consolidator::*;
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::user_data::domain::memory::MemoryFragment;
+use pond_core::user_data::ports::memory_consolidator::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -394,7 +394,7 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                     .get("segment")
                     .and_then(|s| s.as_str())
                     .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
-                    .unwrap_or(pond_core::domain::memory::MemorySegment::Knowledge);
+                    .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                 let importance = v
                     .get("importance")
                     .and_then(|i| i.as_f64())
@@ -436,7 +436,7 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                     .get("segment")
                     .and_then(|s| s.as_str())
                     .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
-                    .unwrap_or(pond_core::domain::memory::MemorySegment::Knowledge);
+                    .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                 let new_importance = v
                     .get("importance")
                     .and_then(|i| i.as_f64())
@@ -471,13 +471,13 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                                     .get("segment")
                                     .and_then(|s| s.as_str())
                                     .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
-                                    .unwrap_or(pond_core::domain::memory::MemorySegment::Knowledge);
+                                    .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                                 let importance = entry
                                     .get("importance")
                                     .and_then(|i| i.as_f64())
                                     .map(|i| (i as f32).clamp(0.0, 1.0))
                                     .unwrap_or(0.5);
-                                Some(pond_core::ports::memory_consolidator::SplitEntry {
+                                Some(pond_core::user_data::ports::memory_consolidator::SplitEntry {
                                     content,
                                     segment,
                                     importance,
@@ -626,7 +626,7 @@ fn empty_result(start: std::time::Instant) -> ConsolidationRunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::domain::memory::{MemorySegment, MemoryTier};
+    use pond_core::user_data::domain::memory::{MemorySegment, MemoryTier};
 
     fn make_memory(id: &str, content: &str, segment: MemorySegment) -> MemoryFragment {
         MemoryFragment {

@@ -7,12 +7,18 @@ This guide shows how to add a new capability to GIAP while keeping the hexagonal
 ## The Five Steps
 
 ```
-1. Domain types  (pond-core/src/domain/)
-2. Port trait    (pond-core/src/ports/)
-3. Mock + tests  (pond-core/src/services/)
+0. Pick a quadrant  (user_data | models | mcp | security | shared)
+1. Domain types  (pond-core/src/<quadrant>/domain/)
+2. Port trait    (pond-core/src/<quadrant>/ports/)
+3. Mock + tests  (pond-core/src/<quadrant>/mocks/)
 4. Real adapter  (crates/pond-adapters-<name>/)
 5. Wire          (pond-server/src/main.rs)
 ```
+
+> The example below adds a `notification` capability, which belongs to the
+> `mcp` quadrant (it is part of the tool/extension surface). Substitute your own
+> quadrant — `user_data`, `models`, `mcp`, `security`, or `shared` — in the
+> paths that follow.
 
 ---
 
@@ -20,7 +26,7 @@ This guide shows how to add a new capability to GIAP while keeping the hexagonal
 
 Create the pure Rust types your port will use. No external imports allowed.
 
-**File:** `crates/pond-core/src/domain/<name>.rs`
+**File:** `crates/pond-core/src/mcp/domain/notification.rs`  *(`<quadrant>/domain/<name>.rs`)*
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -36,7 +42,7 @@ pub struct NotificationMessage {
 pub enum NotificationPriority { Low, Normal, High }
 ```
 
-Register in `crates/pond-core/src/domain/mod.rs`:
+Register in `crates/pond-core/src/mcp/domain/mod.rs`:
 ```rust
 pub mod notification;
 ```
@@ -49,12 +55,12 @@ pub mod notification;
 
 Define the interface the Core will use. One trait per capability.
 
-**File:** `crates/pond-core/src/ports/notification.rs`
+**File:** `crates/pond-core/src/mcp/ports/notification.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::notification::NotificationMessage;
+use crate::mcp::domain::notification::NotificationMessage;
 
 /// Driven Port: push notification delivery.
 ///
@@ -67,7 +73,7 @@ pub trait NotificationSender: Send + Sync {
 }
 ```
 
-Register in `crates/pond-core/src/ports/mod.rs`:
+Register in `crates/pond-core/src/mcp/ports/mod.rs`:
 ```rust
 pub mod notification;
 ```
@@ -78,14 +84,14 @@ pub mod notification;
 
 Write the mock before anything else. This is the test double used by all Core tests.
 
-**File:** `crates/pond-core/src/services/mock_notification.rs`
+**File:** `crates/pond-core/src/mcp/mocks/mock_notification.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Mutex;
-use crate::domain::notification::NotificationMessage;
-use crate::ports::notification::NotificationSender;
+use crate::mcp::domain::notification::NotificationMessage;
+use crate::mcp::ports::notification::NotificationSender;
 
 /// Test double — captures sent notifications for assertion.
 pub struct MockNotificationSender {
@@ -113,7 +119,7 @@ impl NotificationSender for MockNotificationSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::notification::NotificationPriority;
+    use crate::mcp::domain::notification::NotificationPriority;
 
     #[tokio::test]
     async fn send_captures_message() {
@@ -137,7 +143,7 @@ mod tests {
 }
 ```
 
-Register in `crates/pond-core/src/services/mod.rs`:
+Register in `crates/pond-core/src/mcp/mocks/mod.rs` (gated `#[cfg(any(test, feature = "test-mocks"))]`):
 ```rust
 pub mod mock_notification;
 ```
@@ -176,8 +182,8 @@ wiremock = { workspace = true }
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::notification::NotificationMessage;
-use pond_core::ports::notification::NotificationSender;
+use pond_core::mcp::domain::notification::NotificationMessage;
+use pond_core::mcp::ports::notification::NotificationSender;
 
 pub struct GotgNotificationAdapter {
     endpoint: String,
@@ -216,8 +222,8 @@ impl NotificationSender for GotgNotificationAdapter {
 **Integration tests — `crates/pond-adapters-gotg/tests/integration.rs`**
 ```rust
 use pond_adapters_gotg::GotgNotificationAdapter;
-use pond_core::domain::notification::{NotificationMessage, NotificationPriority};
-use pond_core::ports::notification::NotificationSender;
+use pond_core::mcp::domain::notification::{NotificationMessage, NotificationPriority};
+use pond_core::mcp::ports::notification::NotificationSender;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
 

@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-use crate::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
-use crate::ports::model_storage::ModelStorage;
+use crate::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
+use crate::models::ports::model_storage::ModelStorage;
 
 /// Mock storage with three configurable presence modes.
 pub enum MockModelStorage {
@@ -84,7 +84,7 @@ impl ModelStorage for MockModelStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::model_record::ModelCategory;
+    use crate::models::domain::model_record::ModelCategory;
     use tempfile::tempdir;
 
     fn gguf_record(name: &str) -> ModelRecord {

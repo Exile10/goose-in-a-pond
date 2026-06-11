@@ -8,8 +8,8 @@
 //! the character budget is exhausted, then reverses to restore chronological order.
 //! This ensures the most recent context is always preserved.
 
-use crate::domain::message::{ChatMessage, Role};
-use crate::domain::model_capabilities::ModelCapabilities;
+use crate::models::domain::message::{ChatMessage, Role};
+use crate::models::domain::model_capabilities::ModelCapabilities;
 
 const CHARS_PER_TOKEN: usize = 4;
 const MIN_USABLE_HISTORY_CHARS: usize = 256;
@@ -265,7 +265,7 @@ pub fn trim_to_budget_for_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::message::Role;
+    use crate::models::domain::message::Role;
 
     fn msg(content: &str) -> ChatMessage {
         ChatMessage {

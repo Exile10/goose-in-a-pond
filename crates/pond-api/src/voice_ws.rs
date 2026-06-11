@@ -18,10 +18,10 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
-use pond_core::domain::agent::{AgentRequest, AgentStreamEvent};
-use pond_core::domain::message::ChatMessage;
-use pond_core::domain::session::SessionMessage;
-use pond_core::services::chat::{split_sentences, strip_markdown_for_speech};
+use pond_core::shared::domain::agent::{AgentRequest, AgentStreamEvent};
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::user_data::domain::session::SessionMessage;
+use pond_core::shared::services::chat::{split_sentences, strip_markdown_for_speech};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;

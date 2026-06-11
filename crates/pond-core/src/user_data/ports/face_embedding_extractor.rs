@@ -20,7 +20,7 @@
 //! Implementations MUST NOT write raw image pixels or intermediate crops to
 //! disk.  Only the embedding vector may leave the method boundary.
 
-use crate::domain::face_recognition::{BoundingBox, FaceLandmarks};
+use crate::user_data::domain::face_recognition::{BoundingBox, FaceLandmarks};
 use anyhow::Result;
 use async_trait::async_trait;
 

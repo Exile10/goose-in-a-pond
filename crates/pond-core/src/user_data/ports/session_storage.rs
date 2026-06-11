@@ -1,4 +1,4 @@
-use crate::domain::session::{Session, SessionMessage};
+use crate::user_data::domain::session::{Session, SessionMessage};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

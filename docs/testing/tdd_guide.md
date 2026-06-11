@@ -23,7 +23,7 @@ When adding logic to `pond-core`, always write tests before the implementation.
 ### Pattern
 
 ```rust
-// crates/pond-core/src/services/chat.rs
+// crates/pond-core/src/shared/services/chat.rs
 
 #[tokio::test]
 async fn chat_once_persists_user_and_assistant_messages() {
@@ -173,9 +173,9 @@ npm run test:run  # single pass (CI)
 
 ## 5. New Port/Adapter Checklist
 
-- [ ] Domain types in `pond-core/src/domain/`
-- [ ] Port trait in `pond-core/src/ports/` with `async_trait`
-- [ ] Mock implementation in `pond-core/src/services/mock_<name>.rs`
+- [ ] Domain types in `pond-core/src/<quadrant>/domain/`
+- [ ] Port trait in `pond-core/src/<quadrant>/ports/` with `async_trait`
+- [ ] Mock implementation in `pond-core/src/<quadrant>/mocks/mock_<name>.rs`
 - [ ] Unit tests for the mock passing
 - [ ] Real adapter in `crates/pond-adapters-<name>/`
 - [ ] Integration tests covering: happy path, error path (HTTP 500, connection refused), trait-object conformance, `#[ignore]` live test

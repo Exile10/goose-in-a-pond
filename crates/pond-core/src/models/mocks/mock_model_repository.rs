@@ -7,8 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
-use crate::ports::model_repository::ModelRepository;
+use crate::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use crate::models::ports::model_repository::ModelRepository;
 
 /// In-memory model catalog and role assignment store.
 ///
@@ -116,7 +116,7 @@ impl ModelRepository for MockModelRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::model_record::ModelCategory;
+    use crate::models::domain::model_record::ModelCategory;
 
     fn gguf_record(name: &str) -> ModelRecord {
         ModelRecord {

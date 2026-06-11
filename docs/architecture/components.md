@@ -15,7 +15,8 @@ Each crate in `crates/` and the `pond-desktop/` app has a distinct responsibilit
 │  pond-api  (Axum router + REST DTOs)                 │
 ├──────────────────────────────────────────────────────┤
 │  DOMAIN CORE  (never imports framework deps)         │
-│  pond-core: domain/ · ports/ · services/             │
+│  pond-core: user_data/ · models/ · mcp/ · security/  │
+│            · shared/  (each: domain/ ports/ services/)│
 ├──────────────────────────────────────────────────────┤
 │  Driven Adapters (implement Core ports)              │
 │  pond-infra · pond-infra-scheduler                   │
@@ -35,11 +36,21 @@ Each crate in `crates/` and the `pond-desktop/` app has a distinct responsibilit
 
 The heart of GIAP. Contains all domain logic with zero external framework dependencies.
 
-| Sub-directory | Purpose |
+Files are grouped into four quadrants around the user, plus a `shared/` module
+for agent-loop plumbing. Every quadrant carries its own `domain/`, `ports/`, and
+`services/` (and a `mocks/` for test doubles).
+
+| Quadrant | Purpose |
 |---|---|
-| `src/domain/` | Pure Rust types: `ChatMessage`, `Device`, `Schedule`, `MemoryFragment`, `Settings`, `UserSkill`, `AgentRecipe` … |
-| `src/ports/` | `async_trait` interface definitions — one file per capability |
-| `src/services/` | Use-case orchestrators (`ChatService`, `ContextCompactor`) and mock implementations for testing |
+| `src/user_data/` | Facts about / owned by the household: `profile`, `memory`, `session`, `settings`, `skill`, `recipe`, `prompt_template`/`prompt_extra`, `schedule`, `onboarding`, `sensor`, `draft`, `face` |
+| `src/models/` | Anything that runs or routes inference: `message`, `model_record`, `model_capabilities`, providers, `inference`/`inference_pool`, `embedding`, `voice_input`/`voice_output`, `wake_word`, catalog/storage/downloader, plus context-budget / prompt-builder / history / thought-filter services |
+| `src/mcp/` | The tool surface: `extension_manager`, `marketplace`, `mcp_server`, `mcp_knowledge`, `notification`, and `tools::{registry, dispatcher, caller, cache, agent}` |
+| `src/security/` | The enclosing boundary: `secret`, `handshake`, `telemetry`, `event_log`, `policy`, `turn_metrics`, `oauth_provider` |
+| `src/shared/` | Agent-loop plumbing used by every quadrant: `agent` types, `chat` (run_loop), `stdin_input`, `print_output` |
+
+Within each quadrant: `domain/` holds pure Rust types, `ports/` holds the
+`async_trait` interface definitions (one file per capability), and `services/`
+holds the use-case orchestrators (`ChatService`, `ContextCompactor`, …).
 
 **Key invariant:** `pond-core` must never import from `goose::*`, `sqlx::*`, `axum::*`, or any HTTP/filesystem library.
 

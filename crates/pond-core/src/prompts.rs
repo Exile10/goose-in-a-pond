@@ -14,7 +14,7 @@
 //! - `build_system_prompt(settings)` — legacy; uses hard-coded `PROMPT_*` constants (routes, main, tests)
 //! - `SYSTEM_PROMPT` — in tests and absolute last-resort fallback
 
-use crate::domain::settings::Settings;
+use crate::user_data::domain::settings::Settings;
 
 // ── Profile context ───────────────────────────────────────────────────────────
 

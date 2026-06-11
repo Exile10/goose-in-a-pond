@@ -6,8 +6,8 @@
 
 use futures::StreamExt;
 use pond_adapters_llamafile::{LlamafileProvider, DEFAULT_MODEL};
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::ports::provider::LlmProvider;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -208,7 +208,7 @@ async fn complete_no_choices_returns_error() {
 
 /// Helper: mount an SSE mock and collect all text tokens from stream_complete().
 async fn stream_tokens(server: &MockServer, messages: Vec<ChatMessage>) -> Vec<String> {
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
     let provider = LlamafileProvider::new(Some(&server.uri()));
     let mut stream = provider.stream_complete("system", messages);
 
@@ -519,7 +519,7 @@ async fn task_role_stream_complete_yields_action_tokens() {
         vec![ChatMessage::user("remind me to call mum at 9am")],
     );
 
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
     let mut tokens = Vec::new();
     while let Some(Ok(item)) = stream.next().await {
         if let StreamToken::Text(tok) = item {
@@ -564,7 +564,7 @@ async fn think_role_stream_complete_handles_long_reasoning_response() {
         vec![ChatMessage::user("explain why objects fall")],
     );
 
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
     let mut tokens = Vec::new();
     while let Some(Ok(item)) = stream.next().await {
         if let StreamToken::Text(tok) = item {
@@ -628,7 +628,7 @@ async fn think_role_complete_multi_turn_reasoning() {
 /// must parse it and emit a StreamToken::Usage item as the last stream item.
 #[tokio::test]
 async fn stream_complete_parses_usage_from_final_chunk() {
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
 
     let server = MockServer::start().await;
     // Body: one text token + a final chunk with usage, then [DONE]
@@ -672,7 +672,7 @@ async fn stream_complete_parses_usage_from_final_chunk() {
 /// must NOT emit a StreamToken::Usage item — just yield the text tokens and stop.
 #[tokio::test]
 async fn stream_complete_no_usage_when_chunk_omits_it() {
-    use pond_core::ports::provider::StreamToken;
+    use pond_core::models::ports::provider::StreamToken;
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))

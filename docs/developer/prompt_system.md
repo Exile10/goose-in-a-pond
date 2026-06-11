@@ -172,13 +172,13 @@ Four settings fields control GooseAdapter's agentic loop behaviour:
 | File | Role |
 |---|---|
 | `crates/pond-core/src/prompts.rs` | `pub const PROMPT_*`, `build_system_prompt(&Settings)`, `build_system_prompt_from_template`, `sanitize_field`, `render_template` |
-| `crates/pond-core/src/domain/settings.rs` | `prompt_style`, `custom_system_prompt`, `prompt_addendum`, `agent_*` fields |
-| `crates/pond-core/src/ports/prompt_template.rs` | `PromptTemplateRepository` trait |
-| `crates/pond-core/src/ports/prompt_extra.rs` | `PromptExtraRepository` trait |
-| `crates/pond-core/src/ports/skill.rs` | `UserSkillRepository` trait |
-| `crates/pond-core/src/domain/prompt_template.rs` | `PromptTemplate` domain type |
-| `crates/pond-core/src/domain/prompt_extra.rs` | `PromptExtra` domain type |
-| `crates/pond-core/src/domain/skill.rs` | `UserSkill` domain type |
+| `crates/pond-core/src/user_data/domain/settings.rs` | `prompt_style`, `custom_system_prompt`, `prompt_addendum`, `agent_*` fields |
+| `crates/pond-core/src/user_data/ports/prompt_template.rs` | `PromptTemplateRepository` trait |
+| `crates/pond-core/src/user_data/ports/prompt_extra.rs` | `PromptExtraRepository` trait |
+| `crates/pond-core/src/user_data/ports/skill.rs` | `UserSkillRepository` trait |
+| `crates/pond-core/src/user_data/domain/prompt_template.rs` | `PromptTemplate` domain type |
+| `crates/pond-core/src/user_data/domain/prompt_extra.rs` | `PromptExtra` domain type |
+| `crates/pond-core/src/user_data/domain/skill.rs` | `UserSkill` domain type |
 | `crates/pond-infra/src/sqlite_prompt_template.rs` | `SqlitePromptTemplateRepository` |
 | `crates/pond-infra/src/sqlite_prompt_extra.rs` | `SqlitePromptExtraRepository` |
 | `crates/pond-infra/src/sqlite_skill.rs` | `SqliteSkillRepository` |

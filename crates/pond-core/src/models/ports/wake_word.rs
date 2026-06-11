@@ -86,7 +86,7 @@ impl<T: StreamingWakeWordDetector + 'static> WakeWordDetector for T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::instant_activation::InstantActivation;
+    use crate::models::services::instant_activation::InstantActivation;
 
     #[test]
     fn wakeword_activation_no_audio_field_is_none() {

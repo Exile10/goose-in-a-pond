@@ -11,18 +11,18 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_api::{build_router, AppState};
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::ports::agent::{Agent, AgentRequest, AgentResponse};
-use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::ports::extension_manager::{
+use pond_core::mcp::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
 };
-use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::services::mock_agent::MockAgent;
-use pond_core::services::mock_memory::MockMemoryRepository;
-use pond_core::services::mock_profile::MockProfileRepository;
-use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
-use pond_core::services::mock_settings::MockSettingsRepository;
+use pond_core::models::ports::agent::{Agent, AgentRequest, AgentResponse};
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
+use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
+use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use reqwest::Client as ReqwestClient;
@@ -135,17 +135,17 @@ impl Agent for ToolCallingAgent {
     ) -> anyhow::Result<
         futures::stream::BoxStream<
             'static,
-            anyhow::Result<pond_core::domain::agent::AgentStreamEvent>,
+            anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
         >,
     > {
         let stream = async_stream::stream! {
-            yield Ok(pond_core::domain::agent::AgentStreamEvent::ToolCall {
+            yield Ok(pond_core::shared::domain::agent::AgentStreamEvent::ToolCall {
                 id: "test-tool-call-id".to_string(),
                 tool: "giap__get_current_weather".to_string(),
                 input: None,
             });
-            yield Ok(pond_core::domain::agent::AgentStreamEvent::Text { content: "Task completed from agent".to_string() });
-            yield Ok(pond_core::domain::agent::AgentStreamEvent::Done {
+            yield Ok(pond_core::shared::domain::agent::AgentStreamEvent::Text { content: "Task completed from agent".to_string() });
+            yield Ok(pond_core::shared::domain::agent::AgentStreamEvent::Done {
                 session_id: request.session_id,
                 model_role: request.model_role,
                 usage: None,
@@ -183,7 +183,7 @@ fn sse_body_with_usage(tokens: &[&str], usage: Option<(u32, u32)>) -> String {
 
 /// Build an AppState with the given provider wired into llm_provider.
 async fn make_app_with_provider(
-    provider: Arc<dyn pond_core::ports::provider::LlmProvider>,
+    provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
 ) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
@@ -245,7 +245,9 @@ async fn make_app_with_provider(
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
@@ -562,7 +564,9 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
@@ -652,7 +656,9 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,

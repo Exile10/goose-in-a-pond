@@ -16,15 +16,15 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pond_adapters_weather::WeatherProvider;
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::draft::DraftRepository;
-use pond_core::ports::embedding::EmbeddingProvider;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::recipe::AgentRecipeRepository;
-use pond_core::ports::scheduler::SchedulerPort;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
-use pond_core::ports::tool_dispatcher::{ToolCallResult, ToolDispatcher};
+use pond_core::mcp::ports::tools::tool_dispatcher::{ToolCallResult, ToolDispatcher};
+use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::draft::DraftRepository;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::ports::scheduler::SchedulerPort;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use rmcp::model::{CallToolRequestParams, CallToolResult as RmcpCallToolResult, RequestId};
 use rmcp::service::{Peer, RequestContext, RunningService};
 use rmcp::{RoleServer, ServerHandler};
@@ -693,13 +693,15 @@ mod tests {
         // Mock settings repo
         struct MockSettings;
         #[async_trait]
-        impl pond_core::ports::settings::SettingsRepository for MockSettings {
-            async fn get(&self) -> anyhow::Result<pond_core::domain::settings::Settings> {
-                Ok(pond_core::domain::settings::Settings::default())
+        impl pond_core::user_data::ports::settings::SettingsRepository for MockSettings {
+            async fn get(
+                &self,
+            ) -> anyhow::Result<pond_core::user_data::domain::settings::Settings> {
+                Ok(pond_core::user_data::domain::settings::Settings::default())
             }
             async fn update(
                 &self,
-                _: &pond_core::domain::settings::Settings,
+                _: &pond_core::user_data::domain::settings::Settings,
             ) -> anyhow::Result<()> {
                 Ok(())
             }
@@ -710,7 +712,7 @@ mod tests {
                 Ok(())
             }
         }
-        let settings: Arc<dyn pond_core::ports::settings::SettingsRepository> =
+        let settings: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository> =
             Arc::new(MockSettings);
 
         // All servers that don't require complex real deps

@@ -33,7 +33,7 @@ use anyhow::anyhow;
 #[cfg(feature = "legacy-subprocess")]
 use async_trait::async_trait;
 #[cfg(feature = "legacy-subprocess")]
-use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::models::ports::voice_output::VoiceOutput;
 #[cfg(feature = "legacy-subprocess")]
 use std::io::Write as _;
 #[cfg(feature = "legacy-subprocess")]
@@ -615,7 +615,7 @@ mod tests {
     #[cfg(feature = "legacy-subprocess")]
     #[test]
     fn piper_output_compiles_as_voice_output() {
-        use pond_core::ports::voice_output::VoiceOutput;
+        use pond_core::models::ports::voice_output::VoiceOutput;
         use std::sync::Arc;
         let _out: Arc<dyn VoiceOutput> = Arc::new(PiperOutput::new(
             PathBuf::from("piper"),

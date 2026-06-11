@@ -4,9 +4,9 @@
 //! Tables are created by `migrations/system/0001_initial.sql`.
 
 use async_trait::async_trait;
-use pond_core::domain::message::{ChatMessage, Role, ToolCallRecord};
-use pond_core::domain::session::{Session, SessionMessage};
-use pond_core::ports::session_storage::{SessionStorage, SessionStorageError};
+use pond_core::models::domain::message::{ChatMessage, Role, ToolCallRecord};
+use pond_core::user_data::domain::session::{Session, SessionMessage};
+use pond_core::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use sqlx::{Pool, Sqlite};
 
 // ── Raw DB row types ──────────────────────────────────────────────────────────
@@ -331,7 +331,7 @@ impl SessionStorage for SqliteSessionStorage {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use pond_core::domain::message::ChatMessage;
+    use pond_core::models::domain::message::ChatMessage;
     use tempfile::tempdir;
 
     async fn make_storage() -> (SqliteSessionStorage, tempfile::TempDir) {
@@ -571,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_metadata_round_trips() {
-        use pond_core::domain::message::ToolCallRecord;
+        use pond_core::models::domain::message::ToolCallRecord;
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
 

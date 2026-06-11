@@ -6,7 +6,7 @@
 //! the same MCP tool again via Goose's agentic loop. This prevents
 //! duplicate tool invocations that waste latency and tokens.
 
-use pond_core::domain::tool_result::ToolResult;
+use pond_core::mcp::domain::tool_result::ToolResult;
 
 /// Map an internal tool name to the MCP tool names that Goose exposes.
 ///

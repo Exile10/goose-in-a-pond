@@ -34,7 +34,7 @@
 //! See individual template files in `src/prompts/` for per-template variables.
 
 use goose::prompt_template::render_string;
-use pond_core::ports::extension_manager::ExtensionInfo;
+use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use serde::Serialize;
 
 // ── Embedded template files ───────────────────────────────────────────────────

@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use pond_adapters_whisper::{WhisperBackend, WhisperKeywordDetector};
-use pond_core::ports::wake_word::WakeWordDetector;
+use pond_core::models::ports::wake_word::WakeWordDetector;
 use std::sync::Arc;
 
 /// Minimal `WhisperBackend` for tests — always returns the canned transcript.

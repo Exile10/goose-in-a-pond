@@ -36,6 +36,50 @@ graph LR
 
 ---
 
+## 2b. `pond-core` Four-Quadrant Layout
+
+Inside the core, files are grouped into four quadrants around the user, plus a
+`shared/` module for agent-loop plumbing that belongs to none of them. Each
+quadrant has its own `domain/`, `ports/`, and `services/` (and a `mocks/` for
+test doubles).
+
+```mermaid
+graph TB
+    subgraph SEC["pond-core::security (Privacy & Security boundary)"]
+        SECbox["handshake · secret · audit · consent<br/>(wraps inbound calls; emits outbound audit events)"]
+        subgraph USR["pond-core::user_data (centre)"]
+            USRbox["profile · memory · session · settings · skill<br/>recipe · prompt_template · prompt_extra · schedule<br/>onboarding · sensor · camera · draft · face"]
+        end
+        subgraph MOD["pond-core::models"]
+            MODbox["model_record · model_role · capabilities · message<br/>provider · inference · inference_pool · embedding<br/>voice_input · voice_output · wake_word<br/>catalog · storage · downloader · scheduler · repository"]
+        end
+        subgraph MCP["pond-core::mcp"]
+            MCPbox["extension_manager · marketplace · mcp_server<br/>mcp_knowledge (was mcp_memory)<br/>tools::{registry · dispatcher · caller · cache · agent · external · result}<br/>notification"]
+        end
+    end
+
+    USR -.reads/writes via ports.-> MOD
+    USR -.exposed as resources via.-> MCP
+    MOD -.invoked from.-> MCP
+    SEC -.gates all of.-> USR
+    SEC -.gates all of.-> MOD
+    SEC -.gates all of.-> MCP
+```
+
+The arrows are conceptual, not new dependencies — they describe how a request
+flows through the core. `shared/` (agent, chat loop, stdin/print IO) is used by
+all quadrants and lives outside them.
+
+| Quadrant | Holds |
+| :--- | :--- |
+| `user_data` | Facts about / owned by the household: profile, memory, sessions, settings, skills, recipes, prompts, schedules, sensors, drafts, faces |
+| `models` | Anything that runs or routes inference: LLM providers, the model catalog, inference pool, ASR/TTS, embeddings, context budgeting |
+| `mcp` | The tool surface: MCP servers, tool registry/dispatcher/caller/cache, extensions, marketplace, knowledge store |
+| `security` | Secrets, handshake/auth, audit/telemetry, consent — the enclosing boundary |
+| `shared` | Agent-loop plumbing used by every quadrant (agent types, chat loop, IO) |
+
+---
+
 ## 3. The Three Layers
 
 ### A. The Core (`pond-core`)
@@ -102,27 +146,28 @@ The shared language between the Backend and the Frontend.
 ╔═══════════════════════════════════▼════════════════════════════════════════════╗
 ║                     pond-core  ← THE BRAIN (no framework deps)               ║
 ║                                                                               ║
+║  Four quadrants around the user, each with domain/ ports/ services/ mocks/   ║
 ║  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐   ║
-║  │         domain/             │  │          ports/  (trait defs)        │   ║
-║  │  AgentRequest               │  │  Agent · LlmProvider · SessionStorage│   ║
-║  │  ChatMessage                │  │  VoiceInput · VoiceOutput            │   ║
-║  │  ModelRecord / BinaryRecord │  │  WakeWordDetector · Onboarding       │   ║
-║  │  Settings                   │  │  DeviceRegistry · SchedulerPort      │   ║
-║  │  WorkflowState              │  │  ModelCatalogProvider (no url arg)   │   ║
-║  │  PromptTemplate/Extra       │  │  PromptTemplateRepository            │   ║
-║  │  UserSkill                  │  │  PromptExtraRepository               │   ║
-║  │  AgentRecipe                │  │  UserSkillRepository                 │   ║
-║  │  MemoryFragment             │  │  AgentRecipeRepository               │   ║
-║  └─────────────────────────────┘  │  MemoryRepository                   │   ║
-║                                   │  SettingsRepository                  │   ║
-║  ┌─────────────────────────────┐  │  HandshakePort · NotificationSender  │   ║
-║  │       services/             │  │  McpMemoryPort · ExtensionManagerPort│   ║
-║  │  ChatService (run_loop)     │  └──────────────────────────────────────┘   ║
-║  │  ModelService               │                                             ║
-║  │  ContextCompactor           │   Wait → Listen → Thinking → Speak         ║
-║  │  OnboardingService          │   state machine in ChatService::run_loop()  ║
-║  │  Mocks (for testing)        │                                             ║
-║  └─────────────────────────────┘                                             ║
+║  │  user_data/   (the centre)  │  │  models/                             │   ║
+║  │  profile · memory · session │  │  message · model_record · capabilities│  ║
+║  │  settings · skill · recipe  │  │  provider · inference · inference_pool│  ║
+║  │  prompt_template/extra      │  │  embedding · voice_input/output      │   ║
+║  │  schedule · onboarding      │  │  wake_word · catalog · downloader    │   ║
+║  │  sensor · camera · draft    │  │  prompt_builder · context_budget     │   ║
+║  │  face                       │  │  history_manager · thought_filter    │   ║
+║  └─────────────────────────────┘  └──────────────────────────────────────┘   ║
+║  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐   ║
+║  │  mcp/                       │  │  security/   (enclosing boundary)    │   ║
+║  │  extension_manager          │  │  secret · handshake                  │   ║
+║  │  marketplace · mcp_server   │  │  telemetry · event_log · policy      │   ║
+║  │  mcp_knowledge              │  │  turn_metrics · oauth_provider       │   ║
+║  │  tools::{registry·dispatcher│  └──────────────────────────────────────┘   ║
+║  │   ·caller·cache·agent}      │  ┌──────────────────────────────────────┐   ║
+║  │  notification               │  │  shared/  (agent-loop plumbing)      │   ║
+║  └─────────────────────────────┘  │  agent · chat (run_loop)             │   ║
+║                                   │  stdin_input · print_output          │   ║
+║  Wait → Listen → Thinking → Speak │                                      │   ║
+║  state machine in ChatService     └──────────────────────────────────────┘   ║
 ╚══════════════╤══════════════════════════════════════════════════════════════════╝
                │  implements Arc<dyn Port>
 ┌──────────────┴───────────────────────────────────────────────────────────────┐

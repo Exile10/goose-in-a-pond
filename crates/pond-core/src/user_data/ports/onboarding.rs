@@ -1,7 +1,7 @@
 //! Port definition for onboarding persistence.
 //! This trait defines how onboarding state is stored and retrieved.
 
-use crate::domain::onboarding::OnboardingStep;
+use crate::user_data::domain::onboarding::OnboardingStep;
 use std::sync::Arc;
 
 #[async_trait::async_trait]

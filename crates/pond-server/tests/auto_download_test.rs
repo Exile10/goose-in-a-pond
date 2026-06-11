@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use pond_core::domain::model_record::{ModelCategory, ModelRecord};
-use pond_core::ports::model_repository::ModelRepository;
-use pond_core::services::mock_model_downloader::MockModelDownloader;
-use pond_core::services::mock_model_storage::MockModelStorage;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+use pond_core::models::mocks::mock_model_downloader::MockModelDownloader;
+use pond_core::models::mocks::mock_model_storage::MockModelStorage;
+use pond_core::models::ports::model_repository::ModelRepository;
 use pond_infra::db::Database;
 use pond_infra::sqlite_model_repository::SqliteModelRepository;
 use pond_server::startup::auto_download_assigned_models;
@@ -92,7 +92,8 @@ async fn assigned_model_not_on_disk_triggers_download() {
     let downloader = Arc::new(MockModelDownloader::new(true)); // write placeholder
 
     let triggered = auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )
@@ -130,7 +131,8 @@ async fn model_already_on_disk_skips_download() {
     let downloader = Arc::new(MockModelDownloader::new(false));
 
     let triggered = auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )
@@ -162,7 +164,8 @@ async fn db_drift_fixed_when_file_present_but_flag_false() {
     let downloader = Arc::new(MockModelDownloader::new(false));
 
     auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )
@@ -218,7 +221,8 @@ async fn ollama_model_skips_local_download() {
     let downloader = Arc::new(MockModelDownloader::new(false));
 
     let triggered = auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )
@@ -259,7 +263,8 @@ async fn multiple_roles_partial_download() {
     let downloader = Arc::new(MockModelDownloader::new(true)); // write placeholders
 
     let triggered = auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )
@@ -306,7 +311,8 @@ async fn model_with_no_url_is_skipped_gracefully() {
     let downloader = Arc::new(MockModelDownloader::new(false));
 
     let triggered = auto_download_assigned_models(
-        repo.clone() as Arc<dyn pond_core::ports::model_repository::ModelRepository + Send + Sync>,
+        repo.clone()
+            as Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
         storage,
         downloader.clone(),
     )

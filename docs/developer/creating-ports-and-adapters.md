@@ -4,13 +4,19 @@ This guide documents how to create a new port (trait) in `pond-core` and its
 corresponding adapter in `pond-adapters-goose`. Follow these steps to keep the
 hexagonal architecture consistent.
 
+`pond-core` is organized into four quadrants plus `shared/`. Before you start,
+pick the `<quadrant>` your capability belongs to and substitute it in the paths
+below: `user_data` (household facts), `models` (inference/routing), `mcp` (tool
+surface and extensions), `security` (secrets/auth/audit), or `shared`
+(agent-loop plumbing used by all).
+
 ---
 
 ## 1. Define Domain Types
 
-Create the types that your port needs in `pond-core/src/domain/`.
+Create the types that your port needs in `pond-core/src/<quadrant>/domain/`.
 
-**File:** `crates/pond-core/src/domain/<your_types>.rs`
+**File:** `crates/pond-core/src/<quadrant>/domain/<your_types>.rs`
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -24,7 +30,7 @@ pub struct YourDomainType {
 Then register the module:
 
 ```rust
-// crates/pond-core/src/domain/mod.rs
+// crates/pond-core/src/<quadrant>/domain/mod.rs
 pub mod your_types;
 ```
 
@@ -35,14 +41,14 @@ pub mod your_types;
 
 ## 2. Define the Port Trait
 
-Create the trait in `pond-core/src/ports/`.
+Create the trait in `pond-core/src/<quadrant>/ports/`.
 
-**File:** `crates/pond-core/src/ports/<your_port>.rs`
+**File:** `crates/pond-core/src/<quadrant>/ports/<your_port>.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::your_types::YourDomainType;
+use crate::<quadrant>::domain::your_types::YourDomainType;
 
 /// Driven Port: <PortName>
 ///
@@ -57,7 +63,7 @@ pub trait YourPort: Send + Sync {
 Register:
 
 ```rust
-// crates/pond-core/src/ports/mod.rs
+// crates/pond-core/src/<quadrant>/ports/mod.rs
 pub mod your_port;
 ```
 
@@ -65,15 +71,15 @@ pub mod your_port;
 
 ## 3. Create a Mock Implementation
 
-Create a mock for testing in `pond-core/src/services/`.
+Create a mock for testing in `pond-core/src/<quadrant>/mocks/`.
 
-**File:** `crates/pond-core/src/services/mock_<name>.rs`
+**File:** `crates/pond-core/src/<quadrant>/mocks/mock_<name>.rs`
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::your_types::YourDomainType;
-use crate::ports::your_port::YourPort;
+use crate::<quadrant>::domain::your_types::YourDomainType;
+use crate::<quadrant>::ports::your_port::YourPort;
 
 pub struct MockYourPort;
 
@@ -105,7 +111,7 @@ mod tests {
 Register:
 
 ```rust
-// crates/pond-core/src/services/mod.rs
+// crates/pond-core/src/<quadrant>/mocks/mod.rs
 pub mod mock_your_port;
 ```
 
@@ -126,8 +132,8 @@ Adapters live in the crate that matches their dependency:
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::domain::your_types::YourDomainType;
-use pond_core::ports::your_port::YourPort;
+use pond_core::<quadrant>::domain::your_types::YourDomainType;
+use pond_core::<quadrant>::ports::your_port::YourPort;
 use std::sync::Arc;
 
 use goose::some_module::GooseThing;

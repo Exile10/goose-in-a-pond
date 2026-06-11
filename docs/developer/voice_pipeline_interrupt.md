@@ -30,7 +30,7 @@ tokio::select! races:
 
 ## VoiceOutput: Interruptible Playback
 
-**File:** `crates/pond-core/src/ports/voice_output.rs`
+**File:** `crates/pond-core/src/models/ports/voice_output.rs`
 
 ```rust
 pub trait VoiceOutput: Send + Sync {
@@ -68,7 +68,7 @@ synth(sentence1) -> play(sentence1) + synth(sentence2) -> play(sentence2) + synt
 
 ## ChatService: Wake Word Racing
 
-**File:** `crates/pond-core/src/services/chat.rs`
+**File:** `crates/pond-core/src/shared/services/chat.rs`
 
 In `run_loop()`, the agent response races against the wake word detector:
 

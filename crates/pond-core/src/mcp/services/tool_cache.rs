@@ -4,8 +4,8 @@
 //! based on `last_accessed` timestamps. Suitable for pond-core since
 //! it uses only `std` types (no external crate dependencies).
 
-use crate::domain::tool_cache::{make_cache_key, CachedToolResult, DEFAULT_CACHE_CAPACITY};
-use crate::ports::tool_cache::ToolCache;
+use crate::mcp::domain::tool_cache::{make_cache_key, CachedToolResult, DEFAULT_CACHE_CAPACITY};
+use crate::mcp::ports::tools::tool_cache::ToolCache;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

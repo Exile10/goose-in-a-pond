@@ -12,12 +12,12 @@ use crate::ollama_wire::{
     OllamaStreamChunk, OllamaTool,
 };
 use anyhow::{anyhow, Result};
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::domain::model_capabilities::ModelCapabilities;
-use pond_core::ports::inference::{
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::domain::model_capabilities::ModelCapabilities;
+use pond_core::models::ports::inference::{
     ChatEvent, ChatEventStream, InferenceOptions, InferenceProvider, ToolDefinition,
 };
-use pond_core::ports::provider::UsageStats;
+use pond_core::models::ports::provider::UsageStats;
 use tracing;
 
 /// Ollama-based inference provider with NDJSON streaming and tool support.

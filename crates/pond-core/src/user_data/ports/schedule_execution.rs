@@ -3,7 +3,7 @@
 //! The scheduler adapter calls this on each cron fire.  Implementations
 //! dispatch to the LLM agent (`AgentPrompt`) or an HTTP webhook (`Webhook`).
 
-use crate::domain::schedule::TaskKind;
+use crate::user_data::domain::schedule::TaskKind;
 use anyhow::Result;
 use async_trait::async_trait;
 

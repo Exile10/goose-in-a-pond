@@ -1,6 +1,6 @@
 //! CameraStorage port — driven port for recording camera / vision events.
 
-use crate::domain::sensor::CameraEvent;
+use crate::user_data::domain::sensor::CameraEvent;
 use anyhow::Result;
 use async_trait::async_trait;
 

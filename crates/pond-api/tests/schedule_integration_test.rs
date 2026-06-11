@@ -13,17 +13,19 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState};
-use pond_core::domain::onboarding::OnboardingStep;
-use pond_core::domain::schedule::{Schedule, ScheduleRun};
-use pond_core::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::ports::schedule_execution::ScheduleExecutor;
-use pond_core::ports::scheduler::{CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest};
-use pond_core::services::mock_agent::MockAgent;
-use pond_core::services::mock_memory::MockMemoryRepository;
-use pond_core::services::mock_profile::MockProfileRepository;
-use pond_core::services::mock_sensor::{MockCameraStorage, MockSensorStorage};
-use pond_core::services::mock_settings::MockSettingsRepository;
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::schedule::{Schedule, ScheduleRun};
+use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
+use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
+use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::onboarding::OnboardingRepository;
+use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
+use pond_core::user_data::ports::scheduler::{
+    CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
+};
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use reqwest::Client as ReqwestClient;
@@ -255,7 +257,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,

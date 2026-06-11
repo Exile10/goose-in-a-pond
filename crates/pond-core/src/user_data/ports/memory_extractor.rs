@@ -3,7 +3,7 @@
 //! Called asynchronously after each chat exchange. The adapter uses the LLM
 //! to classify facts into segments with importance scores.
 
-use crate::domain::memory::{MemorySegment, MemoryTier};
+use crate::user_data::domain::memory::{MemorySegment, MemoryTier};
 use anyhow::Result;
 use async_trait::async_trait;
 

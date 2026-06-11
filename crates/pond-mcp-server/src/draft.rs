@@ -7,8 +7,8 @@
 //! Tool descriptions instruct the LLM to use `save_draft` instead of executing
 //! destructive actions directly.
 
-use pond_core::domain::draft::{Draft, DraftStatus};
-use pond_core::ports::draft::DraftRepository;
+use pond_core::user_data::domain::draft::{Draft, DraftStatus};
+use pond_core::user_data::ports::draft::DraftRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -389,8 +389,8 @@ pub fn spawn_draft_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pond_core::domain::draft::{Draft, DraftStatus};
-    use pond_core::ports::draft::DraftRepository;
+    use pond_core::user_data::domain::draft::{Draft, DraftStatus};
+    use pond_core::user_data::ports::draft::DraftRepository;
     use std::sync::Mutex;
 
     struct StubDraftRepo {

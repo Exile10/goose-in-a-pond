@@ -76,12 +76,21 @@ pond-core  ←  pond-infra / pond-api / pond-adapters-*  ←  pond-server
 
 ## 5. How to Add a New Capability
 
-Follow this exact sequence — skipping steps causes rework:
+Follow this exact sequence — skipping steps causes rework. First pick the
+**quadrant** your capability belongs to:
 
-1. **Domain type** → `crates/pond-core/src/domain/<name>.rs` (pure Rust, no external deps)
-2. **Port trait** → `crates/pond-core/src/ports/<name>.rs` (add `#[async_trait]` and the import manually — the code generator omits it)
-3. **Mock** → `crates/pond-core/src/services/mock_<name>.rs` — write tests against the mock *before* building the real adapter
-4. **Register the port** → `crates/pond-core/src/ports/mod.rs` (`pub mod <name>;`)
+- **`user_data`** — facts about / owned by the household (profile, memory, settings, skills, recipes, prompts, schedules, sensors, drafts, faces).
+- **`models`** — anything that runs or routes inference (LLM/ASR/TTS/embeddings, providers, catalog, context budgeting).
+- **`mcp`** — the tool surface and extensions (MCP servers, tool registry/dispatcher/caller/cache, marketplace, knowledge store).
+- **`security`** — secrets, auth/handshake, audit/telemetry, consent.
+- **`shared`** — agent-loop plumbing used by all of the above (rare; only if it fits no single quadrant).
+
+Then, with `<quadrant>` chosen:
+
+1. **Domain type** → `crates/pond-core/src/<quadrant>/domain/<name>.rs` (pure Rust, no external deps)
+2. **Port trait** → `crates/pond-core/src/<quadrant>/ports/<name>.rs` (add `#[async_trait]` and the import manually — the code generator omits it)
+3. **Mock** → `crates/pond-core/src/<quadrant>/mocks/mock_<name>.rs` (gated `#[cfg(any(test, feature = "test-mocks"))]`) — write tests against the mock *before* building the real adapter
+4. **Register the port** → `crates/pond-core/src/<quadrant>/ports/mod.rs` (`pub mod <name>;`)
 5. **Real adapter** → new crate or existing adapter crate (check if Goose already has it — see `CLAUDE.md` §Goose Built-in Providers)
 6. **Wire** → `crates/pond-server/src/main.rs` via `Arc<dyn Port>`
 7. **Add to `AppState`** if the REST API needs access → `crates/pond-api/src/lib.rs`
@@ -95,7 +104,7 @@ Follow this exact sequence — skipping steps causes rework:
 | I need to find… | Look here |
 |---|---|
 | The current task list | `.ai/scratchpad.md` |
-| Port trait definitions | `crates/pond-core/src/ports/` |
+| Port trait definitions | `crates/pond-core/src/<quadrant>/ports/` (e.g. `models/ports/`, `user_data/ports/`) |
 | Which adapter implements which port | `CLAUDE.md` §Existing Ports table |
 | Where a port is wired up | `crates/pond-server/src/main.rs` |
 | REST route definitions | `crates/pond-api/src/routes.rs` |
@@ -204,7 +213,7 @@ GIAP targets two primary edge platforms:
 5. **TTS**: Piper with `en_US-lessac-medium.onnx` (~60 MB) is the baseline. Do not add TTS that requires a running GPU server unless wrapped in `Option<>` in `AppState`.
 6. **Never require a GPU for the core serve path.** GPU acceleration is additive (Jetson CUDA feature flag), not mandatory.
 
-**The three-role LLM pipeline** (`ModelRole` in `pond-core/src/domain/model_role.rs`):
+**The three-role LLM pipeline** (`ModelRole` in `pond-core/src/models/domain/model_role.rs`):
 
 | Role | Purpose | Constrained-device guidance |
 |---|---|---|

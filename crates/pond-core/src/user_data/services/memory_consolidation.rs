@@ -9,9 +9,11 @@
 //!   and force the merged segment to `Correction`
 //! - Every lifecycle change is logged as a `MemoryEvent` for auditability
 
-use crate::domain::memory::{MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment};
-use crate::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
-use crate::ports::memory_repository::MemoryRepository;
+use crate::user_data::domain::memory::{
+    MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
+};
+use crate::user_data::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
+use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use std::collections::HashMap;
 

@@ -75,34 +75,34 @@ pub trait LlamafileManager: Send + Sync {
 }
 
 use axum::{middleware::Next, Router};
-use pond_core::ports::agent::Agent;
-use pond_core::ports::camera_storage::CameraStorage;
-use pond_core::ports::device_registry::DeviceRegistry;
-use pond_core::ports::embedding::EmbeddingProvider;
-use pond_core::ports::extension_manager::ExtensionManagerPort;
-use pond_core::ports::extension_marketplace::ExtensionMarketplace;
-use pond_core::ports::face_recognition::FaceRecognition;
-use pond_core::ports::handshake::Handshake;
-use pond_core::ports::mcp_knowledge::McpKnowledgePort;
-use pond_core::ports::mcp_server::McpServerRepository;
-use pond_core::ports::memory_repository::MemoryRepository;
-use pond_core::ports::model_catalog_provider::ModelCatalogProvider;
-use pond_core::ports::model_repository::ModelRepository;
-use pond_core::ports::model_scheduler::ModelScheduler;
-use pond_core::ports::onboarding::OnboardingRepository;
-use pond_core::ports::policy::SecurityPolicy;
-use pond_core::ports::profile::ProfileRepository;
-use pond_core::ports::prompt_extra::PromptExtraRepository;
-use pond_core::ports::prompt_template::PromptTemplateRepository;
-use pond_core::ports::provider::LlmProvider;
-use pond_core::ports::recipe::AgentRecipeRepository;
-use pond_core::ports::scheduler::SchedulerPort;
-use pond_core::ports::sensor_storage::SensorStorage;
-use pond_core::ports::session_storage::SessionStorage;
-use pond_core::ports::settings::SettingsRepository;
-use pond_core::ports::skill::UserSkillRepository;
-use pond_core::ports::telemetry::TelemetryPort;
-use pond_core::ports::voice_output::VoiceOutput;
+use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
+use pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace;
+use pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort;
+use pond_core::mcp::ports::mcp_server::McpServerRepository;
+use pond_core::models::ports::agent::Agent;
+use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::models::ports::model_catalog_provider::ModelCatalogProvider;
+use pond_core::models::ports::model_repository::ModelRepository;
+use pond_core::models::ports::model_scheduler::ModelScheduler;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::models::ports::voice_output::VoiceOutput;
+use pond_core::security::ports::handshake::Handshake;
+use pond_core::security::ports::policy::SecurityPolicy;
+use pond_core::security::ports::telemetry::TelemetryPort;
+use pond_core::user_data::ports::camera_storage::CameraStorage;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::face_recognition::FaceRecognition;
+use pond_core::user_data::ports::memory_repository::MemoryRepository;
+use pond_core::user_data::ports::onboarding::OnboardingRepository;
+use pond_core::user_data::ports::profile::ProfileRepository;
+use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
+use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
+use pond_core::user_data::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::ports::scheduler::SchedulerPort;
+use pond_core::user_data::ports::sensor_storage::SensorStorage;
+use pond_core::user_data::ports::session_storage::SessionStorage;
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::skill::UserSkillRepository;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -183,11 +183,13 @@ pub struct AppState {
     pub mcp_server_repo: Option<Arc<dyn McpServerRepository>>,
     /// Dynamic tool registry — unified view of all built-in + extension tools.
     /// Used by route handlers to sync the registry when extensions are added/removed.
-    pub tool_registry: Option<Arc<dyn pond_core::ports::tool_registry::ToolRegistryPort>>,
+    pub tool_registry:
+        Option<Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>>,
     /// Extension marketplace — curated registry of installable MCP extensions.
     pub marketplace: Option<Arc<dyn ExtensionMarketplace>>,
     /// Secure secret storage for extension API keys and OAuth tokens.
-    pub secret_repo: Option<Arc<dyn pond_core::ports::secret::SecretRepository + Send + Sync>>,
+    pub secret_repo:
+        Option<Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>>,
 
     /// Tracks in-progress model downloads so the UI can show progress bars.
     pub download_tracker:
@@ -222,7 +224,7 @@ pub struct AppState {
     /// Read/write access to the `event_log` table in `pond_logs.db`.
     /// Used by the `/api/v1/logs` endpoint.
     /// `None` in tests.
-    pub event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>>,
+    pub event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>>,
     /// Biometric face recognition service (register + identify household
     /// members from camera frames).  `None` when no ONNX embedding model
     /// is configured — all face endpoints then return 503.
@@ -241,13 +243,14 @@ pub struct AppState {
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
     /// Answer Reviewer — adversarial post-inference review that evaluates
     /// answer quality and triggers revision when below threshold.
-    pub answer_reviewer: Option<Arc<dyn pond_core::ports::answer_reviewer::AnswerReviewer>>,
+    pub answer_reviewer: Option<Arc<dyn pond_core::models::ports::answer_reviewer::AnswerReviewer>>,
     /// Memory Extractor — extracts durable facts from conversation turns.
     /// `None` when `memory_extraction_enabled` is false.
-    pub memory_extractor: Option<Arc<dyn pond_core::ports::memory_extractor::MemoryExtractor>>,
+    pub memory_extractor:
+        Option<Arc<dyn pond_core::user_data::ports::memory_extractor::MemoryExtractor>>,
     /// Shared extraction service instance (rate limiter + dedup state).
     pub memory_extraction_service:
-        Option<Arc<pond_core::services::memory_extraction::MemoryExtractionService>>,
+        Option<Arc<pond_core::user_data::services::memory_extraction::MemoryExtractionService>>,
     /// Timestamp of the last user request — used by the inactivity-based
     /// consolidation scheduler. Updated on every chat/API call.
     pub last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
@@ -255,8 +258,9 @@ pub struct AppState {
     /// arrives, this token is cancelled to stop consolidation immediately.
     pub consolidation_cancel: Arc<tokio::sync::RwLock<Option<tokio_util::sync::CancellationToken>>>,
     /// Broadcast channel for consolidation events (streamed to SSE for the UI modal).
-    pub consolidation_event_tx:
-        tokio::sync::broadcast::Sender<pond_core::ports::memory_consolidator::ConsolidationEvent>,
+    pub consolidation_event_tx: tokio::sync::broadcast::Sender<
+        pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
+    >,
     /// Injected by `pond-server` — spawns the three-stage adversarial
     /// consolidation pipeline.  `pond-api` never imports the consolidator
     /// directly; the closure captures everything it needs.
@@ -265,15 +269,15 @@ pub struct AppState {
     /// Inference pool — concurrent LLM task submission with provider-aware
     /// semaphore (3 for HTTP providers, 1 for GGUF). Used for parallel
     /// post-processing (review + extraction can run concurrently on HTTP providers).
-    pub inference_pool: Option<Arc<dyn pond_core::ports::inference_pool::InferencePool>>,
+    pub inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>>,
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
     pub schedule_result_tx:
-        tokio::sync::broadcast::Sender<pond_core::domain::schedule::ScheduleResultEvent>,
+        tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
     /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
     pub telemetry: Option<Arc<dyn TelemetryPort>>,
     /// Context growth monitor — tracks context window fill rate per session
     /// and emits warnings before the "context cliff" where quality degrades.
-    pub context_monitor: Arc<pond_core::services::context_monitor::ContextMonitor>,
+    pub context_monitor: Arc<pond_core::models::services::context_monitor::ContextMonitor>,
     /// Static registry of MCP App resources: maps `ui://` URIs to embedded HTML
     /// content. Populated at startup from `pond_mcp_server::all_app_resources()`.
     /// Used by `GET /api/v1/mcp/resources?uri=...` to serve MCP App HTML.

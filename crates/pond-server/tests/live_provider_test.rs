@@ -30,8 +30,8 @@
 //! - GGUF: `gemma-4-E2B-it-Q4_K_M.gguf` (at `$DATA_DIR/models/gguf/`)
 
 use futures::StreamExt;
-use pond_core::domain::message::ChatMessage;
-use pond_core::ports::provider::{LlmProvider, StreamToken};
+use pond_core::models::domain::message::ChatMessage;
+use pond_core::models::ports::provider::{LlmProvider, StreamToken};
 
 // ── Environment helpers ────────────────────────────────────────────────────────
 

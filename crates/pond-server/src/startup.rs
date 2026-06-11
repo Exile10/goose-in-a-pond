@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use pond_core::domain::model_record::ModelCategory;
-use pond_core::ports::model_downloader::ModelDownloader;
-use pond_core::ports::model_repository::ModelRepository;
-use pond_core::ports::model_storage::ModelStorage;
+use pond_core::models::domain::model_record::ModelCategory;
+use pond_core::models::ports::model_downloader::ModelDownloader;
+use pond_core::models::ports::model_repository::ModelRepository;
+use pond_core::models::ports::model_storage::ModelStorage;
 
 /// Background task: download any role-assigned model whose file is missing from disk.
 ///

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::domain::model_record::{BinaryRecord, ModelRecord};
-use crate::ports::model_catalog_provider::ModelCatalogProvider;
+use crate::models::domain::model_record::{BinaryRecord, ModelRecord};
+use crate::models::ports::model_catalog_provider::ModelCatalogProvider;
 
 /// Returns a fixed set of models and binaries, or always fails.
 pub struct MockModelCatalogProvider {

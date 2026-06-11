@@ -107,7 +107,7 @@ event_log / sensor_readings → grow forever (no TTL, no pruning)
 
 **Problem**: `chat_once()` calls `get_messages()` (unbounded) on every exchange. After 20–30 turns the 8K context overflows silently.
 
-**New file**: `crates/pond-core/src/services/context_budget.rs`
+**New file**: `crates/pond-core/src/models/services/context_budget.rs`
 
 ```rust
 pub const MAX_CONTEXT_CHARS: usize = 12_000;      // ~3K tokens @ 4 chars/token
@@ -118,7 +118,7 @@ pub const USABLE_HISTORY_CHARS: usize = MAX_CONTEXT_CHARS - RESERVE_FOR_RESPONSE
 pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage>
 ```
 
-**New port method** in `pond-core/src/ports/session_storage.rs`:
+**New port method** in `pond-core/src/user_data/ports/session_storage.rs`:
 
 ```rust
 /// Fetch the most recent `limit` messages in chronological order.
@@ -145,12 +145,12 @@ let messages = context_budget::trim_to_budget(stored.into_iter().map(|sm| sm.mes
 ```
 
 **Files to create/modify**:
-- Create `crates/pond-core/src/services/context_budget.rs`
-- Modify `crates/pond-core/src/ports/session_storage.rs` — add method
-- Modify `crates/pond-core/src/services/mock_session.rs` — implement method
+- Create `crates/pond-core/src/models/services/context_budget.rs`
+- Modify `crates/pond-core/src/user_data/ports/session_storage.rs` — add method
+- Modify `crates/pond-core/src/user_data/mocks/mock_session.rs` — implement method
 - Modify `crates/pond-infra/src/sqlite_session_storage.rs` — implement method
-- Modify `crates/pond-core/src/services/chat.rs` — replace call site
-- Modify `crates/pond-core/src/services/mod.rs` — expose `pub mod context_budget`
+- Modify `crates/pond-core/src/shared/services/chat.rs` — replace call site
+- Modify `crates/pond-core/src/<quadrant>/services/mod.rs` — expose `pub mod context_budget`
 
 **Verification**:
 ```bash
@@ -266,8 +266,8 @@ Test: insert 5 rows with `datetime('now', '-31 days')` → run `prune_once()` �
 
 **Add to** `AppState` in `crates/pond-api/src/lib.rs`:
 ```rust
-pub agent: Arc<dyn pond_core::ports::agent::Agent>,
-pub llm_provider: Option<Arc<dyn pond_core::ports::provider::LlmProvider>>,
+pub agent: Arc<dyn pond_core::models::ports::agent::Agent>,
+pub llm_provider: Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>,
 ```
 
 **Replace echo** in `crates/pond-api/src/routes.rs`, `chat()` handler:
@@ -307,7 +307,7 @@ cargo test -p pond-api
 
 ### P5 — Pipeline Transport Channel (Deferred)
 
-Add `PipelineInput` enum in `crates/pond-core/src/domain/pipeline.rs`:
+Add `PipelineInput` enum in `crates/pond-core/src/<quadrant>/domain/pipeline.rs`:
 ```rust
 pub enum PipelineInput {
     Voice { text: String, session_id: String },
@@ -323,7 +323,7 @@ Add `mpsc::channel::<PipelineInput>(8)` to `ChatService`. Wire voice loop and RE
 
 ### P6 — Sensor/Camera Ports (Deferred)
 
-New port files in `pond-core/src/ports/`:
+New port files in `pond-core/src/<quadrant>/ports/`:
 - `sensor_storage.rs`: `add_reading()`, `get_readings(since)`
 - `vision_events.rs`: `add_event()`
 
@@ -387,20 +387,20 @@ Add `complete_stream()` to `LlmProvider` returning `impl Stream<Item=Result<Stri
 
 | File | Purpose |
 |------|---------|
-| `crates/pond-core/src/services/context_budget.rs` | Token budget constants + `trim_to_budget()` |
+| `crates/pond-core/src/models/services/context_budget.rs` | Token budget constants + `trim_to_budget()` |
 | `crates/pond-infra/src/pruning.rs` | TTL pruning background task |
 | `crates/pond-infra/migrations/logs/0002_sensor_readings.sql` | sensor_readings table + indexes |
 | `crates/pond-infra/migrations/logs/0003_camera_events.sql` | camera_events table + indexes |
-| `crates/pond-core/src/domain/pipeline.rs` | `PipelineInput` enum (P5, deferred) |
+| `crates/pond-core/src/<quadrant>/domain/pipeline.rs` | `PipelineInput` enum (P5, deferred) |
 
 ## Files to Modify
 
 | File | Change |
 |------|--------|
-| `crates/pond-core/src/ports/session_storage.rs` | Add `get_recent_messages()` method |
-| `crates/pond-core/src/services/mock_session.rs` | Implement `get_recent_messages()` |
-| `crates/pond-core/src/services/chat.rs` | Replace `get_messages()` with budget-aware load |
-| `crates/pond-core/src/services/mod.rs` | Expose `context_budget` module |
+| `crates/pond-core/src/user_data/ports/session_storage.rs` | Add `get_recent_messages()` method |
+| `crates/pond-core/src/user_data/mocks/mock_session.rs` | Implement `get_recent_messages()` |
+| `crates/pond-core/src/shared/services/chat.rs` | Replace `get_messages()` with budget-aware load |
+| `crates/pond-core/src/<quadrant>/services/mod.rs` | Expose `context_budget` module |
 | `crates/pond-infra/src/sqlite_session_storage.rs` | Implement `get_recent_messages()` (DESC LIMIT then reverse) |
 | `crates/pond-infra/src/lib.rs` | Expose `pruning` module |
 | `crates/pond-adapters-llamafile/src/lib.rs` | Add `max_tokens`, `temperature` builder fields |
@@ -552,7 +552,7 @@ Index: `idx_biometric_audit_created_at` on `(created_at)` — prune after 30 day
 ### Port Plan
 
 ```
-pond-core/src/ports/
+pond-core/src/<quadrant>/ports/
   speaker_id.rs      register_speaker(user_id, audio) → SpeakerEmbedding
                      identify_speaker(audio) → Option<(user_id, confidence)>
 

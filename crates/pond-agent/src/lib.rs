@@ -1,6 +1,6 @@
 //! pond-agent — GIAP's custom agent loop with sustained tool calling.
 //!
-//! Implements the [`Agent`](pond_core::ports::agent::Agent) port with an
+//! Implements the [`Agent`](pond_core::models::ports::agent::Agent) port with an
 //! Ollama-native inference provider and a multi-turn tool-calling loop.
 //! Replaces Goose's `GooseAdapter` with a purpose-built agent that:
 //!

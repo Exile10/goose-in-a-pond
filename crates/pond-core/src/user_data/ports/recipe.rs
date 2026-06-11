@@ -1,4 +1,4 @@
-use crate::domain::recipe::AgentRecipe;
+use crate::user_data::domain::recipe::AgentRecipe;
 use anyhow::Result;
 use async_trait::async_trait;
 

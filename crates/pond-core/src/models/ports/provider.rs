@@ -4,8 +4,8 @@ use futures::Stream;
 use std::pin::Pin;
 use thiserror::Error;
 
-pub use crate::domain::message::ChatMessage;
-use crate::domain::model_capabilities::ModelCapabilities;
+pub use crate::models::domain::message::ChatMessage;
+use crate::models::domain::model_capabilities::ModelCapabilities;
 
 #[derive(Error, Debug)]
 pub enum ProviderError {

@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use pond_core::ports::model_scheduler::{MemoryStatus, ModelScheduler};
+use pond_core::models::ports::model_scheduler::{MemoryStatus, ModelScheduler};
 
 // ── Jetson / Linux memory constants ──────────────────────────────────────────
 

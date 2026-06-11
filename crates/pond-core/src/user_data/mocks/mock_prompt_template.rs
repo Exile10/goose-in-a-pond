@@ -1,7 +1,7 @@
 //! In-memory mock implementation of `PromptTemplateRepository`.
 
-use crate::domain::prompt_template::PromptTemplate;
-use crate::ports::prompt_template::PromptTemplateRepository;
+use crate::user_data::domain::prompt_template::PromptTemplate;
+use crate::user_data::ports::prompt_template::PromptTemplateRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;

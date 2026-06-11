@@ -4,7 +4,7 @@
 //! `get_stock_quote` (Finnhub), `get_crypto_price` (CoinGecko).
 //! Depends on a `reqwest::Client` for HTTP fetches and `SettingsRepository` for API keys.
 
-use pond_core::ports::settings::SettingsRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{

@@ -1,6 +1,6 @@
 //! Port for persisting and managing drafts (staged destructive actions).
 
-use crate::domain::draft::{Draft, DraftStatus};
+use crate::user_data::domain::draft::{Draft, DraftStatus};
 use anyhow::Result;
 use async_trait::async_trait;
 

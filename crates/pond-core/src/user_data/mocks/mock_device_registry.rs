@@ -1,6 +1,6 @@
 //! No-op mock implementation of `DeviceRegistry` for use in tests and convenience factories.
 
-use crate::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use crate::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use anyhow::Result;
 use async_trait::async_trait;
 

@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::ports::handshake::{Handshake, HandshakeRequest, HandshakeResponse};
+use pond_core::security::ports::handshake::{Handshake, HandshakeRequest, HandshakeResponse};
 
 /// GOTG-specific handshake adapter.
 ///

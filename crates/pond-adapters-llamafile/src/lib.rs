@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::ports::provider::{LlmProvider, StreamToken, TokenStream, UsageStats};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 

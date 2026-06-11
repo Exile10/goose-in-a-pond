@@ -21,12 +21,12 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use pond_core::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
+use pond_core::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "legacy-subprocess")]
-use pond_core::ports::voice_input::VoiceInput;
+use pond_core::models::ports::voice_input::VoiceInput;
 
 mod in_process;
 pub use in_process::WhisperRsInput;
@@ -1181,7 +1181,7 @@ mod tests {
     #[cfg(feature = "legacy-subprocess")]
     #[test]
     fn whisper_input_default_prompt() {
-        use pond_core::ports::voice_input::VoiceInput;
+        use pond_core::models::ports::voice_input::VoiceInput;
         assert_eq!(WhisperInput::new(None).prompt(), "🎤 ");
     }
 

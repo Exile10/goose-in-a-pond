@@ -4,7 +4,7 @@
 //! summarise overnight sensor readings").  The adapter lives in
 //! `pond-infra-scheduler` (workspace-included, no Goose dep).
 
-use crate::domain::schedule::{Schedule, ScheduleRun, TaskKind};
+use crate::user_data::domain::schedule::{Schedule, ScheduleRun, TaskKind};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ pub trait SchedulerPort: Send + Sync {
     /// Called once during startup to break the circular init dependency.
     async fn set_executor(
         &self,
-        executor: Arc<dyn crate::ports::schedule_execution::ScheduleExecutor>,
+        executor: Arc<dyn crate::user_data::ports::schedule_execution::ScheduleExecutor>,
     ) -> Result<()>;
 }
 

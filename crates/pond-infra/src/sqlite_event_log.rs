@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{Pool, Row, Sqlite};
 
-use pond_core::ports::event_log::{EventLogRepository, LogEntry};
+use pond_core::security::ports::event_log::{EventLogRepository, LogEntry};
 
 pub struct SqliteEventLogRepository {
     pool: Pool<Sqlite>,

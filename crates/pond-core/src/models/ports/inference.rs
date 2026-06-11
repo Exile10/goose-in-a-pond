@@ -4,9 +4,9 @@
 //! simple completions (memory extraction, answer review). This port adds
 //! native tool-calling support for the agent loop.
 
-use crate::domain::message::ChatMessage;
-use crate::domain::model_capabilities::ModelCapabilities;
-use crate::ports::provider::UsageStats;
+use crate::models::domain::message::ChatMessage;
+use crate::models::domain::model_capabilities::ModelCapabilities;
+use crate::models::ports::provider::UsageStats;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;

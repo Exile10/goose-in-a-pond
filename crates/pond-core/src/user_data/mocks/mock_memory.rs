@@ -1,8 +1,8 @@
 //! In-memory mock implementations of `EmbeddingProvider` and `MemoryRepository`.
 
-use crate::domain::memory::MemoryFragment;
-use crate::ports::embedding::EmbeddingProvider;
-use crate::ports::memory_repository::MemoryRepository;
+use crate::models::ports::embedding::EmbeddingProvider;
+use crate::user_data::domain::memory::MemoryFragment;
+use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;

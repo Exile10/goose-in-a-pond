@@ -1,7 +1,7 @@
 //! In-memory mock implementation of `UserSkillRepository`.
 
-use crate::domain::skill::UserSkill;
-use crate::ports::skill::UserSkillRepository;
+use crate::user_data::domain::skill::UserSkill;
+use crate::user_data::ports::skill::UserSkillRepository;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;

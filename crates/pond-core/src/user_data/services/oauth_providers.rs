@@ -5,7 +5,7 @@
 //! placeholder until the real GIAP app is registered with each provider;
 //! users can override it via `{PROVIDER_ID}_CLIENT_ID` in the secret store.
 
-use crate::domain::oauth_provider::OAuthProviderConfig;
+use crate::security::domain::oauth_provider::OAuthProviderConfig;
 
 /// Returns the list of OAuth providers that GIAP supports out of the box.
 pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {

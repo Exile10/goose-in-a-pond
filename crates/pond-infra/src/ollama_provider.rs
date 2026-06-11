@@ -4,8 +4,8 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pond_core::domain::message::{ChatMessage, Role};
-use pond_core::ports::provider::LlmProvider;
+use pond_core::models::domain::message::{ChatMessage, Role};
+use pond_core::models::ports::provider::LlmProvider;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 

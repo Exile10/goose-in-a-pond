@@ -32,7 +32,7 @@ Online Registry JSON
 
 ## Domain Types
 
-All types live in `crates/pond-core/src/domain/model_record.rs`.
+All types live in `crates/pond-core/src/models/domain/model_record.rs`.
 
 ### `ModelCategory`
 
@@ -99,7 +99,7 @@ pub struct ModelRoleAssignment {
 
 ## The Five Ports
 
-All ports are defined in `crates/pond-core/src/ports/` and exported from `ports/mod.rs`.
+All ports are defined in `crates/pond-core/src/<quadrant>/ports/` and exported from `ports/mod.rs`.
 
 ### `ModelRepository` — catalog + role assignment persistence
 
@@ -386,7 +386,7 @@ Five roles drive runtime component selection:
 
 ## How to Add a New Model Category
 
-**Step 1 — Domain type.** Add a variant to `ModelCategory` in `crates/pond-core/src/domain/model_record.rs`:
+**Step 1 — Domain type.** Add a variant to `ModelCategory` in `crates/pond-core/src/models/domain/model_record.rs`:
 
 ```rust
 pub enum ModelCategory {
@@ -441,8 +441,8 @@ Use this when Goose has no matching provider (e.g. a completely custom HTTP prot
 ```rust
 // crates/pond-adapters-myprovider/src/lib.rs
 use async_trait::async_trait;
-use pond_core::ports::provider::LlmProvider;
-use pond_core::domain::chat_message::ChatMessage;
+use pond_core::models::ports::provider::LlmProvider;
+use pond_core::models::domain::message::ChatMessage;
 
 pub struct MyProvider { base_url: String }
 
@@ -499,7 +499,7 @@ pub model_scheduler:        Option<Arc<dyn ModelScheduler>>,            // backg
 
 ## Settings Reference
 
-All settings live in `crates/pond-core/src/domain/settings.rs` and are persisted as a flat key-value store in `pond_system.db`. Read/write via `GET /api/v1/settings` and `PUT /api/v1/settings` (or `settings_repo.get()` / `settings_repo.set_key()` in Rust).
+All settings live in `crates/pond-core/src/user_data/domain/settings.rs` and are persisted as a flat key-value store in `pond_system.db`. Read/write via `GET /api/v1/settings` and `PUT /api/v1/settings` (or `settings_repo.get()` / `settings_repo.set_key()` in Rust).
 
 ### Assistant Identity
 

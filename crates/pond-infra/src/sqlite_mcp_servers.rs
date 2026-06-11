@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::ports::mcp_server::{McpServerConfig, McpServerRepository};
+use pond_core::mcp::ports::mcp_server::{McpServerConfig, McpServerRepository};
 use sqlx::{Pool, Row, Sqlite};
 use std::collections::HashMap;
 

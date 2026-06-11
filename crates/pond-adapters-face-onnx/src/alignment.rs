@@ -26,7 +26,7 @@
 //!   right mouth  (70.7299, 92.2041)
 
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
-use pond_core::domain::face_recognition::FaceLandmarks;
+use pond_core::user_data::domain::face_recognition::FaceLandmarks;
 
 /// Canonical 5-point template on a 112×112 output.  Do not edit unless you
 /// are also retraining the embedding model.
