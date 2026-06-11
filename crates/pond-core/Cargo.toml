@@ -5,6 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Expose the in-core mock adapters (normally `#[cfg(test)]`-only) to downstream
+# crates. Downstream test harnesses compile pond-core WITHOUT `cfg(test)`, so
+# they must enable this feature to reach the mocks.
+test-mocks = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-stream = { workspace = true }

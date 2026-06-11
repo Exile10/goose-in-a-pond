@@ -54,7 +54,10 @@ pond-adapters-mcp-memory      = { workspace = true, optional = true }
 pond-adapters-local-inference = { workspace = true, optional = true }
 # Optional: only compiled when --features face-onnx is passed.
 pond-adapters-face-onnx       = { workspace = true, optional = true }
-pond-core              = { workspace = true }
+# `test-mocks` is required at the NORMAL dependency level (not dev-deps) because
+# `main.rs` falls back to `MockAgent` in non-test code paths (the `--agent mock`
+# fallback and the `cfg(not(feature = "goose-agent"))` voice-mode wiring).
+pond-core              = { workspace = true, features = ["test-mocks"] }
 pond-api               = { workspace = true }
 pond-hf-cache          = { workspace = true }
 pond-infra             = { workspace = true }

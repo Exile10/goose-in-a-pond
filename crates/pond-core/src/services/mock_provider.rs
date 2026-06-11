@@ -1,1 +1,1 @@
-pub use crate::models::services::mock_provider::*;
+pub use crate::models::mocks::mock_provider::*;

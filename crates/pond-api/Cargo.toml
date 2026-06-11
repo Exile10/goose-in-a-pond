@@ -46,5 +46,5 @@ tower = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 pond-adapters-llamafile = { workspace = true }
-pond-core = { workspace = true }
+pond-core = { workspace = true, features = ["test-mocks"] }
 uuid = { workspace = true }

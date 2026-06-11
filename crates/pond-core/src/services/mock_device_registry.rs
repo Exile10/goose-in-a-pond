@@ -1,1 +1,1 @@
-pub use crate::user_data::services::mock_device_registry::*;
+pub use crate::user_data::mocks::mock_device_registry::*;

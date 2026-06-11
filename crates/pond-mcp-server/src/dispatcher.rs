@@ -88,9 +88,7 @@ impl<T: ServerHandler + Send + Sync> McpServerBridge for T {
                 .map(|t| {
                     let name = t.name.to_string();
                     let desc = t.description.map(|d| d.to_string()).unwrap_or_default();
-                    let schema = serde_json::Value::Object(
-                        t.input_schema.as_ref().clone()
-                    );
+                    let schema = serde_json::Value::Object(t.input_schema.as_ref().clone());
                     (name, desc, schema)
                 })
                 .collect(),
@@ -175,18 +173,48 @@ impl McpToolDispatcher {
         // Register all servers dynamically. Adding a new MCP server only
         // requires pushing it here — schemas come from list_tools() automatically.
         let mut servers: Vec<RegisteredServer> = vec![
-            RegisteredServer { prefix: PREFIX_WEATHER, server: Box::new(weather_server) },
-            RegisteredServer { prefix: PREFIX_KNOWLEDGE, server: Box::new(knowledge_server) },
-            RegisteredServer { prefix: PREFIX_MEMORY, server: Box::new(memory_server) },
-            RegisteredServer { prefix: PREFIX_SYSTEM, server: Box::new(system_server) },
-            RegisteredServer { prefix: PREFIX_DEVICE, server: Box::new(device_server) },
-            RegisteredServer { prefix: PREFIX_NEWS, server: Box::new(news_server) },
-            RegisteredServer { prefix: PREFIX_FINANCE, server: Box::new(finance_server) },
-            RegisteredServer { prefix: PREFIX_DISCOVERY, server: Box::new(discovery_server) },
-            RegisteredServer { prefix: PREFIX_DRAFT, server: Box::new(draft_server) },
+            RegisteredServer {
+                prefix: PREFIX_WEATHER,
+                server: Box::new(weather_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_KNOWLEDGE,
+                server: Box::new(knowledge_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_MEMORY,
+                server: Box::new(memory_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_SYSTEM,
+                server: Box::new(system_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_DEVICE,
+                server: Box::new(device_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_NEWS,
+                server: Box::new(news_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_FINANCE,
+                server: Box::new(finance_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_DISCOVERY,
+                server: Box::new(discovery_server),
+            },
+            RegisteredServer {
+                prefix: PREFIX_DRAFT,
+                server: Box::new(draft_server),
+            },
         ];
         if let Some(sched) = schedule_server {
-            servers.push(RegisteredServer { prefix: PREFIX_SCHEDULE, server: Box::new(sched) });
+            servers.push(RegisteredServer {
+                prefix: PREFIX_SCHEDULE,
+                server: Box::new(sched),
+            });
         }
 
         Self {
@@ -288,7 +316,10 @@ impl ToolDispatcher for McpToolDispatcher {
                 all_defs.push((full_name, desc, schema));
             }
         }
-        tracing::info!(total = all_defs.len(), "total tool definitions collected from MCP servers");
+        tracing::info!(
+            total = all_defs.len(),
+            "total tool definitions collected from MCP servers"
+        );
         all_defs
     }
 }
@@ -395,8 +426,10 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             },
             "required": ["id"]
         }),
-        "giap-schedule__delete_schedule" | "giap-schedule__pause_schedule"
-        | "giap-schedule__resume_schedule" | "giap-schedule__run_schedule_now" => json!({
+        "giap-schedule__delete_schedule"
+        | "giap-schedule__pause_schedule"
+        | "giap-schedule__resume_schedule"
+        | "giap-schedule__run_schedule_now" => json!({
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "Schedule ID." }
@@ -452,8 +485,10 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             "required": ["path", "content"]
         }),
         // Device
-        "giap-device__list_registered_devices" | "giap-device__get_user_profile"
-        | "giap-device__get_model_assignments" | "giap-device__list_skills" => {
+        "giap-device__list_registered_devices"
+        | "giap-device__get_user_profile"
+        | "giap-device__get_model_assignments"
+        | "giap-device__list_skills" => {
             json!({ "type": "object", "properties": {} })
         }
         "giap-device__get_recipe" => json!({
@@ -644,8 +679,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_mcp_tool_schemas() {
         use crate::{
-            SystemMcpServer, KnowledgeMcpServer, WeatherMcpServer,
-            NewsMcpServer, FinanceMcpServer, DiscoveryMcpServer, DraftMcpServer,
+            DiscoveryMcpServer, DraftMcpServer, FinanceMcpServer, KnowledgeMcpServer,
+            NewsMcpServer, SystemMcpServer, WeatherMcpServer,
         };
 
         // Create peer for RequestContext
@@ -662,20 +697,48 @@ mod tests {
             async fn get(&self) -> anyhow::Result<pond_core::domain::settings::Settings> {
                 Ok(pond_core::domain::settings::Settings::default())
             }
-            async fn update(&self, _: &pond_core::domain::settings::Settings) -> anyhow::Result<()> { Ok(()) }
-            async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> { Ok(None) }
-            async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> { Ok(()) }
+            async fn update(
+                &self,
+                _: &pond_core::domain::settings::Settings,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> {
+                Ok(None)
+            }
+            async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> {
+                Ok(())
+            }
         }
-        let settings: Arc<dyn pond_core::ports::settings::SettingsRepository> = Arc::new(MockSettings);
+        let settings: Arc<dyn pond_core::ports::settings::SettingsRepository> =
+            Arc::new(MockSettings);
 
         // All servers that don't require complex real deps
         let servers: Vec<(&str, Box<dyn McpServerBridge>)> = vec![
-            ("giap-system__", Box::new(SystemMcpServer::new()) as Box<dyn McpServerBridge>),
+            (
+                "giap-system__",
+                Box::new(SystemMcpServer::new()) as Box<dyn McpServerBridge>,
+            ),
             ("giap-weather__", Box::new(WeatherMcpServer::new(None))),
-            ("giap-knowledge__", Box::new(KnowledgeMcpServer::new(http_client.clone()))),
-            ("giap-news__", Box::new(NewsMcpServer::new(http_client.clone(), settings.clone()))),
-            ("giap-finance__", Box::new(FinanceMcpServer::new(http_client.clone(), settings.clone()))),
-            ("giap-discovery__", Box::new(DiscoveryMcpServer::new(http_client.clone(), settings.clone()))),
+            (
+                "giap-knowledge__",
+                Box::new(KnowledgeMcpServer::new(http_client.clone())),
+            ),
+            (
+                "giap-news__",
+                Box::new(NewsMcpServer::new(http_client.clone(), settings.clone())),
+            ),
+            (
+                "giap-finance__",
+                Box::new(FinanceMcpServer::new(http_client.clone(), settings.clone())),
+            ),
+            (
+                "giap-discovery__",
+                Box::new(DiscoveryMcpServer::new(
+                    http_client.clone(),
+                    settings.clone(),
+                )),
+            ),
         ];
 
         println!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");
@@ -689,7 +752,10 @@ mod tests {
             for (name, _desc, schema) in &defs {
                 let has_props = schema.get("properties").is_some();
                 let has_type = schema.get("type").is_some();
-                println!("  {} — has_properties={}, has_type={}", name, has_props, has_type);
+                println!(
+                    "  {} — has_properties={}, has_type={}",
+                    name, has_props, has_type
+                );
 
                 // Build OpenAI format (same as tools_to_json in pond-inference)
                 all_tools_json.push(serde_json::json!({

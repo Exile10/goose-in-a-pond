@@ -13,6 +13,7 @@ pub mod face_recognition;
 pub mod handshake;
 pub mod inference;
 pub mod inference_pool;
+pub mod mcp_knowledge;
 pub mod mcp_memory;
 pub mod mcp_server;
 pub mod memory_consolidator;

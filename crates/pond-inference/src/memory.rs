@@ -105,21 +105,14 @@ pub(crate) fn estimate_max_context(model: &LlamaModel) -> Option<usize> {
 /// 3. Generation headroom (512 tokens reserved)
 ///
 /// Returns the context size to use for `LlamaContextParams::with_n_ctx()`.
-pub(crate) fn effective_context_size(
-    model: &LlamaModel,
-    prompt_token_count: usize,
-) -> usize {
+pub(crate) fn effective_context_size(model: &LlamaModel, prompt_token_count: usize) -> usize {
     let n_ctx_train = model.n_ctx_train() as usize;
     let memory_max = estimate_max_context(model);
 
     // Use the smaller of training context and memory-estimated max.
     let cap = match memory_max {
         Some(mem_max) if mem_max < n_ctx_train => {
-            tracing::info!(
-                n_ctx_train,
-                mem_max,
-                "capping context to memory estimate"
-            );
+            tracing::info!(n_ctx_train, mem_max, "capping context to memory estimate");
             mem_max
         }
         _ => n_ctx_train,

@@ -1,1 +1,1 @@
-pub use crate::shared::services::mock_agent::*;
+pub use crate::shared::mocks::mock_agent::*;

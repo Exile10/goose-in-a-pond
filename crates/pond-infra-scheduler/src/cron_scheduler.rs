@@ -986,7 +986,10 @@ mod tests {
         // The schedule should still exist with the ORIGINAL cron.
         let tasks = sched.list_tasks().await.unwrap();
         let task = tasks.iter().find(|t| t.id == "atomic1").unwrap();
-        assert_eq!(task.cron, "0 0 8 * * *", "original cron should be preserved");
+        assert_eq!(
+            task.cron, "0 0 8 * * *",
+            "original cron should be preserved"
+        );
         assert!(!task.paused, "schedule should still be active");
     }
 

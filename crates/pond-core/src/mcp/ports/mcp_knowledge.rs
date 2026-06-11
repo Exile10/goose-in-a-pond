@@ -1,4 +1,4 @@
-//! McpMemoryPort — structured persistent memory for the assistant.
+//! McpKnowledgePort — structured persistent knowledge store for the assistant.
 //!
 //! Backed by Goose's `MemoryServer` (flat-file MCP storage).
 //! The `instructions()` output is prepended to the LLM system prompt so the
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 #[async_trait]
-pub trait McpMemoryPort: Send + Sync {
+pub trait McpKnowledgePort: Send + Sync {
     /// Store `data` under `category` with optional `tags`.
     /// `global = true` stores in the shared memory dir; `false` is session-local.
     async fn remember(

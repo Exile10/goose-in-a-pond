@@ -1375,7 +1375,9 @@ async fn get_session_messages(
                 obj["tool_call_id"] = json!(tc_id);
             }
             if !m.message.tool_calls.is_empty() {
-                obj["tool_calls"] = json!(m.message.tool_calls
+                obj["tool_calls"] = json!(m
+                    .message
+                    .tool_calls
                     .iter()
                     .map(|tc| json!({
                         "id": tc.id,
@@ -2300,9 +2302,9 @@ async fn cleanup_models(
             )
         })?;
 
-    Ok(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
-        json!({"reclaimed_bytes": 0, "removed": []})
-    })))
+    Ok(Json(serde_json::to_value(&report).unwrap_or_else(
+        |_| json!({"reclaimed_bytes": 0, "removed": []}),
+    )))
 }
 
 /// GET /api/v1/models/disk-usage — per-category bytes plus HF cache totals.
@@ -2791,53 +2793,46 @@ async fn spawn_tracked_download<F>(
 
     tracing::info!("Downloading {} from {}", filename, url);
 
-    let result: Result<(), String> = if let Some((repo_id, revision, fname)) =
-        pond_hf_cache::parse_hf_url(&url)
-    {
-        download_via_hf_cache_tracked(
-            &repo_id,
-            &revision,
-            &fname,
-            &dest,
-            &data_dir,
-            &filename,
-            &tracker,
-        )
-        .await
-    } else {
-        async {
-            let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status()));
-            }
-
-            let total = resp.content_length();
-            {
-                let mut t = tracker.write().await;
-                if let Some(e) = t.get_mut(&filename) {
-                    e.total_bytes = total;
+    let result: Result<(), String> =
+        if let Some((repo_id, revision, fname)) = pond_hf_cache::parse_hf_url(&url) {
+            download_via_hf_cache_tracked(
+                &repo_id, &revision, &fname, &dest, &data_dir, &filename, &tracker,
+            )
+            .await
+        } else {
+            async {
+                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status()));
                 }
-            }
 
-            let mut file = tokio::fs::File::create(&dest)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let mut downloaded: u64 = 0;
-            let mut resp = resp;
-            while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-                file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                downloaded += chunk.len() as u64;
-                let mut t = tracker.write().await;
-                if let Some(e) = t.get_mut(&filename) {
-                    e.downloaded_bytes = downloaded;
+                let total = resp.content_length();
+                {
+                    let mut t = tracker.write().await;
+                    if let Some(e) = t.get_mut(&filename) {
+                        e.total_bytes = total;
+                    }
                 }
+
+                let mut file = tokio::fs::File::create(&dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let mut downloaded: u64 = 0;
+                let mut resp = resp;
+                while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                    downloaded += chunk.len() as u64;
+                    let mut t = tracker.write().await;
+                    if let Some(e) = t.get_mut(&filename) {
+                        e.downloaded_bytes = downloaded;
+                    }
+                }
+                file.flush().await.map_err(|e| e.to_string())?;
+                Ok(())
             }
-            file.flush().await.map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        .await
-    };
+            .await
+        };
 
     match result {
         Ok(()) => {
@@ -2877,8 +2872,8 @@ async fn download_via_hf_cache_tracked(
 ) -> Result<(), String> {
     let cache = pond_hf_cache::HfCache::new(data_dir);
     let token: Option<String> = hf_token_from_env().or_else(|| cache.token().map(String::from));
-    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref())
-        .map_err(|e| e.to_string())?;
+    let client =
+        pond_hf_cache::build_redirect_aware_client(token.as_deref()).map_err(|e| e.to_string())?;
 
     let repo = cache
         .repo(repo_id.to_string())
@@ -2910,7 +2905,9 @@ async fn download_via_hf_cache_tracked(
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     let _ = tokio::fs::remove_file(dest).await;
-    link_or_copy_blob(&blob_path, dest).await.map_err(|e| e.to_string())?;
+    link_or_copy_blob(&blob_path, dest)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -6254,10 +6251,8 @@ async fn oauth_refresh_handler(
                 if let (Some(mgr), Some(mp), Some(secret_repo)) = (mgr, mp, secret_repo) {
                     if let Ok(available) = mp.list_available().await {
                         for ext in available {
-                            let uses_token = ext
-                                .required_secrets
-                                .iter()
-                                .any(|s| s.key == token_key);
+                            let uses_token =
+                                ext.required_secrets.iter().any(|s| s.key == token_key);
                             if uses_token {
                                 let mut env = std::collections::HashMap::new();
                                 for sr in &ext.required_secrets {
