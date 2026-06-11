@@ -1,0 +1,17 @@
+pub mod compact_encoding;
+pub mod context_budget;
+pub mod context_compactor;
+pub mod context_monitor;
+pub mod fallback_provider;
+pub mod fallback_voice_output;
+pub mod fast_responder;
+pub mod history_manager;
+pub mod instant_activation;
+pub mod mock_model_catalog_provider;
+pub mod mock_model_downloader;
+pub mod mock_model_repository;
+pub mod mock_model_storage;
+pub mod mock_provider;
+pub mod model_service;
+pub mod prompt_builder;
+pub mod thought_filter;
