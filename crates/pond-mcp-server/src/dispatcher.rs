@@ -16,6 +16,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pond_adapters_weather::WeatherProvider;
+use pond_core::ports::device_controller::DeviceController;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::draft::DraftRepository;
 use pond_core::ports::embedding::EmbeddingProvider;
@@ -31,8 +32,9 @@ use rmcp::{RoleServer, ServerHandler};
 use std::sync::Arc;
 
 use crate::{
-    DeviceMcpServer, DiscoveryMcpServer, DraftMcpServer, FinanceMcpServer, KnowledgeMcpServer,
-    MemoryMcpServer, NewsMcpServer, ScheduleMcpServer, SystemMcpServer, WeatherMcpServer,
+    ControlMcpServer, DeviceMcpServer, DiscoveryMcpServer, DraftMcpServer, FinanceMcpServer,
+    KnowledgeMcpServer, MemoryMcpServer, NewsMcpServer, ScheduleMcpServer, SystemMcpServer,
+    WeatherMcpServer,
 };
 
 // ── Tool name constants ──────────────────────────────────────────────────────
@@ -47,6 +49,7 @@ const PREFIX_NEWS: &str = "giap-news__";
 const PREFIX_FINANCE: &str = "giap-finance__";
 const PREFIX_DISCOVERY: &str = "giap-discovery__";
 const PREFIX_DRAFT: &str = "giap-draft__";
+const PREFIX_CONTROL: &str = "giap-control__";
 
 // No hardcoded tool list — all tools discovered dynamically via ServerHandler::list_tools().
 
@@ -141,6 +144,7 @@ impl McpToolDispatcher {
         scheduler: Option<Arc<dyn SchedulerPort>>,
         settings_repo: Arc<dyn SettingsRepository>,
         device_registry: Arc<dyn DeviceRegistry>,
+        device_controller: Option<Arc<dyn DeviceController + Send + Sync>>,
         skill_repo: Arc<dyn UserSkillRepository>,
         recipe_repo: Arc<dyn AgentRecipeRepository>,
         draft_repo: Arc<dyn DraftRepository>,
@@ -154,7 +158,7 @@ impl McpToolDispatcher {
         let schedule_server = scheduler.map(|s| ScheduleMcpServer::new(s, settings_repo.clone()));
         let system_server = SystemMcpServer::new();
         let device_server = DeviceMcpServer::new(
-            device_registry,
+            device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
             recipe_repo,
@@ -163,6 +167,7 @@ impl McpToolDispatcher {
         let finance_server = FinanceMcpServer::new(http_client.clone(), settings_repo.clone());
         let discovery_server = DiscoveryMcpServer::new(http_client, settings_repo);
         let draft_server = DraftMcpServer::new(draft_repo);
+        let control_server = ControlMcpServer::new(device_registry.clone(), device_controller);
 
         // Create a dummy peer via serve_directly on a DuplexStream.
         // The system server is lightweight (no deps) — we use it as the service
@@ -184,6 +189,7 @@ impl McpToolDispatcher {
             RegisteredServer { prefix: PREFIX_FINANCE, server: Box::new(finance_server) },
             RegisteredServer { prefix: PREFIX_DISCOVERY, server: Box::new(discovery_server) },
             RegisteredServer { prefix: PREFIX_DRAFT, server: Box::new(draft_server) },
+            RegisteredServer { prefix: PREFIX_CONTROL, server: Box::new(control_server) },
         ];
         if let Some(sched) = schedule_server {
             servers.push(RegisteredServer { prefix: PREFIX_SCHEDULE, server: Box::new(sched) });
@@ -644,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_mcp_tool_schemas() {
         use crate::{
-            SystemMcpServer, KnowledgeMcpServer, WeatherMcpServer,
+            ControlMcpServer, SystemMcpServer, KnowledgeMcpServer, WeatherMcpServer,
             NewsMcpServer, FinanceMcpServer, DiscoveryMcpServer, DraftMcpServer,
         };
 
@@ -668,6 +674,28 @@ mod tests {
         }
         let settings: Arc<dyn pond_core::ports::settings::SettingsRepository> = Arc::new(MockSettings);
 
+        // Minimal stub registry for ControlMcpServer
+        struct StubRegistry;
+        #[async_trait]
+        impl pond_core::ports::device_registry::DeviceRegistry for StubRegistry {
+            async fn register(&self, _req: pond_core::ports::device_registry::RegisterDeviceRequest) -> anyhow::Result<pond_core::ports::device_registry::Device> {
+                Err(anyhow::anyhow!("stub"))
+            }
+            async fn list_devices(&self) -> anyhow::Result<Vec<pond_core::ports::device_registry::Device>> {
+                Ok(vec![])
+            }
+            async fn get_device(&self, _id: &str) -> anyhow::Result<Option<pond_core::ports::device_registry::Device>> {
+                Ok(None)
+            }
+            async fn unregister(&self, _id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn heartbeat(&self, _id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let stub_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> = Arc::new(StubRegistry);
+
         // All servers that don't require complex real deps
         let servers: Vec<(&str, Box<dyn McpServerBridge>)> = vec![
             ("giap-system__", Box::new(SystemMcpServer::new()) as Box<dyn McpServerBridge>),
@@ -676,6 +704,7 @@ mod tests {
             ("giap-news__", Box::new(NewsMcpServer::new(http_client.clone(), settings.clone()))),
             ("giap-finance__", Box::new(FinanceMcpServer::new(http_client.clone(), settings.clone()))),
             ("giap-discovery__", Box::new(DiscoveryMcpServer::new(http_client.clone(), settings.clone()))),
+            ("giap-control__", Box::new(ControlMcpServer::new(stub_registry, None))),
         ];
 
         println!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");

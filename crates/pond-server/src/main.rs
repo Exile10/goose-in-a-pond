@@ -1622,6 +1622,7 @@ async fn run_server(
                     scheduler.clone(),
                     settings_repo.clone(),
                     device_registry.clone(),
+                    device_controller.clone(),
                     skill_repo.clone(),
                     recipe_repo.clone(),
                     draft_repo.clone(),
@@ -1667,6 +1668,7 @@ async fn run_server(
             &data_dir,
             weather.clone(),
             device_registry.clone(),
+            device_controller.clone(),
             scheduler.clone(),
             settings_repo.clone(),
             memory_repo.clone(),
@@ -2341,6 +2343,7 @@ async fn run_chat(
             &data_dir,
             weather,
             device_registry_arc,
+            None, // device_controller — not wired in CLI chat mode
             None, // scheduler not used in voice mode
             settings_repo_arc,
             memory_repo,
@@ -4200,6 +4203,9 @@ async fn build_goose_backend(
     data_dir: &std::path::Path,
     weather: Option<Arc<dyn WeatherProvider>>,
     device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync>,
+    device_controller: Option<
+        Arc<dyn pond_core::ports::device_controller::DeviceController + Send + Sync>,
+    >,
     scheduler: Option<Arc<dyn pond_core::ports::scheduler::SchedulerPort>>,
     settings_repo: Arc<dyn pond_core::ports::settings::SettingsRepository + Send + Sync>,
     memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync>,
@@ -4262,6 +4268,7 @@ async fn build_goose_backend(
             scheduler,
             settings_repo.clone(),
             device_registry.clone(),
+            device_controller.clone(),
             skill_repo.clone(),
             recipe_repo.clone(),
             draft_repo,
@@ -4337,6 +4344,7 @@ async fn build_goose_backend(
         weather,
         settings_repo.clone(),
         device_registry.clone(),
+        device_controller.clone(),
         skill_repo.clone(),
         recipe_repo.clone(),
         draft_repo,
@@ -4850,6 +4858,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 &data_dir,
                 weather,
                 device_registry,
+                None, // device_controller — not wired in CLI chat mode
                 None,
                 settings_repo,
                 memory_repo,
@@ -4885,6 +4894,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 &data_dir,
                 weather,
                 device_registry,
+                None, // device_controller — not wired in CLI repl mode
                 None,
                 settings_repo,
                 memory_repo,
@@ -4948,6 +4958,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 &data_dir,
                 weather,
                 device_registry,
+                None, // device_controller — not wired in CLI tools-list mode
                 None,
                 settings_repo,
                 memory_repo,
