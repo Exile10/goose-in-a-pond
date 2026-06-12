@@ -456,6 +456,10 @@ pub struct Settings {
     /// Enable the discovery tools module (product search, recommendations).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_discovery_enabled: bool,
+
+    /// Enable the device control tools module (set_device_state, get_device_state).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_control_enabled: bool,
 }
 
 impl Default for Settings {
@@ -552,6 +556,7 @@ impl Default for Settings {
             ext_news_enabled: true,
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
+            ext_control_enabled: true,
         }
     }
 }

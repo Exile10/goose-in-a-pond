@@ -8,6 +8,7 @@ use anyhow::Result;
 use goose::builtin_extension::register_builtin_extension;
 use pond_adapters_weather::WeatherProvider;
 use pond_core::domain::settings::Settings;
+use pond_core::ports::device_controller::DeviceController;
 use pond_core::ports::device_registry::DeviceRegistry;
 use pond_core::ports::draft::DraftRepository;
 use pond_core::ports::embedding::EmbeddingProvider;
@@ -47,6 +48,7 @@ pub fn register_giap_extensions(
     weather: Option<Arc<dyn WeatherProvider>>,
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    device_controller: Option<Arc<dyn DeviceController + Send + Sync>>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
     recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
     draft_repo: Arc<dyn DraftRepository + Send + Sync>,
@@ -97,7 +99,7 @@ pub fn register_giap_extensions(
 
     if settings.ext_device_enabled {
         pond_mcp_server::init_device_deps(
-            device_registry,
+            device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
             recipe_repo,
@@ -126,6 +128,12 @@ pub fn register_giap_extensions(
         pond_mcp_server::init_discovery_deps(shared_http, settings_repo);
         register_builtin_extension("giap-discovery", pond_mcp_server::spawn_discovery_server);
         registered.push("giap-discovery".into());
+    }
+
+    if settings.ext_control_enabled {
+        pond_mcp_server::init_control_deps(device_registry, device_controller);
+        register_builtin_extension("giap-control", pond_mcp_server::spawn_control_server);
+        registered.push("giap-control".into());
     }
 
     // Store for GooseAdapter to read
