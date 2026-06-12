@@ -13,6 +13,7 @@ members = [
     "crates/pond-adapters-face-onnx",
     "crates/pond-adapters-gotg",
     "crates/pond-adapters-mqtt",
+    "crates/pond-adapters-http-device",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
     # Independent agent + inference engine (no Goose dependency — future primary path)
@@ -152,6 +153,7 @@ pond-adapters-weather          = { path = "crates/pond-adapters-weather" }
 pond-adapters-mcp-memory       = { path = "crates/pond-adapters-mcp-memory" }
 pond-adapters-local-inference  = { path = "crates/pond-adapters-local-inference" }
 pond-adapters-mqtt             = { path = "crates/pond-adapters-mqtt" }
+pond-adapters-http-device      = { path = "crates/pond-adapters-http-device" }
 pond-adapters-face-onnx        = { path = "crates/pond-adapters-face-onnx" }
 
 # ── Release profile for Jetson / embedded deployment ─────────────────────────

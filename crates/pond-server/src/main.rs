@@ -39,6 +39,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
+use pond_adapters_http_device::{HttpDeviceConfig, HttpDeviceController};
 use pond_adapters_mqtt::{MqttConfig, MqttDeviceController};
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
@@ -1085,9 +1086,10 @@ async fn run_server(
     let device_registry: Arc<dyn pond_core::ports::device_registry::DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
 
-    // ── MQTT device controller ─────────────────────────────────────────────────
-    // Enabled when MQTT_HOST is set. Connects to the broker and subscribes to
-    // zigbee2mqtt/+ and stat/+/STATE for state caching.
+    // ── Device controller ──────────────────────────────────────────────────────
+    // MQTT takes priority when MQTT_HOST is set (stateful, broker-backed).
+    // Falls back to the HTTP adapter (stateless, per-request REST) so Shelly /
+    // ESPHome / generic REST devices work without a broker.
     let device_controller: Option<
         Arc<dyn pond_core::ports::device_controller::DeviceController + Send + Sync>,
     > = if MqttConfig::is_configured() {
@@ -1101,13 +1103,21 @@ async fn run_server(
                 Some(Arc::new(ctrl))
             }
             Err(e) => {
-                tracing::warn!("Failed to connect MQTT controller: {e:#}; device control disabled");
-                None
+                tracing::warn!("Failed to connect MQTT controller: {e:#}; falling back to HTTP adapter");
+                let ctrl = HttpDeviceController::new(
+                    HttpDeviceConfig::from_env(),
+                    Arc::clone(&device_registry),
+                );
+                Some(Arc::new(ctrl))
             }
         }
     } else {
-        tracing::debug!("MQTT_HOST not set; device controller disabled");
-        None
+        tracing::info!("MQTT_HOST not set; using HTTP device controller (stateless REST adapter)");
+        let ctrl = HttpDeviceController::new(
+            HttpDeviceConfig::from_env(),
+            Arc::clone(&device_registry),
+        );
+        Some(Arc::new(ctrl))
     };
 
     let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
