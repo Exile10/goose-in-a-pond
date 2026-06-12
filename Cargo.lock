@@ -7756,6 +7756,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-http-device"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pond-core",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pond-adapters-llamafile"
 version = "0.1.0"
 dependencies = [
@@ -8048,6 +8062,7 @@ dependencies = [
  "indoc",
  "pond-adapters-face-onnx",
  "pond-adapters-goose",
+ "pond-adapters-http-device",
  "pond-adapters-llamafile",
  "pond-adapters-local-inference",
  "pond-adapters-mcp-memory",
