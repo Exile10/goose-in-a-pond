@@ -40,6 +40,7 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_http_device::{HttpDeviceConfig, HttpDeviceController};
+use pond_adapters_ir_lirc::{IrConfig, IrDeviceController};
 use pond_adapters_mqtt::{MqttConfig, MqttDeviceController};
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperOutput;
@@ -1087,9 +1088,10 @@ async fn run_server(
         Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
 
     // ── Device controller ──────────────────────────────────────────────────────
-    // MQTT takes priority when MQTT_HOST is set (stateful, broker-backed).
-    // Falls back to the HTTP adapter (stateless, per-request REST) so Shelly /
-    // ESPHome / generic REST devices work without a broker.
+    // Priority order:
+    //   1. MQTT  — when MQTT_HOST is set (stateful, broker-backed)
+    //   2. IR    — when lircd socket is present (IR blaster for legacy appliances)
+    //   3. HTTP  — always available (stateless REST for Shelly/ESPHome/generic)
     let device_controller: Option<
         Arc<dyn pond_core::ports::device_controller::DeviceController + Send + Sync>,
     > = if MqttConfig::is_configured() {
@@ -1103,21 +1105,32 @@ async fn run_server(
                 Some(Arc::new(ctrl))
             }
             Err(e) => {
-                tracing::warn!("Failed to connect MQTT controller: {e:#}; falling back to HTTP adapter");
-                let ctrl = HttpDeviceController::new(
-                    HttpDeviceConfig::from_env(),
-                    Arc::clone(&device_registry),
-                );
-                Some(Arc::new(ctrl))
+                tracing::warn!("Failed to connect MQTT controller: {e:#}; falling back to IR/HTTP");
+                let ir_cfg = IrConfig::from_env();
+                if IrConfig::is_configured() {
+                    tracing::info!("IR/LIRC available; using IR device controller");
+                    Some(Arc::new(IrDeviceController::new(ir_cfg, Arc::clone(&device_registry))))
+                } else {
+                    tracing::info!("Falling back to HTTP device controller");
+                    Some(Arc::new(HttpDeviceController::new(
+                        HttpDeviceConfig::from_env(),
+                        Arc::clone(&device_registry),
+                    )))
+                }
             }
         }
+    } else if IrConfig::is_configured() {
+        tracing::info!("MQTT_HOST not set; IR/LIRC available — using IR device controller");
+        Some(Arc::new(IrDeviceController::new(
+            IrConfig::from_env(),
+            Arc::clone(&device_registry),
+        )))
     } else {
-        tracing::info!("MQTT_HOST not set; using HTTP device controller (stateless REST adapter)");
-        let ctrl = HttpDeviceController::new(
+        tracing::info!("MQTT_HOST not set, LIRC not found; using HTTP device controller (stateless REST adapter)");
+        Some(Arc::new(HttpDeviceController::new(
             HttpDeviceConfig::from_env(),
             Arc::clone(&device_registry),
-        );
-        Some(Arc::new(ctrl))
+        )))
     };
 
     let memory_repo: Arc<dyn pond_core::ports::memory_repository::MemoryRepository + Send + Sync> =
