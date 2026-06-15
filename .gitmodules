@@ -1,3 +1,4 @@
 [submodule "goose"]
 	path = goose
 	url = https://github.com/jarida-io/goose
+	branch = giap-patches
