@@ -1,9 +1,11 @@
 pub mod agent;
 pub mod answer_reviewer;
 pub mod camera_storage;
+pub mod device_controller;
 pub mod device_registry;
 pub mod draft;
 pub mod embedding;
+pub mod event_bus;
 pub mod event_log;
 pub mod extension_manager;
 pub mod extension_marketplace;

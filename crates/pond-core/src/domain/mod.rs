@@ -1,5 +1,7 @@
 pub mod agent;
+pub mod device;
 pub mod draft;
+pub mod event;
 pub mod external_tool;
 pub mod face_recognition;
 pub mod marketplace;
