@@ -56,6 +56,7 @@ use pond_core::ports::voice_input::VoiceInput;
 use pond_core::ports::voice_output::VoiceOutput;
 use pond_core::prompts::build_system_prompt;
 use pond_core::services::chat::ChatService;
+use pond_core::services::in_process_event_bus::InProcessEventBus;
 use pond_core::services::instant_activation::InstantActivation;
 use pond_core::services::mock_agent::MockAgent;
 use pond_core::services::onboarding::OnboardingService;
@@ -1837,6 +1838,7 @@ async fn run_server(
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
         event_log_repo: event_log_repo,
+        event_bus: Some(Arc::new(InProcessEventBus::new())),
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
