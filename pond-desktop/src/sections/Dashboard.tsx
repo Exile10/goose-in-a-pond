@@ -210,14 +210,7 @@ export function Dashboard() {
             <div className="voice-card__right">
               <VuMeter level={vuLevel} active={voiceActive} />
               <span className="voice-card__state">{voiceStateLabel}</span>
-              <label
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  cursor: "pointer",
-                }}
-              >
+              <label className="voice-card__toggle">
                 <span className="voice-card__switch-label">Hands-free</span>
                 <Switch
                   size="sm"
@@ -295,8 +288,8 @@ export function Dashboard() {
         </div>
 
         {recentSessions.length > 0 && (
-          <div style={{ marginTop: 14 }}>
-            <div className="card__label" style={{ marginBottom: 8 }}>
+          <div className="dash-recent">
+            <div className="card__label dash-recent__label">
               Recent conversations
             </div>
             <div className="quick-actions">
@@ -309,20 +302,10 @@ export function Dashboard() {
                   <span className="quick-action__icon">
                     <MessageCircle size={14} />
                   </span>
-                  <span
-                    className="quick-action__label"
-                    style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                  >
+                  <span className="quick-action__label quick-action__label--ellipsis">
                     {s.title || `Session ${s.id.slice(0, 8)}`}
                   </span>
-                  <span
-                    style={{
-                      fontSize: 11,
-                      color: "var(--grey-500)",
-                      whiteSpace: "nowrap",
-                      marginRight: 4,
-                    }}
-                  >
+                  <span className="quick-action__time">
                     {timeAgo(s.updated_at)}
                   </span>
                   <span className="quick-action__arrow" />
@@ -364,7 +347,7 @@ export function Dashboard() {
                   </span>
                 </div>
               </div>
-              <code className="server-row__url" style={{ fontSize: 12 }}>
+              <code className="server-row__url">
                 {state.serverUrl || "http://127.0.0.1:4000"}
               </code>
             </div>
@@ -460,7 +443,7 @@ export function Dashboard() {
         </div>
         <CardContent>
           {rolesLoading ? (
-            <p style={{ color: "var(--grey-400)", fontSize: 13 }}>Loading\u2026</p>
+            <p className="dash-role-text">Loading\u2026</p>
           ) : roleItems.length > 0 ? (
             <div className="role-grid">
               {roleItems.map((r) => (
@@ -474,7 +457,7 @@ export function Dashboard() {
               ))}
             </div>
           ) : (
-            <p style={{ color: "var(--grey-400)", fontSize: 13 }}>
+            <p className="dash-role-text">
               {state.serverOnline
                 ? "No roles assigned yet. Configure models in Settings."
                 : "Connect to the server to see active roles."}

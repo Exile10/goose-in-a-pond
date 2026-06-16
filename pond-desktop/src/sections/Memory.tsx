@@ -160,7 +160,7 @@ function MemFilterRow({
   const hasSources = Object.keys(sourceCounts).filter((k) => k !== "all").length > 0;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+    <div className="mem-filter-col">
       {/* Segment filter */}
       <div className="mem-filter">
         <button
@@ -184,11 +184,11 @@ function MemFilterRow({
 
       {/* Tier + Source secondary filters */}
       {(hasTiers || hasSources) && (
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" as React.CSSProperties["flexWrap"], alignItems: "center" }}>
+        <div className="mem-filter__sub-row">
           {hasTiers && (
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: "0.07em", color: "var(--grey-400)", textTransform: "uppercase" as React.CSSProperties["textTransform"], marginRight: 2 }}>
-                <Layers size={10} strokeWidth={2} style={{ display: "inline", verticalAlign: "middle", marginRight: 2 }} />
+            <div className="mem-filter__sub-group">
+              <span className="mem-filter__sub-label">
+                <Layers size={10} strokeWidth={2} />
                 Tier
               </span>
               {(["all", "short", "long", "permanent"] as const).map((tier) => {
@@ -197,8 +197,7 @@ function MemFilterRow({
                 return (
                   <button
                     key={tier}
-                    className={`mem-filter__btn${activeTier === tier ? " is-active" : ""}`}
-                    style={{ fontSize: "11px", padding: "2px 8px", height: "22px" }}
+                    className={`mem-filter__btn mem-filter__btn--sm${activeTier === tier ? " is-active" : ""}`}
                     onClick={() => onTierChange(tier)}
                   >
                     {tier === "all" ? "Any" : tierLabels[tier]}
@@ -212,13 +211,13 @@ function MemFilterRow({
           )}
 
           {hasTiers && hasSources && (
-            <span style={{ width: 1, height: 16, background: "var(--grey-150)", display: "inline-block" }} />
+            <span className="mem-filter__divider" />
           )}
 
           {hasSources && (
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: "0.07em", color: "var(--grey-400)", textTransform: "uppercase" as React.CSSProperties["textTransform"], marginRight: 2 }}>
-                <Radio size={10} strokeWidth={2} style={{ display: "inline", verticalAlign: "middle", marginRight: 2 }} />
+            <div className="mem-filter__sub-group">
+              <span className="mem-filter__sub-label">
+                <Radio size={10} strokeWidth={2} />
                 Source
               </span>
               {(["all", "auto", "mcp", "chat"] as const).map((src) => {
@@ -227,8 +226,7 @@ function MemFilterRow({
                 return (
                   <button
                     key={src}
-                    className={`mem-filter__btn${activeSource === src ? " is-active" : ""}`}
-                    style={{ fontSize: "11px", padding: "2px 8px", height: "22px" }}
+                    className={`mem-filter__btn mem-filter__btn--sm${activeSource === src ? " is-active" : ""}`}
                     onClick={() => onSourceChange(src)}
                   >
                     {sourceLabels[src]}
@@ -297,75 +295,31 @@ function MemRow({
   if (editing) {
     // Editing state — spans full row width
     return (
-      <div className="mem-row" style={{ display: "block", padding: "12px" }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div className="mem-row mem-row--editing">
+        <div className="mem-row__edit-body">
           <textarea
             ref={textareaRef}
+            className="mem-row__edit-textarea"
             value={editContent}
             onChange={(e) => setEditContent(e.target.value)}
             disabled={saving}
             rows={3}
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              border: "1px solid var(--color-accent)",
-              borderRadius: "8px",
-              fontSize: "13px",
-              fontFamily: "var(--font-body)",
-              background: "var(--color-accent-subtle)",
-              color: "var(--fg)",
-              outline: "none",
-              resize: "vertical" as React.CSSProperties["resize"],
-              lineHeight: 1.6,
-              boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-              boxShadow: "0 0 0 3px var(--color-accent-subtle)",
-            }}
             aria-label="Edit memory content"
           />
-          <div style={{ display: "flex", gap: 6 }}>
+          <div className="mem-row__edit-actions">
             <button
+              className="mem-row__save-btn"
               onClick={handleSave}
               disabled={saving || !editContent.trim()}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 5,
-                height: "28px",
-                padding: "0 12px",
-                border: "none",
-                borderRadius: "7px",
-                background: "var(--color-accent)",
-                color: "#fff",
-                fontSize: "12px",
-                fontWeight: 600,
-                cursor: saving ? "wait" : "pointer",
-                opacity: saving ? 0.7 : 1,
-                fontFamily: "var(--font-body)",
-                transition: "opacity 120ms",
-              }}
               aria-label="Save edit"
             >
               <Save size={12} strokeWidth={2} />
               {saving ? "Saving…" : "Save"}
             </button>
             <button
+              className="mem-row__cancel-btn"
               onClick={cancelEdit}
               disabled={saving}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 5,
-                height: "28px",
-                padding: "0 12px",
-                border: "1px solid var(--grey-200)",
-                borderRadius: "7px",
-                background: "transparent",
-                color: "var(--grey-600)",
-                fontSize: "12px",
-                fontWeight: 500,
-                cursor: "pointer",
-                fontFamily: "var(--font-body)",
-              }}
               aria-label="Cancel edit"
             >
               Cancel
@@ -387,7 +341,7 @@ function MemRow({
       <div className="mem-row__text">
         <div>{mem.content}</div>
         {/* Badges + importance line */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4, flexWrap: "wrap" as React.CSSProperties["flexWrap"] }}>
+        <div className="mem-row__meta">
           {seg && (
             <span className={`mem-seg-badge mem-seg-badge--${segClass}`}>
               {segMeta?.icon}
@@ -437,7 +391,7 @@ function MemRow({
       </div>
 
       {/* Actions */}
-      <div style={{ display: "flex", gap: 2 }}>
+      <div className="mem-row__actions-group">
         <button
           className="mem-card__delete"
           onClick={startEdit}
@@ -512,32 +466,32 @@ function AddMemoryModal({
   const segmentColor = segment !== "" ? SEGMENT_IMPORT_FILL[segment as MemorySegment] : undefined;
 
   return (
-    <div style={modalStyles.overlay} onClick={onClose}>
-      <div style={modalStyles.dialog} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Add memory">
+    <div className="mem-modal__overlay" onClick={onClose}>
+      <div className="mem-modal__dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Add memory">
         {/* Header */}
-        <div style={modalStyles.header}>
-          <div style={modalStyles.headerLeft}>
-            <div style={modalStyles.headerIcon}>
+        <div className="mem-modal__header">
+          <div className="mem-modal__header-left">
+            <div className="mem-modal__header-icon">
               <BrainCircuit size={16} strokeWidth={1.8} />
             </div>
-            <h2 style={modalStyles.title}>Add Memory</h2>
+            <h2 className="mem-modal__title">Add Memory</h2>
           </div>
-          <button style={modalStyles.closeBtn} onClick={onClose} aria-label="Close">
+          <button className="mem-modal__close" onClick={onClose} aria-label="Close">
             <X size={16} strokeWidth={1.8} />
           </button>
         </div>
 
-        <div style={modalStyles.divider} />
+        <div className="mem-modal__divider" />
 
         {/* Body */}
-        <div style={modalStyles.body}>
+        <div className="mem-modal__body">
           {/* Content textarea */}
-          <div style={modalStyles.fieldGroup}>
-            <label style={modalStyles.label} htmlFor="mem-content">Content</label>
+          <div className="mem-modal__field">
+            <label className="mem-modal__label" htmlFor="mem-content">Content</label>
             <textarea
               id="mem-content"
               ref={textareaRef}
-              style={modalStyles.textarea}
+              className="mem-modal__textarea"
               placeholder="What should the assistant remember?"
               value={content}
               onChange={(e) => setContent(e.target.value)}
@@ -548,18 +502,15 @@ function AddMemoryModal({
           </div>
 
           {/* Segment dropdown */}
-          <div style={modalStyles.fieldGroup}>
-            <label style={modalStyles.label} htmlFor="mem-segment">Segment</label>
-            <div style={modalStyles.selectWrap}>
+          <div className="mem-modal__field">
+            <label className="mem-modal__label" htmlFor="mem-segment">Segment</label>
+            <div className="mem-modal__select-wrap">
               {segment !== "" && (
-                <span style={{ ...modalStyles.segDot, background: segmentColor }} />
+                <span className="mem-modal__seg-dot" style={{ background: segmentColor }} />
               )}
               <select
                 id="mem-segment"
-                style={{
-                  ...modalStyles.select,
-                  paddingLeft: segment !== "" ? "28px" : "10px",
-                }}
+                className="mem-modal__select"
                 value={segment}
                 onChange={(e) => {
                   const val = e.target.value as MemorySegment | "";
@@ -579,18 +530,18 @@ function AddMemoryModal({
           </div>
 
           {/* Importance slider */}
-          <div style={modalStyles.fieldGroup}>
-            <div style={modalStyles.importanceLabelRow}>
-              <label style={modalStyles.label} htmlFor="mem-importance">Importance</label>
-              <span style={modalStyles.importanceVal}>
+          <div className="mem-modal__field">
+            <div className="mem-modal__importance-row">
+              <label className="mem-modal__label" htmlFor="mem-importance">Importance</label>
+              <span className="mem-modal__importance-val">
                 {segment !== "" ? importance.toFixed(2) : "–"}
               </span>
             </div>
             <input
               id="mem-importance"
               type="range"
+              className="mem-modal__range"
               style={{
-                ...modalStyles.range,
                 accentColor: segmentColor ?? "var(--color-accent)",
                 opacity: segment === "" ? 0.4 : 1,
                 cursor: segment === "" ? "not-allowed" : "pointer",
@@ -603,16 +554,16 @@ function AddMemoryModal({
               disabled={saving || segment === ""}
               title={segment === "" ? "Select a segment first to set importance" : `Importance: ${importance}`}
             />
-            <div style={modalStyles.rangeLabels}>
+            <div className="mem-modal__range-labels">
               <span>Low</span>
               <span>High</span>
             </div>
           </div>
 
           {/* Tier selector */}
-          <div style={modalStyles.fieldGroup}>
-            <label style={modalStyles.label}>Tier</label>
-            <div style={modalStyles.tierRow}>
+          <div className="mem-modal__field">
+            <label className="mem-modal__label">Tier</label>
+            <div className="mem-modal__tier-row">
               {(["", "short", "long", "permanent"] as const).map((t) => {
                 const labels: Record<string, string> = {
                   "": "Auto",
@@ -624,10 +575,7 @@ function AddMemoryModal({
                 return (
                   <button
                     key={t}
-                    style={{
-                      ...modalStyles.tierBtn,
-                      ...(isActive ? modalStyles.tierBtnActive : {}),
-                    }}
+                    className={`mem-modal__tier-btn${isActive ? " is-active" : ""}`}
                     onClick={() => setTier(t as MemoryTier | "")}
                     disabled={saving}
                     type="button"
@@ -642,7 +590,7 @@ function AddMemoryModal({
         </div>
 
         {/* Footer */}
-        <div style={modalStyles.footer}>
+        <div className="mem-modal__footer">
           <Button variant="ghost" size="sm" onPress={onClose} isDisabled={saving}>
             Cancel
           </Button>
@@ -660,200 +608,6 @@ function AddMemoryModal({
     </div>
   );
 }
-
-const modalStyles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(23, 22, 22, 0.45)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 1000,
-    backdropFilter: "blur(2px)",
-  },
-  dialog: {
-    background: "#fff",
-    borderRadius: "var(--radius-card)",
-    boxShadow: "0 12px 40px rgba(28,28,28,0.15), 0 2px 8px rgba(28,28,28,0.06)",
-    width: "480px",
-    maxWidth: "calc(100vw - 32px)",
-    maxHeight: "90vh",
-    display: "flex",
-    flexDirection: "column",
-    overflow: "hidden",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "16px 20px 14px",
-    flexShrink: 0,
-  },
-  headerLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: "10px",
-  },
-  headerIcon: {
-    width: "32px",
-    height: "32px",
-    borderRadius: "8px",
-    background: "rgba(147, 51, 234, 0.08)",
-    color: "var(--purple-700, #6d28d9)",
-    display: "grid",
-    placeItems: "center",
-    flexShrink: 0,
-  },
-  title: {
-    fontFamily: "var(--font-heading)",
-    fontWeight: 700,
-    fontSize: "15px",
-    margin: 0,
-    color: "var(--fg)",
-  },
-  closeBtn: {
-    background: "none",
-    border: "none",
-    cursor: "pointer",
-    color: "var(--grey-500)",
-    padding: "6px",
-    lineHeight: 1,
-    borderRadius: "6px",
-    display: "grid",
-    placeItems: "center",
-    transition: "background 120ms, color 120ms",
-  },
-  divider: {
-    height: "1px",
-    background: "var(--grey-100)",
-    flexShrink: 0,
-  },
-  body: {
-    flex: 1,
-    overflowY: "auto",
-    padding: "18px 20px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "16px",
-  },
-  fieldGroup: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "6px",
-  },
-  label: {
-    fontSize: "11px",
-    fontWeight: 600,
-    letterSpacing: "0.06em",
-    textTransform: "uppercase" as React.CSSProperties["textTransform"],
-    color: "var(--grey-500)",
-  },
-  textarea: {
-    width: "100%",
-    padding: "10px 12px",
-    border: "1px solid var(--grey-200)",
-    borderRadius: "8px",
-    fontSize: "13.5px",
-    fontFamily: "var(--font-body)",
-    background: "#fff",
-    color: "var(--fg)",
-    outline: "none",
-    resize: "vertical" as React.CSSProperties["resize"],
-    lineHeight: 1.55,
-    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-    minHeight: "96px",
-    transition: "border-color 120ms",
-  },
-  selectWrap: {
-    position: "relative",
-    display: "flex",
-    alignItems: "center",
-  },
-  segDot: {
-    position: "absolute",
-    left: "10px",
-    width: "8px",
-    height: "8px",
-    borderRadius: "50%",
-    flexShrink: 0,
-    pointerEvents: "none" as React.CSSProperties["pointerEvents"],
-    zIndex: 1,
-  },
-  select: {
-    height: "34px",
-    paddingRight: "10px",
-    border: "1px solid var(--grey-200)",
-    borderRadius: "8px",
-    fontSize: "13px",
-    fontFamily: "var(--font-body)",
-    background: "#fff",
-    color: "var(--fg)",
-    outline: "none",
-    width: "100%",
-    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-    cursor: "pointer",
-    appearance: "auto" as React.CSSProperties["appearance"],
-    transition: "border-color 120ms",
-  },
-  importanceLabelRow: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  importanceVal: {
-    fontFamily: "var(--font-mono)",
-    fontSize: "12px",
-    color: "var(--grey-500)",
-    minWidth: "32px",
-    textAlign: "right" as React.CSSProperties["textAlign"],
-  },
-  range: {
-    width: "100%",
-    height: "20px",
-    cursor: "pointer",
-    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-  },
-  rangeLabels: {
-    display: "flex",
-    justifyContent: "space-between",
-    fontSize: "10px",
-    color: "var(--grey-400)",
-    marginTop: "-2px",
-  },
-  tierRow: {
-    display: "flex",
-    gap: "6px",
-  },
-  tierBtn: {
-    flex: 1,
-    height: "30px",
-    border: "1px solid var(--grey-200)",
-    borderRadius: "7px",
-    background: "transparent",
-    cursor: "pointer",
-    fontSize: "12px",
-    fontFamily: "var(--font-body)",
-    fontWeight: 500,
-    color: "var(--grey-600)",
-    transition: "background 120ms, border-color 120ms, color 120ms",
-  },
-  tierBtnActive: {
-    background: "rgba(147, 51, 234, 0.07)",
-    borderColor: "rgba(147, 51, 234, 0.35)",
-    color: "var(--purple-700, #6d28d9)",
-    fontWeight: 600,
-  },
-  footer: {
-    display: "flex",
-    justifyContent: "flex-end",
-    gap: "8px",
-    padding: "12px 20px",
-    borderTop: "1px solid var(--grey-100)",
-    flexShrink: 0,
-    background: "var(--grey-50)",
-  },
-};
 
 // ── Consolidation progress banner ─────────────────────────────
 
@@ -895,59 +649,23 @@ function ConsolidationBanner({
 
   return (
     <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "10px 14px",
-        borderRadius: "10px",
-        border: `1px solid ${bannerBorder}`,
-        background: bannerBg,
-        fontSize: "12.5px",
-        color: textColor,
-      }}
+      className="consol-banner"
+      style={{ border: `1px solid ${bannerBorder}`, background: bannerBg, color: textColor }}
       role="status"
       aria-live="polite"
     >
-      <GitMerge size={14} strokeWidth={1.8} style={{ flexShrink: 0 }} />
-      <span style={{ flex: 1 }}>
+      <GitMerge size={14} strokeWidth={1.8} className="consol-banner__icon" />
+      <span className="consol-banner__text">
         {isRunning ? "Consolidating memories…" : ""}{" "}
         {message}
       </span>
       {isRunning && (
-        <button
-          onClick={onStop}
-          style={{
-            background: "none",
-            border: "1px solid currentColor",
-            borderRadius: "6px",
-            cursor: "pointer",
-            color: "inherit",
-            fontSize: "11px",
-            padding: "2px 8px",
-            fontFamily: "var(--font-body)",
-            opacity: 0.8,
-          }}
-          aria-label="Stop consolidation"
-        >
+        <button className="consol-banner__stop-btn" onClick={onStop} aria-label="Stop consolidation">
           Stop
         </button>
       )}
       {!isRunning && (
-        <button
-          onClick={onDismiss}
-          style={{
-            background: "none",
-            border: "none",
-            cursor: "pointer",
-            color: "inherit",
-            padding: "2px",
-            display: "grid",
-            placeItems: "center",
-            opacity: 0.6,
-          }}
-          aria-label="Dismiss"
-        >
+        <button className="consol-banner__dismiss-btn" onClick={onDismiss} aria-label="Dismiss">
           <X size={13} strokeWidth={2} />
         </button>
       )}
@@ -991,34 +709,19 @@ function MemorySettingsCard({ settings, onToggle }: {
   return (
     <Card className="card">
       <CardContent>
-        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: 10, color: "var(--fg)" }}>
-          Memory Settings
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div className="mem-settings__header">Memory Settings</div>
+        <div className="mem-settings__list">
           {toggles.map((t) => (
-            <label
-              key={t.key}
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 10,
-                cursor: "pointer",
-                padding: "4px 0",
-              }}
-            >
+            <label key={t.key} className="mem-settings__toggle">
               <input
                 type="checkbox"
+                className="mem-settings__checkbox"
                 checked={t.value}
                 onChange={(e) => onToggle(t.key, e.target.checked)}
-                style={{ marginTop: 2, accentColor: "var(--purple-600, #9333ea)" }}
               />
               <div>
-                <div style={{ fontSize: "13px", fontWeight: 500, color: "var(--fg)" }}>
-                  {t.label}
-                </div>
-                <div style={{ fontSize: "11px", color: "var(--grey-500)", marginTop: 1 }}>
-                  {t.desc}
-                </div>
+                <div className="mem-settings__toggle-label">{t.label}</div>
+                <div className="mem-settings__toggle-desc">{t.desc}</div>
               </div>
             </label>
           ))}
@@ -1267,16 +970,17 @@ export function Memory() {
         title="Memory"
         action={
           <>
-            <Chip size="sm" variant="soft">
+            <Chip size="sm" variant="soft" className="mem-count-chip">
               {loading ? "…" : visibleItems.length} memories
             </Chip>
-            <Button size="sm" variant="ghost" onPress={load} isDisabled={loading}>
+            <span className="mem-header__sep" />
+            <Button size="sm" variant="secondary" onPress={load} isDisabled={loading}>
               <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: loading ? 0.4 : 1 }} />
               Refresh
             </Button>
             <Button
               size="sm"
-              variant="ghost"
+              variant="secondary"
               onPress={handleConsolidate}
               isDisabled={consolidationStatus === "running" || loading || visibleItems.length === 0}
             >
@@ -1310,47 +1014,30 @@ export function Memory() {
       />
 
       {/* Error */}
-      {error && (
-        <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>
-          {error}
-        </p>
-      )}
+      {error && <p className="inline-error">{error}</p>}
 
       {/* Inline add form — design-spec card */}
       <Card className="card">
         <CardContent>
           <div className="mem-add">
-            <div className="mem-add__input" style={{ position: "relative", flex: 1, display: "flex", alignItems: "center" }}>
-              <span style={{ position: "absolute", left: 10, pointerEvents: "none", color: "var(--grey-400)", display: "flex", zIndex: 1 }}>
+            <div className="mem-add__icon-wrap">
+              <span className="mem-add__icon">
                 <Sparkles size={14} strokeWidth={1.8} />
               </span>
               <input
                 type="text"
+                className="mem-add__input-field"
                 placeholder="Add a memory…"
                 value={inlineDraft}
                 onChange={(e) => setInlineDraft(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") handleInlineAdd(); }}
                 disabled={inlineAdding}
-                style={{
-                  width: "100%",
-                  height: "36px",
-                  padding: "0 12px 0 34px",
-                  border: "1px solid var(--grey-200)",
-                  borderRadius: "var(--radius-md)",
-                  fontSize: "13px",
-                  fontFamily: "var(--font-body)",
-                  background: "#fff",
-                  color: "var(--fg)",
-                  outline: "none",
-                  boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-                  transition: "border-color 120ms",
-                }}
                 aria-label="Quick add memory"
               />
             </div>
             <Button
               size="sm"
-              variant="secondary"
+              variant="primary"
               onPress={handleInlineAdd}
               isDisabled={!inlineDraft.trim() || inlineAdding}
             >
@@ -1359,7 +1046,7 @@ export function Memory() {
             </Button>
             <Button
               size="sm"
-              variant="ghost"
+              variant="secondary"
               onPress={() => setShowAddModal(true)}
             >
               Advanced
@@ -1425,19 +1112,17 @@ export function Memory() {
             <div className="empty-state">
               <Brain size={36} strokeWidth={1.2} />
               <div style={{ maxWidth: 320 }}>
-                <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 6, fontSize: "15px" }}>
-                  No memories yet
-                </div>
-                <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)", lineHeight: 1.6 }}>
+                <div className="mem-empty__title">No memories yet</div>
+                <div className="mem-empty__desc">
                   The assistant builds up memory as you chat — facts about you, your preferences, and ongoing projects get saved automatically.
                 </div>
-                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
-                    <MessageSquare size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                <div className="mem-empty__tips">
+                  <div className="mem-empty__tip">
+                    <MessageSquare size={13} strokeWidth={1.8} className="mem-empty__tip-icon" />
                     Chat with the assistant to create memories automatically
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "12px", color: "var(--grey-500)" }}>
-                    <Plus size={13} strokeWidth={2} style={{ flexShrink: 0, color: "var(--grey-400)" }} />
+                  <div className="mem-empty__tip">
+                    <Plus size={13} strokeWidth={2} className="mem-empty__tip-icon" />
                     Or add one manually with the form above
                   </div>
                 </div>

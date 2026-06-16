@@ -57,7 +57,7 @@ export function Devices() {
       />
 
       {loading && <p className="muted-12">Loading devices...</p>}
-      {error && <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>}
+      {error && <p className="muted-12 text-error">{error}</p>}
 
       {!loading && !error && devices.length === 0 && (
         <div className="empty-state">
@@ -100,7 +100,7 @@ export function Devices() {
                   <span className="muted-12">{timeSince(d.last_seen)}</span>
                 </div>
 
-                <div className="card__divider" style={{ margin: "10px 0 8px", borderTop: "1px solid var(--grey-200)" }} />
+                <div className="card__divider card__divider--device" />
 
                 <div className="device-card__actions">
                   <Button size="sm" variant="light" startContent={<Power size={13} />}>

@@ -109,9 +109,9 @@ function AgentChatPanel() {
 
   return (
     <Card className="card agent-chat-card">
-      <CardContent style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", minHeight: "420px" }}>
+      <CardContent className="agent-chat-card__card-body">
         {/* Messages */}
-        <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 4 }}>
+        <div className="agent-chat-card__messages">
           {messages.length === 0 && (
             <div className="empty-state">
               <Send size={28} />
@@ -120,10 +120,10 @@ function AgentChatPanel() {
           )}
           {messages.map((msg, i) => {
             if (msg.kind === "user") return (
-              <div key={i} style={bubbleStyles.user}>{msg.text}</div>
+              <div key={i} className="agent-bubble--user">{msg.text}</div>
             );
             if (msg.kind === "assistant") return (
-              <div key={i} style={bubbleStyles.assistant}><pre style={bubbleStyles.pre}>{msg.text}</pre></div>
+              <div key={i} className="agent-bubble--assistant"><pre className="agent-bubble__pre">{msg.text}</pre></div>
             );
             if (msg.kind === "tool_call") return (
               <div key={i} className="tool-call">
@@ -132,21 +132,21 @@ function AgentChatPanel() {
               </div>
             );
             if (msg.kind === "status") return (
-              <div key={i} style={bubbleStyles.status}>{msg.text}</div>
+              <div key={i} className="agent-bubble--status">{msg.text}</div>
             );
             if (msg.kind === "error") return (
-              <div key={i} style={{ ...bubbleStyles.status, color: "var(--color-destructive)" }}>{msg.text}</div>
+              <div key={i} className="agent-bubble--error">{msg.text}</div>
             );
             return null;
           })}
-          {busy && <div style={bubbleStyles.status}>Agent working...</div>}
+          {busy && <div className="agent-bubble--status">Agent working...</div>}
           <div ref={bottomRef} />
         </div>
 
         {/* Composer */}
         <div className="agent-chat-card__composer">
           <input
-            style={{ ...composerInput, flex: 1 }}
+            className="agent-input agent-input--flex"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
@@ -175,7 +175,7 @@ function ToolsPanel() {
   }, []);
 
   if (loading) return <p className="muted-12">Loading tools...</p>;
-  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
+  if (error)   return <p className="muted-12 text-error">{error}</p>;
   if (!tools.length) return (
     <div className="empty-state">
       <Wrench size={28} />
@@ -190,13 +190,13 @@ function ToolsPanel() {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
+    <div className="agent-panel">
       {Object.entries(byExtension).map(([ext, extTools]) => (
         <Card key={ext} className="card">
           <CardContent className="card-body--flush">
-            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderBottom: "1px solid var(--grey-200)", background: "var(--grey-50)" }}>
+            <div className="agent-ext-header">
               <Chip variant="primary" size="sm">{ext}</Chip>
-              <span className="muted-12" style={{ marginLeft: "auto" }}>
+              <span className="muted-12 agent-ext-count">
                 {extTools.length} tool{extTools.length !== 1 ? "s" : ""}
               </span>
             </div>
@@ -206,7 +206,7 @@ function ToolsPanel() {
                   <span className="tool-row__icon"><Terminal size={14} /></span>
                   <span className="tool-row__name">{t.name.replace(`${ext}__`, "")}</span>
                   {t.description && (
-                    <Chip size="sm" variant="soft" style={{ marginLeft: 6 }}>
+                    <Chip size="sm" variant="soft" className="tool-desc-chip">
                       {t.description.length > 50 ? t.description.slice(0, 47) + "..." : t.description}
                     </Chip>
                   )}
@@ -252,12 +252,12 @@ function ExtrasPanel() {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
+    <div className="agent-panel">
       {/* Add form */}
       <div className="extras-add">
         <div>
           <input
-            style={composerInput}
+            className="agent-input"
             value={key}
             onChange={(e) => setKey(e.target.value)}
             placeholder="Key (e.g. context_note)"
@@ -270,14 +270,14 @@ function ExtrasPanel() {
         </Button>
       </div>
       <textarea
-        style={{ ...composerInput, height: "64px", resize: "vertical" as const, padding: "8px 12px" }}
+        className="agent-input agent-input--textarea"
         value={content}
         onChange={(e) => setContent(e.target.value)}
         placeholder="Content injected into system prompt..."
         aria-label="Extra content"
       />
 
-      {error && <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>}
+      {error && <p className="muted-12 text-error">{error}</p>}
 
       {loading ? (
         <p className="muted-12">Loading...</p>
@@ -291,11 +291,11 @@ function ExtrasPanel() {
           <CardContent className="card-body--flush">
             {extras.map((ex) => (
               <div key={ex.key} className="extra-row">
-                <code style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-base)", color: "var(--color-accent)", fontWeight: 600 }}>
+                <code className="agent-extra-key">
                   {ex.key}
                 </code>
                 {!ex.enabled && <Chip size="sm" variant="soft" color="warning">Disabled</Chip>}
-                <span style={{ flex: 1, fontSize: "var(--text-sm)", color: "var(--grey-600)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>
+                <span className="agent-extra-preview">
                   {ex.content.length > 80 ? ex.content.slice(0, 77) + "..." : ex.content}
                 </span>
                 <Button
@@ -332,7 +332,7 @@ function RecipesPanel() {
   const current = recipes.find((r) => r.name === selected);
 
   if (loading) return <p className="muted-12">Loading recipes...</p>;
-  if (error)   return <p className="muted-12" style={{ color: "var(--color-destructive)" }}>{error}</p>;
+  if (error)   return <p className="muted-12 text-error">{error}</p>;
   if (!recipes.length) return (
     <Card className="card">
       <CardContent>
@@ -342,7 +342,7 @@ function RecipesPanel() {
           <p className="muted-12">
             Import one with{" "}
             <Chip size="sm" variant="soft">
-              <code style={{ fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+              <code className="agent-recipe__import-code">
                 pond-server recipes import &lt;name&gt; &lt;file.yaml&gt;
               </code>
             </Chip>
@@ -353,16 +353,15 @@ function RecipesPanel() {
   );
 
   return (
-    <div style={{ display: "flex", gap: 12, paddingTop: 8, minHeight: 320 }}>
+    <div className="agent-recipes">
       {/* Recipe list */}
-      <Card className="card" style={{ width: 200, flexShrink: 0 }}>
-        <CardContent className="card-body--list" style={{ padding: 4 }}>
+      <Card className="card agent-recipes__list">
+        <CardContent className="card-body--list agent-recipes__list-body">
           {recipes.map((r) => (
             <button
               key={r.name}
-              className={`prompt-tab${selected === r.name ? " is-active" : ""}`}
+              className={`prompt-tab agent-recipe-btn${selected === r.name ? " is-active" : ""}`}
               onClick={() => setSelected(r.name)}
-              style={{ width: "100%", textAlign: "left" }}
             >
               <div className="prompt-tab__title">
                 <span>{r.name}</span>
@@ -374,30 +373,17 @@ function RecipesPanel() {
       </Card>
 
       {/* Recipe detail */}
-      <Card className="card" style={{ flex: 1, minWidth: 0 }}>
-        <CardContent style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <Card className="card agent-recipes__detail">
+        <CardContent className="agent-recipes__detail-body">
           {current ? (
             <>
               <div>
-                <span style={{ fontWeight: 600, fontSize: "var(--text-base)" }}>{current.name}</span>
+                <span className="agent-recipe__name">{current.name}</span>
                 {current.description && (
-                  <p style={{ margin: "4px 0 0", fontSize: "var(--text-sm)", color: "var(--grey-600)" }}>{current.description}</p>
+                  <p className="agent-recipe__desc">{current.description}</p>
                 )}
               </div>
-              <pre style={{
-                flex: 1,
-                margin: 0,
-                padding: "var(--space-4)",
-                background: "var(--grey-50)",
-                border: "1px solid var(--grey-200)",
-                borderRadius: "var(--radius-card)",
-                fontFamily: "var(--font-mono)",
-                fontSize: "var(--text-xs)",
-                color: "var(--fg)",
-                lineHeight: "1.6",
-                overflow: "auto",
-                whiteSpace: "pre" as const,
-              }}>{current.yaml}</pre>
+              <pre className="agent-recipe__yaml">{current.yaml}</pre>
             </>
           ) : (
             <p className="muted-12">Select a recipe to view its YAML.</p>
@@ -408,52 +394,3 @@ function RecipesPanel() {
   );
 }
 
-// ── Shared input style ─────────────────────────────────────────
-
-const composerInput: React.CSSProperties = {
-  height: "36px",
-  border: "1px solid var(--grey-200)",
-  borderRadius: "var(--radius-card)",
-  padding: "0 12px",
-  fontSize: "var(--text-base)",
-  fontFamily: "var(--font-body)",
-  background: "#fff",
-  color: "var(--fg)",
-  width: "100%",
-};
-
-// ── Chat bubble styles ─────────────────────────────────────────
-
-const bubbleStyles: Record<string, React.CSSProperties> = {
-  user: {
-    alignSelf: "flex-end",
-    background: "var(--color-accent)",
-    color: "#fff",
-    borderRadius: "var(--radius-card) var(--radius-card) 2px var(--radius-card)",
-    padding: "8px 12px",
-    fontSize: "var(--text-sm)",
-    maxWidth: "80%",
-    whiteSpace: "pre-wrap",
-  },
-  assistant: {
-    alignSelf: "flex-start",
-    background: "#fff",
-    border: "1px solid var(--grey-200)",
-    borderRadius: "2px var(--radius-card) var(--radius-card) var(--radius-card)",
-    padding: "8px 12px",
-    fontSize: "var(--text-sm)",
-    maxWidth: "90%",
-  },
-  pre: {
-    margin: 0,
-    fontFamily: "inherit",
-    whiteSpace: "pre-wrap",
-    lineHeight: "1.55",
-  },
-  status: {
-    alignSelf: "flex-start",
-    fontSize: "var(--text-xs)",
-    color: "var(--grey-500)",
-    fontStyle: "italic",
-  },
-};

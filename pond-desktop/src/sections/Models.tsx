@@ -117,7 +117,7 @@ function ActiveRolesBanner({
   const toolModel = roles?.tool?.model;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+    <div className="roles-banner">
       <div className="role-grid">
         {ROLE_DEFS.map(({ key, label, icon, category }) => {
           const a = roles?.[key];
@@ -141,12 +141,7 @@ function ActiveRolesBanner({
                     {icon}
                     <span className="role-chip__role">{label}</span>
                     {isSet && (
-                      <span style={{
-                        marginLeft: "auto",
-                        display: "flex", alignItems: "center", gap: 3,
-                        fontSize: "var(--text-xs)", fontWeight: 600,
-                        color: "var(--color-success)",
-                      }}>
+                      <span className="role-chip__active-badge">
                         <CheckCircle size={10} strokeWidth={2.5} />
                         Active
                       </span>
@@ -157,14 +152,7 @@ function ActiveRolesBanner({
                       ? <>
                           {a!.model}
                           {dim && (
-                            <span style={{
-                              marginLeft: 5,
-                              fontSize: "var(--text-xs)",
-                              color: "var(--color-text-secondary)",
-                              fontFamily: "var(--font-mono)",
-                            }}>
-                              {dim}
-                            </span>
+                            <span className="role-chip__dim">{dim}</span>
                           )}
                         </>
                       : "---"}
@@ -217,15 +205,13 @@ function ActiveRolesBanner({
 
       {/* Active model capabilities -- shown inline when set */}
       {capabilities && (capabilities.thinking || capabilities.vision || capabilities.audio_input || capabilities.context_window_tokens > 4096) && (
-        <div style={{
-          display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center",
-        }}>
-          {capabilities.thinking && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Thinking</span>}
-          {capabilities.vision && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Vision</span>}
-          {capabilities.audio_input && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Audio</span>}
-          {capabilities.structured_output && <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>Structured</span>}
+        <div className="cap-badge-row">
+          {capabilities.thinking && <span className="cap-badge cap-badge--brand">Thinking</span>}
+          {capabilities.vision && <span className="cap-badge cap-badge--brand">Vision</span>}
+          {capabilities.audio_input && <span className="cap-badge cap-badge--brand">Audio</span>}
+          {capabilities.structured_output && <span className="cap-badge cap-badge--brand">Structured</span>}
           {capabilities.context_window_tokens > 4096 && (
-            <span className="cap-badge" style={{ color: "var(--purple-500)", borderColor: "var(--purple-100)", background: "var(--purple-50)" }}>
+            <span className="cap-badge cap-badge--brand">
               {Math.round(capabilities.context_window_tokens / 1000)}k ctx
             </span>
           )}
@@ -313,9 +299,9 @@ function ModelList({
 }) {
   const state = useAppState();
 
-  if (loading) return <p style={hint}>Loading…</p>;
-  if (error) return <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>;
-  if (models.length === 0) return <p style={hint}>{emptyMessage}</p>;
+  if (loading) return <p className="hint">Loading…</p>;
+  if (error) return <p className="hint hint--error">{error}</p>;
+  if (models.length === 0) return <p className="hint">{emptyMessage}</p>;
 
   function isRoleActive(m: ModelEntry, role: RoleKey) {
     if (role === "tool") {
@@ -331,7 +317,7 @@ function ModelList({
   }
 
   return (
-    <div className="card" style={{ overflow: "hidden" }}>
+    <div className="card card--overflow">
       {models.map((m) => {
         const activeFor = activeRolesFor(m);
         const isAnyActive = activeFor.length > 0;
@@ -443,18 +429,18 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
 
   return (
     <div className="github-accordion">
-      <button className="acc-title" style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open && results.length === 0) search(); }}>
-        <span style={accordionSt.headerLabel}><Download size={13} /> Browse HuggingFace</span>
+      <button className="acc-header" onClick={() => { setOpen((v) => !v); if (!open && results.length === 0) search(); }}>
+        <span className="acc-header__label"><Download size={13} /> Browse HuggingFace</span>
         {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
       </button>
 
       {open && (
-        <div style={accordionSt.body}>
-          <div style={accordionSt.searchRow}>
-            <div style={{ position: "relative", flex: 1 }}>
-              <Search size={13} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-500)", pointerEvents: "none" }} />
+        <div className="acc-body">
+          <div className="acc-search-row">
+            <div className="acc-search-wrap">
+              <Search size={13} className="acc-search-icon" />
               <input
-                style={accordionSt.searchInput}
+                className="acc-search-input"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && search()}
@@ -467,23 +453,23 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
             </Button>
           </div>
 
-          {searchError && <p style={{ ...hint, color: "var(--color-destructive)" }}>{searchError}</p>}
-          {dlMsg && <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>{dlMsg}</p>}
+          {searchError && <p className="hint hint--error">{searchError}</p>}
+          {dlMsg && <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>}
 
           {!searching && results.length === 0 && !searchError && (
             <p className="gh-empty"><Search size={14} /> No results. Search for &quot;gemma&quot;, &quot;llama&quot;, or &quot;mistral&quot;.</p>
           )}
 
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
+          <div className="acc-list">
             {results.map((model) => {
               const isExpanded = expandedRepo === model.id;
               const files = repoFiles[model.id] ?? [];
               return (
-                <div key={model.id} style={accordionSt.repoCard}>
-                  <div style={accordionSt.repoHeader}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <a href={model.url} target="_blank" rel="noopener noreferrer" style={accordionSt.repoId}>{model.id}</a>
-                      <div style={{ display: "flex", flexWrap: "wrap" as const, gap: "4px", marginTop: "2px" }}>
+                <div key={model.id} className="hf-repo">
+                  <div className="hf-repo__header">
+                    <div className="hf-repo__meta">
+                      <a href={model.url} target="_blank" rel="noopener noreferrer" className="hf-repo__id">{model.id}</a>
+                      <div className="hf-repo__tags">
                         <Chip size="sm" variant="soft">↓ {model.downloads?.toLocaleString() ?? "?"}</Chip>
                         <Chip size="sm" variant="soft">♥ {model.likes ?? "?"}</Chip>
                         {model.tags?.slice(0, 2).map((tag) => <Chip key={tag} size="sm" variant="soft">{tag}</Chip>)}
@@ -494,11 +480,11 @@ function BrowseHfAccordion({ onDownloadStarted }: { onDownloadStarted: () => voi
                     </Button>
                   </div>
                   {isExpanded && (
-                    <div style={accordionSt.fileList}>
-                      {loadingFiles === model.id && <p style={{ ...hint, padding: "var(--space-2) var(--space-3)" }}>Loading files…</p>}
+                    <div className="hf-file-list">
+                      {loadingFiles === model.id && <p className="hint" style={{ padding: "var(--space-2) var(--space-3)" }}>Loading files…</p>}
                       {!loadingFiles && files.length === 0 && <p className="gh-empty" style={{ padding: "var(--space-2) var(--space-3)" }}>No .gguf files in this repo.</p>}
                       {files.map((file) => (
-                        <div key={file.filename} style={accordionSt.fileRow}>
+                        <div key={file.filename} className="hf-file-row">
                           <code className="model-row__name">{file.filename}</code>
                           {file.size_mb != null && <Chip size="sm" variant="soft">{file.size_mb.toLocaleString()} MB</Chip>}
                           <Button
@@ -557,22 +543,22 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
 
   return (
     <div className="github-accordion">
-      <button className="acc-title" style={accordionSt.header} onClick={() => { setOpen((v) => !v); if (!open) load(); }}>
-        <span style={accordionSt.headerLabel}><Download size={13} /> Browse GitHub Releases</span>
+      <button className="acc-header" onClick={() => { setOpen((v) => !v); if (!open) load(); }}>
+        <span className="acc-header__label"><Download size={13} /> Browse GitHub Releases</span>
         {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
       </button>
       {open && (
-        <div style={accordionSt.body}>
-          {loading && <p style={hint}>Fetching releases…</p>}
-          {error && <p style={{ ...hint, color: "var(--color-destructive)" }}>{error}</p>}
-          {dlMsg && <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>{dlMsg}</p>}
+        <div className="acc-body">
+          {loading && <p className="hint">Fetching releases…</p>}
+          {error && <p className="hint hint--error">{error}</p>}
+          {dlMsg && <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>}
           {!loading && releases.length === 0 && !error && <p className="gh-empty"><Download size={14} /> No llamafile releases found.</p>}
-          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
+          <div className="acc-list">
             {releases.map((rel) => (
-              <div key={rel.name} style={accordionSt.fileRow}>
-                <div style={{ flex: 1, minWidth: 0 }}>
+              <div key={rel.name} className="hf-file-row">
+                <div className="hf-repo__meta">
                   <code className="model-row__name">{rel.name}</code>
-                  <div style={{ display: "flex", gap: "4px", marginTop: "2px" }}>
+                  <div className="hf-repo__tags">
                     <Chip size="sm" variant="soft">{rel.tag}</Chip>
                     {rel.size_mb != null && <Chip size="sm" variant="soft">{rel.size_mb.toLocaleString()} MB</Chip>}
                   </div>
@@ -593,56 +579,6 @@ function BrowseGithubAccordion({ onDownloadStarted }: { onDownloadStarted: () =>
   );
 }
 
-const accordionSt: Record<string, React.CSSProperties> = {
-  root: {
-    border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-md)",
-    overflow: "hidden",
-    background: "var(--color-bg)",
-  },
-  header: {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    width: "100%", background: "rgba(23,22,22,0.02)", border: "none",
-    padding: "var(--space-3) var(--space-4)", cursor: "pointer",
-    color: "var(--color-text-secondary)", transition: "background var(--transition-fast)",
-  },
-  headerLabel: {
-    display: "flex", alignItems: "center", gap: "var(--space-2)",
-    fontSize: "var(--text-sm)", fontWeight: 600,
-  },
-  body: {
-    display: "flex", flexDirection: "column" as const, gap: "var(--space-2)",
-    padding: "var(--space-3) var(--space-4)",
-    borderTop: "1px solid var(--color-border)",
-  },
-  searchRow: { display: "flex", gap: "var(--space-2)", alignItems: "center" },
-  searchInput: {
-    width: "100%", height: "32px", paddingLeft: "32px", paddingRight: "var(--space-3)",
-    border: "1px solid var(--color-border-strong)", borderRadius: "var(--radius-md)",
-    fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-    background: "var(--color-bg)", color: "var(--color-text)", outline: "none",
-    boxSizing: "border-box" as const,
-  },
-  repoCard: {
-    border: "1px solid var(--color-border)", borderRadius: "var(--radius-md)",
-    overflow: "hidden", background: "rgba(23,22,22,0.01)",
-  },
-  repoHeader: {
-    display: "flex", alignItems: "flex-start", justifyContent: "space-between",
-    gap: "var(--space-3)", padding: "var(--space-2) var(--space-3)",
-  },
-  repoId: {
-    fontWeight: 600, fontSize: "var(--text-xs)", color: "var(--color-accent)",
-    textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
-    display: "block",
-  },
-  fileList: { borderTop: "1px solid var(--color-border)", background: "rgba(23,22,22,0.02)" },
-  fileRow: {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    gap: "var(--space-3)", padding: "var(--space-2) var(--space-3)",
-    borderBottom: "1px solid var(--color-border)",
-  },
-};
 
 // ── Ollama Panel ──────────────────────────────────────────────
 
@@ -716,11 +652,11 @@ function OllamaPanel({
   ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div className="ollama-panel">
       {/* Status bar */}
       <div className={`seg-banner ${isRunning ? "seg-banner--info" : "seg-banner--warn"}`}>
         <span className={`giap-status-dot ${ollamaLoading ? "" : isRunning ? "giap-status-dot--online" : "giap-status-dot--offline"}`} />
-        <span style={{ flex: 1 }}>
+        <span className="ollama-status__text">
           {ollamaLoading ? "Checking Ollama…" : isRunning ? `Ollama running — ${ollamaModels.length} model${ollamaModels.length !== 1 ? "s" : ""}` : "Ollama not running"}
         </span>
         {!isRunning && !ollamaLoading && (
@@ -735,12 +671,12 @@ function OllamaPanel({
         </Button>
       </div>
 
-      {pullMsg && <p style={{ ...hint, color: pullMsg.startsWith("Error") ? "var(--color-destructive)" : pullMsg.startsWith("Run") ? "var(--color-text-secondary)" : "var(--color-success)" }}>{pullMsg}</p>}
+      {pullMsg && <p className={`hint ${pullMsg.startsWith("Error") ? "hint--error" : pullMsg.startsWith("Run") ? "hint--secondary" : "hint--success"}`}>{pullMsg}</p>}
 
       {/* Pull row */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div className="ollama-pull-row">
         <input
-          style={pullInputSt}
+          className="pull-input"
           value={pullInput}
           onChange={(e) => setPullInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handlePull()}
@@ -772,12 +708,6 @@ function OllamaPanel({
   );
 }
 
-const pullInputSt: React.CSSProperties = {
-  flex: 1, height: "34px", padding: "0 12px",
-  border: "1px solid var(--grey-200)", borderRadius: "8px",
-  fontSize: "var(--text-sm)", fontFamily: "var(--font-body)",
-  background: "#fff", color: "var(--fg)", outline: "none",
-};
 
 // ── LLM Tab ───────────────────────────────────────────────────
 
@@ -832,7 +762,7 @@ function LlmTab({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+    <div className="llm-tab">
       {/* Provider sub-tabs */}
       <div className="seg-toolbar">
         <Tabs
@@ -858,19 +788,15 @@ function LlmTab({
       </div>
 
       {dlMsg && (
-        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
-          {dlMsg}
-        </p>
+        <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>
       )}
 
       {/* GGUF panel */}
       {provider === "gguf" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+        <div className="provider-panel">
           {ggufDownloaded.length > 0 && (
             <>
-              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                Installed
-              </span>
+              <span className="card__label">Installed</span>
               <ModelList
                 models={ggufDownloaded}
                 loading={modelsLoading}
@@ -885,10 +811,8 @@ function LlmTab({
           )}
           {!modelsLoading && ggufAvailable.length > 0 && (
             <>
-              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                Available for download
-              </span>
-              <div className="card" style={{ overflow: "hidden" }}>
+              <span className="card__label">Available for download</span>
+              <div className="card card--overflow">
                 {ggufAvailable.map((m) => (
                   <div key={m.id} className="model-row">
                     <div>
@@ -916,19 +840,17 @@ function LlmTab({
               </div>
             </>
           )}
-          {modelsLoading && ggufDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
+          {modelsLoading && ggufDownloaded.length === 0 && <p className="hint">Loading\u2026</p>}
           <BrowseHfAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
 
       {/* Llamafile panel */}
       {provider === "llamafile" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+        <div className="provider-panel">
           {llamaDownloaded.length > 0 && (
             <>
-              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                Installed
-              </span>
+              <span className="card__label">Installed</span>
               <ModelList
                 models={llamaDownloaded}
                 loading={modelsLoading}
@@ -943,10 +865,8 @@ function LlmTab({
           )}
           {!modelsLoading && llamaAvailable.length > 0 && (
             <>
-              <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                Available for download
-              </span>
-              <div className="card" style={{ overflow: "hidden" }}>
+              <span className="card__label">Available for download</span>
+              <div className="card card--overflow">
                 {llamaAvailable.map((m) => (
                   <div key={m.id} className="model-row">
                     <div>
@@ -974,7 +894,7 @@ function LlmTab({
               </div>
             </>
           )}
-          {modelsLoading && llamaDownloaded.length === 0 && <p style={hint}>Loading\u2026</p>}
+          {modelsLoading && llamaDownloaded.length === 0 && <p className="hint">Loading\u2026</p>}
           <BrowseGithubAccordion onDownloadStarted={onDownloadStarted} />
         </div>
       )}
@@ -1032,90 +952,58 @@ function FacePanel() {
   const installed = data?.models.filter(m => m.downloaded).length ?? 0;
   const total     = data?.models.length ?? 0;
 
-  const fpHint: React.CSSProperties = {
-    color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0,
-  };
-  const fpBadge: React.CSSProperties = {
-    fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-    color: "var(--color-text-tertiary)", background: "rgba(23,22,22,0.05)",
-    padding: "1px 6px", borderRadius: "var(--radius-xs, 4px)", flexShrink: 0,
-  };
-  const fpRow: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: "var(--space-3)",
-    padding: "var(--space-3) var(--space-4)",
-    background: "var(--color-bg)", border: "1px solid var(--color-border)",
-    borderLeft: "4px solid", transition: "border-color 120ms",
-  };
-  const fpInlineCode: React.CSSProperties = {
-    fontFamily: "var(--font-mono)", fontSize: "0.85em",
-    background: "rgba(23,22,22,0.06)", padding: "1px 5px", borderRadius: 4,
-  };
-
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+    <div className="face-panel">
+      <div className="face-panel__header">
         <ScanFace size={14} style={{ color: CAT_COLOR.face }} />
-        <span style={{
-          fontFamily: "var(--font-display)", fontWeight: 700,
-          fontSize: "var(--text-sm)", textTransform: "uppercase" as const,
-          letterSpacing: "0.06em", color: CAT_COLOR.face,
-        }}>
+        <span className="face-panel__title" style={{ color: CAT_COLOR.face }}>
           Face Recognition
         </span>
         {data && (
-          <span style={fpBadge}>
+          <span className="face-panel__badge">
             {data.feature_enabled ? `${installed}/${total} ready` : "feature disabled"}
           </span>
         )}
-        <div style={{ flex: 1 }} />
+        <div className="face-panel__spacer" />
         <Button variant="ghost" size="sm" onPress={reload} isDisabled={loading}>
           <RefreshCw size={12} /> Refresh
         </Button>
       </div>
 
-      {loading && <p style={fpHint}>Loading...</p>}
-      {error && <p style={{ ...fpHint, color: "var(--color-destructive)" }}>{error}</p>}
+      {loading && <p className="face-panel__hint">Loading...</p>}
+      {error && <p className="face-panel__hint face-panel__hint--error">{error}</p>}
 
       {data && !data.feature_enabled && (
-        <p style={fpHint}>
+        <p className="face-panel__hint">
           Face recognition is disabled in this build. Rebuild pond-server with
-          {" "}<code style={fpInlineCode}>--features face-onnx</code>{" "}
+          {" "}<code className="face-panel__code">--features face-onnx</code>{" "}
           to enable per-user identification.
         </p>
       )}
 
       {data && data.models.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
+        <div className="face-model-list">
           {data.models.map(m => (
             <div
               key={m.name}
-              style={{ ...fpRow, borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent" }}
+              className="face-panel__row"
+              style={{ borderLeftColor: m.downloaded ? CAT_COLOR.face : "transparent" }}
             >
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" as const }}>
-                  <span style={{
-                    fontWeight: 600, fontSize: "var(--text-sm)", color: "var(--color-text)",
-                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
-                  }}>
-                    {m.label}
-                  </span>
-                  <span style={fpBadge}>{m.role}</span>
+              <div className="face-model__body">
+                <div className="face-model__name-row">
+                  <span className="face-model__name">{m.label}</span>
+                  <span className="face-panel__badge">{m.role}</span>
                   {m.downloaded ? (
-                    <span style={{ ...fpBadge, color: "var(--color-success)" }}>
+                    <span className="face-panel__badge face-panel__badge--success">
                       {m.size_mb != null ? `${m.size_mb} MB` : "ready"}
                     </span>
                   ) : (
-                    <span style={{ ...fpBadge, color: "#e5a000" }}>
+                    <span className="face-panel__badge face-panel__badge--warning">
                       missing · ~{m.expected_mb} MB
                     </span>
                   )}
                 </div>
-                <span style={{
-                  fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)",
-                  color: "var(--color-text-tertiary)",
-                }}>
-                  {m.name}
-                </span>
+                <span className="face-model__path">{m.name}</span>
               </div>
             </div>
           ))}
@@ -1123,12 +1011,10 @@ function FacePanel() {
       )}
 
       {data?.models_dir && (
-        <p style={{ ...fpHint, fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", opacity: 0.6 }}>
-          {data.models_dir}
-        </p>
+        <p className="face-panel__hint face-panel__hint--dir">{data.models_dir}</p>
       )}
 
-      <p style={fpHint}>
+      <p className="face-panel__hint">
         Models auto-download on first server boot. The buffalo_l fallback zip ships
         ArcFace R50 + SCRFD 10G; Glint-R100 + SCRFD 34G are fetched separately when
         their mirrors are reachable. Once installed, use the <strong>Faces</strong>
@@ -1155,7 +1041,7 @@ function MemoryStatusBar({ status }: { status: ModelMemoryStatus | null }) {
         <span className="sys-stats__value">{availGb} GB free / {totalGb} GB</span>
         {loaded_model && <Chip size="sm" variant="soft">{loaded_model}</Chip>}
       </div>
-      <div className="dl-progress__track" style={{ height: 8 }}>
+      <div className="dl-progress__track dl-progress__track--mem">
         <div
           className="dl-progress__fill"
           style={{
@@ -1205,24 +1091,20 @@ function AsrCatalogPanel({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div className="provider-panel">
       <div className="seg-banner seg-banner--info">
         <Mic size={14} />
         <span>Automatic Speech Recognition &mdash; Whisper models for voice-to-text</span>
       </div>
 
       {dlMsg && (
-        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
-          {dlMsg}
-        </p>
+        <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>
       )}
 
       {/* Downloaded models */}
       {downloaded.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Installed
-          </span>
+          <span className="card__label">Installed</span>
           <ModelList
             models={downloaded}
             loading={modelsLoading}
@@ -1239,10 +1121,8 @@ function AsrCatalogPanel({
       {/* Available for download */}
       {!modelsLoading && available.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Available for download
-          </span>
-          <div className="card" style={{ overflow: "hidden" }}>
+          <span className="card__label">Available for download</span>
+          <div className="card card--overflow">
             {available.map((m) => (
               <div key={m.id} className="model-row">
                 <div>
@@ -1269,9 +1149,9 @@ function AsrCatalogPanel({
         </>
       )}
 
-      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {modelsLoading && <p className="hint">Loading…</p>}
       {!modelsLoading && models.length === 0 && (
-        <p style={hint}>No Whisper models found in catalog. Try refreshing the registry.</p>
+        <p className="hint">No Whisper models found in catalog. Try refreshing the registry.</p>
       )}
     </div>
   );
@@ -1327,44 +1207,34 @@ function EmbeddingCatalogPanel({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div className="seg-banner" style={{ borderColor: `${CAT_COLOR.embedding}33`, background: `${CAT_COLOR.embedding}0d` }}>
-        <Cpu size={14} style={{ color: CAT_COLOR.embedding, flexShrink: 0 }} />
+    <div className="provider-panel">
+      <div className="seg-banner seg-banner--embed">
+        <Cpu size={14} style={{ color: CAT_COLOR.embedding }} />
         <span>Embedding models help the agent understand your intent and route queries to the right tools</span>
       </div>
 
       {/* First-use note */}
-      <div className="seg-banner" style={{ borderColor: "var(--color-border)", background: "var(--grey-50)" }}>
-        <Download size={13} style={{ color: "var(--grey-500)", flexShrink: 0 }} />
-        <span style={{ color: "var(--grey-600)", fontSize: "var(--text-sm)" }}>
-          First-time setup: the model downloads 23-86 MB on first use. Check server logs for progress.
-        </span>
+      <div className="seg-banner seg-banner--note">
+        <Download size={13} style={{ color: "var(--grey-500)" }} />
+        <span>First-time setup: the model downloads 23-86 MB on first use. Check server logs for progress.</span>
       </div>
 
       {dlMsg && (
-        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
-          {dlMsg}
-        </p>
+        <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>
       )}
 
       {!activeEmbedding && !modelsLoading && downloaded.length === 0 && models.length === 0 && (
-        <p style={{ ...hint, fontStyle: "italic" }}>
-          No embedding models found. Download one below to enable better tool routing.
-        </p>
+        <p className="hint hint--italic">No embedding models found. Download one below to enable better tool routing.</p>
       )}
 
       {!activeEmbedding && !modelsLoading && downloaded.length > 0 && (
-        <p style={{ ...hint, fontStyle: "italic" }}>
-          Set a default embedding model for better tool routing.
-        </p>
+        <p className="hint hint--italic">Set a default embedding model for better tool routing.</p>
       )}
 
       {/* Downloaded / ready models */}
       {downloaded.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Installed
-          </span>
+          <span className="card__label">Installed</span>
           <ModelList
             models={downloaded}
             loading={modelsLoading}
@@ -1381,10 +1251,8 @@ function EmbeddingCatalogPanel({
       {/* Available for download */}
       {!modelsLoading && available.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Available for download
-          </span>
-          <div className="card" style={{ overflow: "hidden" }}>
+          <span className="card__label">Available for download</span>
+          <div className="card card--overflow">
             {available.map((m) => (
               <div key={m.id} className="model-row">
                 <div>
@@ -1403,7 +1271,7 @@ function EmbeddingCatalogPanel({
                     onPress={() => handleDownload(m)}
                     isDisabled={downloadingModel === m.name || !state.serverOnline}
                   >
-                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting…" : "Download"}
                   </Button>
                 </div>
               </div>
@@ -1412,9 +1280,9 @@ function EmbeddingCatalogPanel({
         </>
       )}
 
-      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {modelsLoading && <p className="hint">Loading…</p>}
       {!modelsLoading && models.length === 0 && (
-        <p style={hint}>No embedding models found in catalog. Try refreshing the registry.</p>
+        <p className="hint">No embedding models found in catalog. Try refreshing the registry.</p>
       )}
     </div>
   );
@@ -1457,24 +1325,20 @@ function TtsCatalogPanel({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div className="provider-panel">
       <div className="seg-banner seg-banner--warn">
         <Volume2 size={14} />
         <span>Text-to-Speech &mdash; Piper voices for spoken output</span>
       </div>
 
       {dlMsg && (
-        <p style={{ ...hint, color: dlMsg.startsWith("Error") ? "var(--color-destructive)" : "var(--color-success)" }}>
-          {dlMsg}
-        </p>
+        <p className={`hint ${dlMsg.startsWith("Error") ? "hint--error" : "hint--success"}`}>{dlMsg}</p>
       )}
 
       {/* Downloaded voices */}
       {downloaded.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Installed
-          </span>
+          <span className="card__label">Installed</span>
           <ModelList
             models={downloaded}
             loading={modelsLoading}
@@ -1491,10 +1355,8 @@ function TtsCatalogPanel({
       {/* Available for download */}
       {!modelsLoading && available.length > 0 && (
         <>
-          <span className="card__label" style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Available for download
-          </span>
-          <div className="card" style={{ overflow: "hidden" }}>
+          <span className="card__label">Available for download</span>
+          <div className="card card--overflow">
             {available.map((m) => (
               <div key={m.id} className="model-row">
                 <div>
@@ -1513,7 +1375,7 @@ function TtsCatalogPanel({
                     onPress={() => handleDownload(m)}
                     isDisabled={downloadingModel === m.name || !state.serverOnline}
                   >
-                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting\u2026" : "Download"}
+                    <Download size={11} strokeWidth={1.8} /> {downloadingModel === m.name ? "Starting…" : "Download"}
                   </Button>
                 </div>
               </div>
@@ -1522,9 +1384,9 @@ function TtsCatalogPanel({
         </>
       )}
 
-      {modelsLoading && <p style={hint}>Loading\u2026</p>}
+      {modelsLoading && <p className="hint">Loading…</p>}
       {!modelsLoading && models.length === 0 && (
-        <p style={hint}>No TTS voices found in catalog. Try refreshing the registry.</p>
+        <p className="hint">No TTS voices found in catalog. Try refreshing the registry.</p>
       )}
     </div>
   );
@@ -1664,12 +1526,12 @@ export function Models() {
           <span className="card__label">Active model roles</span>
           <div className="card-header__right">
             {memoryStatus && memoryStatus.total_mb > 0 && (
-              <span style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <span className="mem-stat">
                 {(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100).toFixed(0)}%
                 {" · "}
                 {(memoryStatus.available_for_llm_mb / 1024).toFixed(1)} / {(memoryStatus.total_mb / 1024).toFixed(1)} GB
                 {memoryStatus.loaded_model && (
-                  <Chip size="sm" variant="flat" color="secondary" style={{ fontSize: "10px" }}>{memoryStatus.loaded_model}</Chip>
+                  <Chip size="sm" variant="flat" color="secondary" className="mem-stat__chip">{memoryStatus.loaded_model}</Chip>
                 )}
               </span>
             )}
@@ -1678,7 +1540,7 @@ export function Models() {
             </Button>
           </div>
         </div>
-        <div className="card-body--tight" style={{ padding: "0 14px 14px" }}>
+        <div className="card-body--roles">
           <ActiveRolesBanner
             roles={activeRoles}
             memoryStatus={memoryStatus}
@@ -1695,7 +1557,7 @@ export function Models() {
 
       {/* Action feedback */}
       {actionMsg && (
-        <p style={{ ...hint, color: actionMsg.ok ? "var(--color-success)" : "var(--color-destructive)" }}>
+        <p className={`hint ${actionMsg.ok ? "hint--success" : "hint--error"}`}>
           {actionMsg.text}
         </p>
       )}
@@ -1729,8 +1591,8 @@ export function Models() {
           </Tabs.ListContainer>
         </Tabs>
         <div className="models-toolbar__right">
-          <div className="models-toolbar__search" style={{ position: "relative" }}>
-            <Search size={13} strokeWidth={1.8} style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--grey-400)", pointerEvents: "none" }} />
+          <div className="models-toolbar__search">
+            <Search size={13} strokeWidth={1.8} className="search-icon" />
             <input
               className="models-search-input"
               placeholder="Search models..."
@@ -1795,4 +1657,3 @@ export function Models() {
   );
 }
 
-const hint: React.CSSProperties = { color: "var(--color-text-tertiary)", fontSize: "var(--text-sm)", margin: 0 };
