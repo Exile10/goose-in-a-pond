@@ -299,27 +299,43 @@ async fn handshake_handler(
     Ok(Json(response))
 }
 
+/// Log an internal handshake error server-side and return a generic message,
+/// so DB/internal error strings are never leaked to (untrusted) callers.
+fn handshake_error(action: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    tracing::warn!(action, error = %e, "handshake request failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "handshake request failed" })),
+    )
+}
+
+/// Generic 400 for a malformed request body (carries no internal detail).
+fn bad_body() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid request body" })),
+    )
+}
+
 /// Phase 1 of pairing: client requests a challenge (public).
 async fn handshake_init(
     State(state): State<Arc<AppState>>,
     body: Result<Json<InitRequest>, JsonRejection>,
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<Value>)> {
-    let Json(request) = body
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))))?;
-    let resp = state.handshake.init_handshake(request).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("init failed: {e}")})),
-        )
-    })?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .init_handshake(request)
+        .await
+        .map_err(|e| handshake_error("init", e))?;
     Ok(Json(resp))
 }
 
 /// Dedicated, stricter per-IP limiter for `/handshake/verify` — the one
-/// brute-forceable endpoint (an attacker guessing MACs against fresh
-/// challenges). This is tighter than the global limiter and complements the
-/// per-code 5-attempt lockout. 10 attempts / 60 s is ample for legitimate
-/// pairing (a client pairs once) while making online MAC-guessing hopeless.
+/// brute-forceable endpoint (an attacker guessing MACs). It complements the
+/// single-use challenge (each guess burns a challenge, forcing a fresh,
+/// rate-limited `init`). 10 attempts / 60 s is ample for legitimate pairing
+/// (a client pairs once) while making online MAC-guessing hopeless.
 fn verify_limiter() -> &'static crate::middleware::RateLimiter {
     static VERIFY_LIMITER: std::sync::OnceLock<crate::middleware::RateLimiter> =
         std::sync::OnceLock::new();
@@ -341,14 +357,12 @@ async fn handshake_verify(
             Json(json!({"error": "too many handshake attempts; slow down"})),
         ));
     }
-    let Json(request) = body
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))))?;
-    let resp = state.handshake.verify_handshake(request).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("verify failed: {e}")})),
-        )
-    })?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .verify_handshake(request)
+        .await
+        .map_err(|e| handshake_error("verify", e))?;
     Ok(Json(resp))
 }
 
@@ -357,14 +371,12 @@ async fn handshake_refresh(
     State(state): State<Arc<AppState>>,
     body: Result<Json<RefreshRequest>, JsonRejection>,
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
-    let Json(request) = body
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))))?;
-    let resp = state.handshake.refresh(request).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("refresh failed: {e}")})),
-        )
-    })?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .refresh(request)
+        .await
+        .map_err(|e| handshake_error("refresh", e))?;
     Ok(Json(resp))
 }
 
@@ -378,14 +390,12 @@ async fn handshake_revoke(
     State(state): State<Arc<AppState>>,
     body: Result<Json<RevokeRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(request) = body
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))))?;
-    state.handshake.revoke_token(&request.token).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("revoke failed: {e}")})),
-        )
-    })?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    state
+        .handshake
+        .revoke_token(&request.token)
+        .await
+        .map_err(|e| handshake_error("revoke", e))?;
     Ok(Json(json!({"revoked": true})))
 }
 
@@ -401,12 +411,11 @@ async fn handshake_pairing_code(
             Json(json!({"error": "pairing code is only viewable on the host"})),
         ));
     }
-    let code = state.handshake.current_pairing_code().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("lookup failed: {e}")})),
-        )
-    })?;
+    let code = state
+        .handshake
+        .current_pairing_code()
+        .await
+        .map_err(|e| handshake_error("pairing_code_lookup", e))?;
     match code {
         Some(pc) => Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at}))),
         None => Ok(Json(json!({"code": null}))),
@@ -426,12 +435,11 @@ async fn handshake_issue_pairing_code(
             Json(json!({"error": "pairing codes can only be issued on the host"})),
         ));
     }
-    let pc = state.handshake.issue_pairing_code().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("could not issue pairing code: {e}")})),
-        )
-    })?;
+    let pc = state
+        .handshake
+        .issue_pairing_code()
+        .await
+        .map_err(|e| handshake_error("issue_pairing_code", e))?;
     Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at})))
 }
 

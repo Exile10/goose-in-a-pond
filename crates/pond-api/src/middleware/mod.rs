@@ -117,10 +117,13 @@ impl RateLimiter {
 /// Whether to allow unauthenticated loopback clients (local-dev escape hatch).
 /// Off unless `POND_DEV_ALLOW_LOOPBACK` is set to a truthy value.
 fn dev_allow_loopback() -> bool {
-    matches!(
-        std::env::var("POND_DEV_ALLOW_LOOPBACK").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    loopback_flag_enabled(std::env::var("POND_DEV_ALLOW_LOOPBACK").ok().as_deref())
+}
+
+/// Pure truthiness check for the loopback escape-hatch flag. Separated from the
+/// env read so it can be unit-tested without mutating shared process env.
+fn loopback_flag_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("TRUE"))
 }
 
 fn is_public_route(path: &str) -> bool {
@@ -318,6 +321,11 @@ mod tests {
     fn test_is_public_route() {
         assert!(is_public_route("/api/v1/health"));
         assert!(is_public_route("/api/v1/handshake"));
+        assert!(is_public_route("/api/v1/handshake/init"));
+        assert!(is_public_route("/api/v1/handshake/verify"));
+        assert!(is_public_route("/api/v1/handshake/refresh"));
+        assert!(is_public_route("/api/v1/handshake/revoke"));
+        assert!(is_public_route("/api/v1/handshake/pairing-code"));
         assert!(is_public_route("/api/v1/onboard"));
         assert!(is_public_route("/api/v1/onboard/status"));
         assert!(is_public_route("/api/v1/transcribe"));
@@ -334,6 +342,30 @@ mod tests {
     #[test]
     fn test_auth_error_to_response() {
         let err = AuthError::MissingToken;
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_loopback_bypass_is_gated_and_off_by_default() {
+        // Off unless explicitly enabled — the default (env unset) must be false.
+        assert!(!loopback_flag_enabled(None));
+        assert!(!loopback_flag_enabled(Some("")));
+        assert!(!loopback_flag_enabled(Some("0")));
+        assert!(!loopback_flag_enabled(Some("yes")));
+        // Only explicit truthy values enable it.
+        assert!(loopback_flag_enabled(Some("1")));
+        assert!(loopback_flag_enabled(Some("true")));
+        assert!(loopback_flag_enabled(Some("TRUE")));
+    }
+
+    #[test]
+    fn test_protected_route_without_token_is_unauthorized() {
+        // A protected route is not in the public allowlist...
+        assert!(!is_public_route("/api/v1/devices"));
+        // ...and with no Authorization header, the bearer extractor rejects,
+        // which maps to a 401 — i.e. protected routes require a valid token.
+        let headers = HeaderMap::new();
+        let err = extract_bearer_token(&headers).expect_err("missing token must error");
         assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
     }
 }
