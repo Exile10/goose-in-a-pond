@@ -2,8 +2,8 @@
 
 ## Overview
 
-GIAP pins a fork of [block/goose](https://github.com/block/goose) as a git submodule at
-`goose/`. The fork lives at `https://github.com/jarida-io/goose` and carries a small set of
+GIAP pins a fork of [aaif-goose/goose](https://github.com/aaif-goose/goose) as a git submodule at
+`goose/`. The fork lives at `https://github.com/jarida-io/Goose` and carries a small set of
 patches on top of upstream. This document describes those patches, the branch strategy, and
 how to rebase against a new upstream goose release.
 
@@ -18,20 +18,13 @@ how to rebase against a new upstream goose release.
 | Commit | Description | Files |
 |--------|-------------|-------|
 | `5f7dceea` | Replace MCP session panic with warning to allow session switching | `crates/goose/src/agents/mcp_client.rs` |
+| GIAP-local | Add `native_tool_calling` and `use_jinja` fields to `ModelSettings` | `crates/goose/src/providers/local_inference/local_model_registry.rs` |
+| GIAP-local | OR-merge `native_tool_calling` flag in local inference provider | `crates/goose/src/providers/local_inference/local_inference.rs` |
 
 ### Why these patches exist
 
-The MCP session panic fix prevents a hard crash when users switch MCP sessions mid-conversation.
-Upstream has not merged it yet, so it is carried here.
-
-### Native tool-calling support (`native_tool_calling`)
-
-`ModelSettings.native_tool_calling` and `ModelSettings.use_jinja` fields in
-`crates/goose/src/providers/local_inference/local_model_registry.rs` are **already on
-`jarida-io/goose:main`** — they are not a local-only patch. The parent repo's adapter
-(`crates/pond-adapters-local-inference/src/lib.rs`) sets these fields to `true` for
-Apple Silicon and Jetson targets so that models like Gemma 4 use OpenAI-compatible
-chat templates instead of text-based tool emulation.
+- The MCP session panic fix prevents a hard crash when users switch MCP sessions mid-conversation. Upstream has not merged it yet.
+- The `native_tool_calling` / `use_jinja` fields are required for Gemma 4 on Apple Silicon and Jetson — without them the model never sees tools in its trained format and produces immediate EOS. These are GIAP-specific patches; do not drop them during a rebase.
 
 ---
 
@@ -76,7 +69,7 @@ When you want to pull in new upstream goose commits:
 cd goose
 
 # One-time: add the upstream remote
-git remote add upstream https://github.com/block/goose
+git remote add upstream https://github.com/aaif-goose/goose
 
 git fetch upstream
 git checkout giap-patches
