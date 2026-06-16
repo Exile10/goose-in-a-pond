@@ -3,17 +3,19 @@
 -- Three tables back the `SqliteHandshakeAdapter`:
 --   * pairing_codes        — single-use 6-digit codes (only the sha256 hash is
 --                            stored; the plaintext lives process-local until
---                            consumed). failed_attempts gives a soft lockout.
+--                            consumed). A code is consumed on first successful
+--                            pair; bad MAC attempts never touch it (no lockout).
 --   * handshake_challenges — short-lived per-init challenges the client must MAC.
+--                            Consumed on the first verify attempt (one challenge
+--                            = one attempt), which is the brute-force defense.
 --   * session_tokens       — issued session + refresh tokens (sha256-hashed),
 --                            with expiry / refresh-expiry / revoke / last-seen.
 
 CREATE TABLE IF NOT EXISTS pairing_codes (
-    code_hash       TEXT    NOT NULL PRIMARY KEY,
-    created_at      TEXT    NOT NULL,
-    expires_at      TEXT    NOT NULL,
-    consumed_at     TEXT,
-    failed_attempts INTEGER NOT NULL DEFAULT 0
+    code_hash   TEXT NOT NULL PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    consumed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_pairing_codes_active

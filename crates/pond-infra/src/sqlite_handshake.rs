@@ -1,7 +1,7 @@
 //! SQLite-backed [`Handshake`] adapter implementing the two-phase pairing
 //! protocol from `pond-core::ports::handshake` (#93).
 //!
-//! Tables (see `migrations/system/0022_handshake.sql`):
+//! Tables (see `migrations/system/0023_handshake.sql`):
 //! - `pairing_codes`        — single-use codes (only sha256 hash persisted)
 //! - `handshake_challenges` — short-lived challenges, one per `init`
 //! - `session_tokens`       — issued session + refresh tokens (sha256-hashed)
@@ -36,7 +36,6 @@ const PAIRING_CODE_TTL_MIN: i64 = 10;
 const CHALLENGE_TTL_SEC: i64 = 60;
 const SESSION_TTL_HOURS: i64 = 24;
 const REFRESH_TTL_DAYS: i64 = 30;
-const PAIRING_MAX_FAILED_ATTEMPTS: i64 = 5;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -177,16 +176,15 @@ impl SqliteHandshakeAdapter {
         Ok((session_token, refresh_token, expires))
     }
 
-    /// Match a plaintext pairing code against active (unconsumed, unexpired,
-    /// not-locked-out) rows. Returns the matched `code_hash`.
+    /// Match a plaintext pairing code against active (unconsumed, unexpired)
+    /// rows. Returns the matched `code_hash`.
     async fn match_pairing_code(&self, code: &str) -> Result<Option<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT code_hash FROM pairing_codes
-             WHERE consumed_at IS NULL AND expires_at > ? AND failed_attempts < ?
+             WHERE consumed_at IS NULL AND expires_at > ?
              ORDER BY created_at DESC",
         )
         .bind(Self::now().to_rfc3339())
-        .bind(PAIRING_MAX_FAILED_ATTEMPTS)
         .fetch_all(&self.pool)
         .await?;
 
@@ -311,7 +309,26 @@ impl Handshake for SqliteHandshakeAdapter {
             return Ok(self.reject("challenge_expired"));
         }
 
-        // 2. Find the active pairing code whose plaintext (process-local)
+        // 2. Consume the challenge up front — one challenge authorizes exactly
+        //    one verify attempt, success or failure. A wrong guess therefore
+        //    burns the challenge (the client must `init` again, which is
+        //    rate-limited per IP) and never touches the operator's pairing code,
+        //    so there is no remote-triggerable lockout. The `consumed_at IS NULL`
+        //    guard also closes the read→update race if two requests race on the
+        //    same challenge.
+        let attempt_at = Utc::now().to_rfc3339();
+        let consumed = sqlx::query(
+            "UPDATE handshake_challenges SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+        )
+        .bind(&attempt_at)
+        .bind(&request.challenge_id)
+        .execute(&self.pool)
+        .await?;
+        if consumed.rows_affected() == 0 {
+            return Ok(self.reject("challenge_used"));
+        }
+
+        // 3. Find the active pairing code whose plaintext (process-local)
         //    reproduces the submitted MAC.
         let mac_bytes = match hex_decode(&request.mac) {
             Some(b) => b,
@@ -319,10 +336,9 @@ impl Handshake for SqliteHandshakeAdapter {
         };
         let codes: Vec<(String,)> = sqlx::query_as(
             "SELECT code_hash FROM pairing_codes
-             WHERE consumed_at IS NULL AND expires_at > ? AND failed_attempts < ?",
+             WHERE consumed_at IS NULL AND expires_at > ?",
         )
         .bind(Utc::now().to_rfc3339())
-        .bind(PAIRING_MAX_FAILED_ATTEMPTS)
         .fetch_all(&self.pool)
         .await?;
         if codes.is_empty() {
@@ -344,37 +360,25 @@ impl Handshake for SqliteHandshakeAdapter {
         }
 
         let Some(code_hash) = matched_hash else {
-            // Soft lockout: bump failed_attempts on all active codes (we can't
-            // tell which one the client attempted).
-            let _ = sqlx::query(
-                "UPDATE pairing_codes SET failed_attempts = failed_attempts + 1
-                 WHERE consumed_at IS NULL",
-            )
-            .execute(&self.pool)
-            .await;
+            // Wrong code/MAC. The challenge is already spent (step 2) and the
+            // pairing code is untouched, so a bad guess can neither be retried
+            // on this challenge nor lock the operator out.
             return Ok(self.reject("invalid_mac"));
         };
 
-        // 3. Consume challenge + code.
-        let consumed_at = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE handshake_challenges SET consumed_at = ? WHERE id = ?")
-            .bind(&consumed_at)
-            .bind(&request.challenge_id)
-            .execute(&self.pool)
-            .await?;
+        // 4. Consume the matched code (single-use on success), register the
+        //    device, then mint tokens.
         sqlx::query("UPDATE pairing_codes SET consumed_at = ? WHERE code_hash = ?")
-            .bind(&consumed_at)
+            .bind(&attempt_at)
             .bind(&code_hash)
             .execute(&self.pool)
             .await?;
         ISSUED_CODE_CACHE.write().await.remove(&code_hash);
 
-        // 4. Register/refresh the device, then mint tokens.
         let device_id = client_id.clone();
-        let device_name = request
-            .device_name
-            .clone()
-            .unwrap_or_else(|| format!("gotg-{}", &client_id[..client_id.len().min(8)]));
+        let device_name = request.device_name.clone().unwrap_or_else(|| {
+            format!("gotg-{}", client_id.chars().take(8).collect::<String>())
+        });
         let _ = sqlx::query(
             "INSERT INTO devices (id, name, hostname, device_type, ip_address,
                 capabilities, last_seen, is_online, created_at, updated_at)
@@ -385,9 +389,9 @@ impl Handshake for SqliteHandshakeAdapter {
         )
         .bind(&device_id)
         .bind(&device_name)
-        .bind(&consumed_at)
-        .bind(&consumed_at)
-        .bind(&consumed_at)
+        .bind(&attempt_at)
+        .bind(&attempt_at)
+        .bind(&attempt_at)
         .execute(&self.pool)
         .await;
 
@@ -397,7 +401,7 @@ impl Handshake for SqliteHandshakeAdapter {
             client_id = %client_id,
             device = %device_name,
             expires_at = %expires.to_rfc3339(),
-            "🤝 device paired (two-phase handshake)"
+            "device paired (two-phase handshake)"
         );
         Ok(self.response(
             true,
@@ -707,6 +711,139 @@ mod tests {
         assert!(
             !hs.validate_token(&token).await.unwrap(),
             "expired token must be rejected"
+        );
+    }
+
+    async fn init_for(hs: &SqliteHandshakeAdapter, client_id: &str) -> ChallengeResponse {
+        hs.init_handshake(InitRequest {
+            client_id: client_id.into(),
+            client_type: "gotg".into(),
+            client_version: "1.0".into(),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Regression for the reported DoS: a LAN attacker spraying bad MACs must
+    /// NOT lock out the operator's pairing code (no global failed-attempt
+    /// counter anymore). The real device still pairs afterwards.
+    #[tokio::test]
+    async fn bad_mac_attempts_do_not_lock_out_pairing_code() {
+        let hs = fresh().await;
+        let pc = hs.issue_pairing_code().await.unwrap();
+
+        for _ in 0..10 {
+            let init = init_for(&hs, "attacker").await;
+            let resp = hs
+                .verify_handshake(VerifyRequest {
+                    challenge_id: init.challenge_id,
+                    mac: client_mac("999999", &init.challenge, "attacker"),
+                    device_name: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp.rejection_reason.as_deref(), Some("invalid_mac"));
+        }
+
+        // The operator's code is still valid — the legitimate device pairs.
+        let init = init_for(&hs, "device-Z").await;
+        let resp = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: client_mac(&pc.code, &init.challenge, "device-Z"),
+                device_name: None,
+            })
+            .await
+            .unwrap();
+        assert!(resp.accepted, "bad attempts must not lock out the pairing code");
+    }
+
+    /// A challenge authorizes exactly one verify attempt: even a *failed*
+    /// attempt burns it, so it can't be reused to keep guessing.
+    #[tokio::test]
+    async fn challenge_is_single_use_even_on_failure() {
+        let hs = fresh().await;
+        let pc = hs.issue_pairing_code().await.unwrap();
+        let init = init_for(&hs, "device-R").await;
+
+        let bad = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id.clone(),
+                mac: client_mac("000000", &init.challenge, "device-R"),
+                device_name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bad.rejection_reason.as_deref(), Some("invalid_mac"));
+
+        // Same challenge, now with the CORRECT MAC — must still be refused.
+        let reuse = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: client_mac(&pc.code, &init.challenge, "device-R"),
+                device_name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reuse.rejection_reason.as_deref(), Some("challenge_used"));
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_is_rejected() {
+        let hs = fresh().await;
+        let _pc = hs.issue_pairing_code().await.unwrap();
+        let init = init_for(&hs, "device-X").await;
+
+        let past = (Utc::now() - Duration::minutes(5)).to_rfc3339();
+        sqlx::query("UPDATE handshake_challenges SET expires_at = ? WHERE id = ?")
+            .bind(&past)
+            .bind(&init.challenge_id)
+            .execute(&hs.pool)
+            .await
+            .unwrap();
+
+        let resp = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: "00".into(),
+                device_name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.rejection_reason.as_deref(), Some("challenge_expired"));
+    }
+
+    /// After a refresh rotates the pair, the OLD refresh token is revoked and
+    /// must not be replayable.
+    #[tokio::test]
+    async fn refresh_token_cannot_be_reused_after_rotation() {
+        let hs = fresh().await;
+        let pc = hs.issue_pairing_code().await.unwrap();
+        let init = init_for(&hs, "device-Q").await;
+        let paired = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: client_mac(&pc.code, &init.challenge, "device-Q"),
+                device_name: None,
+            })
+            .await
+            .unwrap();
+        let old_refresh = paired.refresh_token.unwrap();
+
+        let rotated = hs
+            .refresh(RefreshRequest { refresh_token: old_refresh.clone() })
+            .await
+            .unwrap();
+        assert!(rotated.accepted, "first refresh should rotate");
+
+        let replay = hs
+            .refresh(RefreshRequest { refresh_token: old_refresh })
+            .await
+            .unwrap();
+        assert!(!replay.accepted, "rotated refresh token must not be replayable");
+        assert_eq!(
+            replay.rejection_reason.as_deref(),
+            Some("invalid_or_expired_refresh")
         );
     }
 }
