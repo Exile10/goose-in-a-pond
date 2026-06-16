@@ -109,7 +109,7 @@ export function Logs() {
         </div>
       </div>
 
-      {error && <p className="text-error" style={{ fontSize: 12, margin: 0 }}>{error}</p>}
+      {error && <p className="text-error text-error--sm">{error}</p>}
 
       <Card className="card logs-table">
         <CardContent className="card-body--flush">

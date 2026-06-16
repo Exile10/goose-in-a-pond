@@ -212,10 +212,9 @@ function OAuthBlock({
           </div>
           <button
             type="button"
-            className="secret-modal__oauth-btn"
+            className="secret-modal__oauth-btn secret-modal__oauth-btn--mt"
             onClick={handleSignIn}
             disabled={disabled}
-            style={{ marginTop: 4 }}
           >
             <ExternalLink size={11} strokeWidth={2} />
             Reopen sign-in window
@@ -420,7 +419,7 @@ function SecretConfigModal({
                     disabled={saving}
                   />
                   {fieldErrors[req.key] && (
-                    <p className="secret-modal__field-error" style={{ marginTop: 4 }}>
+                    <p className="secret-modal__field-error secret-modal__field-error--mt">
                       {fieldErrors[req.key]}
                     </p>
                   )}
@@ -432,7 +431,7 @@ function SecretConfigModal({
           {/* Global error */}
           {globalError && (
             <div className="secret-modal__global-error">
-              <AlertCircle size={13} strokeWidth={2} style={{ flexShrink: 0, marginTop: 1 }} />
+              <AlertCircle size={13} strokeWidth={2} className="secret-modal__alert-icon" />
               {globalError}
             </div>
           )}
@@ -874,7 +873,7 @@ function MarketplaceCard({
               </span>
               {needsSecrets && (
                 <span className="mkt-card__tool-count" title="Requires credentials">
-                  <KeyRound size={9} strokeWidth={2} style={{ display: "inline", verticalAlign: "middle" }} /> credentials
+                  <KeyRound size={9} strokeWidth={2} className="icon-inline" /> credentials
                 </span>
               )}
             </div>
@@ -982,12 +981,8 @@ function BrowseTab({
       <div className="empty-state">
         <Store size={32} strokeWidth={1.2} />
         <div>
-          <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 4 }}>
-            No extensions available
-          </div>
-          <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)" }}>
-            The marketplace is empty right now. Check back later.
-          </div>
+          <div className="empty-state__heading">No extensions available</div>
+          <div className="empty-state__body">The marketplace is empty right now. Check back later.</div>
         </div>
       </div>
     );
@@ -1238,11 +1233,8 @@ export function Extensions() {
       {/* Action feedback */}
       {actionMsg && (
         <p
-          style={{
-            margin: 0,
-            fontSize: "var(--text-sm)",
-            color: actionMsg.ok ? "var(--color-success)" : "var(--color-destructive)",
-          }}
+          className="ext-action-msg"
+          style={{ color: actionMsg.ok ? "var(--color-success)" : "var(--color-destructive)" }}
         >
           {actionMsg.text}
         </p>
@@ -1255,23 +1247,17 @@ export function Extensions() {
           <Card className="card">
             <CardContent>
               {loading && (
-                <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--color-text-tertiary)" }}>
-                  Loading extensions…
-                </p>
+                <p className="ext-status-text">Loading extensions…</p>
               )}
               {!loading && error && (
-                <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--color-destructive)" }}>
-                  {error}
-                </p>
+                <p className="ext-status-text ext-status-text--error">{error}</p>
               )}
               {!loading && !error && extensions.length === 0 && (
                 <div className="empty-state">
                   <Puzzle size={32} strokeWidth={1.2} />
                   <div>
-                    <div style={{ fontWeight: "var(--weight-semibold)", marginBottom: 4 }}>
-                      No extensions registered
-                    </div>
-                    <div style={{ fontSize: "var(--text-sm)", color: "var(--grey-500)" }}>
+                    <div className="empty-state__heading">No extensions registered</div>
+                    <div className="empty-state__body">
                       Add an MCP server extension below, or{" "}
                       <button
                         className="ext-inline-link"
