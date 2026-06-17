@@ -681,7 +681,7 @@ mod tests {
                 assert_eq!(source_ids, &["a1", "a2"]);
                 assert_eq!(merged_content, "combined fact");
             }
-            _ => panic!("expected Merge"),
+            other => panic!("expected Merge, got {other:?}"),
         }
     }
 
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         match &proposals[0].action {
             ConsolidationAction::Prune { id } => assert_eq!(id, "x1"),
-            _ => panic!("expected Prune"),
+            other => panic!("expected Prune, got {other:?}"),
         }
     }
 
@@ -706,7 +706,7 @@ mod tests {
             ConsolidationAction::Merge { source_ids, .. } => {
                 assert_eq!(source_ids, &["n1", "o1"]);
             }
-            _ => panic!("expected Merge from supersede"),
+            other => panic!("expected Merge from supersede, got {other:?}"),
         }
     }
 
