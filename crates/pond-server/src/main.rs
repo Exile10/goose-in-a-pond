@@ -67,7 +67,7 @@ use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_draft::SqliteDraftRepository;
-use pond_infra::sqlite_event_log::SqliteEventLogRepository;
+use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteEventLogRepository};
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use pond_infra::sqlite_model_repository::SqliteModelRepository;
@@ -1789,6 +1789,26 @@ async fn run_server(
     // consumes the listener happens further below.
     let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
 
+    // Event bus + durable event log (#91/#109). The bus is shared with AppState
+    // for publishing on ingest; a background bridge subscribes to it and appends
+    // every bus event (sensor/camera/device) into the unified `events` table, so
+    // events written in normal operation are queryable from pond_logs.db.
+    let event_bus: Arc<dyn pond_core::ports::event_bus::EventBus> =
+        Arc::new(InProcessEventBus::new());
+    {
+        let event_log = SqliteEventLog::new(db.logs.clone());
+        let mut events = event_bus.subscribe();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            use pond_core::ports::event_log::EventLog as _;
+            while let Some(bus_event) = events.next().await {
+                if let Err(e) = event_log.append(bus_event.to_event()).await {
+                    tracing::warn!(error = %e, "failed to persist bus event to event log");
+                }
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -1838,7 +1858,7 @@ async fn run_server(
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
         event_log_repo: event_log_repo,
-        event_bus: Some(Arc::new(InProcessEventBus::new())),
+        event_bus: Some(event_bus.clone()),
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
