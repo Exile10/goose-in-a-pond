@@ -746,6 +746,58 @@ mod tests {
         assert!(parsed[0]["function"]["parameters"].is_object());
     }
 
+    // ── Malformed-input robustness ────────────────────────────────────────────
+
+    #[test]
+    fn malformed_json_tool_call_returns_empty_vec() {
+        // Completely broken JSON — must not panic, must return nothing.
+        let calls = parse_tool_calls("{not valid json at all!!!");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn malformed_arguments_string_in_openai_format_returns_empty_args() {
+        // Valid wrapper but arguments field is not parseable JSON (no braces — avoids
+        // confusing the depth scanner in extract_json_tool_calls).
+        let text = r#"{"tool_calls": [{"function": {"name": "shell", "arguments": "not valid json at all"}}]}"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(calls[0].arguments.is_object());
+        assert!(calls[0].arguments.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn brace_heavy_malformed_arguments_does_not_panic() {
+        // Arguments containing extra `{` confuse the depth scanner so extraction
+        // may fail entirely — the important thing is no panic and no crash.
+        let text = r#"{"tool_calls": [{"function": {"name": "shell", "arguments": "{{bad json"}}]}"#;
+        let calls = parse_tool_calls(text);
+        // Either 0 calls (extraction failed) or 1 call with empty args — never a panic.
+        assert!(calls.len() <= 1);
+        if let Some(call) = calls.first() {
+            assert!(call.arguments.is_object());
+        }
+    }
+
+    #[test]
+    fn malformed_llama3_args_returns_empty_args() {
+        // Llama3 format with unparseable arg JSON — must log + return empty map.
+        let text = "<|tool_call|>call:giap__get_weather{NOT VALID JSON}<tool_call|>";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "giap__get_weather");
+        assert!(calls[0].arguments.is_object());
+        assert!(calls[0].arguments.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_tool_calls_key_returns_empty_vec() {
+        // JSON object present but no tool_calls field — must return nothing.
+        let calls = parse_tool_calls(r#"{"result": "ok"}"#);
+        assert!(calls.is_empty());
+    }
+
     #[test]
     fn compact_tools_json_omits_params() {
         let tools = vec![ToolDefinition {
