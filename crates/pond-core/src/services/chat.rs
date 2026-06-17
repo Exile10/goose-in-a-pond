@@ -1223,6 +1223,59 @@ impl ChatService {
         }
     }
 
+    /// Persist the user side of a turn. Call before starting the agent stream
+    /// so the message is saved even if the stream errors out.
+    pub async fn persist_user_message(&self, message: &str) -> Result<()> {
+        let sm = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            ChatMessage::user(message),
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), sm)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the assistant side of a turn. Call after the agent stream drains.
+    /// `tool_results` is raw JSON strings (one per tool call, in call order).
+    /// `usage` is `(prompt_tokens, completion_tokens)`; pass `None` if unavailable.
+    pub async fn persist_assistant_turn(
+        &self,
+        tool_results: Vec<String>,
+        assistant_text: &str,
+        usage: Option<(u32, u32)>,
+        model_name: Option<&str>,
+    ) -> Result<()> {
+        for content in tool_results {
+            let sm = SessionMessage::new(
+                Uuid::new_v4().to_string(),
+                self.session_id.clone(),
+                ChatMessage::tool_result(content),
+            );
+            self.session_storage
+                .add_message(self.session_id.clone(), sm)
+                .await?;
+        }
+        let sm = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            ChatMessage::assistant(assistant_text),
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), sm)
+            .await?;
+        if let Some((prompt, completion)) = usage {
+            if prompt > 0 || completion > 0 {
+                let _ = self
+                    .session_storage
+                    .increment_usage(&self.session_id, prompt, completion, model_name)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     /// Streaming chat — routes through the Agent, chunks TTS by sentence.
     ///
     /// Differences from `chat_once`:

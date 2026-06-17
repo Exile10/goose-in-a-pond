@@ -725,21 +725,17 @@ async fn chat_stream(
 
         let model_role = "chat";
 
+        let chat_service = pond_core::services::chat::ChatService::new(
+            state.agent.clone(),
+            session_id.clone(),
+            storage.clone(),
+        );
+
         // ── Persist user message ────────────────────────────────────────────
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let user_msg = ChatMessage::user(req.message.clone());
-            let sm = SessionMessage::new(
-                Uuid::new_v4().to_string(),
-                session_id.clone(),
-                user_msg,
-            );
-            if let Err(e) = storage.add_message(session_id.clone(), sm).await {
-                let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
-            }
+        if let Err(e) = chat_service.persist_user_message(&req.message).await {
+            let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+            yield Ok(Event::default().data(data));
+            return;
         }
 
         // ── On-demand llamafile startup ─────────────────────────────────────
@@ -1050,38 +1046,13 @@ async fn chat_stream(
             });
         }
 
-        // Persist tool results (in call order, before the assistant message)
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            for content in tool_results {
-                let sm = SessionMessage::new(
-                    Uuid::new_v4().to_string(),
-                    session_id.clone(),
-                    ChatMessage::tool_result(content),
-                );
-                let _ = storage.add_message(session_id.clone(), sm).await;
-            }
-        }
-
-        // Persist full assistant response (uses revised text if review triggered revision)
-        {
-            use pond_core::domain::message::ChatMessage;
-            use pond_core::domain::session::SessionMessage;
-            let assistant_msg = ChatMessage::assistant(full_text);
-            let sm = SessionMessage::new(Uuid::new_v4().to_string(), session_id.clone(), assistant_msg);
-            let _ = storage.add_message(session_id.clone(), sm).await;
-        }
-
-        // Persist token usage to session
-        if usage_prompt_tokens > 0 || usage_completion_tokens > 0 {
-            let _ = storage.increment_usage(
-                &session_id,
-                usage_prompt_tokens,
-                usage_completion_tokens,
-                Some(&model_name_for_done),
-            ).await;
-        }
+        // ── Persist assistant turn (tool results + response + usage) ───────
+        let _ = chat_service.persist_assistant_turn(
+            tool_results,
+            &full_text,
+            Some((usage_prompt_tokens, usage_completion_tokens)),
+            Some(&model_name_for_done),
+        ).await;
 
         // ── Per-turn telemetry ──────────────────────────────────────────
         if settings.telemetry_enabled {
@@ -4961,9 +4932,32 @@ async fn agent_chat_stream(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let agent = state.agent.clone();
+    let storage = state.session_storage.clone();
 
     let stream = async_stream::stream! {
         let _permit = permit;
+
+        let chat_service = pond_core::services::chat::ChatService::new(
+            agent.clone(),
+            session_id.clone(),
+            storage.clone(),
+        );
+
+        if storage.get_session(&session_id).await.is_err() {
+            if let Err(e) = storage.create_session(session_id.clone()).await {
+                yield Ok(Event::default().data(json!({"error": e.to_string()}).to_string()));
+                return;
+            }
+        }
+
+        if let Err(e) = chat_service.persist_user_message(&message).await {
+            yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
+            return;
+        }
+
+        let mut full_text = String::new();
+        let mut tool_results: Vec<String> = Vec::new();
+
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -5000,6 +4994,11 @@ async fn agent_chat_stream(
                         }
                         AgentStreamEvent::ToolResult { tool, id, content } => {
                             let (clean_content, ui_hint) = extract_ui_hint(&content);
+                            tool_results.push(json!({
+                                "tool_call_id": id,
+                                "tool": tool,
+                                "content": clean_content,
+                            }).to_string());
                             let mut ev = serde_json::json!({
                                 "type": "tool_result",
                                 "tool": tool,
@@ -5016,6 +5015,7 @@ async fn agent_chat_stream(
                             if visible.is_empty() {
                                 None
                             } else {
+                                full_text.push_str(&visible);
                                 Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
                             }
                         }
@@ -5077,9 +5077,18 @@ async fn agent_chat_stream(
 
         let tail = thought.flush();
         if !tail.is_empty() {
+            full_text.push_str(&tail);
             let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
             yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
         }
+
+        // ── Persist assistant turn ──────────────────────────────────────────
+        let _ = chat_service.persist_assistant_turn(
+            tool_results,
+            &full_text,
+            None,
+            None,
+        ).await;
     };
 
     Sse::new(stream)
