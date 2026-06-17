@@ -33,6 +33,7 @@ mod schedule_executors;
 mod startup;
 mod system_deps;
 mod three_stage_consolidator;
+mod tracing_setup;
 mod whisper_process;
 
 use anyhow::Result;
@@ -81,6 +82,7 @@ use pond_infra::sqlite_sensor::{SqliteCameraStorage, SqliteSensorStorage};
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
+use pond_infra::sqlite_telemetry::SqliteTelemetry;
 use pond_infra_scheduler::CronSchedulerAdapter;
 use schedule_executors::{AgentScheduleExecutor, DeferredExecutor};
 use std::collections::HashMap;
@@ -402,6 +404,7 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
+    let data_dir = default_data_dir();
 
     match cli.command {
         Some(Commands::Setup { model }) => run_setup(&model).await,
@@ -412,8 +415,8 @@ async fn async_main() -> Result<()> {
             agent,
             native,
         }) => {
-            init_tracing(debug);
-            run_server(static_dir, open, debug, &agent, native).await
+            let drain = tracing_setup::init_tracing(debug, &data_dir);
+            run_server(static_dir, open, debug, &agent, native, drain).await
         }
         Some(Commands::Chat {
             provider,
@@ -424,7 +427,7 @@ async fn async_main() -> Result<()> {
             tts,
             tts_model,
         }) => {
-            init_tracing(false);
+            let _log = tracing_setup::init_tracing(false, &data_dir);
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
@@ -445,7 +448,7 @@ async fn async_main() -> Result<()> {
         }
         Some(Commands::Models { action }) => run_models(action).await,
         Some(Commands::Agent { action }) => {
-            init_tracing(false);
+            let _log = tracing_setup::init_tracing(false, &data_dir);
             run_agent_cmd(action).await
         }
         Some(Commands::Prompts { action }) => run_prompts_cmd(action).await,
@@ -460,31 +463,12 @@ async fn async_main() -> Result<()> {
         }) => run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await,
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
-            init_tracing(false);
+            let _log = tracing_setup::init_tracing(false, &data_dir);
             run_chat(None, None, "stdin", None, true, Some("none"), None).await
         }
     }
 }
 
-fn init_tracing(debug: bool) {
-    // In debug mode, our own crates run at DEBUG while noisy third-party crates
-    // (sqlx, hyper, tower, reqwest) are capped at WARN so their internal query
-    // and connection tracing does not drown out the useful output.
-    //
-    // RUST_LOG always takes priority, so a developer can still override any
-    // target at runtime:
-    //   RUST_LOG=sqlx=debug cargo run -p pond-server -- serve --debug
-    let filter = if debug {
-        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn"
-    } else {
-        "info"
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .init();
-}
 
 async fn run_setup(model: &str) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
@@ -779,6 +763,7 @@ async fn run_server(
     debug: bool,
     agent_backend: &str,
     native: bool,
+    drain_handle: tracing_setup::LogDrainHandle,
 ) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
     println!(
@@ -1835,6 +1820,20 @@ async fn run_server(
     let event_log_repo: Option<Arc<dyn pond_core::ports::event_log::EventLogRepository>> =
         Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
 
+    // Start routing WARN+ tracing events into the SQLite event log.
+    // _file_guard must live until run_server returns so the background file
+    // writer keeps flushing log output to disk.
+    let _file_guard = drain_handle.drain_into(event_log_repo.clone());
+
+    let telemetry: Option<Arc<dyn pond_core::ports::telemetry::TelemetryPort>> =
+        match SqliteTelemetry::new(db.logs.clone()).await {
+            Ok(t) => Some(Arc::new(t)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize SQLite telemetry, falling back to in-memory: {e}");
+                Some(Arc::new(pond_core::services::telemetry::InMemoryTelemetry::new()))
+            }
+        };
+
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
@@ -1902,9 +1901,7 @@ async fn run_server(
         consolidation_runner,
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
-        telemetry: Some(Arc::new(
-            pond_core::services::telemetry::InMemoryTelemetry::new(),
-        )),
+        telemetry,
         context_monitor: Arc::new(pond_core::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: pond_mcp_server::all_app_resources()
             .into_iter()
@@ -3964,12 +3961,15 @@ async fn run_main_menu() -> Result<()> {
                 run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
             }
             "2" => {
+                let data_dir = default_data_dir();
+                let drain = tracing_setup::init_tracing(false, &data_dir);
                 run_server(
                     std::path::PathBuf::from("web/dist"),
                     false,
                     false,
                     "goose",
                     false,
+                    drain,
                 )
                 .await?;
             }
