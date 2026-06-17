@@ -19,3 +19,4 @@ pub mod sqlite_sensor;
 pub mod sqlite_session_storage;
 pub mod sqlite_settings;
 pub mod sqlite_skill;
+pub mod sqlite_telemetry;
