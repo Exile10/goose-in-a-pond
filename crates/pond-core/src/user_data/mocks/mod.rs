@@ -1,4 +1,5 @@
 pub mod mock_device_control;
+pub mod mock_device_controller;
 pub mod mock_device_registry;
 pub mod mock_memory;
 pub mod mock_profile;

@@ -89,6 +89,7 @@ use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::security::ports::handshake::Handshake;
 use pond_core::security::ports::policy::SecurityPolicy;
 use pond_core::security::ports::telemetry::TelemetryPort;
+use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::face_recognition::FaceRecognition;
@@ -229,6 +230,10 @@ pub struct AppState {
     /// Used by the `/api/v1/logs` endpoint.
     /// `None` in tests.
     pub event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>>,
+    /// In-process event bus (#91): `record_sensor` / `record_camera_event`
+    /// publish here so reactive consumers (the rules engine, live dashboards)
+    /// can respond. `None` in tests that don't exercise the bus.
+    pub event_bus: Option<Arc<dyn EventBus>>,
     /// Biometric face recognition service (register + identify household
     /// members from camera frames).  `None` when no ONNX embedding model
     /// is configured — all face endpoints then return 503.

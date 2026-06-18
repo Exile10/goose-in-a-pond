@@ -2,6 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::security::domain::event::{Event, EventQuery};
+
 /// A single entry from the `event_log` table in `pond_logs.db`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -28,4 +30,20 @@ pub trait EventLogRepository: Send + Sync {
         message: &str,
         metadata: Option<&str>,
     ) -> Result<()>;
+}
+
+/// Driven Port: the unified, append-only event log (#108).
+///
+/// Supersedes the ad-hoc [`EventLogRepository`] shape (which the desktop Logs
+/// screen still uses) by storing the correlatable, typed [`Event`] model that
+/// the whole pipeline emits into. The durable SQLite adapter (Q2-32) and the
+/// activity query API (Q2-37) build on this trait; the legacy repository above
+/// is retained until those land and callers migrate.
+#[async_trait]
+pub trait EventLog: Send + Sync {
+    /// Append a single event. Append-only — events are never mutated.
+    async fn append(&self, event: Event) -> Result<()>;
+
+    /// Return matching events, newest first, honoring `query.limit`.
+    async fn query(&self, query: EventQuery) -> Result<Vec<Event>>;
 }

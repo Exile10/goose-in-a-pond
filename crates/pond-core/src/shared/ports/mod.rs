@@ -1,1 +1,1 @@
-// shared has no ports — pure types only.
+pub mod event_bus;
