@@ -10,7 +10,7 @@ interface DeviceTileProps {
 }
 
 export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
-  const [st, set] = useDeviceState(device.id);
+  const [st, , control] = useDeviceState(device.id);
   const k = device.kind;
   const { on, locked, target = 70 } = st;
 
@@ -65,9 +65,9 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   }
 
   function handle() {
-    if (k === "light" || k === "plug") set({ on: !on });
-    else if (k === "lock") set({ locked: !locked });
-    else if (k === "thermo") set({ target: target >= 74 ? 66 : target + 1 });
+    if (k === "light" || k === "plug") void control({ on: !on });
+    else if (k === "lock") void control({ locked: !locked });
+    else if (k === "thermo") void control({ target: target >= 74 ? 66 : target + 1 });
   }
 
   function openCtrl(e: React.MouseEvent) {

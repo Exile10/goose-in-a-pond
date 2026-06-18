@@ -185,6 +185,10 @@ pub struct AppState {
     /// Used by route handlers to sync the registry when extensions are added/removed.
     pub tool_registry:
         Option<Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>>,
+    /// Direct MCP tool dispatcher — used by `POST /api/v1/tools/invoke` to run a
+    /// tool by name without the LLM. `None` in tests / when unavailable.
+    pub tool_dispatcher:
+        Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
     /// Extension marketplace — curated registry of installable MCP extensions.
     pub marketplace: Option<Arc<dyn ExtensionMarketplace>>,
     /// Secure secret storage for extension API keys and OAuth tokens.

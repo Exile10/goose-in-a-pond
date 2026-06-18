@@ -86,9 +86,39 @@ impl DeviceRegistry for NoDevices {
     }
 }
 
+struct StubDispatcher;
+
+#[async_trait::async_trait]
+impl pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher for StubDispatcher {
+    async fn dispatch(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<pond_core::mcp::ports::tools::tool_dispatcher::ToolCallResult> {
+        Ok(
+            pond_core::mcp::ports::tools::tool_dispatcher::ToolCallResult {
+                content: format!("dispatched {tool_name} with {arguments}"),
+                success: true,
+            },
+        )
+    }
+    async fn available_tools(&self) -> Vec<String> {
+        vec!["giap-device-control__set_device_state".to_string()]
+    }
+    async fn available_tool_definitions(&self) -> Vec<(String, String, serde_json::Value)> {
+        vec![]
+    }
+}
+
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
 async fn make_app() -> (axum::Router, tempfile::TempDir) {
+    make_app_with_dispatcher(None).await
+}
+
+async fn make_app_with_dispatcher(
+    tool_dispatcher: Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
+) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
@@ -156,6 +186,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
+        tool_dispatcher,
         api_port: 4000,
     });
 
@@ -366,6 +397,7 @@ async fn prompt_template_delete_system_returns_403() {
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
+        tool_dispatcher: None,
         api_port: 4000,
     });
 
@@ -830,6 +862,7 @@ async fn returns_501_when_repos_not_configured() {
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
+        tool_dispatcher: None,
         api_port: 4000,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -854,4 +887,56 @@ async fn returns_501_when_repos_not_configured() {
             "expected 501 for {method} {uri}"
         );
     }
+}
+
+// ── Direct tool-invoke (POST /api/v1/tools/invoke) ──────────────────────────────
+
+#[tokio::test]
+async fn invoke_tool_dispatches_and_returns_content() {
+    let (app, _tmp) = make_app_with_dispatcher(Some(Arc::new(StubDispatcher))).await;
+    let resp = app
+        .oneshot(post(
+            "/api/v1/tools/invoke",
+            serde_json::json!({
+                "server": "giap-device-control",
+                "tool": "set_device_state",
+                "args": { "device_id": "lamp-1", "power": true }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
+    assert_eq!(body["tool"], "giap-device-control__set_device_state");
+    assert!(body["content"]
+        .as_str()
+        .unwrap()
+        .contains("set_device_state"));
+}
+
+#[tokio::test]
+async fn invoke_tool_503_when_dispatcher_absent() {
+    let (app, _tmp) = make_app().await; // tool_dispatcher: None
+    let resp = app
+        .oneshot(post(
+            "/api/v1/tools/invoke",
+            serde_json::json!({ "server": "giap-device-control", "tool": "set_device_state" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn invoke_tool_400_when_tool_missing() {
+    let (app, _tmp) = make_app_with_dispatcher(Some(Arc::new(StubDispatcher))).await;
+    let resp = app
+        .oneshot(post(
+            "/api/v1/tools/invoke",
+            serde_json::json!({ "server": "giap-device-control", "tool": "" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

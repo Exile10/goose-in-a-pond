@@ -275,6 +275,22 @@ export class PondApiClient {
     return this.post<unknown>("/api/v1/mcp/tools/call", { name, arguments: args });
   }
 
+  /**
+   * Invoke an MCP tool directly (bypasses the LLM) via `POST /api/v1/tools/invoke`.
+   * Used by the Hub to actuate devices without a chat turn.
+   */
+  async invokeTool(req: {
+    server: string;
+    tool: string;
+    args: Record<string, unknown>;
+  }): Promise<{ tool: string; success: boolean; content: string }> {
+    return this.post("/api/v1/tools/invoke", {
+      server: req.server,
+      tool: req.tool,
+      args: req.args,
+    });
+  }
+
   // ── Usage ─────────────────────────────────────────────────
 
   getUsageSummary(): Promise<UsageSummary> {

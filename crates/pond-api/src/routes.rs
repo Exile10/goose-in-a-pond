@@ -180,6 +180,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── MCP App Resources ────────────────────────────────────────────────
         .route("/mcp/resources", get(mcp_read_resource))
         .route("/mcp/tools/call", post(mcp_call_tool))
+        .route("/tools/invoke", post(invoke_tool))
         // ── System Prompt Extras ───────────────────────────────────────────────
         .route(
             "/agent/extras",
@@ -4972,47 +4973,105 @@ async fn mcp_read_resource(
     }
 }
 
+/// Request body for `POST /api/v1/tools/invoke`.
+#[derive(Debug, Deserialize)]
+struct InvokeToolRequest {
+    /// MCP server prefix (e.g. "giap-device-control"). Optional when `tool` is
+    /// already fully-qualified (contains "__").
+    #[serde(default)]
+    server: String,
+    /// Tool name — bare (e.g. "set_device_state") or fully-qualified.
+    tool: String,
+    /// Tool arguments (JSON object). Defaults to `{}`.
+    #[serde(default)]
+    args: Value,
+}
+
 /// Request body for `POST /api/v1/mcp/tools/call`.
 #[derive(Debug, Deserialize)]
 struct McpToolCallRequest {
-    /// Fully-qualified tool name (e.g. "get_current_weather").
-    #[allow(dead_code)]
+    /// Fully-qualified tool name (e.g. "giap-weather__get_current_weather").
     name: String,
     /// Tool arguments (JSON object).
-    #[allow(dead_code)]
     arguments: Option<Value>,
 }
 
-/// `POST /api/v1/mcp/tools/call` — execute an MCP tool directly.
+/// Compose the fully-qualified tool name the dispatcher expects
+/// (`"<server>__<tool>"`), unless `tool` is already qualified or no server given.
+fn qualify_tool_name(server: &str, tool: &str) -> String {
+    if tool.contains("__") || server.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{server}__{tool}")
+    }
+}
+
+/// Shared direct-dispatch path for the tool-invoke endpoints. Bypasses the LLM:
+/// routes straight to the MCP tool registry and returns the raw result.
+async fn dispatch_tool_direct(
+    state: &Arc<AppState>,
+    qualified: &str,
+    args: Value,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let dispatcher = state.tool_dispatcher.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Tool dispatch is not available on this server." })),
+        )
+    })?;
+    let args = if args.is_null() { json!({}) } else { args };
+    match dispatcher.dispatch(qualified, args).await {
+        Ok(result) => Ok(Json(json!({
+            "tool": qualified,
+            "success": result.success,
+            "content": result.content,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Tool dispatch failed: {e}") })),
+        )),
+    }
+}
+
+/// `POST /api/v1/tools/invoke` — run an MCP tool directly, bypassing the LLM.
 ///
-/// Needed for MCP Apps to call tools back via `app.callServerTool()`.
-/// MVP: returns 501 Not Implemented. Full implementation will route
-/// the call through the appropriate MCP server.
+/// Lets the desktop Hub actuate devices (and call any builtin tool) without a
+/// chat turn. Body: `{ "server": "...", "tool": "...", "args": { ... } }`.
+async fn invoke_tool(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<InvokeToolRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {e}") })),
+        )
+    })?;
+    if req.tool.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`tool` is required." })),
+        ));
+    }
+    let qualified = qualify_tool_name(&req.server, &req.tool);
+    dispatch_tool_direct(&state, &qualified, req.args).await
+}
+
+/// `POST /api/v1/mcp/tools/call` — execute an MCP tool directly by qualified name.
+///
+/// Used by MCP Apps (`app.callServerTool()`). Delegates to the same dispatcher
+/// as `/tools/invoke`.
 async fn mcp_call_tool(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<McpToolCallRequest>, JsonRejection>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let _req = match body {
-        Ok(Json(r)) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("Invalid request: {}", e) })),
-            )
-                .into_response();
-        }
-    };
-
-    // MVP placeholder — full implementation will execute the tool via MCP server
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "Direct tool execution is not yet implemented. Use the agent chat stream instead."
-        })),
-    )
-        .into_response()
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Invalid request: {e}") })),
+        )
+    })?;
+    dispatch_tool_direct(&state, &req.name, req.arguments.unwrap_or_else(|| json!({}))).await
 }
 
 // ── Agent chat stream ─────────────────────────────────────────────────────────

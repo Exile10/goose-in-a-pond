@@ -65,13 +65,13 @@ interface RoomButtonProps {
 }
 
 function RoomButton({ config }: RoomButtonProps): React.ReactElement {
-  const [state, set] = useDeviceState(config.deviceId);
+  const [state, , control] = useDeviceState(config.deviceId);
   const on = state.on;
 
   return (
     <button
       type="button"
-      onClick={() => set({ on: !on })}
+      onClick={() => void control({ on: !on })}
       style={{
         padding: "11px 12px",
         borderRadius: 12,

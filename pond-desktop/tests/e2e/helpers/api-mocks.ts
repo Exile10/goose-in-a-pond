@@ -22,6 +22,14 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { token: "e2e-test-token", session_id: "e2e-session" } }),
   );
 
+  // Direct tool invoke (Hub device control bypasses the LLM)
+  await page.route("**/api/v1/tools/invoke", (route) => {
+    const body = route.request().postDataJSON() as { server?: string; tool?: string };
+    return route.fulfill({
+      json: { tool: `${body.server ?? ""}__${body.tool ?? ""}`, success: true, content: "ok" },
+    });
+  });
+
   // Onboarding
   await page.route("**/api/v1/onboard/status", (route) =>
     route.fulfill({ json: { onboarded: true, current_step: "Completed", steps_completed: 9, total_steps: 9 } }),
