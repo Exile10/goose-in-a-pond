@@ -612,7 +612,6 @@ impl GooseAdapter {
                     let mut settings = ModelSettings::default();
                     settings.native_tool_calling = true;
                     settings.use_jinja = true;
-                    settings.enable_thinking = false;
                     let entry = LocalModelEntry {
                         id: stem.clone(),
                         repo_id: format!("local/{}", stem),
@@ -622,10 +621,6 @@ impl GooseAdapter {
                         source_url: String::new(),
                         settings,
                         size_bytes: 0,
-                        mmproj_path: None,
-                        mmproj_size_bytes: 0,
-                        mmproj_source_url: None,
-                        shard_files: vec![],
                     };
                     match registry.add_model(entry) {
                         Ok(_) => {
