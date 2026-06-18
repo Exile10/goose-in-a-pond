@@ -10,6 +10,7 @@ use pond_adapters_weather::WeatherProvider;
 use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
@@ -50,6 +51,7 @@ pub fn register_giap_extensions(
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
     recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
     draft_repo: Arc<dyn DraftRepository + Send + Sync>,
+    device_control: Arc<dyn DeviceControlPort + Send + Sync>,
     tool_caller: Option<Arc<dyn ToolCaller>>,
 ) -> Result<Vec<String>> {
     // Set the ToolCaller specialist — all MCP tools use it for param generation
@@ -104,6 +106,14 @@ pub fn register_giap_extensions(
         );
         register_builtin_extension("giap-device", pond_mcp_server::spawn_device_server);
         registered.push("giap-device".into());
+
+        // Device actuation surface (set_device_state) — grouped with device read.
+        pond_mcp_server::init_device_control_deps(device_control);
+        register_builtin_extension(
+            "giap-device-control",
+            pond_mcp_server::spawn_device_control_server,
+        );
+        registered.push("giap-device-control".into());
     }
 
     // ── Knowledge expansion servers ────────────────────────────────────────

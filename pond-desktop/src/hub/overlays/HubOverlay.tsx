@@ -5,7 +5,7 @@ import { HubModal as Modal } from "../primitives/HubModal";
 import { CameraFeed } from "../primitives/CameraFeed";
 import { type DeviceData, type DeviceKind } from "../data/mockHome";
 import { useHomeData } from "../state/hubDataStore";
-import { useDeviceState, hubSetDevice } from "../state/hubStore";
+import { useDeviceState, hubControlDevice } from "../state/hubStore";
 
 // ─── Light control ────────────────────────────────────────────
 const TEMPS: Array<{ k: string; c: string; label: string }> = [
@@ -16,7 +16,7 @@ const TEMPS: Array<{ k: string; c: string; label: string }> = [
 ];
 
 function LightControl({ device }: { device: DeviceData }) {
-  const [st, set] = useDeviceState(device.id);
+  const [st, set, control] = useDeviceState(device.id);
   return (
     <>
       <div
@@ -45,7 +45,7 @@ function LightControl({ device }: { device: DeviceData }) {
             value={st.brightness}
             onChange={(e) => {
               const b = Number(e.target.value);
-              set({ brightness: b, on: b > 0 });
+              control({ brightness: b, on: b > 0 });
             }}
             style={{
               background: `linear-gradient(90deg,#F59E0B ${st.brightness}%,var(--line) ${st.brightness}%)`,
@@ -82,10 +82,10 @@ function LightControl({ device }: { device: DeviceData }) {
 
 // ─── Thermostat control ───────────────────────────────────────
 function ThermostatControl({ device }: { device: DeviceData }) {
-  const [st, set] = useDeviceState(device.id);
+  const [st, set, control] = useDeviceState(device.id);
   const target = st.target ?? 70;
   const pct = Math.max(0, Math.min(100, ((target - 60) / 20) * 100));
-  const bump = (d: number) => set({ target: Math.max(60, Math.min(80, target + d)) });
+  const bump = (d: number) => control({ target: Math.max(60, Math.min(80, target + d)) });
   return (
     <>
       <div className="thermo-dial">
@@ -165,7 +165,7 @@ const LOCK_HISTORY: Array<{ who: string; act: string; t: string }> = [
 ];
 
 function LockControl({ device }: { device: DeviceData }) {
-  const [st, set] = useDeviceState(device.id);
+  const [st, , control] = useDeviceState(device.id);
   const locked = st.locked;
   return (
     <>
@@ -183,7 +183,7 @@ function LockControl({ device }: { device: DeviceData }) {
       <button
         className="lock-action"
         data-locked={locked}
-        onClick={() => set({ locked: !locked })}
+        onClick={() => control({ locked: !locked })}
         type="button"
       >
         <HubIco d={locked ? unlockEl : lockEl} size={18} color="#fff" />{" "}
@@ -265,12 +265,12 @@ interface DeviceControlProps {
 function DeviceControl({ deviceId, onClose }: DeviceControlProps) {
   const home = useHomeData();
   const device = home.devices.find((d) => d.id === deviceId);
-  const [st, set] = useDeviceState(deviceId);
+  const [st, , control] = useDeviceState(deviceId);
   if (!device) return null;
   const k = device.kind;
   const on = k === "lock" ? st.locked : (k === "thermo" ? true : st.on);
   const showSwitch = k === "light" || k === "plug";
-  const toggle = () => set(k === "lock" ? { locked: !st.locked } : { on: !st.on });
+  const toggle = () => control(k === "lock" ? { locked: !st.locked } : { on: !st.on });
   const tint   = KIND_TINT[k];
   const tintBg = KIND_TINTBG[k];
 
@@ -395,7 +395,7 @@ function catIconFor(kind: DeviceKind, on: boolean): string | React.ReactNode {
 }
 
 function CatRow({ device }: { device: DeviceData }) {
-  const [st, set] = useDeviceState(device.id);
+  const [st, , control] = useDeviceState(device.id);
   const k = device.kind;
   const on = k === "lock" ? st.locked : st.on;
   const tint = CAT_ROW_TINT[k];
@@ -417,7 +417,7 @@ function CatRow({ device }: { device: DeviceData }) {
         <div className="catrow__therm">
           <button
             type="button"
-            onClick={() => set({ target: Math.max(60, (st.target ?? 70) - 1) })}
+            onClick={() => control({ target: Math.max(60, (st.target ?? 70) - 1) })}
             aria-label="Decrease"
           >
             <HubIco d={HP_PATHS.minus} size={15} color="var(--ink)" />
@@ -425,7 +425,7 @@ function CatRow({ device }: { device: DeviceData }) {
           <span>{st.target ?? 70}°</span>
           <button
             type="button"
-            onClick={() => set({ target: Math.min(80, (st.target ?? 70) + 1) })}
+            onClick={() => control({ target: Math.min(80, (st.target ?? 70) + 1) })}
             aria-label="Increase"
           >
             <HubIco d={HP_PATHS.plus} size={15} color="var(--ink)" />
@@ -437,7 +437,7 @@ function CatRow({ device }: { device: DeviceData }) {
           data-on={on}
           type="button"
           aria-label={`Toggle ${device.name}`}
-          onClick={() => set(k === "lock" ? { locked: !st.locked } : { on: !st.on })}
+          onClick={() => control(k === "lock" ? { locked: !st.locked } : { on: !st.on })}
         >
           <span className="htoggle__knob" />
         </button>
@@ -469,9 +469,9 @@ function CategorySheet({ catId, onClose }: CategorySheetProps) {
   const devices = kindFor ? home.devices.filter((d) => d.kind === kindFor) : [];
 
   function allOn(val: boolean) {
-    devices.forEach((d) =>
-      hubSetDevice(d.id, kindFor === "lock" ? { locked: val } : { on: val }),
-    );
+    devices.forEach((d) => {
+      void hubControlDevice(d.id, kindFor === "lock" ? { locked: val } : { on: val });
+    });
   }
 
   const iconPath = HP_PATHS[cat.icon as keyof typeof HP_PATHS];

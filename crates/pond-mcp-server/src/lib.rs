@@ -1,5 +1,6 @@
 // ── Modular MCP servers (Phase 1 split) ─────────────────────────────────────
 pub mod device;
+pub mod device_control;
 pub mod discovery;
 pub mod dispatcher;
 pub mod draft;
@@ -104,6 +105,7 @@ pub async fn generate_params(
 
 // Re-export key types for downstream crates
 pub use device::DeviceMcpServer;
+pub use device_control::DeviceControlMcpServer;
 pub use discovery::DiscoveryMcpServer;
 pub use draft::DraftMcpServer;
 pub use finance::FinanceMcpServer;
@@ -116,6 +118,7 @@ pub use weather::WeatherMcpServer;
 
 // Re-export init + spawn functions for Goose builtin extension registration
 pub use device::{init_device_deps, spawn_device_server};
+pub use device_control::{init_device_control_deps, spawn_device_control_server};
 pub use discovery::{init_discovery_deps, spawn_discovery_server};
 pub use draft::{init_draft_deps, spawn_draft_server};
 pub use finance::{init_finance_deps, spawn_finance_server};

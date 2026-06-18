@@ -1,6 +1,7 @@
 pub mod db;
 pub mod fastembed_embedding;
 pub mod keyring_secret_repository;
+pub mod logging_device_control;
 pub mod mock_handshake;
 pub mod onboarding;
 pub mod pruning;

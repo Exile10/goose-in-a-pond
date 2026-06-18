@@ -113,8 +113,11 @@ function DeviceToggle({ device, onFlash }: DeviceToggleProps) {
     setOn(next);   // optimistic
     setBusy(true);
     try {
-      // TODO: replace with api.toggleDevice(device.id, next) if endpoint is added
-      await api.callTool("giap-device__set_device_state", { id: device.id, on: next });
+      await api.invokeTool({
+        server: "giap-device-control",
+        tool: "set_device_state",
+        args: { device_id: device.id, power: next },
+      });
       onFlash(`${device.name} turned ${next ? "on" : "off"}.`, true);
     } catch (e) {
       setOn(!next);  // revert on failure

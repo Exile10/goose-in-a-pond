@@ -1724,6 +1724,11 @@ async fn run_server(
     let pond_agent_active = false;
 
     #[cfg(feature = "goose-agent")]
+    // Device actuation backend — logging stub until MQTT/HTTP/IR or HA-MCP land.
+    let device_control: Arc<
+        dyn pond_core::user_data::ports::device_control::DeviceControlPort,
+    > = Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new());
+
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
         let default_registry: Arc<
@@ -1750,6 +1755,7 @@ async fn run_server(
                     recipe_repo.clone(),
                     draft_repo.clone(),
                     embedding_provider.clone(),
+                    device_control.clone(),
                 );
                 let disp: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
                     Arc::new(dispatcher);
@@ -1802,6 +1808,7 @@ async fn run_server(
             prompt_template_repo.clone(),
             prompt_extra_repo.clone(),
             draft_repo.clone(),
+            device_control.clone(),
             Some(session_storage.clone()),
             false, // voice_mode — server mode, not voice
         )
@@ -1969,6 +1976,22 @@ async fn run_server(
     // consumes the listener happens further below.
     let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
 
+    // Direct MCP tool dispatcher for POST /api/v1/tools/invoke (bypasses the LLM).
+    let tool_dispatcher: Option<
+        Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>,
+    > = Some(Arc::new(pond_mcp_server::McpToolDispatcher::new(
+        memory_repo.clone(),
+        weather.clone(),
+        scheduler.clone(),
+        settings_repo.clone(),
+        device_registry.clone(),
+        skill_repo.clone(),
+        recipe_repo.clone(),
+        draft_repo.clone(),
+        embedding_provider.clone(),
+        device_control.clone(),
+    )));
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
@@ -1997,6 +2020,7 @@ async fn run_server(
         extension_manager,
         mcp_server_repo,
         tool_registry: Some(tool_registry),
+        tool_dispatcher,
         marketplace: Some(marketplace),
         secret_repo,
         download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -2520,6 +2544,7 @@ async fn run_chat(
             template_repo,
             extras_repo,
             draft_repo,
+            Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             None,               // session_storage — not needed for goose backend
             input == "whisper", // voice_mode
         )
@@ -4480,6 +4505,9 @@ async fn build_goose_backend(
         dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
     >,
     draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync>,
+    device_control: Arc<
+        dyn pond_core::user_data::ports::device_control::DeviceControlPort + Send + Sync,
+    >,
     session_storage: Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
     voice_mode: bool,
 ) -> (
@@ -4533,6 +4561,7 @@ async fn build_goose_backend(
             recipe_repo.clone(),
             draft_repo,
             embedding_provider,
+            device_control.clone(),
         );
 
         let dispatcher: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
@@ -4607,6 +4636,7 @@ async fn build_goose_backend(
         skill_repo.clone(),
         recipe_repo.clone(),
         draft_repo,
+        device_control,
         tool_caller.clone(),
     ) {
         Ok(ext_names) => {
@@ -5131,6 +5161,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 false,
             )
@@ -5166,6 +5197,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 false,
             )
@@ -5229,6 +5261,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 draft_repo,
+                Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 false,
             )

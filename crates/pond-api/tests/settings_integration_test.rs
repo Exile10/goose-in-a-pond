@@ -140,6 +140,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
+        tool_dispatcher: None,
         api_port: 4000,
     });
     (

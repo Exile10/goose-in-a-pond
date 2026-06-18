@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { HOME } from "../data/mockHome";
+import { api } from "../../api/PondApiClient";
 
 // ─── Device state shape ────────────────────────────────────────
 
@@ -74,19 +75,61 @@ function getSnapshot(): Record<string, DeviceState> {
   return store.snapshot;
 }
 
+// ─── Backend actuation ─────────────────────────────────────────
+
+/**
+ * Actuate a device through the backend device-control MCP tool, bypassing the
+ * LLM via `POST /api/v1/tools/invoke`. Optimistic: the patch is applied locally
+ * immediately, then reverted if the call fails. Patches with no actuatable field
+ * (e.g. color-temp or mode only) stay local and skip the round-trip.
+ * Returns true on success (or local-only), false if the backend call failed.
+ */
+export async function controlDevice(id: string, patch: DevicePatch): Promise<boolean> {
+  const prev = getDevice(id);
+  setDevice(id, patch); // optimistic
+
+  const args: Record<string, unknown> = { device_id: id };
+  if (patch.on !== undefined) args.power = patch.on;
+  if (patch.brightness !== undefined) args.brightness = patch.brightness;
+  if (patch.target !== undefined) args.target_temp = patch.target;
+  if (patch.locked !== undefined) args.locked = patch.locked;
+
+  // Only device_id present → nothing the backend can actuate; keep it local.
+  if (Object.keys(args).length === 1) return true;
+
+  try {
+    await api.invokeTool({
+      server: "giap-device-control",
+      tool: "set_device_state",
+      args,
+    });
+    return true;
+  } catch {
+    setDevice(id, prev); // revert on failure
+    return false;
+  }
+}
+
 // ─── React hook ────────────────────────────────────────────────
 
 /**
  * Returns [deviceState, setDeviceState] for a given device id.
  * Reactive: any call to setDeviceState re-renders all subscribers.
  */
-export function useDeviceState(id: string): [DeviceState, (patch: DevicePatch) => void] {
+export function useDeviceState(
+  id: string,
+): [DeviceState, (patch: DevicePatch) => void, (patch: DevicePatch) => Promise<boolean>] {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot);
   const state = snapshot[id] ?? getDevice(id);
   const set = (patch: DevicePatch) => setDevice(id, patch);
-  return [state, set];
+  const control = (patch: DevicePatch) => controlDevice(id, patch);
+  return [state, set, control];
 }
 
-// Expose raw setDevice for non-React contexts (e.g. event handlers from
-// CategoryDock that may need to toggle multiple devices at once).
-export { setDevice as hubSetDevice, getDevice as hubGetDevice };
+// Expose raw setDevice + backend actuation for non-React contexts (e.g. event
+// handlers from CategoryDock that toggle multiple devices at once).
+export {
+  setDevice as hubSetDevice,
+  getDevice as hubGetDevice,
+  controlDevice as hubControlDevice,
+};
