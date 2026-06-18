@@ -533,10 +533,12 @@ impl GooseAdapter {
                 settings.chat_provider, settings.chat_model, session_id
             );
             tracing::info!(
-                "Switching Goose provider to {}:{} for session {}",
-                settings.chat_provider,
-                settings.chat_model,
-                session_id
+                target: "giap::trace",
+                kind = "provider_swap",
+                session_id = %session_id,
+                provider = %settings.chat_provider,
+                model = %settings.chat_model,
+                "Switching Goose provider"
             );
             self.agent.update_provider(p, session_id).await?;
             *self.last_provider_key.lock().unwrap_or_else(|e| e.into_inner()) = key.clone();
@@ -648,9 +650,10 @@ impl GooseAdapter {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
 
-        // Stash the user message so MCP tools can fall back to it when the
-        // model calls the right tool but sends empty params (common with small models).
+        // Stash the user message and session ID so MCP tool handlers can read
+        // them for ToolCaller param generation and outbound HTTP trace events.
         pond_mcp_server::set_last_user_message(&request.message);
+        pond_mcp_server::set_current_session_id(&session_id);
 
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
@@ -1168,6 +1171,7 @@ impl GooseAdapter {
         let goose_sid_for_usage = goose_sid.clone();
 
         let user_msg_len = request.message.len();
+        let turn_start = std::time::Instant::now();
 
         // Cancellation token: when the stream is dropped (e.g. voice interrupt),
         // the DropGuard fires and cancels the token.  Goose's agent loop checks
@@ -1185,6 +1189,17 @@ impl GooseAdapter {
             let mut total_output_chars: usize = 0;
             // Track tool call ID → tool name so ToolResult events carry the tool name.
             let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+            // Wall-clock start per tool call (keyed by Goose tool-call ID) for latency.
+            let mut tool_call_starts: HashMap<String, std::time::Instant> = HashMap::new();
+
+            tracing::info!(
+                target: "giap::trace",
+                kind = "turn_start",
+                session_id = %session_id,
+                model = %settings.chat_model,
+                provider = %settings.chat_provider,
+                message_len = user_msg_len,
+            );
 
             let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, Some(cancel_token)).await {
                 Ok(s) => s,
@@ -1216,6 +1231,14 @@ impl GooseAdapter {
                                                 continue;
                                             }
                                             tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
+                                            tool_call_starts.insert(tr.id.clone(), std::time::Instant::now());
+                                            tracing::info!(
+                                                target: "giap::trace",
+                                                kind = "tool_call",
+                                                session_id = %session_id,
+                                                tool = %tool_name,
+                                                tool_id = %tr.id,
+                                            );
                                             yield Ok(AgentStreamEvent::ToolCall {
                                                 id: tr.id.clone(),
                                                 tool: tool_name,
@@ -1239,6 +1262,19 @@ impl GooseAdapter {
                                                 .get(&tr.id)
                                                 .cloned()
                                                 .unwrap_or_default();
+                                            let tool_latency_ms = tool_call_starts
+                                                .remove(&tr.id)
+                                                .map(|s| s.elapsed().as_millis() as u64)
+                                                .unwrap_or(0);
+                                            tracing::info!(
+                                                target: "giap::trace",
+                                                kind = "tool_result",
+                                                session_id = %session_id,
+                                                tool = %tool_name,
+                                                tool_id = %tr.id,
+                                                latency_ms = tool_latency_ms,
+                                                result_len = content_text.len(),
+                                            );
                                             yield Ok(AgentStreamEvent::ToolResult {
                                                 id: tr.id.clone(),
                                                 tool: tool_name,
@@ -1292,6 +1328,15 @@ impl GooseAdapter {
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
                 },
             };
+            let total_latency_ms = turn_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                target: "giap::trace",
+                kind = "turn_end",
+                session_id = %session_id,
+                prompt_tokens = usage.prompt_tokens,
+                completion_tokens = usage.completion_tokens,
+                total_latency_ms,
+            );
             yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage) });
         };
 
