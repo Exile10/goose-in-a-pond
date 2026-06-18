@@ -19,6 +19,7 @@ use axum::{
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
+use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::prompts::{
     build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
     ProfileContext,
@@ -3110,12 +3111,17 @@ async fn record_sensor(
         unit: req.unit,
         recorded_at: chrono::Utc::now(),
     };
-    state.sensor_storage.record(reading).await.map_err(|e| {
+    state.sensor_storage.record(reading.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         )
     })?;
+    // Publish to the in-process bus only after the write succeeds (#91), so
+    // reactive consumers never see an event for a reading that failed to persist.
+    if let Some(bus) = &state.event_bus {
+        bus.publish(BusEvent::Sensor(reading));
+    }
     Ok(StatusCode::CREATED)
 }
 
@@ -3182,7 +3188,7 @@ async fn record_camera_event(
             Json(json!({"error": format!("Invalid request: {}", e)})),
         )
     })?;
-    let event = CameraEvent {
+    let mut event = CameraEvent {
         id: None,
         camera_id: req.camera_id,
         event_type: req.event_type,
@@ -3194,7 +3200,7 @@ async fn record_camera_event(
     };
     let id = state
         .camera_storage
-        .record_event(event)
+        .record_event(event.clone())
         .await
         .map_err(|e| {
             (
@@ -3202,6 +3208,11 @@ async fn record_camera_event(
                 Json(json!({"error": e.to_string()})),
             )
         })?;
+    // Publish the persisted event (now with its DB id) to the in-process bus (#91).
+    if let Some(bus) = &state.event_bus {
+        event.id = Some(id);
+        bus.publish(BusEvent::Camera(event));
+    }
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 

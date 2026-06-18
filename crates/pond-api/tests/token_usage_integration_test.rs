@@ -218,6 +218,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         recipe_repo: None,
         llamafile_manager: None,
         event_log_repo: None,
+        event_bus: None,
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
