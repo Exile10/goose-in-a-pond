@@ -521,6 +521,9 @@ async fn make_app_with_agent(
         context_monitor: Arc::new(pond_core::models::services::context_monitor::ContextMonitor::new()),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
+        tool_dispatcher: None,
+        event_bus: None,
         api_port: 4000,
     });
     (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
