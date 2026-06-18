@@ -89,11 +89,10 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
   return out;
 }
 
-let msgId = 0;
-
 export function Chat() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
+  const msgIdRef = useRef(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -270,8 +269,8 @@ export function Chat() {
     setBusy(true);
 
     inThinkBlockRef.current = false; // reset for new stream
-    const userMsg: Message = { id: ++msgId, role: "user", text };
-    const agentMsg: Message = { id: ++msgId, role: "agent", text: "", streaming: true };
+    const userMsg: Message = { id: ++msgIdRef.current, role: "user", text };
+    const agentMsg: Message = { id: ++msgIdRef.current, role: "agent", text: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, agentMsg]);
 
     try {

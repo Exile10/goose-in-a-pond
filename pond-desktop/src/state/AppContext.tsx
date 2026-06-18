@@ -85,19 +85,9 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
           recipe: inferRecipe(toast.schedule_label),
         };
 
-        if (toast.status === "running") {
-          dispatch({ type: "ADD_SCHEDULE_RUN", payload: notification });
-        } else {
-          // Completion: update existing running entry or add new
-          dispatch({ type: "UPDATE_SCHEDULE_RUN", payload: {
-            id: toast.schedule_id,
-            status: toast.status,
-            result: toast.result,
-            error: toast.error,
-          }});
-          // Also add as new entry in case we missed the running event
-          dispatch({ type: "ADD_SCHEDULE_RUN", payload: notification });
-        }
+        // ADD_SCHEDULE_RUN deduplicates by id (filter + prepend), so it handles
+        // both the normal "running → completed" update and the "missed running event" case.
+        dispatch({ type: "ADD_SCHEDULE_RUN", payload: notification });
       } catch {
         // ignore parse errors
       }
