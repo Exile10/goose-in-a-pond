@@ -116,7 +116,7 @@ export function Skills() {
       )}
 
       {error && (
-        <p className="text-error" style={{ fontSize: 12, margin: 0 }}>{error}</p>
+        <p className="text-error text-error--sm">{error}</p>
       )}
 
       {loading ? (

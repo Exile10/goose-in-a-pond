@@ -484,8 +484,8 @@ export function Chat() {
             <div className="chat-skeleton" aria-busy="true" aria-label="Loading conversation">
               {([88, 64, 72] as const).map((w, i) => (
                 <div key={i} className={`chat-skeleton__row${i % 2 !== 0 ? " chat-skeleton__row--right" : ""}`}>
-                  <div className="chat-skeleton__line" style={{ width: `${w}%`, height: "14px", marginBottom: "6px" }} />
-                  <div className="chat-skeleton__line" style={{ width: `${Math.round(w * 0.65)}%`, height: "14px" }} />
+                  <div className="chat-skeleton__line" style={{ width: `${w}%` }} />
+                  <div className="chat-skeleton__line" style={{ width: `${Math.round(w * 0.65)}%` }} />
                 </div>
               ))}
             </div>
@@ -549,7 +549,6 @@ export function Chat() {
 
               <div
                 className={`bubble__body${msg.error ? " bubble__body--error" : ""}`}
-                style={{ userSelect: "text", wordBreak: "break-word" }}
               >
                 {msg.text || (msg.streaming ? (
                   msg.status
@@ -608,7 +607,7 @@ export function Chat() {
         </div>
         <div className="chat-composer__hint">
           {/* Model selector */}
-          <div ref={modelSelectorRef} style={{ position: "relative" }}>
+          <div ref={modelSelectorRef} className="model-selector-wrap">
             <button
               className={`model-selector-trigger${showModelSelector ? " is-open" : ""}`}
               onClick={() => showModelSelector ? setShowModelSelector(false) : openModelSelector()}
@@ -617,7 +616,7 @@ export function Chat() {
               aria-expanded={showModelSelector}
             >
               <Cpu size={11} />
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+              <span className="model-selector-trigger__label">
                 {modelSwitching ? "Switching..." : modelLabel}
               </span>
               {modelSwitching

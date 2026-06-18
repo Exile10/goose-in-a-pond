@@ -192,16 +192,6 @@ export function Prompts() {
             rows={16}
             spellCheck={false}
             placeholder={`Write the ${PRESET_META[active]?.label?.toLowerCase() ?? active} system prompt…`}
-            style={{
-              width: "100%",
-              border: "1px solid var(--grey-200)",
-              borderRadius: "var(--radius-card)",
-              padding: "12px",
-              background: "var(--bg)",
-              color: "var(--fg)",
-              resize: "vertical",
-              lineHeight: "1.55",
-            }}
           />
           <div className="prompt-foot">
             <div className="prompt-foot__tokens">

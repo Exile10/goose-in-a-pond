@@ -127,7 +127,7 @@ export function ScheduleCalendar({ schedules }: Props) {
   const nowOffsetPx = (nowMinute / 60) * 48;
 
   return (
-    <div ref={containerRef} style={{ position: "relative" }}>
+    <div ref={containerRef} className="sched-cal__wrap">
       <div className="sched-cal">
         {/* ── Header row ─────────────────────────────────── */}
         <div className="sched-cal__header-spacer" />
@@ -180,13 +180,10 @@ export function ScheduleCalendar({ schedules }: Props) {
                     )}
 
                     {/* Pills / dots for this cell — side by side when 2+ */}
-                    <div className="sched-cal__cell-items" style={{
-                      display: "flex",
-                      flexDirection: cellItems.length <= 2 ? "row" : "column",
-                      flexWrap: "wrap",
-                      gap: 2,
-                      alignItems: "flex-start",
-                    }}>
+                    <div
+                      className="sched-cal__cell-items"
+                      style={{ flexDirection: cellItems.length <= 2 ? "row" : "column" }}
+                    >
                       {cellItems.map((slot) =>
                         slot.frequency === "hourly" ? (
                           <button

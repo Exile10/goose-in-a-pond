@@ -445,12 +445,12 @@ export function Canvas() {
         <div className="canvas-toolbar__left">
           <h1 className="page-header__title">Canvas</h1>
           <Chip size="sm" variant="flat">
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <span className="canvas-toolbar__chip-icon">
               <Layers size={12} /> MCP-UI
             </span>
           </Chip>
           <Chip size="sm" variant="flat" color={voiceMode ? undefined : "success"}>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <span className="canvas-toolbar__chip-icon">
               <span className={`status-dot ${voiceMode ? "" : "status-dot--online"}`} />
               {voiceMode ? "voice mode" : "live"}
             </span>
@@ -458,34 +458,18 @@ export function Canvas() {
         </div>
         <div className="canvas-toolbar__right">
           {/* Layout toggle */}
-          <div style={{ display: "flex", border: "1px solid var(--grey-200)", borderRadius: 8, overflow: "hidden" }}>
+          <div className="canvas-layout-toggle">
             <button
               onClick={() => setLayout("grid")}
               title="Grid layout"
-              style={{
-                background: layout === "grid" ? "var(--purple-50)" : "#fff",
-                border: "none",
-                padding: "5px 8px",
-                cursor: "pointer",
-                color: layout === "grid" ? "var(--purple-500)" : "var(--grey-500)",
-                display: "flex",
-                alignItems: "center",
-              }}
+              className={`canvas-layout-toggle__btn${layout === "grid" ? " is-active" : ""}`}
             >
               <Grid3X3 size={14} />
             </button>
             <button
               onClick={() => setLayout("stack")}
               title="Stack layout"
-              style={{
-                background: layout === "stack" ? "var(--purple-50)" : "#fff",
-                border: "none",
-                padding: "5px 8px",
-                cursor: "pointer",
-                color: layout === "stack" ? "var(--purple-500)" : "var(--grey-500)",
-                display: "flex",
-                alignItems: "center",
-              }}
+              className={`canvas-layout-toggle__btn${layout === "stack" ? " is-active" : ""}`}
             >
               <Rows3 size={14} />
             </button>
@@ -550,7 +534,7 @@ export function Canvas() {
             <>
               <div className="chat-dock__head">
                 <div className="chat-dock__title">
-                  <div className="bubble__avatar" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <div className="bubble__avatar">
                     <span className="bubble__avatar-fallback">P</span>
                   </div>
                   <span>Pond</span>
@@ -645,7 +629,7 @@ export function Canvas() {
             </>
           ) : (
             <button className="chat-dock__pill" onClick={() => setDockOpen(true)} title="Show chat">
-              <div className="bubble__avatar" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <div className="bubble__avatar">
                 <span className="bubble__avatar-fallback">P</span>
               </div>
               <span>Chat</span>

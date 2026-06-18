@@ -492,6 +492,9 @@ impl GooseAdapter {
                 }
             }
             "ollama" => {
+                let ollama_host = std::env::var("GIAP_OLLAMA_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                std::env::set_var("OLLAMA_HOST", &ollama_host);
                 std::env::set_var("OLLAMA_TIMEOUT", "600");
                 let model_name = if settings.chat_model.is_empty() {
                     "llama3.2".to_string()

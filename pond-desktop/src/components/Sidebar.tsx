@@ -113,6 +113,7 @@ export function Sidebar() {
         <Button
           size="sm"
           variant="outline"
+          isIconOnly={collapsed}
           className="sidebar__action-btn"
           onPress={switchToVoice}
           aria-label="Voice mode"
@@ -123,6 +124,7 @@ export function Sidebar() {
         <Button
           size="sm"
           variant="outline"
+          isIconOnly={collapsed}
           className="sidebar__action-btn"
           onPress={switchToCanvas}
           aria-label="Canvas mode"
