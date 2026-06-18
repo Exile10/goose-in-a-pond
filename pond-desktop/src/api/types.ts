@@ -400,9 +400,31 @@ export interface CalibrateResponse {
 }
 
 // ── Auth / Handshake ──────────────────────────────────────────
+// Mirrors `pond_core::ports::handshake::HandshakeResponse`.
 export interface HandshakeResponse {
-  token: string;
-  expires_in?: number;
+  accepted: boolean;
+  session_token: string | null;
+  refresh_token?: string | null;
+  /** RFC3339 expiry of the session token. */
+  expires_at?: string | null;
+  hostname: string;
+  server_version: string;
+  capabilities: string[];
+  rejection_reason: string | null;
+}
+
+/** Response from POST /api/v1/handshake/init. */
+export interface ChallengeResponse {
+  challenge_id: string;
+  /** base64-encoded challenge bytes. */
+  challenge: string;
+  expires_at: string;
+}
+
+/** Response from the loopback-only GET /api/v1/handshake/pairing-code. */
+export interface PairingCodeResponse {
+  code: string | null;
+  expires_at?: string;
 }
 
 // ── Model Role Assignments ────────────────────────────────────
