@@ -266,13 +266,13 @@ export function Faces() {
   }
 
   return (
-    <div style={st.root}>
+    <div className="faces-root">
       {/* Header */}
-      <div style={st.header}>
+      <div className="faces-header">
         <ScanFace size={18} style={{ color: "var(--color-accent)" }} />
         <div>
-          <h2 style={st.title}>Face Recognition</h2>
-          <p style={st.subtitle}>
+          <h2 className="faces-title">Face Recognition</h2>
+          <p className="faces-subtitle">
             Enroll household members so Goose can tell who is talking. Only opaque
             embedding vectors are stored — never the raw frame, and the vector
             cannot be reversed back into an image.
@@ -281,54 +281,49 @@ export function Faces() {
       </div>
 
       {available === "unavailable" && (
-        <div style={st.bannerWarn}>
+        <div className="faces-banner--warn">
           <strong>Face recognition isn't turned on yet.</strong> Ask whoever set
           up Goose for you to rebuild the server with face support enabled, then
           come back to this page.
         </div>
       )}
-      {error  && <div style={st.bannerError}>{error}</div>}
-      {banner && <div style={st.bannerOk}>{banner}</div>}
+      {error  && <div className="faces-banner--error">{error}</div>}
+      {banner && <div className="faces-banner--ok">{banner}</div>}
 
-      <div style={st.grid}>
+      <div className="faces-grid">
         {/* Camera */}
-        <section style={st.panel}>
-          <h3 style={st.panelTitle}>Camera</h3>
+        <section className="faces-panel">
+          <h3 className="faces-panel__title">Camera</h3>
           {cameraError ? (
-            <p style={{ color: "var(--color-destructive)" }}>{cameraError}</p>
+            <p className="faces-cam-error">{cameraError}</p>
           ) : (
-            <div style={{ position: "relative" }}>
+            <div className="faces-video-wrap">
               <video
                 ref={videoRef}
                 muted
                 playsInline
-                style={{
-                  width: "100%",
-                  borderRadius: "var(--radius-md)",
-                  background: "#000",
-                  aspectRatio: "4/3",
-                }}
+                className="faces-video"
               />
-              <div style={st.cropGuide} aria-hidden />
+              <div className="faces-crop-guide" aria-hidden />
             </div>
           )}
-          <canvas ref={canvasRef} style={{ display: "none" }} />
-          <p style={st.hint}>
+          <canvas ref={canvasRef} hidden />
+          <p className="faces-hint">
             Keep your face inside the dashed square. The server auto-crops to the
             largest centered square when no bounding box is supplied.
           </p>
         </section>
 
         {/* Controls */}
-        <section style={st.panel}>
-          <h3 style={st.panelTitle}>Enroll &amp; Identify</h3>
+        <section className="faces-panel">
+          <h3 className="faces-panel__title">Enroll &amp; Identify</h3>
 
-          <label style={st.label}>Household member</label>
+          <label className="faces-label">Household member</label>
           <select
             value={selectedProfile}
             onChange={(e) => setSelectedProfile(e.target.value)}
             disabled={profiles.length === 0 || busy !== "idle"}
-            style={st.select}
+            className="faces-select"
           >
             {profiles.length === 0 && <option value="">No profiles — finish onboarding first</option>}
             {profiles.map((p) => (
@@ -336,7 +331,7 @@ export function Faces() {
             ))}
           </select>
 
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-2)", marginTop: "var(--space-3)" }}>
+          <div className="faces-btn-row">
             <Button
               variant="primary" size="sm"
               onPress={handleEnroll}
@@ -361,14 +356,14 @@ export function Faces() {
           </div>
 
           {confirmingDelete && (
-            <div style={st.confirmBox}>
-              <strong style={{ display: "block", marginBottom: 6 }}>
+            <div className="faces-confirm">
+              <strong className="faces-confirm__title">
                 Delete every face embedding for {profileLabel(selectedProfile)}?
               </strong>
-              <span style={{ display: "block", fontSize: "var(--text-xs)", color: "var(--color-text-secondary)", marginBottom: "var(--space-2)" }}>
+              <span className="faces-confirm__desc">
                 This permanently removes {enrollments.length} enrolled sample{enrollments.length === 1 ? "" : "s"}. The profile itself is kept; only the biometric vectors are erased.
               </span>
-              <div style={{ display: "flex", gap: "var(--space-2)" }}>
+              <div className="faces-confirm__actions">
                 <Button variant="ghost" size="sm" onPress={() => setConfirmingDelete(false)}>
                   Cancel
                 </Button>
@@ -380,31 +375,31 @@ export function Faces() {
           )}
 
           {last && (
-            <div style={st.result}>
+            <div className="faces-result">
               {last.identified ? (
                 <>
-                  <div style={{ fontWeight: 600, fontSize: "var(--text-sm)", marginBottom: 4 }}>
+                  <div className="faces-result__heading">
                     Recognised as {profileLabel(last.profile_id ?? "")}
                   </div>
-                  <div style={{ fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" }}>
+                  <div className="faces-result__body">
                     Confidence {pct(last.confidence)} · this looks like a strong match.
                   </div>
                 </>
               ) : last.reason === "liveness_failed" ? (
                 <>
-                  <div style={{ fontWeight: 600, fontSize: "var(--text-sm)", marginBottom: 4 }}>
+                  <div className="faces-result__heading">
                     That didn't look like a live face
                   </div>
-                  <div style={{ fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" }}>
+                  <div className="faces-result__body">
                     Try again with your face in front of the camera and a small natural movement (a blink or slight head turn).
                   </div>
                 </>
               ) : (
                 <>
-                  <div style={{ fontWeight: 600, fontSize: "var(--text-sm)", marginBottom: 4 }}>
+                  <div className="faces-result__heading">
                     No matching profile found
                   </div>
-                  <div style={{ fontSize: "var(--text-xs)", color: "var(--color-text-secondary)" }}>
+                  <div className="faces-result__body">
                     {last.confidence != null && last.confidence > 0
                       ? "We weren't confident enough to make a match. Try a brighter spot, or enrol another sample under similar lighting."
                       : "We couldn't find a face in the camera view. Make sure your face is centred in the dashed square and try again."}
@@ -417,12 +412,12 @@ export function Faces() {
       </div>
 
       {/* Enrollments list */}
-      <section style={st.panel}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={st.panelTitle}>
+      <section className="faces-panel">
+        <div className="faces-panel__head">
+          <h3 className="faces-panel__title">
             Samples for {selectedProfile ? profileLabel(selectedProfile) : "—"}
             {enrollments.length > 0 && (
-              <span style={{ marginLeft: "var(--space-2)", fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", fontWeight: 400 }}>
+              <span className="faces-sample-count">
                 · {enrollments.length} sample{enrollments.length === 1 ? "" : "s"}
               </span>
             )}
@@ -433,17 +428,17 @@ export function Faces() {
         </div>
 
         {enrollments.length === 0 ? (
-          <p style={st.hint}>
+          <p className="faces-hint">
             No samples enrolled yet. Capture 3+ samples (different lighting / angles)
             for best accuracy.
           </p>
         ) : (
-          <ul style={{ listStyle: "none", padding: 0, margin: "var(--space-2) 0 0" }}>
+          <ul className="faces-enrollments">
             {enrollments.map((e) => (
-              <li key={e.id} style={st.enrollmentRow}>
-                <code style={{ color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)" }}>{e.id.slice(0, 12)}…</code>
-                <span style={{ fontSize: "var(--text-xs)" }}>{e.model_dims}-d</span>
-                <span style={{ color: "var(--color-text-tertiary)", fontSize: "var(--text-xs)" }}>
+              <li key={e.id} className="faces-enrollment-row">
+                <code className="faces-enrollment-id">{e.id.slice(0, 12)}…</code>
+                <span className="faces-enrollment-dims">{e.model_dims}-d</span>
+                <span className="faces-enrollment-date">
                   {new Date(e.created_at).toLocaleString()}
                 </span>
               </li>
@@ -455,62 +450,3 @@ export function Faces() {
   );
 }
 
-const st: Record<string, React.CSSProperties> = {
-  root: { display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: "var(--content-max-width)" },
-  header: { display: "flex", gap: "var(--space-3)", alignItems: "flex-start" },
-  title: { margin: 0, fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "var(--text-md)", color: "var(--color-text)" },
-  subtitle: { margin: "var(--space-1) 0 0", fontSize: "var(--text-sm)", color: "var(--color-text-secondary)" },
-  panel: {
-    background: "var(--color-bg)",
-    border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-lg)",
-    padding: "var(--space-4)",
-    display: "flex",
-    flexDirection: "column",
-    gap: "var(--space-2)",
-  },
-  panelTitle: { margin: 0, fontSize: "var(--text-sm)", fontWeight: 700, color: "var(--color-text)", fontFamily: "var(--font-display)", textTransform: "uppercase", letterSpacing: "0.06em" },
-  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "var(--space-4)" },
-  label: { fontSize: "var(--text-xs)", fontWeight: 600, color: "var(--color-text-secondary)", marginBottom: 4 },
-  select: {
-    width: "100%",
-    padding: "8px 10px",
-    borderRadius: "var(--radius-md)",
-    border: "1px solid var(--color-border-strong)",
-    fontSize: "var(--text-sm)",
-    background: "var(--color-bg)",
-    color: "var(--color-text)",
-  },
-  result: {
-    marginTop: "var(--space-3)",
-    padding: "var(--space-3)",
-    background: "rgba(140,82,255,0.06)",
-    border: "1px solid var(--color-border)",
-    borderRadius: "var(--radius-md)",
-    fontSize: "var(--text-sm)",
-    color: "var(--color-text)",
-  },
-  enrollmentRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: "var(--space-3)",
-    padding: "var(--space-2) 0",
-    borderBottom: "1px solid var(--color-border)",
-  },
-  bannerWarn:  { padding: "var(--space-3)", borderRadius: "var(--radius-md)", background: "rgba(245,158,11,0.12)", color: "#92400e", border: "1px solid rgba(245,158,11,0.35)", fontSize: "var(--text-sm)" },
-  bannerError: { padding: "var(--space-3)", borderRadius: "var(--radius-md)", background: "rgba(239,68,68,0.10)", color: "#991b1b", border: "1px solid rgba(239,68,68,0.30)", fontSize: "var(--text-sm)" },
-  bannerOk:    { padding: "var(--space-3)", borderRadius: "var(--radius-md)", background: "rgba(34,197,94,0.10)", color: "#065f46", border: "1px solid rgba(34,197,94,0.30)", fontSize: "var(--text-sm)" },
-  confirmBox:  { marginTop: "var(--space-3)", padding: "var(--space-3)", borderRadius: "var(--radius-md)", background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.30)", fontSize: "var(--text-sm)", color: "var(--color-text)" },
-  hint: { fontSize: "var(--text-xs)", color: "var(--color-text-tertiary)", margin: "var(--space-2) 0 0" },
-  cropGuide: {
-    position: "absolute",
-    top: "50%", left: "50%",
-    width: "60%", aspectRatio: "1/1",
-    transform: "translate(-50%, -50%)",
-    border: "2px dashed rgba(255,255,255,0.75)",
-    borderRadius: "var(--radius-md)",
-    pointerEvents: "none",
-  },
-  code: { fontFamily: "var(--font-mono)", padding: "1px 6px", background: "rgba(0,0,0,0.06)", borderRadius: 4, fontSize: "0.9em" },
-};

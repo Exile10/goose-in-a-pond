@@ -421,28 +421,24 @@ export function Schedules() {
   function renderModal() {
     if (!showForm) return null;
     return (
-      <div style={modalStyles.overlay} onClick={closeModal}>
-        <div style={modalStyles.dialog} onClick={(e) => e.stopPropagation()}>
+      <div className="sched-modal__overlay" onClick={closeModal}>
+        <div className="sched-modal__dialog" onClick={(e) => e.stopPropagation()}>
           {/* Header */}
-          <div style={modalStyles.header}>
-            <h2 style={modalStyles.title}>{editingSchedule ? "Edit Schedule" : "New Schedule"}</h2>
-            <button
-              style={modalStyles.closeBtn}
-              onClick={closeModal}
-              aria-label="Close"
-            >
+          <div className="sched-modal__header">
+            <h2 className="sched-modal__title">{editingSchedule ? "Edit Schedule" : "New Schedule"}</h2>
+            <button className="sched-modal__close" onClick={closeModal} aria-label="Close">
               x
             </button>
           </div>
           <Separator />
 
           {/* Body */}
-          <div style={modalStyles.body}>
+          <div className="sched-modal__body">
             {/* Name */}
-            <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>Name</label>
+            <div className="sched-modal__field">
+              <label className="sched-modal__label">Name</label>
               <input
-                style={modalStyles.input}
+                className="sched-modal__input"
                 placeholder="Daily briefing"
                 aria-label="Schedule name"
                 value={name}
@@ -451,20 +447,17 @@ export function Schedules() {
             </div>
 
             {/* Repeat pattern — pill segmented control */}
-            <div style={modalStyles.fieldGroup}>
-              <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+            <div className="sched-modal__field">
+              <label className="sched-modal__label--row">
                 <Repeat size={13} style={{ color: "var(--color-accent)" }} />
                 Repeat
               </label>
-              <div style={pickerStyles.pillRow} role="group" aria-label="Repeat pattern">
+              <div className="sched-picker__pill-row" role="group" aria-label="Repeat pattern">
                 {REPEAT_PATTERNS.map(({ key, label }) => (
                   <button
                     key={key}
                     type="button"
-                    style={{
-                      ...pickerStyles.pill,
-                      ...(repeat === key ? pickerStyles.pillActive : {}),
-                    }}
+                    className={`sched-picker__pill${repeat === key ? " is-active" : ""}`}
                     onClick={() => setRepeat(key)}
                     aria-pressed={repeat === key}
                   >
@@ -476,12 +469,12 @@ export function Schedules() {
 
             {/* Conditional controls per repeat pattern */}
             {repeat === "hourly" && (
-              <div style={pickerStyles.inlineRow}>
-                <div style={modalStyles.fieldGroup}>
-                  <label style={modalStyles.label}>Every</label>
-                  <div style={pickerStyles.inlineInputGroup}>
+              <div className="sched-picker__inline-row">
+                <div className="sched-modal__field">
+                  <label className="sched-modal__label">Every</label>
+                  <div className="sched-picker__input-group">
                     <select
-                      style={{ ...modalStyles.select, width: 80 }}
+                      className="sched-modal__select sched-modal__select--w80"
                       value={schedCfg.everyNHours}
                       onChange={(e) => updateCfg({ everyNHours: Number(e.target.value) })}
                       aria-label="Every N hours"
@@ -490,16 +483,16 @@ export function Schedules() {
                         <option key={n} value={n}>{n}</option>
                       ))}
                     </select>
-                    <span style={pickerStyles.unitLabel}>hours</span>
+                    <span className="sched-picker__unit">hours</span>
                   </div>
                 </div>
-                <div style={modalStyles.fieldGroup}>
-                  <label style={modalStyles.label}>At minute</label>
+                <div className="sched-modal__field">
+                  <label className="sched-modal__label">At minute</label>
                   <input
                     type="number"
                     min={0}
                     max={59}
-                    style={{ ...modalStyles.input, width: 80 }}
+                    className="sched-modal__input sched-modal__input--w80"
                     value={schedCfg.startMinute}
                     onChange={(e) => updateCfg({ startMinute: Math.min(59, Math.max(0, Number(e.target.value))) })}
                     aria-label="Starting at minute"
@@ -509,15 +502,15 @@ export function Schedules() {
             )}
 
             {(repeat === "daily" || repeat === "weekly" || repeat === "monthly" || repeat === "once") && (
-              <div style={modalStyles.fieldGroup}>
-                <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label--row">
                   <Clock size={12} style={{ color: "var(--grey-500)" }} />
                   Time
                 </label>
-                <div style={pickerStyles.inlineRow}>
-                  <div style={pickerStyles.inlineInputGroup}>
+                <div className="sched-picker__inline-row">
+                  <div className="sched-picker__input-group">
                     <select
-                      style={{ ...modalStyles.select, width: 78 }}
+                      className="sched-modal__select sched-modal__select--w78"
                       value={schedCfg.hour}
                       onChange={(e) => updateCfg({ hour: Number(e.target.value) })}
                       aria-label="Hour"
@@ -526,9 +519,9 @@ export function Schedules() {
                         <option key={i} value={i}>{String(i).padStart(2, "0")}</option>
                       ))}
                     </select>
-                    <span style={pickerStyles.timeSep}>:</span>
+                    <span className="sched-picker__time-sep">:</span>
                     <select
-                      style={{ ...modalStyles.select, width: 78 }}
+                      className="sched-modal__select sched-modal__select--w78"
                       value={schedCfg.minute}
                       onChange={(e) => updateCfg({ minute: Number(e.target.value) })}
                       aria-label="Minute"
@@ -543,9 +536,9 @@ export function Schedules() {
             )}
 
             {repeat === "weekly" && (
-              <div style={modalStyles.fieldGroup}>
-                <label style={modalStyles.label}>Days</label>
-                <div style={pickerStyles.pillRow} role="group" aria-label="Days of week">
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Days</label>
+                <div className="sched-picker__pill-row" role="group" aria-label="Days of week">
                   {DAY_LABELS.map((day, i) => {
                     const val = DAY_VALUES[i];
                     const active = schedCfg.daysOfWeek.includes(val);
@@ -553,10 +546,7 @@ export function Schedules() {
                       <button
                         key={day}
                         type="button"
-                        style={{
-                          ...pickerStyles.pill,
-                          ...(active ? pickerStyles.pillActive : {}),
-                        }}
+                        className={`sched-picker__pill${active ? " is-active" : ""}`}
                         onClick={() => toggleDay(val)}
                         aria-pressed={active}
                       >
@@ -569,33 +559,31 @@ export function Schedules() {
             )}
 
             {repeat === "monthly" && (
-              <div style={modalStyles.fieldGroup}>
-                <label style={modalStyles.label}>Day of month</label>
-                <div style={pickerStyles.inlineInputGroup}>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Day of month</label>
+                <div className="sched-picker__input-group">
                   <input
                     type="number"
                     min={1}
                     max={31}
-                    style={{ ...modalStyles.input, width: 80 }}
+                    className="sched-modal__input sched-modal__input--w80"
                     value={schedCfg.dayOfMonth}
                     onChange={(e) => updateCfg({ dayOfMonth: Math.min(31, Math.max(1, Number(e.target.value))) })}
                     aria-label="Day of month"
                   />
-                  <span style={pickerStyles.unitLabel}>of every month</span>
+                  <span className="sched-picker__unit">of every month</span>
                 </div>
               </div>
             )}
 
             {repeat === "custom" && (
-              <div style={modalStyles.fieldGroup}>
-                <label style={modalStyles.label}>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">
                   Cron expression
-                  <span style={{ fontSize: "11px", color: "var(--grey-500)", fontWeight: 400, marginLeft: 6 }}>
-                    sec min hr dom mon dow
-                  </span>
+                  <span className="sched-modal__cron-hint">sec min hr dom mon dow</span>
                 </label>
                 <input
-                  style={modalStyles.input}
+                  className="sched-modal__input"
                   placeholder="0 0 8 * * *"
                   aria-label="Cron expression"
                   value={schedCfg.customCron}
@@ -606,19 +594,19 @@ export function Schedules() {
             )}
 
             {/* Preview line */}
-            <div style={pickerStyles.preview}>
+            <div className="sched-picker__preview">
               <Clock size={12} style={{ color: "var(--color-accent)", flexShrink: 0 }} />
               <span>{humanPreview(repeat, schedCfg, timezone)}</span>
             </div>
 
             {/* Timezone */}
-            <div style={modalStyles.fieldGroup}>
-              <label style={{ ...modalStyles.label, display: "flex", alignItems: "center", gap: 6 }}>
+            <div className="sched-modal__field">
+              <label className="sched-modal__label--row">
                 <Calendar size={13} style={{ color: "var(--grey-500)" }} />
                 Timezone
               </label>
               <select
-                style={modalStyles.select}
+                className="sched-modal__select"
                 value={timezone}
                 onChange={(e) => setTimezone(e.target.value)}
                 aria-label="Schedule timezone"
@@ -633,10 +621,10 @@ export function Schedules() {
             <Separator />
 
             {/* Recipe select */}
-            <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>Recipe</label>
+            <div className="sched-modal__field">
+              <label className="sched-modal__label">Recipe</label>
               <select
-                style={modalStyles.select}
+                className="sched-modal__select"
                 value={recipeKey}
                 onChange={(e) => handleRecipeChange(e.target.value)}
                 aria-label="Schedule recipe"
@@ -649,10 +637,10 @@ export function Schedules() {
               </select>
             </div>
 
-            <div style={modalStyles.fieldGroup}>
-              <label style={modalStyles.label}>Prompt</label>
+            <div className="sched-modal__field">
+              <label className="sched-modal__label">Prompt</label>
               <textarea
-                style={modalStyles.textarea}
+                className="sched-modal__textarea"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Give me a morning briefing: weather, calendar, and top news."
@@ -665,7 +653,7 @@ export function Schedules() {
           <Separator />
 
           {/* Footer */}
-          <div style={modalStyles.footer}>
+          <div className="sched-modal__footer">
             <Button size="sm" variant="ghost" onPress={closeModal}>
               Cancel
             </Button>
@@ -724,21 +712,9 @@ export function Schedules() {
       </div>
 
       {/* ── Feedback messages ───────────────────────────────── */}
-      {actionMsg && (
-        <p style={{ color: "var(--color-success)", fontSize: "var(--text-sm)", margin: 0 }}>
-          {actionMsg}
-        </p>
-      )}
-      {actionError && (
-        <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>
-          {actionError}
-        </p>
-      )}
-      {error && (
-        <p style={{ color: "var(--color-destructive)", fontSize: "var(--text-sm)", margin: 0 }}>
-          {error}
-        </p>
-      )}
+      {actionMsg   && <p className="sched-msg--ok">{actionMsg}</p>}
+      {actionError && <p className="sched-msg--err">{actionError}</p>}
+      {error       && <p className="sched-msg--err">{error}</p>}
 
       {/* ── Schedule content ────────────────────────────────── */}
       {loading ? (
@@ -868,21 +844,14 @@ export function Schedules() {
                 </div>
 
                 {/* ── Run history toggle ─────────────────── */}
-                <div style={{ marginTop: 8 }}>
-                  <button
-                    onClick={() => toggleRuns(s.id)}
-                    style={{
-                      background: "none", border: "none", cursor: "pointer",
-                      fontSize: 12, color: "var(--grey-500)", display: "flex",
-                      alignItems: "center", gap: 4, padding: 0,
-                    }}
-                  >
+                <div className="sched-history">
+                  <button className="sched-history__toggle" onClick={() => toggleRuns(s.id)}>
                     {expandedRuns === s.id ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                     History
                   </button>
 
                   {expandedRuns === s.id && (
-                    <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                    <div className="sched-history__list">
                       {/* Mini health bar — last 5 run statuses */}
                       {(runsCache[s.id] ?? []).length > 0 && (
                         <div className="sched-health-bar">
@@ -892,7 +861,6 @@ export function Schedules() {
                               className="sched-health-dot"
                               title={`${r.status} — ${new Date(r.started_at).toLocaleString()}`}
                               style={{
-                                width: 8, height: 8, borderRadius: "50%",
                                 background: r.status === "completed"
                                   ? "var(--color-success, #34C759)"
                                   : r.status === "failed"
@@ -904,7 +872,7 @@ export function Schedules() {
                         </div>
                       )}
                       {(runsCache[s.id] ?? []).length === 0 ? (
-                        <span style={{ fontSize: 12, color: "var(--grey-400)" }}>No runs yet.</span>
+                        <span className="sched-history__empty">No runs yet.</span>
                       ) : (
                         (runsCache[s.id] ?? []).map((r) => (
                           <div key={r.id} className="sched-run-row">
@@ -966,174 +934,3 @@ export function Schedules() {
   );
 }
 
-/* cronStyle removed — cron is now styled via .sched-card__cron CSS class */
-
-/* ── Schedule picker styles ────────────────────────────────── */
-const pickerStyles: Record<string, React.CSSProperties> = {
-  pillRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "6px",
-  },
-  pill: {
-    height: "30px",
-    padding: "0 12px",
-    borderRadius: "var(--radius-pill)",
-    border: "1px solid var(--grey-300)",
-    background: "#fff",
-    color: "var(--grey-600)",
-    fontSize: "12px",
-    fontFamily: "var(--font-body)",
-    fontWeight: 500,
-    cursor: "pointer",
-    transition: "background 150ms ease, border-color 150ms ease, color 150ms ease",
-    lineHeight: 1,
-    whiteSpace: "nowrap" as React.CSSProperties["whiteSpace"],
-  },
-  pillActive: {
-    background: "var(--color-accent-soft)",
-    borderColor: "var(--color-accent)",
-    color: "var(--color-accent)",
-  },
-  inlineRow: {
-    display: "flex",
-    gap: "12px",
-    alignItems: "flex-end",
-    flexWrap: "wrap" as React.CSSProperties["flexWrap"],
-  },
-  inlineInputGroup: {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-  },
-  unitLabel: {
-    fontSize: "12px",
-    color: "var(--grey-500)",
-    whiteSpace: "nowrap" as React.CSSProperties["whiteSpace"],
-  },
-  timeSep: {
-    fontSize: "16px",
-    fontWeight: 600,
-    color: "var(--grey-500)",
-    lineHeight: 1,
-  },
-  preview: {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-    padding: "8px 12px",
-    background: "var(--color-accent-subtle)",
-    border: "1px solid var(--color-accent-soft)",
-    borderRadius: "var(--radius-md)",
-    fontSize: "12px",
-    color: "var(--grey-700)",
-    fontWeight: 500,
-  },
-};
-
-/* ── Modal styles (matching project pattern) ───────────────── */
-const modalStyles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(23, 22, 22, 0.45)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 1000,
-  },
-  dialog: {
-    background: "#fff",
-    borderRadius: "var(--radius-card)",
-    boxShadow: "0 12px 40px rgba(28,28,28,0.15)",
-    width: "500px",
-    maxWidth: "calc(100vw - 32px)",
-    maxHeight: "80vh",
-    display: "flex",
-    flexDirection: "column",
-    overflow: "hidden",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    padding: "16px 20px 12px",
-    flexShrink: 0,
-  },
-  title: {
-    fontFamily: "var(--font-heading)",
-    fontWeight: 700,
-    fontSize: "16px",
-    margin: 0,
-  },
-  closeBtn: {
-    background: "none",
-    border: "none",
-    cursor: "pointer",
-    fontSize: "var(--text-sm)",
-    color: "var(--grey-500)",
-    padding: "4px",
-    lineHeight: 1,
-  },
-  body: {
-    flex: 1,
-    overflowY: "auto",
-    padding: "16px 20px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "14px",
-  },
-  fieldGroup: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "4px",
-  },
-  label: {
-    fontSize: "var(--text-sm)",
-    fontWeight: 500,
-    color: "var(--grey-700)",
-  },
-  input: {
-    height: "36px",
-    border: "1px solid var(--grey-300)",
-    borderRadius: "8px",
-    padding: "0 10px",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-body)",
-    background: "#fff",
-    color: "var(--fg)",
-    width: "100%",
-    boxSizing: "border-box" as React.CSSProperties["boxSizing"],
-    outline: "none",
-  },
-  select: {
-    height: "36px",
-    border: "1px solid var(--grey-300)",
-    borderRadius: "8px",
-    padding: "0 10px",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-body)",
-    background: "#fff",
-    color: "var(--fg)",
-    cursor: "pointer",
-    appearance: "auto" as React.CSSProperties["appearance"],
-  },
-  textarea: {
-    border: "1px solid var(--grey-300)",
-    borderRadius: "8px",
-    padding: "8px 10px",
-    fontSize: "var(--text-base)",
-    fontFamily: "var(--font-body)",
-    background: "#fff",
-    color: "var(--fg)",
-    resize: "vertical" as React.CSSProperties["resize"],
-    minHeight: "64px",
-  },
-  footer: {
-    display: "flex",
-    justifyContent: "flex-end",
-    gap: "8px",
-    padding: "12px 20px",
-    flexShrink: 0,
-  },
-};
