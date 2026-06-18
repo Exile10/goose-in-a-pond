@@ -43,6 +43,8 @@ impl Handshake for GotgHandshakeAdapter {
         Ok(HandshakeResponse {
             accepted: true, // TODO: validate pairing_code
             session_token: Some(uuid::Uuid::new_v4().to_string()),
+            refresh_token: None,
+            expires_at: None,
             hostname,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: vec![

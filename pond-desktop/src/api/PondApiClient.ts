@@ -5,6 +5,7 @@ import {
   type AgentRecipe,
   type AgentTool,
   type CalibrateResponse,
+  type ChallengeResponse,
   type ChatEvent,
   type ChatStreamRequest,
   type CleanupResponse,
@@ -25,6 +26,7 @@ import {
   type ModelEntry,
   type ModelMemoryStatus,
   type OllamaModel,
+  type PairingCodeResponse,
   type PromptExtra,
   type PromptTemplate,
   type Schedule,
@@ -53,25 +55,73 @@ declare global {
 export class PondApiClient {
   private readonly base: string;
   private token: string | null;
+  private refreshToken: string | null = null;
   private tokenExpiresAt: number | null = null;
   private refreshPromise: Promise<void> | null = null;
+
+  private static readonly LS_SESSION = "giap-session-token";
+  private static readonly LS_REFRESH = "giap-refresh-token";
+  private static readonly LS_EXPIRES = "giap-token-expires-at";
 
   constructor(base?: string, token?: string | null) {
     this.base = (base ?? window.__GIAP_SERVER_URL__ ?? "http://127.0.0.1:4000").replace(/\/$/, "");
     this.token = token ?? null;
+    // Hydrate persisted tokens so the desktop survives restarts without
+    // re-pairing. An explicit constructor token takes precedence.
+    if (!this.token) this.loadPersistedTokens();
   }
 
-  setToken(token: string | null, expiresIn?: number): void {
+  /** Load session/refresh/expiry from localStorage (no-op if unavailable). */
+  private loadPersistedTokens(): void {
+    try {
+      this.token = localStorage.getItem(PondApiClient.LS_SESSION);
+      this.refreshToken = localStorage.getItem(PondApiClient.LS_REFRESH);
+      const exp = localStorage.getItem(PondApiClient.LS_EXPIRES);
+      this.tokenExpiresAt = exp ? Number(exp) || null : null;
+    } catch { /* no localStorage (tests / SSR) */ }
+  }
+
+  /** Persist the current token triple (no-op if localStorage is unavailable). */
+  private persistTokens(): void {
+    try {
+      const set = (k: string, v: string | null) =>
+        v ? localStorage.setItem(k, v) : localStorage.removeItem(k);
+      set(PondApiClient.LS_SESSION, this.token);
+      set(PondApiClient.LS_REFRESH, this.refreshToken);
+      set(PondApiClient.LS_EXPIRES, this.tokenExpiresAt ? String(this.tokenExpiresAt) : null);
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * Set the active session token. Pass `expiresAt` (RFC3339, the server's
+   * `expires_at`) to (re)arm the proactive refresh timer; omit it to update
+   * only the bearer token while preserving the known expiry (used by callers
+   * that just need the header). Pass `null` to clear the expiry.
+   */
+  setToken(token: string | null, expiresAt?: string | null): void {
     this.token = token;
-    this.tokenExpiresAt = token && expiresIn ? Date.now() + expiresIn * 1000 : null;
+    if (expiresAt !== undefined) {
+      this.tokenExpiresAt = token && expiresAt ? Date.parse(expiresAt) || null : null;
+    }
+    this.persistTokens();
   }
 
   private async ensureTokenFresh(): Promise<void> {
     if (!this.token || !this.tokenExpiresAt) return;
     if (Date.now() < this.tokenExpiresAt - 60_000) return;
+    if (!this.refreshToken) return;
     if (this.refreshPromise) return this.refreshPromise;
-    this.refreshPromise = this.post<HandshakeResponse>("/api/v1/handshake", { client_id: "pond-desktop" })
-      .then((res) => { this.setToken(res.token, res.expires_in); })
+    // Use a token-less fetch (handshakeFetch) so this can't recurse back into
+    // ensureTokenFresh via request().
+    this.refreshPromise = this.handshakeFetch<HandshakeResponse>("POST", "/api/v1/handshake/refresh", {
+      refresh_token: this.refreshToken,
+    })
+      .then((res) => {
+        if (res.accepted && res.session_token) {
+          this.refreshToken = res.refresh_token ?? this.refreshToken;
+          this.setToken(res.session_token, res.expires_at ?? null); // persists all three
+        }
+      })
       .catch(() => { /* refresh failed — continue with current token */ })
       .finally(() => { this.refreshPromise = null; });
     return this.refreshPromise;
@@ -377,8 +427,99 @@ export class PondApiClient {
 
   // ── Auth / Handshake ─────────────────────────────────────────
 
-  handshake(clientId: string): Promise<HandshakeResponse> {
-    return this.post("/api/v1/handshake", { client_id: clientId });
+  /**
+   * Token-less fetch for the public handshake endpoints. Deliberately bypasses
+   * `request()`/`ensureTokenFresh()` so refresh/pairing can't recurse.
+   */
+  private async handshakeFetch<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await fetch(`${this.base}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) throw new ApiError(res.status, res.statusText);
+    return res.json() as Promise<T>;
+  }
+
+  /** HMAC-SHA256(pairingCode, challenge ‖ clientId) → lowercase hex (Web Crypto). */
+  private async computeMac(code: string, challengeB64: string, clientId: string): Promise<string> {
+    const enc = new TextEncoder();
+    const challenge = Uint8Array.from(atob(challengeB64), (c) => c.charCodeAt(0));
+    const idBytes = enc.encode(clientId);
+    const msg = new Uint8Array(challenge.length + idBytes.length);
+    msg.set(challenge);
+    msg.set(idBytes, challenge.length);
+    const key = await crypto.subtle.importKey(
+      "raw",
+      enc.encode(code),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const sig = await crypto.subtle.sign("HMAC", key, msg);
+    return Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /**
+   * Auto-pair this desktop install with the local server. Because the desktop
+   * and server share a machine, we read the pairing code off the loopback-only
+   * endpoint and run the full two-phase handshake — no operator typing needed.
+   * On success the session+refresh tokens are stored on this client.
+   */
+  async pair(clientId = "pond-desktop"): Promise<HandshakeResponse> {
+    const pc = await this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
+    if (!pc.code) {
+      throw new ApiError(409, "no active pairing code on the server");
+    }
+    const init = await this.handshakeFetch<ChallengeResponse>("POST", "/api/v1/handshake/init", {
+      client_id: clientId,
+      client_type: "desktop",
+      client_version: "1.0.0",
+    });
+    const mac = await this.computeMac(pc.code, init.challenge, clientId);
+    const res = await this.handshakeFetch<HandshakeResponse>("POST", "/api/v1/handshake/verify", {
+      challenge_id: init.challenge_id,
+      mac,
+      device_name: "Pond Desktop",
+    });
+    if (res.accepted && res.session_token) {
+      this.refreshToken = res.refresh_token ?? null;
+      this.setToken(res.session_token, res.expires_at ?? null); // persists all three
+    }
+    return res;
+  }
+
+  /**
+   * Establish an authenticated session, reusing a persisted token across app
+   * restarts. Tries, in order: a still-valid stored session token → a refresh
+   * with the stored refresh token (no pairing code needed) → a fresh pair
+   * (needs the server's current pairing code). Returns the active session
+   * token, or `null` if none could be established.
+   */
+  async connect(clientId = "pond-desktop"): Promise<string | null> {
+    // 1. Stored session token still comfortably valid.
+    if (this.token && this.tokenExpiresAt && Date.now() < this.tokenExpiresAt - 60_000) {
+      return this.token;
+    }
+    // 2. Refresh with a stored refresh token — survives restarts for 30 days
+    //    without ever needing the pairing code again.
+    if (this.refreshToken) {
+      try {
+        const r = await this.handshakeFetch<HandshakeResponse>("POST", "/api/v1/handshake/refresh", {
+          refresh_token: this.refreshToken,
+        });
+        if (r.accepted && r.session_token) {
+          this.refreshToken = r.refresh_token ?? this.refreshToken;
+          this.setToken(r.session_token, r.expires_at ?? null);
+          return r.session_token;
+        }
+      } catch { /* fall through to a fresh pair */ }
+    }
+    // 3. Fresh pairing.
+    const res = await this.pair(clientId);
+    return res.accepted ? res.session_token : null;
   }
 
   // ── Models ────────────────────────────────────────────────

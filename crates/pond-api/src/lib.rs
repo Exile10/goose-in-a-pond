@@ -107,7 +107,7 @@ use pond_core::user_data::ports::skill::UserSkillRepository;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 /// Callback that spawns the three-stage adversarial memory consolidation
 /// pipeline. Injected by `pond-server` so `pond-api` has no dependency on
@@ -387,16 +387,42 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
             let limiter = rate_limiter.clone();
             rate_limit_with_limiter(req, next, limiter)
         }))
-        // CORS — allow any origin so the Tauri desktop app (tauri://localhost or
-        // http://localhost:1420 in dev) and GOTG mobile clients can reach the API.
-        // pond-server only binds to the local network, so open CORS is safe here.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        // CORS — scoped to the first-party Tauri desktop origins (#94). Browser
+        // requests from other origins are rejected. Native GOTG mobile clients
+        // don't send a browser `Origin` header, so they're unaffected. Operators
+        // can allow-list extra origins via `POND_CORS_ALLOWED_ORIGINS`
+        // (comma-separated, e.g. a LAN dashboard URL).
+        .layer(build_cors_layer())
         .with_state(state)
+}
+
+/// Build the CORS layer with a scoped origin allowlist (see call site).
+fn build_cors_layer() -> CorsLayer {
+    use axum::http::{header, HeaderValue, Method};
+
+    let mut origins: Vec<HeaderValue> = ["tauri://localhost", "http://localhost:1420", "http://127.0.0.1:1420"]
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    if let Ok(extra) = std::env::var("POND_CORS_ALLOWED_ORIGINS") {
+        for o in extra.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(v) = o.parse() {
+                origins.push(v);
+            }
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 async fn rate_limit_with_limiter(
