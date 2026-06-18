@@ -814,6 +814,18 @@ async fn run_server(
         agent_backend
     };
 
+    // Q2-05: pond-agent is quarantined — experimental backend not ready for production.
+    // Force goose even if the setting was written as "pond".
+    let agent_backend: &str = if agent_backend == "pond" {
+        tracing::warn!(
+            "pond-agent backend is quarantined (not production-ready); \
+             falling back to goose. Set agent_backend to \"goose\" in Settings to suppress this warning."
+        );
+        "goose"
+    } else {
+        agent_backend
+    };
+
     // ── Component startup: auto-download + wire critical services ────────────
     println!("\n  ── Components ──────────────────────────────────────");
 
@@ -1556,10 +1568,10 @@ async fn run_server(
     };
 
     // ── Agent backend ────────────────────────────────────────────────────────────
-    // When "pond" is selected, skip Goose entirely to avoid the llama.cpp backend
-    // singleton conflict. PondAgent uses its own LlamaCppEngine directly.
+    // pond_agent_active is always false while the backend is quarantined (Q2-05).
+    // agent_backend has already been normalised to "goose" above.
     #[cfg(feature = "pond-agent")]
-    let pond_agent_active = agent_backend == "pond";
+    let pond_agent_active = agent_backend == "pond"; // stays false: quarantine override above
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
