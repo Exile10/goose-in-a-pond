@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Button, Card, CardContent, Chip, Tabs } from "@heroui/react";
 import { Cpu, RotateCcw, Save } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
+import { PageHeader, ErrorBanner, SkeletonList } from "../components/shared";
 import type { PromptTemplate } from "../api/types";
 
 // ── Preset metadata ───────────────────────────────────────────
@@ -70,6 +70,26 @@ export function Prompts() {
       .finally(() => setLoading(false));
   }, []);
 
+  function reload() {
+    setError(null);
+    setLoading(true);
+    api.listPrompts()
+      .then((list) => {
+        const arr = Array.isArray(list) ? list : [];
+        setPrompts(arr);
+        const bodyMap: Record<string, string> = {};
+        const origMap: Record<string, string> = {};
+        for (const p of arr) { bodyMap[p.name] = p.content; origMap[p.name] = p.content; }
+        setBodies(bodyMap);
+        setOriginals(origMap);
+        const firstPreset = PRESET_KEYS.find((k) => arr.some((p) => p.name === k));
+        if (firstPreset) setActive(firstPreset);
+        else if (arr.length) setActive(arr[0].name);
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }
+
   /** Sorted list: known presets first, then any extras. */
   const orderedPrompts = [
     ...PRESET_KEYS.map((k) => prompts.find((p) => p.name === k)).filter(Boolean),
@@ -110,13 +130,9 @@ export function Prompts() {
     }
   }
 
-  if (loading) return <p className="muted-12">Loading...</p>;
+  if (loading) return <SkeletonList rows={4} />;
   if (error)
-    return (
-      <p className="muted-12" style={{ color: "var(--color-destructive)" }}>
-        {error}
-      </p>
-    );
+    return <ErrorBanner error={error} onRetry={reload} />;
   if (!prompts.length)
     return (
       <p className="muted-12">

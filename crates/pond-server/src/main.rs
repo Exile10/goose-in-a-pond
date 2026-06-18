@@ -129,6 +129,10 @@ enum Commands {
         #[arg(long, default_value = "goose")]
         agent: String,
 
+        /// Port to listen on (defaults to 4000)
+        #[arg(long)]
+        port: Option<u16>,
+
         /// Also launch the native Tauri desktop app after the server starts.
         /// Searches for the binary in pond-desktop/src-tauri/target/debug/ and
         /// pond-desktop/src-tauri/target/release/bundle/macos/.
@@ -414,10 +418,11 @@ async fn async_main() -> Result<()> {
             open,
             debug,
             agent,
+            port,
             native,
         }) => {
             init_tracing(debug);
-            run_server(static_dir, open, debug, &agent, native).await
+            run_server(static_dir, open, debug, &agent, port, native).await
         }
         Some(Commands::Chat {
             provider,
@@ -820,6 +825,7 @@ async fn run_server(
     open: bool,
     debug: bool,
     agent_backend: &str,
+    port: Option<u16>,
     native: bool,
 ) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
@@ -1986,7 +1992,7 @@ async fn run_server(
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
-    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", ports::API_SERVER).await?;
+    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", port.unwrap_or(ports::API_SERVER)).await?;
 
     // Direct MCP tool dispatcher for POST /api/v1/tools/invoke (bypasses the LLM).
     let tool_dispatcher: Option<
@@ -4251,6 +4257,7 @@ async fn run_main_menu() -> Result<()> {
                     false,
                     false,
                     "goose",
+                    None,
                     false,
                 )
                 .await?;

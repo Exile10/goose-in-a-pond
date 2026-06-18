@@ -8,7 +8,7 @@ import {
 } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader, useConfirm } from "../components/shared";
+import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
 import { useAppState } from "../state/AppContext";
 import type { Schedule, ScheduleRun } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
@@ -193,8 +193,10 @@ const TIMEZONE_OPTIONS = [
 
 export function Schedules() {
   const state = useAppState();
+  const SCHED_PAGE = 10;
   const confirm = useConfirm();
   const [schedules, setSchedules]         = useState<Schedule[]>([]);
+  const [visibleCount, setVisibleCount]   = useState(SCHED_PAGE);
   const [loading, setLoading]             = useState(true);
   const [error, setError]                 = useState<string | null>(null);
   const [actionMsg, setActionMsg]         = useState<string | null>(null);
@@ -740,17 +742,21 @@ export function Schedules() {
 
       {/* ── Schedule content ────────────────────────────────── */}
       {loading ? (
-        <p className="muted-12">Loading...</p>
+        <SkeletonList rows={4} />
       ) : schedules.length === 0 ? (
         <div className="empty-state">
           <CalendarClock size={32} />
-          <span>No schedules yet. Create one to automate recurring tasks.</span>
+          <span>No schedules yet. Automate recurring tasks by creating your first one.</span>
+          <button className="empty-state__cta" onClick={() => setShowForm(true)}>
+            <Plus size={14} /> New Schedule
+          </button>
         </div>
       ) : view === "calendar" ? (
         <ScheduleCalendar schedules={schedules} />
       ) : (
+        <>
         <div className="sched-grid">
-          {schedules.map((s) => (
+          {schedules.slice(0, visibleCount).map((s) => (
             <Card key={s.id} className="card sched-card">
               <CardContent>
                 {/* Head: icon + name + toggle */}
@@ -945,6 +951,13 @@ export function Schedules() {
             </Card>
           ))}
         </div>
+        {schedules.length > visibleCount && (
+          <button className="empty-state__cta" style={{ alignSelf: "center" }} onClick={() => setVisibleCount((c) => c + SCHED_PAGE)}>
+            Show {Math.min(SCHED_PAGE, schedules.length - visibleCount)} more
+            <span style={{ color: "var(--grey-400)", fontWeight: "normal" }}> · {schedules.length - visibleCount} remaining</span>
+          </button>
+        )}
+        </>
       )}
 
       {/* ── Create modal ────────────────────────────────────── */}
