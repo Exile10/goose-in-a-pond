@@ -113,13 +113,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
 
         // 1. Fetch story IDs
         let ids_url = format!("{}/{}.json", HN_BASE_URL, category);
-        let ids_resp = match self
-            .http_client
-            .get(&ids_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
+        let ids_resp = match crate::http::traced_get(&self.http_client, &ids_url, "get_top_stories").await {
             Ok(r) => r,
             Err(e) => {
                 println!("[news] HN story IDs fetch failed: {e}");

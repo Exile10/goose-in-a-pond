@@ -21,8 +21,25 @@ pub mod http;
 use pond_core::ports::tool_caller::ToolCaller;
 use std::sync::{Arc, OnceLock, RwLock};
 
-// -- User message: set by GooseAdapter before each turn --
+// -- User message and current session: set by GooseAdapter before each turn --
 static LAST_USER_MESSAGE: RwLock<String> = RwLock::new(String::new());
+
+// Session ID for the turn currently in flight — used by MCP tool handlers to
+// tag outbound HTTP trace events with the correct session for correlation.
+static CURRENT_SESSION_ID: RwLock<String> = RwLock::new(String::new());
+
+pub fn set_current_session_id(sid: &str) {
+    if let Ok(mut guard) = CURRENT_SESSION_ID.write() {
+        *guard = sid.to_string();
+    }
+}
+
+pub fn current_session_id() -> String {
+    CURRENT_SESSION_ID
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
 
 pub fn set_last_user_message(msg: &str) {
     if let Ok(mut guard) = LAST_USER_MESSAGE.write() {
@@ -145,7 +162,7 @@ pub fn all_app_resources() -> Vec<(&'static str, &'static str)> {
 
 // Re-export shared utilities for downstream Knowledge-family servers
 pub use format::{format_api_error, format_list_result, format_not_configured, truncate_to_budget};
-pub use http::build_http_client;
+pub use http::{build_http_client, traced_get};
 
 // Re-export the direct tool dispatcher
 pub use dispatcher::McpToolDispatcher;

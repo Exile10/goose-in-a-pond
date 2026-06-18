@@ -5,21 +5,22 @@
 //! 1. **stdout** — human-readable coloured output (same as before).
 //! 2. **Rolling file** — plain-text log, one file per day under `<data_dir>/logs/`.
 //!    Older files are kept on disk; the OS or the user prunes them as needed.
-//! 3. **SQLite event log** — WARN-and-above events are forwarded to the
-//!    `event_log` table in `pond_logs.db` via an async drain task so they can
-//!    be queried from the UI. The drain is started by calling
-//!    [`LogDrainHandle::drain_into`] once the database is available.
-//!
-//! The rolling-file writer runs on a background thread managed by
-//! `tracing-appender`. The [`FileWriterGuard`] returned by `drain_into` keeps
-//! that thread alive and flushes pending writes when dropped.
+//! 3. **SQLite event log** — routed to the `event_log` table in `pond_logs.db`
+//!    via an async drain task.  Two categories of events reach the DB:
+//!    - WARN and above from any target (incident history).
+//!    - INFO from targets starting with `giap::trace` (correlated turn events:
+//!      turn start/end, tool calls, inference, provider swaps, outbound HTTP).
+//!    Structured key-value fields are serialised as JSON into the `metadata` column,
+//!    enabling `WHERE json_extract(metadata,'$.session_id') = ?` queries.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::field::Visit;
+use tracing::{Level, Metadata, Subscriber};
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 use pond_core::ports::event_log::EventLogRepository;
@@ -28,8 +29,67 @@ use pond_core::ports::event_log::EventLogRepository;
 
 struct ChannelEntry {
     level: String,
+    /// tracing target (e.g. `"giap::trace"`, `"pond_server"`)
     source: String,
     message: String,
+    /// JSON blob of all structured key-value fields except `message`.
+    metadata: Option<String>,
+}
+
+// ── Visitor: captures message + all key-value fields ─────────────────────────
+
+#[derive(Default)]
+struct EventVisitor {
+    message: String,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Visit for EventVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.insert(field.name().to_string(), value.into());
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.insert(field.name().to_string(), format!("{value:?}").into());
+        }
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields.insert(field.name().to_string(), value.into());
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields.insert(field.name().to_string(), value.into());
+    }
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.fields.insert(field.name().to_string(), value.into());
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields.insert(field.name().to_string(), value.into());
+    }
+}
+
+// ── Custom per-layer filter ───────────────────────────────────────────────────
+
+/// Routes events to the SQLite event log when:
+/// - Level is WARN or above (incident/error history), OR
+/// - Level is INFO and the tracing target starts with `giap::trace`
+///   (structured turn-level event stream for session correlation).
+struct TraceFilter;
+
+impl<S: Subscriber> tracing_subscriber::layer::Filter<S> for TraceFilter {
+    fn enabled(&self, meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        *meta.level() <= Level::WARN
+            || (*meta.level() == Level::INFO && meta.target().starts_with("giap::trace"))
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::INFO)
+    }
 }
 
 // ── Custom tracing Layer ──────────────────────────────────────────────────────
@@ -38,43 +98,24 @@ struct EventLogLayer {
     tx: UnboundedSender<ChannelEntry>,
 }
 
-/// Extracts the `message` field from a tracing event's field set.
-#[derive(Default)]
-struct MessageVisitor {
-    message: String,
-}
-
-impl Visit for MessageVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        }
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
-        }
-    }
-}
-
-impl<S: tracing::Subscriber> Layer<S> for EventLogLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = MessageVisitor::default();
+impl<S: Subscriber> Layer<S> for EventLogLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
-        if visitor.message.is_empty() {
+        if visitor.message.is_empty() && visitor.fields.is_empty() {
             return;
         }
+        let metadata = if visitor.fields.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&visitor.fields).ok()
+        };
         let meta = event.metadata();
-        // Level::to_string() produces uppercase ("ERROR", "WARN", …)
         let _ = self.tx.send(ChannelEntry {
             level: meta.level().to_string(),
             source: meta.target().to_string(),
             message: visitor.message,
+            metadata,
         });
     }
 }
@@ -82,8 +123,7 @@ impl<S: tracing::Subscriber> Layer<S> for EventLogLayer {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Keeps the rolling-file background writer thread alive.
-/// When this is dropped the background thread is joined and all buffered
-/// bytes are flushed to disk.
+/// Dropped at server shutdown to flush buffered bytes to disk.
 pub struct FileWriterGuard {
     _guard: tracing_appender::non_blocking::WorkerGuard,
 }
@@ -92,7 +132,7 @@ pub struct FileWriterGuard {
 ///
 /// Keep this value alive for the duration of the process.  Call
 /// [`drain_into`](Self::drain_into) after the database is ready to start
-/// persisting WARN+ events to the SQLite event log.
+/// persisting events to the SQLite event log.
 pub struct LogDrainHandle {
     rx: UnboundedReceiver<ChannelEntry>,
     file_guard: tracing_appender::non_blocking::WorkerGuard,
@@ -100,8 +140,8 @@ pub struct LogDrainHandle {
 
 impl LogDrainHandle {
     /// Spawn the async drain task that writes buffered log events into the
-    /// SQLite event log.  If `repo` is `None` the channel is simply closed
-    /// and events are discarded (file logging still works).
+    /// SQLite event log.  If `repo` is `None` the channel is closed and events
+    /// are discarded (file logging still works).
     ///
     /// Returns a [`FileWriterGuard`] that must be held until the process exits.
     pub fn drain_into(self, repo: Option<Arc<dyn EventLogRepository>>) -> FileWriterGuard {
@@ -111,13 +151,16 @@ impl LogDrainHandle {
             tokio::spawn(async move {
                 while let Some(entry) = rx.recv().await {
                     let _ = repo
-                        .insert(&entry.level, &entry.source, &entry.message, None)
+                        .insert(
+                            &entry.level,
+                            &entry.source,
+                            &entry.message,
+                            entry.metadata.as_deref(),
+                        )
                         .await;
                 }
             });
         }
-        // If repo is None, dropping rx closes the channel; senders silently
-        // discard further events via the `let _ = tx.send(...)` pattern.
         FileWriterGuard { _guard: file_guard }
     }
 }
@@ -142,11 +185,9 @@ pub fn init_tracing(debug: bool, data_dir: &Path) -> LogDrainHandle {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "pond.log");
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
 
-    // ── Event-log channel ────────────────────────────────────────────────
-    // WARN+ only — keeps the event_log table a useful incident history rather
-    // than a verbose mirror of the debug stream.
+    // ── Event-log channel (with selective filter) ────────────────────────
     let (tx, rx) = mpsc::unbounded_channel();
-    let db_layer = EventLogLayer { tx }.with_filter(LevelFilter::WARN);
+    let db_layer = EventLogLayer { tx }.with_filter(TraceFilter);
 
     tracing_subscriber::registry()
         .with(env_filter)
