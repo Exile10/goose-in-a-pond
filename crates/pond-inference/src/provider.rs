@@ -99,6 +99,8 @@ fn generation_task(
     options: &InferenceOptions,
     tx: mpsc::Sender<Result<ChatEvent>>,
 ) {
+    let gen_start = std::time::Instant::now();
+
     // Acquire the model lock (blocking). Mutable for in-memory KV-cache persistence.
     let mut model_guard = model_slot.blocking_lock();
     let Some(loaded) = model_guard.as_mut() else {
@@ -241,6 +243,14 @@ fn generation_task(
 
     let prompt_token_count = tokens.len();
     let ctx_size = effective_context_size(&loaded.model, prompt_token_count);
+
+    tracing::info!(
+        target: "giap::trace",
+        kind = "inference_start",
+        model = %loaded.model_id,
+        prompt_tokens = prompt_token_count,
+        ctx_size,
+    );
 
     if prompt_token_count >= ctx_size {
         let _ = tx.blocking_send(Err(anyhow::anyhow!(
@@ -441,6 +451,7 @@ fn generation_task(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut generated_text = String::new();
     let mut output_token_count: u32 = 0;
+    let mut ttft_ms: Option<u64> = None;
     // Accumulate RAW tool call deltas — merge by index after generation completes.
     // Arguments arrive as partial strings across multiple deltas and must be
     // concatenated before JSON parsing (same approach as Goose).
@@ -455,6 +466,9 @@ fn generation_task(
         }
 
         output_token_count += 1;
+        if output_token_count == 1 {
+            ttft_ms = Some(gen_start.elapsed().as_millis() as u64);
+        }
 
         let piece = match loaded.model.token_to_piece(token, &mut decoder, true, None) {
             Ok(p) => p,
@@ -539,6 +553,16 @@ fn generation_task(
 
     // ── Finalize: flush parser and emit tool calls ──────────────────────
 
+    let total_latency_ms = gen_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        target: "giap::trace",
+        kind = "inference_end",
+        model = %loaded.model_id,
+        prompt_tokens = prompt_token_count,
+        output_tokens = output_token_count,
+        ttft_ms = ttft_ms.unwrap_or(0),
+        total_latency_ms,
+    );
     tracing::debug!(
         generated_len = generated_text.len(),
         output_tokens = output_token_count,
