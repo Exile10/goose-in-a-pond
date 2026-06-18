@@ -58,6 +58,8 @@ agent-client-protocol = "0.11"
 sacp             = "11.0.0"
 arboard          = "3"
 sha2             = "0.10"
+hmac             = "0.12"
+subtle           = "2.6"
 strum            = { version = "0.27", features = ["derive"] }
 shell-words      = "1.1"
 rayon            = "1.10"

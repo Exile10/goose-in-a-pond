@@ -70,7 +70,7 @@ use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository as _;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_infra::db::Database;
-use pond_infra::mock_handshake::MockHandshake;
+use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_draft::SqliteDraftRepository;
@@ -2031,10 +2031,25 @@ async fn run_server(
         });
     }
 
+    // DB-backed handshake/pairing (#93). Construct before `db` is moved into
+    // AppState, then issue a fresh pairing code the operator reads off the CLI
+    // to pair a GOTG device.
+    let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> =
+        Arc::new(SqliteHandshakeAdapter::new(db.system.clone()));
+    match handshake.issue_pairing_code().await {
+        Ok(pc) => {
+            println!("\n  ┌───────────────────────────────────────┐");
+            println!("  │  Pairing code:  {}   (valid 10 min) │", pc.code);
+            println!("  └───────────────────────────────────────┘");
+            println!("  Enter this in Goose On The Go to pair this device.\n");
+        }
+        Err(e) => tracing::warn!("failed to issue pairing code at startup: {e:#}"),
+    }
+
     let state = Arc::new(AppState {
         db,
         onboarding_repo,
-        handshake: Arc::new(MockHandshake::new()),
+        handshake: handshake.clone(),
         whisper_url: whisper_url.clone(),
         session_storage,
         http_client: reqwest::Client::new(),
