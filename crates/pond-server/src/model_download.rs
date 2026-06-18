@@ -1278,6 +1278,7 @@ pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Resul
 // var so a dead mirror can be swapped without rebuilding.
 
 /// On-disk directory where face models live: `<data_dir>/models/face/`.
+#[cfg(feature = "face-onnx")]
 pub fn face_models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models").join("face")
 }
@@ -1289,6 +1290,7 @@ pub fn face_models_dir(data_dir: &Path) -> PathBuf {
 /// The auto-downloader prefers the new defaults but keeps the old buffalo_l
 /// files (`w600k_r50.onnx` + `scrfd.onnx`) as fallback when a fresh download
 /// of a new model fails (e.g. mirror 404).
+#[cfg(feature = "face-onnx")]
 pub fn face_model_paths(data_dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let dir = face_models_dir(data_dir);
     (
@@ -1310,8 +1312,10 @@ pub fn face_model_paths(data_dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf)
 /// (`det_10g.onnx`) and the ArcFace R50 embedder (`w600k_r50.onnx`) in a
 /// single ~281 MB archive.  Kept as the fallback bundle when the AdaFace +
 /// SCRFD-34G mirrors fail.
+#[cfg(feature = "face-onnx")]
 const BUFFALO_L_ZIP_URL: &str =
     "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip";
+#[cfg(feature = "face-onnx")]
 const BUFFALO_L_APPROX_MB: u64 = 281;
 
 /// Glint-R100 embedder — ArcFace ResNet-100 trained on the cleaned
@@ -1323,8 +1327,10 @@ const BUFFALO_L_APPROX_MB: u64 = 281;
 /// for InsightFace-family weights.
 ///
 /// Override the URL with `POND_FACE_EMBEDDING_URL` if needed.
+#[cfg(feature = "face-onnx")]
 const EMBEDDING_DEFAULT_URL: &str =
     "https://huggingface.co/immich-app/antelopev2/resolve/main/recognition/model.onnx";
+#[cfg(feature = "face-onnx")]
 const EMBEDDING_APPROX_MB: u64 = 261;
 
 /// SCRFD 34G GNKPS — same SCRFD family as the 10G in buffalo_l, deeper
@@ -1332,17 +1338,21 @@ const EMBEDDING_APPROX_MB: u64 = 261;
 /// on.  ~39 MB on disk.  Hosted by the Immich team.
 ///
 /// Override the URL with `POND_FACE_DETECTOR_URL`.
+#[cfg(feature = "face-onnx")]
 const DETECTOR_DEFAULT_URL: &str =
     "https://huggingface.co/immich-app/scrfd_34g_gnkps/resolve/main/detection/model.onnx";
+#[cfg(feature = "face-onnx")]
 const DETECTOR_APPROX_MB: u64 = 39;
 
 /// Silent-Face MiniFASNetV2 anti-spoof model — 3-class export
 /// `[fake_2D, fake_3D, live]` at 80×80 BGR input.  Override the mirror
 /// with `POND_FACE_ANTISPOOF_URL`.
+#[cfg(feature = "face-onnx")]
 const ANTISPOOF_MIRRORS: &[&str] = &[
     "https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
     "https://huggingface.co/datasets/giap-mirror/silent-face-anti-spoofing/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
 ];
+#[cfg(feature = "face-onnx")]
 const ANTISPOOF_APPROX_MB: u64 = 2;
 
 /// DeepPixBis (OULU-NPU Protocol-2) PAD — patch-based binary supervision,
@@ -1355,10 +1365,13 @@ const ANTISPOOF_APPROX_MB: u64 = 2;
 /// The OnnxAntispoof adapter auto-detects DeepPixBis from the filename
 /// (`OULU_*` ⇒ DeepPixBis224) and switches to the right preprocessing.
 /// Override the URL with `POND_FACE_ANTISPOOF_2_URL` if needed.
+#[cfg(feature = "face-onnx")]
 const DEEPPIXBIS_DEFAULT_URL: &str =
     "https://github.com/ffletcherr/face-recognition-liveness/releases/download/v0.1/OULU_Protocol_2_model_0_0.onnx";
+#[cfg(feature = "face-onnx")]
 const ANTISPOOF_2_APPROX_MB: u64 = 13;
 
+#[cfg(feature = "face-onnx")]
 fn env_url_override(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
@@ -1382,6 +1395,7 @@ fn env_url_override(key: &str) -> Option<String> {
 /// without recompiling: `POND_FACE_EMBEDDING_URL`,
 /// `POND_FACE_DETECTOR_URL`, `POND_FACE_ANTISPOOF_URL`,
 /// `POND_FACE_ANTISPOOF_2_URL`.
+#[cfg(feature = "face-onnx")]
 pub async fn download_face_models(data_dir: &Path) -> Result<()> {
     let (embed, detect, antispoof, antispoof_2) = face_model_paths(data_dir);
     let dir = face_models_dir(data_dir);
@@ -1506,6 +1520,7 @@ pub async fn download_face_models(data_dir: &Path) -> Result<()> {
 
 /// Stream `buffalo_l.zip`, extracting only `det_10g.onnx` → `scrfd.onnx`
 /// and `w600k_r50.onnx` → `w600k_r50.onnx` into `out_dir`.
+#[cfg(feature = "face-onnx")]
 async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Path) -> Result<()> {
     println!(
         "  ⬇  buffalo_l.zip (~{} MB) — contains both ArcFace R50 + SCRFD 10G",

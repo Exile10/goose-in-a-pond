@@ -23,7 +23,10 @@ use pond_core::prompts::{
     build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
     ProfileContext,
 };
-use pond_core::security::ports::handshake::{HandshakeRequest, HandshakeResponse};
+use pond_core::security::ports::handshake::{
+    ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
+    VerifyRequest,
+};
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
@@ -58,6 +61,16 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
+        // Two-phase pairing (#93): init → verify, plus refresh / revoke and a
+        // loopback-only endpoint to re-display the current pairing code.
+        .route("/handshake/init", post(handshake_init))
+        .route("/handshake/verify", post(handshake_verify))
+        .route("/handshake/refresh", post(handshake_refresh))
+        .route("/handshake/revoke", post(handshake_revoke))
+        .route(
+            "/handshake/pairing-code",
+            get(handshake_pairing_code).post(handshake_issue_pairing_code),
+        )
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
@@ -288,6 +301,150 @@ async fn handshake_handler(
     })?;
 
     Ok(Json(response))
+}
+
+/// Log an internal handshake error server-side and return a generic message,
+/// so DB/internal error strings are never leaked to (untrusted) callers.
+fn handshake_error(action: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    tracing::warn!(action, error = %e, "handshake request failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "handshake request failed" })),
+    )
+}
+
+/// Generic 400 for a malformed request body (carries no internal detail).
+fn bad_body() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid request body" })),
+    )
+}
+
+/// Phase 1 of pairing: client requests a challenge (public).
+async fn handshake_init(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<InitRequest>, JsonRejection>,
+) -> Result<Json<ChallengeResponse>, (StatusCode, Json<Value>)> {
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .init_handshake(request)
+        .await
+        .map_err(|e| handshake_error("init", e))?;
+    Ok(Json(resp))
+}
+
+/// Dedicated, stricter per-IP limiter for `/handshake/verify` — the one
+/// brute-forceable endpoint (an attacker guessing MACs). It complements the
+/// single-use challenge (each guess burns a challenge, forcing a fresh,
+/// rate-limited `init`). 10 attempts / 60 s is ample for legitimate pairing
+/// (a client pairs once) while making online MAC-guessing hopeless.
+fn verify_limiter() -> &'static crate::middleware::RateLimiter {
+    static VERIFY_LIMITER: std::sync::OnceLock<crate::middleware::RateLimiter> =
+        std::sync::OnceLock::new();
+    VERIFY_LIMITER
+        .get_or_init(|| crate::middleware::RateLimiter::new(10, std::time::Duration::from_secs(60)))
+}
+
+/// Phase 2 of pairing: client proves the pairing code via MAC (public).
+async fn handshake_verify(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: Result<Json<VerifyRequest>, JsonRejection>,
+) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
+    // Rate-limit verify attempts per source IP (applies to loopback too — this
+    // endpoint is security-sensitive regardless of origin).
+    if !verify_limiter().check_rate_limit(&peer.ip().to_string()).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "too many handshake attempts; slow down"})),
+        ));
+    }
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .verify_handshake(request)
+        .await
+        .map_err(|e| handshake_error("verify", e))?;
+    Ok(Json(resp))
+}
+
+/// Exchange a refresh token for a fresh session+refresh pair (public).
+async fn handshake_refresh(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RefreshRequest>, JsonRejection>,
+) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let resp = state
+        .handshake
+        .refresh(request)
+        .await
+        .map_err(|e| handshake_error("refresh", e))?;
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct RevokeRequest {
+    token: String,
+}
+
+/// Revoke a session token — i.e. log the device out (public).
+async fn handshake_revoke(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RevokeRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(request) = body.map_err(|_| bad_body())?;
+    state
+        .handshake
+        .revoke_token(&request.token)
+        .await
+        .map_err(|e| handshake_error("revoke", e))?;
+    Ok(Json(json!({"revoked": true})))
+}
+
+/// Re-display the current pairing code. **Loopback-only** — the operator's own
+/// machine (CLI/desktop dashboard), never a remote client.
+async fn handshake_pairing_code(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !peer.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "pairing code is only viewable on the host"})),
+        ));
+    }
+    let code = state
+        .handshake
+        .current_pairing_code()
+        .await
+        .map_err(|e| handshake_error("pairing_code_lookup", e))?;
+    match code {
+        Some(pc) => Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at}))),
+        None => Ok(Json(json!({"code": null}))),
+    }
+}
+
+/// Issue a **fresh** single-use pairing code. **Loopback-only** — this is the
+/// "pair a new device" action the operator triggers from the host (CLI/desktop
+/// dashboard) to pair an additional phone after the startup code is consumed.
+async fn handshake_issue_pairing_code(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !peer.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "pairing codes can only be issued on the host"})),
+        ));
+    }
+    let pc = state
+        .handshake
+        .issue_pairing_code()
+        .await
+        .map_err(|e| handshake_error("issue_pairing_code", e))?;
+    Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at})))
 }
 
 /// Start or report onboarding state (public)

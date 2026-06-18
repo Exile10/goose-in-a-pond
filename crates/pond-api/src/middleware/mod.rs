@@ -114,6 +114,18 @@ impl RateLimiter {
 /// Routes that don't require authentication.
 ///
 /// Must stay in sync with the public route set in `routes::api_routes()`.
+/// Whether to allow unauthenticated loopback clients (local-dev escape hatch).
+/// Off unless `POND_DEV_ALLOW_LOOPBACK` is set to a truthy value.
+fn dev_allow_loopback() -> bool {
+    loopback_flag_enabled(std::env::var("POND_DEV_ALLOW_LOOPBACK").ok().as_deref())
+}
+
+/// Pure truthiness check for the loopback escape-hatch flag. Separated from the
+/// env read so it can be unit-tested without mutating shared process env.
+fn loopback_flag_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("TRUE"))
+}
+
 fn is_public_route(path: &str) -> bool {
     // Non-API paths are static web assets — always public
     if !path.starts_with("/api/") {
@@ -127,6 +139,11 @@ fn is_public_route(path: &str) -> bool {
         path,
         "/health"
             | "/handshake"
+            | "/handshake/init"
+            | "/handshake/verify"
+            | "/handshake/refresh"
+            | "/handshake/revoke"
+            | "/handshake/pairing-code"
             | "/onboard"
             | "/onboard/complete"
             | "/onboard/status"
@@ -197,20 +214,25 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // Same-device clients (loopback 127.0.0.1 / ::1) skip token validation —
-    // mirrors the rate limiter exemption in lib.rs. The desktop app and server
-    // always run on the same machine, so requiring a Bearer token that is lost
-    // on every server restart creates unnecessary friction.
+    // Local-dev convenience: same-device clients (loopback 127.0.0.1 / ::1)
+    // MAY skip token validation, but ONLY when the operator explicitly opts in
+    // with `POND_DEV_ALLOW_LOOPBACK=1`. This is OFF by default (#94): the old
+    // blanket loopback bypass meant any process on the host — not just the
+    // desktop app — reached every protected route unauthenticated. With it off,
+    // even loopback clients (including the desktop app) must present a valid
+    // token obtained via the handshake.
     //
     // Axum stores the peer address as ConnectInfo<SocketAddr> (not bare SocketAddr)
     // when the server is started with into_make_service_with_connect_info.
-    let is_loopback = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
-    if is_loopback {
-        return Ok(next.run(req).await);
+    if dev_allow_loopback() {
+        let is_loopback = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip().is_loopback())
+            .unwrap_or(false);
+        if is_loopback {
+            return Ok(next.run(req).await);
+        }
     }
 
     let token = extract_bearer_token(&headers)?;
@@ -299,6 +321,11 @@ mod tests {
     fn test_is_public_route() {
         assert!(is_public_route("/api/v1/health"));
         assert!(is_public_route("/api/v1/handshake"));
+        assert!(is_public_route("/api/v1/handshake/init"));
+        assert!(is_public_route("/api/v1/handshake/verify"));
+        assert!(is_public_route("/api/v1/handshake/refresh"));
+        assert!(is_public_route("/api/v1/handshake/revoke"));
+        assert!(is_public_route("/api/v1/handshake/pairing-code"));
         assert!(is_public_route("/api/v1/onboard"));
         assert!(is_public_route("/api/v1/onboard/status"));
         assert!(is_public_route("/api/v1/transcribe"));
@@ -315,6 +342,30 @@ mod tests {
     #[test]
     fn test_auth_error_to_response() {
         let err = AuthError::MissingToken;
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_loopback_bypass_is_gated_and_off_by_default() {
+        // Off unless explicitly enabled — the default (env unset) must be false.
+        assert!(!loopback_flag_enabled(None));
+        assert!(!loopback_flag_enabled(Some("")));
+        assert!(!loopback_flag_enabled(Some("0")));
+        assert!(!loopback_flag_enabled(Some("yes")));
+        // Only explicit truthy values enable it.
+        assert!(loopback_flag_enabled(Some("1")));
+        assert!(loopback_flag_enabled(Some("true")));
+        assert!(loopback_flag_enabled(Some("TRUE")));
+    }
+
+    #[test]
+    fn test_protected_route_without_token_is_unauthorized() {
+        // A protected route is not in the public allowlist...
+        assert!(!is_public_route("/api/v1/devices"));
+        // ...and with no Authorization header, the bearer extractor rejects,
+        // which maps to a 401 — i.e. protected routes require a valid token.
+        let headers = HeaderMap::new();
+        let err = extract_bearer_token(&headers).expect_err("missing token must error");
         assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
     }
 }
