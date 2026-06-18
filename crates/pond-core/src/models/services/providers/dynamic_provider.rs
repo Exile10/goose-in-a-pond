@@ -35,16 +35,12 @@ impl DynamicProvider {
         Self { providers, settings_repo, fallback_name: fallback_name.into() }
     }
 
-    fn pick(&self, name: &str) -> Arc<dyn LlmProvider> {
+    fn pick(&self, name: &str) -> Option<Arc<dyn LlmProvider>> {
         let normalized = if name == "gguf" { "local" } else { name };
         self.providers
             .get(normalized)
             .or_else(|| self.providers.get(&self.fallback_name))
             .cloned()
-            .unwrap_or_else(|| {
-                // Should never happen when callers register at least the fallback.
-                panic!("DynamicProvider: no provider registered for '{}' and fallback '{}' is also missing", name, self.fallback_name)
-            })
     }
 }
 
@@ -56,7 +52,13 @@ impl LlmProvider for DynamicProvider {
         messages: Vec<ChatMessage>,
     ) -> Result<ChatMessage> {
         let settings = self.settings_repo.get().await.unwrap_or_default();
-        let provider = self.pick(&settings.chat_provider);
+        let provider = self.pick(&settings.chat_provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider registered for '{}' and fallback '{}' is also missing",
+                settings.chat_provider,
+                self.fallback_name
+            )
+        })?;
         provider.complete(system_prompt, messages).await
     }
 

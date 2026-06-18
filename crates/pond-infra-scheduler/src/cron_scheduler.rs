@@ -957,7 +957,7 @@ mod tests {
         // Kind unchanged
         match &updated.kind {
             TaskKind::AgentPrompt { prompt } => assert_eq!(prompt, "Hello"),
-            _ => panic!("expected AgentPrompt"),
+            other => panic!("expected AgentPrompt, got {other:?}"),
         }
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
             TaskKind::Webhook { webhook_url } => {
                 assert_eq!(webhook_url, "https://example.com/hook");
             }
-            _ => panic!("expected Webhook kind"),
+            other => panic!("expected Webhook kind, got {other:?}"),
         }
     }
 }
