@@ -797,6 +797,12 @@ fn chat_stream_inner(
 
         let mut full_text = String::new();
         let mut ttft_instant: Option<std::time::Instant> = None;
+        // Tracks the most recent tool call's name and wall-clock latency, used
+        // to populate per-turn telemetry below. When a turn invokes several
+        // tools, only the last one is recorded — TurnMetrics has a single slot.
+        let mut last_tool_name: Option<String> = None;
+        let mut last_tool_latency_ms: Option<u64> = None;
+        let mut tool_call_start: Option<std::time::Instant> = None;
         // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
         // preambles and `<think>…</think>` blocks out of the per-token stream.
         // When show_thinking is enabled, capture thinking blocks as SSE events.
@@ -841,9 +847,14 @@ fn chat_stream_inner(
                                     Some(json!({"type": "thinking", "content": content}).to_string())
                                 }
                                 AgentStreamEvent::ToolCall { tool, id, input } => {
+                                    tool_call_start = Some(std::time::Instant::now());
+                                    last_tool_name = Some(tool.clone());
                                     Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
                                 }
                                 AgentStreamEvent::ToolResult { tool, id, content } => {
+                                    if let Some(start) = tool_call_start.take() {
+                                        last_tool_latency_ms = Some(start.elapsed().as_millis() as u64);
+                                    }
                                     let (clean_content, ui_hint) = extract_ui_hint(&content);
                                     let mut ev = serde_json::json!({
                                         "type": "tool_result",
@@ -905,7 +916,11 @@ fn chat_stream_inner(
                                     yield Ok(Event::default().data(
                                         json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
                                     ));
-                                    match state.agent.call_tool(&session_id, &name, &args).await {
+                                    let call_start = std::time::Instant::now();
+                                    let call_result = state.agent.call_tool(&session_id, &name, &args).await;
+                                    last_tool_name = Some(name.clone());
+                                    last_tool_latency_ms = Some(call_start.elapsed().as_millis() as u64);
+                                    match call_result {
                                         Ok(result_text) => {
                                             let (clean, ui_hint) = extract_ui_hint(&result_text);
                                             let mut ev = json!({
@@ -1070,6 +1085,18 @@ fn chat_stream_inner(
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
 
+                let context_limit = if settings.context_window_override > 0 {
+                    settings.context_window_override
+                } else {
+                    state.agent.capabilities().context_window_tokens
+                };
+                let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
+                let context_utilization_pct = if context_limit > 0 {
+                    (estimated_tokens as f32 / context_limit as f32) * 100.0
+                } else {
+                    0.0
+                };
+
                 let metrics = pond_core::security::domain::turn_metrics::TurnMetrics {
                     session_id: session_id.clone(),
                     turn_number: existing_turns + 1,
@@ -1077,10 +1104,10 @@ fn chat_stream_inner(
                     completion_tokens: usage_completion_tokens,
                     ttft_ms,
                     total_latency_ms,
-                    tool_name: None,   // TODO: populate from ToolAgent result
-                    tool_latency_ms: None,
+                    tool_name: last_tool_name.clone(),
+                    tool_latency_ms: last_tool_latency_ms,
                     tool_cache_hit: None,
-                    context_utilization_pct: 0.0, // TODO: compute from context budget
+                    context_utilization_pct,
                     model_name: model_name_for_done.clone(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 };
