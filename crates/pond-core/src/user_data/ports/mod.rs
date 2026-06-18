@@ -1,5 +1,6 @@
 pub mod camera_storage;
 pub mod device_control;
+pub mod device_controller;
 pub mod device_registry;
 pub mod draft;
 pub mod face_detector;
