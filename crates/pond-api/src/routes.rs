@@ -1513,6 +1513,16 @@ async fn update_settings(
         )
     })?;
 
+    // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
+    if patch.get("agent_backend").and_then(|v| v.as_str()) == Some("pond") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "agent_backend \"pond\" is not available — backend is not yet production-ready. Use \"goose\"."
+            })),
+        ));
+    }
+
     // Merge: serialise current → Value, apply patch fields, deserialise back.
     let mut base =
         serde_json::to_value(&current).unwrap_or(serde_json::Value::Object(Default::default()));
