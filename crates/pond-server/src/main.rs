@@ -2018,8 +2018,12 @@ async fn run_server(
     // events written in normal operation are queryable from pond_logs.db.
     let event_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> =
         Arc::new(InProcessEventBus::new());
+    // One shared event store: the bus→log bridge writes to it, and the activity
+    // query API (#114) reads from it via AppState.
+    let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
+        Arc::new(SqliteEventLog::new(db.logs.clone()));
     {
-        let event_log = SqliteEventLog::new(db.logs.clone());
+        let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
         tokio::spawn(async move {
             use futures::StreamExt;
@@ -2098,6 +2102,7 @@ async fn run_server(
         llamafile_manager: Some(llamafile_manager),
         event_log_repo: event_log_repo,
         event_bus: Some(event_bus.clone()),
+        event_log: Some(event_log.clone()),
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
