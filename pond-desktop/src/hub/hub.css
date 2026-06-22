@@ -372,6 +372,20 @@
   margin: 5px 0 0;
 }
 
+.hub-back-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border: 1.5px solid var(--border, #ddd);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mut);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.hub-back-btn:hover { color: var(--ink); border-color: var(--ink, #333); }
+
 /* ════════ ROUTINES VIEW ════════ */
 .rt { padding: 26px 30px; max-width: 1200px; margin: 0 auto; }
 .rt__grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
