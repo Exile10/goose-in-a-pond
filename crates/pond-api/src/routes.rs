@@ -19,7 +19,6 @@ use axum::{
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
-use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
 use pond_core::prompts::{
     build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
