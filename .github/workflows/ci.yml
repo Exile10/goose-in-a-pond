@@ -24,6 +24,16 @@ jobs:
           submodules: false
           fetch-depth: 1
 
+      # Reclaim ~25GB on the hosted runner before the heavy goose build, so the
+      # production-binary `cargo check` + the rust-cache save step don't ENOSPC.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean || true
+          df -h /
+
       # Clone goose directly at the giap-patches branch HEAD.
       # Bypasses submodule SHA pinning — the stored SHA may be unreachable after
       # force-pushes to giap-patches.
