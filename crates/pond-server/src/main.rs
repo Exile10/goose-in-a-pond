@@ -1072,8 +1072,17 @@ async fn run_server(
                     );
                     None
                 } else {
-                    match PiperRsOutput::new(model_path.clone(), config_path) {
-                        Ok(out) => {
+                    let model_path_owned = model_path.clone();
+                    let config_path_owned = config_path.clone();
+                    let piper_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        tokio::task::spawn_blocking(move || {
+                            PiperRsOutput::new(model_path_owned, config_path_owned)
+                        }),
+                    )
+                    .await;
+                    match piper_result {
+                        Ok(Ok(Ok(out))) => {
                             let out = match espeak_data.clone() {
                                 Some(d) => out.with_espeak_data(d),
                                 None => out,
@@ -1084,8 +1093,19 @@ async fn run_server(
                                     dyn pond_core::models::ports::voice_output::VoiceOutput,
                                 >)
                         }
-                        Err(e) => {
+                        Ok(Ok(Err(e))) => {
                             tracing::warn!("PiperRsOutput failed to load voice: {e}");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("PiperRsOutput spawn_blocking panicked: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "PiperRsOutput timed out after 15 s — ONNX Runtime may be \
+                                 version-incompatible (need ORT 1.24.2)"
+                            );
                             None
                         }
                     }
@@ -1694,10 +1714,26 @@ async fn run_server(
                 &settings.active_embedding_model
             };
             let cache_dir = data_dir.join("models").join("embedding");
-            match pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
-                emb_model,
-                Some(cache_dir),
-            ) {
+            let emb_model_owned = emb_model.to_string();
+            let emb_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
+                    pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                        &emb_model_owned,
+                        Some(cache_dir),
+                    )
+                }),
+            )
+            .await;
+            let init_result = match emb_result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => Err(anyhow::anyhow!("embedding spawn_blocking failed: {e}")),
+                Err(_) => Err(anyhow::anyhow!(
+                    "embedding provider init timed out after 30 s — ONNX Runtime may be \
+                     version-incompatible (need ORT 1.24.2)"
+                )),
+            };
+            match init_result {
                 Ok(provider) => {
                     tracing::info!(
                         model = provider.model_name(),
@@ -3525,7 +3561,7 @@ async fn run_status() -> Result<()> {
 // v1.21.0 is the latest release with pre-built tarballs for all four
 // platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
 // Bump this when upgrading — the archive layout is stable across releases.
-const ORT_VERSION: &str = "1.22.0";
+const ORT_VERSION: &str = "1.24.2";
 
 /// Approximate size of the platform library in MB (for the progress message).
 const ORT_APPROX_SIZE_MB: u64 = 30;
