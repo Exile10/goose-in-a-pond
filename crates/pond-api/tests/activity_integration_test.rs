@@ -50,7 +50,10 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         .unwrap();
     // Secret-classified — must never be surfaced by the API.
     event_log
-        .append(Event::new(EventCategory::Auth, "auth.token_minted").sensitivity(PrivacySensitivity::Secret))
+        .append(
+            Event::new(EventCategory::Auth, "auth.token_minted")
+                .sensitivity(PrivacySensitivity::Secret),
+        )
         .await
         .unwrap();
 
@@ -113,7 +116,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         inference_pool: None,
         schedule_result_tx: tokio::sync::broadcast::channel(1).0,
         telemetry: None,
-        context_monitor: Arc::new(pond_core::models::services::context_monitor::ContextMonitor::new()),
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy: None,
@@ -121,7 +126,10 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         api_port: 4000,
     });
 
-    (build_router(state, std::path::PathBuf::from("web/dist")), tmp)
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        tmp,
+    )
 }
 
 async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -133,7 +141,9 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Val
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
 }
@@ -154,7 +164,10 @@ async fn activity_lists_events_and_hides_secret() {
         .collect();
     assert!(actions.contains(&"sensor.reading"));
     assert!(actions.contains(&"device.state_changed"));
-    assert!(!actions.contains(&"auth.token_minted"), "Secret action leaked");
+    assert!(
+        !actions.contains(&"auth.token_minted"),
+        "Secret action leaked"
+    );
 }
 
 #[tokio::test]

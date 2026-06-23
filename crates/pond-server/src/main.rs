@@ -71,11 +71,11 @@ use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository as _;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_infra::db::Database;
-use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_draft::SqliteDraftRepository;
 use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteEventLogRepository};
+use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
 use pond_infra::sqlite_model_repository::SqliteModelRepository;
@@ -478,7 +478,6 @@ async fn async_main() -> Result<()> {
         }
     }
 }
-
 
 async fn run_setup(model: &str) -> Result<()> {
     println!("  ╔═══════════════════════════════════════╗");
@@ -2022,15 +2021,20 @@ async fn run_server(
         match SqliteTelemetry::new(db.logs.clone()).await {
             Ok(t) => Some(Arc::new(t)),
             Err(e) => {
-                tracing::warn!("Failed to initialize SQLite telemetry, falling back to in-memory: {e}");
-                Some(Arc::new(pond_core::security::services::telemetry::InMemoryTelemetry::new()))
+                tracing::warn!(
+                    "Failed to initialize SQLite telemetry, falling back to in-memory: {e}"
+                );
+                Some(Arc::new(
+                    pond_core::security::services::telemetry::InMemoryTelemetry::new(),
+                ))
             }
         };
 
     // Bind the API port early so we can thread it into AppState (needed for
     // dynamic OAuth redirect URIs).  The actual `axum::serve()` call that
     // consumes the listener happens further below.
-    let (listener, api_port) = ports::bind_with_fallback("0.0.0.0", port.unwrap_or(ports::API_SERVER)).await?;
+    let (listener, api_port) =
+        ports::bind_with_fallback("0.0.0.0", port.unwrap_or(ports::API_SERVER)).await?;
 
     // Direct MCP tool dispatcher for POST /api/v1/tools/invoke (bypasses the LLM).
     let tool_dispatcher: Option<
