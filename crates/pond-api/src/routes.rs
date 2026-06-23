@@ -29,6 +29,7 @@ use pond_core::security::ports::handshake::{
     ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
     VerifyRequest,
 };
+use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
@@ -360,7 +361,10 @@ async fn handshake_verify(
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
     // Rate-limit verify attempts per source IP (applies to loopback too — this
     // endpoint is security-sensitive regardless of origin).
-    if !verify_limiter().check_rate_limit(&peer.ip().to_string()).await {
+    if !verify_limiter()
+        .check_rate_limit(&peer.ip().to_string())
+        .await
+    {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "too many handshake attempts; slow down"})),
@@ -905,11 +909,20 @@ fn chat_stream_inner(
 
         let model_role = "chat";
 
-        let chat_service = pond_core::shared::services::chat::ChatService::new(
+        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             state.agent.clone(),
             session_id.clone(),
             storage.clone(),
         );
+        if let (Some(ext), Some(svc)) =
+            (state.memory_extractor.clone(), state.memory_extraction_service.clone())
+        {
+            chat_service = chat_service.with_memory_extraction(
+                ext,
+                svc,
+                state.memory_repo.clone(),
+            );
+        }
 
         // ── Persist user message ────────────────────────────────────────────
         if let Err(e) = chat_service.persist_user_message(&req.message).await {
@@ -1216,38 +1229,20 @@ fn chat_stream_inner(
             }
         }
 
-        // ── Parallel Post-Processing ──────────────────────────────────
-        // Memory extraction is spawned as a background task immediately,
-        // running concurrently with the answer persist below. On HTTP
-        // providers (Ollama/llamafile), the extraction LLM call can
-        // overlap with whatever the main model is doing next.
-        //
-        // The review (above) must remain synchronous because it may
-        // revise `full_text`, which we need before persisting.
-
-        // Start memory extraction ASAP — don't wait for persist.
-        let full_text_for_extraction = full_text.clone();
-        if let (Some(extractor), Some(service)) =
-            (&state.memory_extractor, &state.memory_extraction_service)
-        {
-            let ext = extractor.clone();
-            let svc = service.clone();
-            let repo = state.memory_repo.clone();
-            let user_msg = req.message.clone();
-            let asst_resp = full_text_for_extraction;
-            let sid = session_id.clone();
-            tokio::spawn(async move {
-                svc.run(ext.as_ref(), repo.as_ref(), &user_msg, &asst_resp, Some(&sid)).await;
-            });
-        }
-
-        // ── Persist assistant turn (tool results + response + usage) ───────
-        let _ = chat_service.persist_assistant_turn(
-            tool_results,
-            &full_text,
-            Some((usage_prompt_tokens, usage_completion_tokens)),
-            Some(&model_name_for_done),
-        ).await;
+        // ── Persist assistant turn + memory extraction ────────────────────
+        // `persist_assistant_turn_with_extraction` owns both concerns: it
+        // writes tool results / assistant text / usage to session_messages,
+        // then spawns memory extraction in the background. The handler cannot
+        // accidentally omit extraction by refactoring this block.
+        let _ = chat_service
+            .persist_assistant_turn_with_extraction(
+                tool_results,
+                &full_text,
+                Some((usage_prompt_tokens, usage_completion_tokens)),
+                Some(&model_name_for_done),
+                &req.message,
+            )
+            .await;
 
         // ── Per-turn telemetry ──────────────────────────────────────────
         if settings.telemetry_enabled {
@@ -3382,12 +3377,16 @@ async fn record_sensor(
         unit: req.unit,
         recorded_at: chrono::Utc::now(),
     };
-    state.sensor_storage.record(reading.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
+    state
+        .sensor_storage
+        .record(reading.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     // Publish to the in-process bus only after the write succeeds (#91), so
     // reactive consumers never see an event for a reading that failed to persist.
     if let Some(bus) = &state.event_bus {
@@ -5526,7 +5525,12 @@ async fn mcp_call_tool(
             Json(json!({ "error": format!("Invalid request: {e}") })),
         )
     })?;
-    dispatch_tool_direct(&state, &req.name, req.arguments.unwrap_or_else(|| json!({}))).await
+    dispatch_tool_direct(
+        &state,
+        &req.name,
+        req.arguments.unwrap_or_else(|| json!({})),
+    )
+    .await
 }
 
 // ── Agent chat stream ─────────────────────────────────────────────────────────
