@@ -1297,12 +1297,15 @@ impl ChatService {
             .await?;
 
         // The LLM handles tool routing natively via MCP — no pre-classification needed.
+        // chat_stream_once is only ever reached via run_loop (the voice CLI loop),
+        // so voice_mode is unconditionally true here — this gets the TTS-friendly
+        // prompt and suppressed thinking that desktop's voice path already gets.
         let request = AgentRequest {
             message: message.clone(),
             session_id: self.session_id.clone(),
             model_role: "chat".to_string(),
             images: Vec::new(),
-            voice_mode: false,
+            voice_mode: true,
             canvas_mode: false,
         };
 
@@ -1742,6 +1745,31 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_once_sets_voice_mode_true() {
+        // chat_stream_once is only ever reached via run_loop, the voice CLI
+        // loop — regression test for Q2-23 (voice_mode was hardcoded false,
+        // silently dropping the TTS-friendly prompt + thinking suppression
+        // that desktop's voice path already gets).
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent.clone(), session_id.clone(), storage.clone());
+        service
+            .chat_stream_once("Hello!".to_string())
+            .await
+            .unwrap();
+
+        let request = agent.last_request().expect("agent should have been called");
+        assert!(
+            request.voice_mode,
+            "chat_stream_once must set voice_mode: true so the agent renders \
+             the <voice-mode> prompt section"
+        );
     }
 
     #[tokio::test]
