@@ -1491,6 +1491,13 @@ async fn run_server(
         });
     }
 
+    // Install the audit MCP server's read handle on the unified event store
+    // (#115). Done here, where the logs DB is in scope, before any agent/builtin
+    // extension is built — `spawn_audit_server` only fires at chat time.
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
+
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
         let cleanup_repo = memory_repo.clone();

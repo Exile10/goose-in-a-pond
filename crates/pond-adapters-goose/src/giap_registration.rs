@@ -138,6 +138,14 @@ pub fn register_giap_extensions(
         registered.push("giap-discovery".into());
     }
 
+    // Audit / privacy-audit server (#115). Its event-log handle is installed
+    // separately via `init_audit_deps` in pond-server (where the logs DB is in
+    // scope), so registration here only wires the spawn fn + toggle.
+    if settings.ext_audit_enabled {
+        register_builtin_extension("giap-audit", pond_mcp_server::spawn_audit_server);
+        registered.push("giap-audit".into());
+    }
+
     // Store for GooseAdapter to read
     let _ = REGISTERED_EXTENSIONS.set(registered.clone());
 
