@@ -135,12 +135,10 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         );
         println!("[finance] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -260,12 +258,10 @@ or 'how much is 50 pounds in shillings'.")]
         );
         println!("[finance] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -559,12 +555,10 @@ impl FinanceMcpServer {
         );
         println!("[finance] GET {}", url.replace(api_key, "***"));
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -647,13 +641,11 @@ impl FinanceMcpServer {
         );
         println!("[finance] GET {} (Yahoo Finance unofficial)", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .header("user-agent", "Mozilla/5.0 (compatible; GIAP/0.1)")
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header("user-agent", "Mozilla/5.0 (compatible; GIAP/0.1)")
+                .timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -756,13 +748,11 @@ impl FinanceMcpServer {
 impl FinanceMcpServer {
     /// Fetch a URL and return the parsed JSON body.
     async fn fetch_json(&self, url: &str) -> Result<serde_json::Value, String> {
-        let resp = self
-            .http_client
-            .get(url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let resp = crate::http::traced_get_with(&self.http_client, url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));

@@ -2076,6 +2076,11 @@ async fn run_server(
         });
     }
 
+    // Egress tracker (#113): record every outbound HTTP call made by built-in
+    // MCP tools into the same event store, so network egress is queryable via
+    // `GET /api/v1/activity?category=network`.
+    pond_mcp_server::set_egress_sink(event_log.clone());
+
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
     // to pair a GOTG device.

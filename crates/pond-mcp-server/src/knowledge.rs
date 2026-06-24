@@ -109,21 +109,19 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] search request failed: {e}");
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia request failed: {e}"),
-                    None,
-                )
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] search request failed: {e}");
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia request failed: {e}"),
+                None,
+            )
+        })?;
 
         println!("[wikipedia] search response status: {}", resp.status());
 
@@ -272,12 +270,10 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -366,12 +362,10 @@ when asked 'what does X mean' or 'define X'.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -442,12 +436,10 @@ reading recommendations, or 'who wrote X'.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(15))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -932,21 +924,19 @@ impl KnowledgeMcpServer {
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] article request failed: {e}");
-                WikiFetchError::Mcp(ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia request failed: {e}"),
-                    None,
-                ))
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(15))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] article request failed: {e}");
+            WikiFetchError::Mcp(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia request failed: {e}"),
+                None,
+            ))
+        })?;
 
         println!("[wikipedia] article response status: {}", resp.status());
 
@@ -1016,21 +1006,19 @@ impl KnowledgeMcpServer {
         );
         println!("[wikipedia] fallback search: GET {}", search_url);
 
-        let resp = self
-            .http_client
-            .get(&search_url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] fallback search request failed: {e}");
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia search failed: {e}"),
-                    None,
-                )
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &search_url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] fallback search request failed: {e}");
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia search failed: {e}"),
+                None,
+            )
+        })?;
 
         if !resp.status().is_success() {
             return Err(ErrorData::new(

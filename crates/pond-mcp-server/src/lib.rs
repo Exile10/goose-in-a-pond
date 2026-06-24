@@ -19,6 +19,7 @@ pub mod http;
 // ── Shared state for tool param generation ──────────────────────────────────
 
 use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
+use pond_core::security::ports::event_log::EventLog;
 use std::sync::{Arc, OnceLock, RwLock};
 
 // -- User message and current session: set by GooseAdapter before each turn --
@@ -39,6 +40,40 @@ pub fn current_session_id() -> String {
         .read()
         .map(|g| g.clone())
         .unwrap_or_default()
+}
+
+// Name of the built-in tool currently being dispatched — set by the dispatcher
+// before each tool call so the egress tracker (#113) can attribute every
+// outbound HTTP request to the tool that triggered it.
+static CURRENT_TOOL: RwLock<String> = RwLock::new(String::new());
+
+/// Record the tool about to run. Called by the dispatcher for every tool call.
+pub fn set_current_tool(tool: &str) {
+    if let Ok(mut guard) = CURRENT_TOOL.write() {
+        *guard = tool.to_string();
+    }
+}
+
+/// The tool currently in flight, or an empty string if none is set.
+pub fn current_tool() -> String {
+    CURRENT_TOOL.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+// -- Egress event sink (#113) --------------------------------------------------
+// The unified event store every outbound network call is recorded into. Set
+// once at startup from the server wiring; when unset (tests, standalone use of
+// `build_http_client`) the egress tracker is a silent no-op.
+static EGRESS_SINK: OnceLock<Arc<dyn EventLog>> = OnceLock::new();
+
+/// Install the durable sink the egress tracker writes outbound-call events to.
+/// Call once at startup. Subsequent calls are ignored (the first wins).
+pub fn set_egress_sink(sink: Arc<dyn EventLog>) {
+    let _ = EGRESS_SINK.set(sink);
+}
+
+/// The configured egress sink, if one was installed.
+pub(crate) fn egress_sink() -> Option<Arc<dyn EventLog>> {
+    EGRESS_SINK.get().cloned()
 }
 
 pub fn set_last_user_message(msg: &str) {
@@ -162,7 +197,7 @@ pub fn all_app_resources() -> Vec<(&'static str, &'static str)> {
 
 // Re-export shared utilities for downstream Knowledge-family servers
 pub use format::{format_api_error, format_list_result, format_not_configured, truncate_to_budget};
-pub use http::{build_http_client, traced_get};
+pub use http::{build_http_client, traced_get, traced_get_with};
 
 // Re-export the direct tool dispatcher
 pub use dispatcher::McpToolDispatcher;
