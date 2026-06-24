@@ -104,6 +104,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<TopStoriesParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_top_stories");
         let category = resolve_category(params.0.category.as_deref());
         let limit = params.0.limit.unwrap_or(5).clamp(1, 15) as usize;
         println!(
@@ -221,6 +222,7 @@ current events, or news about a topic.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<SearchNewsParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("search_news");
         // 1. Read Guardian API key from settings
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
@@ -260,6 +262,7 @@ Get today's top news headlines and trending topics. Use for 'what's in the news'
         _ctx: RequestContext<RoleServer>,
         params: Parameters<HeadlinesParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_headlines");
         // 1. Read GNews API key from settings
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
