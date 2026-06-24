@@ -187,6 +187,23 @@ pub struct Settings {
     #[serde(default = "Settings::default_session_messages_keep")]
     pub retention_session_messages_keep: u32,
 
+    /// Baseline days to keep rows in the unified `events` log (#117).
+    /// `0` = keep forever. Per-category overrides take precedence.
+    #[serde(default = "Settings::default_events_days")]
+    pub retention_events_days: u32,
+
+    /// Per-`EventCategory` retention override (snake_case category → days),
+    /// e.g. `{"network": 14, "sensor": 7}`. Categories absent here fall back to
+    /// `retention_events_days`. Empty by default.
+    #[serde(default)]
+    pub retention_events_by_category: std::collections::HashMap<String, u32>,
+
+    /// Privacy-by-default cap: events classified `Sensitive` or `Secret` are
+    /// purged after at most this many days, regardless of category (#117).
+    /// `0` = no extra cap.
+    #[serde(default = "Settings::default_sensitive_days")]
+    pub retention_sensitive_days: u32,
+
     // ── Thinking / Reasoning ────────────────────────────────────────────────────
     /// Thinking/reasoning mode: "auto" | "on" | "off"
     /// "auto" (default): enable for models that support it (Gemma 4, Qwen3, etc.)
@@ -497,6 +514,9 @@ impl Default for Settings {
             retention_event_log_days: Self::default_event_log_days(),
             retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
+            retention_events_days: Self::default_events_days(),
+            retention_events_by_category: std::collections::HashMap::new(),
+            retention_sensitive_days: Self::default_sensitive_days(),
             thinking_mode: Self::default_thinking_mode(),
             show_thinking: false,
             review_mode: Self::default_review_mode(),
@@ -645,6 +665,12 @@ impl Settings {
     }
     fn default_session_messages_keep() -> u32 {
         500
+    }
+    fn default_events_days() -> u32 {
+        30
+    }
+    fn default_sensitive_days() -> u32 {
+        7
     }
     fn default_thinking_mode() -> String {
         "auto".to_string()
