@@ -143,12 +143,10 @@ Look up country data: population, capital, currency, languages. Use for \
         };
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -231,12 +229,10 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             let url = format!("{}/api/v2/product/{}", OFF_BASE, urlencoding::encode(code));
             println!("[discovery] GET {}", url);
 
-            let resp = match self
-                .http_client
-                .get(&url)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
+            let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+                b.timeout(std::time::Duration::from_secs(10))
+            })
+            .await
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -298,12 +294,10 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         );
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(15))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -405,12 +399,10 @@ or price comparisons. European coverage is strongest.")]
         );
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -533,12 +525,10 @@ impl DiscoveryMcpServer {
         );
         println!("[discovery] SearXNG GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -657,12 +647,10 @@ impl DiscoveryMcpServer {
         );
         println!("[discovery] DDG IA GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
