@@ -112,6 +112,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ExchangeRateParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_exchange_rate");
         let from = resolve_currency_code(
             params.0.from.as_deref(),
             &params.0.extra,
@@ -226,6 +227,7 @@ or 'how much is 50 pounds in shillings'.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ConvertCurrencyParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("convert_currency");
         let amount = resolve_amount(params.0.amount, &params.0.extra);
         let from = resolve_currency_code(
             params.0.from.as_deref(),
@@ -323,6 +325,7 @@ Get a stock's current price and daily change. Use for 'AAPL stock price', \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<StockQuoteParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_stock_quote");
         // 1. Resolve symbol first (needed for both paths)
         let symbol = resolve_stock_symbol(params.0.symbol.as_deref(), &params.0.extra);
         println!("[finance] get_stock_quote: symbol={:?}", symbol);
@@ -378,6 +381,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<CryptoPriceParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_crypto_price");
         let asset = resolve_crypto_asset(params.0.asset.as_deref(), &params.0.extra);
 
         println!("[finance] get_crypto_price: asset={:?}", asset);

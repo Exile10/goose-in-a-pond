@@ -7235,6 +7235,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "pond-core",
  "reqwest 0.13.3",
  "serde",
  "serde_json",

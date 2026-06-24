@@ -19,62 +19,18 @@ pub mod http;
 // ── Shared state for tool param generation ──────────────────────────────────
 
 use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
-use pond_core::security::ports::event_log::EventLog;
 use std::sync::{Arc, OnceLock, RwLock};
 
 // -- User message and current session: set by GooseAdapter before each turn --
 static LAST_USER_MESSAGE: RwLock<String> = RwLock::new(String::new());
 
-// Session ID for the turn currently in flight — used by MCP tool handlers to
-// tag outbound HTTP trace events with the correct session for correlation.
-static CURRENT_SESSION_ID: RwLock<String> = RwLock::new(String::new());
-
-pub fn set_current_session_id(sid: &str) {
-    if let Ok(mut guard) = CURRENT_SESSION_ID.write() {
-        *guard = sid.to_string();
-    }
-}
-
-pub fn current_session_id() -> String {
-    CURRENT_SESSION_ID
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default()
-}
-
-// Name of the built-in tool currently being dispatched — set by the dispatcher
-// before each tool call so the egress tracker (#113) can attribute every
-// outbound HTTP request to the tool that triggered it.
-static CURRENT_TOOL: RwLock<String> = RwLock::new(String::new());
-
-/// Record the tool about to run. Called by the dispatcher for every tool call.
-pub fn set_current_tool(tool: &str) {
-    if let Ok(mut guard) = CURRENT_TOOL.write() {
-        *guard = tool.to_string();
-    }
-}
-
-/// The tool currently in flight, or an empty string if none is set.
-pub fn current_tool() -> String {
-    CURRENT_TOOL.read().map(|g| g.clone()).unwrap_or_default()
-}
-
-// -- Egress event sink (#113) --------------------------------------------------
-// The unified event store every outbound network call is recorded into. Set
-// once at startup from the server wiring; when unset (tests, standalone use of
-// `build_http_client`) the egress tracker is a silent no-op.
-static EGRESS_SINK: OnceLock<Arc<dyn EventLog>> = OnceLock::new();
-
-/// Install the durable sink the egress tracker writes outbound-call events to.
-/// Call once at startup. Subsequent calls are ignored (the first wins).
-pub fn set_egress_sink(sink: Arc<dyn EventLog>) {
-    let _ = EGRESS_SINK.set(sink);
-}
-
-/// The configured egress sink, if one was installed.
-pub(crate) fn egress_sink() -> Option<Arc<dyn EventLog>> {
-    EGRESS_SINK.get().cloned()
-}
+// Per-turn request context (session + in-flight tool) and the egress sink now
+// live in `pond-core` so outboard adapters (e.g. pond-adapters-weather) can
+// report egress into the same store without depending on this crate (#113).
+// Re-exported here so existing engine call sites stay unchanged.
+pub use pond_core::shared::services::egress::{
+    current_session_id, current_tool, set_current_session_id, set_current_tool, set_egress_sink,
+};
 
 pub fn set_last_user_message(msg: &str) {
     if let Ok(mut guard) = LAST_USER_MESSAGE.write() {

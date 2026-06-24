@@ -92,6 +92,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("search_wikipedia");
         let query = resolve_topic(&params.0, "search_wikipedia").await;
         println!("[wikipedia] search_wikipedia called: query={:?}", query);
 
@@ -202,6 +203,7 @@ verbatim. In voice mode keep it to 1-3 sentences.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("get_wikipedia_article");
         // Definitive: what did the MCP server receive from Goose?
         println!("[wikipedia] ╔═══ MCP SERVER RECEIVED ═══");
         println!("[wikipedia] ║ params.topic: {:?}", params.0.topic);
@@ -255,6 +257,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("instant_answer");
         let query = resolve_topic(&params.0, "instant_answer").await;
         println!("[knowledge] instant_answer called: query={:?}", query);
 
@@ -347,6 +350,7 @@ when asked 'what does X mean' or 'define X'.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<DefineWordParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("define_word");
         let word = resolve_word(&params.0).await;
         println!("[knowledge] define_word called: word={:?}", word);
 
@@ -419,6 +423,7 @@ reading recommendations, or 'who wrote X'.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<BookSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("search_books");
         let query = resolve_book_query(&params.0).await;
         println!("[knowledge] search_books called: query={:?}", query);
 

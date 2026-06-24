@@ -115,6 +115,7 @@ Look up country data: population, capital, currency, languages. Use for \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<CountryInfoParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_country_info");
         let country = resolve_country(&params.0).await;
         println!("[discovery] get_country_info: country={:?}", country);
 
@@ -211,6 +212,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ProductLookupParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("lookup_product");
         let (barcode, name) = resolve_product(&params.0).await;
         println!(
             "[discovery] lookup_product: barcode={:?}, name={:?}",
@@ -374,6 +376,7 @@ or price comparisons. European coverage is strongest.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ProductPriceParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_product_price");
         let product = resolve_price_product(&params.0).await;
         println!("[discovery] get_product_price: product={:?}", product);
 
@@ -481,6 +484,7 @@ Search the web for information not covered by other tools. Use as a LAST RESORT 
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WebSearchParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("search_web");
         let query = resolve_web_query(&params.0).await;
         println!("[discovery] search_web: query={:?}", query);
 
