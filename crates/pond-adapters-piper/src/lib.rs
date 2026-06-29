@@ -73,9 +73,13 @@ pub(crate) fn pick_quip() -> &'static str {
 
 // ── Barge-in constants ────────────────────────────────────────────────────────
 
-/// RMS energy threshold for speech detection during barge-in monitoring.
-/// Samples above this trigger an interrupt. Tuned for typical desktop mics.
+/// RMS energy threshold for barge-in when the mic is idle (no TTS playing).
 const BARGE_IN_RMS_THRESHOLD: f32 = 0.02;
+
+/// Elevated RMS threshold used while TTS is actively playing.
+/// Speaker echo typically reads 0.01–0.05 RMS; intentional speech from
+/// a human nearby reads 0.10–0.40 RMS, so 0.15 separates the two reliably.
+const BARGE_IN_RMS_THRESHOLD_SPEAKING: f32 = 0.15;
 
 /// Duration in milliseconds of each audio analysis chunk for barge-in.
 const BARGE_IN_CHUNK_MS: u64 = 100;
@@ -133,9 +137,14 @@ pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
 
 /// Spawn the cpal-based barge-in mic monitor thread.
 ///
-/// Sets `interrupt` to `true` as soon as RMS energy of a 100 ms window
-/// exceeds the threshold, then clears `active` and returns.
-pub(crate) fn start_barge_in_thread(active: Arc<AtomicBool>, interrupt: Arc<AtomicBool>) {
+/// Uses `BARGE_IN_RMS_THRESHOLD` when idle and `BARGE_IN_RMS_THRESHOLD_SPEAKING`
+/// while `is_speaking` is true, suppressing speaker echo without blocking
+/// intentional barge-in (human voice is much louder than echo).
+pub(crate) fn start_barge_in_thread(
+    active: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
+    is_speaking: Arc<AtomicBool>,
+) {
     // Don't spawn a second listener if one is already active.
     if active.swap(true, Ordering::SeqCst) {
         return;
@@ -178,6 +187,7 @@ pub(crate) fn start_barge_in_thread(active: Arc<AtomicBool>, interrupt: Arc<Atom
         let rms_buf_write = rms_buf.clone();
         let active_for_callback = active_flag.clone();
         let interrupt_for_callback = interrupt_flag.clone();
+        let is_speaking_for_callback = is_speaking.clone();
 
         let stream_config: cpal::StreamConfig = config.into();
 
@@ -191,13 +201,19 @@ pub(crate) fn start_barge_in_thread(active: Arc<AtomicBool>, interrupt: Arc<Atom
                 buf.extend_from_slice(data);
 
                 if buf.len() >= chunk_samples {
-                    // Compute RMS of the accumulated chunk.
                     let sum_sq: f32 = buf.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / buf.len() as f32).sqrt();
                     buf.clear();
 
-                    if rms > BARGE_IN_RMS_THRESHOLD {
-                        tracing::debug!("Barge-in: speech detected (RMS={rms:.4})");
+                    let threshold = if is_speaking_for_callback.load(Ordering::Relaxed) {
+                        BARGE_IN_RMS_THRESHOLD_SPEAKING
+                    } else {
+                        BARGE_IN_RMS_THRESHOLD
+                    };
+                    if rms > threshold {
+                        tracing::debug!(
+                            "Barge-in: speech detected (RMS={rms:.4}, threshold={threshold:.2})"
+                        );
                         interrupt_for_callback.store(true, Ordering::SeqCst);
                         active_for_callback.store(false, Ordering::SeqCst);
                     }
@@ -255,6 +271,9 @@ pub struct PiperOutput {
     speech_interrupted: Arc<AtomicBool>,
     /// Barge-in listener active flag — shared with the mic monitoring thread.
     barge_in_active: Arc<AtomicBool>,
+    /// True while TTS audio is actively playing. Shared with the barge-in thread
+    /// so it uses an elevated RMS threshold to suppress speaker echo (AEC gating).
+    is_speaking: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "legacy-subprocess")]
@@ -272,6 +291,7 @@ impl PiperOutput {
             thinking_active: Arc::new(AtomicBool::new(false)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             barge_in_active: Arc::new(AtomicBool::new(false)),
+            is_speaking: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -327,6 +347,7 @@ impl VoiceOutput for PiperOutput {
         start_barge_in_thread(
             self.barge_in_active.clone(),
             self.speech_interrupted.clone(),
+            self.is_speaking.clone(),
         );
     }
 
@@ -354,13 +375,14 @@ impl VoiceOutput for PiperOutput {
         let flag = self.speech_interrupted.clone();
 
         // Synthesize then play with interrupt support.
+        let is_speaking = self.is_speaking.clone();
         tokio::task::spawn_blocking(move || {
             let wav =
                 synthesize_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)?;
             if wav.is_empty() {
                 return Ok(());
             }
-            play_wav_interruptible(wav, &flag)
+            play_wav_interruptible(wav, &flag, &is_speaking)
         })
         .await
         .context("piper speak task panicked")??;
@@ -392,7 +414,8 @@ impl VoiceOutput for PiperOutput {
         // Clear the interrupt flag before playback starts.
         self.speech_interrupted.store(false, Ordering::SeqCst);
         let flag = self.speech_interrupted.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag))
+        let is_speaking = self.is_speaking.clone();
+        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag, &is_speaking))
             .await
             .context("playback task panicked")?
     }
@@ -517,15 +540,19 @@ pub(crate) fn f32_samples_to_pcm_le_bytes(samples: &[f32]) -> Vec<u8> {
 #[cfg(feature = "legacy-subprocess")]
 #[allow(dead_code)]
 fn play_wav(wav: Vec<u8>) -> Result<()> {
-    play_wav_interruptible(wav, &AtomicBool::new(false))
+    play_wav_interruptible(wav, &AtomicBool::new(false), &AtomicBool::new(false))
 }
 
-/// Play WAV audio with interrupt support.
+/// Play WAV audio with interrupt support and AEC gating.
 ///
-/// Polls the `interrupted` flag every 50ms. When set to true, immediately
-/// stops the rodio sink and returns Ok. This enables wake-word interruption
-/// of TTS playback with <50ms response time.
-pub(crate) fn play_wav_interruptible(wav: Vec<u8>, interrupted: &AtomicBool) -> Result<()> {
+/// Sets `is_speaking` to `true` for the duration of playback so the barge-in
+/// thread uses an elevated RMS threshold (suppressing speaker echo). Clears the
+/// flag on exit whether playback finishes or is interrupted.
+pub(crate) fn play_wav_interruptible(
+    wav: Vec<u8>,
+    interrupted: &AtomicBool,
+    is_speaking: &AtomicBool,
+) -> Result<()> {
     use rodio::{Decoder, OutputStream, Sink};
     use std::io::Cursor;
 
@@ -537,17 +564,19 @@ pub(crate) fn play_wav_interruptible(wav: Vec<u8>, interrupted: &AtomicBool) -> 
     let sink = Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
 
     sink.append(decoder);
+    is_speaking.store(true, Ordering::SeqCst);
 
-    // Poll for interrupt instead of blocking until end.
     while !sink.empty() {
         if interrupted.load(Ordering::Relaxed) {
             sink.stop();
-            tracing::debug!("TTS playback interrupted by wake word");
+            is_speaking.store(false, Ordering::SeqCst);
+            tracing::debug!("TTS playback interrupted by barge-in");
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    is_speaking.store(false, Ordering::SeqCst);
     Ok(())
 }
 

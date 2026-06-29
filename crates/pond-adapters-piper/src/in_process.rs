@@ -67,6 +67,9 @@ pub struct PiperRsOutput {
     speech_interrupted: Arc<AtomicBool>,
     /// Barge-in listener active flag — shared with the mic monitoring thread.
     barge_in_active: Arc<AtomicBool>,
+    /// True while audio is actively playing. Shared with the barge-in thread so
+    /// it applies an elevated RMS threshold during playback (AEC gating).
+    is_speaking: Arc<AtomicBool>,
 }
 
 impl PiperRsOutput {
@@ -100,6 +103,7 @@ impl PiperRsOutput {
             thinking_active: Arc::new(AtomicBool::new(false)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             barge_in_active: Arc::new(AtomicBool::new(false)),
+            is_speaking: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -232,6 +236,7 @@ impl VoiceOutput for PiperRsOutput {
         start_barge_in_thread(
             self.barge_in_active.clone(),
             self.speech_interrupted.clone(),
+            self.is_speaking.clone(),
         );
     }
 
@@ -256,7 +261,8 @@ impl VoiceOutput for PiperRsOutput {
             return Ok(());
         }
         let flag = self.speech_interrupted.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(wav, &flag))
+        let is_speaking = self.is_speaking.clone();
+        tokio::task::spawn_blocking(move || play_wav_interruptible(wav, &flag, &is_speaking))
             .await
             .context("playback task panicked")??;
         Ok(())
@@ -272,10 +278,10 @@ impl VoiceOutput for PiperRsOutput {
     }
 
     async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
-        // Clear the interrupt flag before playback starts.
         self.speech_interrupted.store(false, Ordering::SeqCst);
         let flag = self.speech_interrupted.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag))
+        let is_speaking = self.is_speaking.clone();
+        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag, &is_speaking))
             .await
             .context("playback task panicked")?
     }
