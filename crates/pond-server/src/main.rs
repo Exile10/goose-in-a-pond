@@ -2064,9 +2064,7 @@ async fn run_server(
         Arc::new(SqliteEventLog::new(db.logs.clone()));
     // Push-token store (#95) — built here, before `db` is moved into AppState.
     let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
-        Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(
-            db.system.clone(),
-        ));
+        Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
