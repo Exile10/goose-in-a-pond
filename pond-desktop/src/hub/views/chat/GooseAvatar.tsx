@@ -9,7 +9,7 @@ export function GooseAvatar({ size = 30 }: GooseAvatarProps) {
   return (
     <span
       className="ch-avatar"
-      style={{ width: size, height: size }}
+      style={{ "--av-size": `${size}px` } as React.CSSProperties}
       aria-hidden="true"
     >
       <HubIco

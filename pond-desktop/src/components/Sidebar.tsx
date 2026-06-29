@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@heroui/react";
 import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
+import { api } from "../api/PondApiClient";
 import logoSrc from "../assets/logo.png";
 import {
   LayoutDashboard,
@@ -17,6 +18,7 @@ import {
   Puzzle,
   Settings,
   Bot,
+  Bell,
   ChevronLeft,
   ChevronRight,
   Mic,
@@ -27,21 +29,23 @@ import {
 // ── Icon map — standard lucide icons matching each section's intent ──────────
 
 const NAV_ICONS: Record<string, React.ElementType> = {
-  dashboard:  LayoutDashboard,
-  home:       LayoutDashboard,
-  chat:       MessageCircle,
-  devices:    Monitor,
-  clock:      CalendarClock,
-  memory:     Brain,
-  skills:     Sparkles,
-  logs:       ScrollText,
-  extensions: Puzzle,
-  model:      Box,
-  prompt:     PenLine,
-  settings:   Settings,
-  face:       ScanFace,
-  canvas:     Layers,
-  agent:      Bot,
+  dashboard:     LayoutDashboard,
+  home:          LayoutDashboard,
+  chat:          MessageCircle,
+  devices:       Monitor,
+  clock:         CalendarClock,
+  memory:        Brain,
+  skills:        Sparkles,
+  logs:          ScrollText,
+  extensions:    Puzzle,
+  model:         Box,
+  prompt:        PenLine,
+  settings:      Settings,
+  face:          ScanFace,
+  canvas:        Layers,
+  agent:         Bot,
+  bell:          Bell,
+  notifications: Bell,
 };
 
 function NavIcon({ name }: { name: string }) {
@@ -59,6 +63,18 @@ export function Sidebar() {
   const [collapsed, setCollapsed] = useState<boolean>(
     () => localStorage.getItem("pond_sidebar_collapsed") === "true"
   );
+  const [userInitial, setUserInitial] = useState<string>("?");
+  const [userName, setUserName]       = useState<string>("");
+
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        const name = s.user_name ?? "";
+        setUserName(name);
+        setUserInitial(name ? name.charAt(0).toUpperCase() : "?");
+      })
+      .catch(() => { /* offline — keep defaults */ });
+  }, []);
 
   useEffect(() => {
     function onResize() {
@@ -86,7 +102,6 @@ export function Sidebar() {
   }
 
   async function switchToCanvas() {
-    // Try Tauri native canvas window first; fall back to inline section
     try {
       await invoke("show_canvas");
       dispatch({ type: "SET_MODE", payload: "canvas" });
@@ -108,7 +123,7 @@ export function Sidebar() {
         {!collapsed && <span className="sidebar__brand-name">Goose In A Pond</span>}
       </div>
 
-      {/* ── Mode buttons (Voice + Canvas) — at top ── */}
+      {/* ── Mode buttons (Voice + Canvas) ── */}
       <div className="sidebar__actions">
         <Button
           size="sm"
@@ -139,7 +154,9 @@ export function Sidebar() {
         {SIDEBAR_GROUPS.map((group, gi) => (
           <div className="sidebar__group" key={gi}>
             {group.label && !collapsed && (
-              <div className="sidebar__group-label">{group.label.charAt(0) + group.label.slice(1).toLowerCase()}</div>
+              <div className="sidebar__group-label">
+                {group.label.charAt(0) + group.label.slice(1).toLowerCase()}
+              </div>
             )}
             {group.sections.map((item) => {
               const active = state.section === item.section;
@@ -163,19 +180,31 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* ── Footer ── */}
+      {/* ── Notifications — pinned above footer ── */}
+      <div className="sidebar__bottom-nav">
+        <button
+          className={`sidebar__item${state.section === "notifications" ? " is-active" : ""}`}
+          onClick={() => navigate("notifications")}
+          aria-label="Notifications"
+          title={collapsed ? "Notifications" : undefined}
+        >
+          <span className="sidebar__icon"><Bell size={16} strokeWidth={1.8} /></span>
+          {!collapsed && <span>Notifications</span>}
+        </button>
+      </div>
+
+      {/* ── Footer — user avatar + collapse toggle ── */}
       <div className="sidebar__footer">
-        {/* Server status */}
-        <div className="sidebar__status">
-          <span className={`sidebar__status-dot ${state.serverOnline ? "is-connected" : ""}`} />
+        <div className="sidebar__avatar-wrap" title={userName || "User"}>
+          <span className="sidebar__avatar">
+            {userInitial}
+            <span className={`sidebar__avatar-dot${state.serverOnline ? " is-online" : ""}`} />
+          </span>
           {!collapsed && (
-            <span>
-              {state.serverOnline ? "Connected" : state.serverStarting ? "Starting\u2026" : "Offline"}
-            </span>
+            <span className="sidebar__avatar-name">{userName || "User"}</span>
           )}
         </div>
 
-        {/* Collapse toggle */}
         <button
           className="sidebar__collapse-btn"
           onClick={toggleCollapsed}

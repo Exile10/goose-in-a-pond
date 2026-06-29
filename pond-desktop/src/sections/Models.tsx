@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button, Tabs, Chip } from "@heroui/react";
+import { ModelSetupGuide } from "./ModelSetupGuide";
 import {
   Brain, Mic, Volume2, RefreshCw, Download, CheckCircle, XCircle,
   ChevronDown, ChevronUp, Search, Trash2, MessageSquare, Play,
@@ -1373,6 +1374,17 @@ function TtsCatalogPanel({
 
 export function Models() {
   const confirm = useConfirm();
+
+  // "setup" is the default for first-time users; "manage" shows the full advanced view.
+  const [view, setView] = useState<"setup" | "manage">(() => {
+    try { return (localStorage.getItem("models-view") as "setup" | "manage") ?? "setup"; }
+    catch { return "setup"; }
+  });
+  function switchView(v: "setup" | "manage") {
+    try { localStorage.setItem("models-view", v); } catch { /* ignore */ }
+    setView(v);
+  }
+
   const [category, setCategory] = useState<Category>("llm");
   const [activeRoles, setActiveRoles] = useState<ModelActiveRoles | null>(null);
   const [rolesLoading, setRolesLoading] = useState(false);
@@ -1508,49 +1520,46 @@ export function Models() {
   return (
     <div className="screen">
       {/* Page header */}
-      <PageHeader
-        title="Models"
-        action={
-          <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-            {diskUsage && (
-              <span
-                style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)" }}
-                data-testid="models-disk-usage"
-              >
-                {fmtBytes(diskUsage.total_bytes)} used · {fmtBytes(diskUsage.hf_cache_bytes)} in cache
-              </span>
-            )}
-            <Button
-              size="sm"
-              variant="ghost"
-              onPress={handleCleanup}
-              isDisabled={cleaning || downloads.some((d) => d.status === "downloading")}
-              data-testid="models-cleanup-btn"
+      <div className="page-header">
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <h1 className="page-header__title">Models</h1>
+          <div className="view-toggle">
+            <button
+              className={`view-toggle__btn${view === "setup" ? " is-active" : ""}`}
+              onClick={() => switchView("setup")}
             >
-              <Sparkles size={14} strokeWidth={1.8} /> {cleaning ? "Cleaning…" : "Free up space"}
-            </Button>
-            <Button size="sm" variant="ghost" onPress={handleScan}>
-              <RefreshCw size={14} strokeWidth={1.8} /> Scan
-            </Button>
+              Set up
+            </button>
+            <button
+              className={`view-toggle__btn${view === "manage" ? " is-active" : ""}`}
+              onClick={() => switchView("manage")}
+            >
+              Manage
+            </button>
           </div>
-        }
-      />
+        </div>
+      </div>
+
+      {/* ── Guided setup view ─────────────────────────────────── */}
+      {view === "setup" && (
+        <ModelSetupGuide
+          models={models}
+          activeRoles={activeRoles}
+          modelsLoading={modelsLoading}
+          onActivate={handleActivate}
+          onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
+          onGoToAdvanced={() => switchView("manage")}
+        />
+      )}
+
+      {/* ── Advanced / Manage view ─────────────────────────────── */}
+      {view === "manage" && <>
 
       {/* Active Roles Card */}
       <div className="card">
         <div className="card-header">
           <span className="card__label">Active model roles</span>
           <div className="card-header__right">
-            {memoryStatus && memoryStatus.total_mb > 0 && (
-              <span className="mem-stat">
-                {(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100).toFixed(0)}%
-                {" · "}
-                {(memoryStatus.available_for_llm_mb / 1024).toFixed(1)} / {(memoryStatus.total_mb / 1024).toFixed(1)} GB
-                {memoryStatus.loaded_model && (
-                  <Chip size="sm" variant="flat" color="secondary" className="mem-stat__chip">{memoryStatus.loaded_model}</Chip>
-                )}
-              </span>
-            )}
             <Button size="sm" variant="ghost" isIconOnly onPress={loadRoles} isDisabled={rolesLoading} aria-label="Refresh roles">
               <RefreshCw size={13} strokeWidth={1.8} style={{ opacity: rolesLoading ? 0.4 : 1, transition: "opacity 0.2s" }} />
             </Button>
@@ -1565,6 +1574,40 @@ export function Models() {
             loading={rolesLoading}
             onNavigate={(cat) => setCategory(cat)}
           />
+        </div>
+        <div className="card-footer--models">
+          {memoryStatus && memoryStatus.total_mb > 0 && (
+            <span className="mem-stat">
+              {(((memoryStatus.total_mb - memoryStatus.available_for_llm_mb) / memoryStatus.total_mb) * 100).toFixed(0)}%
+              {" · "}
+              {(memoryStatus.available_for_llm_mb / 1024).toFixed(1)} / {(memoryStatus.total_mb / 1024).toFixed(1)} GB RAM
+              {memoryStatus.loaded_model && (
+                <Chip size="sm" variant="flat" color="secondary" className="mem-stat__chip">{memoryStatus.loaded_model}</Chip>
+              )}
+            </span>
+          )}
+          {diskUsage && (
+            <span
+              style={{ fontSize: "11px", color: "var(--grey-500)", fontFamily: "var(--font-mono)" }}
+              data-testid="models-disk-usage"
+            >
+              {fmtBytes(diskUsage.total_bytes)} used · {fmtBytes(diskUsage.hf_cache_bytes)} in cache
+            </span>
+          )}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={handleCleanup}
+              isDisabled={cleaning || downloads.some((d) => d.status === "downloading")}
+              data-testid="models-cleanup-btn"
+            >
+              <Sparkles size={14} strokeWidth={1.8} /> {cleaning ? "Cleaning…" : "Free up space"}
+            </Button>
+            <Button size="sm" variant="ghost" onPress={handleScan}>
+              <RefreshCw size={14} strokeWidth={1.8} /> Scan
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -1669,6 +1712,8 @@ export function Models() {
       )}
 
       {category === "face" && <FacePanel />}
+
+      </> /* end manage view */}
     </div>
   );
 }
