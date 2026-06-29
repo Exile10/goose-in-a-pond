@@ -98,12 +98,15 @@ Optional window (hour|day|week, default day) and category filter.")]
             .clamp(1, MAX_RECENT_LIMIT);
         let since = chrono::Utc::now() - window_span(window);
 
+        // Scan up to SCAN_LIMIT (not `limit`) so the post-query Secret filter
+        // can't shrink the result below `limit`; `recent_lines` caps to `limit`
+        // after filtering.
         let events = match self
             .event_log
             .query(EventQuery {
                 category,
                 since: Some(since),
-                limit: Some(limit),
+                limit: Some(SCAN_LIMIT),
                 ..Default::default()
             })
             .await
@@ -112,7 +115,7 @@ Optional window (hour|day|week, default day) and category filter.")]
             Err(e) => return Ok(read_error("recent activity", &e)),
         };
         Ok(CallToolResult::success(vec![Content::text(recent_lines(
-            &events, window,
+            &events, window, limit,
         ))]))
     }
 
@@ -250,17 +253,30 @@ fn is_visible(event: &Event) -> bool {
     event.privacy_sensitivity != PrivacySensitivity::Secret
 }
 
-/// Render a newest-first list of activity lines.
-fn recent_lines(events: &[Event], window: &str) -> String {
-    let visible: Vec<&Event> = events.iter().filter(|e| is_visible(e)).collect();
+/// Render a newest-first list of activity lines, capped to `limit` *after* the
+/// `Secret` filter. The caller scans more rows than `limit` (up to `SCAN_LIMIT`)
+/// so dropping Secret events never shrinks the result below `limit` when more
+/// visible events exist.
+fn recent_lines(events: &[Event], window: &str, limit: usize) -> String {
+    let mut visible: Vec<&Event> = events.iter().filter(|e| is_visible(e)).collect();
     if visible.is_empty() {
         return format!("No activity recorded in the last {window}.");
     }
-    let mut out = format!(
-        "Activity in the last {window} ({} event{}):\n",
-        visible.len(),
-        if visible.len() == 1 { "" } else { "s" }
-    );
+    // Cap to the requested number of *visible* events; flag if we trimmed.
+    let truncated = visible.len() > limit;
+    visible.truncate(limit);
+    let mut out = if truncated {
+        format!(
+            "Activity in the last {window} (showing {} most recent):\n",
+            visible.len()
+        )
+    } else {
+        format!(
+            "Activity in the last {window} ({} event{}):\n",
+            visible.len(),
+            if visible.len() == 1 { "" } else { "s" }
+        )
+    };
     for e in visible {
         let when = e.timestamp.format("%Y-%m-%d %H:%M");
         let mut line = format!("• {} {} · {}", when, category_str(e.category), e.action);
@@ -430,7 +446,7 @@ mod tests {
             ev(EventCategory::Sensor, "sensor.reading"),
             ev(EventCategory::Auth, "auth.token_minted").sensitivity(PrivacySensitivity::Secret),
         ];
-        let out = recent_lines(&events, "day");
+        let out = recent_lines(&events, "day", MAX_RECENT_LIMIT);
         assert!(
             out.contains("2 events"),
             "Secret excluded from count: {out}"
@@ -441,9 +457,38 @@ mod tests {
     }
 
     #[test]
+    fn recent_lines_caps_after_secret_filter() {
+        // The newest scanned row is Secret; with limit=2 the user should still
+        // see 2 visible events, not 1 (the bug: capping before the filter).
+        let events = vec![
+            ev(EventCategory::Auth, "auth.token_minted").sensitivity(PrivacySensitivity::Secret),
+            ev(EventCategory::Sensor, "sensor.reading"),
+            ev(EventCategory::Device, "device.state_changed"),
+        ];
+        let out = recent_lines(&events, "day", 2);
+        assert!(out.contains("sensor.reading"));
+        assert!(out.contains("device.state_changed"));
+        assert!(!out.contains("auth.token_minted"));
+    }
+
+    #[test]
+    fn recent_lines_truncates_with_indicator() {
+        let events = vec![
+            ev(EventCategory::System, "system.a"),
+            ev(EventCategory::System, "system.b"),
+            ev(EventCategory::System, "system.c"),
+        ];
+        let out = recent_lines(&events, "day", 2);
+        assert!(out.contains("showing 2 most recent"), "{out}");
+        // Only the first 2 (newest-first input order) are rendered.
+        assert!(out.contains("system.a") && out.contains("system.b"));
+        assert!(!out.contains("system.c"));
+    }
+
+    #[test]
     fn recent_lines_empty() {
         assert_eq!(
-            recent_lines(&[], "hour"),
+            recent_lines(&[], "hour", MAX_RECENT_LIMIT),
             "No activity recorded in the last hour."
         );
     }
