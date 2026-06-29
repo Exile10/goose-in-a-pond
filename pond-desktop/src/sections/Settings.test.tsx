@@ -49,21 +49,20 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 async function renderSettings() {
   render(<Settings />);
-  // Wait for getSettings to resolve — Identity tab content appears
   await waitFor(() => {
-    const input = screen.queryByPlaceholderText("Friend");
-    if (!input) throw new Error("not loaded");
+    if (!screen.queryByText("Settings")) throw new Error("not loaded");
   });
 }
 
-function clickTab(label: string) {
-  // HeroUI Tabs renders tabs with role="tab" — try that first, fall back to text
-  const byRole = screen.queryAllByRole("tab", { name: new RegExp(label, "i") });
-  if (byRole.length > 0) {
-    fireEvent.click(byRole[0]);
-  } else {
-    fireEvent.click(screen.getAllByText(label)[0]);
-  }
+async function navigateTo(label: string) {
+  fireEvent.click(screen.getByRole("button", { name: label }));
+  await waitFor(() => {
+    if (!screen.queryByText("← Back")) throw new Error("detail not loaded");
+  });
+}
+
+function enableDevMode() {
+  fireEvent.click(screen.getByText("Developer mode"));
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -77,25 +76,33 @@ describe("Settings", () => {
     cleanup();
   });
 
-  it("renders Identity tab by default with user_name field present", async () => {
+  it("renders list view with main settings rows", async () => {
     await renderSettings();
+    expect(screen.getByText("Settings")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Account" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Models" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Voice" })).toBeTruthy();
+  });
+
+  it("Account panel shows user_name field", async () => {
+    await renderSettings();
+    await navigateTo("Account");
     const input = screen.getByPlaceholderText("Friend") as HTMLInputElement;
     expect(input.value).toBe("Jerry");
   });
 
-  it("Voice tab shows voice_wake_word field", async () => {
+  it("Voice panel shows voice_wake_word field", async () => {
     await renderSettings();
-    clickTab("Voice");
-    // voice_wake_word field has placeholder "goose"
+    await navigateTo("Voice");
     await waitFor(() => {
       if (!screen.queryByPlaceholderText("goose")) throw new Error("not rendered");
     });
     expect(screen.getByPlaceholderText("goose")).toBeTruthy();
   });
 
-  it("Voice tab shows 'Not calibrated' and Calibrate button when transcriptions empty", async () => {
+  it("Voice panel shows 'Not calibrated' and Calibrate button when transcriptions empty", async () => {
     await renderSettings();
-    clickTab("Voice");
+    await navigateTo("Voice");
     await waitFor(() => {
       if (!screen.queryByText("Not calibrated")) throw new Error("not rendered");
     });
@@ -103,24 +110,21 @@ describe("Settings", () => {
     expect(screen.getByText("Calibrate")).toBeTruthy();
   });
 
-  it("Models tab shows Main LLM and Tool Caller sections", async () => {
+  it("Models panel shows AI Models section and Change button", async () => {
     await renderSettings();
-    clickTab("Models");
+    await navigateTo("Models");
     await waitFor(() => {
-      if (!screen.queryByText("Main LLM")) throw new Error("not rendered");
+      if (!screen.queryByText("AI Models")) throw new Error("not rendered");
     });
-    expect(screen.getByText("Main LLM")).toBeTruthy();
-    expect(screen.getByText("Tool Caller")).toBeTruthy();
-    // The main LLM role row shows a "Change…" button
+    expect(screen.getByText("AI Models")).toBeTruthy();
     const changeBtns = screen.getAllByText("Change…");
     expect(changeBtns.length).toBeGreaterThanOrEqual(1);
-    // Current chat model is shown in the display row
     expect(screen.getByText("llamafile / llama3.2")).toBeTruthy();
   });
 
-  it("Prompts tab renders 4 prompt_style radio options", async () => {
+  it("Prompts panel renders 4 prompt_style radio options", async () => {
     await renderSettings();
-    clickTab("Prompts");
+    await navigateTo("Prompts");
     await waitFor(() => {
       if (!screen.queryByText("Balanced")) throw new Error("not rendered");
     });
@@ -130,50 +134,43 @@ describe("Settings", () => {
     expect(screen.getByText("Warm")).toBeTruthy();
   });
 
-  it("Location tab shows weather_enabled toggle and lat/lon disabled when off", async () => {
+  it("Memory panel shows 3 agent_goose_mode radio options and memory_limit disabled when inject off", async () => {
     await renderSettings();
-    clickTab("Location");
+    enableDevMode();
     await waitFor(() => {
-      if (screen.queryAllByText("Enable weather").length === 0) throw new Error("not rendered");
+      if (!screen.queryByText("Advanced")) throw new Error("dev mode not enabled");
     });
-    expect(screen.queryAllByText("Enable weather").length).toBeGreaterThan(0);
-    // lat input is disabled when weather_enabled is false
-    const latInput = screen.getByPlaceholderText("-1.2921") as HTMLInputElement;
-    expect(latInput.disabled).toBe(true);
-  });
-
-  it("Agent tab shows 3 agent_goose_mode radio options and memory_limit disabled when inject off", async () => {
-    await renderSettings();
-    clickTab("Agent");
+    await navigateTo("Memory");
     await waitFor(() => {
       if (!screen.queryByText("Smart (recommended)")) throw new Error("not rendered");
     });
-    // New friendly labels
     expect(screen.getByText("Smart (recommended)")).toBeTruthy();
     expect(screen.getByText("Chat only")).toBeTruthy();
     expect(screen.getByText("Proactive")).toBeTruthy();
-    // memory_limit number input is disabled when agent_memory_inject is false
-    // It's a spinbutton with value "5" from mock data
     const spinbtns = screen.getAllByRole("spinbutton") as HTMLInputElement[];
     const memLimit = spinbtns.find((el) => el.disabled && el.value === "5");
     expect(memLimit).toBeTruthy();
   });
 
-  it("Data tab shows retention_event_log_days field", async () => {
+  it("Privacy panel shows data retention fields", async () => {
     await renderSettings();
-    clickTab("Data");
+    enableDevMode();
     await waitFor(() => {
-      if (!screen.queryByText("Event logs")) throw new Error("not rendered");
+      if (!screen.queryByText("Advanced")) throw new Error("dev mode not enabled");
     });
-    expect(screen.getByText("Event logs")).toBeTruthy();
+    await navigateTo("Privacy");
+    await waitFor(() => {
+      if (!screen.queryByText("Keep event logs for")) throw new Error("not rendered");
+    });
+    expect(screen.getByText("Keep event logs for")).toBeTruthy();
     const spinbtns = screen.getAllByRole("spinbutton") as HTMLInputElement[];
     expect(spinbtns.length).toBeGreaterThan(0);
   });
 
   it("Save button calls api.updateSettings with current state", async () => {
     await renderSettings();
-    // Save button text is "Save Settings"
-    fireEvent.click(screen.getByText("Save Settings"));
+    await navigateTo("Account");
+    fireEvent.click(screen.getByText("Save"));
     await waitFor(() => {
       if (vi.mocked(api.updateSettings).mock.calls.length === 0) {
         throw new Error("updateSettings not called yet");
