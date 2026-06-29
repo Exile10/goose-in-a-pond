@@ -130,6 +130,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         event_log_repo: None,
         event_bus: None,
         event_log: None,
+        push_token_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -541,6 +542,7 @@ async fn make_app_with_agent(
         tool_dispatcher: None,
         event_bus: None,
         event_log: None,
+        push_token_repo: None,
         api_port: 4000,
     });
     (

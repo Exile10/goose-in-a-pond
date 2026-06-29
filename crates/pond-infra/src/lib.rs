@@ -16,6 +16,7 @@ pub mod sqlite_model_repository;
 pub mod sqlite_profile;
 pub mod sqlite_prompt_extra;
 pub mod sqlite_prompt_template;
+pub mod sqlite_push_token;
 pub mod sqlite_recipe;
 pub mod sqlite_security_policy;
 pub mod sqlite_sensor;

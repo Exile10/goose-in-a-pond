@@ -138,6 +138,7 @@ async fn make_app_with_real_memory(
         event_log_repo: None,
         event_bus: None,
         event_log: None,
+        push_token_repo: None,
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),

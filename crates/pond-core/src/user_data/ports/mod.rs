@@ -13,6 +13,7 @@ pub mod onboarding;
 pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;
+pub mod push_token;
 pub mod recipe;
 pub mod schedule_execution;
 pub mod scheduler;
