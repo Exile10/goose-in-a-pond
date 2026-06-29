@@ -25,6 +25,8 @@ export interface RoutineDetail {
   does: string[];
   /** Human-readable time/trigger meta */
   time: string;
+  /** Prompt sent to Goose when this routine runs. Used to seed the recipe on first run. */
+  prompt: string;
 }
 
 export const ROUTINES: RoutineDetail[] = [
@@ -36,6 +38,7 @@ export const ROUTINES: RoutineDetail[] = [
     bg: "linear-gradient(150deg,#FCD34D,#F59E0B)",
     does: ["Lights to 60%", "Heat to 70°", "Brew coffee", "Read briefing"],
     time: "7:00 AM · weekdays",
+    prompt: "Run the Good Morning routine: set lights to 60% brightness, set thermostat to 70°F, start brewing coffee, and read the morning news briefing.",
   },
   {
     id: "night",
@@ -45,6 +48,7 @@ export const ROUTINES: RoutineDetail[] = [
     bg: "linear-gradient(150deg,#818CF8,#4F46E5)",
     does: ["Lock all doors", "Lights off", "Heat to 66°", "Arm security"],
     time: "11:00 PM · daily",
+    prompt: "Run the Good Night routine: lock all doors, turn off all lights, set thermostat to 66°F, and arm the security system.",
   },
   {
     id: "movie",
@@ -53,7 +57,8 @@ export const ROUTINES: RoutineDetail[] = [
     color: "#7C3AED",
     bg: "linear-gradient(150deg,#A78BFA,#7C3AED)",
     does: ["Dim to 20%", "Close blinds", "TV on", "Mute notifications"],
-    time: "On demand",
+    time: "8:00 PM · evenings",
+    prompt: "Run the Movie Time routine: dim the lights to 20%, close the blinds, turn on the TV, and mute all notifications.",
   },
   {
     id: "away",
@@ -62,7 +67,8 @@ export const ROUTINES: RoutineDetail[] = [
     color: "#0D9488",
     bg: "linear-gradient(150deg,#2DD4BF,#0D9488)",
     does: ["Lock up", "Eco climate", "Cameras armed", "Lights off"],
-    time: "When everyone leaves",
+    time: "When leaving home",
+    prompt: "Run the Away routine: lock all doors and windows, set climate to eco mode, arm all cameras, and turn off all lights.",
   },
   {
     id: "focus",
@@ -71,6 +77,7 @@ export const ROUTINES: RoutineDetail[] = [
     color: "#EC4899",
     bg: "linear-gradient(150deg,#F472B6,#DB2777)",
     does: ["Do not disturb", "Desk lamp on", "Lo-fi playlist", "Heat to 71°"],
-    time: "On demand",
+    time: "9:00 AM · work days",
+    prompt: "Run the Focus routine: enable do not disturb mode, turn on the desk lamp, start a lo-fi music playlist, and set thermostat to 71°F.",
   },
 ];

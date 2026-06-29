@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Sun,
@@ -7,11 +7,14 @@ import {
   X,
   Calendar,
   CheckCircle,
+  CheckCircle2,
+  Circle,
   Clock,
   TrendingUp,
   Zap,
   Mail,
   Target,
+  XCircle,
 } from "lucide-react";
 import { Chip, Button } from "@heroui/react";
 import type { ScheduleRunNotification } from "../api/types";
@@ -151,9 +154,105 @@ export function ScheduleDebriefCard({
       return <WeeklyReportCard run={run} onClose={onClose} />;
     case "compact-memory":
       return <MemoryCompactionCard run={run} onClose={onClose} />;
+    case "routine":
+      return <RoutineDebriefCard run={run} onClose={onClose} />;
     default:
       return <GenericDebriefCard run={run} onClose={onClose} />;
   }
+}
+
+// ── RoutineDebriefCard ───────────────────────────────────────────
+
+function RoutineDebriefCard({
+  run,
+  onClose,
+}: {
+  run: ScheduleRunNotification;
+  onClose?: () => void;
+}) {
+  const actions = useMemo<string[]>(() => {
+    if (!run.result) return [];
+    try {
+      const parsed = JSON.parse(run.result);
+      if (Array.isArray(parsed)) return parsed as string[];
+    } catch { /* fall through */ }
+    return run.result.split(" · ").filter(Boolean);
+  }, [run.result]);
+
+  const [doneCount, setDoneCount] = useState(0);
+
+  useEffect(() => {
+    if (actions.length === 0) return;
+    const timers = actions.map((_, i) =>
+      setTimeout(() => setDoneCount((n) => n + 1), 400 + i * 420),
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [actions]);
+
+  const failed = run.status === "failed";
+
+  return (
+    <div className="debrief-card debrief-card--routine">
+      <div className="debrief-hd">
+        <div className="debrief-hd__left">
+          <Sparkles size={18} className="debrief-hd__icon" />
+          <div>
+            <div className="debrief-hd__title">{run.scheduleName}</div>
+            <div className="debrief-hd__meta">{formatDate(run.startedAt)}</div>
+          </div>
+        </div>
+        <div className="debrief-hd__right">
+          <Chip size="sm" className="debrief-chip-label">routine</Chip>
+          {onClose && (
+            <button className="debrief-close" onClick={onClose} aria-label="Close">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="debrief-body">
+        {failed ? (
+          <div className="routine-action routine-action--failed">
+            <XCircle size={16} />
+            <span>{run.error ?? "Routine failed"}</span>
+          </div>
+        ) : (
+          <div className="routine-actions">
+            {actions.map((action, i) => {
+              const done = i < doneCount;
+              return (
+                <motion.div
+                  key={action}
+                  className={`routine-action${done ? " is-done" : ""}`}
+                  initial={{ opacity: 0, x: -8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: i * 0.07, duration: 0.2 }}
+                >
+                  <span className="routine-action__icon">
+                    {done ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+                  </span>
+                  <span className="routine-action__label">{action}</span>
+                  {done && <span className="routine-action__tick">done</span>}
+                </motion.div>
+              );
+            })}
+            {doneCount >= actions.length && actions.length > 0 && (
+              <motion.div
+                className="routine-all-done"
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.15 }}
+              >
+                <CheckCircle size={13} />
+                All actions completed
+              </motion.div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ── StatCount — animated stat cell ──────────────────────────────
@@ -301,7 +400,7 @@ function DailyBriefingCard({
               </div>
               <Button
                 size="sm"
-                variant={focusStarted ? "ghost" : "solid"}
+                variant={focusStarted ? "ghost" : "primary"}
                 onPress={() => setFocusStarted(true)}
                 isDisabled={focusStarted}
               >

@@ -96,7 +96,7 @@ function SettingsRow({
       onKeyDown={handleKeyDown}
       aria-label={label}
     >
-      <span className="set-row__icon" style={{ background: bg }}>
+      <span className="set-row__icon" style={{ "--icon-bg": bg } as React.CSSProperties}>
         <HubIco d={iconPath} size={18} color={color} />
       </span>
       <span className="set-row__text">

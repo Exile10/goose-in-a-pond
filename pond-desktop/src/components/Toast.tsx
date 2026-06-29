@@ -1,31 +1,29 @@
 import { useEffect, useRef } from "react";
-import { CheckCircle, XCircle, Loader, Bell, X } from "lucide-react";
+import { CalendarClock, Sparkles, CheckCircle2, XCircle, X } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import type { ScheduleToast } from "../state/reducer";
 
-/* ── Single toast card ─────────────────────────────────────── */
-function ToastCard({ toast }: { toast: ScheduleToast }) {
+function ToastCard({ toast, onViewNotifications }: { toast: ScheduleToast; onViewNotifications: () => void }) {
   const dispatch = useAppDispatch();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    // Running toasts stay visible until replaced by a completion event
     if (toast.status === "running") return;
     timerRef.current = setTimeout(() => {
       dispatch({ type: "DISMISS_TOAST", payload: toast.id });
-    }, 5000);
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
+    }, 6000);
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [toast.id, toast.status, dispatch]);
 
-  const isOk = toast.status === "completed";
-  const isRunning = toast.status === "running";
+  const isRoutine  = toast.id.startsWith("routine-");
+  const isRunning  = toast.status === "running";
+  const isOk       = toast.status === "completed";
+
   const preview = isRunning
-    ? "Running..."
+    ? null
     : isOk
-      ? toast.result?.slice(0, 80) ?? null
-      : toast.error?.slice(0, 80) ?? null;
+      ? (toast.result ?? null)
+      : (toast.error ?? null);
 
   return (
     <div
@@ -33,34 +31,46 @@ function ToastCard({ toast }: { toast: ScheduleToast }) {
       data-status={toast.status}
       role="alert"
       aria-live="polite"
-      onClick={() => dispatch({ type: "DISMISS_TOAST", payload: toast.id })}
     >
-      <div className="toast-card__icon">
-        {isRunning
-          ? <Loader size={16} className="toast-card__spinner" />
-          : isOk
-            ? <CheckCircle size={16} />
-            : <XCircle size={16} />
-        }
-      </div>
+      {/* left accent bar */}
+      <span className="toast-card__bar" />
+
+      {/* icon */}
+      <span className="toast-card__icon">
+        {isRunning ? (
+          <span className="toast-card__spinner" />
+        ) : isOk ? (
+          <CheckCircle2 size={18} />
+        ) : (
+          <XCircle size={18} />
+        )}
+      </span>
+
+      {/* body */}
       <div className="toast-card__body">
-        <div className="toast-card__title">
-          <Bell size={11} />
-          <span>{toast.schedule_label}</span>
+        <div className="toast-card__meta">
+          {isRoutine
+            ? <Sparkles size={11} />
+            : <CalendarClock size={11} />
+          }
+          <span className="toast-card__type">{isRoutine ? "Routine" : "Schedule"}</span>
           <span className={`toast-card__badge toast-card__badge--${toast.status}`}>
-            {toast.status}
+            {isRunning ? "Running" : isOk ? "Done" : "Failed"}
           </span>
         </div>
-        {preview && (
-          <p className="toast-card__preview">{preview}</p>
+        <div className="toast-card__title">{toast.schedule_label}</div>
+        {preview && <p className="toast-card__preview">{preview}</p>}
+        {!isRunning && (
+          <button className="toast-card__link" onClick={onViewNotifications}>
+            View in Notifications →
+          </button>
         )}
       </div>
+
+      {/* close */}
       <button
         className="toast-card__close"
-        onClick={(e) => {
-          e.stopPropagation();
-          dispatch({ type: "DISMISS_TOAST", payload: toast.id });
-        }}
+        onClick={() => dispatch({ type: "DISMISS_TOAST", payload: toast.id })}
         aria-label="Dismiss"
       >
         <X size={12} />
@@ -69,17 +79,21 @@ function ToastCard({ toast }: { toast: ScheduleToast }) {
   );
 }
 
-/* ── Toast container rendered globally ────────────────────── */
 export function ToastContainer() {
-  const state = useAppState();
+  const state    = useAppState();
+  const dispatch = useAppDispatch();
   const { scheduleToasts } = state;
 
   if (scheduleToasts.length === 0) return null;
 
+  function goNotifications() {
+    dispatch({ type: "SET_SECTION", payload: "notifications" });
+  }
+
   return (
     <div className="toast-container" aria-label="Notifications">
       {scheduleToasts.map((t) => (
-        <ToastCard key={t.id} toast={t} />
+        <ToastCard key={t.id} toast={t} onViewNotifications={goNotifications} />
       ))}
     </div>
   );
