@@ -1337,35 +1337,41 @@ impl ChatService {
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
         // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
+        // `first_sentence_spoken` gates clause-boundary speak() for the first sentence
+        // so audio starts before sentence 2's synthesis completes.
         let mut pending_audio: Option<Vec<u8>> = None;
+        let mut first_sentence_spoken = false;
 
-        /// Speak a chunk, using pipelined synthesis when available.
-        /// If `pending_audio` has buffered audio, plays it while synthesizing `text` in parallel.
-        /// Otherwise falls back to sequential speak().
         macro_rules! speak_pipelined {
-            ($self:expr, $text:expr, $pending:expr) => {{
+            ($self:expr, $text:expr, $pending:expr, $first_spoken:expr) => {{
                 let text = $text;
-                // Try pipelined path: synthesize new text, play old audio concurrently
-                match $self.voice_output.synthesize(&text).await {
-                    Ok(Some(new_wav)) => {
-                        // Play previously buffered audio (if any) and stash the new synthesis
-                        if let Some(prev) = $pending.take() {
-                            if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                tracing::warn!("TTS playback failed: {}", e);
-                            }
-                        }
-                        *$pending = Some(new_wav);
+                if !*$first_spoken {
+                    // First sentence: speak() with clause-boundary splitting so the
+                    // user hears audio immediately rather than waiting for S2 synth.
+                    *$first_spoken = true;
+                    if let Err(e) = $self.voice_output.speak(&text).await {
+                        tracing::warn!("TTS failed: {}", e);
                     }
-                    _ => {
-                        // Flush any pending audio first
-                        if let Some(prev) = $pending.take() {
-                            if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                tracing::warn!("TTS playback failed: {}", e);
+                } else {
+                    // Subsequent sentences: synthesize-ahead pipeline.
+                    match $self.voice_output.synthesize(&text).await {
+                        Ok(Some(new_wav)) => {
+                            if let Some(prev) = $pending.take() {
+                                if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                    tracing::warn!("TTS playback failed: {}", e);
+                                }
                             }
+                            *$pending = Some(new_wav);
                         }
-                        // Fallback: sequential speak
-                        if let Err(e) = $self.voice_output.speak(&text).await {
-                            tracing::warn!("TTS failed: {}", e);
+                        _ => {
+                            if let Some(prev) = $pending.take() {
+                                if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                    tracing::warn!("TTS playback failed: {}", e);
+                                }
+                            }
+                            if let Err(e) = $self.voice_output.speak(&text).await {
+                                tracing::warn!("TTS failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -1380,7 +1386,12 @@ impl ChatService {
                         let chunk = sentence_buf.trim().to_string();
                         sentence_buf.clear();
                         stop_tone!();
-                        speak_pipelined!(self, chunk, &mut pending_audio);
+                        speak_pipelined!(
+                            self,
+                            chunk,
+                            &mut pending_audio,
+                            &mut first_sentence_spoken
+                        );
                     }
                     // Flush pending audio before the announcement
                     if let Some(prev) = pending_audio.take() {
@@ -1423,7 +1434,12 @@ impl ChatService {
                             self.voice_output.start_barge_in_listener();
                             barge_in_started = true;
                         }
-                        speak_pipelined!(self, spoken, &mut pending_audio);
+                        speak_pipelined!(
+                            self,
+                            spoken,
+                            &mut pending_audio,
+                            &mut first_sentence_spoken
+                        );
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
@@ -1438,7 +1454,12 @@ impl ChatService {
                         let spoken = strip_markdown_for_speech(&remainder);
                         if !spoken.is_empty() {
                             stop_tone!();
-                            speak_pipelined!(self, spoken, &mut pending_audio);
+                            speak_pipelined!(
+                                self,
+                                spoken,
+                                &mut pending_audio,
+                                &mut first_sentence_spoken
+                            );
                         }
                     }
                     sentence_buf.clear();
