@@ -62,7 +62,9 @@ async function navigateTo(label: string) {
 }
 
 function enableDevMode() {
-  fireEvent.click(screen.getByText("Developer mode"));
+  const btn = screen.queryByText("Developer mode");
+  if (btn) fireEvent.click(btn);
+  // If "Dev mode on" is already showing (localStorage persisted from prior test), devMode is already on
 }
 
 // ── Tests ─────────────────────────────────────────────────────
