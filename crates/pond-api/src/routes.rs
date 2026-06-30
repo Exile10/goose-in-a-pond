@@ -156,6 +156,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         .route("/schedules/{id}/runs", get(list_schedule_runs))
         .route("/schedules/events", get(schedule_events_sse))
+        // Foreground push: per-device notification stream (#99).
+        .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route(
             "/extensions",
@@ -5420,6 +5422,116 @@ async fn schedule_events_sse(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(serde::Deserialize)]
+struct NotificationStreamParams {
+    device_id: Option<String>,
+}
+
+/// `GET /api/v1/notifications/stream?device_id=X` — foreground push (#99).
+///
+/// A paired device opens this to receive notifications in real time. On connect
+/// it first drains anything queued while it was offline, then tails live events
+/// addressed to it (or `"broadcast"`). Notifications carry a stable `id`; clients
+/// dedupe by it. Bounded by `sse_semaphore`.
+async fn notifications_stream(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<NotificationStreamParams>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
+    let device_id = params.device_id.filter(|s| !s.trim().is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "`device_id` query param required" })),
+    ))?;
+
+    let Some(queue) = state.notification_queue.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "notifications not available" })),
+        ));
+    };
+
+    // The stream must belong to a known, registered device.
+    let exists = state
+        .device_registry
+        .get_device(&device_id)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "notifications: device lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "device lookup failed" })),
+            )
+        })?;
+    if exists.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown device" })),
+        ));
+    }
+
+    // Bound concurrent streams (shared with chat/schedule SSE).
+    let permit = state
+        .sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Too many concurrent streams" })),
+            )
+        })?;
+
+    let mut rx = state.notification_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        let _permit = permit; // held for the stream's lifetime
+
+        // 1. Flush notifications queued while the device was offline.
+        match queue.list_undelivered(&device_id).await {
+            Ok(pending) => {
+                let mut ids = Vec::with_capacity(pending.len());
+                for n in &pending {
+                    let data = serde_json::to_string(n).unwrap_or_default();
+                    ids.push(n.id.clone());
+                    yield Ok(Event::default().data(data));
+                }
+                if !ids.is_empty() {
+                    if let Err(e) = queue.mark_delivered(&ids).await {
+                        tracing::warn!(error = %e, "notifications: flush mark_delivered failed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "notifications: flush query failed"),
+        }
+
+        // 2. Live tail — events for this device or broadcasts.
+        loop {
+            match rx.recv().await {
+                Ok(n) => {
+                    if n.target == device_id || n.target == "broadcast" {
+                        let targeted = n.target == device_id;
+                        let id = n.id.clone();
+                        let data = serde_json::to_string(&n).unwrap_or_default();
+                        yield Ok(Event::default().data(data));
+                        if targeted {
+                            if let Err(e) = queue.mark_delivered(&[id]).await {
+                                tracing::warn!(error = %e, "notifications: live mark_delivered failed");
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    tracing::debug!("notifications SSE lagged by {k} messages");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 // ── Agent tools handler ───────────────────────────────────────────────────────
