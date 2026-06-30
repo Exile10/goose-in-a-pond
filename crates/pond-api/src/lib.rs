@@ -234,6 +234,10 @@ pub struct AppState {
     /// publish here so reactive consumers (the rules engine, live dashboards)
     /// can respond. `None` in tests that don't exercise the bus.
     pub event_bus: Option<Arc<dyn EventBus>>,
+    /// Unified, append-only event store (#109): the durable `events` table that
+    /// the bus→log bridge writes to. Read by the activity query API (#114).
+    /// `None` in tests that don't exercise it.
+    pub event_log: Option<Arc<dyn pond_core::security::ports::event_log::EventLog>>,
     /// Biometric face recognition service (register + identify household
     /// members from camera frames).  `None` when no ONNX embedding model
     /// is configured — all face endpoints then return 503.
