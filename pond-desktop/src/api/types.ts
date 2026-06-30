@@ -590,6 +590,52 @@ export interface MarketplaceExtension {
 }
 
 // ── Logs / Telemetry ─────────────────────────────────────────
+// ── Activity / Observability ──────────────────────────────────
+//
+// Mirrors GET /api/v1/activity and GET /api/v1/activity/summary.
+
+export type EventCategory =
+  | "agent" | "tool" | "inference" | "sensor"
+  | "camera" | "device" | "auth" | "network" | "system";
+
+export type PrivacySensitivity = "public" | "internal" | "sensitive" | "secret";
+
+export type AttributeValue =
+  | { bool: boolean }
+  | { int: number }
+  | { float: number }
+  | { text: string };
+
+export interface ActivityEvent {
+  id: string;
+  timestamp: string;
+  category: EventCategory;
+  action: string;
+  privacy_sensitivity: PrivacySensitivity;
+  session_id?: string | null;
+  trace_id?: string | null;
+  attributes: Record<string, AttributeValue>;
+}
+
+export interface ActivityResponse {
+  count: number;
+  events: ActivityEvent[];
+}
+
+export interface ActivitySummary {
+  window: string;
+  since: string;
+  total: number;
+  by_category: Record<string, number>;
+}
+
+export interface ActivityQueryParams {
+  limit?: number;
+  since?: string;
+  category?: EventCategory;
+  session_id?: string;
+}
+
 export interface LogEntry {
   id: number;
   timestamp: string;

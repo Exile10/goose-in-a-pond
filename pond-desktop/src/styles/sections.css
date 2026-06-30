@@ -1935,6 +1935,121 @@
 }
 .logs-table__msg { color: var(--fg); }
 
+/* ─── Activity timeline ─── */
+
+.screen--activity { padding: 0; display: flex; flex-direction: column; height: 100%; }
+
+.act-layout {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ── Toolbar ── */
+.act-main { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--grey-100); }
+.act-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; gap: 10px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--grey-100);
+  flex-shrink: 0;
+}
+.act-toolbar__right { display: flex; align-items: center; gap: 8px; }
+.act-filter-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.act-filter-pill {
+  padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 500;
+  border: 1px solid var(--grey-200); background: transparent; color: var(--grey-600);
+  cursor: pointer; transition: background 0.15s, color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.act-filter-pill:hover { background: var(--grey-50); }
+.act-filter-pill.is-active { background: var(--grey-900); color: #fff; border-color: var(--grey-900); }
+.act-refresh-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 8px;
+  border: 1px solid var(--grey-200); background: transparent; cursor: pointer;
+  color: var(--grey-600);
+}
+.act-refresh-btn:hover { background: var(--grey-50); }
+.act-refresh-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Feed ── */
+.act-feed { flex: 1; overflow-y: auto; padding: 6px 0; }
+.act-error { padding: 12px 16px; color: var(--color-error, #DC2626); font-size: 13px; }
+.act-empty { display: flex; flex-direction: column; gap: 8px; padding: 24px 16px; }
+.act-empty p { font-size: 13px; color: var(--grey-500); }
+.act-skeleton {
+  height: 44px; border-radius: 8px;
+  background: linear-gradient(90deg, var(--grey-100) 25%, var(--grey-50) 50%, var(--grey-100) 75%);
+  background-size: 200% 100%; animation: act-shimmer 1.4s infinite;
+}
+.act-skeleton--sm { height: 32px; width: 60%; }
+@keyframes act-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+/* ── Event row ── */
+.act-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 16px; border-bottom: 1px solid var(--grey-50);
+  transition: background 0.1s;
+}
+.act-row:hover { background: var(--grey-50); }
+.act-row--sensitive { background: #FFF7ED; }
+.act-row--sensitive:hover { background: #FEF3C7; }
+.act-row__body { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.act-row__action { font-size: 13px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.act-row__right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.act-row__ts { font-size: 11px; color: var(--grey-400); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ── Category icon ── */
+.act-icon {
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--icon-bg, var(--grey-100));
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+
+/* ── Chips & badges ── */
+.act-chip {
+  font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+  text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
+}
+.act-badge {
+  font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.act-badge--risk { background: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; }
+
+/* ── Privacy panel ── */
+.act-privacy {
+  display: flex; flex-direction: column; gap: 16px;
+  padding: 16px; overflow-y: auto;
+}
+.act-privacy__head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; color: var(--grey-700); text-transform: uppercase; letter-spacing: 0.06em;
+}
+.act-privacy__summary { display: flex; flex-direction: column; gap: 10px; }
+.act-privacy__stat { display: flex; align-items: baseline; gap: 6px; }
+.act-privacy__stat-n { font-size: 28px; font-weight: 700; color: var(--fg); line-height: 1; }
+.act-privacy__stat-l { font-size: 12px; color: var(--grey-500); }
+.act-privacy__breakdown { display: flex; flex-direction: column; gap: 5px; }
+.act-privacy__cat-row { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.act-privacy__cat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.act-privacy__cat-name { flex: 1; color: var(--grey-700); }
+.act-privacy__cat-count { font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums; }
+.act-privacy__risks { display: flex; flex-direction: column; gap: 8px; }
+.act-privacy__risks-head { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--grey-700); }
+.act-privacy__risk-list { display: flex; flex-direction: column; gap: 4px; }
+.act-privacy__risk-row { display: flex; align-items: center; gap: 7px; padding: 5px 0; }
+.act-privacy__risk-action { flex: 1; font-size: 12px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-privacy__risk-ts { font-size: 11px; color: var(--grey-400); white-space: nowrap; }
+.act-privacy__risk-more { font-size: 11px; color: var(--grey-400); padding-top: 4px; }
+.act-privacy__clear {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px; border-radius: 10px; background: #F0FDF4;
+  font-size: 12px; color: #16A34A; font-weight: 500;
+}
+
 /* ─── Schedules ─── */
 
 /* header subtitle */
