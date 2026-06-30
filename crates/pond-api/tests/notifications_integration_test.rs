@@ -1,46 +1,49 @@
-//! #95 acceptance: a paired device can register/unregister its push token over
-//! `POST/DELETE /api/v1/devices/{id}/push-token`, and the token is persisted.
-//! Drives the real router with a live `SqlitePushTokenRepository` +
+//! #99 acceptance: a paired device opens `GET /api/v1/notifications/stream` and
+//! receives notifications — including ones queued while it was offline. Drives
+//! the real router with a live `BroadcastNotificationSender` + offline queue +
 //! `SqliteDeviceRegistry` (a device is seeded so the existence check passes).
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use futures::StreamExt;
 use pond_api::{build_router, AppState};
+use pond_core::mcp::ports::notification::Notification;
+use pond_core::mcp::ports::notification::NotificationSender;
+use pond_core::mcp::ports::notification_queue::NotificationQueueRepository;
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::device_registry::{DeviceRegistry, RegisterDeviceRequest};
-use pond_core::user_data::ports::push_token::PushTokenRepository;
+use pond_infra::broadcast_notification_sender::BroadcastNotificationSender;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
+use pond_infra::sqlite_notification_queue::SqliteNotificationQueue;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
 use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
-use pond_infra::sqlite_push_token::SqlitePushTokenRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
 use tower::ServiceExt;
 
-/// Build the router with a live push-token repo + device registry, seeding one
-/// device. Returns the router, the push-token repo (to assert persistence), the
-/// seeded device id, and the tempdir guard.
-async fn make_app() -> (
-    axum::Router,
-    Arc<dyn PushTokenRepository>,
-    String,
-    tempfile::TempDir,
-) {
+struct Harness {
+    router: axum::Router,
+    queue: Arc<dyn NotificationQueueRepository>,
+    sender: Arc<dyn NotificationSender>,
+    device_id: String,
+    _tmp: tempfile::TempDir,
+}
+
+async fn make_app() -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
 
-    // Seed a device so the push-token existence check passes.
     let device_registry: Arc<dyn DeviceRegistry + Send + Sync> =
         Arc::new(SqliteDeviceRegistry::new(pool.clone()));
     let device_id = device_registry
@@ -55,8 +58,14 @@ async fn make_app() -> (
         .unwrap()
         .id;
 
-    let push_repo: Arc<dyn PushTokenRepository> =
-        Arc::new(SqlitePushTokenRepository::new(pool.clone()));
+    let (notification_tx, _) = tokio::sync::broadcast::channel::<Notification>(64);
+    let queue: Arc<dyn NotificationQueueRepository> =
+        Arc::new(SqliteNotificationQueue::new(pool.clone()));
+    let sender: Arc<dyn NotificationSender> = Arc::new(BroadcastNotificationSender::new(
+        notification_tx.clone(),
+        queue.clone(),
+        None,
+    ));
 
     let db = Arc::new(db);
     let mock_hs = MockHandshake::new();
@@ -105,10 +114,10 @@ async fn make_app() -> (
         event_log_repo: None,
         event_bus: None,
         event_log: None,
-        push_token_repo: Some(push_repo.clone()),
-        notification_tx: tokio::sync::broadcast::channel(16).0,
-        notification_queue: None,
-        notification_sender: None,
+        push_token_repo: None,
+        notification_tx,
+        notification_queue: Some(queue.clone()),
+        notification_sender: Some(sender.clone()),
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -131,108 +140,137 @@ async fn make_app() -> (
         api_port: 4000,
     });
 
-    (
-        build_router(state, std::path::PathBuf::from("web/dist")),
-        push_repo,
+    Harness {
+        router: build_router(state, std::path::PathBuf::from("web/dist")),
+        queue,
+        sender,
         device_id,
-        tmp,
+        _tmp: tmp,
+    }
+}
+
+fn notif(target: &str, title: &str) -> Notification {
+    Notification {
+        id: uuid_like(),
+        target: target.into(),
+        category: "info".into(),
+        title: title.into(),
+        body: "body".into(),
+        timestamp: "2026-06-29T00:00:00Z".into(),
+        data: None,
+    }
+}
+
+fn uuid_like() -> String {
+    format!(
+        "n-{}",
+        std::time::SystemTime::now()
+            .elapsed()
+            .unwrap_or_default()
+            .as_nanos()
     )
 }
 
-async fn send(
-    app: &axum::Router,
-    method: Method,
-    uri: &str,
-    auth: bool,
-    body: Option<serde_json::Value>,
-) -> (StatusCode, serde_json::Value) {
-    let mut req = Request::builder().method(method).uri(uri);
+async fn status_of(router: &axum::Router, uri: &str, auth: bool) -> StatusCode {
+    let mut req = Request::builder().method(Method::GET).uri(uri);
     if auth {
         req = req.header("Authorization", "Bearer test-token");
     }
-    let req = match body {
-        Some(b) => req
-            .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_vec(&b).unwrap()))
-            .unwrap(),
-        None => req.body(Body::empty()).unwrap(),
-    };
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let resp = router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
+    resp.status()
 }
 
 #[tokio::test]
-async fn register_then_delete_push_token_persists() {
-    let (app, repo, device_id, _tmp) = make_app().await;
-    let uri = format!("/api/v1/devices/{device_id}/push-token");
+async fn stream_requires_auth() {
+    let h = make_app().await;
+    let uri = format!("/api/v1/notifications/stream?device_id={}", h.device_id);
+    assert_eq!(
+        status_of(&h.router, &uri, false).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
 
-    let (status, body) = send(
-        &app,
-        Method::POST,
-        &uri,
-        true,
-        Some(serde_json::json!({ "token": "ExponentPushToken[abc]", "platform": "expo" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["ok"], true);
+#[tokio::test]
+async fn stream_requires_device_id() {
+    let h = make_app().await;
+    assert_eq!(
+        status_of(&h.router, "/api/v1/notifications/stream", true).await,
+        StatusCode::BAD_REQUEST
+    );
+}
 
-    let stored = repo
-        .get(&device_id)
+#[tokio::test]
+async fn stream_unknown_device_404() {
+    let h = make_app().await;
+    assert_eq!(
+        status_of(
+            &h.router,
+            "/api/v1/notifications/stream?device_id=ghost",
+            true
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn stream_flushes_offline_queue_on_connect() {
+    let h = make_app().await;
+
+    // A notification arrived while the device was offline (targeted send enqueues).
+    h.sender
+        .send(notif(&h.device_id, "While you were away"))
         .await
-        .unwrap()
-        .expect("token persisted");
-    assert_eq!(stored.token, "ExponentPushToken[abc]");
+        .unwrap();
+    assert_eq!(
+        h.queue.list_undelivered(&h.device_id).await.unwrap().len(),
+        1,
+        "queued while offline"
+    );
 
-    // DELETE removes it.
-    let (status, _) = send(&app, Method::DELETE, &uri, true, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(repo.get(&device_id).await.unwrap().is_none());
-}
+    // Connect — the first SSE frame should be the flushed notification.
+    let uri = format!("/api/v1/notifications/stream?device_id={}", h.device_id);
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
-#[tokio::test]
-async fn register_push_token_unknown_device_404() {
-    let (app, _repo, _device_id, _tmp) = make_app().await;
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/devices/ghost/push-token",
-        true,
-        Some(serde_json::json!({ "token": "t", "platform": "fcm" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
+    let mut data = resp.into_body().into_data_stream();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(3), data.next())
+        .await
+        .expect("an SSE frame within timeout")
+        .expect("a body chunk")
+        .expect("chunk ok");
+    let text = String::from_utf8_lossy(&frame);
+    assert!(text.contains("While you were away"), "got: {text}");
 
-#[tokio::test]
-async fn register_push_token_bad_platform_400() {
-    let (app, _repo, device_id, _tmp) = make_app().await;
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        &format!("/api/v1/devices/{device_id}/push-token"),
-        true,
-        Some(serde_json::json!({ "token": "t", "platform": "telegram" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
+    // async-stream runs the post-yield `mark_delivered` only on the next poll;
+    // drive it once more (it then awaits live events, so this poll times out —
+    // expected) before closing the stream.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), data.next()).await;
+    drop(data);
 
-#[tokio::test]
-async fn register_push_token_requires_auth() {
-    let (app, _repo, device_id, _tmp) = make_app().await;
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        &format!("/api/v1/devices/{device_id}/push-token"),
-        false,
-        Some(serde_json::json!({ "token": "t", "platform": "fcm" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The flushed notification is now marked delivered.
+    assert!(
+        h.queue
+            .list_undelivered(&h.device_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "marked delivered after flush"
+    );
 }

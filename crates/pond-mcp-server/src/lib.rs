@@ -70,6 +70,26 @@ pub fn tool_caller() -> Option<Arc<dyn ToolCaller>> {
     TOOL_CALLER.get().and_then(|opt| opt.clone())
 }
 
+// -- Notification sender (#99): set once at startup so the `send_notification`
+// tool can push to connected phones (foreground SSE) in addition to the local
+// desktop popup. Unset (tests, standalone) → the tool is desktop-only.
+static NOTIFICATION_SENDER: OnceLock<
+    Arc<dyn pond_core::mcp::ports::notification::NotificationSender>,
+> = OnceLock::new();
+
+/// Install the notification sender. Call once at startup.
+pub fn init_notification_sender(
+    sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender>,
+) {
+    let _ = NOTIFICATION_SENDER.set(sender);
+}
+
+/// The configured notification sender, if installed.
+pub fn notification_sender(
+) -> Option<Arc<dyn pond_core::mcp::ports::notification::NotificationSender>> {
+    NOTIFICATION_SENDER.get().cloned()
+}
+
 /// Generate tool params via the ToolCaller specialist.
 ///
 /// When a ToolCaller is configured, this is the PRIMARY param generator —

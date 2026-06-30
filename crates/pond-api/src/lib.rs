@@ -291,6 +291,18 @@ pub struct AppState {
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
     pub schedule_result_tx:
         tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    /// Push-notification fan-out (#99): connected `/notifications/stream` clients
+    /// subscribe to this; producers send via `notification_sender`.
+    pub notification_tx:
+        tokio::sync::broadcast::Sender<pond_core::mcp::ports::notification::Notification>,
+    /// Offline notification queue (#99) — read on stream connect to flush
+    /// notifications that arrived while a device was disconnected. `None` in tests.
+    pub notification_queue:
+        Option<Arc<dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository>>,
+    /// Notification sender port (#99): producers (the `send_notification` tool,
+    /// the schedule bridge) route through this. `None` in tests.
+    pub notification_sender:
+        Option<Arc<dyn pond_core::mcp::ports::notification::NotificationSender>>,
     /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
     pub telemetry: Option<Arc<dyn TelemetryPort>>,
     /// Context growth monitor — tracks context window fill rate per session

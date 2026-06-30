@@ -2065,6 +2065,69 @@ async fn run_server(
     // Push-token store (#95) — built here, before `db` is moved into AppState.
     let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
         Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
+
+    // Push-notification path (#99): in-process fan-out to connected
+    // `/notifications/stream` clients + an offline queue + a (stub) FCM/APNs
+    // relay backed by #95's push tokens.
+    let (notification_tx, _) =
+        tokio::sync::broadcast::channel::<pond_core::mcp::ports::notification::Notification>(256);
+    let notification_queue: Arc<
+        dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository,
+    > = Arc::new(
+        pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
+    );
+    let push_relay: Arc<dyn pond_core::mcp::ports::notification_relay::NotificationRelay> =
+        Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+            push_token_repo.clone(),
+        ));
+    let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
+        Arc::new(
+            pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
+                notification_tx.clone(),
+                notification_queue.clone(),
+                Some(push_relay),
+            ),
+        );
+    // Let the `send_notification` MCP tool reach connected phones too (#99).
+    pond_mcp_server::init_notification_sender(notification_sender.clone());
+
+    // Bridge schedule completion/failure events to push notifications (#99), so a
+    // reminder/scheduled task surfaces on the phone, not just the dashboard.
+    {
+        let mut rx = schedule_result_tx.subscribe();
+        let sender = notification_sender.clone();
+        tokio::spawn(async move {
+            use pond_core::user_data::domain::schedule::RunStatus;
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let (category, body) = match ev.status {
+                            RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
+                            RunStatus::Failed => (
+                                "alert",
+                                ev.error
+                                    .clone()
+                                    .unwrap_or_else(|| "Task failed".to_string()),
+                            ),
+                            RunStatus::Running => continue, // not user-facing
+                        };
+                        let notification = pond_core::mcp::ports::notification::Notification {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            target: "broadcast".to_string(),
+                            category: category.to_string(),
+                            title: format!("Schedule: {}", ev.schedule_label),
+                            body,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            data: None,
+                        };
+                        let _ = sender.broadcast(notification).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
@@ -2159,6 +2222,9 @@ async fn run_server(
         consolidation_runner,
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
+        notification_tx: notification_tx.clone(),
+        notification_queue: Some(notification_queue.clone()),
+        notification_sender: Some(notification_sender.clone()),
         telemetry,
         context_monitor: Arc::new(
             pond_core::models::services::context_monitor::ContextMonitor::new(),
