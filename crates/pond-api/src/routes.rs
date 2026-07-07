@@ -1706,6 +1706,10 @@ struct RegisterPushTokenRequest {
     platform: String,
 }
 
+/// Upper bound on a stored push token. Real FCM/APNs/Expo tokens are well under
+/// 1 KB; the cap stops a client from persisting arbitrarily large blobs.
+const MAX_PUSH_TOKEN_LEN: usize = 4096;
+
 /// `POST /api/v1/devices/{id}/push-token` — a paired device registers its
 /// current push token (#95). Validates the device exists and the platform is
 /// known; replaces any prior token for that device.
@@ -1730,6 +1734,12 @@ async fn register_push_token(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "`token` must not be empty" })),
+        ));
+    }
+    if req.token.len() > MAX_PUSH_TOKEN_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` too long" })),
         ));
     }
 

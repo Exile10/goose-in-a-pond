@@ -224,6 +224,20 @@ async fn register_push_token_bad_platform_400() {
 }
 
 #[tokio::test]
+async fn register_push_token_oversized_token_400() {
+    let (app, _repo, device_id, _tmp) = make_app().await;
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/devices/{device_id}/push-token"),
+        true,
+        Some(serde_json::json!({ "token": "x".repeat(5000), "platform": "fcm" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn register_push_token_requires_auth() {
     let (app, _repo, device_id, _tmp) = make_app().await;
     let (status, _) = send(
