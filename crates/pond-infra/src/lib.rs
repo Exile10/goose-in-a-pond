@@ -1,3 +1,4 @@
+pub mod broadcast_notification_sender;
 pub mod db;
 pub mod fastembed_embedding;
 pub mod keyring_secret_repository;
@@ -13,6 +14,7 @@ pub mod sqlite_handshake;
 pub mod sqlite_mcp_servers;
 pub mod sqlite_memory;
 pub mod sqlite_model_repository;
+pub mod sqlite_notification_queue;
 pub mod sqlite_profile;
 pub mod sqlite_prompt_extra;
 pub mod sqlite_prompt_template;
@@ -24,3 +26,4 @@ pub mod sqlite_session_storage;
 pub mod sqlite_settings;
 pub mod sqlite_skill;
 pub mod sqlite_telemetry;
+pub mod stub_push_relay;

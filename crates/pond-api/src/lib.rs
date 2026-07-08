@@ -259,6 +259,11 @@ pub struct AppState {
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent `/notifications/stream` connections (#99). Kept
+    /// SEPARATE from `sse_semaphore`: a phone holds its notification stream
+    /// open indefinitely, so sharing the small interactive-chat pool would let
+    /// a few connected devices starve chat streaming entirely.
+    pub notification_sse_semaphore: Arc<tokio::sync::Semaphore>,
     /// Answer Reviewer — adversarial post-inference review that evaluates
     /// answer quality and triggers revision when below threshold.
     pub answer_reviewer: Option<Arc<dyn pond_core::models::ports::answer_reviewer::AnswerReviewer>>,
@@ -291,6 +296,18 @@ pub struct AppState {
     /// Broadcast channel for schedule completion events (SSE + desktop notifications).
     pub schedule_result_tx:
         tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    /// Push-notification fan-out (#99): connected `/notifications/stream` clients
+    /// subscribe to this; producers send via `notification_sender`.
+    pub notification_tx:
+        tokio::sync::broadcast::Sender<pond_core::mcp::ports::notification::Notification>,
+    /// Offline notification queue (#99) — read on stream connect to flush
+    /// notifications that arrived while a device was disconnected. `None` in tests.
+    pub notification_queue:
+        Option<Arc<dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository>>,
+    /// Notification sender port (#99): producers (the `send_notification` tool,
+    /// the schedule bridge) route through this. `None` in tests.
+    pub notification_sender:
+        Option<Arc<dyn pond_core::mcp::ports::notification::NotificationSender>>,
     /// Per-turn telemetry recorder. `None` when `telemetry_enabled` is false.
     pub telemetry: Option<Arc<dyn TelemetryPort>>,
     /// Context growth monitor — tracks context window fill rate per session
