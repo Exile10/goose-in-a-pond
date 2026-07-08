@@ -94,6 +94,13 @@ export function NewRoutineModal({ onClose, onCreated }: Props) {
     return `Run the ${name} routine: ${list}.`;
   }
 
+  /** Escape a string for embedding in a YAML double-quoted scalar. Backslash must
+   *  be escaped BEFORE the quote, otherwise a routine name like `C:\path` produces
+   *  an invalid `\p` escape sequence that breaks the recipe YAML on the server. */
+  function yamlDoubleQuoted(s: string): string {
+    return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
   async function handleSave() {
     if (!name.trim()) { setError("Name is required"); return; }
     if (selectedActions.length === 0) { setError("Add at least one action"); return; }
@@ -103,7 +110,7 @@ export function NewRoutineModal({ onClose, onCreated }: Props) {
       await api.createRecipe({
         name: name.trim(),
         description: selectedActions.join(", "),
-        yaml: `prompt: "${buildPrompt().replace(/"/g, "'")}"`,
+        yaml: `prompt: "${yamlDoubleQuoted(buildPrompt())}"`,
       });
       await refreshHomeData();
       onCreated();

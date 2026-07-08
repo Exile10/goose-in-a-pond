@@ -50,6 +50,14 @@ function CategoryIcon({ category, size = 16 }: { category: EventCategory; size?:
   );
 }
 
+/** Stable React key for an activity event. The backend sends no row id, so we
+ *  derive one from the fields that identify an event within a wholesale refresh
+ *  (timestamp + trace/session + position). Prevents key={undefined} collapsing
+ *  every row to the same key, which corrupted reconciliation on the 30s refresh. */
+function eventKey(e: ActivityEvent, i: number): string {
+  return e.id ?? `${e.timestamp}:${e.trace_id ?? e.session_id ?? ""}:${e.action}:${i}`;
+}
+
 function EventRow({ event }: { event: ActivityEvent }) {
   const meta = CATEGORY_META[event.category] ?? CATEGORY_META.system;
   const isSensitive = event.privacy_sensitivity === "sensitive";
@@ -109,8 +117,8 @@ function PrivacyPanel({ summary, sensitiveEvents }: { summary: ActivitySummary |
             Sensitive data logged
           </div>
           <div className="act-privacy__risk-list">
-            {sensitiveEvents.slice(0, 8).map((e) => (
-              <div key={e.id} className="act-privacy__risk-row">
+            {sensitiveEvents.slice(0, 8).map((e, i) => (
+              <div key={eventKey(e, i)} className="act-privacy__risk-row">
                 <CategoryIcon category={e.category} size={13} />
                 <span className="act-privacy__risk-action">{formatAction(e.action)}</span>
                 <span className="act-privacy__risk-ts">{timeAgo(e.timestamp)}</span>
@@ -228,7 +236,7 @@ export function Logs() {
                 <p>No activity{filter !== "all" ? ` for ${CATEGORY_META[filter]?.label}` : ""} in this window.</p>
               </div>
             )}
-            {filtered.map((e) => <EventRow key={e.id} event={e} />)}
+            {filtered.map((e, i) => <EventRow key={eventKey(e, i)} event={e} />)}
           </div>
         </div>
 

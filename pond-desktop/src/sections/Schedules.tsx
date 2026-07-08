@@ -286,7 +286,9 @@ export function Schedules() {
         setRunningRoutine(null);
       }
     })();
-    setTimeout(() => setRunningRoutine(null), 8000);
+    // NB: the IIFE's `finally` already clears runningRoutine when the run settles.
+    // A trailing setTimeout(…, 8000) used to also fire, but it would clear a
+    // *different* routine started within 8s of this one finishing — removed.
   }
   const [schedules, setSchedules]         = useState<Schedule[]>([]);
   const [visibleCount, setVisibleCount]   = useState(SCHED_PAGE);
