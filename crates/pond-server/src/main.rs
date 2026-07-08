@@ -1482,12 +1482,14 @@ async fn run_server(
 
     let db = Arc::new(db);
 
-    // Spawn background TTL pruning task (runs every 6 hours)
+    // Spawn background TTL pruning task (runs every 6 hours). Reads the user's
+    // retention settings each cycle (per-category + sensitivity-aware, #117).
     {
         let logs = db.logs.clone();
         let system = db.system.clone();
+        let settings_repo = settings_repo.clone();
         tokio::spawn(async move {
-            pond_infra::pruning::run_pruning(logs, system, Default::default()).await;
+            pond_infra::pruning::run_pruning(logs, system, settings_repo).await;
         });
     }
 

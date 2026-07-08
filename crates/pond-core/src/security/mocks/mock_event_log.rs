@@ -57,6 +57,13 @@ impl EventLog for MockEventLog {
         }
         Ok(out)
     }
+
+    async fn purge(&self, query: EventQuery) -> Result<u64> {
+        let mut events = self.events.lock().unwrap();
+        let before = events.len();
+        events.retain(|e| !query.matches(e));
+        Ok((before - events.len()) as u64)
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +140,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn purge_by_category_and_min_sensitivity() {
+        let log = MockEventLog::new();
+        log.append(Event::new(EventCategory::Network, "egress.http").session("s1"))
+            .await
+            .unwrap();
+        log.append(
+            Event::new(EventCategory::Auth, "auth.token").sensitivity(PrivacySensitivity::Secret),
+        )
+        .await
+        .unwrap();
+        log.append(Event::new(EventCategory::Sensor, "sensor.reading"))
+            .await
+            .unwrap();
+
+        // Purge just the Network category.
+        let n = log
+            .purge(EventQuery {
+                category: Some(EventCategory::Network),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(log.all().len(), 2);
+
+        // Purge everything at/above Sensitive — removes the Secret auth event.
+        let n = log
+            .purge(EventQuery {
+                min_sensitivity: Some(PrivacySensitivity::Sensitive),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let remaining = log.all();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].category, EventCategory::Sensor);
+
+        // Filterless purge clears the rest ("clear my activity").
+        let n = log.purge(EventQuery::default()).await.unwrap();
+        assert_eq!(n, 1);
+        assert!(log.all().is_empty());
     }
 
     #[tokio::test]

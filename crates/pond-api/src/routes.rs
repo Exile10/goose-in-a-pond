@@ -129,7 +129,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sensors", post(record_sensor))
         .route("/sensors/{device_id}", get(get_recent_sensors))
         // Activity query API (#114) — read the unified event log.
-        .route("/activity", get(get_activity))
+        // DELETE clears activity on demand (#117, "clear my activity").
+        .route("/activity", get(get_activity).delete(clear_activity))
         .route("/activity/summary", get(activity_summary))
         .route(
             "/camera/events",
@@ -3501,6 +3502,7 @@ async fn get_activity(
         trace_id: None,
         since: parse_rfc3339_param("since", params.since)?,
         until: parse_rfc3339_param("until", params.until)?,
+        min_sensitivity: None,
         limit: Some(params.limit.unwrap_or(100).min(ACTIVITY_MAX_LIMIT)),
     };
 
@@ -3519,6 +3521,49 @@ async fn get_activity(
         .collect();
 
     Ok(Json(json!({ "count": visible.len(), "events": visible })))
+}
+
+/// `DELETE /api/v1/activity` — the user "clear my activity" control (#117).
+/// With no query params it purges the entire event log; `category` / `since` /
+/// `until` / `session_id` narrow the purge. Returns the number of events removed.
+async fn clear_activity(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ActivityQueryParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(event_log) = state.event_log.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "event log not available" })),
+        ));
+    };
+
+    let category = match params.category.as_deref() {
+        Some(c) => Some(parse_event_category(c).ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid `category`" })),
+        ))?),
+        None => None,
+    };
+
+    let query = EventQuery {
+        category,
+        session_id: params.session_id,
+        trace_id: None,
+        since: parse_rfc3339_param("since", params.since)?,
+        until: parse_rfc3339_param("until", params.until)?,
+        min_sensitivity: None,
+        limit: None,
+    };
+
+    let purged = event_log.purge(query).await.map_err(|e| {
+        tracing::warn!(error = %e, "activity purge failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "activity purge failed" })),
+        )
+    })?;
+
+    Ok(Json(json!({ "purged": purged })))
 }
 
 #[derive(serde::Deserialize)]
