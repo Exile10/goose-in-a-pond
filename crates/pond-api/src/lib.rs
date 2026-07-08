@@ -238,6 +238,11 @@ pub struct AppState {
     /// the bus→log bridge writes to. Read by the activity query API (#114).
     /// `None` in tests that don't exercise it.
     pub event_log: Option<Arc<dyn pond_core::security::ports::event_log::EventLog>>,
+    /// Push-notification token store (#95): a paired GOTG device's current
+    /// FCM/APNs/Expo token. `None` when push storage isn't wired (tests) — the
+    /// push-token endpoints then return 503.
+    pub push_token_repo:
+        Option<Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository>>,
     /// Biometric face recognition service (register + identify household
     /// members from camera frames).  `None` when no ONNX embedding model
     /// is configured — all face endpoints then return 503.

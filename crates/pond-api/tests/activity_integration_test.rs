@@ -104,6 +104,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         event_log_repo: None,
         event_bus: None,
         event_log: Some(event_log.clone()),
+        push_token_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,

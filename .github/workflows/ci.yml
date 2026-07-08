@@ -68,7 +68,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-piper \
-            -p pond-adapters-gotg \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
             -p pond-mcp-server
@@ -86,7 +85,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-piper \
-            -p pond-adapters-gotg \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
             -p pond-mcp-server

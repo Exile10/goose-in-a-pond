@@ -84,6 +84,7 @@ async fn make_app_with_bus() -> (axum::Router, Arc<InProcessEventBus>, tempfile:
         event_log_repo: None,
         event_bus: Some(bus.clone() as Arc<dyn EventBus>),
         event_log: None,
+        push_token_repo: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
