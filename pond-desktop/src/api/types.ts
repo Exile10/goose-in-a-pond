@@ -607,7 +607,10 @@ export type AttributeValue =
   | { text: string };
 
 export interface ActivityEvent {
-  id: string;
+  // The backend `Event` domain type has no stable id (GET /api/v1/activity
+  // serializes category/action/timestamp/trace_id/etc., not a row id). Optional
+  // so consumers derive a stable React key instead of keying on `undefined`.
+  id?: string;
   timestamp: string;
   category: EventCategory;
   action: string;

@@ -80,6 +80,50 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
           <textarea className="native-textarea native-textarea--sm" value={s.assistant_personality ?? ""} onChange={(e) => patch("assistant_personality", e.target.value)} placeholder="Friendly, concise, and helpful" />
         </Row>
       </Section>
+      {/* Weather/Location — restored after #159 dropped the standalone LocationTab.
+          Weather is a live feature; without this the location was only editable
+          during onboarding. */}
+      <Section title="Location & Weather">
+        <Row label="Enable weather" hint="Allow the assistant to fetch current weather for your location">
+          <Switch isSelected={s.weather_enabled ?? false} onChange={(v) => patch("weather_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
+        <Row label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
+          <input
+            className="native-input"
+            style={{ opacity: (s.weather_enabled ?? false) ? 1 : 0.45 }}
+            disabled={!(s.weather_enabled ?? false)}
+            value={s.weather_location_name ?? ""}
+            onChange={(e) => patch("weather_location_name", e.target.value)}
+            placeholder="Nairobi, Kenya"
+          />
+        </Row>
+        <Row label="Latitude">
+          <input
+            type="number"
+            step={0.0001}
+            className="native-input"
+            style={{ opacity: (s.weather_enabled ?? false) ? 1 : 0.45 }}
+            disabled={!(s.weather_enabled ?? false)}
+            value={s.weather_latitude ?? ""}
+            onChange={(e) => patch("weather_latitude", e.target.value === "" ? null : Number(e.target.value))}
+            placeholder="-1.2921"
+          />
+        </Row>
+        <Row label="Longitude">
+          <input
+            type="number"
+            step={0.0001}
+            className="native-input"
+            style={{ opacity: (s.weather_enabled ?? false) ? 1 : 0.45 }}
+            disabled={!(s.weather_enabled ?? false)}
+            value={s.weather_longitude ?? ""}
+            onChange={(e) => patch("weather_longitude", e.target.value === "" ? null : Number(e.target.value))}
+            placeholder="36.8219"
+          />
+        </Row>
+      </Section>
     </>
   );
 }
