@@ -1511,9 +1511,13 @@ impl ChatService {
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
-                    // Flush any tail held back by the thought filter
+                    // Flush any tail held back by the thought filter. Also append to
+                    // full_text so the returned + persisted message includes the
+                    // withheld lookahead bytes — otherwise the tail is spoken but
+                    // dropped from history. (#153)
                     let tail = thought_filter.flush();
                     if !tail.is_empty() {
+                        full_text.push_str(&tail);
                         sentence_buf.push_str(&tail);
                     }
                     // Flush any remaining buffer
@@ -1553,9 +1557,12 @@ impl ChatService {
             }
         }
 
-        // Flush thought filter tail if stream ended without Done
+        // Flush thought filter tail if stream ended without Done. Same as the Done
+        // branch, the tail must also reach full_text so the persisted message is
+        // complete on this path too — the second, previously-unfixed flush. (#153)
         let tail = thought_filter.flush();
         if !tail.is_empty() {
+            full_text.push_str(&tail);
             sentence_buf.push_str(&tail);
         }
         // Flush anything left if stream ended without Done
