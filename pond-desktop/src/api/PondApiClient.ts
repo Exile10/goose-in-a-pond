@@ -1085,6 +1085,23 @@ export class PondApiClient {
     await this.del(`/api/v1/secrets/${encodeURIComponent(key)}`);
   }
 
+  // ── Activity ──────────────────────────────────────────────
+
+  listActivity(params?: import("./types").ActivityQueryParams): Promise<import("./types").ActivityResponse> {
+    const qs = new URLSearchParams();
+    if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params?.since) qs.set("since", params.since);
+    if (params?.category) qs.set("category", params.category);
+    if (params?.session_id) qs.set("session_id", params.session_id);
+    const q = qs.toString();
+    return this.get(`/api/v1/activity${q ? `?${q}` : ""}`);
+  }
+
+  getActivitySummary(window?: "hour" | "day" | "week"): Promise<import("./types").ActivitySummary> {
+    const q = window ? `?window=${window}` : "";
+    return this.get(`/api/v1/activity/summary${q}`);
+  }
+
   // ── Logs ─────────────────────────────────────────────────
 
   listLogs(params?: { limit?: number; level?: string }): Promise<LogEntry[]> {
