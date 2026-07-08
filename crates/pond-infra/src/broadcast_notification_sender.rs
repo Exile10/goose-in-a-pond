@@ -6,6 +6,12 @@
 //!   device gets them on reconnect;
 //! - background (scaffold): hand targeted notifications to the optional
 //!   [`NotificationRelay`] (FCM/APNs), best-effort.
+//!
+//! SCAFFOLD STATUS (#99): the queue + relay paths are exercised only via
+//! *targeted* `send()`. Every current production producer publishes with
+//! `broadcast()` (the ephemeral foreground path), so the offline queue and relay
+//! stay dormant until a real targeted producer is wired for phase-3 push. The
+//! machinery is complete and unit-tested; only the producer call site is pending.
 
 use std::sync::Arc;
 
