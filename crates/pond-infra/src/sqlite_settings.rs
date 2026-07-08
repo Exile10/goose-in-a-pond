@@ -454,6 +454,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_audit_enabled",
+            if settings.ext_audit_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         Ok(())
     }
@@ -780,6 +788,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_news_enabled" => s.ext_news_enabled = value == "true",
         "ext_finance_enabled" => s.ext_finance_enabled = value == "true",
         "ext_discovery_enabled" => s.ext_discovery_enabled = value == "true",
+        "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }
