@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import type { VoiceState } from "../state/reducer";
 import { ORB_STATE_COLORS } from "../lib/colors";
 
-export type OrbSize = "sm" | "md" | "lg";
+export type OrbSize = "sm" | "md" | "lg" | "xl";
 
 interface Props {
   state: VoiceState;
@@ -14,6 +14,7 @@ const SIZE_PX: Record<OrbSize, number> = {
   sm: 40,
   md: 80,
   lg: 120,
+  xl: 180,
 };
 
 const STATE_LABELS: Record<VoiceState, string> = {
@@ -25,8 +26,14 @@ const STATE_LABELS: Record<VoiceState, string> = {
   error:     "Error",
 };
 
+// The canvas drawing surface is larger than the layout footprint so glow rings
+// have room to fade without clipping at the canvas edge (which paints a visible square).
+const GLOW_PADDING = 1.4;
+
 export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
   const px = SIZE_PX[size];
+  const canvasPx = Math.round(px * GLOW_PADDING);
+  const glowOffset = Math.round((canvasPx - px) / 2);
   const color = ORB_STATE_COLORS[state];
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
@@ -39,23 +46,25 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = px * dpr;
-    canvas.height = px * dpr;
+    canvas.width = canvasPx * dpr;
+    canvas.height = canvasPx * dpr;
     ctx.scale(dpr, dpr);
+
+    // Drawing center is middle of the larger canvas surface
+    const cx = canvasPx / 2;
+    const cy = canvasPx / 2;
+    // Orb visual size is still based on px (the layout footprint)
+    const baseRadius = px * 0.36;
 
     function draw() {
       if (!ctx) return;
-      ctx.clearRect(0, 0, px, px);
-
-      const cx = px / 2;
-      const cy = px / 2;
-      const baseRadius = px * 0.36;
+      ctx.clearRect(0, 0, canvasPx, canvasPx);
 
       // Outer glow ring (animated for active states) — solid concentric circles, no gradient
       if (state !== "idle") {
         const glowIntensity =
           state === "wait"
-            ? 0.06 + Math.sin(phaseRef.current) * 0.04  // dim, slow pulse
+            ? 0.06 + Math.sin(phaseRef.current) * 0.04
             : state === "recording"
             ? 0.18 + audioLevel * 0.22
             : state === "thinking"
@@ -93,7 +102,7 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
         ctx.stroke();
       }
 
-      // Main orb — solid base + smaller offset highlight circle (no gradient)
+      // Main orb — solid base + offset highlight circle
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
@@ -125,7 +134,7 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
         }
       }
 
-      // Icon for sm size (no bars)
+      // Icon for sm size / idle / wait / error states
       if (size === "sm" || state === "idle" || state === "wait" || state === "error") {
         const icon = state === "error" ? "!" : state === "idle" ? "·" : state === "wait" ? "·" : "";
         if (icon) {
@@ -146,7 +155,7 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
 
     draw();
     return () => cancelAnimationFrame(animRef.current);
-  }, [state, size, px, color, audioLevel]);
+  }, [state, size, px, canvasPx, color, audioLevel]);
 
   return (
     <div
@@ -155,9 +164,7 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
         width: px,
         height: px,
         flexShrink: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
+        overflow: "visible",
       }}
       title={STATE_LABELS[state]}
       aria-label={STATE_LABELS[state]}
@@ -165,7 +172,17 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0 }: Props) {
     >
       <canvas
         ref={canvasRef}
-        style={{ width: px, height: px, display: "block" }}
+        style={{
+          position: "absolute",
+          top: -glowOffset,
+          left: -glowOffset,
+          width: canvasPx,
+          height: canvasPx,
+          display: "block",
+          outline: "none",
+          border: "none",
+          background: "transparent",
+        }}
       />
     </div>
   );
