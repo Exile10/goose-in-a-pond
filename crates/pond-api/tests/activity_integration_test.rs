@@ -205,3 +205,57 @@ async fn activity_rejects_bad_params() {
     let (status, _) = get_json(&app, "/api/v1/activity/summary?window=decade").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+async fn delete_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(uri)
+        .header("Authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn clear_activity_by_category_then_all() {
+    let (app, _tmp) = make_app().await;
+
+    // Purge just the device category → 1 removed.
+    let (status, body) = delete_json(&app, "/api/v1/activity?category=device").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["purged"], 1);
+
+    // sensor.reading still listed; device gone.
+    let (_, after) = get_json(&app, "/api/v1/activity").await;
+    assert_eq!(after["count"], 1);
+    assert_eq!(after["events"][0]["action"], "sensor.reading");
+
+    // Purge everything (incl. the hidden Secret event) → 2 remaining removed.
+    let (status, body) = delete_json(&app, "/api/v1/activity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["purged"], 2,
+        "remaining sensor + Secret auth both purged"
+    );
+
+    let (_, empty) = get_json(&app, "/api/v1/activity").await;
+    assert_eq!(empty["count"], 0);
+}
+
+#[tokio::test]
+async fn clear_activity_requires_auth() {
+    let (app, _tmp) = make_app().await;
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/api/v1/activity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
