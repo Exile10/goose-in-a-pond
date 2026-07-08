@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+pond-core   = { path = "../pond-core" }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 reqwest     = { workspace = true }

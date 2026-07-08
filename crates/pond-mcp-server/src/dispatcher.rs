@@ -251,6 +251,9 @@ impl ToolDispatcher for McpToolDispatcher {
     ) -> Result<ToolCallResult> {
         let (server_prefix, bare_name) = parse_tool_name(tool_name)?;
 
+        // Attribute any outbound HTTP this tool makes to the tool itself (#113).
+        crate::set_current_tool(bare_name);
+
         // Find the server that owns this prefix.
         let server = self
             .servers
