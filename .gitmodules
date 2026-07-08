@@ -1,4 +1,4 @@
 [submodule "goose"]
 	path = goose
 	url = https://github.com/jarida-io/Goose
-	branch = giap-patches
+	branch = giap-patches-rmcp-1.5
