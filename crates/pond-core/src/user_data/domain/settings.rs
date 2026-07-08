@@ -473,6 +473,10 @@ pub struct Settings {
     /// Enable the discovery tools module (product search, recommendations).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_discovery_enabled: bool,
+
+    /// Enable the audit/privacy tools module (recent activity, summary, privacy risks).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_audit_enabled: bool,
 }
 
 impl Default for Settings {
@@ -569,6 +573,7 @@ impl Default for Settings {
             ext_knowledge_enabled: true,
             ext_system_enabled: true,
             ext_device_enabled: true,
+            ext_audit_enabled: true,
             ext_news_enabled: true,
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
