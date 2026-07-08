@@ -254,17 +254,43 @@ impl VoiceOutput for PiperRsOutput {
     }
 
     async fn speak(&self, text: &str) -> Result<()> {
-        // Clear interrupt flag before this utterance.
         self.speech_interrupted.store(false, Ordering::SeqCst);
-        let wav = self.synth_to_wav(text).await?;
-        if wav.is_empty() {
+        let clauses = split_clauses(text);
+        if clauses.is_empty() {
             return Ok(());
         }
-        let flag = self.speech_interrupted.clone();
-        let is_speaking = self.is_speaking.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(wav, &flag, &is_speaking))
-            .await
-            .context("playback task panicked")??;
+        // Synthesize first clause, then overlap playback of clause N with
+        // synthesis of clause N+1 to cut first-audio latency on long sentences
+        // (#162). Thread `is_speaking` through every play call so the barge-in
+        // monitor applies the elevated AEC-gating threshold during playback (#161).
+        let mut pending = self.synth_to_wav(&clauses[0]).await?;
+
+        for i in 1..clauses.len() {
+            if self.speech_interrupted.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if pending.is_empty() {
+                pending = self.synth_to_wav(&clauses[i]).await?;
+                continue;
+            }
+            let flag = self.speech_interrupted.clone();
+            let is_speaking = self.is_speaking.clone();
+            let wav = std::mem::take(&mut pending);
+            let (play_result, next_wav) = tokio::join!(
+                tokio::task::spawn_blocking(move || play_wav_interruptible(wav, &flag, &is_speaking)),
+                self.synth_to_wav(&clauses[i]),
+            );
+            play_result.context("playback task panicked")??;
+            pending = next_wav?;
+        }
+
+        if !pending.is_empty() && !self.speech_interrupted.load(Ordering::Relaxed) {
+            let flag = self.speech_interrupted.clone();
+            let is_speaking = self.is_speaking.clone();
+            tokio::task::spawn_blocking(move || play_wav_interruptible(pending, &flag, &is_speaking))
+                .await
+                .context("playback task panicked")??;
+        }
         Ok(())
     }
 
@@ -340,6 +366,40 @@ fn synth_blocking(voice: Arc<Mutex<Piper>>, text: &str) -> Result<(Vec<u8>, u32)
             Err(anyhow!("piper-rs synth panic: {}", msg))
         }
     }
+}
+
+/// Split text into clause-sized chunks for pipelined synthesis.
+///
+/// Splits on `,`, `;`, `:` so the first clause can be synthesized and played
+/// while the remainder is still being processed. Keeps the delimiter attached
+/// to the preceding clause for natural prosody. A delimiter flanked by digits on
+/// both sides (e.g. `10,000` or `12:30`) is treated as part of the number/time
+/// and does NOT start a new clause.
+fn split_clauses(text: &str) -> Vec<String> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        buf.push(ch);
+        if matches!(ch, ',' | ';' | ':') {
+            let between_digits = prev.is_some_and(|p| p.is_ascii_digit())
+                && chars.peek().is_some_and(|n| n.is_ascii_digit());
+            if !between_digits {
+                let clause = buf.trim().to_string();
+                if !clause.is_empty() {
+                    clauses.push(clause);
+                }
+                buf.clear();
+            }
+        }
+        prev = Some(ch);
+    }
+    let tail = buf.trim().to_string();
+    if !tail.is_empty() {
+        clauses.push(tail);
+    }
+    clauses
 }
 
 /// Best-effort message extraction from a `catch_unwind` payload.
@@ -433,5 +493,44 @@ mod tests {
         // Build a dummy function so we exercise the trait bound at compile time
         // without needing to construct a valid PiperRsOutput.
         fn _assert_object_safe(_: Arc<dyn VoiceOutput>) {}
+    }
+
+    #[test]
+    fn split_clauses_no_delimiters() {
+        let clauses = split_clauses("Hello there");
+        assert_eq!(clauses, vec!["Hello there"]);
+    }
+
+    #[test]
+    fn split_clauses_comma() {
+        let clauses = split_clauses("The model predicts tokens, then verifies them.");
+        assert_eq!(
+            clauses,
+            vec!["The model predicts tokens,", "then verifies them."]
+        );
+    }
+
+    #[test]
+    fn split_clauses_multiple_delimiters() {
+        let clauses = split_clauses("One, two; three: four");
+        assert_eq!(clauses, vec!["One,", "two;", "three:", "four"]);
+    }
+
+    #[test]
+    fn split_clauses_keeps_numbers_and_times() {
+        // A delimiter between digits belongs to a number/time and must not split.
+        assert_eq!(split_clauses("It costs 10,000 dollars"), vec!["It costs 10,000 dollars"]);
+        assert_eq!(split_clauses("Meet at 12:30 sharp"), vec!["Meet at 12:30 sharp"]);
+        // But a real clause boundary after a number still splits.
+        assert_eq!(
+            split_clauses("We have 10,000 tokens, then we stop"),
+            vec!["We have 10,000 tokens,", "then we stop"]
+        );
+    }
+
+    #[test]
+    fn split_clauses_empty() {
+        assert!(split_clauses("").is_empty());
+        assert!(split_clauses("   ").is_empty());
     }
 }
