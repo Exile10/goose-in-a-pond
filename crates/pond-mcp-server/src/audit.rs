@@ -430,6 +430,9 @@ mod tests {
         async fn query(&self, _query: EventQuery) -> anyhow::Result<Vec<Event>> {
             Ok(vec![])
         }
+        async fn purge(&self, _query: EventQuery) -> anyhow::Result<u64> {
+            Ok(0)
+        }
     }
 
     fn ev(category: EventCategory, action: &str) -> Event {

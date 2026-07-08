@@ -285,6 +285,9 @@ mod tests {
             async fn query(&self, _q: EventQuery) -> anyhow::Result<Vec<Event>> {
                 Ok(self.0.lock().unwrap().clone())
             }
+            async fn purge(&self, _q: EventQuery) -> anyhow::Result<u64> {
+                Ok(0)
+            }
         }
 
         let captured = Arc::new(Mutex::new(Vec::new()));
