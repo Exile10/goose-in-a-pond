@@ -277,7 +277,11 @@ impl VoiceOutput for PiperRsOutput {
             let is_speaking = self.is_speaking.clone();
             let wav = std::mem::take(&mut pending);
             let (play_result, next_wav) = tokio::join!(
-                tokio::task::spawn_blocking(move || play_wav_interruptible(wav, &flag, &is_speaking)),
+                tokio::task::spawn_blocking(move || play_wav_interruptible(
+                    wav,
+                    &flag,
+                    &is_speaking
+                )),
                 self.synth_to_wav(&clauses[i]),
             );
             play_result.context("playback task panicked")??;
@@ -287,9 +291,11 @@ impl VoiceOutput for PiperRsOutput {
         if !pending.is_empty() && !self.speech_interrupted.load(Ordering::Relaxed) {
             let flag = self.speech_interrupted.clone();
             let is_speaking = self.is_speaking.clone();
-            tokio::task::spawn_blocking(move || play_wav_interruptible(pending, &flag, &is_speaking))
-                .await
-                .context("playback task panicked")??;
+            tokio::task::spawn_blocking(move || {
+                play_wav_interruptible(pending, &flag, &is_speaking)
+            })
+            .await
+            .context("playback task panicked")??;
         }
         Ok(())
     }
@@ -519,8 +525,14 @@ mod tests {
     #[test]
     fn split_clauses_keeps_numbers_and_times() {
         // A delimiter between digits belongs to a number/time and must not split.
-        assert_eq!(split_clauses("It costs 10,000 dollars"), vec!["It costs 10,000 dollars"]);
-        assert_eq!(split_clauses("Meet at 12:30 sharp"), vec!["Meet at 12:30 sharp"]);
+        assert_eq!(
+            split_clauses("It costs 10,000 dollars"),
+            vec!["It costs 10,000 dollars"]
+        );
+        assert_eq!(
+            split_clauses("Meet at 12:30 sharp"),
+            vec!["Meet at 12:30 sharp"]
+        );
         // But a real clause boundary after a number still splits.
         assert_eq!(
             split_clauses("We have 10,000 tokens, then we stop"),

@@ -154,7 +154,8 @@ async fn prune_events(logs: &Pool<Sqlite>, config: &PruningConfig) {
     let now = Utc::now();
 
     if config.events_sensitive_days > 0 {
-        let until = now - chrono::Duration::days(clamp_retention_days(config.events_sensitive_days));
+        let until =
+            now - chrono::Duration::days(clamp_retention_days(config.events_sensitive_days));
         match log
             .purge(EventQuery {
                 min_sensitivity: Some(PrivacySensitivity::Sensitive),
