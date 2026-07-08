@@ -35,6 +35,19 @@ use pond_core::user_data::ports::settings::SettingsRepository;
 
 use crate::sqlite_event_log::SqliteEventLog;
 
+/// Maximum retention window we will honour, in days (~100 years). A user-supplied
+/// retention value is clamped to this before it reaches `Utc::now() - Duration`,
+/// which **panics** (rather than returning an error) if the resulting timestamp
+/// falls outside chrono's representable range. 100 years is effectively "keep
+/// forever" for any real deployment, so clamping is safe and never surprises.
+const MAX_RETENTION_DAYS: i64 = 36_500;
+
+/// Clamp a user-configured retention (in days) to a value that can never overflow
+/// chrono's `DateTime` subtraction. See [`MAX_RETENTION_DAYS`].
+fn clamp_retention_days(days: u32) -> i64 {
+    (days as i64).min(MAX_RETENTION_DAYS)
+}
+
 /// Retention configuration — all fields have sane defaults via [`Default`].
 /// Built fresh each cycle from the user's [`Settings`] via [`PruningConfig::from_settings`].
 pub struct PruningConfig {
@@ -141,7 +154,7 @@ async fn prune_events(logs: &Pool<Sqlite>, config: &PruningConfig) {
     let now = Utc::now();
 
     if config.events_sensitive_days > 0 {
-        let until = now - chrono::Duration::days(config.events_sensitive_days as i64);
+        let until = now - chrono::Duration::days(clamp_retention_days(config.events_sensitive_days));
         match log
             .purge(EventQuery {
                 min_sensitivity: Some(PrivacySensitivity::Sensitive),
@@ -169,7 +182,7 @@ async fn prune_events(logs: &Pool<Sqlite>, config: &PruningConfig) {
         if days == 0 {
             continue; // keep forever
         }
-        let until = now - chrono::Duration::days(days as i64);
+        let until = now - chrono::Duration::days(clamp_retention_days(days));
         match log
             .purge(EventQuery {
                 category: Some(category),

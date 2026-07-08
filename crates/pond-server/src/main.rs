@@ -2385,6 +2385,13 @@ async fn run_chat(
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
+    // Install the audit MCP server's read handle so the giap-audit extension works
+    // in headless/CLI chat too (not just `run_server`); otherwise invoking the audit
+    // tool here would find no deps. (#115/#157)
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
+
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
@@ -5198,6 +5205,13 @@ async fn stream_agent_response(
 async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+
+    // Install the audit MCP server's read handle so the giap-audit extension works
+    // from the `agent` subcommand too; otherwise invoking the audit tool here would
+    // find no deps. (#115/#157)
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
 
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<
