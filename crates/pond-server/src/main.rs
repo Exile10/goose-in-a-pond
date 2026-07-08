@@ -2071,6 +2071,9 @@ async fn run_server(
     // query API (#114) reads from it via AppState.
     let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
         Arc::new(SqliteEventLog::new(db.logs.clone()));
+    // Push-token store (#95) — built here, before `db` is moved into AppState.
+    let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
+        Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
@@ -2157,6 +2160,7 @@ async fn run_server(
         event_log_repo: event_log_repo,
         event_bus: Some(event_bus.clone()),
         event_log: Some(event_log.clone()),
+        push_token_repo: Some(push_token_repo.clone()),
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),

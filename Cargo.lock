@@ -7137,22 +7137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pond-adapters-gotg"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "hostname",
- "pond-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "pond-adapters-llamafile"
 version = "0.1.0"
 dependencies = [

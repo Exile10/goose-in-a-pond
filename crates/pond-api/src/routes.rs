@@ -105,6 +105,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
+        // Push-notification token register/unregister for a paired device (#95).
+        .route(
+            "/devices/{id}/push-token",
+            post(register_push_token).delete(delete_push_token),
+        )
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
@@ -1691,6 +1696,104 @@ async fn device_heartbeat(
         )
     })?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterPushTokenRequest {
+    token: String,
+    /// "fcm" | "apns" | "expo".
+    platform: String,
+}
+
+/// Upper bound on a stored push token. Real FCM/APNs/Expo tokens are well under
+/// 1 KB; the cap stops a client from persisting arbitrarily large blobs.
+const MAX_PUSH_TOKEN_LEN: usize = 4096;
+
+/// `POST /api/v1/devices/{id}/push-token` — a paired device registers its
+/// current push token (#95). Validates the device exists and the platform is
+/// known; replaces any prior token for that device.
+async fn register_push_token(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RegisterPushTokenRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(repo) = state.push_token_repo.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "push-token storage not available" })),
+        ));
+    };
+
+    let platform = pond_core::user_data::domain::push_token::PushPlatform::parse(&req.platform)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid `platform`; use fcm|apns|expo" })),
+        ))?;
+    if req.token.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` must not be empty" })),
+        ));
+    }
+    if req.token.len() > MAX_PUSH_TOKEN_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` too long" })),
+        ));
+    }
+
+    // The token must belong to a known, registered device.
+    let exists = state.device_registry.get_device(&id).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: device lookup failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "device lookup failed" })),
+        )
+    })?;
+    if exists.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown device" })),
+        ));
+    }
+
+    let token = pond_core::user_data::domain::push_token::PushToken {
+        device_id: id,
+        token: req.token,
+        platform,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    repo.upsert(token).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: upsert failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not store push token" })),
+        )
+    })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/v1/devices/{id}/push-token` — drop a device's push token
+/// (logout / unpair). Idempotent.
+async fn delete_push_token(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(repo) = state.push_token_repo.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "push-token storage not available" })),
+        ));
+    };
+    repo.delete(&id).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: delete failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not remove push token" })),
+        )
+    })?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_settings(
