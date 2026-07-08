@@ -120,6 +120,7 @@ async fn make_app() -> Harness {
         notification_sender: Some(sender.clone()),
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
@@ -151,7 +152,7 @@ async fn make_app() -> Harness {
 
 fn notif(target: &str, title: &str) -> Notification {
     Notification {
-        id: uuid_like(),
+        id: test_id(),
         target: target.into(),
         category: "info".into(),
         title: title.into(),
@@ -161,14 +162,11 @@ fn notif(target: &str, title: &str) -> Notification {
     }
 }
 
-fn uuid_like() -> String {
-    format!(
-        "n-{}",
-        std::time::SystemTime::now()
-            .elapsed()
-            .unwrap_or_default()
-            .as_nanos()
-    )
+/// Monotonic test ids — collision-free, unlike a wall-clock-based generator.
+fn test_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("n-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 async fn status_of(router: &axum::Router, uri: &str, auth: bool) -> StatusCode {

@@ -19,6 +19,23 @@ use tokio::sync::broadcast;
 /// Sentinel `target` meaning "deliver to every connected device".
 pub const BROADCAST_TARGET: &str = "broadcast";
 
+/// Caps applied to every notification at this single enforcement point, so no
+/// producer (tool call, schedule bridge, …) can persist or stream an
+/// arbitrarily large payload. Truncation is by character, never by byte, so a
+/// multi-byte boundary can't panic.
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_BODY_CHARS: usize = 2000;
+
+fn clamp(mut n: Notification) -> Notification {
+    if n.title.chars().count() > MAX_TITLE_CHARS {
+        n.title = n.title.chars().take(MAX_TITLE_CHARS).collect();
+    }
+    if n.body.chars().count() > MAX_BODY_CHARS {
+        n.body = n.body.chars().take(MAX_BODY_CHARS).collect();
+    }
+    n
+}
+
 pub struct BroadcastNotificationSender {
     tx: broadcast::Sender<Notification>,
     queue: Arc<dyn NotificationQueueRepository>,
@@ -38,6 +55,7 @@ impl BroadcastNotificationSender {
 #[async_trait]
 impl NotificationSender for BroadcastNotificationSender {
     async fn send(&self, notification: Notification) -> Result<()> {
+        let notification = clamp(notification);
         let targeted = notification.target != BROADCAST_TARGET;
         if targeted {
             // Persist for offline delivery before fanning out live.
@@ -54,8 +72,9 @@ impl NotificationSender for BroadcastNotificationSender {
         Ok(())
     }
 
-    async fn broadcast(&self, mut notification: Notification) -> Result<()> {
+    async fn broadcast(&self, notification: Notification) -> Result<()> {
         // Broadcasts are ephemeral (not per-device queued).
+        let mut notification = clamp(notification);
         notification.target = BROADCAST_TARGET.to_string();
         let _ = self.tx.send(notification);
         Ok(())
@@ -107,6 +126,26 @@ mod tests {
 
         assert_eq!(queue.enqueued.lock().unwrap().len(), 1, "targeted enqueued");
         assert_eq!(rx.recv().await.unwrap().target, "dev-1", "fanned out live");
+    }
+
+    #[tokio::test]
+    async fn oversized_title_and_body_are_truncated_char_safe() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let queue = Arc::new(StubQueue::default());
+        let sender = BroadcastNotificationSender::new(tx, queue.clone(), None);
+
+        let mut n = notif("dev-1");
+        // Multi-byte chars so a byte-based slice would panic at the boundary.
+        n.title = "é".repeat(MAX_TITLE_CHARS + 50);
+        n.body = "🦆".repeat(MAX_BODY_CHARS + 50);
+        sender.send(n).await.unwrap();
+
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.title.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(got.body.chars().count(), MAX_BODY_CHARS);
+        // The queued copy is clamped too (clamp happens before enqueue).
+        let queued = &queue.enqueued.lock().unwrap()[0];
+        assert_eq!(queued.body.chars().count(), MAX_BODY_CHARS);
     }
 
     #[tokio::test]
