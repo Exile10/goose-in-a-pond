@@ -253,6 +253,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,

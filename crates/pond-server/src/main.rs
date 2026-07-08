@@ -2213,6 +2213,9 @@ async fn run_server(
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        // Long-lived per-device notification streams get their own, larger pool
+        // so connected phones never starve interactive chat SSE (#99 audit).
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,

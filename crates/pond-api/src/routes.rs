@@ -5444,7 +5444,7 @@ struct NotificationStreamParams {
 /// A paired device opens this to receive notifications in real time. On connect
 /// it first drains anything queued while it was offline, then tails live events
 /// addressed to it (or `"broadcast"`). Notifications carry a stable `id`; clients
-/// dedupe by it. Bounded by `sse_semaphore`.
+/// dedupe by it. Bounded by `notification_sse_semaphore`.
 async fn notifications_stream(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<NotificationStreamParams>,
@@ -5481,9 +5481,11 @@ async fn notifications_stream(
         ));
     }
 
-    // Bound concurrent streams (shared with chat/schedule SSE).
+    // Bound concurrent notification streams. Deliberately NOT the chat
+    // `sse_semaphore`: these connections are long-lived (a phone holds one open
+    // indefinitely) and must never starve interactive chat streaming.
     let permit = state
-        .sse_semaphore
+        .notification_sse_semaphore
         .clone()
         .try_acquire_owned()
         .map_err(|_| {

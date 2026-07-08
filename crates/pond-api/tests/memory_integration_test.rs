@@ -145,6 +145,7 @@ async fn make_app_with_real_memory(
         face_recognition: None,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
         memory_extractor: None,
         memory_extraction_service: None,
