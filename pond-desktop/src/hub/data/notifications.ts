@@ -2,6 +2,8 @@
 // Backend-backed categories (schedule debrief) are fetched live in Notifications.tsx.
 // All other categories use mock data from this file until the EventLog port (Q2-32) lands.
 
+import type { ScheduleRunNotification } from "../../api/types";
+
 export type NotificationCategory =
   | "schedule"
   | "security"
@@ -12,6 +14,8 @@ export type NotificationCategory =
 export type NotificationAction = {
   label: string;
   route: string;
+  /** Carried when route is "canvas" and the notification comes from a schedule run. */
+  run?: ScheduleRunNotification;
 };
 
 export interface Notification {

@@ -3,6 +3,7 @@ import { ToastContainer } from "../components/Toast";
 import { useAppState } from "../state/AppContext";
 import type { GuiSection } from "../desktopState";
 import { Hub } from "../hub/Hub";
+import { HubOverlay } from "../hub/overlays/HubOverlay";
 
 // Lazy section imports
 import { Dashboard } from "../sections/Dashboard";
@@ -19,13 +20,15 @@ import { Agent } from "../sections/Agent";
 import { Canvas } from "../sections/Canvas";
 import { Logs } from "../sections/Logs";
 import { Extensions } from "../sections/Extensions";
+import { Notifications } from "../sections/Notifications";
 
 function SectionContent({ section }: { section: GuiSection }) {
   switch (section) {
     case "dashboard": return <Dashboard />;
     case "chat":      return <Chat />;
     case "devices":   return <Devices />;
-    case "schedules": return <Schedules />;
+    case "schedules":     return <Schedules />;
+    case "notifications": return <Notifications />;
     case "memory":     return <Memory />;
     case "skills":     return <Skills />;
     case "extensions": return <Extensions />;
@@ -57,6 +60,7 @@ export function GuiMode() {
         </main>
       </div>
       <ToastContainer />
+      <HubOverlay />
     </div>
   );
 }

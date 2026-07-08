@@ -216,6 +216,16 @@ export class PondApiClient {
     );
   }
 
+  registerDevice(req: {
+    name: string;
+    device_type: string;
+    hostname?: string;
+    capabilities: string[];
+    room?: string;
+  }): Promise<Device> {
+    return this.post<Device>("/api/v1/devices", req);
+  }
+
   // ── Schedules ─────────────────────────────────────────────
 
   listSchedules(): Promise<Schedule[]> {

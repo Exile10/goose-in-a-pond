@@ -1,8 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { Bell, Calendar, Shield, Camera, Sparkles, BatteryLow } from "lucide-react";
 import { useAppState } from "../../state/AppContext";
-import { api } from "../../api/PondApiClient";
-import type { ScheduleRun } from "../../api/types";
+import type { ScheduleRunNotification } from "../../api/types";
 import {
   MOCK_NOTIFICATIONS,
   CATEGORY_COLOR,
@@ -26,22 +25,27 @@ const CATEGORY_ICON: Record<NotificationCategory, React.ReactNode> = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function buildScheduleNotification(
-  run: ScheduleRun & { schedule_name: string },
-): Notification {
+function formatRunBody(run: ScheduleRunNotification): string {
+  if (run.status === "failed") return `Failed${run.error ? ` — ${run.error.slice(0, 80)}` : ""}`;
+  if (run.recipe === "routine" && run.result) {
+    try {
+      const arr = JSON.parse(run.result);
+      if (Array.isArray(arr)) return (arr as string[]).join(" · ");
+    } catch { /* fall through */ }
+  }
+  return run.result?.slice(0, 100) ?? run.excerpt ?? `Completed${run.durationMs ? ` in ${Math.round(run.durationMs / 1000)}s` : ""}`;
+}
+
+function buildNotificationFromRun(run: ScheduleRunNotification): Notification {
+  const isRoutine = run.recipe === "routine";
   return {
-    id: `sched-run-${run.id}`,
-    category: "schedule",
-    title: `${run.schedule_name} ran`,
-    body:
-      run.status === "failed"
-        ? `Failed${run.error ? ` — ${run.error.slice(0, 80)}` : ""}`
-        : run.result
-        ? run.result.slice(0, 100)
-        : `Completed in ${run.duration_ms ? `${Math.round(run.duration_ms / 1000)}s` : "unknown time"}`,
-    timestamp: run.started_at,
-    read: true,
-    action: { label: "View on Canvas", route: "canvas" },
+    id: `run-${run.id}`,
+    category: isRoutine ? "routine" : "schedule",
+    title: `${run.scheduleName} ${isRoutine ? "ran" : "triggered"}`,
+    body: formatRunBody(run),
+    timestamp: run.startedAt,
+    read: run.read,
+    action: { label: "View on Canvas", route: "canvas", run },
   };
 }
 
@@ -52,12 +56,17 @@ function countUnread(items: Notification[]): number {
 // ─── Notification card ────────────────────────────────────────────────────────
 interface NCardProps {
   notification: Notification;
-  onAction?: (route: string) => void;
+  onAction?: (route: string, run?: ScheduleRunNotification) => void;
 }
 
 function NCard({ notification: n, onAction }: NCardProps) {
   const color = CATEGORY_COLOR[n.category];
   const now = new Date();
+
+  function fire() {
+    if (!n.action) return;
+    onAction?.(n.action.route, n.action.run);
+  }
 
   return (
     <article
@@ -65,11 +74,11 @@ function NCard({ notification: n, onAction }: NCardProps) {
       data-read={String(n.read)}
       role="article"
       aria-label={n.title}
-      onClick={() => n.action && onAction?.(n.action.route)}
+      onClick={fire}
       onKeyDown={(e) => {
-        if ((e.key === "Enter" || e.key === " ") && n.action) {
+        if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onAction?.(n.action.route);
+          fire();
         }
       }}
       tabIndex={0}
@@ -92,7 +101,7 @@ function NCard({ notification: n, onAction }: NCardProps) {
             className="ncard__cta"
             onClick={(e) => {
               e.stopPropagation();
-              n.action && onAction?.(n.action.route);
+              fire();
             }}
           >
             {n.action.label}
@@ -106,50 +115,25 @@ function NCard({ notification: n, onAction }: NCardProps) {
 
 // ─── Notifications view ───────────────────────────────────────────────────────
 interface NotificationsViewProps {
-  go?: (route: string) => void;
+  go?: (route: string, run?: ScheduleRunNotification) => void;
 }
 
 export function NotificationsView({ go }: NotificationsViewProps) {
-  const { serverOnline } = useAppState();
-
-  // Merge mock + schedule-run notifications
-  const [allItems, setAllItems] = useState<Notification[]>([...MOCK_NOTIFICATIONS]);
-  const [scheduleOffline, setScheduleOffline] = useState(false);
+  const { serverOnline, scheduleRuns } = useAppState();
   const [readIds, setReadIds] = useState<Set<string>>(new Set());
 
-  // Fetch recent schedule runs when server is online
-  useEffect(() => {
-    if (!serverOnline) {
-      setScheduleOffline(true);
-      return;
-    }
-    setScheduleOffline(false);
+  // Derive all items from state.scheduleRuns (already kept fresh by AppContext) + mock data
+  const allItems = useMemo<Notification[]>(() => {
+    const runNotifs = scheduleRuns.map(buildNotificationFromRun);
+    return [...runNotifs, ...MOCK_NOTIFICATIONS].sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    );
+  }, [scheduleRuns]);
 
-    let cancelled = false;
-    async function load() {
-      try {
-        const runs = await api.getAllRecentRuns(5);
-        if (cancelled) return;
-        const scheduleNotifs: Notification[] = runs.map(buildScheduleNotification);
-        // Merge: scheduleNotifs + mock, sorted newest first
-        setAllItems(
-          [...scheduleNotifs, ...MOCK_NOTIFICATIONS].sort(
-            (a, b) =>
-              new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-          ),
-        );
-      } catch {
-        if (!cancelled) setScheduleOffline(true);
-      }
-    }
-
-    void load();
-    return () => { cancelled = true; };
-  }, [serverOnline]);
-
-  // Derive effective items with local read state overlaid
-  const effectiveItems: Notification[] = allItems.map((n) =>
-    readIds.has(n.id) ? { ...n, read: true } : n,
+  // Overlay local read state
+  const effectiveItems = useMemo<Notification[]>(
+    () => allItems.map((n) => (readIds.has(n.id) ? { ...n, read: true } : n)),
+    [allItems, readIds],
   );
 
   const unreadCount = countUnread(effectiveItems);
@@ -161,8 +145,8 @@ export function NotificationsView({ go }: NotificationsViewProps) {
 
   const groups: NotificationGroup[] = groupNotifications(effectiveItems);
 
-  function handleAction(route: string) {
-    go?.(route);
+  function handleAction(route: string, run?: ScheduleRunNotification) {
+    go?.(route, run);
   }
 
   return (
@@ -186,10 +170,10 @@ export function NotificationsView({ go }: NotificationsViewProps) {
         </button>
       </div>
 
-      {/* schedule offline note */}
-      {scheduleOffline && (
+      {/* offline note */}
+      {!serverOnline && scheduleRuns.length === 0 && (
         <div className="nfeed__offline-note">
-          Schedule history unavailable — connect to Goose server to see run debriefs
+          Connect to Goose server to see schedule and routine history
         </div>
       )}
 

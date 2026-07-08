@@ -50,12 +50,12 @@
   --purple-800: #421593;
   --purple-900: #2A0C66;
 
-  /* Primary accent — Jarida Purple */
-  --color-accent:        #8C4BFF;
-  --color-accent-hover:  #7636E6;
-  --color-accent-active: #5D23C2;
-  --color-accent-soft:   rgba(140, 75, 255, 0.11);
-  --color-accent-subtle: rgba(140, 75, 255, 0.06);
+  /* Primary accent — follows themeStore via --pp (set as inline style on :root) */
+  --color-accent:        var(--pp, #8C4BFF);
+  --color-accent-hover:  var(--pp-600, #7636E6);
+  --color-accent-active: var(--pp-600, #5D23C2);
+  --color-accent-soft:   color-mix(in srgb, var(--pp, #8C4BFF) 11%, transparent);
+  --color-accent-subtle: color-mix(in srgb, var(--pp, #8C4BFF) 6%, transparent);
   --color-text-on-accent: #FFFFFF;
 
   /* Ink style — signature Jarida outlined look */
@@ -85,7 +85,7 @@
   /* Borders */
   --color-border:        rgba(23, 22, 22, 0.08);
   --color-border-strong: rgba(23, 22, 22, 0.15);
-  --color-border-focus:  rgba(140, 82, 255, 0.45);
+  --color-border-focus:  color-mix(in srgb, var(--pp, #8C4BFF) 45%, transparent);
 
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
@@ -152,9 +152,9 @@
   --success:      var(--color-success);
   --warning:      var(--color-warning);
   --danger:       var(--color-destructive);
-  --bg-brand:     var(--color-accent);
-  --bg-brand-soft: #F4ECFF;
-  --fg-brand:     var(--purple-700);
+  --bg-brand:     var(--pp, var(--color-accent));
+  --bg-brand-soft: var(--pp-50, #F4ECFF);
+  --fg-brand:     var(--pp-600, var(--purple-700));
   --fg-on-brand:  var(--color-text-on-accent);
   --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
   --radius-card:  14px;
@@ -231,4 +231,79 @@
   --mem-knowledge-bg:      rgba(20, 184, 166, 0.08);
   --mem-context:           #9ca3af;
   --mem-context-bg:        rgba(156, 163, 175, 0.08);
+}
+
+/* ── Dark mode token overrides ───────────────────────────────────────────────
+   Applied when themeStore sets data-theme="dark" on :root.
+   These flip every semantic token so classic-view components pick up dark
+   mode automatically without per-component overrides.
+   ─────────────────────────────────────────────────────────────────────────── */
+:root[data-theme="dark"] {
+  /* Surfaces */
+  --color-bg:             #131119;
+  --color-surface:        #1E1B26;
+  --color-surface-warm:   #1E1B26;
+  --color-sidebar:        #17141F;
+  --color-content:        #161320;
+  --color-overlay:        rgba(19, 17, 25, 0.92);
+
+  /* Text */
+  --color-text:           #F3F1F8;
+  --color-text-secondary: rgba(243, 241, 248, 0.55);
+  --color-text-tertiary:  rgba(243, 241, 248, 0.38);
+  --color-text-disabled:  rgba(243, 241, 248, 0.25);
+
+  /* Aliases */
+  --fg:                   #F3F1F8;
+  --ink:                  #F3F1F8;
+  --ink-2:                #C7C3D2;
+  --mut:                  #8B8696;
+  --line:                 #322E3C;
+  --panel:                #1E1B26;
+  --hub-bg:               #131119;
+
+  /* Interaction states */
+  --color-hover:          rgba(243, 241, 248, 0.06);
+  --color-pressed:        rgba(243, 241, 248, 0.10);
+
+  /* Borders */
+  --color-border:         rgba(243, 241, 248, 0.10);
+  --color-border-strong:  rgba(243, 241, 248, 0.18);
+
+  /* Grey scale — inverted so grey-50 is darkest, grey-900 lightest */
+  --grey-50:  #18181B;
+  --grey-100: #27272A;
+  --grey-200: #3F3F46;
+  --grey-300: #52525B;
+  --grey-400: #71717A;
+  --grey-500: #A1A1AA;
+  --grey-600: #D4D4D8;
+  --grey-700: #E4E4E7;
+  --grey-800: #F4F4F5;
+  --grey-900: #FAFAFA;
+
+  /* Semantic fg — brightened for dark backgrounds */
+  --color-success-fg:  #4ADE80;
+  --color-warning-fg:  #FBBF24;
+  --color-info-fg:     #60A5FA;
+  --color-info-dark:   #60A5FA;
+
+  /* Semantic soft — slightly more opaque on dark */
+  --color-success-soft:     rgba(52,  199,  89, 0.18);
+  --color-warning-soft:     rgba(255, 149,   0, 0.18);
+  --color-destructive-soft: rgba(255,  59,  48, 0.15);
+  --color-info-soft:        rgba(  0, 114, 245, 0.12);
+
+  /* Shadows — lighter base for dark surfaces */
+  --shadow-xs:     0 1px 1px rgba(0, 0, 0, 0.25);
+  --shadow-sm:     0 1px 3px rgba(0, 0, 0, 0.30);
+  --shadow-md:     0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-lg:     0 4px 16px rgba(0, 0, 0, 0.40);
+  --shadow-canvas: 0 8px 32px rgba(0, 0, 0, 0.50), 0 2px 8px rgba(0, 0, 0, 0.35);
+
+  /* Notification icons */
+  --color-notif-daily-bg:  rgba(234, 88, 12, 0.15);
+  --color-notif-daily-fg:  #FB923C;
+  --color-notif-weekly-bg: rgba(37, 99, 235, 0.15);
+  --color-notif-weekly-fg: #60A5FA;
 }
