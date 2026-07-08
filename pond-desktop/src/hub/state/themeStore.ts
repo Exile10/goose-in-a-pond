@@ -29,6 +29,15 @@ export const ACCENT_PALETTES: Record<AccentName, [string, string, string, string
   Magenta: ["#DB2777", "#BE185D", "#FCE7F3", "#FDF2F8"],
 };
 
+// Dark-mode variants: same pp/pp-600, but tinted rgba for pp-100/pp-50
+const ACCENT_PALETTES_DARK: Record<AccentName, [string, string, string, string]> = {
+  Purple:  ["#7C3AED", "#6D28D9", "rgba(124, 58,237,0.22)", "rgba(124, 58,237,0.12)"],
+  Blue:    ["#2563EB", "#1D4ED8", "rgba( 37, 99,235,0.22)", "rgba( 37, 99,235,0.12)"],
+  Teal:    ["#0D9488", "#0F766E", "rgba( 13,148,136,0.22)", "rgba( 13,148,136,0.12)"],
+  Coral:   ["#F97316", "#EA580C", "rgba(249,115, 22,0.22)", "rgba(249,115, 22,0.12)"],
+  Magenta: ["#DB2777", "#BE185D", "rgba(219, 39,119,0.22)", "rgba(219, 39,119,0.12)"],
+};
+
 // ─── localStorage keys ────────────────────────────────────────────────────────
 
 const KEY_THEME   = "goosehub_theme";
@@ -82,8 +91,9 @@ function applyToDOM(theme: ThemeChoice, accent: AccentName, density: DensityChoi
   // density dataset
   root.dataset.density = density.toLowerCase();
 
-  // accent custom properties
-  const [pp, pp600, pp100, pp50] = ACCENT_PALETTES[accent];
+  // accent custom properties — use dark tints when in dark mode
+  const palette = resolved === "dark" ? ACCENT_PALETTES_DARK[accent] : ACCENT_PALETTES[accent];
+  const [pp, pp600, pp100, pp50] = palette;
   root.style.setProperty("--pp",     pp);
   root.style.setProperty("--pp-600", pp600);
   root.style.setProperty("--pp-100", pp100);

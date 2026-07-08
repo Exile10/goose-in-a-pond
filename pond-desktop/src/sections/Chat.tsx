@@ -1,33 +1,44 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Button, Chip } from "@heroui/react";
-import { ArrowUp, Brain, Check, ChevronDown, Cpu, History, Loader2, Mic, Paperclip, Wrench, Zap } from "lucide-react";
+import { Brain, Check, ChevronDown, Cpu, History, Loader2, PenSquare, Wrench } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
 import type { ContextCard as ContextCardType } from "../state/reducer";
-import { ContextCard } from "../components/ContextCard";
 import { ToolCallChip } from "../components/ToolCallChip";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
+import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
+import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
+import { HubIco, micEl } from "../hub/primitives/HubIco";
+import { HP_PATHS } from "../hub/primitives/icons";
 import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary } from "../api/types";
 import { filterThinking } from "../lib/thinkFilter";
 
-// Human-readable tool status for the chat bubble while a tool runs.
+// Module-level counter — shared across session loads and live sends
+let _msgId = 0;
+
+const CHIPS = [
+  "What can you help me with?",
+  "Check the weather",
+  "Set a schedule",
+  "Show my devices",
+  "Manage my models",
+];
+
 function friendlyToolStatus(rawName: string): string {
   const bare = rawName.includes("__") ? rawName.split("__").pop()! : rawName;
   const map: Record<string, string> = {
-    get_current_weather: "Checking the weather…",
-    list_registered_devices: "Looking up your devices…",
-    recall_memories: "Recalling what I know…",
-    save_memory: "Saving that for later…",
-    list_schedules: "Looking up your schedules…",
-    get_recipe: "Finding that recipe…",
-    get_user_profile: "Looking up your profile…",
-    list_skills: "Checking my skills…",
+    get_current_weather:      "Checking the weather…",
+    list_registered_devices:  "Looking up your devices…",
+    recall_memories:          "Recalling what I know…",
+    save_memory:              "Saving that for later…",
+    list_schedules:           "Looking up your schedules…",
+    get_recipe:               "Finding that recipe…",
+    get_user_profile:         "Looking up your profile…",
+    list_skills:              "Checking my skills…",
   };
   if (map[bare]) return map[bare];
-  const pretty = bare.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-  return `Working on: ${pretty}…`;
+  return `Working on: ${bare.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}…`;
 }
 
 interface Message {
@@ -35,55 +46,32 @@ interface Message {
   role: "user" | "agent";
   text: string;
   streaming?: boolean;
-  status?: string;       // current activity description (e.g. "Thinking...", "Using tool...")
-  cards?: ContextCardType[];  // inline tool call results attached to this message
-  thinkingBlocks?: string[];  // captured reasoning blocks (shown when show_thinking is on)
-  modelRole?: string;         // which role answered (chat/think/task)
+  status?: string;
+  cards?: ContextCardType[];
+  thinkingBlocks?: string[];
+  modelRole?: string;
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
-  error?: boolean;            // true when this bubble represents an error
-  historyToolNames?: string[]; // tool names used in a persisted history turn
+  error?: boolean;
+  historyToolNames?: string[];
 }
 
-/**
- * Filter and transform persisted session messages into renderable Message objects.
- *
- * Rules:
- * - Drop role="tool" messages entirely (raw tool results are internal).
- * - Drop role="assistant" messages where content is empty/whitespace AND
- *   tool_calls is non-empty (the "I'm about to call a tool" preamble).
- * - For role="assistant" messages with tool_calls AND non-empty content,
- *   carry the tool names so a subtle indicator can be shown.
- */
 function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
   const out: Message[] = [];
   for (const m of raw) {
-    // Always drop raw tool result rows.
     if (m.role === "tool") continue;
-
     if (m.role === "assistant") {
       const hasContent = m.content.trim().length > 0;
       const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
-
-      // Drop the empty "about to call a tool" preamble.
       if (!hasContent && hasToolCalls) continue;
-
       const historyToolNames = hasToolCalls
         ? m.tool_calls!.map((tc) => {
-            // Strip server prefix like "giap-weather__" → "get_current_weather"
             const bare = tc.name.includes("__") ? tc.name.split("__").pop()! : tc.name;
             return bare;
           })
         : undefined;
-
-      out.push({
-        id: ++msgId,
-        role: "agent",
-        text: m.content,
-        historyToolNames,
-      });
+      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames });
     } else {
-      // role === "user"
-      out.push({ id: ++msgId, role: "user", text: m.content });
+      out.push({ id: ++_msgId, role: "user", text: m.content });
     }
   }
   return out;
@@ -92,25 +80,24 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
 export function Chat() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
-  const msgIdRef = useRef(0);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [loadingSession, setLoadingSession] = useState(false);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [showSessions, setShowSessions] = useState(false);
-  const [showModelSelector, setShowModelSelector] = useState(false);
-  const [availableModels, setAvailableModels] = useState<ModelEntry[]>([]);
-  const [modelSwitching, setModelSwitching] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const modelSelectorRef = useRef<HTMLDivElement>(null);
-  const sessionIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
-  const inThinkBlockRef = useRef(false);
 
-  // Keep sessionIdRef in sync with state. When the session id changes
-  // externally (e.g. user clicked a Recent item on Dashboard), load
-  // that session's messages.
+  const [messages, setMessages]             = useState<Message[]>([]);
+  const [input, setInput]                   = useState("");
+  const [busy, setBusy]                     = useState(false);
+  const [loadingSession, setLoadingSession] = useState(false);
+  const [sessions, setSessions]             = useState<SessionSummary[]>([]);
+  const [showSessions, setShowSessions]     = useState(false);
+  const [showModelSelector, setShowModelSelector] = useState(false);
+  const [availableModels, setAvailableModels]     = useState<ModelEntry[]>([]);
+  const [modelSwitching, setModelSwitching]       = useState(false);
+
+  const bottomRef        = useRef<HTMLDivElement>(null);
+  const textareaRef      = useRef<HTMLTextAreaElement>(null);
+  const modelSelectorRef = useRef<HTMLDivElement>(null);
+  const sessionIdRef     = useRef<string | undefined>(state.sessionId ?? undefined);
+  const inThinkBlockRef  = useRef(false);
+
+  // Sync session ref; load history when session changes externally
   useEffect(() => {
     const newId = state.sessionId ?? undefined;
     if (newId === sessionIdRef.current) return;
@@ -118,22 +105,14 @@ export function Chat() {
     sessionIdRef.current = newId;
     if (!wasExternal) return;
     api.getSessionMessages(newId!)
-      .then((msgs) => {
-        setMessages(sessionMessagesToMessages(msgs ?? []));
-      })
-      .catch((err) => {
-        console.warn("Could not load session history (non-fatal):", err);
-      });
+      .then((msgs) => setMessages(sessionMessagesToMessages(msgs ?? [])))
+      .catch((err) => console.warn("Could not load session history (non-fatal):", err));
   }, [state.sessionId]);
 
-  // Refresh session list for dropdown
   const refreshSessions = useCallback(() => {
     api.listSessions().then(setSessions).catch(() => {});
   }, []);
 
-  // Fetch available models when the selector is opened.
-  // Merges GGUF/llamafile models from /api/v1/models with Ollama models
-  // from /api/v1/models/ollama so all LLM backends appear in the list.
   const openModelSelector = useCallback(() => {
     setShowModelSelector(true);
     Promise.all([api.listModels(), api.listOllamaModels()])
@@ -155,23 +134,19 @@ export function Chat() {
         setAvailableModels([...localModels, ...ollamaEntries]);
       })
       .catch(() => {
-        // If Ollama request fails (e.g. not running), fall back to local models only
         api.listModels().then(setAvailableModels).catch(() => {});
       });
   }, []);
 
-  // Filter to only downloaded LLM-capable models
   const chatModels = useMemo(() => {
     return availableModels.filter((m) => {
       if (m.downloaded === false) return false;
-      // Exclude ASR/TTS models (categories: whisper, tts, tts_piper, tts_http)
       const cat = (m.category ?? m.provider ?? "").toLowerCase();
       if (cat === "whisper" || cat.startsWith("tts")) return false;
       return true;
     });
   }, [availableModels]);
 
-  // Group models by provider
   const groupedModels = useMemo(() => {
     const map = new Map<string, ModelEntry[]>();
     for (const m of chatModels) {
@@ -182,19 +157,11 @@ export function Chat() {
     return Array.from(map.entries());
   }, [chatModels]);
 
-  // Handle model activation
   const handleModelSwitch = useCallback(async (provider: string, name: string) => {
     setModelSwitching(true);
     try {
       await api.activateModel(provider, name, "chat");
-      dispatch({
-        type: "SET_LAST_RESPONSE_META",
-        payload: {
-          modelName: name,
-          modelRole: "chat",
-          completionTokens: 0,
-        },
-      });
+      dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: name, modelRole: "chat", completionTokens: 0 } });
     } catch (e) {
       console.warn("Model switch failed:", e);
     } finally {
@@ -203,7 +170,7 @@ export function Chat() {
     }
   }, [dispatch]);
 
-  // Close model selector on outside click
+  // Close model selector on outside click / Escape
   useEffect(() => {
     if (!showModelSelector) return;
     function handleClick(e: MouseEvent) {
@@ -222,7 +189,7 @@ export function Chat() {
     };
   }, [showModelSelector]);
 
-  // Load most recent session on mount (once server is online)
+  // Load most recent session on mount
   useEffect(() => {
     if (!state.serverOnline || messages.length > 0) return;
     setLoadingSession(true);
@@ -238,9 +205,7 @@ export function Chat() {
         if (!msgs || msgs.length === 0) return;
         setMessages(sessionMessagesToMessages(msgs));
       })
-      .catch((err) => {
-        console.warn("Could not load session history (non-fatal):", err);
-      })
+      .catch((err) => console.warn("Could not load session history (non-fatal):", err))
       .finally(() => { setLoadingSession(false); refreshSessions(); });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.serverOnline]);
@@ -257,20 +222,17 @@ export function Chat() {
     textareaRef.current?.focus();
   }
 
-  const sendMessage = useCallback(async () => {
-    const text = input.trim();
+  const sendMessage = useCallback(async (directText?: string) => {
+    const text = (directText ?? input).trim();
     if (!text || busy || !state.serverOnline) return;
 
     setInput("");
-    // Reset textarea height
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
     setBusy(true);
+    inThinkBlockRef.current = false;
 
-    inThinkBlockRef.current = false; // reset for new stream
-    const userMsg: Message = { id: ++msgIdRef.current, role: "user", text };
-    const agentMsg: Message = { id: ++msgIdRef.current, role: "agent", text: "", streaming: true };
+    const userMsg:  Message = { id: ++_msgId, role: "user",  text };
+    const agentMsg: Message = { id: ++_msgId, role: "agent", text: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, agentMsg]);
 
     try {
@@ -289,24 +251,18 @@ export function Chat() {
               return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
             });
           }
-
         } else if (ev.type === "thinking" && ev.content) {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), {
-              ...last,
-              thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content],
-            }];
+            return [...prev.slice(0, -1), { ...last, thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string] }];
           });
-
         } else if (ev.type === "status" && ev.content) {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
             return [...prev.slice(0, -1), { ...last, status: ev.content }];
           });
-
         } else if (ev.type === "tool_call" && ev.tool) {
           const card: ContextCardType = {
             id: nextCardId(),
@@ -315,51 +271,40 @@ export function Chat() {
             data: (ev.result as Record<string, unknown>) ?? {},
             timestamp_ms: Date.now(),
           };
-          dispatch({ type: "PUSH_CONTEXT_CARD", payload: card }); // keep for voice compat
+          dispatch({ type: "PUSH_CONTEXT_CARD", payload: card });
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { 
-              ...last, 
-              cards: [...(last.cards ?? []), card],
-              status: friendlyToolStatus(ev.tool ?? "")
-            }];
+            return [...prev.slice(0, -1), { ...last, cards: [...(last.cards ?? []), card], status: friendlyToolStatus(ev.tool ?? "") }];
           });
-
         } else if (ev.type === "tool_result" && ev.id) {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent" || !last.cards) return prev;
-            // Use explicit UI data if provided by MCP-APP, else wrap content
-            const cardData = ev.ui?.data ?? { result: ev.content };
+            const cardData   = ev.ui?.data ?? { result: ev.content };
             const renderHint = ev.ui?.card_type;
-            // Match by MCP request ID (primary) or tool name (fallback).
-            const evId = ev.id as string;
+            const evId   = ev.id as string;
             const evTool = ev.tool as string | undefined;
-            const newCards = last.cards.map(c =>
+            const newCards = last.cards.map((c) =>
               (c.callId && c.callId === evId) || (evTool && c.tool === evTool)
                 ? { ...c, data: cardData, ...(renderHint ? { renderHint } : {}) }
-                : c
+                : c,
             );
             return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
           });
-
         } else if (ev.type === "review_status" && ev.content) {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
             return [...prev.slice(0, -1), { ...last, status: ev.content }];
           });
-
         } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
-          // Replace the streamed text with the revised/tool-augmented version
           inThinkBlockRef.current = false;
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
             return [...prev.slice(0, -1), { ...last, text: ev.content!, status: undefined }];
           });
-
         } else if (ev.type === "error" || ev.error) {
           const errMsg = ev.error ?? "Unknown error from agent";
           setMessages((prev) => {
@@ -367,7 +312,6 @@ export function Chat() {
             if (!last || last.role !== "agent") return prev;
             return [...prev.slice(0, -1), { ...last, text: `Error: ${errMsg}`, streaming: false, error: true }];
           });
-
         } else if (ev.done && ev.session_id) {
           sessionIdRef.current = ev.session_id;
           dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
@@ -381,14 +325,7 @@ export function Chat() {
             }];
           });
           if (ev.model_name && ev.model_role) {
-            dispatch({
-              type: "SET_LAST_RESPONSE_META",
-              payload: {
-                modelName: ev.model_name,
-                modelRole: ev.model_role,
-                completionTokens: ev.usage?.completion_tokens ?? 0,
-              },
-            });
+            dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: ev.model_name, modelRole: ev.model_role, completionTokens: ev.usage?.completion_tokens ?? 0 } });
           }
         }
       }
@@ -401,9 +338,7 @@ export function Chat() {
     } finally {
       setMessages((prev) => {
         const last = prev[prev.length - 1];
-        if (!last || last.role !== "agent") return prev;
-        // Only clear streaming flag if not already cleared by error handler
-        if (!last.streaming) return prev;
+        if (!last || last.role !== "agent" || !last.streaming) return prev;
         return [...prev.slice(0, -1), { ...last, streaming: false }];
       });
       setBusy(false);
@@ -429,248 +364,252 @@ export function Chat() {
   const modelLabel = state.lastResponseMeta?.modelName ?? "local model";
 
   return (
-    <div className="screen screen--chat">
-      {/* Chat Toolbar */}
-      <div className="chat-toolbar">
-        <div className="chat-toolbar__left">
-          <Button
-            size="sm"
-            variant="ghost"
-            isIconOnly
-            onPress={() => { refreshSessions(); setShowSessions(!showSessions); }}
+    <div className="chat2">
+      {/* Header */}
+      <header className="chat2__head">
+        <div className="chat2__id">
+          <GooseAvatar size={40} />
+          <div>
+            <div className="chat2__name">Goose</div>
+            <div className="chat2__status">
+              <span className="chat2__dot" aria-hidden="true" />
+              {state.serverOnline ? "On-device · listening" : "Offline"}
+            </div>
+          </div>
+        </div>
+        <div className="chat2__head-right">
+          <button
+            className="chat2__voice-btn"
+            onClick={() => { refreshSessions(); setShowSessions(!showSessions); }}
             aria-label="Session history"
+            title="Session history"
+            type="button"
           >
-            <History size={16} />
-          </Button>
-          <h1 className="page-header__title chat-toolbar__title">Chat</h1>
-          <Chip size="sm" variant="flat" startContent={<Cpu size={12} />}>
-            {modelLabel}
-          </Chip>
-        </div>
-        <div className="chat-toolbar__right">
-          <Button
-            size="sm"
-            variant="ghost"
-            onPress={newConversation}
+            <History size={18} color="var(--pp)" />
+          </button>
+          <button
+            className="chat2__voice-btn"
+            onClick={newConversation}
             aria-label="New conversation"
+            title="New conversation"
+            type="button"
           >
-            New chat
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            startContent={<Zap size={14} />}
+            <PenSquare size={18} color="var(--pp)" />
+          </button>
+          <button
+            className="chat2__voice-btn"
+            onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+            aria-label="Switch to voice mode"
+            title="Voice mode"
+            type="button"
           >
-            Tools
-          </Button>
+            <HubIco d={micEl} size={20} color="var(--pp)" />
+          </button>
+          <SessionDropdown
+            sessions={sessions}
+            currentSessionId={sessionIdRef.current ?? null}
+            onSelect={(id) => dispatch({ type: "SET_SESSION_ID", payload: id })}
+            onNewChat={newConversation}
+            isOpen={showSessions}
+            onClose={() => setShowSessions(false)}
+          />
         </div>
+      </header>
 
-        <SessionDropdown
-          sessions={sessions}
-          currentSessionId={sessionIdRef.current ?? null}
-          onSelect={(id) => {
-            dispatch({ type: "SET_SESSION_ID", payload: id });
-          }}
-          onNewChat={newConversation}
-          isOpen={showSessions}
-          onClose={() => setShowSessions(false)}
-        />
-      </div>
-
-      {/* Messages */}
-      <div className="chat-body" role="log" aria-live="polite">
-        <div className="chat-thread">
-          {loadingSession && (
-            <div className="chat-skeleton" aria-busy="true" aria-label="Loading conversation">
-              {([88, 64, 72] as const).map((w, i) => (
-                <div key={i} className={`chat-skeleton__row${i % 2 !== 0 ? " chat-skeleton__row--right" : ""}`}>
-                  <div className="chat-skeleton__line" style={{ width: `${w}%` }} />
-                  <div className="chat-skeleton__line" style={{ width: `${Math.round(w * 0.65)}%` }} />
-                </div>
-              ))}
-            </div>
-          )}
-          {!loadingSession && messages.length === 0 && (
-            <div className="empty-state">
-              <p className="chat-empty__title">Start a conversation</p>
-              <p className="chat-empty__hint">Ask Pond anything. Type a message or use voice mode.</p>
-            </div>
-          )}
-          {messages.map((msg) => {
-            // Skip agent bubbles that have no visible content yet — these are the
-            // empty assistant_with_tool_calls preambles that show during streaming
-            // before the synthesis response arrives.
-            const hasText = msg.text && msg.text.trim().length > 0;
-            const hasCards = (msg.cards?.length ?? 0) > 0;
-            const hasThinking = (msg.thinkingBlocks?.length ?? 0) > 0;
-            if (msg.role === "agent" && !hasText && !hasCards && !hasThinking && !msg.streaming) return null;
-            return (
-            <div
-              key={msg.id}
-              className={`bubble ${msg.role === "user" ? "bubble--user" : "bubble--assistant"}`}
-            >
-              <div className="bubble__author">
-                {msg.role === "user" ? "You" : "Pond"}
+      {/* Thread */}
+      <div className="chat2__thread" role="log" aria-live="polite" aria-label="Chat conversation">
+        {loadingSession && (
+          <div className="chat-skeleton" aria-busy="true" aria-label="Loading conversation">
+            {([88, 64, 72] as const).map((w, i) => (
+              <div key={i} className={`chat-skeleton__row${i % 2 !== 0 ? " chat-skeleton__row--right" : ""}`}>
+                <div className="chat-skeleton__line" style={{ width: `${w}%` }} />
+                <div className="chat-skeleton__line" style={{ width: `${Math.round(w * 0.65)}%` }} />
               </div>
-              {/* Tool call chips — shown above message text once streaming is done */}
-              {msg.role === "agent" && msg.cards && msg.cards.length > 0 && !msg.streaming && (
-                <div className="tool-call-chips" role="list" aria-label="Tools used">
-                  {msg.cards.map((card) => (
-                    <ToolCallChip key={card.id} card={card} />
-                  ))}
-                </div>
-              )}
+            ))}
+          </div>
+        )}
 
-              {/* History tool indicator — for persisted messages that used tools */}
-              {msg.role === "agent" && msg.historyToolNames && msg.historyToolNames.length > 0 && (
-                <div className="tool-call-chips" role="list" aria-label="Tools used">
-                  {msg.historyToolNames.map((name) => (
-                    <span key={name} className="tool-history-chip">
-                      <Wrench size={10} aria-hidden />
-                      {name.replace(/_/g, " ")}
-                    </span>
-                  ))}
-                </div>
-              )}
+        {!loadingSession && messages.length === 0 && (
+          <div className="chat-empty">
+            <GooseAvatar size={52} />
+            <p className="chat-empty__title">Start a conversation</p>
+            <p className="chat-empty__hint">Ask Goose anything or pick a suggestion below.</p>
+          </div>
+        )}
 
-              {/* Thinking blocks — collapsible reasoning shown when show_thinking is on */}
-              {msg.role === "agent" && msg.thinkingBlocks && msg.thinkingBlocks.length > 0 && !msg.streaming && (
-                <details className="thinking-block">
-                  <summary className="thinking-block__toggle">
-                    <Brain size={12} aria-hidden /> Thinking
-                  </summary>
-                  <div className="thinking-block__content">
-                    {msg.thinkingBlocks.map((block, i) => (
-                      <p key={i}>{block}</p>
+        {messages.map((msg) => {
+          const hasText     = msg.text && msg.text.trim().length > 0;
+          const hasCards    = (msg.cards?.length ?? 0) > 0;
+          const hasThinking = (msg.thinkingBlocks?.length ?? 0) > 0;
+          if (msg.role === "agent" && !hasText && !hasCards && !hasThinking && !msg.streaming) return null;
+          return (
+            <div key={msg.id} className={`ch-row ${msg.role === "user" ? "ch-row--user" : "ch-row--goose"}`}>
+              {msg.role === "agent" && <GooseAvatar />}
+              <div className="ch-bubble-wrap">
+                {/* Tool call chips */}
+                {msg.role === "agent" && msg.cards && msg.cards.length > 0 && !msg.streaming && (
+                  <div className="tool-call-chips" role="list" aria-label="Tools used">
+                    {msg.cards.map((card) => <ToolCallChip key={card.id} card={card} />)}
+                  </div>
+                )}
+                {/* History tool indicators */}
+                {msg.role === "agent" && msg.historyToolNames && msg.historyToolNames.length > 0 && (
+                  <div className="tool-call-chips" role="list" aria-label="Tools used">
+                    {msg.historyToolNames.map((name) => (
+                      <span key={name} className="tool-history-chip">
+                        <Wrench size={10} aria-hidden />
+                        {name.replace(/_/g, " ")}
+                      </span>
                     ))}
                   </div>
-                </details>
-              )}
-
-              <div
-                className={`bubble__body${msg.error ? " bubble__body--error" : ""}`}
-              >
-                {msg.text || (msg.streaming ? (
-                  msg.status
-                    ? <ThinkingPlaceholder status={msg.status} />
-                    : <span className="stream-dots"><span /><span /><span /></span>
-                ) : "")}
+                )}
+                {/* Thinking block */}
+                {msg.role === "agent" && msg.thinkingBlocks && msg.thinkingBlocks.length > 0 && !msg.streaming && (
+                  <details className="thinking-block">
+                    <summary className="thinking-block__toggle">
+                      <Brain size={12} aria-hidden /> Thinking
+                    </summary>
+                    <div className="thinking-block__content">
+                      {msg.thinkingBlocks.map((block, i) => <p key={i}>{block}</p>)}
+                    </div>
+                  </details>
+                )}
+                {/* Bubble */}
+                <div className={`ch-bubble ${msg.role === "user" ? "ch-bubble--user" : `ch-bubble--goose${msg.error ? " ch-bubble--error" : ""}`}`}>
+                  {msg.text || (msg.streaming
+                    ? msg.status
+                      ? <ThinkingPlaceholder status={msg.status} />
+                      : <span className="stream-dots"><span /><span /><span /></span>
+                    : "")}
+                </div>
+                {/* Model role + token meta */}
+                {msg.role === "agent" && msg.modelRole && !msg.streaming && (
+                  <span className="bubble__meta">
+                    {msg.modelRole}
+                    {msg.tokenUsage && msg.tokenUsage.completion_tokens > 0 && (
+                      <> · {msg.tokenUsage.completion_tokens} tokens</>
+                    )}
+                  </span>
+                )}
               </div>
-
-              {/* Model role badge + token count */}
-              {msg.role === "agent" && msg.modelRole && !msg.streaming && (
-                <span className="bubble__meta">
-                  {msg.modelRole}
-                  {msg.tokenUsage && msg.tokenUsage.completion_tokens > 0 && (
-                    <> · {msg.tokenUsage.completion_tokens} tokens</>
-                  )}
-                </span>
-              )}
             </div>
-            );
-          })}
-          <div ref={bottomRef} />
-        </div>
+          );
+        })}
+
+        {busy && messages[messages.length - 1]?.text === "" && <TypingIndicator />}
+        <div ref={bottomRef} />
       </div>
 
-      {/* Composer */}
-      <div className="chat-composer">
-        <div className="chat-composer__inner">
-          <textarea
-            ref={textareaRef}
-            className="chat-composer__textarea"
-            value={input}
-            onChange={onInput}
-            onKeyDown={onKeyDown}
-            placeholder="Message Pond..."
-            disabled={!state.serverOnline || busy}
-            aria-label="Message input"
-          />
-          <div className="chat-composer__actions">
-            <Button isIconOnly size="sm" variant="ghost">
-              <Paperclip size={16} />
-            </Button>
-            <Button isIconOnly size="sm" variant="ghost">
-              <Mic size={16} />
-            </Button>
-            <Button
-              isIconOnly
-              size="sm"
-              variant="secondary"
-              isDisabled={!input.trim() || !state.serverOnline || busy}
-              onPress={sendMessage}
-              aria-label="Send message"
-            >
-              <ArrowUp size={16} />
-            </Button>
-          </div>
-        </div>
-        <div className="chat-composer__hint">
-          {/* Model selector */}
-          <div ref={modelSelectorRef} className="model-selector-wrap">
+      {/* Suggestion chips — only when thread is empty */}
+      {!loadingSession && messages.length === 0 && (
+        <div className="chat2__chips" role="group" aria-label="Quick suggestions">
+          {CHIPS.map((c) => (
             <button
-              className={`model-selector-trigger${showModelSelector ? " is-open" : ""}`}
-              onClick={() => showModelSelector ? setShowModelSelector(false) : openModelSelector()}
-              disabled={modelSwitching}
-              aria-label="Select model"
-              aria-expanded={showModelSelector}
+              key={c}
+              className="ch-chip"
+              onClick={() => sendMessage(c)}
+              disabled={busy || !state.serverOnline}
+              type="button"
             >
-              <Cpu size={11} />
-              <span className="model-selector-trigger__label">
-                {modelSwitching ? "Switching..." : modelLabel}
-              </span>
-              {modelSwitching
-                ? <Loader2 size={10} className="spin" />
-                : <ChevronDown size={10} />}
+              {c}
             </button>
-
-            {showModelSelector && (
-              <div className="model-selector-dropdown">
-                <div className="model-selector-dropdown__header">
-                  <span>Switch Model</span>
-                </div>
-                <div className="model-selector-dropdown__list">
-                  {groupedModels.length === 0 && (
-                    <div className="model-selector-dropdown__empty">
-                      No models available
-                    </div>
-                  )}
-                  {groupedModels.map(([provider, group]) => {
-                    const providerLabel = provider.charAt(0).toUpperCase() + provider.slice(1);
-                    return (
-                      <div key={provider}>
-                        <div className="model-selector-dropdown__group-label">{providerLabel}</div>
-                        {group.map((m) => {
-                          const isActive = modelLabel === m.name || modelLabel === (m.display_name ?? m.name);
-                          const label = m.name;
-                          return (
-                            <button
-                              key={m.id}
-                              className={`model-selector-dropdown__item${isActive ? " is-active" : ""}`}
-                              onClick={() => handleModelSwitch(m.provider, m.name)}
-                              disabled={modelSwitching}
-                            >
-                              <span className="model-selector-dropdown__item-name">
-                                {label}
-                              </span>
-                              <span className="model-selector-dropdown__item-meta">
-                                {m.size_mb ? `${m.size_mb >= 1024 ? (m.size_mb / 1024).toFixed(1) + " GB" : m.size_mb + " MB"}` : ""}
-                                {isActive && <Check size={12} color="var(--color-accent)" />}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-
-          <span>&middot;</span>
-          <span>Cmd + Enter to send</span>
+          ))}
         </div>
+      )}
+
+      {/* Input row */}
+      <div className="chat2__input">
+        <button
+          className="ch-mic"
+          onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+          aria-label="Switch to voice mode"
+          title="Voice input"
+          type="button"
+        >
+          <HubIco d={micEl} size={19} color="#fff" />
+        </button>
+        <textarea
+          ref={textareaRef}
+          className="chat2__textarea"
+          value={input}
+          onChange={onInput}
+          onKeyDown={onKeyDown}
+          placeholder="Message Goose…"
+          disabled={!state.serverOnline || busy}
+          aria-label="Message input"
+          rows={1}
+        />
+        <button
+          className="ch-send"
+          onClick={() => sendMessage()}
+          disabled={!input.trim() || !state.serverOnline || busy}
+          aria-label="Send message"
+          type="button"
+        >
+          <HubIco d={HP_PATHS.chevR} size={18} color="#fff" sw={2.5} />
+        </button>
+      </div>
+
+      {/* Hint bar — model selector + keyboard shortcut */}
+      <div className="chat2__hint">
+        <div ref={modelSelectorRef} className="model-selector-wrap">
+          <button
+            className={`model-selector-trigger${showModelSelector ? " is-open" : ""}`}
+            onClick={() => showModelSelector ? setShowModelSelector(false) : openModelSelector()}
+            disabled={modelSwitching}
+            aria-label="Select model"
+            aria-expanded={showModelSelector}
+          >
+            <Cpu size={11} />
+            <span className="model-selector-trigger__label">
+              {modelSwitching ? "Switching…" : modelLabel}
+            </span>
+            {modelSwitching ? <Loader2 size={10} className="spin" /> : <ChevronDown size={10} />}
+          </button>
+
+          {showModelSelector && (
+            <div className="model-selector-dropdown">
+              <div className="model-selector-dropdown__header">
+                <span>Switch Model</span>
+              </div>
+              <div className="model-selector-dropdown__list">
+                {groupedModels.length === 0 && (
+                  <div className="model-selector-dropdown__empty">No models available</div>
+                )}
+                {groupedModels.map(([provider, group]) => (
+                  <div key={provider}>
+                    <div className="model-selector-dropdown__group-label">
+                      {provider.charAt(0).toUpperCase() + provider.slice(1)}
+                    </div>
+                    {group.map((m) => {
+                      const isActive = modelLabel === m.name || modelLabel === (m.display_name ?? m.name);
+                      return (
+                        <button
+                          key={m.id}
+                          className={`model-selector-dropdown__item${isActive ? " is-active" : ""}`}
+                          onClick={() => handleModelSwitch(m.provider, m.name)}
+                          disabled={modelSwitching}
+                        >
+                          <span className="model-selector-dropdown__item-name">{m.name}</span>
+                          <span className="model-selector-dropdown__item-meta">
+                            {m.size_mb
+                              ? m.size_mb >= 1024
+                                ? `${(m.size_mb / 1024).toFixed(1)} GB`
+                                : `${m.size_mb} MB`
+                              : ""}
+                            {isActive && <Check size={12} color="var(--color-accent)" />}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <span>·</span>
+        <span>Cmd + Enter to send</span>
       </div>
     </div>
   );

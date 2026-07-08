@@ -1,17 +1,18 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import {
-  Card,
-  CardContent,
-  Button,
-  Chip,
-  Separator,
-} from "@heroui/react";
+import { Button, Separator } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
-import { useAppState } from "../state/AppContext";
-import type { Schedule, ScheduleRun } from "../api/types";
+import { useAppState, useAppDispatch } from "../state/AppContext";
+import type { Schedule, ScheduleRun, ChatEvent } from "../api/types";
+import { ApiError } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
+import { NewRoutineModal } from "./NewRoutineModal";
+import { useRoutines } from "../hub/state/hubDataStore";
+import { HubIco } from "../hub/primitives/HubIco";
+import { HP_PATHS } from "../hub/primitives/icons";
+import { type RoutineId, ROUTINES } from "../hub/data/routines";
+import "../hub/views/routines.css";
 
 /* ── Repeat patterns ──────────────────────────────────────── */
 type RepeatPattern = "once" | "hourly" | "daily" | "weekly" | "monthly" | "custom";
@@ -193,8 +194,100 @@ const TIMEZONE_OPTIONS = [
 
 export function Schedules() {
   const state = useAppState();
+  const dispatch = useAppDispatch();
   const SCHED_PAGE = 10;
   const confirm = useConfirm();
+
+  // Routines (one-tap macros from hub)
+  const routines = useRoutines();
+  const [runningRoutine, setRunningRoutine] = useState<RoutineId | null>(null);
+
+  function handleRunRoutine(id: RoutineId, name: string) {
+    setRunningRoutine(id);
+    const startedAt = new Date().toISOString();
+    const t0 = Date.now();
+    dispatch({
+      type: "SCHEDULE_RESULT",
+      payload: { id: `routine-${id}`, schedule_id: id, schedule_label: name, status: "running", timestamp: t0 },
+    });
+    void (async () => {
+      async function drain(gen: AsyncGenerator<ChatEvent>): Promise<string> {
+        let text = "";
+        for await (const ev of gen) {
+          if (ev.type === "text") text += ev.content ?? ev.token ?? "";
+        }
+        return text.trim();
+      }
+      try {
+        const detail = ROUTINES.find((r) => r.id === id);
+        // Run the recipe in the background; seed it first if it doesn't exist yet
+        try {
+          await drain(api.runRecipe(name));
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 404) {
+            if (detail) {
+              await api.createRecipe({
+                name,
+                description: detail.does.join(", "),
+                yaml: `prompt: "${detail.prompt.replace(/"/g, "'")}"`,
+              });
+              await drain(api.runRecipe(name));
+            } else throw e;
+          } else throw e;
+        }
+        // Use the routine's does[] as the displayed result — the LLM output is
+        // discarded until real MCP tool integrations are wired up (Option B).
+        const result = detail ? JSON.stringify(detail.does) : name;
+        dispatch({
+          type: "SCHEDULE_RESULT",
+          payload: { id: `routine-${id}`, schedule_id: id, schedule_label: name, status: "completed", result, timestamp: Date.now() },
+        });
+        dispatch({
+          type: "ADD_SCHEDULE_RUN",
+          payload: {
+            id: `routine-${id}-${t0}`,
+            scheduleId: id,
+            scheduleName: name,
+            status: "completed",
+            result,
+            error: null,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - t0,
+            read: false,
+            excerpt: result.slice(0, 80),
+            recipe: "routine",
+          },
+        });
+      } catch (e) {
+        const error = String(e);
+        dispatch({
+          type: "SCHEDULE_RESULT",
+          payload: { id: `routine-${id}`, schedule_id: id, schedule_label: name, status: "failed", error, timestamp: Date.now() },
+        });
+        dispatch({
+          type: "ADD_SCHEDULE_RUN",
+          payload: {
+            id: `routine-${id}-${t0}`,
+            scheduleId: id,
+            scheduleName: name,
+            status: "failed",
+            result: null,
+            error,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - t0,
+            read: false,
+            excerpt: error.slice(0, 80),
+            recipe: "routine",
+          },
+        });
+      } finally {
+        setRunningRoutine(null);
+      }
+    })();
+    setTimeout(() => setRunningRoutine(null), 8000);
+  }
   const [schedules, setSchedules]         = useState<Schedule[]>([]);
   const [visibleCount, setVisibleCount]   = useState(SCHED_PAGE);
   const [loading, setLoading]             = useState(true);
@@ -218,6 +311,9 @@ export function Schedules() {
     try { localStorage.setItem("schedules-view", v); } catch { /* ignore */ }
     setView(v);
   }
+
+  // New routine form
+  const [showRoutineForm, setShowRoutineForm] = useState(false);
 
   // New schedule form
   const [showForm, setShowForm]       = useState(false);
@@ -384,11 +480,21 @@ export function Schedules() {
   }
 
   async function handleRunNow(s: Schedule) {
+    dispatch({
+      type: "SCHEDULE_RESULT",
+      payload: { id: `manual-${s.id}`, schedule_id: s.id, schedule_label: s.name, status: "running", timestamp: Date.now() },
+    });
     try {
       await api.runScheduleNow(s.id);
-      flashMsg(`"${s.name}" triggered.`);
+      dispatch({
+        type: "SCHEDULE_RESULT",
+        payload: { id: `manual-${s.id}`, schedule_id: s.id, schedule_label: s.name, status: "completed", result: "Schedule triggered successfully", timestamp: Date.now() },
+      });
     } catch (e) {
-      flashMsg(String(e), true);
+      dispatch({
+        type: "SCHEDULE_RESULT",
+        payload: { id: `manual-${s.id}`, schedule_id: s.id, schedule_label: s.name, status: "failed", error: String(e), timestamp: Date.now() },
+      });
     }
   }
 
@@ -673,11 +779,62 @@ export function Schedules() {
     );
   }
 
+  const routinesEl = routines.length > 0 ? (
+    <section className="sched-routines">
+      <div className="sched-routines__head">
+        <h2 className="sched-section__title">Routines</h2>
+        <span className="sched-section__sub">One tap · runs instantly</span>
+      </div>
+      <div className="rt__grid">
+        {routines.map((r) => {
+          const isRunning = runningRoutine === r.id;
+          return (
+            <div key={r.id} className="rt-card">
+              <div className="rt-card__top">
+                <span className="rt-card__icon" style={{ background: r.bg }}>
+                  <HubIco d={r.iconPath} size={22} color="#fff" sw={2} />
+                </span>
+                <div>
+                  <div className="rt-card__name">{r.name}</div>
+                  <div className="rt-card__time">{r.time}</div>
+                </div>
+              </div>
+              <div className="rt-card__does">
+                {r.does.map((chip) => (
+                  <span key={chip} className="rt-card__chip">{chip}</span>
+                ))}
+              </div>
+              <button
+                className="rt-card__run"
+                data-running={isRunning}
+                style={isRunning
+                  ? { background: r.color, borderColor: r.color, color: "#fff" }
+                  : { color: r.color }}
+                onClick={() => handleRunRoutine(r.id, r.name)}
+                disabled={!state.serverOnline}
+                type="button"
+              >
+                {isRunning ? (
+                  <><HubIco d={HP_PATHS.check} size={15} color="#fff" sw={3} /> Running…</>
+                ) : (
+                  <><HubIco d={HP_PATHS.play} size={14} color={r.color} fill={r.color} /> Run now</>
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  ) : null;
+
   return (
     <div className="screen screen--schedules">
       {/* ── Page header ─────────────────────────────────────── */}
       <div className="page-header">
-        <h1 className="page-header__title">Schedules</h1>
+        <div>
+          <h1 className="page-header__title">Routines & Schedules</h1>
+          <p className="sched-header__sub">One-tap scenes and recurring automations.</p>
+        </div>
         <div className="page-header__action">
           <div className="view-toggle" role="group" aria-label="View mode">
             <button
@@ -701,12 +858,18 @@ export function Schedules() {
           </div>
           <Button
             size="sm"
+            variant="secondary"
+            onPress={() => setShowRoutineForm(true)}
+          >
+            <Plus size={14} /> New Routine
+          </Button>
+          <Button
+            size="sm"
             variant="primary"
             isDisabled={!state.serverOnline}
             onPress={() => setShowForm(true)}
-            startContent={<Plus size={14} />}
           >
-            New Schedule
+            <Plus size={14} /> New Schedule
           </Button>
         </div>
       </div>
@@ -720,41 +883,51 @@ export function Schedules() {
       {loading ? (
         <SkeletonList rows={4} />
       ) : schedules.length === 0 ? (
-        <div className="empty-state">
-          <CalendarClock size={32} />
-          <span>No schedules yet. Automate recurring tasks by creating your first one.</span>
-          <button className="empty-state__cta" onClick={() => setShowForm(true)}>
-            <Plus size={14} /> New Schedule
-          </button>
-        </div>
+        <>
+          {routinesEl}
+          <div className="empty-state">
+            <CalendarClock size={32} />
+            <span>No schedules yet. Automate recurring tasks by creating your first one.</span>
+            <button className="empty-state__cta" onClick={() => setShowForm(true)}>
+              <Plus size={14} /> New Schedule
+            </button>
+          </div>
+        </>
       ) : view === "calendar" ? (
-        <ScheduleCalendar schedules={schedules} />
+        <>
+          {routinesEl}
+          <div className="sched-routines__head">
+            <h2 className="sched-section__title">Schedules</h2>
+            <span className="sched-section__sub">Time-triggered · runs automatically</span>
+          </div>
+          <ScheduleCalendar schedules={schedules} />
+        </>
       ) : (
         <>
+        {routinesEl}
+        <div className="sched-routines__head">
+          <h2 className="sched-section__title">Schedules</h2>
+          <span className="sched-section__sub">Time-triggered · runs automatically</span>
+        </div>
         <div className="sched-grid">
-          {schedules.slice(0, visibleCount).map((s) => (
-            <Card key={s.id} className="card sched-card">
-              <CardContent>
-                {/* Head: icon + name + toggle */}
-                <div className="sched-card__head">
-                  <div className="sched-card__icon">
-                    <CalendarClock size={16} />
-                  </div>
-                  <div className="sched-card__main">
+          {schedules.slice(0, visibleCount).map((s) => {
+            const isRunning = runningIds.has(s.id);
+            const parsed = parseCronToConfig(s.cron);
+            const timePreview = humanPreview(parsed.repeat, parsed.config, s.timezone ?? "UTC");
+            const statusClass = isRunning ? "sched-card__chip--running" : s.enabled ? "sched-card__chip--active" : "sched-card__chip--paused";
+            const statusLabel = isRunning ? "Running" : s.enabled ? "Active" : "Paused";
+            return (
+              <div key={s.id} className={`sched-card${!s.enabled ? " sched-card--paused" : ""}`}>
+                {/* Top: icon + info + toggle */}
+                <div className="sched-card__top">
+                  <span className="sched-card__icon">
+                    <CalendarClock size={22} />
+                  </span>
+                  <div className="sched-card__info">
                     <div className="sched-card__name">{s.name}</div>
-                    <div className="sched-card__subtitle">
-                      <span className="sched-card__cron" title={s.cron}>
-                        {(() => {
-                          const parsed = parseCronToConfig(s.cron);
-                          return humanPreview(parsed.repeat, parsed.config, s.timezone ?? "UTC");
-                        })()}
-                      </span>
-                      {s.timezone && s.timezone !== "UTC" && (
-                        <span className="sched-card__tz">
-                          <Clock size={9} />
-                          {s.timezone}
-                        </span>
-                      )}
+                    <div className="sched-card__time" title={s.cron}>
+                      {timePreview}
+                      {s.timezone && s.timezone !== "UTC" && ` · ${s.timezone}`}
                     </div>
                   </div>
                   <label className="toggle-wrap" aria-label={s.enabled ? "Pause schedule" : "Resume schedule"}>
@@ -769,56 +942,37 @@ export function Schedules() {
                   </label>
                 </div>
 
-                {/* Meta: recipe + status */}
-                <div className="sched-card__meta">
-                  <div className="sched-card__meta-row">
-                    <span className="sched-card__meta-label">Recipe</span>
-                    <span className="sched-card__meta-value">
-                      {s.prompt
-                        ? s.prompt.length > 60
-                          ? s.prompt.slice(0, 60) + "..."
-                          : s.prompt
-                        : "--"}
+                {/* Chips: prompt snippet + status */}
+                <div className="sched-card__chips">
+                  {s.prompt && (
+                    <span className="sched-card__chip">
+                      {s.prompt.length > 40 ? s.prompt.slice(0, 40) + "…" : s.prompt}
                     </span>
-                  </div>
-                  <div className="sched-card__meta-row">
-                    <span className="sched-card__meta-label">Status</span>
-                    {(() => {
-                      const isRunning = runningIds.has(s.id);
-                      return (
-                        <Chip
-                          size="sm"
-                          variant="flat"
-                          color={isRunning ? "warning" : s.enabled ? "success" : "default"}
-                          className={isRunning ? "sched-card__chip--running" : ""}
-                        >
-                          {isRunning ? "Running" : s.enabled ? "Active" : "Paused"}
-                        </Chip>
-                      );
-                    })()}
-                  </div>
+                  )}
+                  <span className={`sched-card__chip ${statusClass}`}>{statusLabel}</span>
                 </div>
 
-                {/* Actions */}
+                {/* Run button */}
+                <button
+                  className="sched-card__run"
+                  data-running={isRunning}
+                  disabled={!state.serverOnline}
+                  onClick={() => handleRunNow(s)}
+                >
+                  {isRunning ? (
+                    <><Clock size={14} /> Running…</>
+                  ) : (
+                    <><Play size={14} fill="currentColor" /> Run now</>
+                  )}
+                </button>
+
+                {/* Action row: edit + delete + history */}
                 <div className="sched-card__actions">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onPress={() => handleRunNow(s)}
-                    isDisabled={!state.serverOnline}
-                    aria-label="Run now"
-                    startContent={<Play size={11} />}
-                  >
-                    Run now
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    isDisabled={!state.serverOnline}
+                  <button
+                    className="sched-card__action-btn"
+                    disabled={!state.serverOnline}
                     aria-label="Edit schedule"
-                    startContent={<Pencil size={11} />}
-                    onPress={() => {
-                      const parsed = parseCronToConfig(s.cron);
+                    onClick={() => {
                       setName(s.name);
                       setPrompt(s.prompt);
                       setTimezone(s.timezone ?? "UTC");
@@ -828,101 +982,84 @@ export function Schedules() {
                       setShowForm(true);
                     }}
                   >
-                    Edit
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="sched-card__trash"
-                    onPress={() => handleDelete(s.id, s.name)}
-                    isDisabled={!state.serverOnline}
+                    <Pencil size={11} /> Edit
+                  </button>
+                  <button
+                    className="sched-card__action-btn sched-card__action-btn--danger"
+                    disabled={!state.serverOnline}
                     aria-label="Delete schedule"
-                    startContent={<Trash2 size={11} />}
+                    onClick={() => handleDelete(s.id, s.name)}
                   >
-                    Delete
-                  </Button>
-                </div>
-
-                {/* ── Run history toggle ─────────────────── */}
-                <div className="sched-history">
-                  <button className="sched-history__toggle" onClick={() => toggleRuns(s.id)}>
+                    <Trash2 size={11} /> Delete
+                  </button>
+                  <button
+                    className="sched-card__action-btn sched-card__action-btn--right"
+                    onClick={() => toggleRuns(s.id)}
+                  >
                     {expandedRuns === s.id ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                     History
                   </button>
-
-                  {expandedRuns === s.id && (
-                    <div className="sched-history__list">
-                      {/* Mini health bar — last 5 run statuses */}
-                      {(runsCache[s.id] ?? []).length > 0 && (
-                        <div className="sched-health-bar">
-                          {(runsCache[s.id] ?? []).slice(0, 5).map((r) => (
-                            <span
-                              key={r.id}
-                              className="sched-health-dot"
-                              title={`${r.status} — ${new Date(r.started_at).toLocaleString()}`}
-                              style={{
-                                background: r.status === "completed"
-                                  ? "var(--color-success, #34C759)"
-                                  : r.status === "failed"
-                                  ? "var(--color-destructive, #FF3B30)"
-                                  : "var(--color-warning, #FF9500)",
-                              }}
-                            />
-                          ))}
-                        </div>
-                      )}
-                      {(runsCache[s.id] ?? []).length === 0 ? (
-                        <span className="sched-history__empty">No runs yet.</span>
-                      ) : (
-                        (runsCache[s.id] ?? []).map((r) => (
-                          <div key={r.id} className="sched-run-row">
-                            <Chip
-                              size="sm"
-                              variant="flat"
-                              color={r.status === "completed" ? "success" : r.status === "failed" ? "danger" : "warning"}
-                            >
-                              {r.status}
-                            </Chip>
-                            <span
-                              className="sched-run-row__time"
-                              title={new Date(r.started_at).toLocaleString()}
-                            >
-                              {timeAgo(r.started_at)}
-                            </span>
-                            {r.duration_ms != null && (
-                              <span className="sched-run-row__duration">{(r.duration_ms / 1000).toFixed(1)}s</span>
-                            )}
-                            {(r.result || r.error) && (
-                              <span
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setExpandedRunId(expandedRunId === r.id ? null : r.id);
-                                }}
-                                className={[
-                                  "sched-run-row__result",
-                                  expandedRunId === r.id && "is-expanded",
-                                  r.error && "sched-run-row__result--error",
-                                ].filter(Boolean).join(" ")}
-                              >
-                                {expandedRunId === r.id
-                                  ? (r.result ?? r.error ?? "")
-                                  : (r.result ?? r.error ?? "").slice(0, 120)}
-                              </span>
-                            )}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  )}
                 </div>
-              </CardContent>
-            </Card>
-          ))}
+
+                {/* Run history (collapsible) */}
+                {expandedRuns === s.id && (
+                  <div className="sched-history__list">
+                    {(runsCache[s.id] ?? []).length > 0 && (
+                      <div className="sched-health-bar">
+                        {(runsCache[s.id] ?? []).slice(0, 5).map((r) => (
+                          <span
+                            key={r.id}
+                            className="sched-health-dot"
+                            data-status={r.status}
+                            title={`${r.status} — ${new Date(r.started_at).toLocaleString()}`}
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {(runsCache[s.id] ?? []).length === 0 ? (
+                      <span className="sched-history__empty">No runs yet.</span>
+                    ) : (
+                      (runsCache[s.id] ?? []).map((r) => (
+                        <div key={r.id} className="sched-run-row">
+                          <span className={`sched-card__chip sched-card__chip--${r.status === "completed" ? "active" : r.status === "failed" ? "paused" : "running"}`}>
+                            {r.status}
+                          </span>
+                          <span className="sched-run-row__time" title={new Date(r.started_at).toLocaleString()}>
+                            {timeAgo(r.started_at)}
+                          </span>
+                          {r.duration_ms != null && (
+                            <span className="sched-run-row__duration">{(r.duration_ms / 1000).toFixed(1)}s</span>
+                          )}
+                          {(r.result || r.error) && (
+                            <span
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setExpandedRunId(expandedRunId === r.id ? null : r.id);
+                              }}
+                              className={[
+                                "sched-run-row__result",
+                                expandedRunId === r.id && "is-expanded",
+                                r.error && "sched-run-row__result--error",
+                              ].filter(Boolean).join(" ")}
+                            >
+                              {expandedRunId === r.id
+                                ? (r.result ?? r.error ?? "")
+                                : (r.result ?? r.error ?? "").slice(0, 120)}
+                            </span>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         {schedules.length > visibleCount && (
-          <button className="empty-state__cta" style={{ alignSelf: "center" }} onClick={() => setVisibleCount((c) => c + SCHED_PAGE)}>
+          <button className="empty-state__cta sched-show-more" onClick={() => setVisibleCount((c) => c + SCHED_PAGE)}>
             Show {Math.min(SCHED_PAGE, schedules.length - visibleCount)} more
-            <span style={{ color: "var(--grey-400)", fontWeight: "normal" }}> · {schedules.length - visibleCount} remaining</span>
+            <span className="muted"> · {schedules.length - visibleCount} remaining</span>
           </button>
         )}
         </>
@@ -930,6 +1067,14 @@ export function Schedules() {
 
       {/* ── Create modal ────────────────────────────────────── */}
       {renderModal()}
+
+      {/* ── New Routine modal ───────────────────────────────── */}
+      {showRoutineForm && (
+        <NewRoutineModal
+          onClose={() => setShowRoutineForm(false)}
+          onCreated={() => setShowRoutineForm(false)}
+        />
+      )}
     </div>
   );
 }

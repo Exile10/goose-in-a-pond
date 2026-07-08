@@ -5,6 +5,7 @@ export type GuiSection =
   | "chat"
   | "devices"
   | "schedules"
+  | "notifications"
   | "memory"
   | "skills"
   | "extensions"

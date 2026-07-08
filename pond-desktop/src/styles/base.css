@@ -28,9 +28,24 @@
   padding: 0;
 }
 
-/* Force light mode — never inherit OS dark mode */
+/* heroui switch thumb position is driven by margin-inline-start.
+   The * { margin: 0 } reset above overrides heroui's @layer CSS (unlayered
+   always beats layered). Re-declare at class specificity so the thumb slides. */
+.switch__thumb { margin-inline-start: calc(var(--spacing, 0.25rem) * 0.5); }
+.switch[data-selected=true] .switch__thumb { margin-inline-start: calc(100% - 1.5rem); }
+.switch--sm.switch[data-selected=true] .switch__thumb,
+.switch[data-selected=true] .switch--sm .switch__thumb { margin-inline-start: calc(100% - 1.15625rem); }
+.switch--lg.switch[data-selected=true] .switch__thumb,
+.switch[data-selected=true] .switch--lg .switch__thumb { margin-inline-start: calc(100% - 1.875rem); }
+
+/* Default to light; themeStore flips to dark via data-theme */
 html {
   color-scheme: light;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+html {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
