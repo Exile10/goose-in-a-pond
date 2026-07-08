@@ -391,7 +391,17 @@ pub fn init_audit_deps(event_log: Arc<dyn EventLog>) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_audit_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = AUDIT_DEPS.get().expect("init_audit_deps() not called");
+    // Degrade gracefully instead of panicking: if an entry point registered the
+    // giap-audit extension without calling `init_audit_deps` first, we simply do
+    // not start the server. Goose sees the pipe close and treats the extension as
+    // unavailable for the session rather than crashing the whole process.
+    let Some(deps) = AUDIT_DEPS.get() else {
+        tracing::error!(
+            "giap-audit: init_audit_deps() was never called for this entry point; \
+             audit MCP server not started (the audit tool is unavailable this session)"
+        );
+        return;
+    };
     let server = AuditMcpServer::new(deps.event_log.clone());
     tokio::spawn(async move {
         match server.serve((reader, writer)).await {
