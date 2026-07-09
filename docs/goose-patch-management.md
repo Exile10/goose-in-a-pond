@@ -28,6 +28,23 @@ how to rebase against a new upstream goose release.
 
 ---
 
+## RMCP 1.5 Patch Set
+
+### Branch: `giap-patches-rmcp-1.5`
+
+The `giap-patches-rmcp-1.5` branch carries the GIAP patches against the rmcp 1.5
+line. In addition to the base `giap-patches` set above, it includes:
+
+| Commit | Description | Files |
+|--------|-------------|-------|
+| `d52efa2e` | Retry the turn tool-less when an Ollama model rejects tools with HTTP 400 ("does not support tools"). Adds `is_tools_unsupported_error` + splits `OllamaProvider::stream` into `stream` (catch/retry) and `stream_inner` (single attempt), so non-tool models (e.g. `gemma3:4b`) answer as plain chat models instead of aborting the turn. | `crates/goose/src/providers/ollama.rs` |
+
+This fix is model-agnostic (matches on the error text) and lives entirely inside
+the Ollama provider, so both the `/chat/stream` and `/agent/chat/stream` GIAP
+paths get it for free.
+
+---
+
 ## Branch Layout
 
 ```

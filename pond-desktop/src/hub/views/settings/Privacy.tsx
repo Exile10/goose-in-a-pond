@@ -165,14 +165,7 @@ export function PrivacyDetail({ go }: PrivacyDetailProps) {
       // The API does not expose a bulk-delete endpoint, so we
       // iterate the session list and delete each session.
       const sessions = await api.listSessions();
-      await Promise.all(
-        sessions.map((s) =>
-          (api as unknown as Record<string, (id: string) => Promise<void>>)
-            .deleteSession?.(s.id) ??
-          // Fallback: silently succeed if method not available yet
-          Promise.resolve(),
-        ),
-      );
+      await Promise.all(sessions.map((s) => api.deleteSession(s.id)));
       setSessionCount(0);
       setConfirmClear(false);
       showFlash("Conversation history cleared.");

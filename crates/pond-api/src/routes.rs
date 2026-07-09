@@ -99,7 +99,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/chat/stream", post(chat_stream))
         .route("/tts", post(tts_synthesise))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/{session_id}", patch(rename_session))
+        .route(
+            "/sessions/{session_id}",
+            patch(rename_session).delete(delete_session),
+        )
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
@@ -1017,22 +1020,27 @@ fn chat_stream_inner(
             }
         };
 
-        // ── Agent turn timeout ─────────────────────────────────────────
-        // Compute an absolute deadline for the entire stream consumption.
-        // When agent_timeout_secs is 0, the timeout is effectively disabled
-        // (set to a very large value so the code path stays uniform).
+        // ── Agent turn idle timeout ────────────────────────────────────
+        // Bound the SILENCE between stream events, not total generation.
+        // A slow reasoning model that streams continuously must never be
+        // killed; only a genuinely stalled stream (no event for
+        // `agent_timeout_secs`) trips the deadline. The deadline is reset
+        // after every event received below. When agent_timeout_secs is 0
+        // the timeout is disabled (24h sentinel keeps the path uniform).
         let timeout_secs = settings.agent_timeout_secs;
-        let deadline = tokio::time::Instant::now()
-            + if timeout_secs == 0 {
-                std::time::Duration::from_secs(86_400) // 24h — effectively disabled
-            } else {
-                std::time::Duration::from_secs(timeout_secs)
-            };
+        let idle_budget = if timeout_secs == 0 {
+            std::time::Duration::from_secs(86_400) // effectively disabled
+        } else {
+            std::time::Duration::from_secs(timeout_secs)
+        };
+        let mut deadline = tokio::time::Instant::now() + idle_budget;
         let mut timed_out = false;
 
         loop {
             match tokio::time::timeout_at(deadline, agent_stream.next()).await {
                 Ok(Some(event_result)) => {
+                    // Progress observed — extend the idle window.
+                    deadline = tokio::time::Instant::now() + idle_budget;
                     match event_result {
                         Ok(event) => {
                             let maybe_data = match event {
@@ -1522,6 +1530,31 @@ async fn rename_session(
         "session_id": session_id,
         "title": req.title,
     })))
+}
+
+/// Delete a session and all its messages.
+///
+/// DELETE /api/v1/sessions/:session_id
+///
+/// Idempotent: deleting a non-existent session returns 204 (the storage
+/// layer does not distinguish a missing row from a deleted one).
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    state
+        .session_storage
+        .delete_session(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Get messages for a session (paginated).

@@ -51,6 +51,10 @@ export function Devices() {
   const [submitting, setSubmitting]   = useState(false);
   const [formError, setFormError]     = useState<string | null>(null);
 
+  // Per-card action state
+  const [busyId, setBusyId]           = useState<string | null>(null);
+  const [detail, setDetail]           = useState<Device | null>(null);
+
   function load() {
     setLoading(true);
     api.listDevices()
@@ -87,6 +91,38 @@ export function Devices() {
       setFormError(String(e));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // Toggle device power via the device-control MCP tool (same path the Hub uses).
+  // There is no "wake"/"restart" primitive in the backend, so this is an honest
+  // on/off toggle: turn on when offline, off when online.
+  async function handlePower(d: Device) {
+    setBusyId(d.id);
+    try {
+      await api.invokeTool({
+        server: "giap-device-control",
+        tool: "set_device_state",
+        args: { device_id: d.id, power: !d.is_online },
+      });
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleUnregister(d: Device) {
+    setBusyId(d.id);
+    try {
+      await api.unregisterDevice(d.id);
+      setDetail(null);
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -152,10 +188,19 @@ export function Devices() {
 
               {/* Actions */}
               <div className="device-card__actions">
-                <button className="device-card__action-btn">
-                  <Power size={12} /> {d.is_online ? "Restart" : "Wake"}
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => handlePower(d)}
+                  disabled={busyId === d.id}
+                  type="button"
+                >
+                  <Power size={12} /> {d.is_online ? "Turn off" : "Turn on"}
                 </button>
-                <button className="device-card__action-btn">
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => setDetail(d)}
+                  type="button"
+                >
                   <Settings size={12} /> Configure
                 </button>
               </div>
@@ -237,6 +282,55 @@ export function Devices() {
                 onPress={handleRegister}
               >
                 {submitting ? "Registering…" : "Register"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Device detail / configure modal ─────────────────── */}
+      {detail && (
+        <div className="sched-modal__overlay" onClick={() => setDetail(null)}>
+          <div className="sched-modal__dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="sched-modal__header">
+              <h2 className="sched-modal__title">{detail.name}</h2>
+              <button className="sched-modal__close" onClick={() => setDetail(null)} aria-label="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <Separator />
+            <div className="sched-modal__body">
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Type</label>
+                <div className="muted-12">{detail.device_type ?? "—"}</div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Room</label>
+                <div className="muted-12">{detail.room ?? "—"}</div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Status</label>
+                <div className="muted-12">
+                  {detail.is_online ? "online" : "offline"} · last seen {timeSince(detail.last_seen)}
+                </div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Address</label>
+                <code className="device-card__ip">
+                  {detail.metadata?.ip != null ? String(detail.metadata.ip) : "—"}
+                </code>
+              </div>
+            </div>
+            <Separator />
+            <div className="sched-modal__footer">
+              <Button size="sm" variant="ghost" onPress={() => setDetail(null)}>Close</Button>
+              <Button
+                size="sm"
+                variant="danger"
+                isDisabled={busyId === detail.id}
+                onPress={() => handleUnregister(detail)}
+              >
+                {busyId === detail.id ? "Removing…" : "Unregister device"}
               </Button>
             </div>
           </div>

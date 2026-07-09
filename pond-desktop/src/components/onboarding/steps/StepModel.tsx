@@ -27,7 +27,7 @@ const RECOMMENDED_LLM: Record<string, ModelEntry[]> = {
     { id: "gemma-2-2b-it", provider: "llamafile", name: "gemma-2-2b-it.Q4_K_M", display_name: "Gemma 2 2B Instruct", is_active: false, ram_estimate_mb: 1800, recommended_role: "Fast", downloaded: false, size_mb: 1600, category: "llamafile", description: "Default llamafile model. Lightweight and responsive." },
   ],
   ollama: [
-    { id: "gemma3-4b", provider: "ollama", name: "gemma3:4b", display_name: "Gemma 3 4B", is_active: false, ram_estimate_mb: 3200, recommended_role: "Balanced", downloaded: false, size_mb: 2800, category: "ollama", description: "Good balance of speed and capability." },
+    { id: "gemma4-e2b", provider: "ollama", name: "gemma4:e2b", display_name: "Gemma 4 E2B", is_active: false, ram_estimate_mb: 3200, recommended_role: "Recommended", downloaded: false, size_mb: 3100, category: "ollama", description: "Tool-capable. Best default for the assistant." },
     { id: "gemma4", provider: "ollama", name: "gemma4:latest", display_name: "Gemma 4", is_active: false, ram_estimate_mb: 5120, recommended_role: "Capable", downloaded: false, size_mb: 4800, category: "ollama", description: "Latest generation. Best quality responses." },
   ],
   local: [
