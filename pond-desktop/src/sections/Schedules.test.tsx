@@ -21,6 +21,7 @@ vi.mock("../api/PondApiClient", () => ({
 
 vi.mock("../state/AppContext", () => ({
   useAppState: () => ({ serverOnline: true, sessionToken: "test-token" }),
+  useAppDispatch: () => vi.fn(),
 }));
 
 // ── Mock useConfirm (used in handleDelete) ────────────────────────────────────

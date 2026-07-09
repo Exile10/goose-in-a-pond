@@ -109,6 +109,19 @@ impl SettingsRepository for SqliteSettingsRepository {
             "retention_session_messages_keep",
             settings.retention_session_messages_keep.to_string()
         );
+        upsert!(
+            "retention_events_days",
+            settings.retention_events_days.to_string()
+        );
+        upsert!(
+            "retention_events_by_category",
+            serde_json::to_string(&settings.retention_events_by_category)
+                .unwrap_or_else(|_| "{}".to_string())
+        );
+        upsert!(
+            "retention_sensitive_days",
+            settings.retention_sensitive_days.to_string()
+        );
         upsert!("prompt_style", &settings.prompt_style);
         upsert!(
             "custom_system_prompt",
@@ -441,6 +454,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_audit_enabled",
+            if settings.ext_audit_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         Ok(())
     }
@@ -553,6 +574,21 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "retention_session_messages_keep" => {
             if let Ok(v) = value.parse() {
                 s.retention_session_messages_keep = v;
+            }
+        }
+        "retention_events_days" => {
+            if let Ok(v) = value.parse() {
+                s.retention_events_days = v;
+            }
+        }
+        "retention_events_by_category" => {
+            if let Ok(v) = serde_json::from_str(value) {
+                s.retention_events_by_category = v;
+            }
+        }
+        "retention_sensitive_days" => {
+            if let Ok(v) = value.parse() {
+                s.retention_sensitive_days = v;
             }
         }
         "prompt_style" => s.prompt_style = value.to_string(),
@@ -752,6 +788,47 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_news_enabled" => s.ext_news_enabled = value == "true",
         "ext_finance_enabled" => s.ext_finance_enabled = value == "true",
         "ext_discovery_enabled" => s.ext_discovery_enabled = value == "true",
+        "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
         _ => {} // unknown key — ignore
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use tempfile::tempdir;
+
+    async fn fresh_repo() -> SqliteSettingsRepository {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteSettingsRepository::new(db.system.clone());
+        std::mem::forget(tmp); // keep the sqlite file alive for the test
+        repo
+    }
+
+    #[tokio::test]
+    async fn retention_events_settings_roundtrip() {
+        let repo = fresh_repo().await;
+
+        // Defaults before any write.
+        let s0 = repo.get().await.unwrap();
+        assert_eq!(s0.retention_events_days, 30);
+        assert_eq!(s0.retention_sensitive_days, 7);
+        assert!(s0.retention_events_by_category.is_empty());
+
+        // Persist non-default per-category + sensitivity retention.
+        let mut s = s0;
+        s.retention_events_days = 45;
+        s.retention_sensitive_days = 3;
+        s.retention_events_by_category.insert("network".into(), 14);
+        s.retention_events_by_category.insert("sensor".into(), 5);
+        repo.update(&s).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert_eq!(got.retention_events_days, 45);
+        assert_eq!(got.retention_sensitive_days, 3);
+        assert_eq!(got.retention_events_by_category.get("network"), Some(&14));
+        assert_eq!(got.retention_events_by_category.get("sensor"), Some(&5));
     }
 }

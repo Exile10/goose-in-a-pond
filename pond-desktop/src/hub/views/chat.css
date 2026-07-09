@@ -55,6 +55,8 @@
 
 /* Avatar */
 .ch-avatar {
+  width: var(--av-size, 30px);
+  height: var(--av-size, 30px);
   border-radius: 50%;
   background: linear-gradient(150deg, var(--pp), var(--pp-600));
   display: flex;
@@ -107,7 +109,7 @@
 }
 
 .ch-bubble--goose {
-  background: #fff;
+  background: var(--color-surface);
   border: 1px solid var(--line);
   color: var(--ink);
   border-bottom-left-radius: 6px;
@@ -199,7 +201,7 @@
   font-size: 12px;
   font-weight: 600;
   color: var(--ink-2);
-  background: #fff;
+  background: var(--color-surface);
   padding: 4px 10px;
   border-radius: 999px;
 }
@@ -222,7 +224,7 @@
   padding: 9px 15px;
   border-radius: 999px;
   border: 1px solid var(--pp-100);
-  background: #fff;
+  background: var(--color-surface);
   color: var(--pp);
   font-family: inherit;
   font-size: 13px;
@@ -248,7 +250,7 @@
 .chat2__input input {
   flex: 1;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--color-surface);
   border-radius: 16px;
   padding: 14px 18px;
   font-family: inherit;
@@ -312,13 +314,103 @@
   box-shadow: none;
 }
 
+/* Textarea (multi-line composer, replaces <input>) */
+.chat2__textarea {
+  flex: 1;
+  border: 1px solid var(--line);
+  background: var(--color-surface);
+  border-radius: 16px;
+  padding: 14px 18px;
+  font-family: inherit;
+  font-size: 14.5px;
+  font-weight: 500;
+  color: var(--ink);
+  outline: none;
+  transition: border 0.15s;
+  resize: none;
+  min-height: 52px;
+  max-height: 120px;
+  line-height: 1.4;
+  overflow-y: auto;
+}
+.chat2__textarea:focus {
+  border-color: var(--pp);
+  box-shadow: 0 0 0 3px var(--pp-50);
+}
+.chat2__textarea::placeholder {
+  color: #A8A8B3;
+  font-weight: 500;
+}
+.chat2__textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Header right-side button group */
+.chat2__head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+}
+
+/* Hint bar below input (model selector + shortcut hint) */
+.chat2__hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 24px 16px;
+  font-size: 12px;
+  color: var(--mut);
+  flex-shrink: 0;
+}
+
+/* Empty state inside thread */
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin: auto;
+  padding: 40px 24px;
+  text-align: center;
+}
+.chat-empty__title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--ink);
+  margin: 0;
+}
+.chat-empty__hint {
+  font-size: 13.5px;
+  color: var(--mut);
+  margin: 0;
+}
+
+/* Model role + token meta below agent bubble */
+.bubble__meta {
+  font-size: 10px;
+  color: var(--mut, #94A3B8);
+  font-family: var(--font-mono, monospace);
+  margin-top: 4px;
+  padding-left: 2px;
+  display: block;
+}
+
+/* Error bubble */
+.ch-bubble--error {
+  background: var(--color-destructive-soft);
+  border-color: rgba(255, 59, 48, 0.25);
+  color: var(--color-destructive);
+}
+
 /* Voice icon button in header */
 .chat2__voice-btn {
   width: 42px;
   height: 42px;
   border-radius: 13px;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--color-surface);
   display: flex;
   align-items: center;
   justify-content: center;

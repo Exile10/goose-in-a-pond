@@ -198,21 +198,47 @@ impl SystemMcpServer {
         _ctx: RequestContext<RoleServer>,
         params: Parameters<NotifyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        notify_rust::Notification::new()
-            .summary(&params.0.title)
-            .body(&params.0.body)
+        let title = params.0.title;
+        let body = params.0.body;
+
+        // Local desktop popup — best-effort (a headless server has no display).
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
             .appname("Goose in a Pond")
             .show()
-            .map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to send notification: {}", e),
-                    None,
-                )
-            })?;
+        {
+            tracing::debug!("desktop notification unavailable: {e}");
+        }
+
+        // Also push to connected phones over the foreground stream (#99), if the
+        // notification sender is wired (broadcast to all connected devices).
+        let mut reached_devices = false;
+        if let Some(sender) = crate::notification_sender() {
+            let notification = pond_core::mcp::ports::notification::Notification {
+                id: uuid::Uuid::new_v4().to_string(),
+                target: "broadcast".to_string(),
+                category: "info".to_string(),
+                title: title.clone(),
+                body: body.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                data: None,
+            };
+            match sender.broadcast(notification).await {
+                Ok(()) => reached_devices = true,
+                Err(e) => tracing::warn!(error = %e, "failed to push notification to devices"),
+            }
+        }
+
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Notification sent: \"{}\" — {}",
-            params.0.title, params.0.body,
+            "Notification sent: \"{}\" — {}{}",
+            title,
+            body,
+            if reached_devices {
+                " (also pushed to connected devices)"
+            } else {
+                ""
+            },
         ))]))
     }
 

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { Button, Chip } from "@heroui/react";
+import { Button } from "@heroui/react";
 import {
-  Layers, Mic, RefreshCw, ExternalLink, Zap, Send,
+  Layers, Mic, RefreshCw, Zap,
   ChevronLeft, ChevronRight, Grid3X3, Rows3,
 } from "lucide-react";
 import { useAppState, useAppDispatch } from "../state/AppContext";
@@ -9,6 +9,27 @@ import { api } from "../api/PondApiClient";
 import { nextCardId } from "../state/reducer";
 import type { ChatEvent } from "../api/types";
 import { ScheduleDebriefCard } from "../components/ScheduleDebriefCard";
+import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
+import { HubIco, micEl } from "../hub/primitives/HubIco";
+import { HP_PATHS } from "../hub/primitives/icons";
+import "../hub/views/chat.css";
+import { CardChrome }    from "../hub/views/canvas/CardChrome";
+import { WeatherCard }   from "../hub/views/canvas/WeatherCard";
+import { CalendarCard }  from "../hub/views/canvas/CalendarCard";
+import { MapsCard }      from "../hub/views/canvas/MapsCard";
+import { CryptoCard }    from "../hub/views/canvas/CryptoCard";
+import { SmartHomeCard } from "../hub/views/canvas/SmartHomeCard";
+import { NewsCard }      from "../hub/views/canvas/NewsCard";
+import "../hub/views/canvas-mcp.css";
+
+const HUB_CARDS = [
+  { app: "giap-weather",       Comp: WeatherCard },
+  { app: "giap-calendar",      Comp: CalendarCard },
+  { app: "giap-homeassistant", Comp: SmartHomeCard },
+  { app: "giap-finance",       Comp: CryptoCard },
+  { app: "giap-maps",          Comp: MapsCard },
+  { app: "giap-news",          Comp: NewsCard },
+];
 import {
   encodeWav, downsampleTo16k, calculateRms,
   createVadState, advanceVad, DEFAULT_VAD_CONFIG,
@@ -444,17 +465,13 @@ export function Canvas() {
       <div className="canvas-toolbar">
         <div className="canvas-toolbar__left">
           <h1 className="page-header__title">Canvas</h1>
-          <Chip size="sm" variant="flat">
-            <span className="canvas-toolbar__chip-icon">
-              <Layers size={12} /> MCP-UI
-            </span>
-          </Chip>
-          <Chip size="sm" variant="flat" color={voiceMode ? undefined : "success"}>
-            <span className="canvas-toolbar__chip-icon">
-              <span className={`status-dot ${voiceMode ? "" : "status-dot--online"}`} />
-              {voiceMode ? "voice mode" : "live"}
-            </span>
-          </Chip>
+          <span className="canvas-chip">
+            <Layers size={12} /> MCP-UI
+          </span>
+          <span className={`canvas-chip${voiceMode ? "" : " canvas-chip--live"}`}>
+            <span className={`status-dot ${voiceMode ? "" : "status-dot--online"}`} />
+            {voiceMode ? "voice mode" : "live"}
+          </span>
         </div>
         <div className="canvas-toolbar__right">
           {/* Layout toggle */}
@@ -476,23 +493,18 @@ export function Canvas() {
           </div>
           <Button
             size="sm"
-            variant={voiceMode ? "solid" : "bordered"}
-            color={voiceMode ? "secondary" : "default"}
-            radius="md"
+            variant={voiceMode ? "primary" : "outline"}
             onPress={() => setVoiceMode((v) => !v)}
           >
             <Mic size={14} /> Voice mode
           </Button>
           <Button
             size="sm"
-            variant="light"
+            variant="ghost"
             onPress={() => setCards([])}
             isDisabled={cards.length === 0}
           >
             <RefreshCw size={14} /> Clear
-          </Button>
-          <Button size="sm" variant="bordered" radius="md">
-            <ExternalLink size={14} /> Pop out
           </Button>
         </div>
       </div>
@@ -506,18 +518,29 @@ export function Canvas() {
             <div className="canvas-pane__title">
               <Layers size={14} />
               <span>Canvas</span>
-              <Chip size="sm" variant="flat">{cards.length}</Chip>
+              <span className="canvas-count">{cards.length === 0 ? HUB_CARDS.length : cards.length}</span>
             </div>
-            <span className="canvas-pane__hint">Auto-renders when tools return UI</span>
+            <span className="canvas-pane__hint">
+              {cards.length === 0 ? "Live MCP cards — chat with Goose to add more" : "Auto-renders when tools return UI"}
+            </span>
           </div>
 
-          <div className="canvas-pane__body">
-            {cards.length === 0 ? (
-              <div className="canvas-empty">
-                <div className="canvas-empty__icon"><Layers size={28} /></div>
-                <div className="canvas-empty__title">Nothing rendered yet</div>
-                <div className="canvas-empty__sub">
-                  Ask Pond a question or try a suggestion chip to see MCP tool results materialize here.
+          <div className={`canvas-pane__body${cards.length === 0 && !state.debriefContext ? " canvas-pane__body--hub" : ""}`}>
+            {state.debriefContext ? (
+              <div className="canvas-grid">
+                <ScheduleDebriefCard
+                  run={state.debriefContext.run}
+                  onClose={() => dispatch({ type: "CLEAR_DEBRIEF_CONTEXT" })}
+                />
+              </div>
+            ) : cards.length === 0 ? (
+              <div className="mcpc">
+                <div className="mcpc__board">
+                  {HUB_CARDS.map(({ app, Comp }) => (
+                    <CardChrome key={app} app={app}>
+                      <Comp />
+                    </CardChrome>
+                  ))}
                 </div>
               </div>
             ) : (
@@ -532,19 +555,24 @@ export function Canvas() {
         <div className={`chat-dock${dockOpen ? " is-open" : " is-collapsed"}`}>
           {dockOpen ? (
             <>
+              {/* Dock header */}
               <div className="chat-dock__head">
-                <div className="chat-dock__title">
-                  <div className="bubble__avatar">
-                    <span className="bubble__avatar-fallback">P</span>
+                <div className="chat2__id">
+                  <GooseAvatar size={32} />
+                  <div>
+                    <div className="chat2__name">Goose</div>
+                    <div className="chat2__status">
+                      <span className="chat2__dot" aria-hidden="true" />
+                      {voiceMode ? "voice" : "chat"}
+                    </div>
                   </div>
-                  <span>Pond</span>
-                  <span className="chat-dock__subtitle">{voiceMode ? "voice" : "chat"}</span>
                 </div>
                 <button className="chat-dock__icon-btn" onClick={() => setDockOpen(false)} title="Hide chat">
                   <ChevronLeft size={14} />
                 </button>
               </div>
 
+              {/* Thread */}
               <div ref={scrollRef} className="chat-dock__body">
                 {thread.map((m, i) => {
                   if (m.role === "tool") {
@@ -554,33 +582,37 @@ export function Canvas() {
                         <code>{m.tool}</code>
                         <span className="tool-call__status">
                           {m.status === "running"
-                            ? <span className="dots"><span /><span /><span /></span>
+                            ? <span className="stream-dots"><span /><span /><span /></span>
                             : "returned"}
                         </span>
                       </div>
                     );
                   }
                   return (
-                    <div key={i} className={`bubble bubble--${m.role}`}>
-                      <div className="bubble__author">
-                        {m.role === "user" ? "You" : "Pond"}
+                    <div key={i} className={`ch-row ${m.role === "user" ? "ch-row--user" : "ch-row--goose"}`}>
+                      {m.role === "assistant" && <GooseAvatar />}
+                      <div className="ch-bubble-wrap">
+                        <div className={`ch-bubble ${m.role === "user" ? "ch-bubble--user" : "ch-bubble--goose"}`}>
+                          {m.text || (streaming && i === thread.length - 1
+                            ? <span className="stream-dots"><span /><span /><span /></span>
+                            : "")}
+                        </div>
                       </div>
-                      <div className="bubble__body">{m.text}</div>
                     </div>
                   );
                 })}
               </div>
 
-              {/* Suggest chips — send real prompts to the LLM */}
-              {!voiceMode && (
-                <div className="canvas-suggest">
-                  <span className="canvas-suggest__label">Try</span>
+              {/* Suggestion chips — visible when thread is short */}
+              {!voiceMode && thread.filter((m) => m.role !== "tool").length <= 1 && (
+                <div className="chat2__chips" role="group" aria-label="Quick suggestions">
                   {promptSuggestions.map((s) => (
                     <button
                       key={s.key}
-                      className="canvas-suggest__chip"
+                      className="ch-chip"
                       onClick={() => sendPrompt(s.prompt)}
                       disabled={streaming}
+                      type="button"
                     >
                       {s.label}
                     </button>
@@ -588,7 +620,7 @@ export function Canvas() {
                 </div>
               )}
 
-              {/* Composer or voice orb */}
+              {/* Composer / voice orb */}
               {voiceMode ? (
                 <div className="voice-bar">
                   <button
@@ -606,32 +638,47 @@ export function Canvas() {
                   </div>
                 </div>
               ) : (
-                <div className="canvas-composer">
-                  <input
-                    className="canvas-composer__input"
-                    placeholder="Ask anything..."
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-                  />
-                  <Button
-                    isIconOnly
-                    size="sm"
-                    color="secondary"
-                    radius="md"
-                    onPress={send}
-                    isDisabled={!draft.trim() || streaming}
+                <div className="chat2__input">
+                  <button
+                    className="ch-mic"
+                    onClick={() => setVoiceMode(true)}
+                    aria-label="Switch to voice"
+                    title="Voice input"
+                    type="button"
                   >
-                    {streaming ? <Zap size={14} /> : <Send size={14} />}
-                  </Button>
+                    <HubIco d={micEl} size={17} color="#fff" />
+                  </button>
+                  <textarea
+                    className="chat2__textarea"
+                    placeholder="Ask anything…"
+                    value={draft}
+                    rows={1}
+                    onChange={(e) => {
+                      setDraft(e.target.value);
+                      const el = e.target;
+                      el.style.height = "auto";
+                      el.style.height = `${Math.min(el.scrollHeight, 100)}px`;
+                    }}
+                    onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); send(); } }}
+                    disabled={streaming}
+                  />
+                  <button
+                    className="ch-send"
+                    onClick={send}
+                    disabled={!draft.trim() || streaming}
+                    aria-label="Send message"
+                    type="button"
+                  >
+                    {streaming
+                      ? <Zap size={14} color="#fff" />
+                      : <HubIco d={HP_PATHS.chevR} size={18} color="#fff" sw={2.5} />}
+                  </button>
                 </div>
               )}
             </>
           ) : (
             <button className="chat-dock__pill" onClick={() => setDockOpen(true)} title="Show chat">
-              <div className="bubble__avatar">
-                <span className="bubble__avatar-fallback">P</span>
-              </div>
+              <GooseAvatar size={24} />
               <span>Chat</span>
               <span className="chat-dock__count">
                 {thread.filter((m) => m.role !== "tool").length}

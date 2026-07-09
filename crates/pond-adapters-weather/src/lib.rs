@@ -10,6 +10,26 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Send a prepared request and report the egress to the shared tracker (#113).
+///
+/// This adapter reaches the network with its own `reqwest::Client`, so it can't
+/// use `pond-mcp-server`'s `traced_get`; instead it reports directly into
+/// `pond-core`'s egress tracker. Records host / method / status / latency for
+/// every weather + geocoding call so it appears in the activity API alongside
+/// the other built-in tools. Returns the raw result so callers keep their own
+/// `.context(...)` / `.error_for_status()` handling.
+pub(crate) async fn traced_send(
+    builder: reqwest::RequestBuilder,
+    url: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let start = std::time::Instant::now();
+    let result = builder.send().await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    let status = result.as_ref().ok().map(|r| r.status().as_u16());
+    pond_core::shared::services::egress::record_egress(url, "GET", status, latency_ms);
+    result
+}
+
 // ── Current weather ──────────────────────────────────────────────────────────
 
 /// Current weather snapshot.
