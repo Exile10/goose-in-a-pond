@@ -226,6 +226,10 @@ export class PondApiClient {
     return this.post<Device>("/api/v1/devices", req);
   }
 
+  unregisterDevice(id: string): Promise<void> {
+    return this.del(`/api/v1/devices/${encodeURIComponent(id)}`);
+  }
+
   // ── Schedules ─────────────────────────────────────────────
 
   listSchedules(): Promise<Schedule[]> {
@@ -648,6 +652,10 @@ export class PondApiClient {
         tool_call_id: m.tool_call_id as string | undefined,
       }));
     });
+  }
+
+  deleteSession(sessionId: string): Promise<void> {
+    return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
   }
 
   // ── Prompts ───────────────────────────────────────────────
