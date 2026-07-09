@@ -65,6 +65,9 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
+      - name: cargo clippy
+        run: rustup component add clippy
+
       - name: cargo clippy (fast crates)
         run: |
           cargo clippy \
