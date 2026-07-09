@@ -21,3 +21,4 @@ pub mod sensor_storage;
 pub mod session_storage;
 pub mod settings;
 pub mod skill;
+pub mod vision;

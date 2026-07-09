@@ -1513,6 +1513,10 @@ async fn run_server(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
 
+    // Install the vision MCP server's camera-event store handle (#130), same
+    // deal — `spawn_vision_server` only fires at chat time.
+    pond_mcp_server::init_vision_deps(camera_storage.clone());
+
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
         let cleanup_repo = memory_repo.clone();
@@ -2185,6 +2189,43 @@ async fn run_server(
         ));
     }
 
+    // Vision pipeline (#130): camera frames → on-device motion detection →
+    // camera_events + EventBus, so #92 rules and the activity feed react to
+    // what the camera sees. Opt-in (`vision_enabled` + a camera URL) because
+    // it needs a camera and ffmpeg on the device. Classifier is None for now —
+    // events are plain "motion" until the ONNX pet/package model lands.
+    if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
+        let capture = pond_adapters_vision::CaptureConfig {
+            input: settings.vision_camera_url.trim().to_string(),
+            fps: settings.vision_fps.max(1),
+            ..Default::default()
+        };
+        let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
+            camera_id: settings.vision_camera_id.clone(),
+            motion: pond_adapters_vision::MotionConfig {
+                changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
+            Ok(source) => {
+                let storage = camera_storage.clone();
+                let bus = event_bus.clone();
+                tokio::spawn(pond_adapters_vision::run_vision_pipeline(
+                    Box::new(source),
+                    None,
+                    storage,
+                    bus,
+                    pipeline_cfg,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "vision pipeline not started (camera/ffmpeg unavailable)")
+            }
+        }
+    }
+
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
     // to pair a GOTG device.
@@ -2546,6 +2587,9 @@ async fn run_chat(
     pond_mcp_server::init_audit_deps(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
+
+    // Same for the vision MCP server's camera-event store handle (#130).
+    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
@@ -5367,6 +5411,9 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     pond_mcp_server::init_audit_deps(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
+
+    // Same for the vision MCP server's camera-event store handle (#130).
+    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<
