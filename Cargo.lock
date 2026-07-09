@@ -7783,7 +7783,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "image 0.25.10",
- "ndarray 0.16.1",
+ "ndarray 0.17.2",
  "ort",
  "pond-core",
  "tempfile",
