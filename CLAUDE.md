@@ -49,8 +49,16 @@ Do not remove either guard without a dedicated stabilisation milestone. The code
 
 See `docs/goose-patch-management.md` for the patch set carried on top of upstream (`aaif-goose/goose`) and the upstream-rebase procedure.
 
-The submodule is pinned to `jarida-io/Goose:giap-patches`. After any force-push to that branch, teammates must run:
+The submodule is pinned to `jarida-io/Goose:giap-patches-rmcp-1.5` (goose-main
+pinned to `rmcp =1.5.0`; the old `giap-patches` MCP-session panic→warning patch
+is subsumed upstream, and the workspace forces `rmcp = "=1.5.0"` to match). CI
+clones this branch's tip directly, bypassing the stored submodule SHA. After any
+force-push to the branch, teammates must run:
 
 ```bash
 git submodule update --init --recursive
 ```
+
+Note: `.cargo/config.toml` sets `-C target-cpu=native` for on-device (Jetson)
+performance; CI overrides it with an empty `RUSTFLAGS` because native-CPU
+artifacts in a shared cache SIGILL across heterogeneous runners.
