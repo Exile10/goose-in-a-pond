@@ -11,6 +11,7 @@ pub mod memory;
 pub mod news;
 pub mod schedule;
 pub mod system;
+pub mod vision;
 pub mod weather;
 
 // ── Shared utilities for Knowledge-family servers ───────────────────────────
@@ -144,6 +145,7 @@ pub use memory::{auto_classify_segment, parse_memory_segment, parse_memory_tier,
 pub use news::NewsMcpServer;
 pub use schedule::{try_upcoming_schedules_context, ScheduleMcpServer};
 pub use system::SystemMcpServer;
+pub use vision::VisionMcpServer;
 pub use weather::WeatherMcpServer;
 
 // Re-export init + spawn functions for Goose builtin extension registration
@@ -158,6 +160,7 @@ pub use memory::{init_memory_deps, spawn_memory_server};
 pub use news::{init_news_deps, spawn_news_server};
 pub use schedule::{init_schedule_deps, spawn_schedule_server};
 pub use system::spawn_system_server;
+pub use vision::{init_vision_deps, spawn_vision_server};
 pub use weather::{init_weather_deps, spawn_weather_server, WEATHER_APP_URI};
 
 // ── MCP App resources ─────────────────────────────────────────────────────

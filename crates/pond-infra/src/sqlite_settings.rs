@@ -154,6 +154,22 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("weather_latitude", settings.weather_latitude.to_string());
         upsert!("weather_longitude", settings.weather_longitude.to_string());
         upsert!("weather_location_name", &settings.weather_location_name);
+        // Vision (#130)
+        upsert!(
+            "vision_enabled",
+            if settings.vision_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("vision_camera_url", &settings.vision_camera_url);
+        upsert!("vision_camera_id", &settings.vision_camera_id);
+        upsert!("vision_fps", settings.vision_fps.to_string());
+        upsert!(
+            "vision_motion_threshold",
+            settings.vision_motion_threshold.to_string()
+        );
         // Thinking / reasoning
         upsert!("thinking_mode", &settings.thinking_mode);
         upsert!(
@@ -462,6 +478,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_vision_enabled",
+            if settings.ext_vision_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         Ok(())
     }
@@ -625,6 +649,20 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "weather_location_name" => s.weather_location_name = value.to_string(),
+        // Vision (#130)
+        "vision_enabled" => s.vision_enabled = value == "true",
+        "vision_camera_url" => s.vision_camera_url = value.to_string(),
+        "vision_camera_id" => s.vision_camera_id = value.to_string(),
+        "vision_fps" => {
+            if let Ok(v) = value.parse() {
+                s.vision_fps = v;
+            }
+        }
+        "vision_motion_threshold" => {
+            if let Ok(v) = value.parse() {
+                s.vision_motion_threshold = v;
+            }
+        }
         // Thinking / reasoning
         "thinking_mode" => s.thinking_mode = value.to_string(),
         "show_thinking" => s.show_thinking = value == "true",

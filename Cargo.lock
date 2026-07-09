@@ -7891,6 +7891,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-vision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "pond-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pond-adapters-weather"
 version = "0.1.0"
 dependencies = [
@@ -8125,6 +8139,7 @@ dependencies = [
  "pond-adapters-mcp-memory",
  "pond-adapters-ollama",
  "pond-adapters-piper",
+ "pond-adapters-vision",
  "pond-adapters-weather",
  "pond-adapters-whisper",
  "pond-agent",
