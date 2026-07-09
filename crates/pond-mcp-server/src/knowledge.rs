@@ -92,6 +92,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("search_wikipedia");
         let query = resolve_topic(&params.0, "search_wikipedia").await;
         println!("[wikipedia] search_wikipedia called: query={:?}", query);
 
@@ -109,21 +110,19 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] search request failed: {e}");
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia request failed: {e}"),
-                    None,
-                )
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] search request failed: {e}");
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia request failed: {e}"),
+                None,
+            )
+        })?;
 
         println!("[wikipedia] search response status: {}", resp.status());
 
@@ -204,6 +203,7 @@ verbatim. In voice mode keep it to 1-3 sentences.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("get_wikipedia_article");
         // Definitive: what did the MCP server receive from Goose?
         println!("[wikipedia] ╔═══ MCP SERVER RECEIVED ═══");
         println!("[wikipedia] ║ params.topic: {:?}", params.0.topic);
@@ -257,6 +257,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WikipediaQueryParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("instant_answer");
         let query = resolve_topic(&params.0, "instant_answer").await;
         println!("[knowledge] instant_answer called: query={:?}", query);
 
@@ -272,12 +273,10 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -351,6 +350,7 @@ when asked 'what does X mean' or 'define X'.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<DefineWordParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("define_word");
         let word = resolve_word(&params.0).await;
         println!("[knowledge] define_word called: word={:?}", word);
 
@@ -366,12 +366,10 @@ when asked 'what does X mean' or 'define X'.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -425,6 +423,7 @@ reading recommendations, or 'who wrote X'.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<BookSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("search_books");
         let query = resolve_book_query(&params.0).await;
         println!("[knowledge] search_books called: query={:?}", query);
 
@@ -442,12 +441,10 @@ reading recommendations, or 'who wrote X'.")]
         );
         println!("[knowledge] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(15))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -932,21 +929,19 @@ impl KnowledgeMcpServer {
         );
         println!("[wikipedia] GET {}", url);
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] article request failed: {e}");
-                WikiFetchError::Mcp(ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia request failed: {e}"),
-                    None,
-                ))
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(15))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] article request failed: {e}");
+            WikiFetchError::Mcp(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia request failed: {e}"),
+                None,
+            ))
+        })?;
 
         println!("[wikipedia] article response status: {}", resp.status());
 
@@ -1016,21 +1011,19 @@ impl KnowledgeMcpServer {
         );
         println!("[wikipedia] fallback search: GET {}", search_url);
 
-        let resp = self
-            .http_client
-            .get(&search_url)
-            .header("user-agent", WIKI_UA)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[wikipedia] fallback search request failed: {e}");
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Wikipedia search failed: {e}"),
-                    None,
-                )
-            })?;
+        let resp = crate::http::traced_get_with(&self.http_client, &search_url, |b| {
+            b.header("user-agent", WIKI_UA)
+                .timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .map_err(|e| {
+            println!("[wikipedia] fallback search request failed: {e}");
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Wikipedia search failed: {e}"),
+                None,
+            )
+        })?;
 
         if !resp.status().is_success() {
             return Err(ErrorData::new(

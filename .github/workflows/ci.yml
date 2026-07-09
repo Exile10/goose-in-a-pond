@@ -34,13 +34,14 @@ jobs:
           sudo apt-get clean || true
           df -h /
 
-      # Clone goose directly at the giap-patches branch HEAD.
+      # Clone goose directly at the giap-patches-rmcp-1.5 branch HEAD.
       # Bypasses submodule SHA pinning — the stored SHA may be unreachable after
-      # force-pushes to giap-patches.
+      # force-pushes. This branch is goose-main pinned to rmcp =1.5.0 (the old
+      # giap-patches MCP-session panic→warning patch is already subsumed upstream).
       - name: Checkout goose submodule
         run: |
           rm -rf goose
-          git clone --depth=1 --branch giap-patches https://github.com/jarida-io/Goose goose
+          git clone --depth=1 --branch giap-patches-rmcp-1.5 https://github.com/jarida-io/Goose goose
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,7 +69,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-piper \
-            -p pond-adapters-gotg \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
             -p pond-mcp-server
@@ -86,7 +86,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-piper \
-            -p pond-adapters-gotg \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
             -p pond-mcp-server

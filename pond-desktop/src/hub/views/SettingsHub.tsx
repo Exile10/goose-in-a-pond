@@ -2,6 +2,7 @@ import { HubIco } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { SETTINGS } from "../data/settingsConfig";
 import type { SettingsRowId } from "../data/settingsConfig";
+import { useAppDispatch } from "../../state/AppContext";
 
 // ─── Chevron right ────────────────────────────────────────────
 const CHEVR = HP_PATHS.chevR;
@@ -11,6 +12,7 @@ interface SettingsHubViewProps {
 }
 
 export function SettingsHubView({ go }: SettingsHubViewProps) {
+  const dispatch = useAppDispatch();
   return (
     <div className="set">
       <header className="view-head">
@@ -20,6 +22,13 @@ export function SettingsHubView({ go }: SettingsHubViewProps) {
             Your home, your assistant, and the models that power it.
           </p>
         </div>
+        <button
+          className="hub-back-btn"
+          onClick={() => dispatch({ type: "SET_SECTION", payload: "dashboard" })}
+          title="Switch back to the classic desktop"
+        >
+          ← Classic view
+        </button>
       </header>
 
       <div className="set__groups">
@@ -87,7 +96,7 @@ function SettingsRow({
       onKeyDown={handleKeyDown}
       aria-label={label}
     >
-      <span className="set-row__icon" style={{ background: bg }}>
+      <span className="set-row__icon" style={{ "--icon-bg": bg } as React.CSSProperties}>
         <HubIco d={iconPath} size={18} color={color} />
       </span>
       <span className="set-row__text">

@@ -56,7 +56,7 @@ export function HomeView({ go }: HomeViewProps) {
             {home.date} · {home.weather.cond}, {home.weather.temp}°
           </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+        <div className="home2__head-actions">
           <button
             className="home2__iconbtn"
             onClick={() => go?.("chat")}
@@ -132,7 +132,7 @@ export function HomeView({ go }: HomeViewProps) {
         {/* ambient sidebar */}
         <aside className="home2__aside">
           <WeatherWidget />
-          <div className="gpanel" style={{ padding: 13 }}>
+          <div className="gpanel gpanel--padded">
             <PanelHead title="Now Playing" />
             <NowPlaying variant="tile" />
           </div>
