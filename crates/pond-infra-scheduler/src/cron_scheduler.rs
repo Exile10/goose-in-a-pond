@@ -169,9 +169,13 @@ impl CronSchedulerAdapter {
             }
 
             let kind = record.kind.clone().unwrap();
-            let job_id = self
-                .add_job_to_scheduler(&record.id, &record.cron, kind)
-                .await?;
+            // Event-triggered rules (#92) are loaded but never cron-registered.
+            let job_id = if kind.is_event_triggered() {
+                uuid::Uuid::nil()
+            } else {
+                self.add_job_to_scheduler(&record.id, &record.cron, kind)
+                    .await?
+            };
 
             let mut guard = self.tasks.lock().await;
             guard.insert(
@@ -405,11 +409,21 @@ impl SchedulerPort for CronSchedulerAdapter {
             created_at: Some(Utc::now()),
         };
 
-        let job_id = self
-            .add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
-            .await?;
+        // Event-triggered rules (#92) never register a cron job — the rules
+        // engine fires them via `run_now` when a matching bus event arrives.
+        // The nil job id marks "no cron job", same as the paused state.
+        let job_id = if req.kind.is_event_triggered() {
+            uuid::Uuid::nil()
+        } else {
+            self.add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
+                .await?
+        };
 
-        let next_run = compute_next_run(&req.cron, &req.timezone);
+        let next_run = if req.kind.is_event_triggered() {
+            None
+        } else {
+            compute_next_run(&req.cron, &req.timezone)
+        };
         let schedule = Schedule {
             id: req.id.clone(),
             label: req.label,
@@ -498,7 +512,13 @@ impl SchedulerPort for CronSchedulerAdapter {
             (entry.persisted.cron.clone(), Self::resolve_kind(entry))
         };
 
-        let job_id = self.add_job_to_scheduler(id, &cron, kind).await?;
+        // Event-triggered rules have no cron job to re-register (#92);
+        // clearing `paused` is enough — the rules engine checks the flag.
+        let job_id = if kind.is_event_triggered() {
+            uuid::Uuid::nil()
+        } else {
+            self.add_job_to_scheduler(id, &cron, kind).await?
+        };
 
         {
             let mut guard = self.tasks.lock().await;

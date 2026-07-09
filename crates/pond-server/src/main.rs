@@ -1901,6 +1901,7 @@ async fn run_server(
         let real_executor = Arc::new(AgentScheduleExecutor::new(
             agent.clone(),
             session_storage.clone(),
+            Some(device_control.clone()),
             settings.schedule_max_concurrent,
         ));
         deferred_executor
@@ -2173,6 +2174,16 @@ async fn run_server(
     // MCP tools into the same event store, so network egress is queryable via
     // `GET /api/v1/activity?category=network`.
     pond_mcp_server::set_egress_sink(event_log.clone());
+
+    // Sensor/event-triggered rules engine (#92): fire SensorTrigger schedules
+    // when a matching sensor/camera/device event arrives on the bus. Fires go
+    // through the scheduler's own run_now path (run records + result events).
+    if let Some(sched) = scheduler.clone() {
+        tokio::spawn(pond_infra_scheduler::run_rules_engine(
+            event_bus.subscribe(),
+            sched,
+        ));
+    }
 
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
