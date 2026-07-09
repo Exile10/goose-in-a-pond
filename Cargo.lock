@@ -8066,6 +8066,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "croner",
+ "futures",
  "pond-core",
  "reqwest 0.13.3",
  "serde",
