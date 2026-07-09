@@ -117,8 +117,10 @@ test.describe("Q2-26 — browser fallback speculative overlap", () => {
     await page.evaluate(() => (window as unknown as { __setMicGain: (v: number) => void }).__setMicGain(0));
 
     // Give the pipeline time to fully resolve (silence confirmation + mocked
-    // chat/TTS), then check what happened.
-    await expect(page.getByText("hello goose")).toBeVisible({ timeout: 5_000 });
+    // chat/TTS), then check what happened. The transcript renders in both the
+    // live-transcript line and the chat bubble — strict mode resolves 2
+    // elements, and we only care that it appeared.
+    await expect(page.getByText("hello goose").first()).toBeVisible({ timeout: 5_000 });
 
     // ── ASR speculation assertions ─────────────────────────────────────────
     expect(transcribeTimestamps, "exactly one transcribe call — speculative result must be reused, not refetched").toHaveLength(1);
