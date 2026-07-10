@@ -1,4 +1,4 @@
-use crate::models::domain::message::ChatMessage;
+use crate::models::domain::message::{ChatMessage, Role};
 use crate::models::ports::agent::Agent;
 use crate::models::ports::provider::LlmProvider;
 use crate::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
@@ -1032,6 +1032,36 @@ pub fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
     (visible, in_block)
 }
 
+/// Derive a short, deterministic session title from a user message.
+///
+/// Takes the first ~6 whitespace-separated words, trims surrounding
+/// punctuation/quotes, and caps the result at 60 chars. Returns an empty
+/// string when the input has no usable words (caller skips the update).
+///
+/// This is the no-LLM fallback used by `ChatService::ensure_session_title`
+/// so sessions always get a human-readable title even when no provider is
+/// attached (the common HTTP-handler path).
+fn derive_title_from_text(text: &str) -> String {
+    const MAX_WORDS: usize = 6;
+    const MAX_CHARS: usize = 60;
+
+    let cleaned = text.trim().trim_matches('"').trim_matches('\'');
+    let title = cleaned
+        .split_whitespace()
+        .take(MAX_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = title.trim().trim_matches('"').trim_matches('\'').trim();
+
+    if title.chars().count() <= MAX_CHARS {
+        title.to_string()
+    } else {
+        // Cap at MAX_CHARS on a char boundary and add an ellipsis.
+        let truncated: String = title.chars().take(MAX_CHARS).collect();
+        format!("{}…", truncated.trim_end())
+    }
+}
+
 /// Domain Service: ChatService
 ///
 /// Orchestrates the Wait → Listen → Thinking → Speak workflow loop.
@@ -1346,7 +1376,63 @@ impl ChatService {
             }
         }
 
+        // Ensure the session has a title. Handlers build ChatService without a
+        // provider, so the LLM-based `maybe_generate_title` never fires; without
+        // this fallback every session stays `title = null`. This derives a
+        // cheap, deterministic title from the first user message — no LLM call.
+        self.ensure_session_title().await;
+
         Ok(())
+    }
+
+    /// Set a session title if one is not already present, deriving it
+    /// deterministically from the first user message (first ~6 words).
+    ///
+    /// This is the reliable fallback for the common path where no
+    /// `LlmProvider` is attached (all HTTP handlers). It is best-effort:
+    /// failures are logged, never bubbled, and it runs inside the
+    /// persistence owner so the ChatService contract is preserved.
+    async fn ensure_session_title(&self) {
+        // Skip if a title already exists (either set here previously or by the
+        // LLM path). A missing session is treated as "no title" — the update
+        // below is a no-op for a non-existent row.
+        if let Ok(session) = self.session_storage.get_session(&self.session_id).await {
+            if session.title.is_some() {
+                return;
+            }
+        }
+
+        // Find the first user message to derive a title from.
+        let first_user_text = match self
+            .session_storage
+            .get_messages_paginated(&self.session_id, 20, 0)
+            .await
+        {
+            Ok(msgs) => msgs
+                .into_iter()
+                .find(|m| m.message.role == Role::User)
+                .map(|m| m.message.content),
+            Err(_) => None,
+        };
+
+        let Some(text) = first_user_text else {
+            return;
+        };
+
+        let title = derive_title_from_text(&text);
+        if title.is_empty() {
+            return;
+        }
+
+        if let Err(e) = self
+            .session_storage
+            .update_title(&self.session_id, title.clone())
+            .await
+        {
+            tracing::warn!("Failed to save derived session title: {}", e);
+        } else {
+            tracing::debug!("Derived session title: {}", title);
+        }
     }
 
     /// Like `persist_assistant_turn` but also triggers memory extraction in a
@@ -2096,6 +2182,78 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
+    }
+
+    // ── derive_title_from_text / ensure_session_title (DEF-7) ────────────
+
+    #[test]
+    fn derive_title_takes_first_six_words() {
+        let title = derive_title_from_text("What is the capital of France exactly?");
+        assert_eq!(title, "What is the capital of France");
+    }
+
+    #[test]
+    fn derive_title_trims_quotes_and_whitespace() {
+        assert_eq!(derive_title_from_text("  \"hello world\"  "), "hello world");
+        assert_eq!(derive_title_from_text("'single quoted'"), "single quoted");
+    }
+
+    #[test]
+    fn derive_title_empty_for_blank_input() {
+        assert_eq!(derive_title_from_text(""), "");
+        assert_eq!(derive_title_from_text("   "), "");
+    }
+
+    #[test]
+    fn derive_title_caps_long_single_word() {
+        let long = "a".repeat(100);
+        let title = derive_title_from_text(&long);
+        // 60 chars + ellipsis
+        assert!(title.chars().count() <= 61);
+        assert!(title.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn persist_assistant_turn_sets_deterministic_title() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "title-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        service
+            .persist_user_message("How do I reset my password on the router?")
+            .await
+            .unwrap();
+        service
+            .persist_assistant_turn(vec![], "Here's how...", None, None)
+            .await
+            .unwrap();
+
+        let session = storage.get_session(&session_id).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("How do I reset my password"));
+    }
+
+    #[tokio::test]
+    async fn persist_assistant_turn_preserves_existing_title() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "kept-title".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+        storage
+            .update_title(&session_id, "My custom title".to_string())
+            .await
+            .unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        service.persist_user_message("hello there").await.unwrap();
+        service
+            .persist_assistant_turn(vec![], "hi", None, None)
+            .await
+            .unwrap();
+
+        let session = storage.get_session(&session_id).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("My custom title"));
     }
 
     // ── is_dismissal_or_exit_phrase / classify_voice_command ─────────────

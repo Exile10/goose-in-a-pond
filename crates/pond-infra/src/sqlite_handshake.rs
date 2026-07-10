@@ -270,11 +270,12 @@ impl Handshake for SqliteHandshakeAdapter {
         let expires = now + Duration::seconds(CHALLENGE_TTL_SEC);
 
         sqlx::query(
-            "INSERT INTO handshake_challenges (id, client_id, challenge, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO handshake_challenges (id, client_id, client_type, challenge, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&request.client_id)
+        .bind(&request.client_type)
         .bind(&challenge)
         .bind(now.to_rfc3339())
         .bind(expires.to_rfc3339())
@@ -290,15 +291,15 @@ impl Handshake for SqliteHandshakeAdapter {
 
     async fn verify_handshake(&self, request: VerifyRequest) -> Result<HandshakeResponse> {
         // 1. Look up + validate the challenge.
-        let row: Option<(String, Vec<u8>, String, Option<String>)> = sqlx::query_as(
-            "SELECT client_id, challenge, expires_at, consumed_at
+        let row: Option<(String, String, Vec<u8>, String, Option<String>)> = sqlx::query_as(
+            "SELECT client_id, client_type, challenge, expires_at, consumed_at
              FROM handshake_challenges WHERE id = ?",
         )
         .bind(&request.challenge_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        let Some((client_id, challenge, expires_at, consumed_at)) = row else {
+        let Some((client_id, client_type, challenge, expires_at, consumed_at)) = row else {
             return Ok(self.reject("unknown_challenge"));
         };
         if consumed_at.is_some() {
@@ -388,13 +389,15 @@ impl Handshake for SqliteHandshakeAdapter {
         let _ = sqlx::query(
             "INSERT INTO devices (id, name, hostname, device_type, ip_address,
                 capabilities, last_seen, is_online, created_at, updated_at)
-             VALUES (?, ?, '', 'gotg', '', '[]', ?, 1, ?, ?)
+             VALUES (?, ?, '', ?, '', '[]', ?, 1, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
-               name = excluded.name, last_seen = excluded.last_seen,
+               name = excluded.name, device_type = excluded.device_type,
+               last_seen = excluded.last_seen,
                is_online = 1, updated_at = excluded.updated_at",
         )
         .bind(&device_id)
         .bind(&device_name)
+        .bind(&client_type)
         .bind(&attempt_at)
         .bind(&attempt_at)
         .bind(&attempt_at)
@@ -402,7 +405,7 @@ impl Handshake for SqliteHandshakeAdapter {
         .await;
 
         let (session, refresh, expires) = self
-            .issue_session_pair(&client_id, "gotg", &device_id)
+            .issue_session_pair(&client_id, &client_type, &device_id)
             .await?;
         tracing::info!(
             client_id = %client_id,
@@ -577,10 +580,69 @@ mod tests {
             .unwrap();
 
         assert!(resp.accepted);
+        // A 'gotg' client still persists device_type='gotg' end to end.
+        let (dtype,): (String,) = sqlx::query_as("SELECT device_type FROM devices WHERE id = ?")
+            .bind("device-A")
+            .fetch_one(&hs.pool)
+            .await
+            .unwrap();
+        assert_eq!(dtype, "gotg");
+        let (ctype,): (String,) = sqlx::query_as(
+            "SELECT client_type FROM session_tokens WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind("device-A")
+        .fetch_one(&hs.pool)
+        .await
+        .unwrap();
+        assert_eq!(ctype, "gotg");
+
         let token = resp.session_token.unwrap();
         assert!(hs.validate_token(&token).await.unwrap());
         hs.revoke_token(&token).await.unwrap();
         assert!(!hs.validate_token(&token).await.unwrap());
+    }
+
+    /// Regression for DEF-4: verify_handshake used to hardcode device_type='gotg'
+    /// (and pass "gotg" to issue_session_pair), discarding the real client_type
+    /// sent at init. A desktop client must now persist device_type='desktop' and
+    /// session_tokens.client_type='desktop'.
+    #[tokio::test]
+    async fn verify_persists_real_client_type_not_hardcoded_gotg() {
+        let hs = fresh().await;
+        let pc = hs.issue_pairing_code().await.unwrap();
+        let init = hs
+            .init_handshake(InitRequest {
+                client_id: "device-DT".into(),
+                client_type: "desktop".into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+        let resp = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: client_mac(&pc.code, &init.challenge, "device-DT"),
+                device_name: Some("Pond Desktop".into()),
+            })
+            .await
+            .unwrap();
+        assert!(resp.accepted);
+
+        let (dtype,): (String,) = sqlx::query_as("SELECT device_type FROM devices WHERE id = ?")
+            .bind("device-DT")
+            .fetch_one(&hs.pool)
+            .await
+            .unwrap();
+        assert_eq!(dtype, "desktop");
+
+        let (ctype,): (String,) = sqlx::query_as(
+            "SELECT client_type FROM session_tokens WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind("device-DT")
+        .fetch_one(&hs.pool)
+        .await
+        .unwrap();
+        assert_eq!(ctype, "desktop");
     }
 
     #[tokio::test]

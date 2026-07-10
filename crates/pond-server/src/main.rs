@@ -5912,21 +5912,68 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
     Ok(())
 }
 
-/// `pond pairing` — re-display (or refresh) the device pairing code + QR while the
-/// server is running elsewhere.
+/// `pond pairing` — re-display (or refresh) the device pairing code + QR by asking
+/// the RUNNING server (loopback) to mint/return it. Pairing-code plaintext is
+/// process-local (`ISSUED_CODE_CACHE` lives in the server process), so the CLI must
+/// NOT mint locally — a locally-minted code lands in a per-process cache the running
+/// server can never see, so it can never verify (DEF-6). We instead delegate to the
+/// server's loopback-gated `GET/POST /api/v1/handshake/pairing-code` endpoints, which
+/// execute in the process that owns the cache.
 async fn run_pairing(refresh: bool) -> Result<()> {
-    use pond_core::security::ports::handshake::Handshake as _;
     let data_dir = default_data_dir();
-    let db = Database::init(&data_dir).await?;
-    let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> =
-        Arc::new(SqliteHandshakeAdapter::new(db.system.clone()));
 
-    let pc = if refresh {
-        handshake.issue_pairing_code().await?
+    // The running server persisted its actually-bound port here (see run_server).
+    // Fall back to the default only so the URL is still meaningful; a missing file
+    // almost certainly means the server isn't running, which the HTTP call surfaces.
+    let port = std::fs::read_to_string(data_dir.join(".runtime_api_port"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(ports::API_SERVER);
+
+    let base = format!("http://127.0.0.1:{port}/api/v1/handshake/pairing-code");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // GET returns the current unconsumed code; POST mints a fresh one. Both are
+    // loopback-only and execute inside the server process (cache is populated there).
+    let resp = if refresh {
+        client.post(&base).send().await
     } else {
-        match handshake.current_pairing_code().await? {
-            Some(existing) => existing,
-            None => handshake.issue_pairing_code().await?,
+        client.get(&base).send().await
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to reach the running pond server on 127.0.0.1:{port}: {e}. \
+             Is the server running? Start it with `pond serve` before `pond pairing`."
+        )
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "server returned {} for pairing-code request",
+            resp.status()
+        ));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodeResp {
+        code: Option<String>,
+        expires_at: Option<String>,
+    }
+    let body: CodeResp = resp.json().await?;
+
+    // A GET can return {"code": null} when no live code exists — mint one via POST.
+    let (code, expires_at) = match (body.code, body.expires_at) {
+        (Some(c), Some(e)) => (c, e),
+        _ => {
+            let minted: CodeResp = client.post(&base).send().await?.json().await?;
+            (
+                minted
+                    .code
+                    .ok_or_else(|| anyhow::anyhow!("server did not return a pairing code"))?,
+                minted.expires_at.unwrap_or_default(),
+            )
         }
     };
 
@@ -5939,23 +5986,13 @@ async fn run_pairing(refresh: bool) -> Result<()> {
         .unwrap_or(&hostname)
         .to_string();
 
-    // Use the ACTUAL bound port the running server persisted (see run_server),
-    // falling back to the default if the server isn't running or never wrote it.
-    // Fixes the pairing URL pointing at a hardcoded port that may not be bound.
-    let port = std::fs::read_to_string(data_dir.join(".runtime_api_port"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(ports::API_SERVER);
-    let pair_url = format!(
-        "pond://pair?host={}.local&port={}&code={}",
-        hostname, port, pc.code
-    );
+    let pair_url = format!("pond://pair?host={hostname}.local&port={port}&code={code}");
 
     println!("\n  ┌────────────────────────────────────────────────────┐");
     println!(
         "  │  Pairing code:  {}   (expires: {})  │",
-        pc.code,
-        &pc.expires_at[..16.min(pc.expires_at.len())]
+        code,
+        &expires_at[..16.min(expires_at.len())]
     );
     println!("  │  Scan with Goose On The Go or enter the code.     │");
     println!("  └────────────────────────────────────────────────────┘");
