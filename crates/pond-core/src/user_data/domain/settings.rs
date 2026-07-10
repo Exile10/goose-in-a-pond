@@ -254,9 +254,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
-    /// Maximum seconds for an entire agent turn (stream start to done).
-    /// When exceeded, the stream emits a timeout error and stops.
-    /// Default: 300 (5 minutes). Set to 0 to disable.
+    /// Maximum seconds of SILENCE (no stream event) before an agent turn
+    /// is aborted. This bounds a stalled stream, NOT total generation time,
+    /// so slow reasoning models that stream continuously are never killed.
+    /// The deadline is reset on every stream event. Set to 0 to disable.
+    /// Default: 300 (5 minutes of no progress).
     #[serde(default = "Settings::default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
 
