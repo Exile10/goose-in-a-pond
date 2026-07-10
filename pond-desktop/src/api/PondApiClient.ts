@@ -490,9 +490,17 @@ export class PondApiClient {
    * On success the session+refresh tokens are stored on this client.
    */
   async pair(clientId = "pond-desktop"): Promise<HandshakeResponse> {
-    const pc = await this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
+    // Read the current code; if none is active (e.g. the startup code expired
+    // after 10 min), ISSUE a fresh one. Both endpoints are loopback-only, so the
+    // same-host desktop is trusted to mint its own code — this is what makes
+    // silent auto-pair actually reliable instead of failing once the operator's
+    // startup code lapses.
+    let pc = await this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
     if (!pc.code) {
-      throw new ApiError(409, "no active pairing code on the server");
+      pc = await this.handshakeFetch<PairingCodeResponse>("POST", "/api/v1/handshake/pairing-code");
+    }
+    if (!pc.code) {
+      throw new ApiError(409, "could not obtain a pairing code from the local server");
     }
     const init = await this.handshakeFetch<ChallengeResponse>("POST", "/api/v1/handshake/init", {
       client_id: clientId,
