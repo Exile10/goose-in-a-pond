@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+# Guarantees pond-desktop/dist exists at compile time so include_dir! never fails
+# on a fresh checkout (embeds a placeholder until the real UI is built).
+build = "build.rs"
 
 [features]
 # Enable in-process GGUF inference routing (mirrors pond-server's local-inference feature).
@@ -38,6 +41,9 @@ tokio-stream = { workspace = true }
 tower-http = { workspace = true, features = ["fs"] }
 uuid = { workspace = true }
 urlencoding = { workspace = true }
+# Single-executable: embed the built web UI (pond-desktop/dist) into the binary.
+include_dir = { workspace = true }
+mime_guess = "2"
 
 [dev-dependencies]
 async-trait = { workspace = true }

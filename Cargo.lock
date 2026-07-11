@@ -7957,6 +7957,8 @@ dependencies = [
  "futures",
  "goose",
  "hostname",
+ "include_dir",
+ "mime_guess",
  "pond-adapters-llamafile",
  "pond-adapters-local-inference",
  "pond-adapters-ollama",

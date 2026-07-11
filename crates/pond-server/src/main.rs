@@ -2387,11 +2387,14 @@ async fn run_server(
             }
         };
 
-    // Warn if static assets haven't been built yet
-    if !static_dir.exists() {
+    // The web UI is normally embedded into this binary (single executable). We
+    // only fall back to `static_dir` when the binary was built without the UI,
+    // so a missing dir is only worth warning about in that case.
+    if !pond_api::web_ui_embedded() && !static_dir.exists() {
         tracing::warn!(
-            "Static dir {:?} not found — web dashboard will not be served. \
-             Run `cd web && npm run build` to build it.",
+            "No web UI embedded and static dir {:?} not found — the dashboard will \
+             not be served. Build the UI (`cd pond-desktop && npm run build`) before \
+             building the server to embed it, or pass an existing --static-dir.",
             static_dir
         );
     }

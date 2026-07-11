@@ -382,6 +382,12 @@ pub struct ModelStatusEntry {
 }
 
 /// Build the full API router.
+/// True when the web UI is embedded into this binary (a single-executable build,
+/// i.e. `pond-desktop/dist` was present when the binary was compiled).
+pub fn web_ui_embedded() -> bool {
+    routes::embedded_ui_present()
+}
+
 ///
 /// Web dashboard: `/{route_name}`
 /// REST API:      `/api/v1/{route_name}`
@@ -399,7 +405,9 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         .route("/dev/test", axum::routing::get(routes::dev_test_page))
         .route("/dev/face", axum::routing::get(routes::dev_face_page))
         .nest("/api/v1", routes::api_routes(state.clone()))
-        .fallback_service(routes::web_routes(static_dir))
+        // Serve the web UI: embedded-into-the-binary (single executable) when the
+        // UI was built in, otherwise from the on-disk `static_dir` (dev).
+        .fallback(move |uri: axum::http::Uri| routes::serve_web(uri, static_dir.clone()))
         // Log every request/response at DEBUG level.
         .layer(axum::middleware::from_fn(middleware::log_requests))
         // Enforce Bearer token authentication on all protected routes.
