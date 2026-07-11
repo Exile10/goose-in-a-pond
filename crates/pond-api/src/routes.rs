@@ -42,7 +42,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
-use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
@@ -274,10 +273,76 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 // ───────────────────────── Web Dashboard Routes ─────────────────────
 
-/// Serves the built Vite assets from the given directory as a fallback service.
-/// In development, use `npm run dev` instead (Vite dev server on port 5173).
-pub fn web_routes(static_dir: std::path::PathBuf) -> ServeDir {
-    ServeDir::new(static_dir)
+/// The web UI, embedded into the binary at compile time (single-executable).
+/// Populated by `build.rs` + `vite build`; a placeholder until the real UI is
+/// built (detected via the `data-giap-placeholder` marker below).
+static WEB_DIST: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../pond-desktop/dist");
+
+/// True when a *real* built UI is embedded (not the build.rs placeholder).
+pub(crate) fn embedded_ui_present() -> bool {
+    WEB_DIST
+        .get_file("index.html")
+        .map(|f| {
+            !f.contents()
+                .windows(20)
+                .any(|w| w == b"data-giap-placeholder")
+        })
+        .unwrap_or(false)
+}
+
+fn file_response(path: &str, bytes: Vec<u8>) -> Response<axum::body::Body> {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    (
+        [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
+        axum::body::Body::from(bytes),
+    )
+        .into_response()
+}
+
+/// Serve the web UI. Prefers the embedded bundle (single-executable); falls back
+/// to the on-disk `static_dir` for dev builds where the UI wasn't embedded.
+/// SPA-aware: unknown non-asset routes return `index.html`.
+pub async fn serve_web(uri: axum::http::Uri, static_dir: std::path::PathBuf) -> impl IntoResponse {
+    let raw = uri.path().trim_start_matches('/');
+    let rel = if raw.is_empty() { "index.html" } else { raw };
+
+    if embedded_ui_present() {
+        if let Some(file) = WEB_DIST.get_file(rel) {
+            return file_response(rel, file.contents().to_vec());
+        }
+        // SPA fallback: a route with no file extension → serve the app shell.
+        if !rel.contains('.') {
+            if let Some(index) = WEB_DIST.get_file("index.html") {
+                return file_response("index.html", index.contents().to_vec());
+            }
+        }
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+
+    // Dev fallback: read from the on-disk static dir (SPA fallback to index.html).
+    serve_from_disk(&static_dir, rel).await
+}
+
+async fn serve_from_disk(static_dir: &std::path::Path, rel: &str) -> Response<axum::body::Body> {
+    // Prevent path traversal: reject any candidate that escapes the root.
+    let candidate = static_dir.join(rel);
+    if candidate.starts_with(static_dir) {
+        if let Ok(bytes) = tokio::fs::read(&candidate).await {
+            return file_response(rel, bytes);
+        }
+    }
+    if !rel.contains('.') {
+        if let Ok(bytes) = tokio::fs::read(static_dir.join("index.html")).await {
+            return file_response("index.html", bytes);
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        "Web UI not available. Build it with `cd pond-desktop && npm run build`, \
+         or pass --static-dir.",
+    )
+        .into_response()
 }
 
 // ───────────────────────── Handlers ─────────────────────────────────
