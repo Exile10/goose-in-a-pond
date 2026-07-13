@@ -5127,3 +5127,27 @@
   background: rgba(23,22,22,.07); border: 1px solid rgba(23,22,22,.14);
   border-radius: 4px; padding: 0 4px; color: var(--color-text-secondary);
 }
+
+/* ── Memory-fit guard badge (Phase 6) ─────────────────────────
+   Shown when a model will spill to CPU on the current device.
+   Used by both the onboarding model step and the Models tab. */
+.fit-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; line-height: 1.3;
+  padding: 2px 8px; border-radius: 6px; white-space: nowrap;
+}
+.fit-badge svg { flex-shrink: 0; }
+.fit-badge--spills {
+  color: var(--color-warning-fg);
+  background: var(--color-warning-soft);
+  border: 1px solid var(--color-warning);
+}
+/* Spill-tradeoff hint copy under the model list. */
+.fit-hint {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 12px; color: var(--color-warning-fg);
+  background: var(--color-warning-soft);
+  border: 1px solid var(--color-warning);
+  border-radius: 6px; padding: 8px 10px; margin-top: 8px;
+}
+.fit-hint svg { flex-shrink: 0; margin-top: 1px; }
