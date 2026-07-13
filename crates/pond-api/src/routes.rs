@@ -9984,7 +9984,7 @@ mod tests {
 
     #[test]
     fn model_spills_budget_unknown_when_no_budget() {
-        // NoopScheduler / Mac dev reports zero budget → no verdict.
+        // NoopScheduler / Mac dev reports zero budget -- no verdict.
         assert_eq!(model_spills_budget(5600, 0), None);
     }
 
