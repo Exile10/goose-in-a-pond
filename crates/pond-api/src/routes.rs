@@ -3034,7 +3034,7 @@ async fn activate_model(
     }
 
     let model_id = ModelRecord::id_for(&cat, &name);
-    model_repo
+    let record = model_repo
         .get_by_id(&model_id)
         .await
         .map_err(|e| {
@@ -3108,11 +3108,82 @@ async fn activate_model(
 
     // Hot-rebuild the ModelRouter for LLM roles using the existing helper
     if matches!(role.as_str(), "chat" | "think" | "task") {
+        // Memory-fit guard (Phase 6): warn if the model will not fully reside in
+        // the device LLM budget and therefore spill to CPU (single-digit tok/s).
+        //
+        // This is cross-platform-safe: it only *logs*. On Jetson the recommended
+        // fail-closed behavior (drop_caches + -ngl residency check, and refusing
+        // a spilling full-GPU load) belongs in the local-inference loader and is
+        // NOT done here — see scripts/jetson-llama-optimization and the note in
+        // .ai/scratchpad.md. We do not touch the loader from the Mac build.
+        warn_if_model_spills(&state, &record).await;
+
         let settings = state.settings_repo.get().await.unwrap_or_default();
         rebuild_llm_provider(&state, &settings).await;
     }
 
     Ok(Json(json!({"role": role, "model_id": model_id})))
+}
+
+/// Headroom (MB) reserved on top of a model's own weights for KV cache + system
+/// slack. Mirrors `DEFAULT_HEADROOM_MB` in the desktop `modelFit` helper so the
+/// server-side warning and the UI verdict agree.
+const MEMORY_FIT_HEADROOM_MB: u64 = 1024;
+
+/// Pure fit decision: does a model of `residency_mb` spill on a device with
+/// `available_for_llm_mb` free, reserving `MEMORY_FIT_HEADROOM_MB` headroom?
+///
+/// Returns `None` when there is no basis for a verdict — the budget is absent
+/// (`available_for_llm_mb == 0`, e.g. NoopScheduler / Mac dev) or the model size
+/// is unknown (`residency_mb == 0`). Returns `Some(true)` when the model spills,
+/// `Some(false)` when it fits. Mirrors the desktop `modelFit` helper.
+fn model_spills_budget(residency_mb: u64, available_for_llm_mb: u64) -> Option<bool> {
+    if available_for_llm_mb == 0 || residency_mb == 0 {
+        return None;
+    }
+    let budget = available_for_llm_mb.saturating_sub(MEMORY_FIT_HEADROOM_MB);
+    Some(residency_mb > budget)
+}
+
+/// Logs a warning when a model being activated for an LLM role is larger than
+/// the device's LLM memory budget (minus headroom) and will therefore spill to
+/// CPU and run slowly.
+///
+/// Cross-platform-safe: this only *logs*. When the scheduler reports no budget
+/// (`total_mb == 0`, e.g. NoopScheduler for llamafile/ollama or a Mac dev
+/// machine) it stays silent — there is nothing to compare against. The residency
+/// estimate prefers `size_mb` (on-disk weights) and falls back to
+/// `ram_estimate_mb`.
+async fn warn_if_model_spills(state: &Arc<AppState>, record: &ModelRecord) {
+    let Some(scheduler) = state.model_scheduler.as_ref() else {
+        return;
+    };
+    let status = scheduler.memory_status();
+    if status.total_mb == 0 {
+        return;
+    }
+
+    let residency_mb = if record.size_mb > 0 {
+        record.size_mb
+    } else {
+        record.ram_estimate_mb.unwrap_or(0)
+    };
+
+    if model_spills_budget(residency_mb, status.available_for_llm_mb) == Some(true) {
+        let budget = status
+            .available_for_llm_mb
+            .saturating_sub(MEMORY_FIT_HEADROOM_MB);
+        tracing::warn!(
+            model = %record.name,
+            model_size_mb = residency_mb,
+            available_for_llm_mb = status.available_for_llm_mb,
+            budget_mb = budget,
+            "model exceeds device LLM memory budget — it will spill to CPU and \
+             run slowly. On Jetson, enable the fail-closed loader path \
+             (drop_caches + -ngl residency check) or pick a model that fits the \
+             GPU budget. See scripts/jetson-llama-optimization."
+        );
+    }
 }
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
@@ -9889,6 +9960,45 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Memory-fit guard (Phase 6) ───────────────────────────────
+
+    #[test]
+    fn model_spills_budget_fits_small_model() {
+        // gemma-2-2b (~1600 MB) fits a 4096 MB budget (effective 3072 after headroom).
+        assert_eq!(model_spills_budget(1600, 4096), Some(false));
+    }
+
+    #[test]
+    fn model_spills_budget_spills_large_model() {
+        // gemma3n:e2b real download (~5600 MB) spills a 4096 MB budget.
+        assert_eq!(model_spills_budget(5600, 4096), Some(true));
+    }
+
+    #[test]
+    fn model_spills_budget_borderline_at_effective_boundary() {
+        // Effective budget = 4096 - 1024 headroom = 3072.
+        assert_eq!(model_spills_budget(3072, 4096), Some(false)); // exactly fits
+        assert_eq!(model_spills_budget(3073, 4096), Some(true)); // one MB over
+    }
+
+    #[test]
+    fn model_spills_budget_unknown_when_no_budget() {
+        // NoopScheduler / Mac dev reports zero budget → no verdict.
+        assert_eq!(model_spills_budget(5600, 0), None);
+    }
+
+    #[test]
+    fn model_spills_budget_unknown_when_size_unknown() {
+        assert_eq!(model_spills_budget(0, 4096), None);
+    }
+
+    #[test]
+    fn model_spills_budget_headroom_matches_desktop() {
+        // MEMORY_FIT_HEADROOM_MB must mirror the desktop DEFAULT_HEADROOM_MB (1024)
+        // so the server warning and the UI badge agree.
+        assert_eq!(MEMORY_FIT_HEADROOM_MB, 1024);
+    }
 
     #[test]
     fn derived_session_label_short_message_passthrough() {
