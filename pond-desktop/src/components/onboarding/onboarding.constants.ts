@@ -9,7 +9,6 @@ import type {
   PromptStyle,
   TtsVoice,
   WakePreset,
-  ProviderOption,
 } from "./onboarding.types";
 
 // ── Steps ──────────────────────────────────────────────────
@@ -20,7 +19,6 @@ export const STEPS: StepMeta[] = [
   { id: "locale",      label: "Language & location",   caption: "Locale, weather",     required: true  },
   { id: "personality", label: "Personality & identity", caption: "How Goose talks",     required: false },
   { id: "wake-word",   label: "Wake word",             caption: "How to summon",       required: false },
-  { id: "model",       label: "AI model",              caption: "The brain",           required: true  },
   { id: "complete",    label: "All set",               caption: "Hello, world",        required: false },
 ];
 
@@ -78,15 +76,6 @@ export const WAKE_PRESETS: WakePreset[] = [
   { value: "custom",      label: "Custom phrase",  desc: "Say anything you like." },
 ];
 
-// ── AI providers ───────────────────────────────────────────
-
-/** Provider metadata — icons are rendered via lucide-react in StepModel. */
-export const PROVIDERS: ProviderOption[] = [
-  { key: "llamafile", label: "Llamafile",  icon: "", desc: "Self-contained. Starts automatically.", recommended: true },
-  { key: "ollama",    label: "Ollama",     icon: "", desc: "Use models you've already set up." },
-  { key: "local",     label: "GGUF file",  icon: "", desc: "Load a GGUF directly from disk." },
-];
-
 // ── Default draft ──────────────────────────────────────────
 
 export const DEFAULT_DRAFT: OnboardingDraft = {
@@ -109,10 +98,6 @@ export const DEFAULT_DRAFT: OnboardingDraft = {
   ttsRate: 50,
   wakeWord: "goose",
   wakeWordCustom: "",
-  llmProvider: "llamafile",
-  llmModel: "",
-  asrModel: "",
-  ttsModel: "",
   enableMcpMemory: true,
   enableHomeAssistant: false,
   enableCalendar: false,
