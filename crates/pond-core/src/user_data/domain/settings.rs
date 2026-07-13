@@ -33,6 +33,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_timezone")]
     pub timezone: String,
 
+    /// Human-readable name for this household/home (e.g. "The Anyumba Home").
+    /// Shown in the UI and used to personalise greetings. Empty by default.
+    #[serde(default = "Settings::default_home_name")]
+    pub home_name: String,
+
     /// Prompt style — selects the built-in system prompt template.
     /// Accepted values: "balanced" (default) | "concise" | "technical" | "warm"
     #[serde(default = "Settings::default_prompt_style")]
@@ -199,6 +204,25 @@ pub struct Settings {
     /// Fraction of the frame (0.0–1.0) that must change to count as motion.
     #[serde(default = "Settings::default_vision_motion_threshold")]
     pub vision_motion_threshold: f64,
+
+    // ── Privacy / sensor access ────────────────────────────────────────────
+    /// User-controlled privacy toggle for microphone access. When false, the
+    /// voice pipeline (wake-word + ASR capture) is not permitted to record.
+    /// The device has a mic; this is the user's consent switch. Default: true.
+    #[serde(default = "Settings::default_mic_enabled")]
+    pub mic_enabled: bool,
+
+    /// User-controlled privacy toggle for camera access. When false, the vision
+    /// pipeline and any camera capture are not permitted. The device has
+    /// cameras; this is the user's consent switch. Default: true.
+    #[serde(default = "Settings::default_cameras_enabled")]
+    pub cameras_enabled: bool,
+
+    /// When true, requests may spill over to a cloud model on local-model
+    /// failure. Privacy-first: OFF by default (local-only, opt-in). Persisted
+    /// here to gate a future failure-only cloud-spill path — no spill logic yet.
+    #[serde(default = "Settings::default_cloud_fallback_enabled")]
+    pub cloud_fallback_enabled: bool,
 
     // ── Data retention ─────────────────────────────────────────────────────
     /// Days to keep rows in event_log (0 = keep forever)
@@ -521,6 +545,7 @@ impl Default for Settings {
             assistant_personality: Self::default_assistant_personality(),
             user_name: Self::default_user_name(),
             timezone: Self::default_timezone(),
+            home_name: Self::default_home_name(),
             prompt_style: Self::default_prompt_style(),
             custom_system_prompt: None,
             prompt_addendum: Self::default_prompt_addendum(),
@@ -554,6 +579,9 @@ impl Default for Settings {
             vision_camera_id: Self::default_vision_camera_id(),
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
+            mic_enabled: Self::default_mic_enabled(),
+            cameras_enabled: Self::default_cameras_enabled(),
+            cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
             retention_event_log_days: Self::default_event_log_days(),
             retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
@@ -643,6 +671,9 @@ impl Settings {
     fn default_timezone() -> String {
         "UTC".to_string()
     }
+    fn default_home_name() -> String {
+        "".to_string()
+    }
     // 4096 covers most practical assistant replies.  The previous 1024 cap
     // truncated long answers mid-sentence — especially for Harmony-channel
     // models (Gemma 4 / gpt-oss) whose internal `<|channel>thought ...
@@ -716,6 +747,15 @@ impl Settings {
     }
     fn default_vision_motion_threshold() -> f64 {
         0.05
+    }
+    fn default_mic_enabled() -> bool {
+        true
+    }
+    fn default_cameras_enabled() -> bool {
+        true
+    }
+    fn default_cloud_fallback_enabled() -> bool {
+        false
     }
     fn default_event_log_days() -> u32 {
         30
@@ -971,6 +1011,45 @@ mod tests {
         assert!(s.api_key_gnews.is_none());
         assert!(s.api_key_finnhub.is_none());
         assert!(s.api_key_coingecko.is_none());
+    }
+
+    #[test]
+    fn privacy_and_home_fields_default_correctly() {
+        let s = Settings::default();
+        // Devices exist but the user controls privacy — mic/cameras default ON.
+        assert!(s.mic_enabled);
+        assert!(s.cameras_enabled);
+        // Privacy-first: cloud fallback is OFF (opt-in) by default.
+        assert!(!s.cloud_fallback_enabled);
+        // Home name is empty until the user sets one.
+        assert_eq!(s.home_name, "");
+    }
+
+    #[test]
+    fn privacy_and_home_fields_roundtrip_via_json() {
+        let mut s = Settings::default();
+        s.mic_enabled = false;
+        s.cameras_enabled = false;
+        s.cloud_fallback_enabled = true;
+        s.home_name = "The Anyumba Home".to_string();
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!s2.mic_enabled);
+        assert!(!s2.cameras_enabled);
+        assert!(s2.cloud_fallback_enabled);
+        assert_eq!(s2.home_name, "The Anyumba Home");
+    }
+
+    #[test]
+    fn privacy_fields_deserialize_from_partial_json() {
+        // Simulates the TS client sending only the privacy toggles on PUT.
+        let json = r#"{"mic_enabled": false, "home_name": "Home"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(!s.mic_enabled);
+        assert_eq!(s.home_name, "Home");
+        // Unspecified fields keep defaults.
+        assert!(s.cameras_enabled);
+        assert!(!s.cloud_fallback_enabled);
     }
 
     #[test]
