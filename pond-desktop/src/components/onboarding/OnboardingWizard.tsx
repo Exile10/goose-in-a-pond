@@ -7,7 +7,7 @@
 
 import { useState, useCallback } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import logoSrc from "../../assets/logo.png";
+import { Logo } from "../Logo";
 
 import { OnboardingProvider, useOnboarding } from "./OnboardingContext";
 import { STEPS } from "./onboarding.constants";
@@ -30,7 +30,7 @@ function StepRail({ stepIndex, onJump }: { stepIndex: number; onJump: (i: number
   return (
     <aside className="ob-rail">
       <div className="ob-rail__brand">
-        <img src={logoSrc} alt="Goose In A Pond" className="ob-rail__brand-logo" />
+        <Logo size={32} className="ob-rail__brand-logo" />
         <div>
           <div className="ob-rail__brand-name">Goose In A Pond</div>
           <div className="ob-rail__brand-sub">First-time setup</div>

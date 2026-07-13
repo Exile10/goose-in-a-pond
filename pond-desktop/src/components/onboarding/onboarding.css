@@ -282,7 +282,6 @@
   font-weight: var(--weight-semibold);
   cursor: pointer;
   font-family: var(--font-body);
-  box-shadow: var(--shadow-brand);
   transition: opacity var(--transition-fast);
 }
 
@@ -735,7 +734,6 @@
   border-radius: 50%;
   background: var(--color-accent);
   border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(140, 75, 255, 0.35);
   cursor: pointer;
   transition: transform var(--transition-fast);
 }
@@ -750,7 +748,6 @@
   border-radius: 50%;
   background: var(--color-accent);
   border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(140, 75, 255, 0.35);
   cursor: pointer;
 }
 
@@ -1045,7 +1042,6 @@
   font-weight: var(--weight-bold);
   cursor: pointer;
   font-family: var(--font-body);
-  box-shadow: var(--shadow-brand);
   transition: background var(--transition-fast);
 }
 
@@ -1117,7 +1113,6 @@
   justify-content: center;
   color: #fff;
   margin-bottom: 20px;
-  box-shadow: 0 8px 28px rgba(140, 75, 255, 0.35);
 }
 
 .ob-complete__title {
@@ -1193,7 +1188,6 @@
   font-weight: var(--weight-bold);
   cursor: pointer;
   font-family: var(--font-body);
-  box-shadow: var(--shadow-brand);
 }
 
 .ob-complete__btn-primary:hover {
@@ -1332,7 +1326,6 @@
   font-weight: var(--weight-semibold);
   cursor: pointer;
   font-family: var(--font-body);
-  box-shadow: 0 2px 8px rgba(140, 75, 255, 0.25);
 }
 
 .ob-calibration__btn:hover:not(:disabled) {

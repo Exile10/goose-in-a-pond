@@ -1,4 +1,4 @@
-import gooseLogoDark from "../assets/goose-logo-dark.png";
+import { Logo } from "../components/Logo";
 import { HubIco } from "./primitives/HubIco";
 import { HP_PATHS } from "./primitives/icons";
 import { BellShortcut } from "./primitives/BellShortcut";
@@ -30,7 +30,7 @@ export function IconRail({ active, go }: IconRailProps) {
     <nav className="irail">
       <div className="irail__brand">
         <span className="irail__logo">
-          <img src={gooseLogoDark} alt="Goose In A Pond" width={32} height={32} />
+          <Logo size={32} />
         </span>
       </div>
       <div className="irail__nav">
