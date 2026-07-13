@@ -132,6 +132,8 @@ export interface Settings {
   ext_news_enabled?: boolean;
   ext_finance_enabled?: boolean;
   ext_discovery_enabled?: boolean;
+  ext_audit_enabled?: boolean;
+  ext_vision_enabled?: boolean;
 
   // API keys for keyed services
   api_key_guardian?: string | null;
@@ -152,6 +154,13 @@ export interface Settings {
 
   // Identity — home name
   home_name?: string;
+
+  // Vision / cameras (on-device event detection)
+  vision_enabled?: boolean;
+  vision_camera_url?: string;
+  vision_camera_id?: string;
+  vision_fps?: number;
+  vision_motion_threshold?: number;
 }
 
 // ── Consolidation ────────────────────────────────────────────

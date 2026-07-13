@@ -323,6 +323,29 @@ impl LocalInferenceLlmAdapter {
     ///
     /// The function silently ignores errors (model not yet downloaded, registry
     /// lock poisoned) — defaults will be used in that case.
+    ///
+    /// ## Memory-fit fail-closed (Phase 6 — FUTURE on-Jetson work, NOT done here)
+    ///
+    /// `n_gpu_layers = 99` requests full GPU residency. On the 8 GB Jetson this
+    /// SILENTLY partial-offloads to CPU when the model exceeds the unified-memory
+    /// budget (e.g. the ~5.6 GB `gemma3n:e2b`), collapsing decode to single-digit
+    /// tok/s. The UI-side memory-fit guard now WARNS about this before load
+    /// (`FitBadge` / `warn_if_model_spills`), but the loader itself does not yet
+    /// fail closed. The recommended on-device enforcement, to add here when it can
+    /// be validated on real Jetson hardware:
+    ///
+    ///   1. Before requesting `-ngl 99`, compare the model's on-disk size against
+    ///      `MemAvailable` (see `ResourceAwareModelScheduler::memory_status`),
+    ///      reserving ~1 GB headroom for KV cache + system.
+    ///   2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) to
+    ///      free the page cache first — otherwise the `-ngl` allocation hits the
+    ///      NvMap OOM wall (error 12). See `scripts/jetson-llama-optimization`.
+    ///   3. Re-check after dropping caches; if it STILL won't fit, refuse the
+    ///      full-GPU load (fail closed) and surface the spill to the UI rather
+    ///      than silently degrading to a CPU/GPU split.
+    ///
+    /// This is intentionally NOT implemented in the cross-platform loader: it is
+    /// unsafe to change from the macOS Metal build and cannot be tested here.
     #[cfg(feature = "cuda")]
     fn apply_jetson_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{

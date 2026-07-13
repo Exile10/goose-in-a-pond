@@ -72,6 +72,9 @@ async function setupRoutes(
   await page.route("**/api/v1/onboard/complete", (r) =>
     r.fulfill({ json: { status: "completed" } }),
   );
+  await page.route("**/api/v1/onboard/reset", (r) =>
+    r.fulfill({ json: { onboarded: false, current_step: "Welcome", steps_completed: 1, total_steps: 10 } }),
+  );
 
   // Settings — GET and PUT
   await page.route("**/api/v1/settings", async (r) => {
@@ -259,5 +262,29 @@ test.describe("Hub — Account sub-screen wiring", () => {
     // Wait briefly then check
     await page.waitForTimeout(400);
     await expect(errorFlash).not.toBeVisible();
+  });
+
+  test("Start over calls resetOnboarding and returns to the wizard", async ({ page }) => {
+    await setupRoutes(page);
+
+    // Observe the reset call. Registered AFTER setupRoutes so it takes
+    // precedence over the default reset mock (last-registered wins).
+    let resetHit = false;
+    await page.route("**/api/v1/onboard/reset", (r) => {
+      resetHit = true;
+      return r.fulfill({ json: { onboarded: false, current_step: "Welcome", steps_completed: 1, total_steps: 10 } });
+    });
+
+    await goToAccountScreen(page);
+
+    const restartBtn = page.getByTestId("restart-onboarding-btn");
+    await expect(restartBtn).toBeVisible({ timeout: 5_000 });
+    await restartBtn.click();
+
+    // The reset endpoint was called…
+    await expect.poll(() => resetHit, { timeout: 5_000 }).toBe(true);
+
+    // …and the onboarding wizard is shown (SET_NEEDS_ONBOARDING → OnboardingWizard).
+    await expect(page.getByText("First-time setup")).toBeVisible({ timeout: 5_000 });
   });
 });

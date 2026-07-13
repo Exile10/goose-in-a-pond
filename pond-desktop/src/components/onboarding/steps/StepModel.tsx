@@ -4,14 +4,17 @@
 // ASR and TTS are optional (sensible defaults exist).
 // ────────────────────────────────────────────────────────────
 
-import { Cpu, Server, HardDrive, AudioLines, Volume2 } from "lucide-react";
+import { Cpu, Server, HardDrive, AudioLines, Volume2, AlertTriangle } from "lucide-react";
 import { useOnboarding } from "../OnboardingContext";
 import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";
 import { useAvailableModels } from "../hooks/useAvailableModels";
 import { PROVIDERS } from "../onboarding.constants";
-import type { ModelEntry } from "../../../api/types";
+import { useMemoryStatus } from "../../../api/useMemoryStatus";
+import { FitBadge } from "../../shared/FitBadge";
+import { modelFitFor } from "../../../api/modelFit";
+import type { ModelEntry, ModelMemoryStatus } from "../../../api/types";
 
 const ICON_PROPS = { size: 18, strokeWidth: 1.8 } as const;
 
@@ -27,7 +30,7 @@ const RECOMMENDED_LLM: Record<string, ModelEntry[]> = {
     { id: "gemma-2-2b-it", provider: "llamafile", name: "gemma-2-2b-it.Q4_K_M", display_name: "Gemma 2 2B Instruct", is_active: false, ram_estimate_mb: 1800, recommended_role: "Fast", downloaded: false, size_mb: 1600, category: "llamafile", description: "Default llamafile model. Lightweight and responsive." },
   ],
   ollama: [
-    { id: "gemma4-e2b", provider: "ollama", name: "gemma4:e2b", display_name: "Gemma 4 E2B", is_active: false, ram_estimate_mb: 3200, recommended_role: "Recommended", downloaded: false, size_mb: 3100, category: "ollama", description: "Tool-capable. Best default for the assistant." },
+    { id: "gemma4-e2b", provider: "ollama", name: "gemma4:e2b", display_name: "Gemma 4 E2B", is_active: false, ram_estimate_mb: 5600, recommended_role: "Recommended", downloaded: false, size_mb: 5600, category: "ollama", description: "Tool-capable. Best default for the assistant. Large (~5.6 GB) — needs an 8 GB+ GPU budget for full speed." },
     { id: "gemma4", provider: "ollama", name: "gemma4:latest", display_name: "Gemma 4", is_active: false, ram_estimate_mb: 5120, recommended_role: "Capable", downloaded: false, size_mb: 4800, category: "ollama", description: "Latest generation. Best quality responses." },
   ],
   local: [
@@ -54,10 +57,13 @@ function ModelCard({
   model,
   selected,
   onSelect,
+  memoryStatus,
 }: {
   model: ModelEntry;
   selected: boolean;
   onSelect: () => void;
+  /** Device LLM memory budget; when provided, a spill warning is shown for models that won't fit. */
+  memoryStatus?: ModelMemoryStatus | null;
 }) {
   return (
     <div
@@ -77,6 +83,9 @@ function ModelCard({
             <span className="ob-model-card__size">
               ~{model.ram_estimate_mb >= 1024 ? `${(model.ram_estimate_mb / 1024).toFixed(1)} GB` : `${model.ram_estimate_mb} MB`} RAM
             </span>
+          )}
+          {memoryStatus !== undefined && (
+            <FitBadge model={model} status={memoryStatus} compact />
           )}
         </div>
         {model.description && (
@@ -106,6 +115,8 @@ function ModelCard({
 export function StepModel() {
   const { draft, patch } = useOnboarding();
   const { grouped, asrModels, ttsModels, loading, error } = useAvailableModels();
+  // Device LLM memory budget (null on Mac/dev or when the endpoint is absent).
+  const memoryStatus = useMemoryStatus();
 
   // ── LLM providers + models ──
   const providers = PROVIDERS.map((p) => {
@@ -116,6 +127,14 @@ export function StepModel() {
 
   const currentLlmModels =
     providers.find((p) => p.key === draft.llmProvider)?.models || [];
+
+  // Does any selectable LLM model spill on this device? Drives the tradeoff hint.
+  const anyLlmSpills = currentLlmModels.some(
+    (m) => modelFitFor(m, memoryStatus) === "spills",
+  );
+  const selectedLlmSpills = currentLlmModels.some(
+    (m) => m.name === draft.llmModel && modelFitFor(m, memoryStatus) === "spills",
+  );
 
   // ── ASR + TTS with fallbacks ──
   const asrList = asrModels.length > 0 ? asrModels : RECOMMENDED_ASR;
@@ -176,9 +195,22 @@ export function StepModel() {
               model={m}
               selected={draft.llmModel === m.name}
               onSelect={() => patch({ llmModel: m.name })}
+              memoryStatus={memoryStatus}
             />
           ))}
         </div>
+        {anyLlmSpills && (
+          <div className="fit-hint" role="status">
+            <AlertTriangle size={14} strokeWidth={2} />
+            <span>
+              {selectedLlmSpills
+                ? "The recommended model is larger than this device's GPU budget — it will spill to CPU and run slowly. "
+                : "Some models here are larger than this device's GPU budget. "}
+              Recommended: pick a model that fits your GPU budget (the smaller
+              Gemma 2 2B or a 3B-class model) for full on-device speed.
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ── ASR (Whisper) ─────────────────────────────────── */}

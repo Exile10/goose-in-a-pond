@@ -4,7 +4,7 @@ import { Button } from "@heroui/react";
 import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { api } from "../api/PondApiClient";
-import logoSrc from "../assets/logo.png";
+import { Logo } from "./Logo";
 import {
   LayoutDashboard,
   MessageCircle,
@@ -120,7 +120,7 @@ export function Sidebar() {
       {/* ── Brand ── */}
       <div className={`sidebar__brand${collapsed ? " sidebar__brand--collapsed" : ""}`}>
         <div className="sidebar__logo">
-          <img src={logoSrc} alt="" style={{ width: 26, height: 26, objectFit: "contain" }} />
+          <Logo size={26} alt="" />
         </div>
         {!collapsed && <span className="sidebar__brand-name">Goose In A Pond</span>}
       </div>

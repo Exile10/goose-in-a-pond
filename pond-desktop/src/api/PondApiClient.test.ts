@@ -122,6 +122,51 @@ describe("deleteMemory()", () => {
   });
 });
 
+// ── sessions ────────────────────────────────────────────────────────────────────
+
+describe("listSessions()", () => {
+  it("unwraps the { sessions } envelope and passes message_count through", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        sessions: [
+          { id: "s1", title: "Weather plan", message_count: 4, created_at: "", updated_at: "" },
+        ],
+      }),
+    );
+    const sessions = await client().listSessions();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].message_count).toBe(4);
+    expect(sessions[0].title).toBe("Weather plan");
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/v1/sessions");
+  });
+
+  it("tolerates a bare array response", async () => {
+    fetchMock.mockResolvedValueOnce(okJson([{ id: "s2", created_at: "", updated_at: "" }]));
+    const sessions = await client().listSessions();
+    expect(sessions[0].id).toBe("s2");
+  });
+});
+
+describe("renameSession()", () => {
+  it("PATCHes /sessions/:id with the new title", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ session_id: "s1", title: "Renamed" }));
+    await client().renameSession("s1", "Renamed");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/v1/sessions/s1");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ title: "Renamed" });
+  });
+});
+
+describe("deleteSession()", () => {
+  it("DELETEs /sessions/:id", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({}));
+    await client().deleteSession("s1");
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/v1/sessions/s1");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("DELETE");
+  });
+});
+
 // ── skills ────────────────────────────────────────────────────────────────────
 
 describe("listSkills()", () => {
