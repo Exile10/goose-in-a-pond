@@ -195,6 +195,7 @@ async fn make_app_with_dispatcher(
         security_policy: None,
         tool_dispatcher,
         api_port: 4000,
+        weather_provider: None,
     });
 
     (
@@ -413,6 +414,7 @@ async fn prompt_template_delete_system_returns_403() {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
 
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
@@ -885,6 +887,7 @@ async fn returns_501_when_repos_not_configured() {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

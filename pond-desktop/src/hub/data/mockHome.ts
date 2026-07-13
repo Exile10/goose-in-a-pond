@@ -3,7 +3,7 @@
 
 export interface WeatherForecastDay {
   d: string;
-  i: "sun" | "cloud" | "rain";
+  i: "sun" | "cloudSun" | "cloud" | "rain";
   t: number;
 }
 
@@ -15,6 +15,9 @@ export interface WeatherData {
   lo: number;
   hum: number;
   wind: number;
+  /** "HH:MM" local time, used to derive the day/night background phase. */
+  sunrise: string;
+  sunset: string;
   forecast: WeatherForecastDay[];
 }
 
@@ -101,6 +104,8 @@ export const HOME: HomeData = {
     lo: 54,
     hum: 62,
     wind: 12,
+    sunrise: "06:30",
+    sunset: "20:15",
     forecast: [
       { d: "Tue", i: "sun", t: 66 },
       { d: "Wed", i: "cloud", t: 62 },

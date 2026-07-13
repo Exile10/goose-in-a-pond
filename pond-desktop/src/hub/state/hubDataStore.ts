@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { api } from "../../api/PondApiClient";
-import type { AgentRecipe, Device, Schedule, Settings } from "../../api/types";
+import type { AgentRecipe, Device, Schedule, Settings, WeatherApiResponse } from "../../api/types";
 import {
   HOME as MOCK_HOME,
   type CameraData,
@@ -10,6 +10,7 @@ import {
   type HomeData,
   type RoomData,
   type SceneData,
+  type WeatherData,
 } from "../data/mockHome";
 import { ROUTINES as MOCK_ROUTINES, type RoutineDetail } from "../data/routines";
 import { sunEl, filmEl, focusEl } from "../primitives/HubIco";
@@ -236,6 +237,24 @@ function routinesFromRecipes(recipes: AgentRecipe[]): RoutineDetail[] {
   });
 }
 
+function weatherFromApi(w: WeatherApiResponse | null): WeatherData {
+  if (!w || !w.enabled) return MOCK_HOME.weather;
+  return {
+    temp: w.temp ?? MOCK_HOME.weather.temp,
+    cond: w.cond ?? MOCK_HOME.weather.cond,
+    icon: w.icon ?? MOCK_HOME.weather.icon,
+    hi: w.hi ?? MOCK_HOME.weather.hi,
+    lo: w.lo ?? MOCK_HOME.weather.lo,
+    hum: w.hum ?? MOCK_HOME.weather.hum,
+    wind: w.wind ?? MOCK_HOME.weather.wind,
+    sunrise: w.sunrise ?? MOCK_HOME.weather.sunrise,
+    sunset: w.sunset ?? MOCK_HOME.weather.sunset,
+    forecast: w.forecast?.length
+      ? (w.forecast as WeatherData["forecast"])
+      : MOCK_HOME.weather.forecast,
+  };
+}
+
 function todayDateStr(): string {
   // "Monday, June 1"
   const d = new Date();
@@ -248,17 +267,19 @@ async function load() {
   if (state.loading) return;
   state.loading = true;
   try {
-    const [settings, devices, schedules, recipes] = await Promise.allSettled([
+    const [settings, devices, schedules, recipes, weather] = await Promise.allSettled([
       api.getSettings(),
       api.listDevices(),
       api.listSchedules(),
       api.listRecipes(),
+      api.getWeather(),
     ]);
 
     const sOK = settings.status === "fulfilled" ? (settings.value as Settings) : null;
     const dOK = devices.status === "fulfilled" ? devices.value : [];
     const schOK = schedules.status === "fulfilled" ? schedules.value : [];
     const rcOK = recipes.status === "fulfilled" ? recipes.value : [];
+    const wOK = weather.status === "fulfilled" ? weather.value : null;
 
     // Partition devices into controllable + cameras
     const ctlDevices: DeviceData[] = [];
@@ -291,6 +312,7 @@ async function load() {
       rooms,
       categories,
       scenes,
+      weather: weatherFromApi(wOK),
     };
     state.routines = routinesFromRecipes(rcOK);
     state.loaded = true;

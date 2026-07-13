@@ -13,14 +13,48 @@ function getForecastIcon(iconKey: string): string | React.ReactNode {
   return path ?? "";
 }
 
+type DayPhase = "night" | "dawn" | "day" | "dusk";
+
+/** Parses "HH:MM" into minutes-past-midnight. Returns null if malformed. */
+function parseClock(t: string): number | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(t);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/**
+ * Derives the visual time-of-day phase from real sunrise/sunset times
+ * (already location- and season-accurate from the backend) compared
+ * against the device's current local clock.
+ */
+export function dayPhaseFor(sunrise: string, sunset: string, now = new Date()): DayPhase {
+  const sr = parseClock(sunrise);
+  const ss = parseClock(sunset);
+  if (sr === null || ss === null) return "day";
+
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const TWILIGHT_MIN = 45;
+
+  if (Math.abs(cur - sr) <= TWILIGHT_MIN) return "dawn";
+  if (Math.abs(cur - ss) <= TWILIGHT_MIN) return "dusk";
+  if (cur > sr + TWILIGHT_MIN && cur < ss - TWILIGHT_MIN) return "day";
+  return "night";
+}
+
 export function WeatherWidget({ variant = "card" }: WeatherWidgetProps) {
   const w = useHomeData().weather;
+  const phase = dayPhaseFor(w.sunrise, w.sunset);
 
   return (
-    <div className={`wx wx--${variant}`}>
+    <div className={`wx wx--${variant} wx--${phase}`}>
       <div className="wx__main">
         <span className="wx__icon">
-          <HubIco d={HP_PATHS.cloudSun} size={variant === "hero" ? 44 : 34} color="#fff" sw={1.7} />
+          <HubIco
+            d={getForecastIcon(w.icon) || HP_PATHS.cloudSun}
+            size={variant === "hero" ? 44 : 34}
+            color="#fff"
+            sw={1.7}
+          />
         </span>
         <div className="wx__temp">{w.temp}<span>°</span></div>
         <div className="wx__meta">

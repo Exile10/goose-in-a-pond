@@ -661,6 +661,22 @@
 .wx--hero { background: linear-gradient(150deg, #60A5FA, #6366F1); }
 .wx--hero .wx__temp { font-size: 52px; }
 
+/* Time-of-day background, derived from real sunrise/sunset (overrides the
+   default/hero gradients above regardless of variant). "day" keeps the
+   existing sky-blue look, so it has no override here. */
+.wx--dawn {
+  background: linear-gradient(150deg, #FDBA74 0%, #FB923C 45%, #818CF8 100%);
+  box-shadow: 0 6px 18px rgba(251, 146, 60, 0.3);
+}
+.wx--dusk {
+  background: linear-gradient(150deg, #FB7185 0%, #C026D3 45%, #4C1D95 100%);
+  box-shadow: 0 6px 18px rgba(192, 38, 211, 0.3);
+}
+.wx--night {
+  background: linear-gradient(150deg, #1E293B 0%, #0F172A 60%, #312E81 100%);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.4);
+}
+
 /* ─── Sticky note ─── */
 .sticky {
   background: linear-gradient(165deg, #FEF08A, #FDE047);

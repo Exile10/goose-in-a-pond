@@ -109,6 +109,7 @@ async fn make_app_with_bus() -> (axum::Router, Arc<InProcessEventBus>, tempfile:
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
 
     let router = build_router(state, std::path::PathBuf::from("web/dist"));
