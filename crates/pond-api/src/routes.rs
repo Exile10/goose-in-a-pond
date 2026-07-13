@@ -1465,22 +1465,60 @@ async fn list_sessions(
         )
     })?;
 
-    let session_list: Vec<Value> = sessions
-        .iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "title": s.title,
-                "total_prompt_tokens": s.total_prompt_tokens,
-                "total_completion_tokens": s.total_completion_tokens,
-                "model_name": s.model_name,
-                "created_at": s.created_at.to_rfc3339(),
-                "updated_at": s.updated_at.to_rfc3339(),
-            })
-        })
-        .collect();
+    let mut session_list: Vec<Value> = Vec::with_capacity(sessions.len());
+    for s in &sessions {
+        // Message count powers the sidebar badge. A failure here is non-fatal —
+        // the badge just shows 0 rather than breaking the whole list.
+        let message_count = state
+            .session_storage
+            .count_messages(&s.id)
+            .await
+            .unwrap_or(0);
+
+        // Read-time title fallback: if a session has no stored title yet,
+        // derive a short label from its first user message so the client
+        // never has to render a raw session id. The stored title stays None —
+        // this is a projection, not a mutation.
+        let effective_title: Option<String> = match &s.title {
+            Some(t) if !t.trim().is_empty() => Some(t.clone()),
+            _ => state
+                .session_storage
+                .first_user_message(&s.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|m| derived_session_label(&m))
+                .filter(|t| !t.is_empty()),
+        };
+
+        session_list.push(json!({
+            "id": s.id,
+            "title": effective_title,
+            "message_count": message_count,
+            "total_prompt_tokens": s.total_prompt_tokens,
+            "total_completion_tokens": s.total_completion_tokens,
+            "model_name": s.model_name,
+            "created_at": s.created_at.to_rfc3339(),
+            "updated_at": s.updated_at.to_rfc3339(),
+        }));
+    }
 
     Ok(Json(json!({ "sessions": session_list })))
+}
+
+/// Derive a short, human-readable label from the first user message of a
+/// session. Read-only helper for the sessions list fallback — collapses
+/// whitespace and caps at ~40 characters on a char boundary.
+fn derived_session_label(text: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = cleaned.trim_matches('"').trim_matches('\'').trim();
+    if cleaned.chars().count() <= MAX_CHARS {
+        cleaned.to_string()
+    } else {
+        let truncated: String = cleaned.chars().take(MAX_CHARS).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 /// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
@@ -9755,6 +9793,40 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_session_label_short_message_passthrough() {
+        assert_eq!(
+            derived_session_label("What is the weather today?"),
+            "What is the weather today?"
+        );
+    }
+
+    #[test]
+    fn derived_session_label_collapses_whitespace() {
+        assert_eq!(
+            derived_session_label("  hello\n\n  there   world "),
+            "hello there world"
+        );
+    }
+
+    #[test]
+    fn derived_session_label_caps_at_40_chars() {
+        let long = "The quick brown fox jumps over the lazy dog again and again";
+        let label = derived_session_label(long);
+        // 40 chars of content + a trailing ellipsis marker.
+        assert!(label.ends_with('…'), "expected ellipsis, got: {label}");
+        assert!(
+            label.chars().count() <= 41,
+            "expected <=41 chars, got {}: {label}",
+            label.chars().count()
+        );
+    }
+
+    #[test]
+    fn derived_session_label_strips_wrapping_quotes() {
+        assert_eq!(derived_session_label("\"hello world\""), "hello world");
+    }
 
     #[test]
     fn extract_ui_hint_with_valid_weather_hint() {

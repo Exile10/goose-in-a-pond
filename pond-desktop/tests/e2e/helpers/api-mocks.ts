@@ -72,13 +72,32 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { status: "ok" } }),
   );
 
-  // Sessions
+  // Sessions. The list carries `message_count` so the sidebar badge renders.
+  // Individual tests override `**/api/v1/sessions` with populated data.
   await page.route("**/api/v1/sessions", (route) =>
     route.fulfill({ json: { sessions: [] } }),
   );
   await page.route("**/api/v1/sessions/*/messages", (route) =>
     route.fulfill({ json: { messages: [] } }),
   );
+  // Rename (PATCH) and delete (DELETE) on an individual session. This pattern
+  // also matches `/sessions/:id/messages`, so fall through for those to let the
+  // more specific messages route above handle them. Echoes the body for PATCH
+  // and returns 204 for DELETE; specs that need stateful behaviour route these
+  // themselves before calling into the app.
+  await page.route("**/api/v1/sessions/*", (route) => {
+    const url = route.request().url();
+    if (url.includes("/messages")) return route.fallback();
+    const method = route.request().method();
+    if (method === "PATCH") {
+      const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+      return route.fulfill({ json: { session_id: "mock", title: body.title ?? "" } });
+    }
+    if (method === "DELETE") {
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ json: {} });
+  });
 
   // Models
   await page.route("**/api/v1/models/active-roles", (route) =>

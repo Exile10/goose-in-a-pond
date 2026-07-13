@@ -680,6 +680,10 @@ export class PondApiClient {
     });
   }
 
+  renameSession(sessionId: string, title: string): Promise<void> {
+    return this.patch(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, { title });
+  }
+
   deleteSession(sessionId: string): Promise<void> {
     return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
   }
