@@ -4,7 +4,7 @@
 // ────────────────────────────────────────────────────────────
 
 import { Lock, Mic, Shield } from "lucide-react";
-import logoSrc from "../../../assets/logo.png";
+import { Logo } from "../../Logo";
 import { useSystemInfo } from "../hooks/useSystemInfo";
 
 interface Props {
@@ -39,7 +39,7 @@ export function StepWelcome({ onNext }: Props) {
 
   return (
     <div className="ob-welcome">
-      <img src={logoSrc} alt="Goose In A Pond" className="ob-welcome__logo" />
+      <Logo className="ob-welcome__logo" size={96} />
 
       <h1 className="ob-welcome__title">Welcome to Goose In A Pond</h1>
       <p className="ob-welcome__subtitle">

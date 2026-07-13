@@ -41,6 +41,7 @@ use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -75,8 +76,17 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
+        // Per-step progress tracking so the wizard can resume-from-N (public —
+        // called mid-onboarding before completion).
+        .route("/onboard/step/{name}", post(onboarding_step))
+        // Reset onboarding back to the first step ("Start over" in Settings).
+        .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // TTS synthesis is public so the onboarding voice-preview can play a
+        // sample before onboarding completes. Text→audio via local Piper is not
+        // privileged and leaks no user data.
+        .route("/tts", post(tts_synthesise))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
@@ -96,7 +106,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
-        .route("/tts", post(tts_synthesise))
         .route("/sessions", get(list_sessions))
         .route(
             "/sessions/{session_id}",
@@ -572,6 +581,39 @@ async fn start_onboarding(
 async fn complete_onboarding(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Validate the minimum required configuration before finishing. A half-set-up
+    // assistant (no name, no timezone, or no chat model) must not lift the
+    // onboarding guard — it would leave the user in a broken dashboard.
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to load settings: {}", e)})),
+        )
+    })?;
+
+    let mut missing: Vec<&str> = Vec::new();
+    if settings.user_name.trim().is_empty() {
+        missing.push("user_name");
+    }
+    if settings.assistant_name.trim().is_empty() {
+        missing.push("assistant_name");
+    }
+    if settings.timezone.trim().is_empty() {
+        missing.push("timezone");
+    }
+    if settings.chat_model.trim().is_empty() {
+        missing.push("chat_model");
+    }
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Onboarding is incomplete — required settings are missing.",
+                "missing_fields": missing,
+            })),
+        ));
+    }
+
     state
         .onboarding_repo
         .save_step(OnboardingStep::Completed)
@@ -585,35 +627,112 @@ async fn complete_onboarding(
     Ok(Json(json!({"status": "completed"})))
 }
 
-/// Return current onboarding progress (public)
-async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let service = OnboardingService::new(state.onboarding_repo.clone());
-
-    let total_steps = 9; // Welcome Basics Location Accessibility Personality GooseIdentity WakeWord Model Extensions
-    let (current_step, steps_completed, onboarded) = match service.status().await {
+/// Build the canonical onboarding-status JSON from the persisted current step.
+///
+/// Shared by `GET /onboard/status`, `POST /onboard/step/:name`, and
+/// `POST /onboard/reset` so every response has the same shape. Counts are
+/// derived from [`OnboardingStep::ALL`] so they can never drift from the enum.
+fn onboarding_status_json(step: Option<OnboardingStep>) -> Value {
+    let total_steps = OnboardingStep::ALL.len();
+    let (current_step, steps_completed, onboarded) = match step {
         None => ("not_started".to_string(), 0, false),
-        Some(OnboardingStep::Welcome) => (OnboardingStep::Welcome.to_string(), 1, false),
-        Some(OnboardingStep::Basics) => (OnboardingStep::Basics.to_string(), 2, false),
-        Some(OnboardingStep::Location) => (OnboardingStep::Location.to_string(), 3, false),
-        Some(OnboardingStep::Accessibility) => {
-            (OnboardingStep::Accessibility.to_string(), 4, false)
-        }
-        Some(OnboardingStep::Personality) => (OnboardingStep::Personality.to_string(), 5, false),
-        Some(OnboardingStep::GooseIdentity) => {
-            (OnboardingStep::GooseIdentity.to_string(), 6, false)
-        }
-        Some(OnboardingStep::WakeWord) => (OnboardingStep::WakeWord.to_string(), 7, false),
-        Some(OnboardingStep::Model) => (OnboardingStep::Model.to_string(), 8, false),
-        Some(OnboardingStep::Extensions) => (OnboardingStep::Extensions.to_string(), 8, false),
-        Some(OnboardingStep::Completed) => ("Completed".to_string(), 8, true),
+        Some(step) => (step.to_string(), step.position(), step.is_complete()),
     };
 
-    Json(json!({
+    json!({
         "onboarded": onboarded,
         "current_step": current_step,
         "steps_completed": steps_completed,
         "total_steps": total_steps
-    }))
+    })
+}
+
+/// Return current onboarding progress (public)
+async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+    Json(onboarding_status_json(service.status().await))
+}
+
+/// Record that the client has reached a named onboarding step (public).
+///
+/// `POST /api/v1/onboard/step/:name` — the wizard calls this as each step is
+/// reached so the backend tracks progress and can resume-from-N if the user
+/// quits mid-onboarding. `:name` is an [`OnboardingStep`] variant name
+/// (e.g. `Basics`, `WakeWord`).
+///
+/// Progress is **monotonic**: the persisted step only ever moves forward. If
+/// the client re-POSTs an earlier step (e.g. after navigating Back), the
+/// furthest-reached step is retained. `Completed` is rejected here — completion
+/// is owned by `/onboard/complete`, which validates required settings first.
+async fn onboarding_step(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let requested = OnboardingStep::from_str(&name).map_err(|_| {
+        let valid: Vec<String> = OnboardingStep::ALL
+            .iter()
+            .filter(|s| !s.is_complete())
+            .map(|s| s.to_string())
+            .collect();
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Unknown onboarding step: {name}"),
+                "valid_steps": valid,
+            })),
+        )
+    })?;
+
+    // Completion goes through `/onboard/complete` (with required-field
+    // validation). Accepting it here would lift the onboarding guard
+    // unvalidated.
+    if requested.is_complete() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Use POST /onboard/complete to finish onboarding",
+            })),
+        ));
+    }
+
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    // Monotonic: `advance_to` never regresses past the furthest step reached.
+    let target = service.advance_to(requested).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save onboarding step: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(onboarding_status_json(Some(target))))
+}
+
+/// Reset onboarding back to the first step (public).
+///
+/// `POST /api/v1/onboard/reset` — powers the "Start over" control in Settings.
+/// Clears any persisted progress and re-arms the onboarding guard so the wizard
+/// is shown again from `Welcome`. Distinct from `POST /onboard` (which only
+/// *starts* onboarding when no state exists and otherwise reports status).
+async fn reset_onboarding(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    service.reset().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to reset onboarding: {}", e)})),
+        )
+    })?;
+    service.start().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to restart onboarding: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(onboarding_status_json(Some(OnboardingStep::Welcome))))
 }
 
 #[derive(Deserialize)]
@@ -1442,22 +1561,60 @@ async fn list_sessions(
         )
     })?;
 
-    let session_list: Vec<Value> = sessions
-        .iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "title": s.title,
-                "total_prompt_tokens": s.total_prompt_tokens,
-                "total_completion_tokens": s.total_completion_tokens,
-                "model_name": s.model_name,
-                "created_at": s.created_at.to_rfc3339(),
-                "updated_at": s.updated_at.to_rfc3339(),
-            })
-        })
-        .collect();
+    let mut session_list: Vec<Value> = Vec::with_capacity(sessions.len());
+    for s in &sessions {
+        // Message count powers the sidebar badge. A failure here is non-fatal —
+        // the badge just shows 0 rather than breaking the whole list.
+        let message_count = state
+            .session_storage
+            .count_messages(&s.id)
+            .await
+            .unwrap_or(0);
+
+        // Read-time title fallback: if a session has no stored title yet,
+        // derive a short label from its first user message so the client
+        // never has to render a raw session id. The stored title stays None —
+        // this is a projection, not a mutation.
+        let effective_title: Option<String> = match &s.title {
+            Some(t) if !t.trim().is_empty() => Some(t.clone()),
+            _ => state
+                .session_storage
+                .first_user_message(&s.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|m| derived_session_label(&m))
+                .filter(|t| !t.is_empty()),
+        };
+
+        session_list.push(json!({
+            "id": s.id,
+            "title": effective_title,
+            "message_count": message_count,
+            "total_prompt_tokens": s.total_prompt_tokens,
+            "total_completion_tokens": s.total_completion_tokens,
+            "model_name": s.model_name,
+            "created_at": s.created_at.to_rfc3339(),
+            "updated_at": s.updated_at.to_rfc3339(),
+        }));
+    }
 
     Ok(Json(json!({ "sessions": session_list })))
+}
+
+/// Derive a short, human-readable label from the first user message of a
+/// session. Read-only helper for the sessions list fallback — collapses
+/// whitespace and caps at ~40 characters on a char boundary.
+fn derived_session_label(text: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = cleaned.trim_matches('"').trim_matches('\'').trim();
+    if cleaned.chars().count() <= MAX_CHARS {
+        cleaned.to_string()
+    } else {
+        let truncated: String = cleaned.chars().take(MAX_CHARS).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 /// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
@@ -2877,7 +3034,7 @@ async fn activate_model(
     }
 
     let model_id = ModelRecord::id_for(&cat, &name);
-    model_repo
+    let record = model_repo
         .get_by_id(&model_id)
         .await
         .map_err(|e| {
@@ -2951,11 +3108,82 @@ async fn activate_model(
 
     // Hot-rebuild the ModelRouter for LLM roles using the existing helper
     if matches!(role.as_str(), "chat" | "think" | "task") {
+        // Memory-fit guard (Phase 6): warn if the model will not fully reside in
+        // the device LLM budget and therefore spill to CPU (single-digit tok/s).
+        //
+        // This is cross-platform-safe: it only *logs*. On Jetson the recommended
+        // fail-closed behavior (drop_caches + -ngl residency check, and refusing
+        // a spilling full-GPU load) belongs in the local-inference loader and is
+        // NOT done here — see scripts/jetson-llama-optimization and the note in
+        // .ai/scratchpad.md. We do not touch the loader from the Mac build.
+        warn_if_model_spills(&state, &record).await;
+
         let settings = state.settings_repo.get().await.unwrap_or_default();
         rebuild_llm_provider(&state, &settings).await;
     }
 
     Ok(Json(json!({"role": role, "model_id": model_id})))
+}
+
+/// Headroom (MB) reserved on top of a model's own weights for KV cache + system
+/// slack. Mirrors `DEFAULT_HEADROOM_MB` in the desktop `modelFit` helper so the
+/// server-side warning and the UI verdict agree.
+const MEMORY_FIT_HEADROOM_MB: u64 = 1024;
+
+/// Pure fit decision: does a model of `residency_mb` spill on a device with
+/// `available_for_llm_mb` free, reserving `MEMORY_FIT_HEADROOM_MB` headroom?
+///
+/// Returns `None` when there is no basis for a verdict — the budget is absent
+/// (`available_for_llm_mb == 0`, e.g. NoopScheduler / Mac dev) or the model size
+/// is unknown (`residency_mb == 0`). Returns `Some(true)` when the model spills,
+/// `Some(false)` when it fits. Mirrors the desktop `modelFit` helper.
+fn model_spills_budget(residency_mb: u64, available_for_llm_mb: u64) -> Option<bool> {
+    if available_for_llm_mb == 0 || residency_mb == 0 {
+        return None;
+    }
+    let budget = available_for_llm_mb.saturating_sub(MEMORY_FIT_HEADROOM_MB);
+    Some(residency_mb > budget)
+}
+
+/// Logs a warning when a model being activated for an LLM role is larger than
+/// the device's LLM memory budget (minus headroom) and will therefore spill to
+/// CPU and run slowly.
+///
+/// Cross-platform-safe: this only *logs*. When the scheduler reports no budget
+/// (`total_mb == 0`, e.g. NoopScheduler for llamafile/ollama or a Mac dev
+/// machine) it stays silent — there is nothing to compare against. The residency
+/// estimate prefers `size_mb` (on-disk weights) and falls back to
+/// `ram_estimate_mb`.
+async fn warn_if_model_spills(state: &Arc<AppState>, record: &ModelRecord) {
+    let Some(scheduler) = state.model_scheduler.as_ref() else {
+        return;
+    };
+    let status = scheduler.memory_status();
+    if status.total_mb == 0 {
+        return;
+    }
+
+    let residency_mb = if record.size_mb > 0 {
+        record.size_mb
+    } else {
+        record.ram_estimate_mb.unwrap_or(0)
+    };
+
+    if model_spills_budget(residency_mb, status.available_for_llm_mb) == Some(true) {
+        let budget = status
+            .available_for_llm_mb
+            .saturating_sub(MEMORY_FIT_HEADROOM_MB);
+        tracing::warn!(
+            model = %record.name,
+            model_size_mb = residency_mb,
+            available_for_llm_mb = status.available_for_llm_mb,
+            budget_mb = budget,
+            "model exceeds device LLM memory budget — it will spill to CPU and \
+             run slowly. On Jetson, enable the fail-closed loader path \
+             (drop_caches + -ngl residency check) or pick a model that fits the \
+             GPU budget. See scripts/jetson-llama-optimization."
+        );
+    }
 }
 
 /// GET /api/v1/models/ollama — proxy Ollama's /api/tags to list available local models.
@@ -9732,6 +9960,79 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Memory-fit guard (Phase 6) ───────────────────────────────
+
+    #[test]
+    fn model_spills_budget_fits_small_model() {
+        // gemma-2-2b (~1600 MB) fits a 4096 MB budget (effective 3072 after headroom).
+        assert_eq!(model_spills_budget(1600, 4096), Some(false));
+    }
+
+    #[test]
+    fn model_spills_budget_spills_large_model() {
+        // gemma3n:e2b real download (~5600 MB) spills a 4096 MB budget.
+        assert_eq!(model_spills_budget(5600, 4096), Some(true));
+    }
+
+    #[test]
+    fn model_spills_budget_borderline_at_effective_boundary() {
+        // Effective budget = 4096 - 1024 headroom = 3072.
+        assert_eq!(model_spills_budget(3072, 4096), Some(false)); // exactly fits
+        assert_eq!(model_spills_budget(3073, 4096), Some(true)); // one MB over
+    }
+
+    #[test]
+    fn model_spills_budget_unknown_when_no_budget() {
+        // NoopScheduler / Mac dev reports zero budget -- no verdict.
+        assert_eq!(model_spills_budget(5600, 0), None);
+    }
+
+    #[test]
+    fn model_spills_budget_unknown_when_size_unknown() {
+        assert_eq!(model_spills_budget(0, 4096), None);
+    }
+
+    #[test]
+    fn model_spills_budget_headroom_matches_desktop() {
+        // MEMORY_FIT_HEADROOM_MB must mirror the desktop DEFAULT_HEADROOM_MB (1024)
+        // so the server warning and the UI badge agree.
+        assert_eq!(MEMORY_FIT_HEADROOM_MB, 1024);
+    }
+
+    #[test]
+    fn derived_session_label_short_message_passthrough() {
+        assert_eq!(
+            derived_session_label("What is the weather today?"),
+            "What is the weather today?"
+        );
+    }
+
+    #[test]
+    fn derived_session_label_collapses_whitespace() {
+        assert_eq!(
+            derived_session_label("  hello\n\n  there   world "),
+            "hello there world"
+        );
+    }
+
+    #[test]
+    fn derived_session_label_caps_at_40_chars() {
+        let long = "The quick brown fox jumps over the lazy dog again and again";
+        let label = derived_session_label(long);
+        // 40 chars of content + a trailing ellipsis marker.
+        assert!(label.ends_with('…'), "expected ellipsis, got: {label}");
+        assert!(
+            label.chars().count() <= 41,
+            "expected <=41 chars, got {}: {label}",
+            label.chars().count()
+        );
+    }
+
+    #[test]
+    fn derived_session_label_strips_wrapping_quotes() {
+        assert_eq!(derived_session_label("\"hello world\""), "hello world");
+    }
 
     #[test]
     fn extract_ui_hint_with_valid_weather_hint() {

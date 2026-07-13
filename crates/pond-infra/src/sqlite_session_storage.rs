@@ -323,6 +323,41 @@ impl SessionStorage for SqliteSessionStorage {
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
         Ok(())
     }
+
+    async fn count_messages(&self, session_id: &str) -> Result<u64, SessionStorageError> {
+        // Indexed COUNT(*) — cheap even for long conversations. Unlike the
+        // read methods, this deliberately does NOT guard on session existence:
+        // a missing session simply has zero messages, which is the answer the
+        // sidebar badge wants.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_messages WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(count.max(0) as u64)
+    }
+
+    async fn first_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        // Earliest user-authored message, used only as a read-time title
+        // fallback. Ordered identically to get_messages so "first" is stable.
+        let content: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM session_messages \
+             WHERE session_id = ? AND role = 'user' \
+             ORDER BY created_at ASC, rowid ASC \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(content)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -603,6 +638,81 @@ mod tests {
         assert_eq!(msgs[0].message.tool_calls[0].name, "get_weather");
         assert_eq!(msgs[1].message.role, Role::Tool);
         assert_eq!(msgs[1].message.tool_call_id.as_deref(), Some("call-42"));
+    }
+
+    #[tokio::test]
+    async fn count_messages_reflects_stored_rows() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        assert_eq!(s.count_messages("sess-1").await.unwrap(), 0);
+
+        for i in 0..5 {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    format!("m{}", i),
+                    "sess-1".to_string(),
+                    ChatMessage::user(format!("Msg {}", i)),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(s.count_messages("sess-1").await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn count_messages_missing_session_is_zero() {
+        let (s, _tmp) = make_storage().await;
+        // No error, no session — just zero rows.
+        assert_eq!(s.count_messages("nope").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_user_message_returns_earliest_user_row() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        // No user messages yet.
+        assert_eq!(s.first_user_message("sess-1").await.unwrap(), None);
+
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m0".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("greeting"),
+            ),
+        )
+        .await
+        .unwrap();
+        // Still no *user* message.
+        assert_eq!(s.first_user_message("sess-1").await.unwrap(), None);
+
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("What is the weather in Nairobi today?"),
+            ),
+        )
+        .await
+        .unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m2".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("second question"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            s.first_user_message("sess-1").await.unwrap(),
+            Some("What is the weather in Nairobi today?".to_string())
+        );
     }
 
     #[tokio::test]

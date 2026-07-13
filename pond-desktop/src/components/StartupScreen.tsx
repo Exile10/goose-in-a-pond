@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@heroui/react";
-import logoSrc from "../assets/logo.png";
 import { defaultServerUrl } from "../api/PondApiClient";
+import { Logo } from "./Logo";
 
 interface Props {
   onReady: () => void;
@@ -109,8 +109,7 @@ export function StartupScreen({ onReady }: Props) {
   return (
     <div style={styles.root}>
       <div style={styles.card}>
-        {/* Jarida logo */}
-        <img src={logoSrc} alt="Goose In A Pond" style={styles.logoMark} />
+        <Logo size={96} style={styles.logoMark} />
 
         <h1 style={styles.title}>Goose In A Pond</h1>
         <p style={styles.subtitle}>by Jarida Open Source</p>
