@@ -572,6 +572,39 @@ async fn start_onboarding(
 async fn complete_onboarding(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Validate the minimum required configuration before finishing. A half-set-up
+    // assistant (no name, no timezone, or no chat model) must not lift the
+    // onboarding guard — it would leave the user in a broken dashboard.
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to load settings: {}", e)})),
+        )
+    })?;
+
+    let mut missing: Vec<&str> = Vec::new();
+    if settings.user_name.trim().is_empty() {
+        missing.push("user_name");
+    }
+    if settings.assistant_name.trim().is_empty() {
+        missing.push("assistant_name");
+    }
+    if settings.timezone.trim().is_empty() {
+        missing.push("timezone");
+    }
+    if settings.chat_model.trim().is_empty() {
+        missing.push("chat_model");
+    }
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Onboarding is incomplete — required settings are missing.",
+                "missing_fields": missing,
+            })),
+        ));
+    }
+
     state
         .onboarding_repo
         .save_step(OnboardingStep::Completed)
@@ -589,23 +622,13 @@ async fn complete_onboarding(
 async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
-    let total_steps = 9; // Welcome Basics Location Accessibility Personality GooseIdentity WakeWord Model Extensions
+    // Derive counts from the enum so they can never drift from it.
+    // `total_steps` counts every variant (Welcome..Extensions + terminal Completed);
+    // `steps_completed` is the current step's 1-based position within that list.
+    let total_steps = OnboardingStep::ALL.len();
     let (current_step, steps_completed, onboarded) = match service.status().await {
         None => ("not_started".to_string(), 0, false),
-        Some(OnboardingStep::Welcome) => (OnboardingStep::Welcome.to_string(), 1, false),
-        Some(OnboardingStep::Basics) => (OnboardingStep::Basics.to_string(), 2, false),
-        Some(OnboardingStep::Location) => (OnboardingStep::Location.to_string(), 3, false),
-        Some(OnboardingStep::Accessibility) => {
-            (OnboardingStep::Accessibility.to_string(), 4, false)
-        }
-        Some(OnboardingStep::Personality) => (OnboardingStep::Personality.to_string(), 5, false),
-        Some(OnboardingStep::GooseIdentity) => {
-            (OnboardingStep::GooseIdentity.to_string(), 6, false)
-        }
-        Some(OnboardingStep::WakeWord) => (OnboardingStep::WakeWord.to_string(), 7, false),
-        Some(OnboardingStep::Model) => (OnboardingStep::Model.to_string(), 8, false),
-        Some(OnboardingStep::Extensions) => (OnboardingStep::Extensions.to_string(), 8, false),
-        Some(OnboardingStep::Completed) => ("Completed".to_string(), 8, true),
+        Some(step) => (step.to_string(), step.position(), step.is_complete()),
     };
 
     Json(json!({

@@ -481,6 +481,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["News","Top stories and headline search","ext_news_enabled"],
     ["Finance","Stock quotes, crypto prices, and currency exchange rates","ext_finance_enabled"],
     ["Discovery","Country info, product lookup, web search","ext_discovery_enabled"],
+    ["Audit / Privacy tools","Recent activity, activity summary, and privacy-risk report","ext_audit_enabled"],
   ] as const;
 
   return (

@@ -132,6 +132,7 @@ export interface Settings {
   ext_news_enabled?: boolean;
   ext_finance_enabled?: boolean;
   ext_discovery_enabled?: boolean;
+  ext_audit_enabled?: boolean;
 
   // API keys for keyed services
   api_key_guardian?: string | null;

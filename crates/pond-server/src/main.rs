@@ -1366,6 +1366,10 @@ async fn run_server(
     //
     // Async helper so we can await LocalInferenceLlmAdapter::new() for the
     // "local" (in-process GGUF) provider without blocking the Tokio runtime.
+    // TODO(cloud-fallback): when `settings.cloud_fallback_enabled` is ON, wrap
+    // the selected local provider so a failed local inference spills over to a
+    // cloud model (failure-only, never on success). OFF by default (privacy-first)
+    // — the toggle is persisted but no spill path is wired yet.
     async fn build_provider(
         provider: &str,
         model: &str,

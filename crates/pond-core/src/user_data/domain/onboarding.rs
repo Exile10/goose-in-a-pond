@@ -33,6 +33,32 @@ pub enum OnboardingStep {
 }
 
 impl OnboardingStep {
+    /// All steps in wizard order, including the terminal `Completed` state.
+    /// Used to derive progress counts (`total_steps`, `steps_completed`) so the
+    /// API never hardcodes a length that can drift from the enum.
+    pub const ALL: [OnboardingStep; 10] = [
+        Self::Welcome,
+        Self::Basics,
+        Self::Location,
+        Self::Accessibility,
+        Self::Personality,
+        Self::GooseIdentity,
+        Self::WakeWord,
+        Self::Model,
+        Self::Extensions,
+        Self::Completed,
+    ];
+
+    /// 1-based position of this step within [`OnboardingStep::ALL`].
+    /// `Welcome` → 1, … `Extensions` → 9, `Completed` → 10.
+    pub fn position(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|s| *s == self)
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Welcome => Self::Basics,
@@ -111,6 +137,28 @@ mod tests {
     #[test]
     fn completed_is_terminal() {
         assert_eq!(OnboardingStep::Completed.next(), OnboardingStep::Completed);
+    }
+
+    #[test]
+    fn all_covers_every_variant_and_is_ordered() {
+        // ALL must list all 10 variants exactly once, in wizard order.
+        assert_eq!(OnboardingStep::ALL.len(), 10);
+        // Each step's `next()` is the following entry in ALL (except the terminal).
+        for pair in OnboardingStep::ALL.windows(2) {
+            if pair[0] != OnboardingStep::Completed {
+                assert_eq!(pair[0].next(), pair[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn position_is_one_based_and_monotonic() {
+        assert_eq!(OnboardingStep::Welcome.position(), 1);
+        assert_eq!(OnboardingStep::Extensions.position(), 9);
+        assert_eq!(OnboardingStep::Completed.position(), 10);
+        // Strictly increasing across ALL.
+        let positions: Vec<usize> = OnboardingStep::ALL.iter().map(|s| s.position()).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
