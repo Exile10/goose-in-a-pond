@@ -12,6 +12,17 @@ export function mockSseStream(events: Array<Record<string, unknown>>): string {
  * Call `await mockAllApiRoutes(page)` in each test's beforeEach.
  */
 export async function mockAllApiRoutes(page: Page): Promise<void> {
+  // Pin the API base to the conventional local server. In a real browser the
+  // app now defaults to window.location.origin (so the single-executable works
+  // same-origin over the LAN); in tests that origin is the Vite dev server,
+  // whose SPA fallback returns index.html for any UNMOCKED /api/* path, which
+  // would make the app's res.json() throw. Pinning a distinct cross-origin base
+  // keeps unmocked calls failing fast/gracefully, as they did before.
+  await page.addInitScript(() => {
+    (window as unknown as { __GIAP_SERVER_URL__?: string }).__GIAP_SERVER_URL__ =
+      "http://127.0.0.1:4000";
+  });
+
   // Health
   await page.route("**/api/v1/health", (route) =>
     route.fulfill({ json: { status: "ok", version: "test" } }),
