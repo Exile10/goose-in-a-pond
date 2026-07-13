@@ -29,34 +29,32 @@ test.describe("Settings section", () => {
     ).toBeVisible({ timeout: 10_000 });
   });
 
-  test("renders all expected tabs", async ({ page }) => {
-    const expectedTabs = ["Identity", "Voice", "Models", "Prompts", "Agent", "Data"];
-    for (const tab of expectedTabs) {
+  test("renders all expected settings rows", async ({ page }) => {
+    // Settings is now a list/detail panel — check for row labels visible in the list view
+    const expectedRows = ["Account", "Voice", "Models", "Prompts"];
+    for (const row of expectedRows) {
       await expect(
-        page.getByRole("tab", { name: tab }).or(page.getByText(tab)).first()
+        page.getByRole("button", { name: row }).or(page.getByText(row)).first()
       ).toBeVisible({ timeout: 10_000 });
     }
   });
 
-  test("Identity tab shows assistant name and user name fields", async ({ page }) => {
-    // Identity is the default tab — click it explicitly to be safe
-    const identityTab = page
-      .getByRole("tab", { name: /identity/i })
-      .or(page.getByText(/identity/i))
-      .first();
-    await identityTab.click();
+  test("Account panel shows assistant name and user name fields", async ({ page }) => {
+    // Navigate into the Account detail panel
+    await page.getByRole("button", { name: "Account" }).click({ timeout: 5_000 });
 
     await expect(
       page.getByLabel(/assistant name/i)
-        .or(page.getByPlaceholder(/assistant name/i))
+        .or(page.getByPlaceholder(/goose/i))
         .or(page.getByText(/assistant name/i))
         .first()
     ).toBeVisible({ timeout: 10_000 });
   });
 
   test("settings data is loaded from the API on mount", async ({ page }) => {
+    // Navigate into Account panel where user_name and assistant_name inputs live
+    await page.getByRole("button", { name: "Account" }).click({ timeout: 5_000 });
     // The mock returns assistant_name: "Pond" and user_name: "Jerry"
-    // After load, at least one input should contain those values
     await expect(
       page.locator('input').filter({ hasValue: "Pond" })
         .or(page.locator('input').filter({ hasValue: "Jerry" }))

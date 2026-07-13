@@ -99,12 +99,20 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/chat/stream", post(chat_stream))
         .route("/tts", post(tts_synthesise))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/{session_id}", patch(rename_session))
+        .route(
+            "/sessions/{session_id}",
+            patch(rename_session).delete(delete_session),
+        )
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
+        // Push-notification token register/unregister for a paired device (#95).
+        .route(
+            "/devices/{id}/push-token",
+            post(register_push_token).delete(delete_push_token),
+        )
         .route("/settings", get(get_settings))
         .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
@@ -129,7 +137,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sensors", post(record_sensor))
         .route("/sensors/{device_id}", get(get_recent_sensors))
         // Activity query API (#114) — read the unified event log.
-        .route("/activity", get(get_activity))
+        // DELETE clears activity on demand (#117, "clear my activity").
+        .route("/activity", get(get_activity).delete(clear_activity))
         .route("/activity/summary", get(activity_summary))
         .route(
             "/camera/events",
@@ -151,6 +160,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         .route("/schedules/{id}/runs", get(list_schedule_runs))
         .route("/schedules/events", get(schedule_events_sse))
+        // Foreground push: per-device notification stream (#99).
+        .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route(
             "/extensions",
@@ -1009,22 +1020,27 @@ fn chat_stream_inner(
             }
         };
 
-        // ── Agent turn timeout ─────────────────────────────────────────
-        // Compute an absolute deadline for the entire stream consumption.
-        // When agent_timeout_secs is 0, the timeout is effectively disabled
-        // (set to a very large value so the code path stays uniform).
+        // ── Agent turn idle timeout ────────────────────────────────────
+        // Bound the SILENCE between stream events, not total generation.
+        // A slow reasoning model that streams continuously must never be
+        // killed; only a genuinely stalled stream (no event for
+        // `agent_timeout_secs`) trips the deadline. The deadline is reset
+        // after every event received below. When agent_timeout_secs is 0
+        // the timeout is disabled (24h sentinel keeps the path uniform).
         let timeout_secs = settings.agent_timeout_secs;
-        let deadline = tokio::time::Instant::now()
-            + if timeout_secs == 0 {
-                std::time::Duration::from_secs(86_400) // 24h — effectively disabled
-            } else {
-                std::time::Duration::from_secs(timeout_secs)
-            };
+        let idle_budget = if timeout_secs == 0 {
+            std::time::Duration::from_secs(86_400) // effectively disabled
+        } else {
+            std::time::Duration::from_secs(timeout_secs)
+        };
+        let mut deadline = tokio::time::Instant::now() + idle_budget;
         let mut timed_out = false;
 
         loop {
             match tokio::time::timeout_at(deadline, agent_stream.next()).await {
                 Ok(Some(event_result)) => {
+                    // Progress observed — extend the idle window.
+                    deadline = tokio::time::Instant::now() + idle_budget;
                     match event_result {
                         Ok(event) => {
                             let maybe_data = match event {
@@ -1516,6 +1532,31 @@ async fn rename_session(
     })))
 }
 
+/// Delete a session and all its messages.
+///
+/// DELETE /api/v1/sessions/:session_id
+///
+/// Idempotent: deleting a non-existent session returns 204 (the storage
+/// layer does not distinguish a missing row from a deleted one).
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    state
+        .session_storage
+        .delete_session(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Get messages for a session (paginated).
 ///
 /// GET /api/v1/sessions/:session_id/messages?limit=100&offset=0
@@ -1594,13 +1635,18 @@ async fn get_session_messages(
     Ok(Json(json!({ "messages": list })))
 }
 
-async fn system_info() -> Json<Value> {
+async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    let hostname = hostname
+        .strip_suffix(".local")
+        .unwrap_or(&hostname)
+        .to_string();
 
     Json(json!({
         "hostname": hostname,
+        "port": state.api_port,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -1690,6 +1736,104 @@ async fn device_heartbeat(
         )
     })?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterPushTokenRequest {
+    token: String,
+    /// "fcm" | "apns" | "expo".
+    platform: String,
+}
+
+/// Upper bound on a stored push token. Real FCM/APNs/Expo tokens are well under
+/// 1 KB; the cap stops a client from persisting arbitrarily large blobs.
+const MAX_PUSH_TOKEN_LEN: usize = 4096;
+
+/// `POST /api/v1/devices/{id}/push-token` — a paired device registers its
+/// current push token (#95). Validates the device exists and the platform is
+/// known; replaces any prior token for that device.
+async fn register_push_token(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RegisterPushTokenRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(repo) = state.push_token_repo.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "push-token storage not available" })),
+        ));
+    };
+
+    let platform = pond_core::user_data::domain::push_token::PushPlatform::parse(&req.platform)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid `platform`; use fcm|apns|expo" })),
+        ))?;
+    if req.token.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` must not be empty" })),
+        ));
+    }
+    if req.token.len() > MAX_PUSH_TOKEN_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` too long" })),
+        ));
+    }
+
+    // The token must belong to a known, registered device.
+    let exists = state.device_registry.get_device(&id).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: device lookup failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "device lookup failed" })),
+        )
+    })?;
+    if exists.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown device" })),
+        ));
+    }
+
+    let token = pond_core::user_data::domain::push_token::PushToken {
+        device_id: id,
+        token: req.token,
+        platform,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    repo.upsert(token).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: upsert failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not store push token" })),
+        )
+    })?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/v1/devices/{id}/push-token` — drop a device's push token
+/// (logout / unpair). Idempotent.
+async fn delete_push_token(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(repo) = state.push_token_repo.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "push-token storage not available" })),
+        ));
+    };
+    repo.delete(&id).await.map_err(|e| {
+        tracing::warn!(error = %e, "push-token: delete failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not remove push token" })),
+        )
+    })?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_settings(
@@ -3501,6 +3645,7 @@ async fn get_activity(
         trace_id: None,
         since: parse_rfc3339_param("since", params.since)?,
         until: parse_rfc3339_param("until", params.until)?,
+        min_sensitivity: None,
         limit: Some(params.limit.unwrap_or(100).min(ACTIVITY_MAX_LIMIT)),
     };
 
@@ -3519,6 +3664,49 @@ async fn get_activity(
         .collect();
 
     Ok(Json(json!({ "count": visible.len(), "events": visible })))
+}
+
+/// `DELETE /api/v1/activity` — the user "clear my activity" control (#117).
+/// With no query params it purges the entire event log; `category` / `since` /
+/// `until` / `session_id` narrow the purge. Returns the number of events removed.
+async fn clear_activity(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ActivityQueryParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(event_log) = state.event_log.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "event log not available" })),
+        ));
+    };
+
+    let category = match params.category.as_deref() {
+        Some(c) => Some(parse_event_category(c).ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid `category`" })),
+        ))?),
+        None => None,
+    };
+
+    let query = EventQuery {
+        category,
+        session_id: params.session_id,
+        trace_id: None,
+        since: parse_rfc3339_param("since", params.since)?,
+        until: parse_rfc3339_param("until", params.until)?,
+        min_sensitivity: None,
+        limit: None,
+    };
+
+    let purged = event_log.purge(query).await.map_err(|e| {
+        tracing::warn!(error = %e, "activity purge failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "activity purge failed" })),
+        )
+    })?;
+
+    Ok(Json(json!({ "purged": purged })))
 }
 
 #[derive(serde::Deserialize)]
@@ -5327,6 +5515,118 @@ async fn schedule_events_sse(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(serde::Deserialize)]
+struct NotificationStreamParams {
+    device_id: Option<String>,
+}
+
+/// `GET /api/v1/notifications/stream?device_id=X` — foreground push (#99).
+///
+/// A paired device opens this to receive notifications in real time. On connect
+/// it first drains anything queued while it was offline, then tails live events
+/// addressed to it (or `"broadcast"`). Notifications carry a stable `id`; clients
+/// dedupe by it. Bounded by `notification_sse_semaphore`.
+async fn notifications_stream(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<NotificationStreamParams>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
+    let device_id = params.device_id.filter(|s| !s.trim().is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "`device_id` query param required" })),
+    ))?;
+
+    let Some(queue) = state.notification_queue.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "notifications not available" })),
+        ));
+    };
+
+    // The stream must belong to a known, registered device.
+    let exists = state
+        .device_registry
+        .get_device(&device_id)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "notifications: device lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "device lookup failed" })),
+            )
+        })?;
+    if exists.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown device" })),
+        ));
+    }
+
+    // Bound concurrent notification streams. Deliberately NOT the chat
+    // `sse_semaphore`: these connections are long-lived (a phone holds one open
+    // indefinitely) and must never starve interactive chat streaming.
+    let permit = state
+        .notification_sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Too many concurrent streams" })),
+            )
+        })?;
+
+    let mut rx = state.notification_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        let _permit = permit; // held for the stream's lifetime
+
+        // 1. Flush notifications queued while the device was offline.
+        match queue.list_undelivered(&device_id).await {
+            Ok(pending) => {
+                let mut ids = Vec::with_capacity(pending.len());
+                for n in &pending {
+                    let data = serde_json::to_string(n).unwrap_or_default();
+                    ids.push(n.id.clone());
+                    yield Ok(Event::default().data(data));
+                }
+                if !ids.is_empty() {
+                    if let Err(e) = queue.mark_delivered(&ids).await {
+                        tracing::warn!(error = %e, "notifications: flush mark_delivered failed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "notifications: flush query failed"),
+        }
+
+        // 2. Live tail — events for this device or broadcasts.
+        loop {
+            match rx.recv().await {
+                Ok(n) => {
+                    if n.target == device_id || n.target == "broadcast" {
+                        let targeted = n.target == device_id;
+                        let id = n.id.clone();
+                        let data = serde_json::to_string(&n).unwrap_or_default();
+                        yield Ok(Event::default().data(data));
+                        if targeted {
+                            if let Err(e) = queue.mark_delivered(&[id]).await {
+                                tracing::warn!(error = %e, "notifications: live mark_delivered failed");
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    tracing::debug!("notifications SSE lagged by {k} messages");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 // ── Agent tools handler ───────────────────────────────────────────────────────

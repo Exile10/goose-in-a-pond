@@ -21,6 +21,8 @@ async function goToModels(page: Parameters<typeof mockAllApiRoutes>[0]) {
     .or(page.locator('[title="Models"]'))
     .first();
   await modelsBtn.click({ timeout: 10_000 });
+  // Models defaults to "Set up" view; switch to "Manage" where roles/memory/downloads live
+  await page.getByRole("button", { name: "Manage" }).click({ timeout: 5_000 });
 }
 
 test.describe("Models section", () => {

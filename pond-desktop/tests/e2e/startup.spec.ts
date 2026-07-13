@@ -26,8 +26,8 @@ test.describe("App startup", () => {
 
   test("server status indicator is visible", async ({ page }) => {
     await page.goto("/");
-    // Status dot exists — health + handshake mocked so it should show Connected
-    await expect(page.locator('.sidebar__status-dot').first()).toBeVisible();
+    // Status dot on the avatar — class renamed to sidebar__avatar-dot in redesign
+    await expect(page.locator('.sidebar__avatar-dot').first()).toBeVisible();
   });
 
   test("Voice mode button is present in sidebar footer", async ({ page }) => {
@@ -45,9 +45,11 @@ test.describe("App startup", () => {
     const settingsBtn = page.getByRole("button", { name: /settings/i }).first();
     await settingsBtn.click();
 
-    // Identity tab (default) should render a recognisable field
+    // Settings now shows a list/detail panel — the list rows should be visible
     await expect(
-      page.getByText(/identity|assistant name|user name/i).first()
+      page.getByRole("button", { name: "Account" })
+        .or(page.getByRole("button", { name: "Models" }))
+        .first()
     ).toBeVisible({ timeout: 10_000 });
 
     // No unhandled error overlay

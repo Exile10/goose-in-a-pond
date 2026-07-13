@@ -166,11 +166,7 @@ impl OpenMeteoWeatherAdapter {
 
         tracing::debug!("weather: fetching current for {name} ({lat}, {lon})");
 
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(10))
-            .send()
+        let resp = crate::traced_send(self.client.get(&url).timeout(Duration::from_secs(10)), &url)
             .await
             .context("weather API request failed")?
             .error_for_status()
@@ -233,11 +229,7 @@ impl OpenMeteoWeatherAdapter {
 
         tracing::debug!("weather: fetching {days}-day forecast for {name} ({lat}, {lon})");
 
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(10))
-            .send()
+        let resp = crate::traced_send(self.client.get(&url).timeout(Duration::from_secs(10)), &url)
             .await
             .context("forecast API request failed")?
             .error_for_status()

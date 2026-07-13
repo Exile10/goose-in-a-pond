@@ -35,6 +35,12 @@ impl Database {
     pub async fn connect(path: &Path) -> Result<Pool<Sqlite>> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path.display()))?
             .create_if_missing(true)
+            // Enforce foreign keys on every pooled connection. SQLite defaults this
+            // OFF per-connection, so without it the ON DELETE CASCADE constraints
+            // declared across the schema (push_tokens/notifications tie their
+            // lifecycle to the owning device, plus profiles/memory/model roles/…)
+            // are silently no-ops and rows outlive their parents. (#160/#164)
+            .foreign_keys(true)
             .pragma("journal_mode", "WAL")
             .pragma("synchronous", "NORMAL")
             .pragma("cache_size", "2000") // 2000 pages × 4KB = 8MB shared cache

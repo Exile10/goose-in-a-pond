@@ -104,6 +104,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<TopStoriesParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_top_stories");
         let category = resolve_category(params.0.category.as_deref());
         let limit = params.0.limit.unwrap_or(5).clamp(1, 15) as usize;
         println!(
@@ -113,16 +114,15 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
 
         // 1. Fetch story IDs
         let ids_url = format!("{}/{}.json", HN_BASE_URL, category);
-        let ids_resp =
-            match crate::http::traced_get(&self.http_client, &ids_url, "get_top_stories").await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("[news] HN story IDs fetch failed: {e}");
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        crate::format::format_api_error("Hacker News", &e.to_string()),
-                    )]));
-                }
-            };
+        let ids_resp = match crate::http::traced_get(&self.http_client, &ids_url).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("[news] HN story IDs fetch failed: {e}");
+                return Ok(CallToolResult::success(vec![Content::text(
+                    crate::format::format_api_error("Hacker News", &e.to_string()),
+                )]));
+            }
+        };
 
         if !ids_resp.status().is_success() {
             let status = ids_resp.status();
@@ -150,12 +150,10 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         let mut ui_items: Vec<serde_json::Value> = Vec::with_capacity(ids_to_fetch.len());
         for &id in ids_to_fetch {
             let item_url = format!("{}/item/{}.json", HN_BASE_URL, id);
-            match self
-                .http_client
-                .get(&item_url)
-                .timeout(std::time::Duration::from_secs(8))
-                .send()
-                .await
+            match crate::http::traced_get_with(&self.http_client, &item_url, |b| {
+                b.timeout(std::time::Duration::from_secs(8))
+            })
+            .await
             {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(item) = resp.json::<serde_json::Value>().await {
@@ -224,6 +222,7 @@ current events, or news about a topic.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<SearchNewsParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("search_news");
         // 1. Read Guardian API key from settings
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
@@ -263,6 +262,7 @@ Get today's top news headlines and trending topics. Use for 'what's in the news'
         _ctx: RequestContext<RoleServer>,
         params: Parameters<HeadlinesParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_headlines");
         // 1. Read GNews API key from settings
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
@@ -346,12 +346,10 @@ impl NewsMcpServer {
         }
         println!("[news] GET {}", url.replace(api_key, "***"));
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -537,12 +535,10 @@ impl NewsMcpServer {
         }
         println!("[news] GET {}", url.replace(api_key, "***"));
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -755,20 +751,18 @@ impl NewsMcpServer {
         );
         println!("[news] GET {} (Wikimedia feed)", url);
 
-        let resp = self
-            .http_client
-            .get(&url)
-            .header(
+        let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.header(
                 "user-agent",
                 "goose-in-a-pond/0.1 (GIAP MCP; https://github.com/jarida-io/goose-in-a-pond)",
             )
             .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| {
-                println!("[news] Wikimedia feed request failed: {e}");
-                crate::format::format_api_error("Wikipedia (news feed)", &e.to_string())
-            })?;
+        })
+        .await
+        .map_err(|e| {
+            println!("[news] Wikimedia feed request failed: {e}");
+            crate::format::format_api_error("Wikipedia (news feed)", &e.to_string())
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

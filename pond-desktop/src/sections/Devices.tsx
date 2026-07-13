@@ -1,118 +1,339 @@
 import { useState, useEffect } from "react";
-import { Card, CardContent, Button, Chip } from "@heroui/react";
-import { Monitor, Cpu, Activity, Power, Settings, Plus } from "lucide-react";
+import { Button, Separator } from "@heroui/react";
+import { Monitor, Cpu, Activity, Power, Settings, Plus, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader } from "../components/shared";
 import type { Device } from "../api/types";
 
-function deviceIcon(kind: string | undefined): React.ReactNode {
-  switch (kind) {
-    case "host":   return <Cpu size={18} />;
-    case "sensor": return <Activity size={18} />;
-    default:       return <Monitor size={18} />;
-  }
+const DEVICE_TYPES = [
+  { value: "host",          label: "Host / PC" },
+  { value: "sensor",        label: "Sensor" },
+  { value: "gotg",          label: "Mobile (GOTG)" },
+  { value: "smart_speaker", label: "Smart speaker" },
+  { value: "pond",          label: "Pond instance" },
+  { value: "edge",          label: "Edge device" },
+];
+
+function DeviceIcon({ kind }: { kind: string | undefined }) {
+  if (kind === "host")   return <Cpu size={22} />;
+  if (kind === "sensor") return <Activity size={22} />;
+  return <Monitor size={22} />;
 }
 
 function iconClass(kind: string | undefined, isOnline: boolean): string {
   if (!isOnline) return "device-card__icon";
-  switch (kind) {
-    case "host":   return "device-card__icon device-card__icon--host";
-    case "sensor": return "device-card__icon device-card__icon--sensor";
-    default:       return "device-card__icon device-card__icon--edge";
-  }
+  if (kind === "host")   return "device-card__icon device-card__icon--host";
+  if (kind === "sensor") return "device-card__icon device-card__icon--sensor";
+  return "device-card__icon device-card__icon--edge";
 }
 
 function timeSince(iso: string | null | undefined): string {
-  if (!iso) return "\u2014";
+  if (!iso) return "—";
   const diff = Date.now() - new Date(iso).getTime();
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return "now";
   if (mins < 60) return `${mins} min ago`;
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)} days ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 export function Devices() {
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [devices, setDevices]     = useState<Device[]>([]);
+  const [loading, setLoading]     = useState(true);
+  const [error, setError]         = useState<string | null>(null);
+  const [showForm, setShowForm]   = useState(false);
 
-  useEffect(() => {
+  // Form state
+  const [name, setName]               = useState("");
+  const [deviceType, setDeviceType]   = useState("host");
+  const [hostname, setHostname]       = useState("");
+  const [room, setRoom]               = useState("");
+  const [submitting, setSubmitting]   = useState(false);
+  const [formError, setFormError]     = useState<string | null>(null);
+
+  // Per-card action state
+  const [busyId, setBusyId]           = useState<string | null>(null);
+  const [detail, setDetail]           = useState<Device | null>(null);
+
+  function load() {
+    setLoading(true);
     api.listDevices()
       .then(setDevices)
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
-  }, []);
+  }
+
+  useEffect(() => { load(); }, []);
+
+  function openForm() {
+    setName(""); setDeviceType("host"); setHostname(""); setRoom("");
+    setFormError(null);
+    setShowForm(true);
+  }
+
+  function closeForm() { setShowForm(false); setFormError(null); }
+
+  async function handleRegister() {
+    if (!name.trim()) { setFormError("Name is required."); return; }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      await api.registerDevice({
+        name: name.trim(),
+        device_type: deviceType,
+        hostname: hostname.trim() || undefined,
+        capabilities: [],
+        room: room.trim() || undefined,
+      });
+      closeForm();
+      load();
+    } catch (e) {
+      setFormError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  // Toggle device power via the device-control MCP tool (same path the Hub uses).
+  // There is no "wake"/"restart" primitive in the backend, so this is an honest
+  // on/off toggle: turn on when offline, off when online.
+  async function handlePower(d: Device) {
+    setBusyId(d.id);
+    try {
+      await api.invokeTool({
+        server: "giap-device-control",
+        tool: "set_device_state",
+        args: { device_id: d.id, power: !d.is_online },
+      });
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleUnregister(d: Device) {
+    setBusyId(d.id);
+    try {
+      await api.unregisterDevice(d.id);
+      setDetail(null);
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   return (
     <div className="screen screen--devices">
-      <PageHeader
-        title="Devices"
-        action={
-          <Button color="secondary" radius="md" startContent={<Plus size={14} />}>
-            Register device
+      {/* ── Page header ────────────────────────────────────── */}
+      <div className="page-header">
+        <div>
+          <h1 className="page-header__title">Devices</h1>
+          <p className="dev-header__sub">All registered nodes on your local network.</p>
+        </div>
+        <div className="page-header__action">
+          <Button size="sm" variant="primary" onPress={openForm}>
+            <Plus size={14} /> Register device
           </Button>
-        }
-      />
+        </div>
+      </div>
 
-      {loading && <p className="muted-12">Loading devices...</p>}
-      {error && <p className="muted-12 text-error">{error}</p>}
+      {loading && <p className="muted-12">Loading devices…</p>}
+      {error   && <p className="muted-12 text-error">{error}</p>}
 
       {!loading && !error && devices.length === 0 && (
         <div className="empty-state">
           <Monitor size={32} />
           <span>No devices registered yet.</span>
+          <button className="empty-state__cta" onClick={openForm}>
+            <Plus size={14} /> Register device
+          </button>
         </div>
       )}
 
       {devices.length > 0 && (
         <div className="devices-grid">
           {devices.map((d) => (
-            <Card
+            <div
               key={d.id}
-              className={`card device-card${!d.is_online ? " device-card--offline" : ""}`}
+              className={`device-card${!d.is_online ? " device-card--offline" : ""}`}
             >
-              <CardContent>
-                <div className="device-card__head">
-                  <div className={iconClass(d.device_type, d.is_online)}>
-                    {deviceIcon(d.device_type)}
-                  </div>
-                  <Chip
-                    size="sm"
-                    variant="flat"
-                    color={d.is_online ? "success" : "default"}
-                    startContent={<span className={`status-dot status-dot--${d.is_online ? "online" : "offline"}`} />}
-                  >
-                    {d.is_online ? "online" : "offline"}
-                  </Chip>
+              {/* Top: icon + name + IP */}
+              <div className="device-card__top">
+                <span className={iconClass(d.device_type, d.is_online)}>
+                  <DeviceIcon kind={d.device_type} />
+                </span>
+                <div className="device-card__info">
+                  <div className="device-card__name">{d.name}</div>
+                  <code className="device-card__ip">
+                    {d.metadata?.ip != null ? String(d.metadata.ip) : "—"}
+                  </code>
                 </div>
+              </div>
 
-                <div className="device-card__name">{d.name}</div>
+              {/* Chips: status + type + last seen */}
+              <div className="device-card__chips">
+                <span className={`device-card__chip device-card__chip--${d.is_online ? "online" : "offline"}`}>
+                  <span className="device-card__dot" />
+                  {d.is_online ? "online" : "offline"}
+                </span>
+                {d.device_type && (
+                  <span className="device-card__chip">{d.device_type}</span>
+                )}
+                <span className="device-card__chip">{timeSince(d.last_seen)}</span>
+              </div>
 
-                <code className="device-card__ip">
-                  {d.metadata?.ip ?? "\u2014"}
-                </code>
-
-                <div className="device-card__meta">
-                  <span className="muted-12">{d.device_type ?? "edge"}</span>
-                  <span className="muted-12">&middot;</span>
-                  <span className="muted-12">{timeSince(d.last_seen)}</span>
-                </div>
-
-                <div className="card__divider card__divider--device" />
-
-                <div className="device-card__actions">
-                  <Button size="sm" variant="light" startContent={<Power size={13} />}>
-                    {d.is_online ? "Restart" : "Wake"}
-                  </Button>
-                  <Button size="sm" variant="light" startContent={<Settings size={13} />}>
-                    Configure
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
+              {/* Actions */}
+              <div className="device-card__actions">
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => handlePower(d)}
+                  disabled={busyId === d.id}
+                  type="button"
+                >
+                  <Power size={12} /> {d.is_online ? "Turn off" : "Turn on"}
+                </button>
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => setDetail(d)}
+                  type="button"
+                >
+                  <Settings size={12} /> Configure
+                </button>
+              </div>
+            </div>
           ))}
+        </div>
+      )}
+
+      {/* ── Register device modal ─────────────────────────── */}
+      {showForm && (
+        <div className="sched-modal__overlay" onClick={closeForm}>
+          <div className="sched-modal__dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="sched-modal__header">
+              <h2 className="sched-modal__title">Register device</h2>
+              <button className="sched-modal__close" onClick={closeForm} aria-label="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <Separator />
+
+            <div className="sched-modal__body">
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Name</label>
+                <input
+                  className="sched-modal__input"
+                  placeholder="Living Room Pi"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  autoFocus
+                />
+              </div>
+
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Device type</label>
+                <select
+                  className="sched-modal__select"
+                  value={deviceType}
+                  onChange={(e) => setDeviceType(e.target.value)}
+                >
+                  {DEVICE_TYPES.map((t) => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Hostname <span className="sched-modal__cron-hint">(optional)</span></label>
+                <input
+                  className="sched-modal__input"
+                  placeholder="raspberrypi.local"
+                  value={hostname}
+                  onChange={(e) => setHostname(e.target.value)}
+                />
+              </div>
+
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Room <span className="sched-modal__cron-hint">(optional)</span></label>
+                <input
+                  className="sched-modal__input"
+                  placeholder="Living Room"
+                  value={room}
+                  onChange={(e) => setRoom(e.target.value)}
+                />
+              </div>
+
+              {formError && (
+                <p className="text-error text-error--sm">{formError}</p>
+              )}
+            </div>
+
+            <Separator />
+
+            <div className="sched-modal__footer">
+              <Button size="sm" variant="ghost" onPress={closeForm}>Cancel</Button>
+              <Button
+                size="sm"
+                variant="primary"
+                isDisabled={submitting || !name.trim()}
+                onPress={handleRegister}
+              >
+                {submitting ? "Registering…" : "Register"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Device detail / configure modal ─────────────────── */}
+      {detail && (
+        <div className="sched-modal__overlay" onClick={() => setDetail(null)}>
+          <div className="sched-modal__dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="sched-modal__header">
+              <h2 className="sched-modal__title">{detail.name}</h2>
+              <button className="sched-modal__close" onClick={() => setDetail(null)} aria-label="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <Separator />
+            <div className="sched-modal__body">
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Type</label>
+                <div className="muted-12">{detail.device_type ?? "—"}</div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Room</label>
+                <div className="muted-12">{detail.room ?? "—"}</div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Status</label>
+                <div className="muted-12">
+                  {detail.is_online ? "online" : "offline"} · last seen {timeSince(detail.last_seen)}
+                </div>
+              </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Address</label>
+                <code className="device-card__ip">
+                  {detail.metadata?.ip != null ? String(detail.metadata.ip) : "—"}
+                </code>
+              </div>
+            </div>
+            <Separator />
+            <div className="sched-modal__footer">
+              <Button size="sm" variant="ghost" onPress={() => setDetail(null)}>Close</Button>
+              <Button
+                size="sm"
+                variant="danger"
+                isDisabled={busyId === detail.id}
+                onPress={() => handleUnregister(detail)}
+              >
+                {busyId === detail.id ? "Removing…" : "Unregister device"}
+              </Button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -184,7 +184,7 @@ export class PondApiClient {
     return this.get("/api/v1/health");
   }
 
-  getSystemInfo(): Promise<{ hostname: string; version: string; platform: string; arch: string }> {
+  getSystemInfo(): Promise<{ hostname: string; port: number; version: string; platform: string; arch: string }> {
     return this.get("/api/v1/system/info");
   }
 
@@ -214,6 +214,20 @@ export class PondApiClient {
     return this.get<{ devices: Device[] } | Device[]>("/api/v1/devices").then((r) =>
       Array.isArray(r) ? r : (r as { devices: Device[] }).devices ?? [],
     );
+  }
+
+  registerDevice(req: {
+    name: string;
+    device_type: string;
+    hostname?: string;
+    capabilities: string[];
+    room?: string;
+  }): Promise<Device> {
+    return this.post<Device>("/api/v1/devices", req);
+  }
+
+  unregisterDevice(id: string): Promise<void> {
+    return this.del(`/api/v1/devices/${encodeURIComponent(id)}`);
   }
 
   // ── Schedules ─────────────────────────────────────────────
@@ -529,6 +543,18 @@ export class PondApiClient {
     return res.accepted ? res.session_token : null;
   }
 
+  // ── Pairing ───────────────────────────────────────────────
+
+  /** Return the current unexpired pairing code, or null if none is active. Loopback-only. */
+  getPairingCode(): Promise<PairingCodeResponse> {
+    return this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
+  }
+
+  /** Issue a fresh pairing code, replacing any existing one. Loopback-only. */
+  issuePairingCode(): Promise<PairingCodeResponse> {
+    return this.handshakeFetch<PairingCodeResponse>("POST", "/api/v1/handshake/pairing-code");
+  }
+
   // ── Models ────────────────────────────────────────────────
 
   listModels(): Promise<ModelEntry[]> {
@@ -626,6 +652,10 @@ export class PondApiClient {
         tool_call_id: m.tool_call_id as string | undefined,
       }));
     });
+  }
+
+  deleteSession(sessionId: string): Promise<void> {
+    return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
   }
 
   // ── Prompts ───────────────────────────────────────────────
@@ -1073,6 +1103,23 @@ export class PondApiClient {
 
   async deleteSecret(key: string): Promise<void> {
     await this.del(`/api/v1/secrets/${encodeURIComponent(key)}`);
+  }
+
+  // ── Activity ──────────────────────────────────────────────
+
+  listActivity(params?: import("./types").ActivityQueryParams): Promise<import("./types").ActivityResponse> {
+    const qs = new URLSearchParams();
+    if (params?.limit !== undefined) qs.set("limit", String(params.limit));
+    if (params?.since) qs.set("since", params.since);
+    if (params?.category) qs.set("category", params.category);
+    if (params?.session_id) qs.set("session_id", params.session_id);
+    const q = qs.toString();
+    return this.get(`/api/v1/activity${q ? `?${q}` : ""}`);
+  }
+
+  getActivitySummary(window?: "hour" | "day" | "week"): Promise<import("./types").ActivitySummary> {
+    const q = window ? `?window=${window}` : "";
+    return this.get(`/api/v1/activity/summary${q}`);
   }
 
   // ── Logs ─────────────────────────────────────────────────
