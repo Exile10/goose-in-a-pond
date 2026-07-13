@@ -2387,11 +2387,14 @@ async fn run_server(
             }
         };
 
-    // Warn if static assets haven't been built yet
-    if !static_dir.exists() {
+    // The web UI is normally embedded into this binary (single executable). We
+    // only fall back to `static_dir` when the binary was built without the UI,
+    // so a missing dir is only worth warning about in that case.
+    if !pond_api::web_ui_embedded() && !static_dir.exists() {
         tracing::warn!(
-            "Static dir {:?} not found — web dashboard will not be served. \
-             Run `cd web && npm run build` to build it.",
+            "No web UI embedded and static dir {:?} not found — the dashboard will \
+             not be served. Build the UI (`cd pond-desktop && npm run build`) before \
+             building the server to embed it, or pass an existing --static-dir.",
             static_dir
         );
     }
@@ -4785,6 +4788,7 @@ async fn build_goose_backend(
     Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>,
 ) {
     use pond_adapters_goose::GooseAdapter;
+    #[cfg(feature = "local-inference")]
     use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
     use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
@@ -4871,6 +4875,11 @@ async fn build_goose_backend(
     }
 
     // Build tool-calling specialist (FunctionGemma) if configured.
+    // The specialist is an in-process GGUF engine, so it only exists when the
+    // `local-inference` feature is compiled in. In lean builds (e.g. the Jetson
+    // single-executable without in-process GGUF) there is no specialist and the
+    // main LLM handles all tool calling natively via MCP.
+    #[cfg(feature = "local-inference")]
     let tool_caller: Option<Arc<dyn ToolCaller>> = {
         let settings = settings_repo.get().await.unwrap_or_default();
         match settings.tool_model.as_deref() {
@@ -4889,6 +4898,8 @@ async fn build_goose_backend(
             _ => None,
         }
     };
+    #[cfg(not(feature = "local-inference"))]
+    let tool_caller: Option<Arc<dyn ToolCaller>> = None;
 
     // Register all GIAP MCP servers into Goose's builtin extension registry.
     // Extension toggles (ext_*_enabled) are read from settings to gate registration.

@@ -9,7 +9,12 @@
 #   # Add --features pond-adapters-local-inference/cuda for GPU acceleration
 
 [build.env]
-passthrough = ["SQLX_OFFLINE", "RUST_LOG"]
+# RUSTFLAGS is passed through so the host-side override (portable target-cpu for
+# the Jetson Orin Nano, e.g. cortex-a78) reaches the in-container rustc. This is
+# required to neutralise the workspace `.cargo/config.toml` `[build] rustflags =
+# ["-C","target-cpu=native"]`, which would otherwise bake the BUILD container's
+# CPU into the binary and produce a non-portable artifact.
+passthrough = ["SQLX_OFFLINE", "RUST_LOG", "RUSTFLAGS"]
 
 [target.aarch64-unknown-linux-gnu]
 xargo = false
