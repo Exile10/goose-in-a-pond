@@ -179,6 +179,7 @@ export function AccountDetail({ go }: AccountDetailProps) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [signingOut, setSigningOut] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [flash, setFlash] = useState<{ text: string; ok: boolean } | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -231,6 +232,19 @@ export function AccountDetail({ go }: AccountDetailProps) {
     } catch {
       setSigningOut(false);
       showFlash("Sign out failed.", false);
+    }
+  }
+
+  async function handleRestartOnboarding() {
+    if (restarting) return;
+    setRestarting(true);
+    try {
+      await api.resetOnboarding();
+      // Route back into the onboarding wizard. Settings are preserved server-side.
+      dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true });
+    } catch (e) {
+      setRestarting(false);
+      showFlash(`Couldn't restart setup: ${String(e)}`, false);
     }
   }
 
@@ -336,6 +350,21 @@ export function AccountDetail({ go }: AccountDetailProps) {
           onClick={() => {
             /* TODO: open help/feedback modal */
           }}
+        />
+        <Row
+          label="Restart onboarding"
+          sub="Walk through first-time setup again. Your settings are kept."
+          control={
+            <button
+              className="acct-restart-btn"
+              type="button"
+              disabled={restarting}
+              onClick={() => void handleRestartOnboarding()}
+              data-testid="restart-onboarding-btn"
+            >
+              {restarting ? "Restarting..." : "Start over"}
+            </button>
+          }
         />
       </Card>
 

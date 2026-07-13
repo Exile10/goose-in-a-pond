@@ -24,7 +24,7 @@ export const STEPS: StepMeta[] = [
   { id: "complete",    label: "All set",               caption: "Hello, world",        required: false },
 ];
 
-// ── FE ↔ BE step mapping ───────────────────────────────────
+// ── FE / BE step mapping ───────────────────────────────────
 //
 // The wizard has 7 visible steps; the backend `OnboardingStep` enum has 10
 // variants (Welcome, Basics, Location, Accessibility, Personality,
