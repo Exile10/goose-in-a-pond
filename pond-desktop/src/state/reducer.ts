@@ -106,7 +106,12 @@ export function nextCardId(): number { return ++_cardIdCounter; }
 
 export function buildInitialState(): AppState {
   const storedMode = normalizeDesktopMode(localStorage.getItem("giap-mode"));
-  const storedSection = normalizeGuiSection(localStorage.getItem("giap-section"));
+  // The classic (sections) UI is the default landing surface. The Goose Hub is
+  // still a preview (reachable via Settings > "Preview Goose Hub"), so never
+  // *start* in it even if it was the last-viewed section — always land on the
+  // classic UI on launch/reload.
+  const rawSection = normalizeGuiSection(localStorage.getItem("giap-section"));
+  const storedSection: GuiSection = rawSection === "hub" ? "dashboard" : rawSection;
   const storedUrl = localStorage.getItem("giap-server-url") || defaultServerUrl();
   const storedToken = localStorage.getItem("giap-session-token") || null;
 
