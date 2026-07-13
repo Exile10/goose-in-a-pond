@@ -112,6 +112,90 @@ test.describe("Models section", () => {
     ).toBeVisible({ timeout: 10_000 });
   });
 
+  test("memory-fit guard: too-large model shows a spill warning", async ({ page }) => {
+    // Budget: 4096 MB available → effective 3072 MB after 1 GB headroom.
+    await page.route("**/api/v1/models/memory-status", (route) =>
+      route.fulfill({
+        json: { total_mb: 8192, available_for_llm_mb: 4096, loaded_model: null },
+      }),
+    );
+    // One installed model that spills (5600 MB) and one that fits (1600 MB).
+    await page.route("**/api/v1/models", (route) =>
+      route.fulfill({
+        json: {
+          llamafile: [],
+          gguf: [
+            {
+              category: "gguf",
+              name: "gemma3n-e2b-toolarge",
+              description: "gemma3n e2b (too large)",
+              size_mb: 5600,
+              downloaded: true,
+              active: false,
+            },
+            {
+              category: "gguf",
+              name: "gemma-2-2b-fits",
+              description: "gemma 2 2b (fits)",
+              size_mb: 1600,
+              downloaded: true,
+              active: false,
+            },
+          ],
+          whisper: [],
+          tts: [],
+          ollama: [],
+          embedding: [],
+        },
+      }),
+    );
+
+    await goToModels(page);
+
+    // The spill warning badge appears for the too-large model.
+    await expect(page.locator(".fit-badge").first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".fit-badge").first()).toContainText(/too large/i);
+
+    // Exactly one badge — the fitting model must NOT be flagged.
+    await expect(page.locator(".fit-badge")).toHaveCount(1);
+  });
+
+  test("memory-fit guard: no warning when budget is unavailable (Mac/dev)", async ({ page }) => {
+    // NoopScheduler / Mac dev reports zeros → no verdict, no badge.
+    await page.route("**/api/v1/models/memory-status", (route) =>
+      route.fulfill({
+        json: { total_mb: 0, available_for_llm_mb: 0, loaded_model: null },
+      }),
+    );
+    await page.route("**/api/v1/models", (route) =>
+      route.fulfill({
+        json: {
+          llamafile: [],
+          gguf: [
+            {
+              category: "gguf",
+              name: "gemma3n-e2b-toolarge",
+              description: "gemma3n e2b (too large)",
+              size_mb: 5600,
+              downloaded: true,
+              active: false,
+            },
+          ],
+          whisper: [],
+          tts: [],
+          ollama: [],
+          embedding: [],
+        },
+      }),
+    );
+
+    await goToModels(page);
+
+    // The model list renders, but no spill badge appears (budget unknown).
+    await expect(page.getByText(/gemma3n e2b/i).first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".fit-badge")).toHaveCount(0);
+  });
+
   test("download progress bar visible when download in progress", async ({ page }) => {
     await page.route("**/api/v1/models/download/progress", (route) =>
       route.fulfill({
