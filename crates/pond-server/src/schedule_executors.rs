@@ -9,7 +9,8 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::agent::Agent;
 use pond_core::shared::domain::agent::AgentRequest;
-use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::domain::schedule::{TaskKind, TriggerAction};
+use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use std::sync::Arc;
@@ -17,11 +18,15 @@ use tokio::sync::{OnceCell, Semaphore};
 
 // ── AgentScheduleExecutor ────────────────────────────────────────────────────
 
-/// Executes scheduled tasks by dispatching to the LLM agent or HTTP webhook.
+/// Executes scheduled tasks by dispatching to the LLM agent, an HTTP webhook,
+/// or — for sensor-triggered rules (#92) — a list of actions (agent prompt,
+/// device control, notification).
 pub struct AgentScheduleExecutor {
     agent: Arc<dyn Agent>,
     session_storage: Arc<dyn SessionStorage>,
     http_client: reqwest::Client,
+    /// Actuation seam for rule actions. `None` → device actions report failure.
+    device_control: Option<Arc<dyn DeviceControlPort>>,
     /// Limit concurrent scheduled runs to avoid starving interactive chat.
     semaphore: Semaphore,
 }
@@ -30,13 +35,81 @@ impl AgentScheduleExecutor {
     pub fn new(
         agent: Arc<dyn Agent>,
         session_storage: Arc<dyn SessionStorage>,
+        device_control: Option<Arc<dyn DeviceControlPort>>,
         max_concurrent: u32,
     ) -> Self {
         Self {
             agent,
             session_storage,
             http_client: reqwest::Client::new(),
+            device_control,
             semaphore: Semaphore::new(max_concurrent.max(1) as usize),
+        }
+    }
+
+    /// Send `prompt` to the agent in an ephemeral session. Shared by the
+    /// `AgentPrompt` kind and the rule `AgentPrompt` action (no recursion —
+    /// the semaphore is held once by `execute`).
+    async fn run_agent_prompt(&self, task_id: &str, prompt: &str) -> Result<String> {
+        let session_id = format!("sched-{}-{}", task_id, chrono::Utc::now().timestamp());
+        let _ = self
+            .session_storage
+            .create_session(session_id.clone())
+            .await;
+
+        let request = AgentRequest {
+            message: prompt.to_string(),
+            session_id,
+            model_role: "task".to_string(),
+            images: vec![],
+            voice_mode: false,
+            canvas_mode: false,
+        };
+
+        tracing::info!("[scheduler] executing prompt for task {task_id}");
+        let response = self.agent.chat(request).await?;
+        tracing::info!(
+            "[scheduler] task {task_id} completed ({} chars)",
+            response.text.len()
+        );
+        Ok(response.text)
+    }
+
+    /// Run one sensor-rule action, returning a short outcome summary.
+    async fn run_trigger_action(&self, task_id: &str, action: &TriggerAction) -> Result<String> {
+        match action {
+            TriggerAction::AgentPrompt { prompt } => self.run_agent_prompt(task_id, prompt).await,
+            TriggerAction::DevicePower { device_id, on } => match &self.device_control {
+                Some(dc) => {
+                    dc.set_power(device_id, *on).await?;
+                    Ok(format!(
+                        "{device_id} switched {}",
+                        if *on { "on" } else { "off" }
+                    ))
+                }
+                None => bail!("device control not available"),
+            },
+            TriggerAction::Notify { title, body } => {
+                // Resolved at fire time via the process-global (set during
+                // startup, long before any rule can fire) — same pattern as
+                // the `send_notification` MCP tool.
+                match pond_mcp_server::notification_sender() {
+                    Some(sender) => {
+                        let n = pond_core::mcp::ports::notification::Notification {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            target: "broadcast".to_string(),
+                            category: "alert".to_string(),
+                            title: title.clone(),
+                            body: body.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            data: None,
+                        };
+                        sender.broadcast(n).await?;
+                        Ok(format!("notified: {title}"))
+                    }
+                    None => bail!("notification sender not available"),
+                }
+            }
         }
     }
 }
@@ -47,31 +120,7 @@ impl ScheduleExecutor for AgentScheduleExecutor {
         let _permit = self.semaphore.acquire().await?;
 
         match kind {
-            TaskKind::AgentPrompt { prompt } => {
-                let session_id = format!("sched-{}-{}", task_id, chrono::Utc::now().timestamp());
-                // Create an ephemeral session for this run.
-                let _ = self
-                    .session_storage
-                    .create_session(session_id.clone())
-                    .await;
-
-                let request = AgentRequest {
-                    message: prompt.clone(),
-                    session_id: session_id.clone(),
-                    model_role: "task".to_string(),
-                    images: vec![],
-                    voice_mode: false,
-                    canvas_mode: false,
-                };
-
-                tracing::info!("[scheduler] executing prompt for task {task_id}");
-                let response = self.agent.chat(request).await?;
-                tracing::info!(
-                    "[scheduler] task {task_id} completed ({} chars)",
-                    response.text.len()
-                );
-                Ok(response.text)
-            }
+            TaskKind::AgentPrompt { prompt } => self.run_agent_prompt(task_id, prompt).await,
             TaskKind::Webhook { webhook_url } => {
                 tracing::info!("[scheduler] firing webhook for task {task_id}: {webhook_url}");
                 let resp = self
@@ -86,6 +135,34 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                     bail!("task {task_id}: webhook returned {status}");
                 }
                 Ok(format!("Webhook returned {status}"))
+            }
+            TaskKind::SensorTrigger(spec) => {
+                // Run every action; report per-action outcomes. The run only
+                // counts as failed when *no* action succeeded.
+                let mut summaries = Vec::with_capacity(spec.actions.len());
+                let mut any_ok = false;
+                for action in &spec.actions {
+                    match self.run_trigger_action(task_id, action).await {
+                        Ok(s) => {
+                            any_ok = true;
+                            summaries.push(s);
+                        }
+                        Err(e) => {
+                            tracing::warn!("[rules] task {task_id} action failed: {e}");
+                            summaries.push(format!("action failed: {e}"));
+                        }
+                    }
+                }
+                if spec.actions.is_empty() {
+                    bail!("task {task_id}: sensor rule has no actions");
+                }
+                if !any_ok {
+                    bail!(
+                        "task {task_id}: all rule actions failed: {}",
+                        summaries.join("; ")
+                    );
+                }
+                Ok(summaries.join(" · "))
             }
         }
     }
