@@ -212,8 +212,47 @@ export class PondApiClient {
     return this.get("/api/v1/onboard/status");
   }
 
+  /**
+   * Record that the wizard has reached an onboarding step. `step` is a backend
+   * `OnboardingStep` variant name (e.g. "Basics", "WakeWord"). Progress is
+   * monotonic server-side, so re-reporting an earlier step is a safe no-op.
+   */
+  recordOnboardingStep(
+    step: string,
+  ): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {
+    return this.post(`/api/v1/onboard/step/${encodeURIComponent(step)}`);
+  }
+
   completeOnboarding(): Promise<{ status: string }> {
     return this.post("/api/v1/onboard/complete");
+  }
+
+  /**
+   * Reset onboarding back to the first step ("Start over"). Clears persisted
+   * progress and re-arms the onboarding guard so the wizard shows again.
+   */
+  resetOnboarding(): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {
+    return this.post("/api/v1/onboard/reset");
+  }
+
+  /**
+   * Synthesize `text` to speech and return the raw audio bytes (WAV) for
+   * client-side playback. Throws {@link ApiError} (e.g. 503) when no TTS
+   * backend is running — callers should degrade gracefully.
+   */
+  async synthesizeSpeech(text: string): Promise<ArrayBuffer> {
+    await this.ensureTokenFresh();
+    const res = await fetch(`${this.base}/api/v1/tts`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
+      throw new ApiError(res.status, msg);
+    }
+    return res.arrayBuffer();
   }
 
   // ── Settings ──────────────────────────────────────────────

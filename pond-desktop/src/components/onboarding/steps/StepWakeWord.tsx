@@ -1,10 +1,10 @@
 // ────────────────────────────────────────────────────────────
 // Step 4 — Wake Word
-// Skip allowed — defaults to "goose"
+// Optional — defaults to "goose". Real mic calibration is deferred to
+// Settings → Voice so onboarding never blocks on microphone permissions.
 // ────────────────────────────────────────────────────────────
 
-import { useState, useRef, useEffect } from "react";
-import { Mic } from "lucide-react";
+import { Mic, Settings2 } from "lucide-react";
 import { useOnboarding } from "../OnboardingContext";
 import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
@@ -13,32 +13,6 @@ import { WAKE_PRESETS } from "../onboarding.constants";
 
 export function StepWakeWord() {
   const { draft, patch } = useOnboarding();
-  const [calibrating, setCalibrating] = useState(false);
-  const [level, setLevel] = useState(0);
-  const [samples, setSamples] = useState(0);
-  const tick = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    return () => { if (tick.current) clearInterval(tick.current); };
-  }, []);
-
-  function startCalib() {
-    setCalibrating(true);
-    setLevel(0);
-    setSamples(0);
-    tick.current = setInterval(() => {
-      setLevel(0.15 + Math.random() * 0.85);
-      setSamples((s) => {
-        const n = s + 1;
-        if (n >= 12) {
-          if (tick.current) clearInterval(tick.current);
-          setCalibrating(false);
-          setLevel(0);
-        }
-        return n;
-      });
-    }, 220);
-  }
 
   const isCustom = draft.wakeWord === "custom";
 
@@ -81,53 +55,24 @@ export function StepWakeWord() {
         </div>
       )}
 
-      {/* Calibration */}
+      {/* Calibration is deferred — no mic permission prompt during onboarding. */}
       <div className="ob-calibration">
         <div className="ob-calibration__header">
           <div>
             <div className="ob-calibration__title">
               <Mic size={16} strokeWidth={1.8} className="ob-calibration__title-icon" />
-              Calibrate microphone
+              Calibrate later
             </div>
             <p className="ob-calibration__desc">
-              Say your wake word a few times so Goose learns your voice pattern.
+              Calibration teaches Goose how your voice sounds so it hears your
+              wake word more reliably. It needs microphone access, so we've left
+              it out of setup. You can calibrate any time in{" "}
+              <strong>Settings &rarr; Voice</strong>.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={startCalib}
-            disabled={calibrating}
-            className="ob-calibration__btn"
-          >
-            {calibrating ? "Listening\u2026" : samples >= 12 ? "Re-calibrate" : "Start"}
-          </button>
-        </div>
-
-        {/* Level meter */}
-        <div className="ob-calibration__meter">
-          {Array.from({ length: 20 }).map((_, i) => {
-            const t = i / 19;
-            const on = calibrating && level > t;
-            return (
-              <div
-                key={i}
-                className="ob-calibration__meter-bar"
-                style={{
-                  height: on ? `${40 + level * 60}%` : "25%",
-                  background: on ? `hsl(${270 - t * 40}, 80%, 60%)` : undefined,
-                }}
-              />
-            );
-          })}
-        </div>
-
-        {/* Progress */}
-        <div className="ob-calibration__progress">
-          <span className="ob-calibration__progress-label">Samples</span>
-          <div className="ob-calibration__progress-track">
-            <div className="ob-calibration__progress-bar" style={{ width: `${(samples / 12) * 100}%` }} />
+          <div className="ob-calibration__later" aria-hidden="true">
+            <Settings2 size={18} strokeWidth={1.8} />
           </div>
-          <span className="ob-calibration__progress-count">{samples}/12</span>
         </div>
       </div>
     </div>
