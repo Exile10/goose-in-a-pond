@@ -5,6 +5,7 @@ import {
   normalizeGuiSection,
 } from "../desktopState";
 import type { ScheduleRunNotification, DebriefContext } from "../api/types";
+import { defaultServerUrl } from "../api/PondApiClient";
 
 export type VoiceState = "idle" | "wait" | "recording" | "thinking" | "speaking" | "error";
 
@@ -106,7 +107,7 @@ export function nextCardId(): number { return ++_cardIdCounter; }
 export function buildInitialState(): AppState {
   const storedMode = normalizeDesktopMode(localStorage.getItem("giap-mode"));
   const storedSection = normalizeGuiSection(localStorage.getItem("giap-section"));
-  const storedUrl = localStorage.getItem("giap-server-url") || "http://127.0.0.1:4000";
+  const storedUrl = localStorage.getItem("giap-server-url") || defaultServerUrl();
   const storedToken = localStorage.getItem("giap-session-token") || null;
 
   return {

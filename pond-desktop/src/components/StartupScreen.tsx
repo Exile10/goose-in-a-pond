@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@heroui/react";
 import logoSrc from "../assets/logo.png";
+import { defaultServerUrl } from "../api/PondApiClient";
 
 interface Props {
   onReady: () => void;
@@ -44,9 +45,7 @@ export function StartupScreen({ onReady }: Props) {
     if (!isTauri) {
       // Browser dev mode: poll the health endpoint directly via fetch.
       // This lets Playwright and web browser testing work without Tauri.
-      const serverUrl =
-        (window as { __GIAP_SERVER_URL__?: string }).__GIAP_SERVER_URL__ ??
-        "http://127.0.0.1:4000";
+      const serverUrl = defaultServerUrl();
       for (let i = 0; i < MAX_POLLS; i++) {
         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
         try {

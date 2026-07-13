@@ -64,9 +64,25 @@ if [ "$DESKTOP" = true ]; then
     libayatana-appindicator3-dev
 fi
 
+# ── 2b. Build the web UI (embedded into the single-executable server) ────────
+# pond-server embeds pond-desktop/dist at compile time (crates/pond-api/build.rs
+# + routes.rs), so the built binary is a single self-contained executable. Build
+# the UI BEFORE the server so the real dashboard is embedded rather than the
+# build.rs placeholder.
+echo ""
+echo "Building web UI (embedded into the server binary)..."
+if command -v npm &>/dev/null; then
+  ( cd pond-desktop && npm ci --no-audit --no-fund && npm run build )
+  echo "  UI built — will be embedded into pond-server."
+else
+  echo "  Node.js/npm not found — the server will build API-only (no embedded UI)."
+  echo "  To embed the dashboard, install Node and re-run:"
+  echo "    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt-get install -y nodejs"
+fi
+
 # ── 3. Build pond-server ─────────────────────────────────────────────────────
 echo ""
-echo "Building pond-server..."
+echo "Building pond-server (single executable — API + embedded UI)..."
 
 SERVER_FEATURES=""
 if [ "$CUDA" = true ]; then
