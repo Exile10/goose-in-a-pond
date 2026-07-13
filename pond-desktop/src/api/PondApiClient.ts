@@ -52,6 +52,24 @@ declare global {
   }
 }
 
+// Resolve the pond-server base URL for the current runtime.
+//   1. Tauri desktop shell injects `window.__GIAP_SERVER_URL__` (a local server).
+//   2. Dashboard served over HTTP by the single-executable → the API lives at
+//      the SAME origin the page was loaded from. Using window.location.origin
+//      makes remote/LAN access work (same-origin, no CORS) instead of every
+//      request hitting the *viewer's* own 127.0.0.1.
+//   3. Fallback (SSR / non-browser / tests): the conventional local server.
+export function defaultServerUrl(): string {
+  if (typeof window !== "undefined") {
+    if (window.__GIAP_SERVER_URL__) return window.__GIAP_SERVER_URL__;
+    const isTauri = "__TAURI_INTERNALS__" in window;
+    if (!isTauri && window.location?.origin?.startsWith("http")) {
+      return window.location.origin;
+    }
+  }
+  return "http://127.0.0.1:4000";
+}
+
 export class PondApiClient {
   private readonly base: string;
   private token: string | null;
@@ -64,7 +82,7 @@ export class PondApiClient {
   private static readonly LS_EXPIRES = "giap-token-expires-at";
 
   constructor(base?: string, token?: string | null) {
-    this.base = (base ?? window.__GIAP_SERVER_URL__ ?? "http://127.0.0.1:4000").replace(/\/$/, "");
+    this.base = (base ?? defaultServerUrl()).replace(/\/$/, "");
     this.token = token ?? null;
     // Hydrate persisted tokens so the desktop survives restarts without
     // re-pairing. An explicit constructor token takes precedence.
