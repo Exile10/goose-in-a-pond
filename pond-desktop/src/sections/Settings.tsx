@@ -59,7 +59,26 @@ const TIMEZONES = [
 
 // ── Tab content components ────────────────────────────────────
 
-function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
+function IdentityTab({
+  s, patch, onRestartOnboarding,
+}: {
+  s: Partial<SettingsType>;
+  patch: (k: keyof SettingsType, v: unknown) => void;
+  onRestartOnboarding: () => void;
+}) {
+  const [restarting, setRestarting] = useState(false);
+
+  async function restart() {
+    if (restarting) return;
+    setRestarting(true);
+    try {
+      await api.resetOnboarding();
+      onRestartOnboarding();
+    } catch {
+      setRestarting(false);
+    }
+  }
+
   return (
     <>
       <Section title="Personal">
@@ -122,6 +141,13 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             onChange={(e) => patch("weather_longitude", e.target.value === "" ? null : Number(e.target.value))}
             placeholder="36.8219"
           />
+        </Row>
+      </Section>
+      <Section title="Onboarding">
+        <Row label="Start over" hint="Reset first-time setup and walk through the onboarding wizard again. Your settings are kept.">
+          <Button variant="outline" size="sm" isDisabled={restarting} onPress={restart}>
+            {restarting ? "Restarting…" : "Restart onboarding"}
+          </Button>
         </Row>
       </Section>
     </>
@@ -679,7 +705,7 @@ export function Settings() {
 
   function renderDetail(id: SettingsRowId) {
     switch (id) {
-      case "account":       return <IdentityTab s={settings} patch={patch} />;
+      case "account":       return <IdentityTab s={settings} patch={patch} onRestartOnboarding={() => dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true })} />;
       case "models":        return <ModelsTab   s={settings} patch={patch} devMode={devMode} />;
       case "prompts":       return <PromptsTab  s={settings} patch={patch} />;
       case "voice":         return <VoiceTab    s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} refreshSettings={refreshSettings} devMode={devMode} />;
