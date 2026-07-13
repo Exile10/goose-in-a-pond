@@ -174,6 +174,32 @@ pub struct Settings {
     #[serde(default = "Settings::default_weather_location_name")]
     pub weather_location_name: String,
 
+    // ── Vision (#130) ──────────────────────────────────────────────────────
+    /// Whether to run the on-device vision pipeline (camera capture + motion
+    /// detection feeding camera_events / the EventBus). Off by default —
+    /// requires a camera and ffmpeg on the device.
+    #[serde(default = "Settings::default_vision_enabled")]
+    pub vision_enabled: bool,
+
+    /// Camera input for the vision pipeline: an `rtsp://` URL or a local
+    /// device path like `/dev/video0`. Empty = pipeline not started.
+    #[serde(default = "Settings::default_vision_camera_url")]
+    pub vision_camera_url: String,
+
+    /// The camera_id stamped on emitted vision events (matched by automation
+    /// rules and shown in the activity feed).
+    #[serde(default = "Settings::default_vision_camera_id")]
+    pub vision_camera_id: String,
+
+    /// Frames per second to analyse (low on purpose — motion detection does
+    /// not need full frame rate, and this bounds CPU use on the Jetson).
+    #[serde(default = "Settings::default_vision_fps")]
+    pub vision_fps: u32,
+
+    /// Fraction of the frame (0.0–1.0) that must change to count as motion.
+    #[serde(default = "Settings::default_vision_motion_threshold")]
+    pub vision_motion_threshold: f64,
+
     // ── Data retention ─────────────────────────────────────────────────────
     /// Days to keep rows in event_log (0 = keep forever)
     #[serde(default = "Settings::default_event_log_days")]
@@ -479,6 +505,12 @@ pub struct Settings {
     /// Enable the audit/privacy tools module (recent activity, summary, privacy risks).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_audit_enabled: bool,
+
+    /// Enable the vision tools module (recent camera events, acknowledge).
+    /// Read-only over the local event store — independent of `vision_enabled`,
+    /// which controls the capture pipeline itself.
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_vision_enabled: bool,
 }
 
 impl Default for Settings {
@@ -517,6 +549,11 @@ impl Default for Settings {
             weather_latitude: Self::default_weather_latitude(),
             weather_longitude: Self::default_weather_longitude(),
             weather_location_name: Self::default_weather_location_name(),
+            vision_enabled: Self::default_vision_enabled(),
+            vision_camera_url: Self::default_vision_camera_url(),
+            vision_camera_id: Self::default_vision_camera_id(),
+            vision_fps: Self::default_vision_fps(),
+            vision_motion_threshold: Self::default_vision_motion_threshold(),
             retention_event_log_days: Self::default_event_log_days(),
             retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
@@ -576,6 +613,7 @@ impl Default for Settings {
             ext_system_enabled: true,
             ext_device_enabled: true,
             ext_audit_enabled: true,
+            ext_vision_enabled: true,
             ext_news_enabled: true,
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
@@ -663,6 +701,21 @@ impl Settings {
     }
     fn default_weather_location_name() -> String {
         "".to_string()
+    }
+    fn default_vision_enabled() -> bool {
+        false
+    }
+    fn default_vision_camera_url() -> String {
+        "".to_string()
+    }
+    fn default_vision_camera_id() -> String {
+        "camera-1".to_string()
+    }
+    fn default_vision_fps() -> u32 {
+        2
+    }
+    fn default_vision_motion_threshold() -> f64 {
+        0.05
     }
     fn default_event_log_days() -> u32 {
         30
