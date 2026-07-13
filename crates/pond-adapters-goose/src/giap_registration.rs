@@ -146,6 +146,13 @@ pub fn register_giap_extensions(
         registered.push("giap-audit".into());
     }
 
+    // Vision server (#130). Like giap-audit, its camera-event store handle is
+    // installed separately via `init_vision_deps` in pond-server.
+    if settings.ext_vision_enabled {
+        register_builtin_extension("giap-vision", pond_mcp_server::spawn_vision_server);
+        registered.push("giap-vision".into());
+    }
+
     // Store for GooseAdapter to read
     let _ = REGISTERED_EXTENSIONS.set(registered.clone());
 
