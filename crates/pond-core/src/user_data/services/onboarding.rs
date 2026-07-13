@@ -29,6 +29,22 @@ impl<R: OnboardingRepository> OnboardingService<R> {
         Ok(())
     }
 
+    /// Record that the client has reached `step`, moving progress **forward only**.
+    ///
+    /// If the persisted step is already at or past `step` (by wizard position),
+    /// the furthest-reached step is retained — so a client re-reporting an
+    /// earlier step (e.g. after navigating Back) never regresses progress. This
+    /// is what makes resume-from-N correct. Returns the step that is now
+    /// persisted.
+    pub async fn advance_to(&self, step: OnboardingStep) -> Result<OnboardingStep> {
+        let target = match self.repo.get_current_step().await {
+            Some(current) if current.position() >= step.position() => current,
+            _ => step,
+        };
+        self.repo.save_step(target).await?;
+        Ok(target)
+    }
+
     /// Get the current onboarding status.
     pub async fn status(&self) -> Option<OnboardingStep> {
         self.repo.get_current_step().await
@@ -162,6 +178,47 @@ mod tests {
         service.advance().await?;
         service.reset().await?;
         assert_eq!(service.status().await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advance_to_records_step_from_scratch() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        let saved = service.advance_to(OnboardingStep::WakeWord).await?;
+        assert_eq!(saved, OnboardingStep::WakeWord);
+        assert_eq!(service.status().await, Some(OnboardingStep::WakeWord));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advance_to_moves_forward() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        service.advance_to(OnboardingStep::Basics).await?;
+        let saved = service.advance_to(OnboardingStep::Model).await?;
+        assert_eq!(saved, OnboardingStep::Model);
+        assert_eq!(service.status().await, Some(OnboardingStep::Model));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advance_to_never_regresses() -> Result<()> {
+        // Reaching a later step then re-reporting an earlier one (e.g. Back-nav)
+        // must keep the furthest-reached step — this is what makes resume correct.
+        let service = OnboardingService::new(MockRepo::new());
+        service.advance_to(OnboardingStep::Model).await?;
+        let saved = service.advance_to(OnboardingStep::Basics).await?;
+        assert_eq!(saved, OnboardingStep::Model);
+        assert_eq!(service.status().await, Some(OnboardingStep::Model));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advance_to_same_step_is_idempotent() -> Result<()> {
+        let service = OnboardingService::new(MockRepo::new());
+        service.advance_to(OnboardingStep::Location).await?;
+        let saved = service.advance_to(OnboardingStep::Location).await?;
+        assert_eq!(saved, OnboardingStep::Location);
+        assert_eq!(service.status().await, Some(OnboardingStep::Location));
         Ok(())
     }
 }
