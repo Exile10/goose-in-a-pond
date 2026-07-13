@@ -5,12 +5,13 @@
 // and wires step components + Framer Motion transitions.
 // ────────────────────────────────────────────────────────────
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Logo } from "../Logo";
+import { api } from "../../api/PondApiClient";
 
 import { OnboardingProvider, useOnboarding } from "./OnboardingContext";
-import { STEPS } from "./onboarding.constants";
+import { STEPS, beStepToFeIndex } from "./onboarding.constants";
 import { useOnboardingPersist } from "./hooks/useOnboardingPersist";
 import { StepHeader, Actions, ErrorBanner } from "./primitives/StepShell";
 
@@ -86,6 +87,22 @@ function WizardInner({ onComplete }: { onComplete: () => void }) {
   const { draft, loading } = useOnboarding();
   const { persist, isPersisting, error, clearError } = useOnboardingPersist();
   const [stepIndex, setStepIndex] = useState(0);
+
+  // Resume-from-N: if the backend has persisted progress from a prior session,
+  // start the wizard at the furthest step reached instead of Welcome. Runs
+  // once; ignores failures (fresh setups just start at 0).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await api.getOnboardingStatus();
+        if (cancelled || status.onboarded) return;
+        const resumeAt = beStepToFeIndex(status.current_step);
+        if (resumeAt > 0) setStepIndex(resumeAt);
+      } catch { /* not started / offline — start from the beginning */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const isWelcome = stepIndex === 0;
   const isDone = stepIndex === STEPS.length - 1;
