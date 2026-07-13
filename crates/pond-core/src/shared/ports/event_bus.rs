@@ -17,7 +17,8 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::security::domain::event::{Event, EventCategory, PrivacySensitivity};
-use crate::user_data::domain::device::DeviceStateChanged;
+use crate::user_data::domain::device::{DeviceStateChanged, DeviceStateValue};
+use crate::user_data::domain::schedule::{TriggerEventView, TriggerSourceKind};
 use crate::user_data::domain::sensor::{CameraEvent, SensorReading};
 
 /// A typed reactive event carried on the bus. A closed enum (rather than the
@@ -50,6 +51,37 @@ impl BusEvent {
             BusEvent::Device(d) => Event::new(EventCategory::Device, "device.state_changed")
                 .attr("device_id", d.device_id.as_str())
                 .attr("key", d.key.as_str()),
+        }
+    }
+
+    /// Project this bus event onto the fields sensor-trigger rules evaluate
+    /// (#92): source family, id, signal name, and an optional numeric value
+    /// (sensor value / camera confidence / numeric device state).
+    pub fn trigger_view(&self) -> TriggerEventView<'_> {
+        match self {
+            BusEvent::Sensor(r) => TriggerEventView {
+                kind: TriggerSourceKind::Sensor,
+                device_id: &r.device_id,
+                signal: &r.sensor_type,
+                value: Some(r.value),
+            },
+            BusEvent::Camera(c) => TriggerEventView {
+                kind: TriggerSourceKind::Camera,
+                device_id: &c.camera_id,
+                signal: &c.event_type,
+                value: c.confidence,
+            },
+            BusEvent::Device(d) => TriggerEventView {
+                kind: TriggerSourceKind::Device,
+                device_id: d.device_id.as_str(),
+                signal: &d.key,
+                value: match &d.value {
+                    DeviceStateValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    DeviceStateValue::Int(i) => Some(*i as f64),
+                    DeviceStateValue::Float(f) => Some(*f),
+                    DeviceStateValue::Text(_) => None,
+                },
+            },
         }
     }
 }

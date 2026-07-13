@@ -1,11 +1,16 @@
-//! Schedule MCP Server — manage cron-based scheduled tasks.
+//! Schedule MCP Server — manage cron-based scheduled tasks and
+//! sensor/event-triggered rules (#92).
 //!
-//! Provides 9 tools: `list_schedules`, `create_schedule`, `update_schedule`,
+//! Provides 12 tools: `list_schedules`, `create_schedule`, `update_schedule`,
 //! `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`,
-//! `get_schedule_runs`, `world_clock`.
+//! `get_schedule_runs`, `world_clock`, `create_sensor_rule`,
+//! `list_sensor_rules`, `delete_sensor_rule`.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
-use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::domain::schedule::{
+    CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
+    TriggerSourceKind,
+};
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
 };
@@ -50,6 +55,52 @@ pub struct ScheduleIdParam {
     /// The schedule ID to operate on.
     #[serde(default)]
     pub id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CreateSensorRuleParams {
+    /// Short human-readable rule name (e.g. "Backyard motion lights").
+    pub name: Option<String>,
+    /// Event family to listen to: "sensor" (default) | "camera" | "device".
+    pub source: Option<String>,
+    /// Only match events from this device/camera ID. Omit for any.
+    pub device_id: Option<String>,
+    /// Only match this sensor type / camera event type / device state key
+    /// (e.g. "motion", "person", "temperature"). Omit for any.
+    pub signal: Option<String>,
+    /// Numeric comparison on the event value: gt | gte | lt | lte | eq.
+    pub op: Option<String>,
+    /// Threshold for `op` (e.g. 1 for motion, 30 for temperature).
+    pub value: Option<f64>,
+    /// Only fire after this local time, 24h "HH:MM" (e.g. "18:30" ≈ sunset).
+    pub after: Option<String>,
+    /// Only fire before this local time, 24h "HH:MM" (e.g. "06:00").
+    pub before: Option<String>,
+    /// Action: send this prompt to the agent when the rule fires.
+    pub prompt: Option<String>,
+    /// Action: switch this device when the rule fires (with power_on).
+    pub power_device_id: Option<String>,
+    /// true = turn on (default), false = turn off.
+    pub power_on: Option<bool>,
+    /// Action: push a notification with this title (requires notify_body).
+    pub notify_title: Option<String>,
+    pub notify_body: Option<String>,
+    /// Minimum seconds between fires (debounce). Default 60.
+    pub cooldown_secs: Option<u64>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DeleteSensorRuleParams {
+    /// The rule ID to delete (see list_sensor_rules).
+    pub rule_id: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -131,6 +182,7 @@ impl ScheduleMcpServer {
                             let kind_label = match &t.kind {
                                 TaskKind::AgentPrompt { .. } => "agent",
                                 TaskKind::Webhook { .. } => "webhook",
+                                TaskKind::SensorTrigger(_) => "sensor-rule",
                             };
                             let status = if t.currently_running {
                                 "running"
@@ -154,10 +206,12 @@ impl ScheduleMcpServer {
                         let kind_label = match &t.kind {
                             TaskKind::AgentPrompt { .. } => "agent",
                             TaskKind::Webhook { .. } => "webhook",
+                            TaskKind::SensorTrigger(_) => "sensor-rule",
                         };
                         let prompt_preview = match &t.kind {
                             TaskKind::AgentPrompt { prompt } => prompt.clone(),
                             TaskKind::Webhook { webhook_url } => webhook_url.clone(),
+                            TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
                         };
                         let status = if t.currently_running {
                             "running"
@@ -345,6 +399,195 @@ impl ScheduleMcpServer {
                 format!("Failed to delete schedule: {}", e),
                 None,
             )),
+        }
+    }
+
+    #[tool(description = "\
+Create a sensor/event-triggered automation rule (#92), e.g. 'if motion in the backyard \
+after sunset, turn on the lights and notify me'. The rule fires when a matching \
+sensor/camera/device event arrives — not on a timer. At least one action \
+(prompt, device power, or notification) is required.")]
+    async fn create_sensor_rule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<CreateSensorRuleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let p = params.0;
+
+        // ── Source ──
+        let source_kind = match p.source.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "sensor" => TriggerSourceKind::Sensor,
+            Some(s) if s == "camera" => TriggerSourceKind::Camera,
+            Some(s) if s == "device" => TriggerSourceKind::Device,
+            None => TriggerSourceKind::Sensor,
+            Some(other) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid source '{other}'. Use sensor, camera, or device."
+                ))]));
+            }
+        };
+
+        // ── Condition ──
+        let op = match p.op.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            None => None,
+            Some(s) => match s.as_str() {
+                "gt" | ">" => Some(CompareOp::Gt),
+                "gte" | ">=" => Some(CompareOp::Gte),
+                "lt" | "<" => Some(CompareOp::Lt),
+                "lte" | "<=" => Some(CompareOp::Lte),
+                "eq" | "==" | "=" => Some(CompareOp::Eq),
+                other => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Invalid op '{other}'. Use gt, gte, lt, lte, or eq."
+                    ))]));
+                }
+            },
+        };
+        for (field, v) in [("after", &p.after), ("before", &p.before)] {
+            if let Some(v) = v {
+                if chrono::NaiveTime::parse_from_str(v, "%H:%M").is_err() {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Invalid `{field}` '{v}' — use 24h HH:MM (e.g. \"18:30\")."
+                    ))]));
+                }
+            }
+        }
+
+        // ── Actions (at least one) ──
+        let mut actions = Vec::new();
+        if let Some(prompt) = p.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            actions.push(TriggerAction::AgentPrompt {
+                prompt: prompt.trim().to_string(),
+            });
+        }
+        if let Some(device_id) = p
+            .power_device_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            actions.push(TriggerAction::DevicePower {
+                device_id: device_id.trim().to_string(),
+                on: p.power_on.unwrap_or(true),
+            });
+        }
+        if let (Some(title), Some(body)) = (&p.notify_title, &p.notify_body) {
+            actions.push(TriggerAction::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        if actions.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "A rule needs at least one action: `prompt`, `power_device_id` (+ `power_on`), \
+                 or `notify_title` + `notify_body`.",
+            )]));
+        }
+
+        let spec = SensorTriggerSpec {
+            source: TriggerSource {
+                kind: source_kind,
+                device_id: p.device_id.filter(|s| !s.trim().is_empty()),
+                signal: p.signal.filter(|s| !s.trim().is_empty()),
+            },
+            condition: TriggerCondition {
+                op,
+                value: p.value,
+                after: p.after,
+                before: p.before,
+            },
+            actions,
+            cooldown_secs: p
+                .cooldown_secs
+                .unwrap_or_else(SensorTriggerSpec::default_cooldown_secs),
+        };
+
+        let label = p
+            .name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("Rule: {}", sensor_rule_summary(&spec)));
+        let timezone = self
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.timezone)
+            .unwrap_or_else(|_| "UTC".to_string());
+        let id = format!("rule-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
+            id: id.clone(),
+            label: label.clone(),
+            // Sentinel for display — event rules are never cron-registered.
+            cron: "@event".to_string(),
+            timezone,
+            kind: TaskKind::SensorTrigger(spec.clone()),
+        };
+        match self.scheduler.create_task(req).await {
+            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Sensor rule created: \"{label}\" [{id}] — {} (cooldown {}s). \
+                 It fires when a matching event arrives.",
+                sensor_rule_summary(&spec),
+                spec.cooldown_secs,
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to create sensor rule: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "\
+List the sensor/event-triggered automation rules (motion rules, threshold alerts, …). \
+Time-based schedules are listed by list_schedules instead.")]
+    async fn list_sensor_rules(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.scheduler.list_tasks().await {
+            Ok(tasks) => {
+                let rules: Vec<String> = tasks
+                    .iter()
+                    .filter_map(|t| match &t.kind {
+                        TaskKind::SensorTrigger(spec) => Some(format!(
+                            "- \"{}\" [{}]: {} (cooldown {}s{})",
+                            t.label,
+                            t.id,
+                            sensor_rule_summary(spec),
+                            spec.cooldown_secs,
+                            if t.paused { ", paused" } else { "" },
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let text = if rules.is_empty() {
+                    "No sensor rules defined. Create one with create_sensor_rule.".to_string()
+                } else {
+                    rules.join("\n")
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to list sensor rules: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Delete a sensor/event-triggered rule by its ID (see list_sensor_rules).")]
+    async fn delete_sensor_rule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<DeleteSensorRuleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(id) = params.0.rule_id.filter(|s| !s.trim().is_empty()) else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "I need a `rule_id`. Use list_sensor_rules to find it.",
+            )]));
+        };
+        match self.scheduler.delete_task(id.trim()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Sensor rule {id} deleted."
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to delete sensor rule '{id}': {e}"
+            ))])),
         }
     }
 
@@ -584,6 +827,7 @@ impl ScheduleMcpServer {
                         }
                     }
                     TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
+                    TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
                 };
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Schedule updated: \"{}\" [{}] — {} {} ({})",
@@ -942,6 +1186,9 @@ pub async fn try_upcoming_schedules_context(scheduler: &dyn SchedulerPort) -> Op
                 TaskKind::Webhook { webhook_url } => {
                     format!("webhook: {webhook_url}")
                 }
+                TaskKind::SensorTrigger(spec) => {
+                    format!("rule: {}", sensor_rule_summary(spec))
+                }
             };
             format!(
                 "- \"{}\" — {} {} ({})",
@@ -950,6 +1197,21 @@ pub async fn try_upcoming_schedules_context(scheduler: &dyn SchedulerPort) -> Op
         })
         .collect();
     Some(format!("## Upcoming Scheduled Tasks\n{}", lines.join("\n")))
+}
+
+/// One-line human summary of a sensor rule, shared by every display site.
+fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
+    let src = match spec.source.kind {
+        TriggerSourceKind::Sensor => "sensor",
+        TriggerSourceKind::Camera => "camera",
+        TriggerSourceKind::Device => "device",
+    };
+    format!(
+        "on {src} {}/{} → {} action(s)",
+        spec.source.device_id.as_deref().unwrap_or("any"),
+        spec.source.signal.as_deref().unwrap_or("any"),
+        spec.actions.len(),
+    )
 }
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
