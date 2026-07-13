@@ -1063,4 +1063,170 @@ mod tests {
         // API keys still None
         assert!(s.api_key_guardian.is_none());
     }
+
+    /// Completeness / disposition guard (Phase 4 — "Consistent").
+    ///
+    /// Every field serialized from `Settings` MUST be classified as either
+    /// UI_WIRED (surfaced in the desktop Settings/onboarding UI, with a TS
+    /// mirror in `pond-desktop/src/api/types.ts`) or HEADLESS_BY_DESIGN (an
+    /// advanced/backend-managed knob with no UI). Adding a new `Settings` field
+    /// fails this test until it is placed in one of the two lists — forcing a
+    /// conscious decision (wire UI + TS mirror, or document it as headless) and
+    /// preventing the "TS-only / silently-dropped-on-save" class of bug that
+    /// Phase 1 fixed (mic/cameras/cloud_fallback/home_name).
+    ///
+    /// To update after adding a field: add its serialized key to UI_WIRED (and
+    /// wire it into `Settings.tsx` + `types.ts`) or to HEADLESS_BY_DESIGN.
+    #[test]
+    fn every_settings_field_is_dispositioned() {
+        // Advanced retention knobs, tuned via backend/config — intentionally no UI.
+        const HEADLESS_BY_DESIGN: &[&str] = &[
+            "retention_events_days",
+            "retention_events_by_category",
+            "retention_sensitive_days",
+        ];
+        // Everything else is surfaced in the desktop UI (Settings tabs / hub
+        // views / onboarding) and mirrored in the TS Settings type.
+        const UI_WIRED: &[&str] = &[
+            "active_embedding_model",
+            "active_llm_model",
+            "active_tts_model",
+            "active_whisper_model",
+            "agent_backend",
+            "agent_goose_mode",
+            "agent_max_turns",
+            "agent_memory_inject",
+            "agent_memory_limit",
+            "agent_timeout_secs",
+            "api_key_coingecko",
+            "api_key_finnhub",
+            "api_key_gnews",
+            "api_key_guardian",
+            "assistant_name",
+            "assistant_personality",
+            "cameras_enabled",
+            "chat_model",
+            "chat_provider",
+            "cloud_fallback_enabled",
+            "cloud_input_price_per_million",
+            "cloud_output_price_per_million",
+            "compact_encoding",
+            "context_monitor_enabled",
+            "context_window_override",
+            "custom_system_prompt",
+            "embedding_provider",
+            "ext_audit_enabled",
+            "ext_device_enabled",
+            "ext_discovery_enabled",
+            "ext_finance_enabled",
+            "ext_knowledge_enabled",
+            "ext_memory_enabled",
+            "ext_news_enabled",
+            "ext_schedule_enabled",
+            "ext_system_enabled",
+            "ext_vision_enabled",
+            "ext_weather_enabled",
+            "fast_path_enabled",
+            "home_name",
+            "llm_max_tokens",
+            "llm_provider",
+            "llm_temperature",
+            "memory_archive_threshold",
+            "memory_cleanup_enabled",
+            "memory_cleanup_interval_hours",
+            "memory_consolidation_batch_size",
+            "memory_consolidation_enabled",
+            "memory_consolidation_interval_hours",
+            "memory_consolidation_mode",
+            "memory_decay_base_half_life_days",
+            "memory_decay_beta",
+            "memory_extraction_enabled",
+            "memory_extraction_interval_secs",
+            "memory_extraction_max_facts",
+            "memory_graph_enabled",
+            "memory_prune_threshold",
+            "mic_enabled",
+            "multi_tool_enabled",
+            "prefix_cache_prompt",
+            "primary_profile_id",
+            "prompt_addendum",
+            "prompt_style",
+            "retention_event_log_days",
+            "retention_sensor_days",
+            "retention_session_messages_keep",
+            "review_max_rounds",
+            "review_mode",
+            "review_pass_threshold",
+            "schedule_max_concurrent",
+            "schedule_max_runs_per_task",
+            "schedule_result_notify",
+            "searxng_url",
+            "show_thinking",
+            "telemetry_enabled",
+            "thinking_mode",
+            "timezone",
+            "tool_cache_enabled",
+            "tool_call_validation",
+            "tool_model",
+            "tool_output_compaction",
+            "tool_request_detection",
+            "user_name",
+            "vision_camera_id",
+            "vision_camera_url",
+            "vision_enabled",
+            "vision_fps",
+            "vision_motion_threshold",
+            "voice_kws_cooldown_ms",
+            "voice_kws_energy_threshold",
+            "voice_kws_post_trigger_silence_ms",
+            "voice_kws_whisper_url",
+            "voice_recording_duration_secs",
+            "voice_tts_voice",
+            "voice_wake_word",
+            "voice_wake_word_transcriptions",
+            "voice_whisper_url",
+            "weather_enabled",
+            "weather_latitude",
+            "weather_location_name",
+            "weather_longitude",
+        ];
+
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let obj = value
+            .as_object()
+            .expect("Settings serializes to a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
+
+        // 1. The two lists are disjoint.
+        for k in UI_WIRED {
+            assert!(
+                !HEADLESS_BY_DESIGN.contains(k),
+                "field `{k}` is in both UI_WIRED and HEADLESS_BY_DESIGN"
+            );
+        }
+        // 2. No stale/typo entries — every listed field is a real serialized key.
+        for k in UI_WIRED.iter().chain(HEADLESS_BY_DESIGN.iter()) {
+            assert!(
+                keys.contains(k),
+                "listed field `{k}` is not an actual Settings field (stale entry — remove it)"
+            );
+        }
+        // 3. Every serialized field is dispositioned.
+        for k in &keys {
+            assert!(
+                UI_WIRED.contains(k) || HEADLESS_BY_DESIGN.contains(k),
+                "Settings field `{k}` is not dispositioned. Add it to UI_WIRED \
+                 (and wire it into pond-desktop Settings.tsx + types.ts) or to \
+                 HEADLESS_BY_DESIGN in this test."
+            );
+        }
+        // 4. Counts add up (guards against an accidental double-count).
+        assert_eq!(
+            keys.len(),
+            UI_WIRED.len() + HEADLESS_BY_DESIGN.len(),
+            "settings field count mismatch: {} serialized vs {} classified",
+            keys.len(),
+            UI_WIRED.len() + HEADLESS_BY_DESIGN.len()
+        );
+    }
 }
