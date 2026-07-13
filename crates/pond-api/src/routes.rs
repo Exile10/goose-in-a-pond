@@ -41,6 +41,7 @@ use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -75,8 +76,17 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))
+        // Per-step progress tracking so the wizard can resume-from-N (public —
+        // called mid-onboarding before completion).
+        .route("/onboard/step/{name}", post(onboarding_step))
+        // Reset onboarding back to the first step ("Start over" in Settings).
+        .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // TTS synthesis is public so the onboarding voice-preview can play a
+        // sample before onboarding completes. Text→audio via local Piper is not
+        // privileged and leaks no user data.
+        .route("/tts", post(tts_synthesise))
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
@@ -96,7 +106,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
-        .route("/tts", post(tts_synthesise))
         .route("/sessions", get(list_sessions))
         .route(
             "/sessions/{session_id}",
@@ -618,25 +627,112 @@ async fn complete_onboarding(
     Ok(Json(json!({"status": "completed"})))
 }
 
-/// Return current onboarding progress (public)
-async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let service = OnboardingService::new(state.onboarding_repo.clone());
-
-    // Derive counts from the enum so they can never drift from it.
-    // `total_steps` counts every variant (Welcome..Extensions + terminal Completed);
-    // `steps_completed` is the current step's 1-based position within that list.
+/// Build the canonical onboarding-status JSON from the persisted current step.
+///
+/// Shared by `GET /onboard/status`, `POST /onboard/step/:name`, and
+/// `POST /onboard/reset` so every response has the same shape. Counts are
+/// derived from [`OnboardingStep::ALL`] so they can never drift from the enum.
+fn onboarding_status_json(step: Option<OnboardingStep>) -> Value {
     let total_steps = OnboardingStep::ALL.len();
-    let (current_step, steps_completed, onboarded) = match service.status().await {
+    let (current_step, steps_completed, onboarded) = match step {
         None => ("not_started".to_string(), 0, false),
         Some(step) => (step.to_string(), step.position(), step.is_complete()),
     };
 
-    Json(json!({
+    json!({
         "onboarded": onboarded,
         "current_step": current_step,
         "steps_completed": steps_completed,
         "total_steps": total_steps
-    }))
+    })
+}
+
+/// Return current onboarding progress (public)
+async fn onboarding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+    Json(onboarding_status_json(service.status().await))
+}
+
+/// Record that the client has reached a named onboarding step (public).
+///
+/// `POST /api/v1/onboard/step/:name` — the wizard calls this as each step is
+/// reached so the backend tracks progress and can resume-from-N if the user
+/// quits mid-onboarding. `:name` is an [`OnboardingStep`] variant name
+/// (e.g. `Basics`, `WakeWord`).
+///
+/// Progress is **monotonic**: the persisted step only ever moves forward. If
+/// the client re-POSTs an earlier step (e.g. after navigating Back), the
+/// furthest-reached step is retained. `Completed` is rejected here — completion
+/// is owned by `/onboard/complete`, which validates required settings first.
+async fn onboarding_step(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let requested = OnboardingStep::from_str(&name).map_err(|_| {
+        let valid: Vec<String> = OnboardingStep::ALL
+            .iter()
+            .filter(|s| !s.is_complete())
+            .map(|s| s.to_string())
+            .collect();
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Unknown onboarding step: {name}"),
+                "valid_steps": valid,
+            })),
+        )
+    })?;
+
+    // Completion goes through `/onboard/complete` (with required-field
+    // validation). Accepting it here would lift the onboarding guard
+    // unvalidated.
+    if requested.is_complete() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Use POST /onboard/complete to finish onboarding",
+            })),
+        ));
+    }
+
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    // Monotonic: `advance_to` never regresses past the furthest step reached.
+    let target = service.advance_to(requested).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to save onboarding step: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(onboarding_status_json(Some(target))))
+}
+
+/// Reset onboarding back to the first step (public).
+///
+/// `POST /api/v1/onboard/reset` — powers the "Start over" control in Settings.
+/// Clears any persisted progress and re-arms the onboarding guard so the wizard
+/// is shown again from `Welcome`. Distinct from `POST /onboard` (which only
+/// *starts* onboarding when no state exists and otherwise reports status).
+async fn reset_onboarding(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let service = OnboardingService::new(state.onboarding_repo.clone());
+
+    service.reset().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to reset onboarding: {}", e)})),
+        )
+    })?;
+    service.start().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to restart onboarding: {}", e)})),
+        )
+    })?;
+
+    Ok(Json(onboarding_status_json(Some(OnboardingStep::Welcome))))
 }
 
 #[derive(Deserialize)]
