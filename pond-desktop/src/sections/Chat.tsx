@@ -222,6 +222,34 @@ export function Chat() {
     textareaRef.current?.focus();
   }
 
+  const renameSession = useCallback(async (id: string, title: string) => {
+    // Optimistically update the row, then persist. Refresh reconciles with the
+    // server's stored/derived title on success or failure.
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
+    try {
+      await api.renameSession(id, title);
+    } catch (err) {
+      console.warn("Rename failed (non-fatal):", err);
+    } finally {
+      refreshSessions();
+    }
+  }, [refreshSessions]);
+
+  const deleteSession = useCallback(async (id: string) => {
+    try {
+      await api.deleteSession(id);
+    } catch (err) {
+      console.warn("Delete failed (non-fatal):", err);
+    }
+    // If the deleted conversation was the active one, drop back to a blank chat.
+    if (sessionIdRef.current === id) {
+      newConversation();
+    }
+    refreshSessions();
+  // newConversation is a stable component-scope function; safe to omit.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshSessions]);
+
   const sendMessage = useCallback(async (directText?: string) => {
     const text = (directText ?? input).trim();
     if (!text || busy || !state.serverOnline) return;
@@ -410,6 +438,8 @@ export function Chat() {
             currentSessionId={sessionIdRef.current ?? null}
             onSelect={(id) => dispatch({ type: "SET_SESSION_ID", payload: id })}
             onNewChat={newConversation}
+            onRename={renameSession}
+            onDelete={deleteSession}
             isOpen={showSessions}
             onClose={() => setShowSessions(false)}
           />

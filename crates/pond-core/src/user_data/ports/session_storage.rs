@@ -82,4 +82,25 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
     }
+
+    /// Count the messages stored for a session.
+    ///
+    /// Used to render a per-conversation badge in the history sidebar.
+    /// The default returns 0 so in-memory mocks and legacy adapters keep
+    /// compiling; real adapters override with an indexed `COUNT(*)`.
+    async fn count_messages(&self, _session_id: &str) -> Result<u64, SessionStorageError> {
+        Ok(0) // default no-op for backward compat
+    }
+
+    /// Return the content of the earliest user message in a session, if any.
+    ///
+    /// Used as a read-time fallback to derive a human-readable label when a
+    /// session has no stored `title`. The default returns `None` so mocks and
+    /// legacy adapters keep compiling.
+    async fn first_user_message(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(None) // default no-op for backward compat
+    }
 }

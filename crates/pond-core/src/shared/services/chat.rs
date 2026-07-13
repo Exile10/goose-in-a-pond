@@ -1313,14 +1313,26 @@ impl ChatService {
                         .update_title(&self.session_id, title.clone())
                         .await
                     {
-                        tracing::warn!("Failed to save session title: {}", e);
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            error = %e,
+                            "Failed to save LLM-generated session title"
+                        );
                     } else {
-                        tracing::debug!("Auto-generated session title: {}", title);
+                        tracing::info!(
+                            session_id = %self.session_id,
+                            title = %title,
+                            "Auto-generated session title (LLM)"
+                        );
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Title generation failed (non-fatal): {}", e);
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "LLM title generation failed (non-fatal)"
+                );
             }
         }
     }
@@ -1429,9 +1441,17 @@ impl ChatService {
             .update_title(&self.session_id, title.clone())
             .await
         {
-            tracing::warn!("Failed to save derived session title: {}", e);
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "Failed to save derived session title"
+            );
         } else {
-            tracing::debug!("Derived session title: {}", title);
+            tracing::info!(
+                session_id = %self.session_id,
+                title = %title,
+                "Derived session title (deterministic fallback)"
+            );
         }
     }
 
