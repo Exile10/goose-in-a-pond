@@ -180,6 +180,7 @@ async fn make_app_with_settings_repo() -> (
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
 
     (

@@ -9,6 +9,28 @@ export interface HealthResponse {
   uptime_seconds?: number;
 }
 
+// ── Weather ──────────────────────────────────────────────────
+export interface WeatherForecastDayResponse {
+  d: string;
+  i: string;
+  t: number;
+}
+
+export interface WeatherApiResponse {
+  enabled: boolean;
+  location_name?: string;
+  temp?: number;
+  cond?: string;
+  icon?: string;
+  hi?: number;
+  lo?: number;
+  hum?: number;
+  wind?: number;
+  sunrise?: string;
+  sunset?: string;
+  forecast?: WeatherForecastDayResponse[];
+}
+
 // ── Settings ─────────────────────────────────────────────────
 export interface Settings {
   // Identity

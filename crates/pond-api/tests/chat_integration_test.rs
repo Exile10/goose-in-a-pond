@@ -155,6 +155,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),
@@ -552,6 +553,7 @@ async fn make_app_with_agent(
         notification_queue: None,
         notification_sender: None,
         api_port: 4000,
+        weather_provider: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),

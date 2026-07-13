@@ -104,6 +104,7 @@ use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
+use pond_adapters_weather::WeatherProvider;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -329,6 +330,9 @@ pub struct AppState {
     /// Used to construct OAuth redirect URIs dynamically (the server may bind
     /// to a port other than 4000 if that port is already in use).
     pub api_port: u16,
+    /// Weather provider (Open-Meteo) for `GET /api/v1/weather`. `None` when
+    /// `weather_enabled` is false or no location has been configured.
+    pub weather_provider: Option<Arc<dyn WeatherProvider>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.

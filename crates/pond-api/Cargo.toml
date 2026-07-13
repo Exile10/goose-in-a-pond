@@ -16,6 +16,7 @@ pond-infra = { workspace = true }
 pond-adapters-llamafile = { workspace = true }
 pond-adapters-ollama = { path = "../pond-adapters-ollama" }
 pond-adapters-local-inference = { workspace = true, optional = true }
+pond-adapters-weather = { workspace = true }
 goose = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls"] }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
