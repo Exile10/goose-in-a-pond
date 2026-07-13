@@ -1,7 +1,7 @@
-use crate::models::domain::message::ChatMessage;
+use crate::models::domain::message::{ChatMessage, Role};
 use crate::models::ports::agent::Agent;
 use crate::models::ports::provider::LlmProvider;
-use crate::models::ports::voice_input::VoiceInput;
+use crate::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use crate::models::ports::voice_output::VoiceOutput;
 use crate::models::ports::wake_word::StreamingWakeWordDetector;
 use crate::models::services::context_compactor::ContextCompactor;
@@ -27,6 +27,46 @@ use uuid::Uuid;
 /// natively via MCP — no pre-classification needed.
 fn resolve_voice_role(_message: &str) -> String {
     "chat".to_string()
+}
+
+/// Voice-loop control classification for a raw transcript.
+///
+/// This is voice-CLI UI control (turn-taking / loop lifecycle), NOT a
+/// tool/thinking classifier — these phrases are intercepted by `run_loop`
+/// before the LLM ever sees them, so the no-keyword-classification rule
+/// does not apply here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceCommand {
+    /// Dismissal / sleep — return to wake-word mode, keep the loop alive.
+    Dismissal,
+    /// Hard exit — terminate the voice loop entirely.
+    Exit,
+    /// Ordinary utterance — hand it to the LLM.
+    Normal,
+}
+
+/// Single source of truth for voice-loop control phrases. Used by BOTH
+/// `run_loop`'s dismissal/exit gates AND the Q2-26 speculative gate, so the
+/// keyword list never drifts between the two paths.
+fn classify_voice_command(text: &str) -> VoiceCommand {
+    let lower = text.trim().to_lowercase();
+    let lower = lower.trim_end_matches(|c: char| c == '.' || c == '!');
+    match lower {
+        "bye" | "goodbye" | "good bye" | "dismissed" | "go to sleep" | "that's all"
+        | "thats all" | "never mind" | "nevermind" | "stop" | "stop listening" => {
+            VoiceCommand::Dismissal
+        }
+        "exit" | "quit" => VoiceCommand::Exit,
+        _ => VoiceCommand::Normal,
+    }
+}
+
+/// True if `text` is any voice-loop control phrase (dismissal OR hard exit)
+/// that `run_loop` intercepts before the LLM sees it. Used by the Q2-26
+/// speculative-chat path to avoid speculatively calling `chat_stream_once`
+/// on a phrase that should never reach the LLM at all.
+fn is_dismissal_or_exit_phrase(text: &str) -> bool {
+    !matches!(classify_voice_command(text), VoiceCommand::Normal)
 }
 
 /// Human-readable announcement spoken while an MCP tool is executing.
@@ -992,6 +1032,36 @@ pub fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
     (visible, in_block)
 }
 
+/// Derive a short, deterministic session title from a user message.
+///
+/// Takes the first ~6 whitespace-separated words, trims surrounding
+/// punctuation/quotes, and caps the result at 60 chars. Returns an empty
+/// string when the input has no usable words (caller skips the update).
+///
+/// This is the no-LLM fallback used by `ChatService::ensure_session_title`
+/// so sessions always get a human-readable title even when no provider is
+/// attached (the common HTTP-handler path).
+fn derive_title_from_text(text: &str) -> String {
+    const MAX_WORDS: usize = 6;
+    const MAX_CHARS: usize = 60;
+
+    let cleaned = text.trim().trim_matches('"').trim_matches('\'');
+    let title = cleaned
+        .split_whitespace()
+        .take(MAX_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = title.trim().trim_matches('"').trim_matches('\'').trim();
+
+    if title.chars().count() <= MAX_CHARS {
+        title.to_string()
+    } else {
+        // Cap at MAX_CHARS on a char boundary and add an ellipsis.
+        let truncated: String = title.chars().take(MAX_CHARS).collect();
+        format!("{}…", truncated.trim_end())
+    }
+}
+
 /// Domain Service: ChatService
 ///
 /// Orchestrates the Wait → Listen → Thinking → Speak workflow loop.
@@ -1002,6 +1072,11 @@ pub fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
 ///
 /// Input is abstracted via the `VoiceInput` port.  The default is
 /// `StdinInput` (reads from stdin).  Override with `with_voice_input()`.
+///
+/// `Clone` is cheap — every field is an `Arc`, `Option<Arc>`, `String`, or a
+/// small `Clone` value. The Q2-26 speculative path clones the service into a
+/// spawned task so a provisional transcript can start inference early.
+#[derive(Clone)]
 pub struct ChatService {
     agent: Arc<dyn Agent>,
     provider: Option<Arc<dyn LlmProvider>>,
@@ -1301,7 +1376,63 @@ impl ChatService {
             }
         }
 
+        // Ensure the session has a title. Handlers build ChatService without a
+        // provider, so the LLM-based `maybe_generate_title` never fires; without
+        // this fallback every session stays `title = null`. This derives a
+        // cheap, deterministic title from the first user message — no LLM call.
+        self.ensure_session_title().await;
+
         Ok(())
+    }
+
+    /// Set a session title if one is not already present, deriving it
+    /// deterministically from the first user message (first ~6 words).
+    ///
+    /// This is the reliable fallback for the common path where no
+    /// `LlmProvider` is attached (all HTTP handlers). It is best-effort:
+    /// failures are logged, never bubbled, and it runs inside the
+    /// persistence owner so the ChatService contract is preserved.
+    async fn ensure_session_title(&self) {
+        // Skip if a title already exists (either set here previously or by the
+        // LLM path). A missing session is treated as "no title" — the update
+        // below is a no-op for a non-existent row.
+        if let Ok(session) = self.session_storage.get_session(&self.session_id).await {
+            if session.title.is_some() {
+                return;
+            }
+        }
+
+        // Find the first user message to derive a title from.
+        let first_user_text = match self
+            .session_storage
+            .get_messages_paginated(&self.session_id, 20, 0)
+            .await
+        {
+            Ok(msgs) => msgs
+                .into_iter()
+                .find(|m| m.message.role == Role::User)
+                .map(|m| m.message.content),
+            Err(_) => None,
+        };
+
+        let Some(text) = first_user_text else {
+            return;
+        };
+
+        let title = derive_title_from_text(&text);
+        if title.is_empty() {
+            return;
+        }
+
+        if let Err(e) = self
+            .session_storage
+            .update_title(&self.session_id, title.clone())
+            .await
+        {
+            tracing::warn!("Failed to save derived session title: {}", e);
+        } else {
+            tracing::debug!("Derived session title: {}", title);
+        }
     }
 
     /// Like `persist_assistant_turn` but also triggers memory extraction in a
@@ -1341,7 +1472,8 @@ impl ChatService {
         Ok(())
     }
 
-    /// Streaming chat — routes through the Agent, chunks TTS by sentence.
+    /// Streaming chat — routes through the Agent, chunks TTS by sentence,
+    /// AND persists the turn (user + assistant) to session storage.
     ///
     /// Differences from `chat_once`:
     /// - Calls `agent.chat_stream()` so text arrives token-by-token.
@@ -1349,7 +1481,15 @@ impl ChatService {
     /// - Announces MCP tool calls with a short spoken phrase before execution.
     /// - Speaking happens *inside* this method; callers must NOT call
     ///   `voice_output.speak()` on the returned text.
+    ///
+    /// This is the persisting entry point used for a *confirmed* transcript.
+    /// The Q2-26 speculative path must NOT call this — it calls
+    /// `stream_response_inner` (no persistence) so a provisional transcript
+    /// that later turns out wrong never lands a phantom turn in
+    /// `pond_system.db`. `run_loop` persists the confirmed turn exactly once
+    /// via `persist_confirmed_turn`.
     pub async fn chat_stream_once(&self, message: String) -> Result<String> {
+        let fired_at = std::time::Instant::now();
         // Persist user message
         let user_msg = ChatMessage::user(message.clone());
         let session_msg = SessionMessage::new(
@@ -1361,8 +1501,31 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
+        // Stream + speak (no persistence inside).
+        let full_text = self
+            .stream_response_inner(message.clone(), fired_at)
+            .await?;
+
+        // Persist the assistant response and generate a title if needed.
+        self.persist_assistant_response(&full_text).await?;
+        self.maybe_generate_title(&message, &full_text).await;
+        Ok(full_text)
+    }
+
+    /// Streams a response through the Agent and speaks it, returning the full
+    /// assistant text. Performs **no persistence** — the caller owns that.
+    ///
+    /// Used directly by the Q2-26 speculative path (which must be able to run
+    /// on a provisional transcript and be discarded without side effects) and
+    /// by `chat_stream_once` (which wraps it with persistence). `fired_at`
+    /// timestamps when inference was kicked off, purely for TTFT telemetry.
+    async fn stream_response_inner(
+        &self,
+        message: String,
+        fired_at: std::time::Instant,
+    ) -> Result<String> {
         // The LLM handles tool routing natively via MCP — no pre-classification needed.
-        // chat_stream_once is only ever reached via run_loop (the voice CLI loop),
+        // This path is only ever reached via run_loop (the voice CLI loop),
         // so voice_mode is unconditionally true here — this gets the TTS-friendly
         // prompt and suppressed thinking that desktop's voice path already gets.
         let request = AgentRequest {
@@ -1405,35 +1568,41 @@ impl ChatService {
 
         // Pipelined TTS: synthesize the next sentence while the current one plays.
         // `pending_audio` holds WAV bytes ready for playback while we synthesize ahead.
+        // `first_sentence_spoken` gates clause-boundary speak() for the first sentence
+        // so audio starts before sentence 2's synthesis completes.
         let mut pending_audio: Option<Vec<u8>> = None;
+        let mut first_sentence_spoken = false;
 
-        /// Speak a chunk, using pipelined synthesis when available.
-        /// If `pending_audio` has buffered audio, plays it while synthesizing `text` in parallel.
-        /// Otherwise falls back to sequential speak().
         macro_rules! speak_pipelined {
-            ($self:expr, $text:expr, $pending:expr) => {{
+            ($self:expr, $text:expr, $pending:expr, $first_spoken:expr) => {{
                 let text = $text;
-                // Try pipelined path: synthesize new text, play old audio concurrently
-                match $self.voice_output.synthesize(&text).await {
-                    Ok(Some(new_wav)) => {
-                        // Play previously buffered audio (if any) and stash the new synthesis
-                        if let Some(prev) = $pending.take() {
-                            if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                tracing::warn!("TTS playback failed: {}", e);
-                            }
-                        }
-                        *$pending = Some(new_wav);
+                if !*$first_spoken {
+                    // First sentence: speak() with clause-boundary splitting so the
+                    // user hears audio immediately rather than waiting for S2 synth.
+                    *$first_spoken = true;
+                    if let Err(e) = $self.voice_output.speak(&text).await {
+                        tracing::warn!("TTS failed: {}", e);
                     }
-                    _ => {
-                        // Flush any pending audio first
-                        if let Some(prev) = $pending.take() {
-                            if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                tracing::warn!("TTS playback failed: {}", e);
+                } else {
+                    // Subsequent sentences: synthesize-ahead pipeline.
+                    match $self.voice_output.synthesize(&text).await {
+                        Ok(Some(new_wav)) => {
+                            if let Some(prev) = $pending.take() {
+                                if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                    tracing::warn!("TTS playback failed: {}", e);
+                                }
                             }
+                            *$pending = Some(new_wav);
                         }
-                        // Fallback: sequential speak
-                        if let Err(e) = $self.voice_output.speak(&text).await {
-                            tracing::warn!("TTS failed: {}", e);
+                        _ => {
+                            if let Some(prev) = $pending.take() {
+                                if let Err(e) = $self.voice_output.play_audio(prev).await {
+                                    tracing::warn!("TTS playback failed: {}", e);
+                                }
+                            }
+                            if let Err(e) = $self.voice_output.speak(&text).await {
+                                tracing::warn!("TTS failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -1448,7 +1617,12 @@ impl ChatService {
                         let chunk = sentence_buf.trim().to_string();
                         sentence_buf.clear();
                         stop_tone!();
-                        speak_pipelined!(self, chunk, &mut pending_audio);
+                        speak_pipelined!(
+                            self,
+                            chunk,
+                            &mut pending_audio,
+                            &mut first_sentence_spoken
+                        );
                     }
                     // Flush pending audio before the announcement
                     if let Some(prev) = pending_audio.take() {
@@ -1470,6 +1644,10 @@ impl ChatService {
                     }
 
                     if !spoken_first {
+                        tracing::info!(
+                            "[Q2-26 TTFT] {}ms from-fire",
+                            fired_at.elapsed().as_millis()
+                        );
                         self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
                         spoken_first = true;
                     }
@@ -1491,13 +1669,19 @@ impl ChatService {
                             self.voice_output.start_barge_in_listener();
                             barge_in_started = true;
                         }
-                        speak_pipelined!(self, spoken, &mut pending_audio);
+                        speak_pipelined!(
+                            self,
+                            spoken,
+                            &mut pending_audio,
+                            &mut first_sentence_spoken
+                        );
                     }
                 }
                 AgentStreamEvent::Done { .. } => {
-                    // Flush any tail held back by the thought filter.
-                    // Must also append to full_text so the return value and persisted
-                    // message include the withheld lookahead bytes.
+                    // Flush any tail held back by the thought filter. Also append to
+                    // full_text so the returned + persisted message includes the
+                    // withheld lookahead bytes — otherwise the tail is spoken but
+                    // dropped from history. (#153)
                     let tail = thought_filter.flush();
                     if !tail.is_empty() {
                         full_text.push_str(&tail);
@@ -1509,7 +1693,12 @@ impl ChatService {
                         let spoken = strip_markdown_for_speech(&remainder);
                         if !spoken.is_empty() {
                             stop_tone!();
-                            speak_pipelined!(self, spoken, &mut pending_audio);
+                            speak_pipelined!(
+                                self,
+                                spoken,
+                                &mut pending_audio,
+                                &mut first_sentence_spoken
+                            );
                         }
                     }
                     sentence_buf.clear();
@@ -1535,9 +1724,12 @@ impl ChatService {
             }
         }
 
-        // Flush thought filter tail if stream ended without Done
+        // Flush thought filter tail if stream ended without Done. Same as the Done
+        // branch, the tail must also reach full_text so the persisted message is
+        // complete on this path too — the second, previously-unfixed flush. (#153)
         let tail = thought_filter.flush();
         if !tail.is_empty() {
+            full_text.push_str(&tail);
             sentence_buf.push_str(&tail);
         }
         // Flush anything left if stream ended without Done
@@ -1560,8 +1752,18 @@ impl ChatService {
             self.voice_output.stop_barge_in_listener();
         }
 
-        // Persist the assistant response
-        let assistant_msg = ChatMessage::assistant(full_text.clone());
+        // No persistence here — the caller (chat_stream_once for a confirmed
+        // transcript, or run_loop's persist_confirmed_turn for the reused
+        // speculative result) owns writing this turn to session storage.
+        Ok(full_text)
+    }
+
+    /// Persist a single assistant message to session storage. Split out of
+    /// `chat_stream_once` so the Q2-26 speculative path can persist the
+    /// assistant turn *after* the transcript is confirmed, not during the
+    /// speculative stream.
+    async fn persist_assistant_response(&self, full_text: &str) -> Result<()> {
+        let assistant_msg = ChatMessage::assistant(full_text.to_string());
         let session_msg = SessionMessage::new(
             Uuid::new_v4().to_string(),
             self.session_id.clone(),
@@ -1570,9 +1772,119 @@ impl ChatService {
         self.session_storage
             .add_message(self.session_id.clone(), session_msg)
             .await?;
+        Ok(())
+    }
 
-        self.maybe_generate_title(&message, &full_text).await;
-        Ok(full_text)
+    /// Persist a confirmed voice turn (user message + assistant response) that
+    /// was produced by a speculative stream, and generate a title if needed.
+    ///
+    /// The Q2-26 speculative path runs `stream_response_inner` (no
+    /// persistence) on a *provisional* transcript. Once `run_loop` confirms
+    /// the final transcript matches, it calls this to write exactly one turn —
+    /// keyed to the confirmed transcript — preserving the single-source-of-
+    /// truth invariant (`pond_system.db` is authoritative; ChatService is the
+    /// sole persistence owner).
+    async fn persist_confirmed_turn(
+        &self,
+        confirmed_message: &str,
+        response_text: &str,
+    ) -> Result<()> {
+        let user_msg = ChatMessage::user(confirmed_message.to_string());
+        let session_msg = SessionMessage::new(
+            Uuid::new_v4().to_string(),
+            self.session_id.clone(),
+            user_msg,
+        );
+        self.session_storage
+            .add_message(self.session_id.clone(), session_msg)
+            .await?;
+
+        self.persist_assistant_response(response_text).await?;
+        self.maybe_generate_title(confirmed_message, response_text)
+            .await;
+        Ok(())
+    }
+
+    /// Q2-26: listen for the next utterance while *speculatively* starting the
+    /// LLM response as soon as a provisional transcript is available, to hide
+    /// whisper + first-token latency inside the end-of-speech silence wait.
+    ///
+    /// Returns `(confirmed_transcript, speculative)` where `speculative`, when
+    /// present, is a still-running job that streamed a response for the
+    /// **provisional** transcript `spec_transcript`. The job runs
+    /// `stream_response_inner`, which performs **no persistence** — so if the
+    /// provisional transcript turns out wrong, discarding the job leaves no
+    /// phantom turn in `pond_system.db`.
+    ///
+    /// The caller (`run_loop`) must:
+    ///   - race the job against the wake-word interrupt (barge-in parity), and
+    ///   - only commit (persist) the job's result if `spec_transcript` equals
+    ///     the `confirmed_transcript`; otherwise discard it and process the
+    ///     confirmed transcript through the normal persisting path.
+    ///
+    /// A `SpeculativeSignal::Ready` for an empty or dismissal/exit phrase never
+    /// starts a job — those are intercepted by `run_loop` before the LLM sees
+    /// them, and a speculative call would bypass that.
+    #[allow(clippy::type_complexity)]
+    async fn listen_with_speculative_chat(
+        &self,
+    ) -> Result<(
+        Option<String>,
+        Option<(String, tokio::task::JoinHandle<Result<String>>)>,
+    )> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpeculativeSignal>();
+        let callback: Box<dyn Fn(SpeculativeSignal) + Send + Sync> = Box::new(move |signal| {
+            let _ = tx.send(signal);
+        });
+
+        let listen_fut = self.voice_input.listen_with_speculative(callback);
+        tokio::pin!(listen_fut);
+
+        // `(spec_transcript, handle)` — the transcript the job was fired on is
+        // retained so `run_loop` can confirm it matches the final transcript
+        // before persisting anything.
+        let mut speculative: Option<(String, tokio::task::JoinHandle<Result<String>>)> = None;
+
+        loop {
+            tokio::select! {
+                result = &mut listen_fut => {
+                    let transcript = result?;
+                    return Ok((transcript, speculative.take()));
+                }
+                Some(signal) = rx.recv() => {
+                    match signal {
+                        SpeculativeSignal::Ready(text)
+                            if !text.is_empty() && !is_dismissal_or_exit_phrase(&text) =>
+                        {
+                            // Fire the LLM early on the provisional transcript.
+                            // NOTE: uses stream_response_inner (NO persistence),
+                            // so an incorrect provisional transcript can be
+                            // discarded without leaving a phantom turn.
+                            let svc = self.clone();
+                            let spec_text = text.clone();
+                            let fired_at = std::time::Instant::now();
+                            let handle = tokio::spawn(async move {
+                                svc.stream_response_inner(spec_text, fired_at).await
+                            });
+                            speculative = Some((text, handle));
+                        }
+                        // Empty / dismissal / exit — let run_loop handle it normally.
+                        SpeculativeSignal::Ready(_) => {}
+                        SpeculativeSignal::Invalidated => {
+                            // The provisional transcript covered a too-short
+                            // clip (speech resumed). Abort the job and silence
+                            // any audio it may have started. No persistence
+                            // happened, so nothing to roll back.
+                            if let Some((_, handle)) = speculative.take() {
+                                handle.abort();
+                                self.voice_output.stop_speaking();
+                                self.voice_output.stop_thinking_tone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run the interactive workflow loop.
@@ -1595,11 +1907,15 @@ impl ChatService {
         let mut pending_input: Option<String> = None;
 
         loop {
-            let input = if let Some(text) = pending_input.take() {
+            // `speculative`, when present, is a (provisional_transcript, job)
+            // pair: an LLM response already streaming for a provisional
+            // transcript (Q2-26). It is reused ONLY if the confirmed transcript
+            // matches; otherwise it is discarded without persisting anything.
+            let (input, speculative) = if let Some(text) = pending_input.take() {
                 // Interrupt gave us pre-captured text — skip listen phase.
                 // Emit events so the UI/state machine stays consistent.
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
-                Some(text)
+                (Some(text), None)
             } else if first_turn {
                 // ── Wait for wake word ──
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
@@ -1623,31 +1939,46 @@ impl ChatService {
                     self.voice_input.prime_with_captured(wav);
                 }
 
-                self.voice_input.listen().await?
+                self.listen_with_speculative_chat().await?
             } else {
                 // ── Conversational turn — listen without wake word ──
                 self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
                 println!("\n  🎧 Listening for your reply...");
                 io::stdout().flush()?;
 
-                self.voice_input.listen().await?
+                self.listen_with_speculative_chat().await?
             };
+
+            // Any early-return path (no speech / dismissal / exit) must abort a
+            // live speculative job so it stops speaking and never persists.
+            // Helper: aborts + silences the speculative job if one is running.
+            let abort_speculative =
+                |spec: Option<(String, tokio::task::JoinHandle<Result<String>>)>| {
+                    if let Some((_, handle)) = spec {
+                        handle.abort();
+                        self.voice_output.stop_speaking();
+                        self.voice_output.stop_thinking_tone();
+                    }
+                };
 
             let input = match input {
                 None if first_turn => {
                     // Stdin EOF — exit the loop
+                    abort_speculative(speculative);
                     self.emit_event(WorkflowEvent::Exit);
                     println!("\n  ⏹ End of input.");
                     break;
                 }
                 None => {
                     // Conversational mode, no speech — reset to wake word
+                    abort_speculative(speculative);
                     println!("  💤 No speech detected, returning to wake word mode.");
                     first_turn = true;
                     continue;
                 }
                 Some(text) if text.is_empty() => {
                     // Empty transcription — fall back to wake word mode
+                    abort_speculative(speculative);
                     if !first_turn {
                         println!("  💤 No speech detected, returning to wake word mode.");
                     }
@@ -1657,41 +1988,31 @@ impl ChatService {
                 Some(text) => text,
             };
 
-            // ── Dismissal / sleep commands → speak farewell, return to wake word ──
-            let lower = input.trim().to_lowercase();
-            let lower = lower.trim_end_matches(|c: char| c == '.' || c == '!');
-            if matches!(
-                lower,
-                "bye"
-                    | "goodbye"
-                    | "good bye"
-                    | "dismissed"
-                    | "go to sleep"
-                    | "that's all"
-                    | "thats all"
-                    | "never mind"
-                    | "nevermind"
-                    | "stop"
-                    | "stop listening"
-            ) {
-                let farewell = "Until next time. Just say my name when you need me.";
-                println!("  🫡 {}", farewell);
-                if let Err(e) = self.voice_output.speak(farewell).await {
-                    tracing::warn!("TTS farewell failed: {}", e);
+            // ── Voice-loop control (dismissal / exit) — single source of truth ──
+            match classify_voice_command(&input) {
+                // Dismissal / sleep → speak farewell, return to wake word.
+                VoiceCommand::Dismissal => {
+                    abort_speculative(speculative);
+                    let farewell = "Until next time. Just say my name when you need me.";
+                    println!("  🫡 {}", farewell);
+                    if let Err(e) = self.voice_output.speak(farewell).await {
+                        tracing::warn!("TTS farewell failed: {}", e);
+                    }
+                    first_turn = true;
+                    continue;
                 }
-                first_turn = true;
-                continue;
-            }
-
-            // ── Hard exit (terminates the voice loop entirely) ──
-            if matches!(lower, "exit" | "quit") {
-                let farewell = "Goodbye! I'll be here whenever you need me.";
-                println!("  👋 {}", farewell);
-                if let Err(e) = self.voice_output.speak(farewell).await {
-                    tracing::warn!("TTS farewell failed: {}", e);
+                // Hard exit → terminate the voice loop entirely.
+                VoiceCommand::Exit => {
+                    abort_speculative(speculative);
+                    let farewell = "Goodbye! I'll be here whenever you need me.";
+                    println!("  👋 {}", farewell);
+                    if let Err(e) = self.voice_output.speak(farewell).await {
+                        tracing::warn!("TTS farewell failed: {}", e);
+                    }
+                    self.emit_event(WorkflowEvent::Exit);
+                    break;
                 }
-                self.emit_event(WorkflowEvent::Exit);
-                break;
+                VoiceCommand::Normal => {}
             }
 
             // Conversation is active — subsequent turns skip the wake word
@@ -1702,25 +2023,69 @@ impl ChatService {
             // ── Thinking → Speak (streaming), with wake-word interrupt ──
             self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
 
+            // ── Q2-26 phantom-turn gate ─────────────────────────────────────
+            // A speculative job (if any) streamed a response for a *provisional*
+            // transcript with NO persistence. Reuse it ONLY if the confirmed
+            // transcript matches; otherwise discard it and fall through to the
+            // normal persisting path on the confirmed transcript. This
+            // guarantees exactly ONE persisted turn per utterance, always keyed
+            // to the confirmed transcript (single-source-of-truth invariant).
+            let reusable_speculative = match speculative {
+                Some((spec_transcript, handle)) if spec_transcript == input => Some(handle),
+                Some((_, handle)) => {
+                    // Mismatch: provisional transcript was wrong. Abort the job
+                    // and silence any audio it started — nothing was persisted.
+                    handle.abort();
+                    self.voice_output.stop_speaking();
+                    self.voice_output.stop_thinking_tone();
+                    self.voice_output.stop_barge_in_listener();
+                    None
+                }
+                None => None,
+            };
+
             // Race the agent response against the wake word detector.
             // If the user says the wake word during inference or TTS playback,
             // interrupt immediately: stop TTS, drop the stream, and process
             // the new speech as a fresh request.
-            let chat_fut = self.chat_stream_once(input);
+            //
+            // `chat_handle` is either the reusable speculative job (already
+            // streaming, NO persistence) or a fresh non-persisting stream.
+            // Either way it is raced against the wake interrupt identically, so
+            // barge-in works the same. Persistence happens AFTER it completes,
+            // via persist_confirmed_turn — so exactly one confirmed turn lands.
+            let input_for_task = input.clone();
+            let chat_handle = reusable_speculative.unwrap_or_else(|| {
+                let svc = self.clone();
+                let msg = input_for_task;
+                let fired_at = std::time::Instant::now();
+                tokio::spawn(async move { svc.stream_response_inner(msg, fired_at).await })
+            });
             let wake_fut = self.wake_word_detector.wait_for_activation_with_audio();
 
-            tokio::pin!(chat_fut);
+            tokio::pin!(chat_handle);
             tokio::pin!(wake_fut);
 
             tokio::select! {
-                chat_result = &mut chat_fut => {
-                    // Normal completion — agent finished before any interrupt
+                chat_result = &mut chat_handle => {
+                    // Normal completion — agent finished before any interrupt.
                     match chat_result {
-                        Ok(response_text) => {
+                        Ok(Ok(response_text)) => {
+                            // Persist the confirmed turn exactly once (user +
+                            // assistant), keyed to the confirmed transcript.
+                            if let Err(e) =
+                                self.persist_confirmed_turn(&input, &response_text).await
+                            {
+                                tracing::warn!("Failed to persist confirmed turn: {}", e);
+                            }
                             self.emit_event(WorkflowEvent::AgentOutput(response_text));
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             eprintln!("  ❌ Error: {}", e);
+                            first_turn = true;
+                        }
+                        Err(join_err) => {
+                            eprintln!("  ❌ Error: {}", join_err);
                             first_turn = true;
                         }
                     }
@@ -1734,10 +2099,14 @@ impl ChatService {
                     self.voice_output.stop_thinking_tone();
                     self.voice_output.stop_barge_in_listener();
 
-                    // chat_fut is dropped here by tokio::select!, which drops the
-                    // agent stream.  The channel-receiver drop propagates into
+                    // `chat_handle` is a spawned task (fresh or reused speculative).
+                    // Aborting it propagates the same drop-based cancellation into
                     // Goose's spawn_blocking inference, causing TokenAction::Stop
-                    // within one token cycle.
+                    // within one token cycle. Crucially, the interrupted task ran
+                    // `stream_response_inner` (NO persistence), so an interrupted
+                    // response never leaves a partial turn in pond_system.db —
+                    // persistence only happens on normal completion above.
+                    chat_handle.abort();
 
                     // Capture the user's new speech (wake word may include trailing audio).
                     // Instead of processing inline (which would be non-interruptible),
@@ -1813,6 +2182,320 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
+    }
+
+    // ── derive_title_from_text / ensure_session_title (DEF-7) ────────────
+
+    #[test]
+    fn derive_title_takes_first_six_words() {
+        let title = derive_title_from_text("What is the capital of France exactly?");
+        assert_eq!(title, "What is the capital of France");
+    }
+
+    #[test]
+    fn derive_title_trims_quotes_and_whitespace() {
+        assert_eq!(derive_title_from_text("  \"hello world\"  "), "hello world");
+        assert_eq!(derive_title_from_text("'single quoted'"), "single quoted");
+    }
+
+    #[test]
+    fn derive_title_empty_for_blank_input() {
+        assert_eq!(derive_title_from_text(""), "");
+        assert_eq!(derive_title_from_text("   "), "");
+    }
+
+    #[test]
+    fn derive_title_caps_long_single_word() {
+        let long = "a".repeat(100);
+        let title = derive_title_from_text(&long);
+        // 60 chars + ellipsis
+        assert!(title.chars().count() <= 61);
+        assert!(title.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn persist_assistant_turn_sets_deterministic_title() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "title-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        service
+            .persist_user_message("How do I reset my password on the router?")
+            .await
+            .unwrap();
+        service
+            .persist_assistant_turn(vec![], "Here's how...", None, None)
+            .await
+            .unwrap();
+
+        let session = storage.get_session(&session_id).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("How do I reset my password"));
+    }
+
+    #[tokio::test]
+    async fn persist_assistant_turn_preserves_existing_title() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "kept-title".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+        storage
+            .update_title(&session_id, "My custom title".to_string())
+            .await
+            .unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        service.persist_user_message("hello there").await.unwrap();
+        service
+            .persist_assistant_turn(vec![], "hi", None, None)
+            .await
+            .unwrap();
+
+        let session = storage.get_session(&session_id).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("My custom title"));
+    }
+
+    // ── is_dismissal_or_exit_phrase / classify_voice_command ─────────────
+
+    #[test]
+    fn dismissal_phrases_are_detected() {
+        assert_eq!(classify_voice_command("goodbye"), VoiceCommand::Dismissal);
+        assert_eq!(classify_voice_command("Stop."), VoiceCommand::Dismissal);
+        assert_eq!(
+            classify_voice_command("  STOP LISTENING  "),
+            VoiceCommand::Dismissal
+        );
+        assert!(is_dismissal_or_exit_phrase("goodbye"));
+        assert!(is_dismissal_or_exit_phrase("Stop."));
+    }
+
+    #[test]
+    fn exit_phrases_are_classified_as_exit() {
+        assert_eq!(classify_voice_command("exit"), VoiceCommand::Exit);
+        assert_eq!(classify_voice_command("quit!"), VoiceCommand::Exit);
+        assert!(is_dismissal_or_exit_phrase("exit"));
+        assert!(is_dismissal_or_exit_phrase("quit!"));
+    }
+
+    #[test]
+    fn non_dismissal_text_is_not_flagged() {
+        assert_eq!(
+            classify_voice_command("what's the weather like"),
+            VoiceCommand::Normal
+        );
+        assert_eq!(
+            classify_voice_command("stop and think about this"),
+            VoiceCommand::Normal
+        );
+        assert_eq!(classify_voice_command(""), VoiceCommand::Normal);
+        assert!(!is_dismissal_or_exit_phrase("what's the weather like"));
+        assert!(!is_dismissal_or_exit_phrase("stop and think about this"));
+        assert!(!is_dismissal_or_exit_phrase(""));
+    }
+
+    // ── listen_with_speculative_chat (Q2-26) ─────────────────────────────
+
+    /// Drives `listen_with_speculative`'s callback through a scripted
+    /// sequence of signals (yielding briefly after each so the caller's
+    /// `tokio::select!` loop gets a chance to react), then resolves with
+    /// `final_transcript` — mirroring how `record_mono_f32_vad` behaves for
+    /// a confirmed recording.
+    struct ScriptedSpeculativeVoiceInput {
+        signals: Vec<SpeculativeSignal>,
+        final_transcript: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceInput for ScriptedSpeculativeVoiceInput {
+        async fn listen(&self) -> Result<Option<String>> {
+            Ok(self.final_transcript.clone())
+        }
+
+        async fn listen_with_speculative(
+            &self,
+            on_speculative: Box<dyn Fn(SpeculativeSignal) + Send + Sync>,
+        ) -> Result<Option<String>> {
+            for sig in &self.signals {
+                on_speculative(sig.clone());
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            Ok(self.final_transcript.clone())
+        }
+
+        fn prompt(&self) -> &str {
+            "> "
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_chat_runs_and_is_reused_when_confirmed() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let voice_input = Arc::new(ScriptedSpeculativeVoiceInput {
+            signals: vec![SpeculativeSignal::Ready("hello".to_string())],
+            final_transcript: Some("hello".to_string()),
+        });
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(voice_input);
+
+        let (transcript, speculative) = service.listen_with_speculative_chat().await.unwrap();
+        assert_eq!(transcript, Some("hello".to_string()));
+
+        let (spec_transcript, handle) = speculative
+            .expect("confirmed, non-dismissal transcript must yield a speculative handle");
+        assert_eq!(
+            spec_transcript, "hello",
+            "the handle must carry the provisional transcript for the confirm-vs-spec gate"
+        );
+        let response = handle.await.unwrap().unwrap();
+        assert_eq!(response, "Echo: hello");
+
+        // The speculative stream persists NOTHING — the run_loop gate owns
+        // persistence after confirmation. Storage must still be empty here.
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert!(
+            msgs.is_empty(),
+            "speculative stream must not persist; found {} messages",
+            msgs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_chat_invalidated_on_resumed_speech_yields_no_handle() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let voice_input = Arc::new(ScriptedSpeculativeVoiceInput {
+            signals: vec![
+                SpeculativeSignal::Ready("hello".to_string()),
+                SpeculativeSignal::Invalidated,
+            ],
+            final_transcript: Some("hello there".to_string()),
+        });
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(voice_input);
+
+        let (transcript, speculative) = service.listen_with_speculative_chat().await.unwrap();
+        assert_eq!(transcript, Some("hello there".to_string()));
+        assert!(
+            speculative.is_none(),
+            "a false pause must abort the speculative job, not hand it back"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_chat_skips_dismissal_phrases() {
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let voice_input = Arc::new(ScriptedSpeculativeVoiceInput {
+            signals: vec![SpeculativeSignal::Ready("goodbye".to_string())],
+            final_transcript: Some("goodbye".to_string()),
+        });
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(voice_input);
+
+        let (transcript, speculative) = service.listen_with_speculative_chat().await.unwrap();
+        assert_eq!(transcript, Some("goodbye".to_string()));
+        assert!(
+            speculative.is_none(),
+            "dismissal phrases must never get a speculative chat call"
+        );
+    }
+
+    // ── Phantom-turn persistence invariant (Q2-26, data integrity) ───────
+
+    #[tokio::test]
+    async fn confirmed_turn_persists_exactly_once_user_and_assistant() {
+        // The persisting entry point (chat_stream_once) writes exactly two
+        // messages: the user turn and the assistant turn. This is the ground
+        // truth the speculative path must match — no more, no less.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        service
+            .chat_stream_once("what's the weather".to_string())
+            .await
+            .unwrap();
+
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "exactly one user + one assistant message must persist per turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_response_inner_persists_nothing() {
+        // The non-persisting core used by the speculative path must never
+        // touch storage — that is what makes discarding a wrong provisional
+        // transcript safe (no phantom turn).
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+        let response = service
+            .stream_response_inner("hello".to_string(), std::time::Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(response, "Echo: hello");
+
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert!(
+            msgs.is_empty(),
+            "stream_response_inner must not persist; found {} messages",
+            msgs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_confirmed_turn_writes_confirmed_transcript_only() {
+        // Simulates the run_loop gate: a speculative stream ran on a provisional
+        // transcript ("weath"), but the CONFIRMED transcript ("what's the
+        // weather") is what gets persisted — never the provisional one. Exactly
+        // one user + one assistant message, keyed to the confirmed text.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "test-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let service = ChatService::new(agent, session_id.clone(), storage.clone());
+
+        // Provisional stream (no persistence).
+        let response = service
+            .stream_response_inner("weath".to_string(), std::time::Instant::now())
+            .await
+            .unwrap();
+
+        // Confirmed transcript differs — commit the CONFIRMED one.
+        service
+            .persist_confirmed_turn("what's the weather", &response)
+            .await
+            .unwrap();
+
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert_eq!(msgs.len(), 2, "exactly one user + one assistant turn");
+        assert_eq!(
+            msgs[0].message.content, "what's the weather",
+            "the persisted user turn must be the CONFIRMED transcript, never the provisional one"
+        );
     }
 
     #[tokio::test]

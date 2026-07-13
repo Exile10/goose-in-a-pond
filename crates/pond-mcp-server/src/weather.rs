@@ -68,6 +68,7 @@ home location. DO NOT guess weather data or use shell commands for weather.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WeatherParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("get_current_weather");
         let location = resolve_location(&params.0);
         tracing::debug!(
             "get_current_weather called, location={:?}, provider={}",
@@ -133,6 +134,7 @@ DO NOT guess forecast data.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ForecastParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("get_weather_forecast");
         let location = resolve_forecast_location(&params.0);
         let days = params.0.days.unwrap_or(3).clamp(1, 7);
 

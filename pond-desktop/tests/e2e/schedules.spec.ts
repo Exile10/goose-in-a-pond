@@ -102,10 +102,10 @@ test.describe("Schedules section", () => {
 
     await goToSchedules(page);
 
-    // Open form
+    // Open the schedule form — use "New Schedule" specifically to avoid matching "New Routine"
     const addBtn = page
-      .getByRole("button")
-      .filter({ hasText: /add|new|create/i })
+      .getByRole("button", { name: /new schedule/i })
+      .or(page.getByRole("button").filter({ hasText: /add schedule|create schedule/i }))
       .first();
     await addBtn.click();
 

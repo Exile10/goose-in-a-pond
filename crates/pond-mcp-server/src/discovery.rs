@@ -115,6 +115,7 @@ Look up country data: population, capital, currency, languages. Use for \
         _ctx: RequestContext<RoleServer>,
         params: Parameters<CountryInfoParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_country_info");
         let country = resolve_country(&params.0).await;
         println!("[discovery] get_country_info: country={:?}", country);
 
@@ -143,12 +144,10 @@ Look up country data: population, capital, currency, languages. Use for \
         };
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -213,6 +212,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ProductLookupParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("lookup_product");
         let (barcode, name) = resolve_product(&params.0).await;
         println!(
             "[discovery] lookup_product: barcode={:?}, name={:?}",
@@ -231,12 +231,10 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             let url = format!("{}/api/v2/product/{}", OFF_BASE, urlencoding::encode(code));
             println!("[discovery] GET {}", url);
 
-            let resp = match self
-                .http_client
-                .get(&url)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
+            let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+                b.timeout(std::time::Duration::from_secs(10))
+            })
+            .await
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -298,12 +296,10 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         );
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(15))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -380,6 +376,7 @@ or price comparisons. European coverage is strongest.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ProductPriceParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_product_price");
         let product = resolve_price_product(&params.0).await;
         println!("[discovery] get_product_price: product={:?}", product);
 
@@ -405,12 +402,10 @@ or price comparisons. European coverage is strongest.")]
         );
         println!("[discovery] GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -489,6 +484,7 @@ Search the web for information not covered by other tools. Use as a LAST RESORT 
         _ctx: RequestContext<RoleServer>,
         params: Parameters<WebSearchParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("search_web");
         let query = resolve_web_query(&params.0).await;
         println!("[discovery] search_web: query={:?}", query);
 
@@ -533,12 +529,10 @@ impl DiscoveryMcpServer {
         );
         println!("[discovery] SearXNG GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -657,12 +651,10 @@ impl DiscoveryMcpServer {
         );
         println!("[discovery] DDG IA GET {}", url);
 
-        let resp = match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
+            b.timeout(std::time::Duration::from_secs(10))
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {

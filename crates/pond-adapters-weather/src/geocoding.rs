@@ -70,11 +70,7 @@ impl Geocoder {
 
         tracing::debug!("geocoding: {url}");
 
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
+        let resp = crate::traced_send(self.client.get(&url).timeout(Duration::from_secs(5)), &url)
             .await
             .context("geocoding request failed")?
             .error_for_status()

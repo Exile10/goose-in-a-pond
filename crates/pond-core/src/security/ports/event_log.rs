@@ -46,4 +46,10 @@ pub trait EventLog: Send + Sync {
 
     /// Return matching events, newest first, honoring `query.limit`.
     async fn query(&self, query: EventQuery) -> Result<Vec<Event>>;
+
+    /// Delete every event matching `query` (the same filters as [`query`], but
+    /// `limit` is ignored). Returns the number of rows removed. Powers
+    /// sensitivity-aware retention pruning and the user "clear my activity"
+    /// control (#117).
+    async fn purge(&self, query: EventQuery) -> Result<u64>;
 }

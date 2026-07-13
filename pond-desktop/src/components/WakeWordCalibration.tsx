@@ -67,6 +67,9 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
   const prevSampleCount = useRef(0);
   const abortedRef = useRef(false);
   const recordingRef = useRef(false);
+  // Evaluated at render time for the audio-level listener effect below; also
+  // re-checked at invoke time inside startSample so we see the live DOM state
+  // rather than a potentially-stale snapshot from an early render.
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
   // ── Audio level listener (Tauri only) ─────────────────────────
@@ -79,7 +82,11 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
   }, [isTauri]);
 
   // ── Cleanup on unmount ────────────────────────────────────────
+  // Reset on each mount: React 18 StrictMode reuses the same ref object across
+  // its simulated unmount/remount pair, so the cleanup's `true` would survive
+  // into the live mount and silently short-circuit every startSample call.
   useEffect(() => {
+    abortedRef.current = false;
     return () => {
       abortedRef.current = true;
       if (recordingRef.current && isTauri) {
@@ -104,13 +111,20 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
     }
     if (abortedRef.current) return;
 
-    // 2. Stop any running wake listener so it doesn't detect the
-    //    calibration utterance and interfere with the recording.
-    if (isTauri) {
-      await invoke("stop_wake_listener").catch(() => undefined);
+    // 2. Re-check Tauri IPC availability at call time (not just at render time)
+    //    so a stale snapshot from an early render can't cause a cryptic TypeError.
+    const tauriReady = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!tauriReady) {
+      setErrorMsg("Microphone capture requires the desktop app — Tauri IPC bridge unavailable. Try restarting the app.");
+      setPhase("error");
+      return;
     }
 
-    // 3. Start Tauri mic capture
+    // 3. Stop any running wake listener so it doesn't detect the
+    //    calibration utterance and interfere with the recording.
+    await invoke("stop_wake_listener").catch(() => undefined);
+
+    // 4. Start Tauri mic capture
     setPhase("recording");
     recordingRef.current = true;
     try {
@@ -122,11 +136,11 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
       return;
     }
 
-    // 4. Record for 2.5s
+    // 5. Record for 2.5s
     await sleep(RECORD_DURATION_MS);
     if (abortedRef.current) return;
 
-    // 5. Stop recording, get WAV bytes
+    // 6. Stop recording, get WAV bytes
     let wavBytes: number[];
     try {
       wavBytes = await invoke<number[]>("stop_recording");
@@ -139,7 +153,7 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
     recordingRef.current = false;
     if (abortedRef.current) return;
 
-    // 6. Hold at review — let the user decide to submit or discard
+    // 7. Hold at review — let the user decide to submit or discard
     setPendingWav(wavBytes);
     setPhase("review");
   }, []);

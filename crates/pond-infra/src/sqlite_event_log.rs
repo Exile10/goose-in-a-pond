@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{Pool, Row, Sqlite};
 use std::sync::Arc;
 
-use pond_core::security::domain::event::{Event, EventQuery};
+use pond_core::security::domain::event::{Event, EventQuery, PrivacySensitivity};
 use pond_core::security::ports::event_log::{EventLog, EventLogRepository, LogEntry};
 
 pub struct SqliteEventLogRepository {
@@ -107,6 +107,86 @@ fn enum_from_str<T: DeserializeOwned>(s: &str) -> Result<T> {
     ))?)
 }
 
+/// The on-disk sensitivity strings that are `>=` `min` on the
+/// `Public < Internal < Sensitive < Secret` ordering. The column stores
+/// snake_case text, so a `>=` comparison can't be done in SQL — we expand to an
+/// `IN (...)` set instead.
+fn sensitivities_at_least(min: PrivacySensitivity) -> Vec<String> {
+    [
+        PrivacySensitivity::Public,
+        PrivacySensitivity::Internal,
+        PrivacySensitivity::Sensitive,
+        PrivacySensitivity::Secret,
+    ]
+    .into_iter()
+    .filter(|s| *s >= min)
+    .filter_map(|s| enum_to_str(&s).ok())
+    .collect()
+}
+
+/// Append the shared `EventQuery` `WHERE` fragments (everything except
+/// ordering/limit) to `sql`, in a fixed order so binding can match positionally.
+/// Used by both `query` (SELECT) and `purge` (DELETE).
+fn push_filters(sql: &mut String, query: &EventQuery) {
+    if query.category.is_some() {
+        sql.push_str(" AND category = ?");
+    }
+    if query.session_id.is_some() {
+        sql.push_str(" AND session_id = ?");
+    }
+    if query.trace_id.is_some() {
+        sql.push_str(" AND trace_id = ?");
+    }
+    if query.since.is_some() {
+        sql.push_str(" AND timestamp >= ?");
+    }
+    if query.until.is_some() {
+        sql.push_str(" AND timestamp < ?");
+    }
+    if let Some(min) = query.min_sensitivity {
+        let n = sensitivities_at_least(min).len();
+        if n > 0 {
+            sql.push_str(" AND privacy_sensitivity IN (");
+            for i in 0..n {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+        }
+    }
+}
+
+/// Bind the values for [`push_filters`] in the same order. Returns the query so
+/// callers can chain additional binds (e.g. a trailing `LIMIT`).
+fn bind_filters<'q>(
+    mut q: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: &'q EventQuery,
+) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+    if let Some(category) = &query.category {
+        q = q.bind(enum_to_str(category)?);
+    }
+    if let Some(session_id) = &query.session_id {
+        q = q.bind(session_id.clone());
+    }
+    if let Some(trace_id) = &query.trace_id {
+        q = q.bind(trace_id.clone());
+    }
+    if let Some(since) = query.since {
+        q = q.bind(since.to_rfc3339());
+    }
+    if let Some(until) = query.until {
+        q = q.bind(until.to_rfc3339());
+    }
+    if let Some(min) = query.min_sensitivity {
+        for level in sensitivities_at_least(min) {
+            q = q.bind(level);
+        }
+    }
+    Ok(q)
+}
+
 /// Unified, append-only event store (#109) implementing [`EventLog`] over the
 /// `events` table in `pond_logs.db`.
 pub struct SqliteEventLog {
@@ -167,39 +247,10 @@ impl EventLog for SqliteEventLog {
             "SELECT id, timestamp, category, action, session_id, trace_id, attributes, \
              privacy_sensitivity FROM events WHERE 1 = 1",
         );
-        if query.category.is_some() {
-            sql.push_str(" AND category = ?");
-        }
-        if query.session_id.is_some() {
-            sql.push_str(" AND session_id = ?");
-        }
-        if query.trace_id.is_some() {
-            sql.push_str(" AND trace_id = ?");
-        }
-        if query.since.is_some() {
-            sql.push_str(" AND timestamp >= ?");
-        }
-        if query.until.is_some() {
-            sql.push_str(" AND timestamp < ?");
-        }
+        push_filters(&mut sql, &query);
         sql.push_str(" ORDER BY timestamp DESC, id DESC LIMIT ?");
 
-        let mut q = sqlx::query(&sql);
-        if let Some(category) = &query.category {
-            q = q.bind(enum_to_str(category)?);
-        }
-        if let Some(session_id) = &query.session_id {
-            q = q.bind(session_id.clone());
-        }
-        if let Some(trace_id) = &query.trace_id {
-            q = q.bind(trace_id.clone());
-        }
-        if let Some(since) = query.since {
-            q = q.bind(since.to_rfc3339());
-        }
-        if let Some(until) = query.until {
-            q = q.bind(until.to_rfc3339());
-        }
+        let mut q = bind_filters(sqlx::query(&sql), &query)?;
         let limit = query
             .limit
             .map(|l| l as i64)
@@ -209,6 +260,19 @@ impl EventLog for SqliteEventLog {
 
         let rows = q.fetch_all(&self.pool).await?;
         rows.iter().map(Self::row_to_event).collect()
+    }
+
+    async fn purge(&self, query: EventQuery) -> Result<u64> {
+        // Same parameterized filters as `query`, but a DELETE — no ORDER/LIMIT.
+        // A filterless query (all `None`) purges every event ("clear my
+        // activity"); any set filter narrows it (per-category retention, a time
+        // window, a session, or a sensitivity floor).
+        let mut sql = String::from("DELETE FROM events WHERE 1 = 1");
+        push_filters(&mut sql, &query);
+
+        let q = bind_filters(sqlx::query(&sql), &query)?;
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -338,5 +402,60 @@ mod event_log_tests {
             .await
             .unwrap();
         assert_eq!(log.query(EventQuery::default()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_by_category_time_and_sensitivity() {
+        let log = fresh().await;
+        let base = chrono::Utc::now();
+
+        let mut old_net = Event::new(EventCategory::Network, "egress.http");
+        old_net.timestamp = base - chrono::Duration::days(40);
+        log.append(old_net).await.unwrap();
+
+        let mut fresh_net = Event::new(EventCategory::Network, "egress.http");
+        fresh_net.timestamp = base - chrono::Duration::days(1);
+        log.append(fresh_net).await.unwrap();
+
+        let mut sensitive =
+            Event::new(EventCategory::Auth, "auth.token").sensitivity(PrivacySensitivity::Secret);
+        sensitive.timestamp = base - chrono::Duration::days(2);
+        log.append(sensitive).await.unwrap();
+
+        log.append(Event::new(EventCategory::Sensor, "sensor.reading"))
+            .await
+            .unwrap();
+
+        // Per-category time-window purge: Network older than 30 days → only old_net.
+        let n = log
+            .purge(EventQuery {
+                category: Some(EventCategory::Network),
+                until: Some(base - chrono::Duration::days(30)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(log.query(EventQuery::default()).await.unwrap().len(), 3);
+
+        // Sensitivity sweep: anything ≥ Sensitive → the Secret auth event.
+        let n = log
+            .purge(EventQuery {
+                min_sensitivity: Some(PrivacySensitivity::Sensitive),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Remaining: fresh Network + Sensor.
+        let left = log.query(EventQuery::default()).await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|e| e.action != "auth.token"));
+
+        // Filterless purge clears everything ("clear my activity").
+        let n = log.purge(EventQuery::default()).await.unwrap();
+        assert_eq!(n, 2);
+        assert!(log.query(EventQuery::default()).await.unwrap().is_empty());
     }
 }

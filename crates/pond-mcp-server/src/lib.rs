@@ -1,4 +1,5 @@
 // ── Modular MCP servers (Phase 1 split) ─────────────────────────────────────
+pub mod audit;
 pub mod device;
 pub mod device_control;
 pub mod discovery;
@@ -24,22 +25,13 @@ use std::sync::{Arc, OnceLock, RwLock};
 // -- User message and current session: set by GooseAdapter before each turn --
 static LAST_USER_MESSAGE: RwLock<String> = RwLock::new(String::new());
 
-// Session ID for the turn currently in flight — used by MCP tool handlers to
-// tag outbound HTTP trace events with the correct session for correlation.
-static CURRENT_SESSION_ID: RwLock<String> = RwLock::new(String::new());
-
-pub fn set_current_session_id(sid: &str) {
-    if let Ok(mut guard) = CURRENT_SESSION_ID.write() {
-        *guard = sid.to_string();
-    }
-}
-
-pub fn current_session_id() -> String {
-    CURRENT_SESSION_ID
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default()
-}
+// Per-turn request context (session + in-flight tool) and the egress sink now
+// live in `pond-core` so outboard adapters (e.g. pond-adapters-weather) can
+// report egress into the same store without depending on this crate (#113).
+// Re-exported here so existing engine call sites stay unchanged.
+pub use pond_core::shared::services::egress::{
+    current_session_id, current_tool, set_current_session_id, set_current_tool, set_egress_sink,
+};
 
 pub fn set_last_user_message(msg: &str) {
     if let Ok(mut guard) = LAST_USER_MESSAGE.write() {
@@ -68,6 +60,26 @@ pub fn set_tool_caller(tc: Option<Arc<dyn ToolCaller>>) {
 /// Get the tool-calling specialist, if configured.
 pub fn tool_caller() -> Option<Arc<dyn ToolCaller>> {
     TOOL_CALLER.get().and_then(|opt| opt.clone())
+}
+
+// -- Notification sender (#99): set once at startup so the `send_notification`
+// tool can push to connected phones (foreground SSE) in addition to the local
+// desktop popup. Unset (tests, standalone) → the tool is desktop-only.
+static NOTIFICATION_SENDER: OnceLock<
+    Arc<dyn pond_core::mcp::ports::notification::NotificationSender>,
+> = OnceLock::new();
+
+/// Install the notification sender. Call once at startup.
+pub fn init_notification_sender(
+    sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender>,
+) {
+    let _ = NOTIFICATION_SENDER.set(sender);
+}
+
+/// The configured notification sender, if installed.
+pub fn notification_sender(
+) -> Option<Arc<dyn pond_core::mcp::ports::notification::NotificationSender>> {
+    NOTIFICATION_SENDER.get().cloned()
 }
 
 /// Generate tool params via the ToolCaller specialist.
@@ -121,6 +133,7 @@ pub async fn generate_params(
 }
 
 // Re-export key types for downstream crates
+pub use audit::AuditMcpServer;
 pub use device::DeviceMcpServer;
 pub use device_control::DeviceControlMcpServer;
 pub use discovery::DiscoveryMcpServer;
@@ -134,6 +147,7 @@ pub use system::SystemMcpServer;
 pub use weather::WeatherMcpServer;
 
 // Re-export init + spawn functions for Goose builtin extension registration
+pub use audit::{init_audit_deps, spawn_audit_server};
 pub use device::{init_device_deps, spawn_device_server};
 pub use device_control::{init_device_control_deps, spawn_device_control_server};
 pub use discovery::{init_discovery_deps, spawn_discovery_server};
@@ -162,7 +176,7 @@ pub fn all_app_resources() -> Vec<(&'static str, &'static str)> {
 
 // Re-export shared utilities for downstream Knowledge-family servers
 pub use format::{format_api_error, format_list_result, format_not_configured, truncate_to_budget};
-pub use http::{build_http_client, traced_get};
+pub use http::{build_http_client, traced_get, traced_get_with};
 
 // Re-export the direct tool dispatcher
 pub use dispatcher::McpToolDispatcher;

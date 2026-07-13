@@ -12,7 +12,6 @@ members = [
     "crates/pond-adapters-whisper",
     "crates/pond-adapters-piper",
     "crates/pond-adapters-face-onnx",
-    "crates/pond-adapters-gotg",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
     # Independent agent + inference engine (no Goose dependency — future primary path)

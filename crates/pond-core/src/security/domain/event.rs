@@ -35,6 +35,22 @@ pub enum EventCategory {
     System,
 }
 
+impl EventCategory {
+    /// Every variant, for exhaustive iteration (e.g. per-category retention).
+    /// Adding a variant breaks this array's length and forces an update.
+    pub const ALL: [EventCategory; 9] = [
+        EventCategory::Agent,
+        EventCategory::Tool,
+        EventCategory::Inference,
+        EventCategory::Sensor,
+        EventCategory::Camera,
+        EventCategory::Device,
+        EventCategory::Auth,
+        EventCategory::Network,
+        EventCategory::System,
+    ];
+}
+
 /// How sensitive an event's contents are. Drives retention and export policy
 /// (Q2-40); defaults to the most permissive only where explicitly chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -149,6 +165,10 @@ pub struct EventQuery {
     pub since: Option<DateTime<Utc>>,
     /// Exclusive upper bound on `timestamp`.
     pub until: Option<DateTime<Utc>>,
+    /// Minimum sensitivity (inclusive): match events whose `privacy_sensitivity`
+    /// is `>=` this on the `Public < Internal < Sensitive < Secret` ordering.
+    /// Used by sensitivity-aware retention to target sensitive activity.
+    pub min_sensitivity: Option<PrivacySensitivity>,
     /// Cap on returned rows (newest first).
     pub limit: Option<usize>,
 }
@@ -178,6 +198,11 @@ impl EventQuery {
         }
         if let Some(until) = self.until {
             if event.timestamp >= until {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_sensitivity {
+            if event.privacy_sensitivity < min {
                 return false;
             }
         }

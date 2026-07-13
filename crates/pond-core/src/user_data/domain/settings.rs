@@ -187,6 +187,23 @@ pub struct Settings {
     #[serde(default = "Settings::default_session_messages_keep")]
     pub retention_session_messages_keep: u32,
 
+    /// Baseline days to keep rows in the unified `events` log (#117).
+    /// `0` = keep forever. Per-category overrides take precedence.
+    #[serde(default = "Settings::default_events_days")]
+    pub retention_events_days: u32,
+
+    /// Per-`EventCategory` retention override (snake_case category → days),
+    /// e.g. `{"network": 14, "sensor": 7}`. Categories absent here fall back to
+    /// `retention_events_days`. Empty by default.
+    #[serde(default)]
+    pub retention_events_by_category: std::collections::HashMap<String, u32>,
+
+    /// Privacy-by-default cap: events classified `Sensitive` or `Secret` are
+    /// purged after at most this many days, regardless of category (#117).
+    /// `0` = no extra cap.
+    #[serde(default = "Settings::default_sensitive_days")]
+    pub retention_sensitive_days: u32,
+
     // ── Thinking / Reasoning ────────────────────────────────────────────────────
     /// Thinking/reasoning mode: "auto" | "on" | "off"
     /// "auto" (default): enable for models that support it (Gemma 4, Qwen3, etc.)
@@ -237,9 +254,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
-    /// Maximum seconds for an entire agent turn (stream start to done).
-    /// When exceeded, the stream emits a timeout error and stops.
-    /// Default: 300 (5 minutes). Set to 0 to disable.
+    /// Maximum seconds of SILENCE (no stream event) before an agent turn
+    /// is aborted. This bounds a stalled stream, NOT total generation time,
+    /// so slow reasoning models that stream continuously are never killed.
+    /// The deadline is reset on every stream event. Set to 0 to disable.
+    /// Default: 300 (5 minutes of no progress).
     #[serde(default = "Settings::default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
 
@@ -456,6 +475,10 @@ pub struct Settings {
     /// Enable the discovery tools module (product search, recommendations).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_discovery_enabled: bool,
+
+    /// Enable the audit/privacy tools module (recent activity, summary, privacy risks).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_audit_enabled: bool,
 }
 
 impl Default for Settings {
@@ -497,6 +520,9 @@ impl Default for Settings {
             retention_event_log_days: Self::default_event_log_days(),
             retention_sensor_days: Self::default_sensor_days(),
             retention_session_messages_keep: Self::default_session_messages_keep(),
+            retention_events_days: Self::default_events_days(),
+            retention_events_by_category: std::collections::HashMap::new(),
+            retention_sensitive_days: Self::default_sensitive_days(),
             thinking_mode: Self::default_thinking_mode(),
             show_thinking: false,
             review_mode: Self::default_review_mode(),
@@ -549,6 +575,7 @@ impl Default for Settings {
             ext_knowledge_enabled: true,
             ext_system_enabled: true,
             ext_device_enabled: true,
+            ext_audit_enabled: true,
             ext_news_enabled: true,
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
@@ -645,6 +672,12 @@ impl Settings {
     }
     fn default_session_messages_keep() -> u32 {
         500
+    }
+    fn default_events_days() -> u32 {
+        30
+    }
+    fn default_sensitive_days() -> u32 {
+        7
     }
     fn default_thinking_mode() -> String {
         "auto".to_string()

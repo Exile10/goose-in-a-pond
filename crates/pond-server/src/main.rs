@@ -24,6 +24,7 @@ mod inference_pool;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
+mod mdns_advertiser;
 mod model_download;
 #[cfg(feature = "legacy-subprocess")]
 mod piper_http;
@@ -250,6 +251,17 @@ enum Commands {
         #[arg(long)]
         reset: bool,
     },
+
+    /// Show or refresh the device pairing code.
+    ///
+    /// Prints the current pairing code (if one is still valid) or issues a
+    /// fresh 6-digit code the operator can enter into the Goose On The Go app.
+    /// Also prints a QR code the phone can scan to complete pairing.
+    Pairing {
+        /// Force a fresh code even if one is still active
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -471,6 +483,7 @@ async fn async_main() -> Result<()> {
             whisper_url,
             reset,
         }) => run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await,
+        Some(Commands::Pairing { refresh }) => run_pairing(refresh).await,
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
@@ -1482,14 +1495,23 @@ async fn run_server(
 
     let db = Arc::new(db);
 
-    // Spawn background TTL pruning task (runs every 6 hours)
+    // Spawn background TTL pruning task (runs every 6 hours). Reads the user's
+    // retention settings each cycle (per-category + sensitivity-aware, #117).
     {
         let logs = db.logs.clone();
         let system = db.system.clone();
+        let settings_repo = settings_repo.clone();
         tokio::spawn(async move {
-            pond_infra::pruning::run_pruning(logs, system, Default::default()).await;
+            pond_infra::pruning::run_pruning(logs, system, settings_repo).await;
         });
     }
+
+    // Install the audit MCP server's read handle on the unified event store
+    // (#115). Done here, where the logs DB is in scope, before any agent/builtin
+    // extension is built — `spawn_audit_server` only fires at chat time.
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -2036,6 +2058,11 @@ async fn run_server(
     let (listener, api_port) =
         ports::bind_with_fallback("0.0.0.0", port.unwrap_or(ports::API_SERVER)).await?;
 
+    // Persist the ACTUAL bound port so the standalone `pond pairing` CLI can
+    // build a pairing URL with the real port (bind_with_fallback may have picked
+    // a fallback, or the operator passed --port). Best-effort; ignored on error.
+    let _ = std::fs::write(data_dir.join(".runtime_api_port"), api_port.to_string());
+
     // Direct MCP tool dispatcher for POST /api/v1/tools/invoke (bypasses the LLM).
     let tool_dispatcher: Option<
         Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>,
@@ -2062,6 +2089,72 @@ async fn run_server(
     // query API (#114) reads from it via AppState.
     let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
         Arc::new(SqliteEventLog::new(db.logs.clone()));
+    // Push-token store (#95) — built here, before `db` is moved into AppState.
+    let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
+        Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
+
+    // Push-notification path (#99): in-process fan-out to connected
+    // `/notifications/stream` clients + an offline queue + a (stub) FCM/APNs
+    // relay backed by #95's push tokens.
+    let (notification_tx, _) =
+        tokio::sync::broadcast::channel::<pond_core::mcp::ports::notification::Notification>(256);
+    let notification_queue: Arc<
+        dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository,
+    > = Arc::new(
+        pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
+    );
+    let push_relay: Arc<dyn pond_core::mcp::ports::notification_relay::NotificationRelay> =
+        Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+            push_token_repo.clone(),
+        ));
+    let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
+        Arc::new(
+            pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
+                notification_tx.clone(),
+                notification_queue.clone(),
+                Some(push_relay),
+            ),
+        );
+    // Let the `send_notification` MCP tool reach connected phones too (#99).
+    pond_mcp_server::init_notification_sender(notification_sender.clone());
+
+    // Bridge schedule completion/failure events to push notifications (#99), so a
+    // reminder/scheduled task surfaces on the phone, not just the dashboard.
+    {
+        let mut rx = schedule_result_tx.subscribe();
+        let sender = notification_sender.clone();
+        tokio::spawn(async move {
+            use pond_core::user_data::domain::schedule::RunStatus;
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let (category, body) = match ev.status {
+                            RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
+                            RunStatus::Failed => (
+                                "alert",
+                                ev.error
+                                    .clone()
+                                    .unwrap_or_else(|| "Task failed".to_string()),
+                            ),
+                            RunStatus::Running => continue, // not user-facing
+                        };
+                        let notification = pond_core::mcp::ports::notification::Notification {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            target: "broadcast".to_string(),
+                            category: category.to_string(),
+                            title: format!("Schedule: {}", ev.schedule_label),
+                            body,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            data: None,
+                        };
+                        let _ = sender.broadcast(notification).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
@@ -2076,17 +2169,38 @@ async fn run_server(
         });
     }
 
+    // Egress tracker (#113): record every outbound HTTP call made by built-in
+    // MCP tools into the same event store, so network egress is queryable via
+    // `GET /api/v1/activity?category=network`.
+    pond_mcp_server::set_egress_sink(event_log.clone());
+
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
     // to pair a GOTG device.
     let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> =
         Arc::new(SqliteHandshakeAdapter::new(db.system.clone()));
+    let pairing_hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "pond".to_string());
+    let pairing_hostname = pairing_hostname
+        .strip_suffix(".local")
+        .unwrap_or(&pairing_hostname)
+        .to_string();
     match handshake.issue_pairing_code().await {
         Ok(pc) => {
-            println!("\n  ┌───────────────────────────────────────┐");
-            println!("  │  Pairing code:  {}   (valid 10 min) │", pc.code);
-            println!("  └───────────────────────────────────────┘");
-            println!("  Enter this in Goose On The Go to pair this device.\n");
+            let pair_url = format!(
+                "pond://pair?host={}.local&port={}&code={}",
+                pairing_hostname, api_port, pc.code
+            );
+            println!("\n  ┌────────────────────────────────────────────────────┐");
+            println!(
+                "  │  Pairing code:  {}   (valid 10 min)           │",
+                pc.code
+            );
+            println!("  │  Scan with Goose On The Go or enter the code.     │");
+            println!("  └────────────────────────────────────────────────────┘");
+            print_pairing_qr(&pair_url);
+            println!();
         }
         Err(e) => tracing::warn!("failed to issue pairing code at startup: {e:#}"),
     }
@@ -2143,9 +2257,13 @@ async fn run_server(
         event_log_repo: event_log_repo,
         event_bus: Some(event_bus.clone()),
         event_log: Some(event_log.clone()),
+        push_token_repo: Some(push_token_repo.clone()),
         face_recognition,
         session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        // Long-lived per-device notification streams get their own, larger pool
+        // so connected phones never starve interactive chat SSE (#99 audit).
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
         answer_reviewer: answer_reviewer_for_http,
         memory_extractor: memory_extractor_for_http,
         memory_extraction_service: memory_extraction_service_for_http,
@@ -2155,6 +2273,9 @@ async fn run_server(
         consolidation_runner,
         inference_pool,
         schedule_result_tx: schedule_result_tx.clone(),
+        notification_tx: notification_tx.clone(),
+        notification_queue: Some(notification_queue.clone()),
+        notification_sender: Some(notification_sender.clone()),
         telemetry,
         context_monitor: Arc::new(
             pond_core::models::services::context_monitor::ContextMonitor::new(),
@@ -2251,6 +2372,21 @@ async fn run_server(
         tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
     }
 
+    // Advertise _pond._tcp.local. so phones on the LAN can discover this hub.
+    // The handle is kept alive for the duration of the server; dropping it
+    // deregisters the service gracefully.
+    let _mdns_handle =
+        match mdns_advertiser::advertise(&pairing_hostname, api_port, env!("CARGO_PKG_VERSION")) {
+            Ok(h) => {
+                println!("  📡 mDNS: advertising _pond._tcp.local. on port {api_port}");
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!("mDNS advertisement failed (LAN discovery disabled): {e:#}");
+                None
+            }
+        };
+
     // Warn if static assets haven't been built yet
     if !static_dir.exists() {
         tracing::warn!(
@@ -2307,6 +2443,28 @@ async fn run_server(
     .await?;
 
     Ok(())
+}
+
+/// Print a Unicode QR code for `url` to stdout, indented to match the startup banner.
+fn print_pairing_qr(url: &str) {
+    use qrcode::render::unicode;
+    use qrcode::QrCode;
+
+    match QrCode::new(url.as_bytes()) {
+        Ok(code) => {
+            let image = code
+                .render::<unicode::Dense1x2>()
+                .dark_color(unicode::Dense1x2::Light)
+                .light_color(unicode::Dense1x2::Dark)
+                .quiet_zone(true)
+                .build();
+            // Indent each line to match the banner style.
+            for line in image.lines() {
+                println!("  {line}");
+            }
+        }
+        Err(e) => tracing::warn!("QR code generation failed: {e}"),
+    }
 }
 
 /// Locate and spawn the pond-desktop Tauri binary.
@@ -2370,6 +2528,13 @@ async fn run_chat(
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+
+    // Install the audit MCP server's read handle so the giap-audit extension works
+    // in headless/CLI chat too (not just `run_server`); otherwise invoking the audit
+    // tool here would find no deps. (#115/#157)
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
@@ -5185,6 +5350,13 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
+    // Install the audit MCP server's read handle so the giap-audit extension works
+    // from the `agent` subcommand too; otherwise invoking the audit tool here would
+    // find no deps. (#115/#157)
+    pond_mcp_server::init_audit_deps(
+        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
+    );
+
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
@@ -5737,6 +5909,95 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `pond pairing` — re-display (or refresh) the device pairing code + QR by asking
+/// the RUNNING server (loopback) to mint/return it. Pairing-code plaintext is
+/// process-local (`ISSUED_CODE_CACHE` lives in the server process), so the CLI must
+/// NOT mint locally — a locally-minted code lands in a per-process cache the running
+/// server can never see, so it can never verify (DEF-6). We instead delegate to the
+/// server's loopback-gated `GET/POST /api/v1/handshake/pairing-code` endpoints, which
+/// execute in the process that owns the cache.
+async fn run_pairing(refresh: bool) -> Result<()> {
+    let data_dir = default_data_dir();
+
+    // The running server persisted its actually-bound port here (see run_server).
+    // Fall back to the default only so the URL is still meaningful; a missing file
+    // almost certainly means the server isn't running, which the HTTP call surfaces.
+    let port = std::fs::read_to_string(data_dir.join(".runtime_api_port"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(ports::API_SERVER);
+
+    let base = format!("http://127.0.0.1:{port}/api/v1/handshake/pairing-code");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // GET returns the current unconsumed code; POST mints a fresh one. Both are
+    // loopback-only and execute inside the server process (cache is populated there).
+    let resp = if refresh {
+        client.post(&base).send().await
+    } else {
+        client.get(&base).send().await
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to reach the running pond server on 127.0.0.1:{port}: {e}. \
+             Is the server running? Start it with `pond serve` before `pond pairing`."
+        )
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "server returned {} for pairing-code request",
+            resp.status()
+        ));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodeResp {
+        code: Option<String>,
+        expires_at: Option<String>,
+    }
+    let body: CodeResp = resp.json().await?;
+
+    // A GET can return {"code": null} when no live code exists — mint one via POST.
+    let (code, expires_at) = match (body.code, body.expires_at) {
+        (Some(c), Some(e)) => (c, e),
+        _ => {
+            let minted: CodeResp = client.post(&base).send().await?.json().await?;
+            (
+                minted
+                    .code
+                    .ok_or_else(|| anyhow::anyhow!("server did not return a pairing code"))?,
+                minted.expires_at.unwrap_or_default(),
+            )
+        }
+    };
+
+    // Derive the hostname the same way run_server does.
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "pond".to_string());
+    let hostname = hostname
+        .strip_suffix(".local")
+        .unwrap_or(&hostname)
+        .to_string();
+
+    let pair_url = format!("pond://pair?host={hostname}.local&port={port}&code={code}");
+
+    println!("\n  ┌────────────────────────────────────────────────────┐");
+    println!(
+        "  │  Pairing code:  {}   (expires: {})  │",
+        code,
+        &expires_at[..16.min(expires_at.len())]
+    );
+    println!("  │  Scan with Goose On The Go or enter the code.     │");
+    println!("  └────────────────────────────────────────────────────┘");
+    print_pairing_qr(&pair_url);
+    println!("\n  URL: {pair_url}\n");
     Ok(())
 }
 
