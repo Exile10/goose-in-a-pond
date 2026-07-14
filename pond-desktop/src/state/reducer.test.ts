@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type AppState, reducer, type TranscriptMessage, type ContextCard } from "./reducer";
+import { type AppState, reducer, buildInitialState, type TranscriptMessage, type ContextCard } from "./reducer";
 
 // ── Mock localStorage (pure function tests must not touch real storage) ───────
 
@@ -56,6 +56,25 @@ describe("reducer — mode & section", () => {
     const next = reducer(BASE, { type: "SET_SECTION", payload: "settings" });
     expect(next.section).toBe("settings");
     expect(storageMock.setItem).toHaveBeenCalledWith("giap-section", "settings");
+  });
+});
+
+describe("buildInitialState — classic UI is the default landing surface", () => {
+  it("defaults to the classic dashboard when nothing is stored", () => {
+    expect(buildInitialState().section).toBe("dashboard");
+  });
+  it("never lands in the Goose Hub on launch (coerces a persisted 'hub' back to dashboard)", () => {
+    localStorage.setItem("giap-section", "hub");
+    expect(buildInitialState().section).toBe("dashboard");
+  });
+  it("preserves a persisted classic section across launches", () => {
+    localStorage.setItem("giap-section", "settings");
+    expect(buildInitialState().section).toBe("settings");
+  });
+  it("the explicit giap-force-hub opt-in bypasses the coercion", () => {
+    localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
+    expect(buildInitialState().section).toBe("hub");
   });
 });
 

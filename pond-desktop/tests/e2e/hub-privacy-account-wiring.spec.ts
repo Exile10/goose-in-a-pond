@@ -144,6 +144,7 @@ async function setupRoutes(
 async function navigateTo(page: Page) {
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.setViewportSize({ width: 1440, height: 900 });
