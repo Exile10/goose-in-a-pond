@@ -2343,6 +2343,7 @@ async fn run_server(
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
         security_policy,
         api_port,
+        weather_provider: weather.clone(),
     });
 
     // Spawn OAuth token auto-refresh worker.

@@ -122,6 +122,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(register_push_token).delete(delete_push_token),
         )
         .route("/settings", get(get_settings))
+        .route("/weather", get(get_weather))
         .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/memory-status", get(get_memory_status))
@@ -2162,6 +2163,96 @@ async fn update_settings(
     Ok(Json(
         serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
     ))
+}
+
+/// Current conditions + short forecast for the dashboard weather widget.
+/// Returns `{"enabled": false}` when no location is configured, rather than
+/// an error — the dashboard just keeps showing its placeholder in that case.
+async fn get_weather(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(provider) = state.weather_provider.as_ref() else {
+        return Ok(Json(json!({ "enabled": false })));
+    };
+
+    let current = provider.current().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to fetch weather: {}", e)})),
+        )
+    })?;
+    let forecast = provider.forecast(4).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Failed to fetch forecast: {}", e)})),
+        )
+    })?;
+
+    let (hi, lo) = forecast
+        .days
+        .first()
+        .map(|d| (d.temp_max_c.round() as i64, d.temp_min_c.round() as i64))
+        .unwrap_or((
+            current.temperature_c.round() as i64,
+            current.temperature_c.round() as i64,
+        ));
+
+    let upcoming: Vec<Value> = forecast
+        .days
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|d| {
+            json!({
+                "d": weather_short_weekday(&d.date),
+                "i": weather_icon_key(&d.description),
+                "t": d.temp_max_c.round() as i64,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "enabled": true,
+        "location_name": current.location_name,
+        "temp": current.temperature_c.round() as i64,
+        "cond": current.description,
+        "icon": weather_icon_key(&current.description),
+        "hi": hi,
+        "lo": lo,
+        "hum": current.humidity_pct,
+        "wind": current.wind_speed_kmh.round() as i64,
+        "sunrise": current.sunrise,
+        "sunset": current.sunset,
+        "forecast": upcoming,
+    })))
+}
+
+/// Maps an Open-Meteo/WMO description to one of the icon keys the dashboard
+/// widget knows how to render ("sun" | "cloudSun" | "cloud" | "rain").
+fn weather_icon_key(description: &str) -> &'static str {
+    let d = description.to_lowercase();
+    if d.contains("rain")
+        || d.contains("drizzle")
+        || d.contains("shower")
+        || d.contains("snow")
+        || d.contains("thunder")
+    {
+        "rain"
+    } else if d.contains("clear sky") {
+        "sun"
+    } else if d.contains("clear") || d.contains("partly") {
+        "cloudSun"
+    } else {
+        "cloud"
+    }
+}
+
+/// Formats a `YYYY-MM-DD` forecast date as a short weekday name (e.g. "Tue").
+/// Falls back to the raw date string if parsing fails.
+fn weather_short_weekday(date: &str) -> String {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| d.format("%a").to_string())
+        .unwrap_or_else(|_| date.to_string())
 }
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.

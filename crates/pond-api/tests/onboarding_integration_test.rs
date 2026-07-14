@@ -164,6 +164,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),

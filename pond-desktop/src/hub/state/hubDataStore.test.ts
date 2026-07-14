@@ -6,6 +6,7 @@ vi.mock("../../api/PondApiClient", () => ({
     listDevices: vi.fn(),
     listSchedules: vi.fn(),
     listRecipes: vi.fn().mockResolvedValue([]),
+    getWeather: vi.fn().mockResolvedValue({ enabled: false }),
   },
 }));
 
@@ -18,6 +19,7 @@ const apiMock = api as unknown as {
   listDevices: ReturnType<typeof vi.fn>;
   listSchedules: ReturnType<typeof vi.fn>;
   listRecipes: ReturnType<typeof vi.fn>;
+  getWeather: ReturnType<typeof vi.fn>;
 };
 
 describe("hubDataStore", () => {
@@ -28,6 +30,8 @@ describe("hubDataStore", () => {
     apiMock.listSchedules.mockReset();
     apiMock.listRecipes.mockReset();
     apiMock.listRecipes.mockResolvedValue([]);
+    apiMock.getWeather.mockReset();
+    apiMock.getWeather.mockResolvedValue({ enabled: false });
   });
 
   it("falls back to mock data when API returns empty devices", async () => {
@@ -72,6 +76,41 @@ describe("hubDataStore", () => {
     expect(lights?.status).toBe("1 on");
     const climate = home.categories.find((c) => c.id === "climate");
     expect(climate?.status).toBe("Heat to 72°");
+  });
+
+  it("uses real weather when the API reports enabled", async () => {
+    apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
+    apiMock.listDevices.mockResolvedValue([]);
+    apiMock.listSchedules.mockResolvedValue([]);
+    apiMock.getWeather.mockResolvedValue({
+      enabled: true,
+      temp: 71,
+      cond: "Clear sky",
+      icon: "sun",
+      hi: 75,
+      lo: 60,
+      hum: 40,
+      wind: 8,
+      forecast: [{ d: "Wed", i: "rain", t: 55 }],
+    });
+
+    await refreshHomeData();
+    const home = getHomeData();
+    expect(home.weather.temp).toBe(71);
+    expect(home.weather.icon).toBe("sun");
+    expect(home.weather.forecast).toEqual([{ d: "Wed", i: "rain", t: 55 }]);
+  });
+
+  it("falls back to mock weather when the API reports disabled", async () => {
+    apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
+    apiMock.listDevices.mockResolvedValue([]);
+    apiMock.listSchedules.mockResolvedValue([]);
+    apiMock.getWeather.mockResolvedValue({ enabled: false });
+
+    await refreshHomeData();
+    const home = getHomeData();
+    expect(home.weather.temp).toBe(64);
+    expect(home.weather.cond).toBe("Partly cloudy");
   });
 
   it("falls back to mock routines when no recipes returned", async () => {

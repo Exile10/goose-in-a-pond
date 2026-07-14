@@ -75,6 +75,7 @@ pub trait LlamafileManager: Send + Sync {
 }
 
 use axum::{middleware::Next, Router};
+use pond_adapters_weather::WeatherProvider;
 use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
 use pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace;
 use pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort;
@@ -329,6 +330,9 @@ pub struct AppState {
     /// Used to construct OAuth redirect URIs dynamically (the server may bind
     /// to a port other than 4000 if that port is already in use).
     pub api_port: u16,
+    /// Weather provider (Open-Meteo) for `GET /api/v1/weather`. `None` when
+    /// `weather_enabled` is false or no location has been configured.
+    pub weather_provider: Option<Arc<dyn WeatherProvider>>,
 }
 
 /// State of a single in-progress (or recently completed) model download.
