@@ -35,11 +35,6 @@ export interface OnboardingDraft {
   // Wake Word
   wakeWord: string;
   wakeWordCustom: string;
-  // AI Model
-  llmProvider: string;
-  llmModel: string;
-  asrModel: string;
-  ttsModel: string;
   // Extensions
   enableMcpMemory: boolean;
   enableHomeAssistant: boolean;
@@ -82,12 +77,4 @@ export interface WakePreset {
   value: string;
   label: string;
   desc: string;
-}
-
-export interface ProviderOption {
-  key: string;
-  label: string;
-  icon: string;
-  desc: string;
-  recommended?: boolean;
 }
