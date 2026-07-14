@@ -53,10 +53,6 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
           assistantName: settings.assistant_name || DEFAULT_DRAFT.assistantName,
           ttsVoice: settings.voice_tts_voice || DEFAULT_DRAFT.ttsVoice,
           wakeWord: settings.voice_wake_word || DEFAULT_DRAFT.wakeWord,
-          llmProvider: settings.chat_provider || settings.llm_provider || DEFAULT_DRAFT.llmProvider,
-          llmModel: settings.chat_model || settings.active_llm_model || DEFAULT_DRAFT.llmModel,
-          asrModel: settings.active_whisper_model || DEFAULT_DRAFT.asrModel,
-          ttsModel: settings.active_tts_model || DEFAULT_DRAFT.ttsModel,
           enableMcpMemory: settings.agent_memory_inject ?? DEFAULT_DRAFT.enableMcpMemory,
         });
       } catch {

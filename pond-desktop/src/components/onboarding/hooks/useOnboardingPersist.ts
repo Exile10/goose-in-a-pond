@@ -90,16 +90,6 @@ function buildSettingsPatch(stepId: string, draft: OnboardingDraft): Partial<Set
           : draft.wakeWord,
       };
 
-    case "model":
-      return {
-        chat_provider: draft.llmProvider,
-        chat_model: draft.llmModel,
-        llm_provider: draft.llmProvider,
-        active_llm_model: draft.llmModel,
-        active_whisper_model: draft.asrModel || undefined,
-        active_tts_model: draft.ttsModel || undefined,
-      };
-
     case "complete":
       return {
         agent_memory_inject: draft.enableMcpMemory,

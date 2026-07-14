@@ -20,7 +20,6 @@ import { StepAboutYou } from "./steps/StepAboutYou";
 import { StepLocale } from "./steps/StepLocale";
 import { StepPersonality } from "./steps/StepPersonality";
 import { StepWakeWord } from "./steps/StepWakeWord";
-import { StepModel } from "./steps/StepModel";
 import { StepComplete } from "./steps/StepComplete";
 
 import "./onboarding.css";
@@ -115,7 +114,6 @@ function WizardInner({ onComplete }: { onComplete: () => void }) {
       case "about-you": return !!draft.userName.trim();
       case "personality": return !!draft.assistantName.trim();
       case "wake-word": return draft.wakeWord !== "custom" || !!draft.wakeWordCustom.trim();
-      case "model": return !!draft.llmModel;
       default: return true;
     }
   })();
@@ -152,7 +150,6 @@ function WizardInner({ onComplete }: { onComplete: () => void }) {
     case "locale":      body = <StepLocale />; break;
     case "personality": body = <StepPersonality />; break;
     case "wake-word":   body = <StepWakeWord />; break;
-    case "model":       body = <StepModel />; break;
     case "complete":    body = <StepComplete onFinish={onComplete} />; break;
     default:            body = null;
   }
