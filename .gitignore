@@ -46,3 +46,11 @@ llama.log
 
 **/*.log
 /boop-agent-main/
+
+# Off-device Jetson cross-build output (aarch64 target dir; kept locally as a
+# build cache but never committed — see scripts/build-jetson-docker.sh)
+/target-jetson/
+
+# Throwaway verification screenshots dropped at the repo root by Playwright /
+# manual UI checks (real assets live under */src/assets/)
+/*.png
