@@ -23,27 +23,28 @@ interface ChatMessage {
 
 // ── Constants ─────────────────────────────────────────────────
 
-const SEED: ChatMessage[] = [
-  {
-    id: "seed-0",
-    who: "goose",
-    text: "Morning, Jerry. The house is set to Good Morning — lights are easing up and coffee's brewing. Anything you need?",
-  },
-  { id: "seed-1", who: "user", text: "What’s the weather looking like?" },
-  {
-    id: "seed-2",
-    who: "goose",
-    text: "Partly cloudy and mild today — here’s your day:",
-    card: "weather",
-  },
-  { id: "seed-3", who: "user", text: "Is the front door locked?" },
-  {
-    id: "seed-4",
-    who: "goose",
-    text: "Yes — the front door is locked. Tap to toggle it from here:",
-    card: "lock",
-  },
-];
+function makeSeed(userName: string): ChatMessage[] {
+  const greeting = userName
+    ? `Morning, ${userName}. The house is set to Good Morning — lights are easing up and coffee’s brewing. Anything you need?`
+    : "Morning! The house is set to Good Morning — lights are easing up and coffee’s brewing. Anything you need?";
+  return [
+    { id: "seed-0", who: "goose", text: greeting },
+    { id: "seed-1", who: "user", text: "What’s the weather looking like?" },
+    {
+      id: "seed-2",
+      who: "goose",
+      text: "Partly cloudy and mild today — here’s your day:",
+      card: "weather",
+    },
+    { id: "seed-3", who: "user", text: "Is the front door locked?" },
+    {
+      id: "seed-4",
+      who: "goose",
+      text: "Yes — the front door is locked. Tap to toggle it from here:",
+      card: "lock",
+    },
+  ];
+}
 
 const CHIPS = [
   "Set Movie Time",
@@ -76,8 +77,19 @@ export function ChatHubView() {
   const dispatch = useAppDispatch();
 
   // Use seed as initial messages; cleared when user sends first real message
-  const [msgs, setMsgs] = useState<ChatMessage[]>(SEED);
+  const [msgs, setMsgs] = useState<ChatMessage[]>(() => makeSeed(""));
   const [seeded, setSeeded] = useState(true); // true = currently showing seed
+
+  // Populate the greeting with the real user name once settings are loaded
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    api.getSettings()
+      .then((s) => {
+        const name = s.user_name?.trim() ?? "";
+        setMsgs(makeSeed(name));
+      })
+      .catch(() => {});
+  }, [state.serverOnline]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
 
