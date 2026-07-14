@@ -71,6 +71,11 @@ describe("buildInitialState — classic UI is the default landing surface", () =
     localStorage.setItem("giap-section", "settings");
     expect(buildInitialState().section).toBe("settings");
   });
+  it("the explicit giap-force-hub opt-in bypasses the coercion", () => {
+    localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
+    expect(buildInitialState().section).toBe("hub");
+  });
 });
 
 describe("reducer — server status", () => {

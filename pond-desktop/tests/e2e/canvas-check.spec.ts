@@ -5,6 +5,7 @@ test("Canvas masonry board renders 6 MCP cards", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "canvas");
   });
   await page.goto("/");
@@ -33,6 +34,7 @@ test("SmartHome room toggle syncs with hubStore", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "canvas");
   });
   await page.goto("/");
