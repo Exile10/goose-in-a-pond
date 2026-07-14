@@ -6,6 +6,7 @@ import { useState, useCallback } from "react";
 import { api } from "../../../api/PondApiClient";
 import type { OnboardingDraft } from "../onboarding.types";
 import type { Settings } from "../../../api/types";
+import { FE_STEP_TO_BE } from "../onboarding.constants";
 
 /**
  * Maps onboarding draft fields to backend Settings keys per step,
@@ -36,6 +37,14 @@ export function useOnboardingPersist() {
         const stored = localStorage.getItem("giap-user-profile");
         const existing = stored ? JSON.parse(stored) : {};
         localStorage.setItem("giap-user-profile", JSON.stringify({ ...existing, ...profilePatch }));
+      }
+
+      // Track backend progress so a mid-onboarding quit resumes from here.
+      // Non-fatal: a step-tracking hiccup must not block advancing the wizard.
+      const beStep = FE_STEP_TO_BE[stepId];
+      if (beStep) {
+        try { await api.recordOnboardingStep(beStep); }
+        catch (err) { console.warn("onboard step tracking failed (non-fatal):", err); }
       }
 
       return true;

@@ -308,6 +308,53 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32
 
 ---
 
+## Memory-Fit Guard (Phase 6)
+
+On-device decode is **memory-bandwidth-bound** (~102 GB/s on the Jetson Orin
+Nano). When a model fully resides in the unified-memory GPU budget, throughput
+is roughly `tok/s ≈ 102 / model_size_GB`. When the model exceeds the budget it
+**silently partial-offloads to CPU** and decode collapses to single-digit tok/s.
+
+This bit users with `gemma3n:e2b`: the Ollama download is really **~5.6 GB**,
+not the 3.1 GB the UI once estimated. On 8 GB it cannot fit alongside the OS,
+STT, TTS, and KV cache, so it spilled to CPU and felt "hella slow".
+
+### What the guard does (shipped, cross-platform)
+
+- **Decision helper** — `pond-desktop/src/api/modelFit.ts` (`modelFit`,
+  `modelFitFor`): pure `fits`/`spills`/`unknown` verdict given a model's
+  residency size and the LLM budget from `GET /api/v1/models/memory-status`,
+  reserving `DEFAULT_HEADROOM_MB = 1024` for KV cache + system slack. Unit-tested
+  (`modelFit.test.ts`). The server mirrors this in `model_spills_budget`
+  (`crates/pond-api/src/routes.rs`) with the same `MEMORY_FIT_HEADROOM_MB = 1024`.
+- **UI warning** — a shared `FitBadge` (lucide `AlertTriangle`, no emoji) shows
+  "Too large — will spill to CPU and run slowly" on models that exceed the budget
+  on *this* device, in both onboarding (`StepModel`) and the Models Manage tab
+  (`sections/Models`). It stays quiet for `fits` and `unknown`, so on Mac/dev
+  (NoopScheduler / `total_mb == 0`) nothing is shown.
+- **Server log** — `warn_if_model_spills` logs a `tracing::warn!` at LLM-role
+  activation when the model exceeds the budget. Log only; no loader change.
+
+### Recommended on-Jetson fail-closed enforcement (NOT yet implemented)
+
+The loader (`ModelSettings { n_gpu_layers: 99, .. }` in
+`crates/pond-adapters-local-inference/src/lib.rs::apply_jetson_settings`) still
+requests full GPU residency and silently splits when it does not fit. When it can
+be validated on real Jetson hardware, enforce fail-closed at load:
+
+1. Before `-ngl 99`, compare the model's on-disk size against `MemAvailable`
+   (`ResourceAwareModelScheduler::memory_status`), reserving ~1 GB headroom.
+2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) first to
+   free the page cache — otherwise the `-ngl` allocation hits the NvMap OOM wall
+   (error 12). See `scripts/jetson-llama-optimization`.
+3. Re-check; if it STILL will not fit, refuse the full-GPU load (fail closed) and
+   surface the spill to the UI rather than silently degrading to a CPU/GPU split.
+
+This is deliberately kept out of the cross-platform loader — it is unsafe to
+change from the macOS Metal build and is not testable there.
+
+---
+
 ## Related Documents
 
 - [Debug Guide](debug_guide.md) -- GIAP_DUMP_PROMPT and log-level debugging

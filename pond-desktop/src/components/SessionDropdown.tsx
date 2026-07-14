@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Button } from "@heroui/react";
-import { Plus, MessageSquare } from "lucide-react";
+import { Plus, MessageSquare, Pencil, Trash2, Check, X } from "lucide-react";
 import type { SessionSummary } from "../api/types";
 
 function timeAgo(iso: string): string {
@@ -12,6 +12,20 @@ function timeAgo(iso: string): string {
   if (hrs < 24) return `${hrs}h`;
   const days = Math.floor(hrs / 24);
   return `${days}d`;
+}
+
+/**
+ * Human-readable label for a conversation row.
+ *
+ * The backend already supplies a derived title (first user-message snippet)
+ * when a session has no stored title, so `title` is usually populated. This
+ * chain is the last line of defence: stored/derived title → id short-slug.
+ * It never renders a raw full session id.
+ */
+function sessionLabel(s: SessionSummary): string {
+  const t = s.title?.trim();
+  if (t) return t;
+  return `Session ${s.id.slice(0, 8)}`;
 }
 
 function groupSessions(sessions: SessionSummary[]) {
@@ -38,12 +52,27 @@ interface Props {
   currentSessionId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onRename: (id: string, title: string) => void | Promise<void>;
+  onDelete: (id: string) => void | Promise<void>;
   isOpen: boolean;
   onClose: () => void;
 }
 
-export function SessionDropdown({ sessions, currentSessionId, onSelect, onNewChat, isOpen, onClose }: Props) {
+export function SessionDropdown({
+  sessions,
+  currentSessionId,
+  onSelect,
+  onNewChat,
+  onRename,
+  onDelete,
+  isOpen,
+  onClose,
+}: Props) {
   const ref = useRef<HTMLDivElement>(null);
+  const editInputRef = useRef<HTMLInputElement>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -56,27 +85,160 @@ export function SessionDropdown({ sessions, currentSessionId, onSelect, onNewCha
     return () => document.removeEventListener("mousedown", handleClick);
   }, [isOpen, onClose]);
 
+  // Reset any in-progress edit/confirm state whenever the panel closes.
+  useEffect(() => {
+    if (!isOpen) {
+      setEditingId(null);
+      setConfirmDeleteId(null);
+    }
+  }, [isOpen]);
+
+  // Focus + select the rename input when editing begins.
+  useEffect(() => {
+    if (editingId) {
+      editInputRef.current?.focus();
+      editInputRef.current?.select();
+    }
+  }, [editingId]);
+
   if (!isOpen) return null;
 
   const { today, yesterday, older } = groupSessions(sessions);
 
+  function beginRename(s: SessionSummary) {
+    setConfirmDeleteId(null);
+    setEditingId(s.id);
+    setEditValue(sessionLabel(s));
+  }
+
+  function commitRename(id: string) {
+    const next = editValue.trim();
+    setEditingId(null);
+    if (next) void onRename(id, next);
+  }
+
+  function cancelRename() {
+    setEditingId(null);
+    setEditValue("");
+  }
+
+  function confirmDelete(id: string) {
+    setConfirmDeleteId(null);
+    void onDelete(id);
+  }
+
   function renderItem(s: SessionSummary) {
-    const title = s.title?.trim() || `Session ${s.id.slice(0, 8)}`;
-    const tokens = (s.total_prompt_tokens ?? 0) + (s.total_completion_tokens ?? 0);
     const isActive = s.id === currentSessionId;
+    const isEditing = editingId === s.id;
+    const isConfirming = confirmDeleteId === s.id;
+    const count = s.message_count ?? 0;
+
+    if (isEditing) {
+      return (
+        <div key={s.id} className="session-dropdown__item is-editing">
+          <MessageSquare size={13} style={{ flexShrink: 0, opacity: 0.5 }} />
+          <input
+            ref={editInputRef}
+            className="session-dropdown__edit-input"
+            value={editValue}
+            onChange={(e) => setEditValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRename(s.id);
+              else if (e.key === "Escape") cancelRename();
+            }}
+            aria-label="Rename conversation"
+          />
+          <button
+            className="session-dropdown__action"
+            onClick={() => commitRename(s.id)}
+            aria-label="Save name"
+            title="Save"
+            type="button"
+          >
+            <Check size={13} />
+          </button>
+          <button
+            className="session-dropdown__action"
+            onClick={cancelRename}
+            aria-label="Cancel rename"
+            title="Cancel"
+            type="button"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      );
+    }
+
+    if (isConfirming) {
+      return (
+        <div key={s.id} className="session-dropdown__item is-confirming">
+          <Trash2 size={13} style={{ flexShrink: 0, color: "var(--color-danger, #d92d20)" }} />
+          <span className="session-dropdown__title">Delete this conversation?</span>
+          <button
+            className="session-dropdown__action session-dropdown__action--danger"
+            onClick={() => confirmDelete(s.id)}
+            aria-label="Confirm delete"
+            title="Delete"
+            type="button"
+          >
+            <Check size={13} />
+          </button>
+          <button
+            className="session-dropdown__action"
+            onClick={() => setConfirmDeleteId(null)}
+            aria-label="Cancel delete"
+            title="Cancel"
+            type="button"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      );
+    }
+
     return (
-      <button
+      <div
         key={s.id}
         className={`session-dropdown__item${isActive ? " is-active" : ""}`}
-        onClick={() => { onSelect(s.id); onClose(); }}
       >
-        <MessageSquare size={13} style={{ flexShrink: 0, opacity: 0.5 }} />
-        <span className="session-dropdown__title">{title}</span>
+        <button
+          className="session-dropdown__open"
+          onClick={() => { onSelect(s.id); onClose(); }}
+          type="button"
+        >
+          <MessageSquare size={13} style={{ flexShrink: 0, opacity: 0.5 }} />
+          <span className="session-dropdown__title">{sessionLabel(s)}</span>
+        </button>
         <span className="session-dropdown__meta">
-          {tokens > 0 && <span>{tokens > 1000 ? `${(tokens / 1000).toFixed(1)}k` : tokens}</span>}
+          {count > 0 && (
+            <span className="session-dropdown__count" title={`${count} messages`}>
+              {count}
+            </span>
+          )}
           <span>{timeAgo(s.updated_at)}</span>
         </span>
-      </button>
+        <span className="session-dropdown__actions">
+          <button
+            className="session-dropdown__action"
+            onClick={() => beginRename(s)}
+            aria-label="Rename conversation"
+            title="Rename"
+            type="button"
+          >
+            <Pencil size={13} />
+          </button>
+          <button
+            className="session-dropdown__action session-dropdown__action--danger"
+            onClick={() => { setEditingId(null); setConfirmDeleteId(s.id); }}
+            aria-label="Delete conversation"
+            title="Delete"
+            type="button"
+          >
+            <Trash2 size={13} />
+          </button>
+        </span>
+      </div>
     );
   }
 

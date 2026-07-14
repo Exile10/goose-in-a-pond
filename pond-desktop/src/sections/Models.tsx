@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
-import { PageHeader, useConfirm, ErrorBanner } from "../components/shared";
+import { PageHeader, useConfirm, ErrorBanner, FitBadge } from "../components/shared";
 import type {
   ModelEntry, ModelActiveRoles, ModelMemoryStatus, ModelCapabilities,
   HfModel, HfModelFile, DownloadEntry, DiskUsage,
@@ -268,6 +268,7 @@ function ModelList({
   onActivate,
   onDelete,
   emptyMessage,
+  memoryStatus,
 }: {
   models: ModelEntry[];
   loading: boolean;
@@ -277,6 +278,8 @@ function ModelList({
   onActivate: (provider: string, name: string, role: string) => void;
   onDelete: (provider: string, name: string) => void;
   emptyMessage: string;
+  /** Device LLM memory budget; when set, models that spill to CPU get a warning badge. */
+  memoryStatus?: ModelMemoryStatus | null;
 }) {
   const state = useAppState();
 
@@ -319,6 +322,9 @@ function ModelList({
                   </Chip>
                 ))}
                 <CapabilityBadges name={m.name} />
+                {memoryStatus !== undefined && (
+                  <FitBadge model={m} status={memoryStatus} compact />
+                )}
               </div>
               <div className="model-row__file"><code>{m.provider} / {m.name}</code></div>
             </div>
@@ -567,6 +573,7 @@ function OllamaPanel({
   activeRoles,
   onActivate,
   onDelete,
+  memoryStatus,
 }: {
   models: ModelEntry[];
   modelsLoading: boolean;
@@ -574,6 +581,8 @@ function OllamaPanel({
   activeRoles: ModelActiveRoles | null;
   onActivate: (provider: string, name: string, role: string) => void;
   onDelete: (provider: string, name: string) => void;
+  /** Device LLM memory budget; forwarded to the model list for the fit guard. */
+  memoryStatus?: ModelMemoryStatus | null;
 }) {
   const state = useAppState();
   const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
@@ -681,6 +690,7 @@ function OllamaPanel({
         onActivate={onActivate}
         onDelete={onDelete}
         emptyMessage={isRunning ? "No Ollama models found. Pull a model above." : "Ollama is not running. Start it to see available models."}
+        memoryStatus={memoryStatus}
       />
     </div>
   );
@@ -700,6 +710,7 @@ function LlmTab({
   onDelete,
   onDownloadStarted,
   onScanModels,
+  memoryStatus,
 }: {
   models: ModelEntry[];
   modelsLoading: boolean;
@@ -709,6 +720,8 @@ function LlmTab({
   onDelete: (provider: string, name: string) => void;
   onDownloadStarted: () => void;
   onScanModels: () => void;
+  /** Device LLM memory budget; forwarded to the model lists for the fit guard. */
+  memoryStatus?: ModelMemoryStatus | null;
 }) {
   const state = useAppState();
   const [provider, setProvider] = useState<LlmProvider>("gguf");
@@ -784,6 +797,7 @@ function LlmTab({
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
+                memoryStatus={memoryStatus}
               />
             </>
           )}
@@ -798,6 +812,9 @@ function LlmTab({
                         <span className="model-row__name">{m.display_name ?? m.name}</span>
                         {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                         <CapabilityBadges name={m.name} />
+                        {memoryStatus !== undefined && (
+                          <FitBadge model={m} status={memoryStatus} compact />
+                        )}
                       </div>
                       {m.description && (
                         <div className="model-row__file"><code>{m.description}</code></div>
@@ -838,6 +855,7 @@ function LlmTab({
                 onActivate={onActivate}
                 onDelete={onDelete}
                 emptyMessage=""
+                memoryStatus={memoryStatus}
               />
             </>
           )}
@@ -852,6 +870,9 @@ function LlmTab({
                         <span className="model-row__name">{m.display_name ?? m.name}</span>
                         {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
                         <CapabilityBadges name={m.name} />
+                        {memoryStatus !== undefined && (
+                          <FitBadge model={m} status={memoryStatus} compact />
+                        )}
                       </div>
                       {m.description && (
                         <div className="model-row__file"><code>{m.description}</code></div>
@@ -886,6 +907,7 @@ function LlmTab({
           activeRoles={activeRoles}
           onActivate={onActivate}
           onDelete={onDelete}
+          memoryStatus={memoryStatus}
         />
       )}
     </div>
@@ -1672,6 +1694,7 @@ export function Models() {
           onDelete={handleDelete}
           onDownloadStarted={() => { startDownloadPoll(); loadDownloads(); }}
           onScanModels={handleScan}
+          memoryStatus={memoryStatus}
         />
       )}
 

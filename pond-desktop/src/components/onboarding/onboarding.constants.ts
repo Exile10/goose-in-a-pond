@@ -22,6 +22,49 @@ export const STEPS: StepMeta[] = [
   { id: "complete",    label: "All set",               caption: "Hello, world",        required: false },
 ];
 
+// ── FE / BE step mapping ───────────────────────────────────
+//
+// The wizard has 7 visible steps; the backend `OnboardingStep` enum has 10
+// variants (Welcome, Basics, Location, Accessibility, Personality,
+// GooseIdentity, WakeWord, Model, Extensions, Completed). `Completed` is set
+// only by POST /onboard/complete. Accessibility prefs are folded into the
+// about-you step (stored in localStorage); the merged Personality+GooseIdentity
+// FE step reports the furthest of the two (GooseIdentity).
+
+/** FE step id → backend `OnboardingStep` name to POST when that step persists. */
+export const FE_STEP_TO_BE: Record<string, string> = {
+  welcome:     "Welcome",
+  "about-you": "Basics",
+  locale:      "Location",
+  personality: "GooseIdentity",
+  "wake-word": "WakeWord",
+  model:       "Model",
+  complete:    "Extensions",
+};
+
+/** Backend `OnboardingStep` name → FE step index to resume at. */
+const BE_TO_FE_INDEX: Record<string, number> = {
+  Welcome:       0,
+  Basics:        1,
+  Accessibility: 1, // folded into about-you
+  Location:      2,
+  Personality:   3, // merged into the personality FE step
+  GooseIdentity: 3,
+  WakeWord:      4,
+  Model:         5,
+  Extensions:    6,
+  Completed:     6, // handled separately; keep at the last visible step
+};
+
+/**
+ * Map a backend `OnboardingStep` name to the FE step index the wizard should
+ * resume at. Unknown / not-started names resume at the beginning.
+ */
+export function beStepToFeIndex(beStep: string | undefined | null): number {
+  if (!beStep) return 0;
+  return BE_TO_FE_INDEX[beStep] ?? 0;
+}
+
 // ── Avatars ────────────────────────────────────────────────
 
 export const AVATARS = ["\u{1F986}", "\u{1F427}", "\u{1F985}", "\u{1F99C}", "\u{1F438}", "\u{1F989}", "\u{1F43B}", "\u{1F98A}", "\u{1F431}", "\u{1F436}"];

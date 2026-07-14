@@ -12,6 +12,17 @@ export function mockSseStream(events: Array<Record<string, unknown>>): string {
  * Call `await mockAllApiRoutes(page)` in each test's beforeEach.
  */
 export async function mockAllApiRoutes(page: Page): Promise<void> {
+  // Pin the API base to the conventional local server. In a real browser the
+  // app now defaults to window.location.origin (so the single-executable works
+  // same-origin over the LAN); in tests that origin is the Vite dev server,
+  // whose SPA fallback returns index.html for any UNMOCKED /api/* path, which
+  // would make the app's res.json() throw. Pinning a distinct cross-origin base
+  // keeps unmocked calls failing fast/gracefully, as they did before.
+  await page.addInitScript(() => {
+    (window as unknown as { __GIAP_SERVER_URL__?: string }).__GIAP_SERVER_URL__ =
+      "http://127.0.0.1:4000";
+  });
+
   // Health
   await page.route("**/api/v1/health", (route) =>
     route.fulfill({ json: { status: "ok", version: "test" } }),
@@ -32,10 +43,20 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
 
   // Onboarding
   await page.route("**/api/v1/onboard/status", (route) =>
-    route.fulfill({ json: { onboarded: true, current_step: "Completed", steps_completed: 9, total_steps: 9 } }),
+    route.fulfill({ json: { onboarded: true, current_step: "Completed", steps_completed: 10, total_steps: 10 } }),
   );
   await page.route("**/api/v1/onboard/complete", (route) =>
     route.fulfill({ json: { status: "completed" } }),
+  );
+  // Per-step progress tracking (POST /onboard/step/:name) — echoes the reached
+  // step back in status shape.
+  await page.route("**/api/v1/onboard/step/*", (route) => {
+    const name = route.request().url().split("/").pop() ?? "Welcome";
+    return route.fulfill({ json: { onboarded: false, current_step: name, steps_completed: 1, total_steps: 10 } });
+  });
+  // Reset onboarding ("Start over") — returns to the first step.
+  await page.route("**/api/v1/onboard/reset", (route) =>
+    route.fulfill({ json: { onboarded: false, current_step: "Welcome", steps_completed: 1, total_steps: 10 } }),
   );
 
   // Settings
@@ -61,13 +82,32 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { status: "ok" } }),
   );
 
-  // Sessions
+  // Sessions. The list carries `message_count` so the sidebar badge renders.
+  // Individual tests override `**/api/v1/sessions` with populated data.
   await page.route("**/api/v1/sessions", (route) =>
     route.fulfill({ json: { sessions: [] } }),
   );
   await page.route("**/api/v1/sessions/*/messages", (route) =>
     route.fulfill({ json: { messages: [] } }),
   );
+  // Rename (PATCH) and delete (DELETE) on an individual session. This pattern
+  // also matches `/sessions/:id/messages`, so fall through for those to let the
+  // more specific messages route above handle them. Echoes the body for PATCH
+  // and returns 204 for DELETE; specs that need stateful behaviour route these
+  // themselves before calling into the app.
+  await page.route("**/api/v1/sessions/*", (route) => {
+    const url = route.request().url();
+    if (url.includes("/messages")) return route.fallback();
+    const method = route.request().method();
+    if (method === "PATCH") {
+      const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+      return route.fulfill({ json: { session_id: "mock", title: body.title ?? "" } });
+    }
+    if (method === "DELETE") {
+      return route.fulfill({ status: 204, body: "" });
+    }
+    return route.fulfill({ json: {} });
+  });
 
   // Models
   await page.route("**/api/v1/models/active-roles", (route) =>

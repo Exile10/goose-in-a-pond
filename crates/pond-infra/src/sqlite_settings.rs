@@ -63,6 +63,7 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("assistant_personality", &settings.assistant_personality);
         upsert!("user_name", &settings.user_name);
         upsert!("timezone", &settings.timezone);
+        upsert!("home_name", &settings.home_name);
         upsert!("llm_max_tokens", settings.llm_max_tokens.to_string());
         upsert!("llm_temperature", settings.llm_temperature.to_string());
         upsert!("llm_provider", &settings.llm_provider);
@@ -154,6 +155,47 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("weather_latitude", settings.weather_latitude.to_string());
         upsert!("weather_longitude", settings.weather_longitude.to_string());
         upsert!("weather_location_name", &settings.weather_location_name);
+        // Vision (#130)
+        upsert!(
+            "vision_enabled",
+            if settings.vision_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("vision_camera_url", &settings.vision_camera_url);
+        upsert!("vision_camera_id", &settings.vision_camera_id);
+        upsert!("vision_fps", settings.vision_fps.to_string());
+        upsert!(
+            "vision_motion_threshold",
+            settings.vision_motion_threshold.to_string()
+        );
+        // Privacy / sensor access
+        upsert!(
+            "mic_enabled",
+            if settings.mic_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "cameras_enabled",
+            if settings.cameras_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "cloud_fallback_enabled",
+            if settings.cloud_fallback_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Thinking / reasoning
         upsert!("thinking_mode", &settings.thinking_mode);
         upsert!(
@@ -462,6 +504,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_vision_enabled",
+            if settings.ext_vision_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         Ok(())
     }
@@ -512,6 +562,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "assistant_personality" => s.assistant_personality = value.to_string(),
         "user_name" => s.user_name = value.to_string(),
         "timezone" => s.timezone = value.to_string(),
+        "home_name" => s.home_name = value.to_string(),
         "llm_max_tokens" => {
             if let Ok(v) = value.parse() {
                 s.llm_max_tokens = v;
@@ -625,6 +676,24 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "weather_location_name" => s.weather_location_name = value.to_string(),
+        // Vision (#130)
+        "vision_enabled" => s.vision_enabled = value == "true",
+        "vision_camera_url" => s.vision_camera_url = value.to_string(),
+        "vision_camera_id" => s.vision_camera_id = value.to_string(),
+        "vision_fps" => {
+            if let Ok(v) = value.parse() {
+                s.vision_fps = v;
+            }
+        }
+        "vision_motion_threshold" => {
+            if let Ok(v) = value.parse() {
+                s.vision_motion_threshold = v;
+            }
+        }
+        // Privacy / sensor access
+        "mic_enabled" => s.mic_enabled = value == "true",
+        "cameras_enabled" => s.cameras_enabled = value == "true",
+        "cloud_fallback_enabled" => s.cloud_fallback_enabled = value == "true",
         // Thinking / reasoning
         "thinking_mode" => s.thinking_mode = value.to_string(),
         "show_thinking" => s.show_thinking = value == "true",
@@ -805,6 +874,32 @@ mod tests {
         let repo = SqliteSettingsRepository::new(db.system.clone());
         std::mem::forget(tmp); // keep the sqlite file alive for the test
         repo
+    }
+
+    #[tokio::test]
+    async fn privacy_and_home_settings_roundtrip() {
+        let repo = fresh_repo().await;
+
+        // Defaults before any write: mic/cameras ON, cloud fallback OFF, home empty.
+        let s0 = repo.get().await.unwrap();
+        assert!(s0.mic_enabled);
+        assert!(s0.cameras_enabled);
+        assert!(!s0.cloud_fallback_enabled);
+        assert_eq!(s0.home_name, "");
+
+        // Persist non-default privacy toggles + a home name.
+        let mut s = s0;
+        s.mic_enabled = false;
+        s.cameras_enabled = false;
+        s.cloud_fallback_enabled = true;
+        s.home_name = "The Anyumba Home".to_string();
+        repo.update(&s).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert!(!got.mic_enabled);
+        assert!(!got.cameras_enabled);
+        assert!(got.cloud_fallback_enabled);
+        assert_eq!(got.home_name, "The Anyumba Home");
     }
 
     #[tokio::test]
