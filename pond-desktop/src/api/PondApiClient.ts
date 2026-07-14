@@ -39,6 +39,7 @@ import {
   type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
+  type WeatherApiResponse,
 } from "./types";
 
 // ────────────────────────────────────────────────────────────
@@ -263,6 +264,12 @@ export class PondApiClient {
 
   updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return this.put("/api/v1/settings", patch);
+  }
+
+  // ── Weather ───────────────────────────────────────────────
+
+  getWeather(): Promise<WeatherApiResponse> {
+    return this.get("/api/v1/weather");
   }
 
   // ── Devices ───────────────────────────────────────────────

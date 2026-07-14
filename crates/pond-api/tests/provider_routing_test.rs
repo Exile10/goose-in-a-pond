@@ -260,6 +260,7 @@ async fn make_app_with_provider(
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),
@@ -587,6 +588,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 
@@ -687,6 +689,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     let app = build_router(state, std::path::PathBuf::from("web/dist"));
 

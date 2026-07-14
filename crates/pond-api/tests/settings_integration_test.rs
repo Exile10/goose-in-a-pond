@@ -149,6 +149,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
+        weather_provider: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),
@@ -311,4 +312,33 @@ async fn get_settings_returns_current_settings() {
         json.get("assistant_name").and_then(|v| v.as_str()),
         Some("Ducky"),
     );
+}
+
+/// GET /api/v1/weather must report {"enabled": false} rather than error
+/// when no weather provider is configured (the default in tests / for
+/// users who haven't set a location).
+#[tokio::test]
+async fn get_weather_reports_disabled_without_provider() {
+    let (app, _tmp) = make_app().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/weather")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(json.get("enabled").and_then(|v| v.as_bool()), Some(false));
 }

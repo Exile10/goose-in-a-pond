@@ -134,6 +134,11 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { devices: [] } }),
   );
 
+  // Weather — no location configured in tests, dashboard falls back to mock data.
+  await page.route("**/api/v1/weather", (route) =>
+    route.fulfill({ json: { enabled: false } }),
+  );
+
   // Memories
   await page.route("**/api/v1/memories", (route) =>
     route.fulfill({ json: [] }),
