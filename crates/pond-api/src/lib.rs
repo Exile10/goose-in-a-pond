@@ -75,6 +75,7 @@ pub trait LlamafileManager: Send + Sync {
 }
 
 use axum::{middleware::Next, Router};
+use pond_adapters_weather::WeatherProvider;
 use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
 use pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace;
 use pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort;
@@ -104,7 +105,6 @@ use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
-use pond_adapters_weather::WeatherProvider;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
