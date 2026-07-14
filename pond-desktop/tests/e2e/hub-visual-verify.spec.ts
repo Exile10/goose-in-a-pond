@@ -14,6 +14,7 @@ test("Hub visual screenshot", async ({ page }) => {
   // Land directly in hub by pre-setting localStorage
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");
@@ -117,6 +118,7 @@ test("State: device tile toggles and route persists", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");

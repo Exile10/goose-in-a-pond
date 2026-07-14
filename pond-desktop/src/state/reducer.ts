@@ -108,10 +108,14 @@ export function buildInitialState(): AppState {
   const storedMode = normalizeDesktopMode(localStorage.getItem("giap-mode"));
   // The classic (sections) UI is the default landing surface. The Goose Hub is
   // still a preview (reachable via Settings > "Preview Goose Hub"), so never
-  // *start* in it even if it was the last-viewed section — always land on the
-  // classic UI on launch/reload.
+  // *start* in it even if it was the last-viewed section — a persisted "hub" is
+  // coerced back to the classic UI on launch/reload so the preview is not
+  // sticky. An explicit opt-in (`giap-force-hub`, used by hub E2E tests and
+  // available for dev) bypasses the coercion.
   const rawSection = normalizeGuiSection(localStorage.getItem("giap-section"));
-  const storedSection: GuiSection = rawSection === "hub" ? "dashboard" : rawSection;
+  const forceHub = localStorage.getItem("giap-force-hub") === "1";
+  const storedSection: GuiSection =
+    rawSection === "hub" && !forceHub ? "dashboard" : rawSection;
   const storedUrl = localStorage.getItem("giap-server-url") || defaultServerUrl();
   const storedToken = localStorage.getItem("giap-session-token") || null;
 

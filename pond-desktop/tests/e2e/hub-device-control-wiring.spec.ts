@@ -8,6 +8,7 @@ async function openHubHome(page: import("@playwright/test").Page) {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");
@@ -49,6 +50,7 @@ test("optimistic state reverts when the backend call fails", async ({ page }) =>
   );
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");

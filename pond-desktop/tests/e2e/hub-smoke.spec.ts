@@ -26,6 +26,7 @@ test("Hub rail navigation works", async ({ page }) => {
   // Pre-set route to hub
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");
@@ -50,6 +51,7 @@ test("Hub route persists to localStorage", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");
@@ -69,6 +71,7 @@ test("Device tile toggles state in place", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.goto("/");
