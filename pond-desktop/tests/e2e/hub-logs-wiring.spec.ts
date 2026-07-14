@@ -102,6 +102,7 @@ async function setupLogsRoutes(page: Page, opts: { logEntries?: object[] } = {})
 async function goToLogsScreen(page: Page) {
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.setViewportSize({ width: 1440, height: 900 });

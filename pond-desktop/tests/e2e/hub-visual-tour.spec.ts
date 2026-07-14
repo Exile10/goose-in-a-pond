@@ -31,6 +31,7 @@ test("Hub visual tour — light theme", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -96,6 +97,7 @@ test("Hub visual tour — dark theme covers all top views", async ({ page }) => 
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
     localStorage.setItem("goosehub_theme", "Dark");
   });
@@ -114,6 +116,7 @@ test("Hub responsive — narrow viewport collapses sidebar grids", async ({ page
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   // The design's media query: @media (max-width: 1080px) → ambient sidebar collapses
@@ -138,6 +141,7 @@ test("Hub compact density mode", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
     localStorage.setItem("goosehub_density", "Compact");
   });
@@ -156,6 +160,7 @@ test("Hub visual tour — accent variants on Home", async ({ page }) => {
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -185,6 +190,7 @@ test("Hub interaction smoke — tile toggle + routine run + bell shortcut", asyn
   await mockAllApiRoutes(page);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
+    localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
   await page.setViewportSize({ width: 1440, height: 900 });
