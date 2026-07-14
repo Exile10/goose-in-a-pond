@@ -1226,6 +1226,9 @@
 .acct-hero__badge { margin-left: auto; font-size: 11px; font-weight: 800; color: #16A34A; background: #DCFCE7; padding: 5px 12px; border-radius: 999px; }
 .signout-btn { align-self: flex-start; border: 1px solid #FECACA; background: #FEF2F2; color: #DC2626; font-family: inherit; font-size: 13.5px; font-weight: 700; padding: 11px 20px; border-radius: 12px; cursor: pointer; }
 .signout-btn:hover { background: #FEE2E2; }
+.acct-restart-btn { border: 1px solid #E2E8F0; background: #fff; color: #475569; font-family: inherit; font-size: 12.5px; font-weight: 600; padding: 6px 14px; border-radius: 8px; cursor: pointer; }
+.acct-restart-btn:hover:not(:disabled) { background: #F8FAFC; }
+.acct-restart-btn:disabled { opacity: 0.6; cursor: default; }
 
 /* ─── Shared button helpers ─── */
 .ghost-btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink-2); font-family: inherit; font-size: 13px; font-weight: 700; padding: 8px 14px; border-radius: 10px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }

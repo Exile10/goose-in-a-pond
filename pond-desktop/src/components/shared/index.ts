@@ -8,3 +8,4 @@ export { QuickAction } from "./QuickAction";
 export { ConfirmProvider, useConfirm } from "./ConfirmDialog";
 export { ErrorBanner, friendlyMessage } from "./ErrorBanner";
 export { SkeletonList } from "./SkeletonList";
+export { FitBadge } from "./FitBadge";

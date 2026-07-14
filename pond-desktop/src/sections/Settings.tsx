@@ -59,7 +59,26 @@ const TIMEZONES = [
 
 // ── Tab content components ────────────────────────────────────
 
-function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
+function IdentityTab({
+  s, patch, onRestartOnboarding,
+}: {
+  s: Partial<SettingsType>;
+  patch: (k: keyof SettingsType, v: unknown) => void;
+  onRestartOnboarding: () => void;
+}) {
+  const [restarting, setRestarting] = useState(false);
+
+  async function restart() {
+    if (restarting) return;
+    setRestarting(true);
+    try {
+      await api.resetOnboarding();
+      onRestartOnboarding();
+    } catch {
+      setRestarting(false);
+    }
+  }
+
   return (
     <>
       <Section title="Personal">
@@ -122,6 +141,13 @@ function IdentityTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof 
             onChange={(e) => patch("weather_longitude", e.target.value === "" ? null : Number(e.target.value))}
             placeholder="36.8219"
           />
+        </Row>
+      </Section>
+      <Section title="Onboarding">
+        <Row label="Start over" hint="Reset first-time setup and walk through the onboarding wizard again. Your settings are kept.">
+          <Button variant="outline" size="sm" isDisabled={restarting} onPress={restart}>
+            {restarting ? "Restarting…" : "Restart onboarding"}
+          </Button>
         </Row>
       </Section>
     </>
@@ -481,6 +507,15 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["News","Top stories and headline search","ext_news_enabled"],
     ["Finance","Stock quotes, crypto prices, and currency exchange rates","ext_finance_enabled"],
     ["Discovery","Country info, product lookup, web search","ext_discovery_enabled"],
+    ["Audit / Privacy tools","Recent activity, activity summary, and privacy-risk report","ext_audit_enabled"],
+    ["Vision","Camera event detection and vision queries (read-only event store)","ext_vision_enabled"],
+  ] as const;
+
+  const API_KEYS = [
+    ["Guardian (news)","api_key_guardian","Enables the Guardian news source for the News tools"],
+    ["GNews","api_key_gnews","Enables GNews headline search for the News tools"],
+    ["Finnhub (stocks)","api_key_finnhub","Enables stock quotes in the Finance tools"],
+    ["CoinGecko (crypto)","api_key_coingecko","Enables crypto prices in the Finance tools"],
   ] as const;
 
   return (
@@ -491,6 +526,35 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
             <Switch isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
           </Row>
         ))}
+      </Section>
+      <Section title="Vision / Cameras">
+        <Row label="Enable vision" hint="On-device camera event detection (motion, objects) via the vision MCP server">
+          <Switch isSelected={s.vision_enabled ?? false} onChange={(v) => patch("vision_enabled", v)}>
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </Row>
+        <Row label="Camera URL" hint="RTSP/HTTP stream or device path">
+          <input className="native-input" style={{ opacity: (s.vision_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.vision_enabled ?? false)} value={s.vision_camera_url ?? ""} onChange={(e) => patch("vision_camera_url", e.target.value)} placeholder="rtsp://… or /dev/video0" />
+        </Row>
+        <Row label="Camera ID" hint="Label for this camera in events">
+          <input className="native-input" style={{ opacity: (s.vision_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.vision_enabled ?? false)} value={s.vision_camera_id ?? ""} onChange={(e) => patch("vision_camera_id", e.target.value)} placeholder="front-door" />
+        </Row>
+        <Row label="Frames per second" hint="Detection sampling rate">
+          <input type="number" role="spinbutton" className="native-input native-input--w80" min={1} max={30} style={{ opacity: (s.vision_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.vision_enabled ?? false)} value={s.vision_fps ?? 2} onChange={(e) => patch("vision_fps", Number(e.target.value))} />
+        </Row>
+        <Row label="Motion threshold" hint="0.0–1.0; higher = less sensitive">
+          <input type="number" step={0.01} min={0} max={1} className="native-input native-input--w80" style={{ opacity: (s.vision_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.vision_enabled ?? false)} value={s.vision_motion_threshold ?? 0.1} onChange={(e) => patch("vision_motion_threshold", Number(e.target.value))} />
+        </Row>
+      </Section>
+      <Section title="API Keys / Integrations">
+        {API_KEYS.map(([label, key, hint]) => (
+          <Row key={key} label={label} hint={hint}>
+            <input type="password" autoComplete="off" className="native-input" value={String((s as Record<string, unknown>)[key] ?? "")} onChange={(e) => patch(key as keyof SettingsType, e.target.value === "" ? null : e.target.value)} placeholder="Paste key" />
+          </Row>
+        ))}
+        <Row label="SearXNG URL" hint="Self-hosted SearXNG instance for private web search (Discovery tools)">
+          <input className="native-input" value={s.searxng_url ?? ""} onChange={(e) => patch("searxng_url", e.target.value === "" ? null : e.target.value)} placeholder="http://localhost:8888" />
+        </Row>
       </Section>
       {devMode && (
         <>
@@ -641,7 +705,7 @@ export function Settings() {
 
   function renderDetail(id: SettingsRowId) {
     switch (id) {
-      case "account":       return <IdentityTab s={settings} patch={patch} />;
+      case "account":       return <IdentityTab s={settings} patch={patch} onRestartOnboarding={() => dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true })} />;
       case "models":        return <ModelsTab   s={settings} patch={patch} devMode={devMode} />;
       case "prompts":       return <PromptsTab  s={settings} patch={patch} />;
       case "voice":         return <VoiceTab    s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} refreshSettings={refreshSettings} devMode={devMode} />;

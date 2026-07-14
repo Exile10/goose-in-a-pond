@@ -62,6 +62,7 @@ pond-api               = { workspace = true }
 pond-hf-cache          = { workspace = true }
 pond-infra             = { workspace = true }
 pond-infra-scheduler   = { workspace = true }
+pond-adapters-vision       = { workspace = true }
 pond-adapters-weather      = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }

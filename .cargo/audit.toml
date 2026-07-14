@@ -1,0 +1,30 @@
+# cargo-audit policy — every ignore below is a documented, justified exception,
+# not a silenced finding. Re-evaluate on each weekly Security run and remove
+# entries as soon as the owning dependency can be bumped.
+#
+# Triage rule: advisories fixable from THIS repo's lockfile are fixed, never
+# ignored (crossbeam-epoch and quinn-proto were bumped when this file landed).
+
+[advisories]
+ignore = [
+    # lopdf 0.40: stack overflow via deeply nested PDF objects (7.5 high).
+    # Owned by goose-mcp inside the pinned goose submodule
+    # (jarida-io/Goose:giap-patches-rmcp-1.5) — not upgradable from this repo.
+    # Fix: bump lopdf to >=0.42 on the goose patch branch. GIAP itself never
+    # feeds untrusted PDFs to lopdf (developer-tools path in goose).
+    "RUSTSEC-2026-0187",
+
+    # quick-xml 0.36/0.37: quadratic duplicate-attribute check (7.5) …
+    "RUSTSEC-2026-0194",
+    # … and unbounded namespace-declaration allocation DoS (7.5).
+    # Both owned by docx-rs/office crates under goose-mcp (goose submodule);
+    # fix requires quick-xml >=0.41 upstream. GIAP does not parse untrusted
+    # XML/DOCX through these paths.
+    "RUSTSEC-2026-0195",
+
+    # rsa: Marvin timing side-channel (5.9 medium). NO fixed release exists
+    # (long-standing ecosystem advisory, pulled transitively). Not used for
+    # GIAP's own crypto (pairing uses HMAC-SHA256; tokens are sha256 hashes).
+    # Remove the moment the rsa crate ships a fixed version.
+    "RUSTSEC-2023-0071",
+]

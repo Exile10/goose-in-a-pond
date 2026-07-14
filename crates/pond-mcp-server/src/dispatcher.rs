@@ -50,6 +50,21 @@ const PREFIX_NEWS: &str = "giap-news__";
 const PREFIX_FINANCE: &str = "giap-finance__";
 const PREFIX_DISCOVERY: &str = "giap-discovery__";
 const PREFIX_DRAFT: &str = "giap-draft__";
+/// Prefix for the audit / privacy tools (`get_recent_activity`, `summarize_activity`,
+/// privacy report). These ARE callable Goose builtin extension tools.
+///
+/// `giap-audit` (and, symmetrically, `giap-vision`) are intentionally NOT added to
+/// this dispatcher's `servers` vec. This `McpToolDispatcher` is the **PondAgent**
+/// direct-dispatch path, which is quarantined (Q2-05, not runtime-activatable). The
+/// live chat routes both run through `GooseAdapter`, which dispatches audit/vision
+/// tools via Goose's own extension manager (see `giap_registration.rs`), not here.
+/// Additionally, both servers need their backing stores installed via the global
+/// `init_audit_deps` / `init_vision_deps` (called in pond-server where the logs DB
+/// is in scope) rather than through `McpToolDispatcher::new`, whose constructor does
+/// not receive an `EventLog` / `CameraStorage`. The prefix const is defined for
+/// completeness and to document the routing so future edits don't re-flag the gap.
+#[allow(dead_code)] // documented, referenced in tests; not routed via this dispatcher (see above)
+const PREFIX_AUDIT: &str = "giap-audit__";
 
 // No hardcoded tool list — all tools discovered dynamically via ServerHandler::list_tools().
 
@@ -684,6 +699,17 @@ mod tests {
         let (prefix, bare) = parse_tool_name("ext-filesystem__read_file").unwrap();
         assert_eq!(prefix, "ext-filesystem__");
         assert_eq!(bare, "read_file");
+    }
+
+    #[test]
+    fn parse_audit_tool_name() {
+        // `giap-audit` tools are callable via the Goose extension manager, not
+        // this quarantined PondAgent dispatcher. The prefix is still a valid,
+        // parseable route — asserting this keeps `PREFIX_AUDIT` referenced and
+        // documents that audit tool names are well-formed.
+        let (prefix, bare) = parse_tool_name("giap-audit__get_recent_activity").unwrap();
+        assert_eq!(prefix, PREFIX_AUDIT);
+        assert_eq!(bare, "get_recent_activity");
     }
 
     /// Diagnostic: call list_tools on ALL MCP servers and show what the dispatcher collects.

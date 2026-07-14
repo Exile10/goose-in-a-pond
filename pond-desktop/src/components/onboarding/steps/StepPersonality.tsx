@@ -3,15 +3,19 @@
 // Skip allowed — sensible defaults exist
 // ────────────────────────────────────────────────────────────
 
-import { useState } from "react";
-import { Scale, Zap, Wrench, Sun, Play, Square } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import { Scale, Zap, Wrench, Sun, Play, Square, VolumeX } from "lucide-react";
 import { useOnboarding } from "../OnboardingContext";
 import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";
 import { TTS_VOICES } from "../onboarding.constants";
+import { api } from "../../../api/PondApiClient";
 
 const ICON_PROPS = { size: 16, strokeWidth: 1.8 } as const;
+
+/** Short line synthesized when previewing a voice. */
+const PREVIEW_LINE = "Hi, I'm your Goose assistant. This is how I sound.";
 
 const PROMPT_STYLES = [
   { value: "balanced",  label: "Balanced",  icon: <Scale {...ICON_PROPS} />,  desc: "Warm and practical. Just enough detail." },
@@ -23,10 +27,40 @@ const PROMPT_STYLES = [
 export function StepPersonality() {
   const { draft, patch } = useOnboarding();
   const [playing, setPlaying] = useState<string | null>(null);
+  // null = untested, true = TTS worked, false = TTS unavailable on this host.
+  const [ttsAvailable, setTtsAvailable] = useState<boolean | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const urlRef = useRef<string | null>(null);
 
-  function preview(v: string) {
+  // Clean up any object URL / audio element on unmount.
+  useEffect(() => {
+    return () => {
+      audioRef.current?.pause();
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    };
+  }, []);
+
+  async function preview(v: string) {
+    // Stop any in-flight playback before starting a new one.
+    audioRef.current?.pause();
+    if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null; }
+
     setPlaying(v);
-    setTimeout(() => setPlaying(null), 1400);
+    try {
+      const audioBytes = await api.synthesizeSpeech(PREVIEW_LINE);
+      const url = URL.createObjectURL(new Blob([audioBytes], { type: "audio/wav" }));
+      urlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => setPlaying((cur) => (cur === v ? null : cur));
+      audio.onerror = () => { setPlaying(null); setTtsAvailable(false); };
+      await audio.play();
+      setTtsAvailable(true);
+    } catch {
+      // 503 (no TTS backend) or a playback error — degrade gracefully.
+      setPlaying(null);
+      setTtsAvailable(false);
+    }
   }
 
   return (
@@ -106,15 +140,25 @@ export function StepPersonality() {
                 </div>
                 <button
                   type="button"
-                  onClick={(e) => { e.stopPropagation(); preview(v.value); }}
+                  onClick={(e) => { e.stopPropagation(); void preview(v.value); }}
+                  disabled={ttsAvailable === false || (playing !== null && playing !== v.value)}
+                  aria-label={`Preview ${v.label} voice`}
                   className={`ob-voice-card__preview ${playing === v.value ? "ob-voice-card__preview--playing" : ""}`}
                 >
-                  {playing === v.value ? <Square size={10} /> : <Play size={10} />}
+                  {ttsAvailable === false
+                    ? <VolumeX size={10} />
+                    : playing === v.value ? <Square size={10} /> : <Play size={10} />}
                 </button>
               </div>
             );
           })}
         </div>
+        {ttsAvailable === false && (
+          <p className="ob-field-hint" role="status">
+            Voice preview isn't available on this host. Your selected voice is
+            still saved and will be used once a TTS engine is running.
+          </p>
+        )}
       </div>
 
       {/* Speaking rate */}

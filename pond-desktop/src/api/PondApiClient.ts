@@ -52,6 +52,24 @@ declare global {
   }
 }
 
+// Resolve the pond-server base URL for the current runtime.
+//   1. Tauri desktop shell injects `window.__GIAP_SERVER_URL__` (a local server).
+//   2. Dashboard served over HTTP by the single-executable → the API lives at
+//      the SAME origin the page was loaded from. Using window.location.origin
+//      makes remote/LAN access work (same-origin, no CORS) instead of every
+//      request hitting the *viewer's* own 127.0.0.1.
+//   3. Fallback (SSR / non-browser / tests): the conventional local server.
+export function defaultServerUrl(): string {
+  if (typeof window !== "undefined") {
+    if (window.__GIAP_SERVER_URL__) return window.__GIAP_SERVER_URL__;
+    const isTauri = "__TAURI_INTERNALS__" in window;
+    if (!isTauri && window.location?.origin?.startsWith("http")) {
+      return window.location.origin;
+    }
+  }
+  return "http://127.0.0.1:4000";
+}
+
 export class PondApiClient {
   private readonly base: string;
   private token: string | null;
@@ -64,7 +82,7 @@ export class PondApiClient {
   private static readonly LS_EXPIRES = "giap-token-expires-at";
 
   constructor(base?: string, token?: string | null) {
-    this.base = (base ?? window.__GIAP_SERVER_URL__ ?? "http://127.0.0.1:4000").replace(/\/$/, "");
+    this.base = (base ?? defaultServerUrl()).replace(/\/$/, "");
     this.token = token ?? null;
     // Hydrate persisted tokens so the desktop survives restarts without
     // re-pairing. An explicit constructor token takes precedence.
@@ -194,8 +212,47 @@ export class PondApiClient {
     return this.get("/api/v1/onboard/status");
   }
 
+  /**
+   * Record that the wizard has reached an onboarding step. `step` is a backend
+   * `OnboardingStep` variant name (e.g. "Basics", "WakeWord"). Progress is
+   * monotonic server-side, so re-reporting an earlier step is a safe no-op.
+   */
+  recordOnboardingStep(
+    step: string,
+  ): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {
+    return this.post(`/api/v1/onboard/step/${encodeURIComponent(step)}`);
+  }
+
   completeOnboarding(): Promise<{ status: string }> {
     return this.post("/api/v1/onboard/complete");
+  }
+
+  /**
+   * Reset onboarding back to the first step ("Start over"). Clears persisted
+   * progress and re-arms the onboarding guard so the wizard shows again.
+   */
+  resetOnboarding(): Promise<{ onboarded: boolean; current_step: string; steps_completed: number; total_steps: number }> {
+    return this.post("/api/v1/onboard/reset");
+  }
+
+  /**
+   * Synthesize `text` to speech and return the raw audio bytes (WAV) for
+   * client-side playback. Throws {@link ApiError} (e.g. 503) when no TTS
+   * backend is running — callers should degrade gracefully.
+   */
+  async synthesizeSpeech(text: string): Promise<ArrayBuffer> {
+    await this.ensureTokenFresh();
+    const res = await fetch(`${this.base}/api/v1/tts`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
+      throw new ApiError(res.status, msg);
+    }
+    return res.arrayBuffer();
   }
 
   // ── Settings ──────────────────────────────────────────────
@@ -490,9 +547,17 @@ export class PondApiClient {
    * On success the session+refresh tokens are stored on this client.
    */
   async pair(clientId = "pond-desktop"): Promise<HandshakeResponse> {
-    const pc = await this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
+    // Read the current code; if none is active (e.g. the startup code expired
+    // after 10 min), ISSUE a fresh one. Both endpoints are loopback-only, so the
+    // same-host desktop is trusted to mint its own code — this is what makes
+    // silent auto-pair actually reliable instead of failing once the operator's
+    // startup code lapses.
+    let pc = await this.handshakeFetch<PairingCodeResponse>("GET", "/api/v1/handshake/pairing-code");
     if (!pc.code) {
-      throw new ApiError(409, "no active pairing code on the server");
+      pc = await this.handshakeFetch<PairingCodeResponse>("POST", "/api/v1/handshake/pairing-code");
+    }
+    if (!pc.code) {
+      throw new ApiError(409, "could not obtain a pairing code from the local server");
     }
     const init = await this.handshakeFetch<ChallengeResponse>("POST", "/api/v1/handshake/init", {
       client_id: clientId,
@@ -652,6 +717,10 @@ export class PondApiClient {
         tool_call_id: m.tool_call_id as string | undefined,
       }));
     });
+  }
+
+  renameSession(sessionId: string, title: string): Promise<void> {
+    return this.patch(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, { title });
   }
 
   deleteSession(sessionId: string): Promise<void> {

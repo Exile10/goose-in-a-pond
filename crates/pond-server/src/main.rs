@@ -1366,6 +1366,10 @@ async fn run_server(
     //
     // Async helper so we can await LocalInferenceLlmAdapter::new() for the
     // "local" (in-process GGUF) provider without blocking the Tokio runtime.
+    // TODO(cloud-fallback): when `settings.cloud_fallback_enabled` is ON, wrap
+    // the selected local provider so a failed local inference spills over to a
+    // cloud model (failure-only, never on success). OFF by default (privacy-first)
+    // — the toggle is persisted but no spill path is wired yet.
     async fn build_provider(
         provider: &str,
         model: &str,
@@ -1512,6 +1516,10 @@ async fn run_server(
     pond_mcp_server::init_audit_deps(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
+
+    // Install the vision MCP server's camera-event store handle (#130), same
+    // deal — `spawn_vision_server` only fires at chat time.
+    pond_mcp_server::init_vision_deps(camera_storage.clone());
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -1901,6 +1909,7 @@ async fn run_server(
         let real_executor = Arc::new(AgentScheduleExecutor::new(
             agent.clone(),
             session_storage.clone(),
+            Some(device_control.clone()),
             settings.schedule_max_concurrent,
         ));
         deferred_executor
@@ -2174,6 +2183,53 @@ async fn run_server(
     // `GET /api/v1/activity?category=network`.
     pond_mcp_server::set_egress_sink(event_log.clone());
 
+    // Sensor/event-triggered rules engine (#92): fire SensorTrigger schedules
+    // when a matching sensor/camera/device event arrives on the bus. Fires go
+    // through the scheduler's own run_now path (run records + result events).
+    if let Some(sched) = scheduler.clone() {
+        tokio::spawn(pond_infra_scheduler::run_rules_engine(
+            event_bus.subscribe(),
+            sched,
+        ));
+    }
+
+    // Vision pipeline (#130): camera frames → on-device motion detection →
+    // camera_events + EventBus, so #92 rules and the activity feed react to
+    // what the camera sees. Opt-in (`vision_enabled` + a camera URL) because
+    // it needs a camera and ffmpeg on the device. Classifier is None for now —
+    // events are plain "motion" until the ONNX pet/package model lands.
+    if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
+        let capture = pond_adapters_vision::CaptureConfig {
+            input: settings.vision_camera_url.trim().to_string(),
+            fps: settings.vision_fps.max(1),
+            ..Default::default()
+        };
+        let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
+            camera_id: settings.vision_camera_id.clone(),
+            motion: pond_adapters_vision::MotionConfig {
+                changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
+            Ok(source) => {
+                let storage = camera_storage.clone();
+                let bus = event_bus.clone();
+                tokio::spawn(pond_adapters_vision::run_vision_pipeline(
+                    Box::new(source),
+                    None,
+                    storage,
+                    bus,
+                    pipeline_cfg,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "vision pipeline not started (camera/ffmpeg unavailable)")
+            }
+        }
+    }
+
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
     // to pair a GOTG device.
@@ -2387,11 +2443,14 @@ async fn run_server(
             }
         };
 
-    // Warn if static assets haven't been built yet
-    if !static_dir.exists() {
+    // The web UI is normally embedded into this binary (single executable). We
+    // only fall back to `static_dir` when the binary was built without the UI,
+    // so a missing dir is only worth warning about in that case.
+    if !pond_api::web_ui_embedded() && !static_dir.exists() {
         tracing::warn!(
-            "Static dir {:?} not found — web dashboard will not be served. \
-             Run `cd web && npm run build` to build it.",
+            "No web UI embedded and static dir {:?} not found — the dashboard will \
+             not be served. Build the UI (`cd pond-desktop && npm run build`) before \
+             building the server to embed it, or pass an existing --static-dir.",
             static_dir
         );
     }
@@ -2535,6 +2594,9 @@ async fn run_chat(
     pond_mcp_server::init_audit_deps(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
+
+    // Same for the vision MCP server's camera-event store handle (#130).
+    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
@@ -4785,6 +4847,7 @@ async fn build_goose_backend(
     Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>,
 ) {
     use pond_adapters_goose::GooseAdapter;
+    #[cfg(feature = "local-inference")]
     use pond_adapters_local_inference::ToolCallerEngine;
     use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
     use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
@@ -4871,6 +4934,11 @@ async fn build_goose_backend(
     }
 
     // Build tool-calling specialist (FunctionGemma) if configured.
+    // The specialist is an in-process GGUF engine, so it only exists when the
+    // `local-inference` feature is compiled in. In lean builds (e.g. the Jetson
+    // single-executable without in-process GGUF) there is no specialist and the
+    // main LLM handles all tool calling natively via MCP.
+    #[cfg(feature = "local-inference")]
     let tool_caller: Option<Arc<dyn ToolCaller>> = {
         let settings = settings_repo.get().await.unwrap_or_default();
         match settings.tool_model.as_deref() {
@@ -4889,6 +4957,8 @@ async fn build_goose_backend(
             _ => None,
         }
     };
+    #[cfg(not(feature = "local-inference"))]
+    let tool_caller: Option<Arc<dyn ToolCaller>> = None;
 
     // Register all GIAP MCP servers into Goose's builtin extension registry.
     // Extension toggles (ext_*_enabled) are read from settings to gate registration.
@@ -5356,6 +5426,9 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     pond_mcp_server::init_audit_deps(
         pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
     );
+
+    // Same for the vision MCP server's camera-event store handle (#130).
+    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<

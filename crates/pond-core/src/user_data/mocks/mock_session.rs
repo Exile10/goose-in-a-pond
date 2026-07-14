@@ -138,6 +138,29 @@ impl SessionStorage for InMemorySessionStorage {
         let start = msgs.len().saturating_sub(limit);
         Ok(msgs[start..].to_vec())
     }
+
+    async fn count_messages(&self, session_id: &str) -> Result<u64, SessionStorageError> {
+        // A missing session simply has zero messages (matches the SQLite impl).
+        Ok(self
+            .messages
+            .read()
+            .await
+            .get(session_id)
+            .map(|m| m.len() as u64)
+            .unwrap_or(0))
+    }
+
+    async fn first_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        use crate::models::domain::message::Role;
+        Ok(self.messages.read().await.get(session_id).and_then(|msgs| {
+            msgs.iter()
+                .find(|m| m.message.role == Role::User)
+                .map(|m| m.message.content.clone())
+        }))
+    }
 }
 
 impl InMemorySessionStorage {
@@ -328,6 +351,72 @@ mod tests {
             .update_title("nonexistent", "Nope".to_string())
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_count_messages() {
+        let storage = InMemorySessionStorage::new();
+        storage.create_session("s".to_string()).await.unwrap();
+        assert_eq!(storage.count_messages("s").await.unwrap(), 0);
+        assert_eq!(storage.count_messages("missing").await.unwrap(), 0);
+
+        for i in 0..4 {
+            let m = SessionMessage::new(
+                format!("m{i}"),
+                "s".to_string(),
+                ChatMessage::user(format!("hi {i}")),
+            );
+            storage.add_message("s".to_string(), m).await.unwrap();
+        }
+        assert_eq!(storage.count_messages("s").await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_first_user_message() {
+        let storage = InMemorySessionStorage::new();
+        storage.create_session("s".to_string()).await.unwrap();
+        assert_eq!(storage.first_user_message("s").await.unwrap(), None);
+
+        storage
+            .add_message(
+                "s".to_string(),
+                SessionMessage::new(
+                    "a".to_string(),
+                    "s".to_string(),
+                    ChatMessage::assistant("hi"),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.first_user_message("s").await.unwrap(), None);
+
+        storage
+            .add_message(
+                "s".to_string(),
+                SessionMessage::new(
+                    "u1".to_string(),
+                    "s".to_string(),
+                    ChatMessage::user("what is the capital of Kenya?"),
+                ),
+            )
+            .await
+            .unwrap();
+        storage
+            .add_message(
+                "s".to_string(),
+                SessionMessage::new(
+                    "u2".to_string(),
+                    "s".to_string(),
+                    ChatMessage::user("second"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.first_user_message("s").await.unwrap(),
+            Some("what is the capital of Kenya?".to_string())
+        );
     }
 
     #[tokio::test]

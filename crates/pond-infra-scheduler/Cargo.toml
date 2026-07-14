@@ -10,6 +10,7 @@ license.workspace = true
 pond-core       = { workspace = true }
 anyhow          = { workspace = true }
 async-trait     = { workspace = true }
+futures         = { workspace = true }
 tokio           = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
