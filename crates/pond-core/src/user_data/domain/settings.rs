@@ -1128,6 +1128,7 @@ mod tests {
             "ext_memory_enabled",
             "ext_news_enabled",
             "ext_schedule_enabled",
+            "ext_sensor_enabled",
             "ext_system_enabled",
             "ext_vision_enabled",
             "ext_weather_enabled",
