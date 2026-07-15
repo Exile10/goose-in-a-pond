@@ -3944,7 +3944,9 @@ async fn get_recent_sensors(
 
     // When a sensor_type + time range is given, use the history query path.
     if let Some(ref sensor_type) = params.sensor_type {
-        if agg.as_deref() == Some("current") || (params.since.is_none() && params.until.is_none() && agg.is_none()) {
+        if agg.as_deref() == Some("current")
+            || (params.since.is_none() && params.until.is_none() && agg.is_none())
+        {
             // Fall through to latest-value query below only when no time bounds.
         } else {
             let since = params.since.as_deref().and_then(parse_sensor_datetime);
@@ -3962,12 +3964,22 @@ async fn get_recent_sensors(
 
             return match agg.as_deref() {
                 Some("min") => {
-                    let val = readings.iter().map(|r| r.value).fold(f64::INFINITY, f64::min);
-                    Ok(Json(json!({ "device_id": device_id, "sensor_type": sensor_type, "min": val, "count": readings.len() })))
+                    let val = readings
+                        .iter()
+                        .map(|r| r.value)
+                        .fold(f64::INFINITY, f64::min);
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "min": val, "count": readings.len() }),
+                    ))
                 }
                 Some("max") => {
-                    let val = readings.iter().map(|r| r.value).fold(f64::NEG_INFINITY, f64::max);
-                    Ok(Json(json!({ "device_id": device_id, "sensor_type": sensor_type, "max": val, "count": readings.len() })))
+                    let val = readings
+                        .iter()
+                        .map(|r| r.value)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "max": val, "count": readings.len() }),
+                    ))
                 }
                 Some("avg") => {
                     let avg = if readings.is_empty() {
@@ -3976,18 +3988,22 @@ async fn get_recent_sensors(
                         let sum: f64 = readings.iter().map(|r| r.value).sum();
                         serde_json::Value::from(sum / readings.len() as f64)
                     };
-                    Ok(Json(json!({ "device_id": device_id, "sensor_type": sensor_type, "avg": avg, "count": readings.len() })))
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "avg": avg, "count": readings.len() }),
+                    ))
                 }
                 _ => {
                     let list: Vec<Value> = readings
                         .iter()
-                        .map(|r| json!({
-                            "device_id":   r.device_id,
-                            "sensor_type": r.sensor_type,
-                            "value":       r.value,
-                            "unit":        r.unit,
-                            "recorded_at": r.recorded_at.to_rfc3339(),
-                        }))
+                        .map(|r| {
+                            json!({
+                                "device_id":   r.device_id,
+                                "sensor_type": r.sensor_type,
+                                "value":       r.value,
+                                "unit":        r.unit,
+                                "recorded_at": r.recorded_at.to_rfc3339(),
+                            })
+                        })
                         .collect();
                     Ok(Json(json!({ "readings": list })))
                 }

@@ -138,7 +138,10 @@ impl SensorStorage for SqliteSensorStorage {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| (r.device_id, r.sensor_type)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.device_id, r.sensor_type))
+            .collect())
     }
 }
 
@@ -315,9 +318,15 @@ mod tests {
         let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
         for v in [21.0_f64, 22.5, 23.0] {
-            storage.record(reading("room1", "temperature", v)).await.unwrap();
+            storage
+                .record(reading("room1", "temperature", v))
+                .await
+                .unwrap();
         }
-        let history = storage.get_history("room1", "temperature", None, None).await.unwrap();
+        let history = storage
+            .get_history("room1", "temperature", None, None)
+            .await
+            .unwrap();
         assert_eq!(history.len(), 3);
     }
 
@@ -325,9 +334,18 @@ mod tests {
     async fn sensor_list_sensors_returns_distinct_pairs() {
         let (pool, _tmp) = make_logs_pool().await;
         let storage = SqliteSensorStorage::new(pool);
-        storage.record(reading("bedroom", "temperature", 20.0)).await.unwrap();
-        storage.record(reading("bedroom", "temperature", 21.0)).await.unwrap();
-        storage.record(reading("kitchen", "humidity", 55.0)).await.unwrap();
+        storage
+            .record(reading("bedroom", "temperature", 20.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("bedroom", "temperature", 21.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("kitchen", "humidity", 55.0))
+            .await
+            .unwrap();
         let pairs = storage.list_sensors().await.unwrap();
         assert_eq!(pairs.len(), 2);
         assert!(pairs.contains(&("bedroom".to_string(), "temperature".to_string())));
