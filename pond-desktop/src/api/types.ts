@@ -156,6 +156,7 @@ export interface Settings {
   ext_discovery_enabled?: boolean;
   ext_audit_enabled?: boolean;
   ext_vision_enabled?: boolean;
+  ext_sensor_enabled?: boolean;
 
   // API keys for keyed services
   api_key_guardian?: string | null;
