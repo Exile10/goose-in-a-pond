@@ -176,6 +176,32 @@ async fn activity_lists_events_and_hides_secret() {
     );
 }
 
+/// #157 review follow-up: Secret rows are excluded in the store query itself,
+/// so `limit` counts only surfaceable events. The seeded Secret event is the
+/// NEWEST row — with the old post-filter approach, `limit=2` fetched
+/// [Secret, device] and returned just 1 visible event; the SQL-level filter
+/// must return both visible ones.
+#[tokio::test]
+async fn activity_limit_counts_only_visible_events() {
+    let (app, _tmp) = make_app().await;
+
+    let (status, body) = get_json(&app, "/api/v1/activity?limit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["count"], 2,
+        "the Secret row must not consume limit budget"
+    );
+    let actions: Vec<&str> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"sensor.reading"));
+    assert!(actions.contains(&"device.state_changed"));
+    assert!(!actions.contains(&"auth.token_minted"), "Secret leaked");
+}
+
 #[tokio::test]
 async fn activity_filters_by_category_and_session() {
     let (app, _tmp) = make_app().await;

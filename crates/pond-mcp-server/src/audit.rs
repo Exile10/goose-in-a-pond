@@ -33,6 +33,10 @@ const DEFAULT_RECENT_LIMIT: usize = 50;
 const MAX_RECENT_LIMIT: usize = 200;
 /// Bound on rows scanned for aggregation tools (summary / privacy report).
 const SCAN_LIMIT: usize = 1000;
+/// The highest sensitivity these tools ever surface. `Secret` (credentials,
+/// tokens) is excluded in the store query itself — not just post-filtered —
+/// so row limits count only visible events (#157 review follow-up).
+const MAX_SURFACEABLE: PrivacySensitivity = PrivacySensitivity::Sensitive;
 
 // ── Parameter structs ──────────────────────────────────────────────────────--
 
@@ -98,15 +102,17 @@ Optional window (hour|day|week, default day) and category filter.")]
             .clamp(1, MAX_RECENT_LIMIT);
         let since = chrono::Utc::now() - window_span(window);
 
-        // Scan up to SCAN_LIMIT (not `limit`) so the post-query Secret filter
-        // can't shrink the result below `limit`; `recent_lines` caps to `limit`
-        // after filtering.
+        // Secret events are excluded by the store itself (max_sensitivity), so
+        // `limit` counts only surfaceable rows — no over-fetch needed. Query
+        // one extra row purely to detect truncation for the "showing N most
+        // recent" indicator; `recent_lines` caps to `limit`.
         let events = match self
             .event_log
             .query(EventQuery {
                 category,
                 since: Some(since),
-                limit: Some(SCAN_LIMIT),
+                max_sensitivity: Some(MAX_SURFACEABLE),
+                limit: Some(limit + 1),
                 ..Default::default()
             })
             .await
@@ -135,6 +141,7 @@ of today\". Flags how many outbound network calls were made.")]
             .event_log
             .query(EventQuery {
                 since: Some(since),
+                max_sensitivity: Some(MAX_SURFACEABLE),
                 limit: Some(SCAN_LIMIT),
                 ..Default::default()
             })
@@ -166,6 +173,7 @@ sensitive data. Use for \"what data did you send out?\", \"did you contact any s
             .query(EventQuery {
                 category: Some(EventCategory::Network),
                 since: Some(since),
+                max_sensitivity: Some(MAX_SURFACEABLE),
                 limit: Some(SCAN_LIMIT),
                 ..Default::default()
             })
@@ -178,6 +186,7 @@ sensitive data. Use for \"what data did you send out?\", \"did you contact any s
             .event_log
             .query(EventQuery {
                 since: Some(since),
+                max_sensitivity: Some(MAX_SURFACEABLE),
                 limit: Some(SCAN_LIMIT),
                 ..Default::default()
             })
@@ -249,14 +258,16 @@ fn attr_text<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
 }
 
 /// Events safe to surface: `Secret` (credentials/tokens) is always excluded.
+/// The store query already excludes Secret via `max_sensitivity` — this is
+/// defense in depth so a future `EventLog` impl that ignores the filter can
+/// never leak credentials through these tools.
 fn is_visible(event: &Event) -> bool {
     event.privacy_sensitivity != PrivacySensitivity::Secret
 }
 
-/// Render a newest-first list of activity lines, capped to `limit` *after* the
-/// `Secret` filter. The caller scans more rows than `limit` (up to `SCAN_LIMIT`)
-/// so dropping Secret events never shrinks the result below `limit` when more
-/// visible events exist.
+/// Render a newest-first list of activity lines, capped to `limit`. The caller
+/// queries `limit + 1` store-filtered rows, so one extra visible event here
+/// means there are more than `limit` and the output flags the truncation.
 fn recent_lines(events: &[Event], window: &str, limit: usize) -> String {
     let mut visible: Vec<&Event> = events.iter().filter(|e| is_visible(e)).collect();
     if visible.is_empty() {

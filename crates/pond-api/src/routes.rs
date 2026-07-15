@@ -4002,8 +4002,10 @@ fn parse_rfc3339_param(
 /// `GET /api/v1/activity` — recent events, newest first, with optional
 /// `since` / `until` / `category` / `session_id` / `limit` filters.
 ///
-/// Secret-classified events are never returned (defense in depth — such events
-/// should not be logged at all, but the API also refuses to surface them).
+/// Secret-classified events are never returned: the store query excludes them
+/// (`max_sensitivity`), so `limit` counts only surfaceable events, and the
+/// handler re-filters as defense in depth (such events should not be logged
+/// at all, but the API also refuses to surface them).
 async fn get_activity(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ActivityQueryParams>,
@@ -4030,6 +4032,7 @@ async fn get_activity(
         since: parse_rfc3339_param("since", params.since)?,
         until: parse_rfc3339_param("until", params.until)?,
         min_sensitivity: None,
+        max_sensitivity: Some(PrivacySensitivity::Sensitive),
         limit: Some(params.limit.unwrap_or(100).min(ACTIVITY_MAX_LIMIT)),
     };
 
@@ -4079,6 +4082,8 @@ async fn clear_activity(
         since: parse_rfc3339_param("since", params.since)?,
         until: parse_rfc3339_param("until", params.until)?,
         min_sensitivity: None,
+        // No max: "clear my activity" must be able to purge Secret rows too.
+        max_sensitivity: None,
         limit: None,
     };
 
@@ -4130,6 +4135,7 @@ async fn activity_summary(
     let events = event_log
         .query(EventQuery {
             since: Some(since),
+            max_sensitivity: Some(PrivacySensitivity::Sensitive),
             limit: Some(ACTIVITY_MAX_LIMIT),
             ..Default::default()
         })
