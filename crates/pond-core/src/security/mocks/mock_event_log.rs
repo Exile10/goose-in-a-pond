@@ -187,6 +187,52 @@ mod tests {
         assert!(log.all().is_empty());
     }
 
+    /// #157 follow-up: the audit/activity read paths exclude Secret at the
+    /// store via `max_sensitivity`, so a row limit counts only visible events.
+    #[tokio::test]
+    async fn query_max_sensitivity_excludes_secret_and_limit_counts_visible() {
+        let log = MockEventLog::new();
+        log.append(
+            Event::new(EventCategory::Auth, "auth.token").sensitivity(PrivacySensitivity::Secret),
+        )
+        .await
+        .unwrap();
+        log.append(Event::new(EventCategory::Sensor, "sensor.reading"))
+            .await
+            .unwrap();
+        log.append(
+            Event::new(EventCategory::Network, "egress.http")
+                .sensitivity(PrivacySensitivity::Sensitive),
+        )
+        .await
+        .unwrap();
+
+        // With limit=2 and the Secret row filtered at the store, BOTH visible
+        // events come back — the Secret row never consumes limit budget.
+        let visible = log
+            .query(EventQuery {
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|e| e.action != "auth.token"));
+
+        // min + max combine: exactly the Sensitive band.
+        let band = log
+            .query(EventQuery {
+                min_sensitivity: Some(PrivacySensitivity::Sensitive),
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(band.len(), 1);
+        assert_eq!(band[0].action, "egress.http");
+    }
+
     #[tokio::test]
     async fn usable_as_trait_object() {
         let log: Arc<dyn EventLog> = Arc::new(MockEventLog::new());
