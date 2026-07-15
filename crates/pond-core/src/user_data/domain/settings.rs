@@ -304,6 +304,15 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
+    /// Maximum agentic loop turns for VOICE requests (#105). Voice trades
+    /// completeness for latency: every extra turn is another full LLM round
+    /// the user waits through in silence before hearing anything. The default
+    /// (8) still fits a chained command — two or three tool rounds plus the
+    /// spoken summary — while capping the worst case well below the text-chat
+    /// limit. Never raised above `agent_max_turns`; 0 = no voice-specific cap.
+    #[serde(default = "Settings::default_voice_max_turns")]
+    pub voice_max_turns: u32,
+
     /// Maximum seconds of SILENCE (no stream event) before an agent turn
     /// is aborted. This bounds a stalled stream, NOT total generation time,
     /// so slow reasoning models that stream continuously are never killed.
@@ -597,6 +606,7 @@ impl Default for Settings {
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
+            voice_max_turns: Self::default_voice_max_turns(),
             agent_timeout_secs: Self::default_agent_timeout_secs(),
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
             agent_memory_inject: Self::default_agent_memory_inject(),
@@ -792,6 +802,26 @@ impl Settings {
     }
     fn default_agent_max_turns() -> u32 {
         20
+    }
+    // 8 turns ≈ 2-3 chained tool rounds + the spoken summary. Chosen against
+    // the #105 harness (command_chaining_live_test.rs): chained two-action
+    // utterances complete in 3-5 turns, so 8 leaves headroom for a retry
+    // without letting a runaway loop keep the speaker silent for 20 rounds.
+    fn default_voice_max_turns() -> u32 {
+        8
+    }
+
+    /// The agent-loop turn cap for a request, honouring the voice-specific
+    /// tuning (#105): voice requests use the tighter `voice_max_turns` so a
+    /// chained command still completes but a runaway loop can't keep the
+    /// speaker silent for the full text-chat budget. `voice_max_turns` never
+    /// raises the cap above `agent_max_turns`, and 0 disables the voice cap.
+    pub fn effective_max_turns(&self, voice: bool) -> u32 {
+        if voice && self.voice_max_turns > 0 {
+            self.voice_max_turns.min(self.agent_max_turns)
+        } else {
+            self.agent_max_turns
+        }
     }
     fn default_agent_timeout_secs() -> u64 {
         300
@@ -1064,6 +1094,35 @@ mod tests {
         assert!(s.api_key_guardian.is_none());
     }
 
+    /// #105: voice requests get the tighter turn cap; text keeps the full budget.
+    #[test]
+    fn effective_max_turns_prefers_voice_cap_for_voice_requests() {
+        let s = Settings::default();
+        assert_eq!(
+            s.effective_max_turns(false),
+            20,
+            "text uses agent_max_turns"
+        );
+        assert_eq!(s.effective_max_turns(true), 8, "voice uses voice_max_turns");
+    }
+
+    /// #105: the voice cap can only tighten the budget, never extend it.
+    #[test]
+    fn effective_max_turns_never_exceeds_agent_max_turns() {
+        let mut s = Settings::default();
+        s.agent_max_turns = 5;
+        s.voice_max_turns = 50;
+        assert_eq!(s.effective_max_turns(true), 5);
+    }
+
+    /// #105: 0 disables the voice-specific cap (falls back to agent_max_turns).
+    #[test]
+    fn effective_max_turns_zero_disables_voice_cap() {
+        let mut s = Settings::default();
+        s.voice_max_turns = 0;
+        assert_eq!(s.effective_max_turns(true), s.agent_max_turns);
+    }
+
     /// Completeness / disposition guard (Phase 4 — "Consistent").
     ///
     /// Every field serialized from `Settings` MUST be classified as either
@@ -1084,6 +1143,9 @@ mod tests {
             "retention_events_days",
             "retention_events_by_category",
             "retention_sensitive_days",
+            // Voice-latency tuning knob (#105): the default is derived from the
+            // command-chaining harness; operators override via the settings API.
+            "voice_max_turns",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.

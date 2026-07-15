@@ -132,6 +132,7 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("agent_backend", &settings.agent_backend);
         upsert!("agent_goose_mode", &settings.agent_goose_mode);
         upsert!("agent_max_turns", settings.agent_max_turns.to_string());
+        upsert!("voice_max_turns", settings.voice_max_turns.to_string());
         upsert!(
             "agent_memory_inject",
             if settings.agent_memory_inject {
@@ -656,6 +657,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "agent_max_turns" => {
             if let Ok(v) = value.parse() {
                 s.agent_max_turns = v;
+            }
+        }
+        "voice_max_turns" => {
+            if let Ok(v) = value.parse() {
+                s.voice_max_turns = v;
             }
         }
         "agent_memory_inject" => s.agent_memory_inject = value == "true",
