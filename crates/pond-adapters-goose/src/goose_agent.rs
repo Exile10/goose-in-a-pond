@@ -778,6 +778,13 @@ impl GooseAdapter {
             .map(|t| t.content)
             .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
 
+        // Voice detection is shared by prompt construction (disables thinking)
+        // and the session turn cap (#105 — voice_max_turns). Check both the
+        // instance-level flag (CLI --input whisper) and the per-request flag
+        // (desktop voice pipeline sends voice_mode: true).
+        let is_voice =
+            self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) || request.voice_mode;
+
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
@@ -793,10 +800,6 @@ impl GooseAdapter {
             // Resolve thinking mode from settings + capabilities.
             // Voice mode always disables thinking — reasoning tokens waste TTS
             // time and leak as spoken text if any filter layer misses them.
-            // Check both the instance-level flag (CLI --input whisper) and the
-            // per-request flag (desktop voice pipeline sends voice_mode: true).
-            let is_voice =
-                self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) || request.voice_mode;
             let caps = self
                 .model_capabilities
                 .lock()
@@ -1190,7 +1193,9 @@ impl GooseAdapter {
         let session_cfg = goose::agents::types::SessionConfig {
             id: goose_sid.clone(),
             schedule_id: None,
-            max_turns: Some(settings.agent_max_turns as u32),
+            // Voice requests get the tighter #105 cap so a runaway loop can't
+            // keep the speaker silent for the full text-chat turn budget.
+            max_turns: Some(settings.effective_max_turns(is_voice)),
             retry_config: None,
         };
 
