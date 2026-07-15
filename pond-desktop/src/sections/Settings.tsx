@@ -509,6 +509,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["Discovery","Country info, product lookup, web search","ext_discovery_enabled"],
     ["Audit / Privacy tools","Recent activity, activity summary, and privacy-risk report","ext_audit_enabled"],
     ["Vision","Camera event detection and vision queries (read-only event store)","ext_vision_enabled"],
+    ["Sensors","Read stored IoT sensor data: latest reading, history, and list sensors","ext_sensor_enabled"],
   ] as const;
 
   const API_KEYS = [
