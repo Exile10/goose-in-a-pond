@@ -139,7 +139,11 @@ or omit for the raw time series. Use for 'What was the temperature trend today?'
         let until = params.0.until.as_deref().and_then(parse_datetime);
         let agg = params.0.agg.as_deref().map(str::to_lowercase);
 
-        let readings = match self.sensor_storage.get_history(&device_id, &sensor_type, since, until).await {
+        let readings = match self
+            .sensor_storage
+            .get_history(&device_id, &sensor_type, since, until)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, device_id, sensor_type, "sensors: get_history failed");
