@@ -83,8 +83,16 @@ Pass device_id (the room/device name) and sensor_type ('temperature', 'humidity'
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("get_sensor_reading");
 
-        let device_id = resolve_str_param(&params.0.device_id, &params.0.extra, &["device_id", "device", "room", "location"]);
-        let sensor_type = resolve_str_param(&params.0.sensor_type, &params.0.extra, &["sensor_type", "type", "sensor"]);
+        let device_id = resolve_str_param(
+            &params.0.device_id,
+            &params.0.extra,
+            &["device_id", "device", "room", "location"],
+        );
+        let sensor_type = resolve_str_param(
+            &params.0.sensor_type,
+            &params.0.extra,
+            &["sensor_type", "type", "sensor"],
+        );
 
         let (Some(device_id), Some(sensor_type)) = (device_id, sensor_type) else {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -92,7 +100,11 @@ Pass device_id (the room/device name) and sensor_type ('temperature', 'humidity'
             )]));
         };
 
-        match self.sensor_storage.get_latest(&device_id, &sensor_type).await {
+        match self
+            .sensor_storage
+            .get_latest(&device_id, &sensor_type)
+            .await
+        {
             Ok(Some(r)) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Latest {} reading from '{}': {} {} (recorded at {})",
                 r.sensor_type,
@@ -126,8 +138,16 @@ or omit for the raw time series. Use for 'What was the temperature trend today?'
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("get_sensor_history");
 
-        let device_id = resolve_str_param(&params.0.device_id, &params.0.extra, &["device_id", "device", "room"]);
-        let sensor_type = resolve_str_param(&params.0.sensor_type, &params.0.extra, &["sensor_type", "type", "sensor"]);
+        let device_id = resolve_str_param(
+            &params.0.device_id,
+            &params.0.extra,
+            &["device_id", "device", "room"],
+        );
+        let sensor_type = resolve_str_param(
+            &params.0.sensor_type,
+            &params.0.extra,
+            &["sensor_type", "type", "sensor"],
+        );
 
         let (Some(device_id), Some(sensor_type)) = (device_id, sensor_type) else {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -158,7 +178,11 @@ or omit for the raw time series. Use for 'What was the temperature trend today?'
                 "No '{}' history found for device '{}'{}.",
                 sensor_type,
                 device_id,
-                if since.is_some() || until.is_some() { " in the requested time range" } else { "" },
+                if since.is_some() || until.is_some() {
+                    " in the requested time range"
+                } else {
+                    ""
+                },
             ))]));
         }
 
@@ -176,13 +200,27 @@ or omit for the raw time series. Use for 'What was the temperature trend today?'
             }
             Some("avg") => {
                 let avg = values.iter().sum::<f64>() / values.len() as f64;
-                format!("Average {} for '{}': {:.2} {} (over {} readings)", sensor_type, device_id, avg, unit, values.len())
+                format!(
+                    "Average {} for '{}': {:.2} {} (over {} readings)",
+                    sensor_type,
+                    device_id,
+                    avg,
+                    unit,
+                    values.len()
+                )
             }
             _ => {
                 let lines: Vec<String> = readings
                     .iter()
                     .take(50)
-                    .map(|r| format!("  {} — {} {}", r.recorded_at.format("%Y-%m-%d %H:%M"), r.value, r.unit))
+                    .map(|r| {
+                        format!(
+                            "  {} — {} {}",
+                            r.recorded_at.format("%Y-%m-%d %H:%M"),
+                            r.value,
+                            r.unit
+                        )
+                    })
                     .collect();
                 format!(
                     "{} history for '{}' ({} readings):\n{}",
@@ -339,7 +377,9 @@ mod tests {
 
     impl StubStorage {
         fn new() -> Self {
-            Self { readings: Arc::new(RwLock::new(Vec::new())) }
+            Self {
+                readings: Arc::new(RwLock::new(Vec::new())),
+            }
         }
     }
 
@@ -350,7 +390,11 @@ mod tests {
             Ok(())
         }
 
-        async fn get_latest(&self, device_id: &str, sensor_type: &str) -> Result<Option<SensorReading>> {
+        async fn get_latest(
+            &self,
+            device_id: &str,
+            sensor_type: &str,
+        ) -> Result<Option<SensorReading>> {
             let r = self.readings.read().await;
             Ok(r.iter()
                 .filter(|r| r.device_id == device_id && r.sensor_type == sensor_type)
@@ -360,15 +404,26 @@ mod tests {
 
         async fn get_recent(&self, device_id: &str, limit: usize) -> Result<Vec<SensorReading>> {
             let r = self.readings.read().await;
-            let mut v: Vec<_> = r.iter().filter(|r| r.device_id == device_id).cloned().collect();
+            let mut v: Vec<_> = r
+                .iter()
+                .filter(|r| r.device_id == device_id)
+                .cloned()
+                .collect();
             v.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
             v.truncate(limit);
             Ok(v)
         }
 
-        async fn get_history(&self, device_id: &str, sensor_type: &str, since: Option<DateTime<Utc>>, until: Option<DateTime<Utc>>) -> Result<Vec<SensorReading>> {
+        async fn get_history(
+            &self,
+            device_id: &str,
+            sensor_type: &str,
+            since: Option<DateTime<Utc>>,
+            until: Option<DateTime<Utc>>,
+        ) -> Result<Vec<SensorReading>> {
             let r = self.readings.read().await;
-            let mut v: Vec<_> = r.iter()
+            let mut v: Vec<_> = r
+                .iter()
                 .filter(|r| {
                     r.device_id == device_id
                         && r.sensor_type == sensor_type
@@ -398,7 +453,11 @@ mod tests {
 
     fn make_ctx() -> RequestContext<RoleServer> {
         let (_client, stream) = tokio::io::duplex(64);
-        let running = serve_directly(SensorsMcpServer::new(Arc::new(StubStorage::new())), stream, None);
+        let running = serve_directly(
+            SensorsMcpServer::new(Arc::new(StubStorage::new())),
+            stream,
+            None,
+        );
         RequestContext::new(RequestId::Number(0), running.peer().clone())
     }
 
@@ -413,14 +472,26 @@ mod tests {
     }
 
     fn text_of(result: CallToolResult) -> String {
-        result.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect::<Vec<_>>().join("")
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     #[tokio::test]
     async fn get_sensor_reading_returns_latest() {
         let storage = Arc::new(StubStorage::new());
-        storage.record(reading("bedroom", "temperature", 21.0)).await.unwrap();
-        storage.record(reading("bedroom", "temperature", 23.5)).await.unwrap();
+        storage
+            .record(reading("bedroom", "temperature", 21.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("bedroom", "temperature", 23.5))
+            .await
+            .unwrap();
 
         let server = SensorsMcpServer::new(storage);
         let params = Parameters(GetSensorReadingParams {
@@ -429,7 +500,10 @@ mod tests {
             extra: Default::default(),
         });
         let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
-        assert!(text.contains("23.5"), "expected latest value 23.5 in: {text}");
+        assert!(
+            text.contains("23.5"),
+            "expected latest value 23.5 in: {text}"
+        );
         assert!(text.contains("bedroom"), "expected device_id in: {text}");
     }
 
@@ -438,17 +512,31 @@ mod tests {
         let server = SensorsMcpServer::new(Arc::new(StubStorage::new()));
         let params = Parameters(GetSensorReadingParams::default());
         let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
-        assert!(text.contains("device_id"), "should prompt for device_id: {text}");
+        assert!(
+            text.contains("device_id"),
+            "should prompt for device_id: {text}"
+        );
     }
 
     #[tokio::test]
     async fn list_sensors_shows_known_devices() {
         let storage = Arc::new(StubStorage::new());
-        storage.record(reading("bedroom", "temperature", 21.0)).await.unwrap();
-        storage.record(reading("kitchen", "humidity", 55.0)).await.unwrap();
+        storage
+            .record(reading("bedroom", "temperature", 21.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("kitchen", "humidity", 55.0))
+            .await
+            .unwrap();
 
         let server = SensorsMcpServer::new(storage);
-        let text = text_of(server.list_sensors(make_ctx(), Parameters(ListSensorsParams::default())).await.unwrap());
+        let text = text_of(
+            server
+                .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
+                .await
+                .unwrap(),
+        );
         assert!(text.contains("bedroom"), "should list bedroom: {text}");
         assert!(text.contains("kitchen"), "should list kitchen: {text}");
     }
@@ -456,9 +544,18 @@ mod tests {
     #[tokio::test]
     async fn get_sensor_history_avg_aggregation() {
         let storage = Arc::new(StubStorage::new());
-        storage.record(reading("living-room", "temperature", 20.0)).await.unwrap();
-        storage.record(reading("living-room", "temperature", 24.0)).await.unwrap();
-        storage.record(reading("living-room", "temperature", 22.0)).await.unwrap();
+        storage
+            .record(reading("living-room", "temperature", 20.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("living-room", "temperature", 24.0))
+            .await
+            .unwrap();
+        storage
+            .record(reading("living-room", "temperature", 22.0))
+            .await
+            .unwrap();
 
         let server = SensorsMcpServer::new(storage);
         let params = Parameters(GetSensorHistoryParams {
