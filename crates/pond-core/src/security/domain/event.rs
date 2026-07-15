@@ -169,6 +169,11 @@ pub struct EventQuery {
     /// is `>=` this on the `Public < Internal < Sensitive < Secret` ordering.
     /// Used by sensitivity-aware retention to target sensitive activity.
     pub min_sensitivity: Option<PrivacySensitivity>,
+    /// Maximum sensitivity (inclusive): match events whose `privacy_sensitivity`
+    /// is `<=` this. Used by the audit/activity read paths to exclude `Secret`
+    /// events at the store, so a row `limit` counts only surfaceable events
+    /// (#157 review follow-up).
+    pub max_sensitivity: Option<PrivacySensitivity>,
     /// Cap on returned rows (newest first).
     pub limit: Option<usize>,
 }
@@ -203,6 +208,11 @@ impl EventQuery {
         }
         if let Some(min) = self.min_sensitivity {
             if event.privacy_sensitivity < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_sensitivity {
+            if event.privacy_sensitivity > max {
                 return false;
             }
         }
