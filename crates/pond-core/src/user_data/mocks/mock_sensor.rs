@@ -5,7 +5,7 @@ use crate::user_data::ports::camera_storage::CameraStorage;
 use crate::user_data::ports::sensor_storage::SensorStorage;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,6 +57,42 @@ impl SensorStorage for MockSensorStorage {
         results.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
         results.truncate(limit);
         Ok(results)
+    }
+
+    async fn get_history(
+        &self,
+        device_id: &str,
+        sensor_type: &str,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SensorReading>> {
+        let readings = self.readings.read().await;
+        let mut results: Vec<SensorReading> = readings
+            .iter()
+            .filter(|r| {
+                r.device_id == device_id
+                    && r.sensor_type == sensor_type
+                    && since.map_or(true, |s| r.recorded_at >= s)
+                    && until.map_or(true, |u| r.recorded_at < u)
+            })
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+        Ok(results)
+    }
+
+    async fn list_sensors(&self) -> Result<Vec<(String, String)>> {
+        let readings = self.readings.read().await;
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for r in readings.iter() {
+            let key = (r.device_id.clone(), r.sensor_type.clone());
+            if seen.insert(key.clone()) {
+                result.push(key);
+            }
+        }
+        result.sort();
+        Ok(result)
     }
 }
 
