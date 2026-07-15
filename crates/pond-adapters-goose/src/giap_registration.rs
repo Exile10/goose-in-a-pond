@@ -153,6 +153,13 @@ pub fn register_giap_extensions(
         registered.push("giap-vision".into());
     }
 
+    // Sensor data aggregator. Storage handle installed separately via
+    // `init_sensor_deps` in pond-server (where the logs DB is in scope).
+    if settings.ext_sensor_enabled {
+        register_builtin_extension("giap-sensors", pond_mcp_server::spawn_sensor_server);
+        registered.push("giap-sensors".into());
+    }
+
     // Store for GooseAdapter to read
     let _ = REGISTERED_EXTENSIONS.set(registered.clone());
 

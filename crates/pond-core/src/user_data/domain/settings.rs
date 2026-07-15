@@ -535,6 +535,10 @@ pub struct Settings {
     /// which controls the capture pipeline itself.
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_vision_enabled: bool,
+
+    /// Enable the sensor tools module (query stored IoT sensor readings).
+    #[serde(default = "Settings::default_ext_enabled")]
+    pub ext_sensor_enabled: bool,
 }
 
 impl Default for Settings {
@@ -645,6 +649,7 @@ impl Default for Settings {
             ext_news_enabled: true,
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
+            ext_sensor_enabled: true,
         }
     }
 }

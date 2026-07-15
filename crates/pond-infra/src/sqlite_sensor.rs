@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
@@ -96,6 +96,49 @@ impl SensorStorage for SqliteSensorStorage {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(sensor_row_to_reading).collect())
+    }
+
+    async fn get_history(
+        &self,
+        device_id: &str,
+        sensor_type: &str,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SensorReading>> {
+        let since_str = since.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        let until_str = until.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        let rows: Vec<SensorRow> = sqlx::query_as(
+            "SELECT device_id, sensor_type, value, unit, created_at \
+             FROM sensor_readings \
+             WHERE device_id = ? AND sensor_type = ? \
+               AND (? IS NULL OR created_at >= ?) \
+               AND (? IS NULL OR created_at < ?) \
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .bind(device_id)
+        .bind(sensor_type)
+        .bind(&since_str)
+        .bind(&since_str)
+        .bind(&until_str)
+        .bind(&until_str)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(sensor_row_to_reading).collect())
+    }
+
+    async fn list_sensors(&self) -> Result<Vec<(String, String)>> {
+        #[derive(sqlx::FromRow)]
+        struct PairRow {
+            device_id: String,
+            sensor_type: String,
+        }
+        let rows: Vec<PairRow> = sqlx::query_as(
+            "SELECT DISTINCT device_id, sensor_type FROM sensor_readings \
+             ORDER BY device_id, sensor_type",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.device_id, r.sensor_type)).collect())
     }
 }
 
@@ -265,5 +308,29 @@ mod tests {
         storage.record_event(cam_event("back")).await.unwrap();
         let front_events = storage.list_events("front", 10).await.unwrap();
         assert_eq!(front_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sensor_get_history_no_bounds() {
+        let (pool, _tmp) = make_logs_pool().await;
+        let storage = SqliteSensorStorage::new(pool);
+        for v in [21.0_f64, 22.5, 23.0] {
+            storage.record(reading("room1", "temperature", v)).await.unwrap();
+        }
+        let history = storage.get_history("room1", "temperature", None, None).await.unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sensor_list_sensors_returns_distinct_pairs() {
+        let (pool, _tmp) = make_logs_pool().await;
+        let storage = SqliteSensorStorage::new(pool);
+        storage.record(reading("bedroom", "temperature", 20.0)).await.unwrap();
+        storage.record(reading("bedroom", "temperature", 21.0)).await.unwrap();
+        storage.record(reading("kitchen", "humidity", 55.0)).await.unwrap();
+        let pairs = storage.list_sensors().await.unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("bedroom".to_string(), "temperature".to_string())));
+        assert!(pairs.contains(&("kitchen".to_string(), "humidity".to_string())));
     }
 }
