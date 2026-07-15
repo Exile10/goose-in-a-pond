@@ -124,6 +124,22 @@ fn sensitivities_at_least(min: PrivacySensitivity) -> Vec<String> {
     .collect()
 }
 
+/// Counterpart of [`sensitivities_at_least`]: the on-disk strings that are
+/// `<=` `max`. Lets the audit/activity read paths exclude `Secret` events in
+/// the store itself, so `LIMIT` counts only surfaceable rows (#157 follow-up).
+fn sensitivities_at_most(max: PrivacySensitivity) -> Vec<String> {
+    [
+        PrivacySensitivity::Public,
+        PrivacySensitivity::Internal,
+        PrivacySensitivity::Sensitive,
+        PrivacySensitivity::Secret,
+    ]
+    .into_iter()
+    .filter(|s| *s <= max)
+    .filter_map(|s| enum_to_str(&s).ok())
+    .collect()
+}
+
 /// Append the shared `EventQuery` `WHERE` fragments (everything except
 /// ordering/limit) to `sql`, in a fixed order so binding can match positionally.
 /// Used by both `query` (SELECT) and `purge` (DELETE).
@@ -144,18 +160,27 @@ fn push_filters(sql: &mut String, query: &EventQuery) {
         sql.push_str(" AND timestamp < ?");
     }
     if let Some(min) = query.min_sensitivity {
-        let n = sensitivities_at_least(min).len();
-        if n > 0 {
-            sql.push_str(" AND privacy_sensitivity IN (");
-            for i in 0..n {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-            }
-            sql.push(')');
-        }
+        push_sensitivity_in_clause(sql, sensitivities_at_least(min).len());
     }
+    if let Some(max) = query.max_sensitivity {
+        push_sensitivity_in_clause(sql, sensitivities_at_most(max).len());
+    }
+}
+
+/// Append ` AND privacy_sensitivity IN (?, …)` with `n` placeholders (no-op
+/// when the set is empty).
+fn push_sensitivity_in_clause(sql: &mut String, n: usize) {
+    if n == 0 {
+        return;
+    }
+    sql.push_str(" AND privacy_sensitivity IN (");
+    for i in 0..n {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+    }
+    sql.push(')');
 }
 
 /// Bind the values for [`push_filters`] in the same order. Returns the query so
@@ -181,6 +206,11 @@ fn bind_filters<'q>(
     }
     if let Some(min) = query.min_sensitivity {
         for level in sensitivities_at_least(min) {
+            q = q.bind(level);
+        }
+    }
+    if let Some(max) = query.max_sensitivity {
+        for level in sensitivities_at_most(max) {
             q = q.bind(level);
         }
     }
@@ -402,6 +432,54 @@ mod event_log_tests {
             .await
             .unwrap();
         assert_eq!(log.query(EventQuery::default()).await.unwrap().len(), 1);
+    }
+
+    /// #157 follow-up: `max_sensitivity` filters IN THE SQL, so a `LIMIT`
+    /// counts only surfaceable rows — Secret events can't starve the result.
+    #[tokio::test]
+    async fn query_max_sensitivity_filters_in_sql_before_limit() {
+        let log = fresh().await;
+        let base = chrono::Utc::now();
+
+        // Newest rows are Secret; older rows are visible. A post-filter over a
+        // LIMIT 2 window would return only 0 visible rows — the SQL filter
+        // must return both visible ones instead.
+        for i in 0..2 {
+            let mut secret = Event::new(EventCategory::Auth, format!("auth.token.{i}"))
+                .sensitivity(PrivacySensitivity::Secret);
+            secret.timestamp = base;
+            log.append(secret).await.unwrap();
+        }
+        let mut visible_new = Event::new(EventCategory::Network, "egress.http")
+            .sensitivity(PrivacySensitivity::Sensitive);
+        visible_new.timestamp = base - chrono::Duration::seconds(10);
+        log.append(visible_new).await.unwrap();
+        let mut visible_old = Event::new(EventCategory::Sensor, "sensor.reading");
+        visible_old.timestamp = base - chrono::Duration::seconds(20);
+        log.append(visible_old).await.unwrap();
+
+        let got = log
+            .query(EventQuery {
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2, "limit must count only visible rows");
+        assert!(got.iter().all(|e| !e.action.starts_with("auth.token")));
+
+        // min + max combine to a single band.
+        let band = log
+            .query(EventQuery {
+                min_sensitivity: Some(PrivacySensitivity::Sensitive),
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(band.len(), 1);
+        assert_eq!(band[0].action, "egress.http");
     }
 
     #[tokio::test]
