@@ -3925,6 +3925,14 @@ async fn record_sensor(
 #[derive(serde::Deserialize)]
 struct SensorQueryParams {
     limit: Option<usize>,
+    /// Filter by sensor type (e.g. "temperature", "humidity").
+    sensor_type: Option<String>,
+    /// RFC3339 inclusive start time for history queries.
+    since: Option<String>,
+    /// RFC3339 exclusive end time for history queries.
+    until: Option<String>,
+    /// Aggregation function: "min", "max", "avg", or "current". Omit for raw history.
+    agg: Option<String>,
 }
 
 async fn get_recent_sensors(
@@ -3932,6 +3940,104 @@ async fn get_recent_sensors(
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<SensorQueryParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let agg = params.agg.as_deref().map(str::to_lowercase);
+
+    // When a sensor_type + time range is given, use the history query path.
+    if let Some(ref sensor_type) = params.sensor_type {
+        if agg.as_deref() == Some("current")
+            || (params.since.is_none() && params.until.is_none() && agg.is_none())
+        {
+            // Fall through to latest-value query below only when no time bounds.
+        } else {
+            let since = params.since.as_deref().and_then(parse_sensor_datetime);
+            let until = params.until.as_deref().and_then(parse_sensor_datetime);
+            let readings = state
+                .sensor_storage
+                .get_history(&device_id, sensor_type, since, until)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+
+            return match agg.as_deref() {
+                Some("min") => {
+                    let val = readings
+                        .iter()
+                        .map(|r| r.value)
+                        .fold(f64::INFINITY, f64::min);
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "min": val, "count": readings.len() }),
+                    ))
+                }
+                Some("max") => {
+                    let val = readings
+                        .iter()
+                        .map(|r| r.value)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "max": val, "count": readings.len() }),
+                    ))
+                }
+                Some("avg") => {
+                    let avg = if readings.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        let sum: f64 = readings.iter().map(|r| r.value).sum();
+                        serde_json::Value::from(sum / readings.len() as f64)
+                    };
+                    Ok(Json(
+                        json!({ "device_id": device_id, "sensor_type": sensor_type, "avg": avg, "count": readings.len() }),
+                    ))
+                }
+                _ => {
+                    let list: Vec<Value> = readings
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "device_id":   r.device_id,
+                                "sensor_type": r.sensor_type,
+                                "value":       r.value,
+                                "unit":        r.unit,
+                                "recorded_at": r.recorded_at.to_rfc3339(),
+                            })
+                        })
+                        .collect();
+                    Ok(Json(json!({ "readings": list })))
+                }
+            };
+        }
+    }
+
+    // Current-value query: latest reading per sensor_type (or all types).
+    if let Some(ref sensor_type) = params.sensor_type {
+        if agg.as_deref() == Some("current") || params.since.is_none() {
+            let reading = state
+                .sensor_storage
+                .get_latest(&device_id, sensor_type)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+            return match reading {
+                Some(r) => Ok(Json(json!({
+                    "device_id":   r.device_id,
+                    "sensor_type": r.sensor_type,
+                    "value":       r.value,
+                    "unit":        r.unit,
+                    "recorded_at": r.recorded_at.to_rfc3339(),
+                }))),
+                None => Ok(Json(json!({ "readings": [] }))),
+            };
+        }
+    }
+
+    // Default: recent readings (all types) with a limit.
     let limit = params.limit.unwrap_or(20).min(100);
     let readings = state
         .sensor_storage
@@ -3956,6 +4062,14 @@ async fn get_recent_sensors(
         })
         .collect();
     Ok(Json(json!({ "readings": list })))
+}
+
+fn parse_sensor_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.parse::<chrono::DateTime<chrono::Utc>>().ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+            .ok()
+            .map(|ndt| ndt.and_utc())
+    })
 }
 
 // ── Activity query API (#114) ──────────────────────────────────────────────────

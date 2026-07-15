@@ -1521,6 +1521,10 @@ async fn run_server(
     // deal — `spawn_vision_server` only fires at chat time.
     pond_mcp_server::init_vision_deps(camera_storage.clone());
 
+    // Install the sensor MCP server's storage handle — `spawn_sensor_server`
+    // only fires at chat time.
+    pond_mcp_server::init_sensor_deps(sensor_storage.clone());
+
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
         let cleanup_repo = memory_repo.clone();
