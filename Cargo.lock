@@ -7900,8 +7900,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "image 0.25.10",
  "pond-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
