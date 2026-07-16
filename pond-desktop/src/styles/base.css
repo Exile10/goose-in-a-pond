@@ -190,6 +190,22 @@ select:focus {
   box-shadow: 0 0 0 3px var(--color-accent-subtle);
 }
 
+/* Global focus-visible safety net (a11y pass): several component stylesheets
+ * set `outline: none` on custom buttons/inputs without a replacement ring.
+ * Rather than auditing every one individually, guarantee a visible indicator
+ * everywhere via !important so no interactive element can end up with zero
+ * focus feedback, regardless of what a more specific/later rule does. */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--color-border-focus) !important;
+  outline-offset: 2px !important;
+}
+
 textarea {
   resize: vertical;
   min-height: 80px;

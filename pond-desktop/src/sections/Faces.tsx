@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Button } from "@heroui/react";
 import { ScanFace, Camera, UserCheck, Trash2, RefreshCw, CheckCircle2, Hand } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { ApiError } from "../api/types";
+import { useDialogFocusTrap } from "../components/shared";
 
 // Mirrors the web `FaceEnrollment` page. Three-action layout (enroll,
 // identify, delete) over the same `/api/v1/faces/*` endpoints, styled with
@@ -58,6 +59,9 @@ export function Faces() {
   // WebView, which is why the previous "Delete biometrics" button silently
   // did nothing. Toggling this state shows a small inline confirmation panel.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const householdLabelId = useId();
+  const confirmTitleId = useId();
+  const confirmDialogRef = useDialogFocusTrap<HTMLDivElement>(confirmingDelete, () => setConfirmingDelete(false));
 
   // ── Profiles ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -319,8 +323,9 @@ export function Faces() {
         <section className="faces-panel">
           <h3 className="faces-panel__title">Enroll &amp; Identify</h3>
 
-          <label className="faces-label">Household member</label>
+          <label htmlFor={householdLabelId} className="faces-label">Household member</label>
           <select
+            id={householdLabelId}
             value={selectedProfile}
             onChange={(e) => setSelectedProfile(e.target.value)}
             disabled={profiles.length === 0 || busy !== "idle"}
@@ -357,8 +362,15 @@ export function Faces() {
           </div>
 
           {confirmingDelete && (
-            <div className="faces-confirm">
-              <strong className="faces-confirm__title">
+            <div
+              ref={confirmDialogRef}
+              className="faces-confirm"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby={confirmTitleId}
+              tabIndex={-1}
+            >
+              <strong id={confirmTitleId} className="faces-confirm__title">
                 Delete every face embedding for {profileLabel(selectedProfile)}?
               </strong>
               <span className="faces-confirm__desc">
