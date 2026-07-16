@@ -9,3 +9,4 @@ export { ConfirmProvider, useConfirm } from "./ConfirmDialog";
 export { ErrorBanner, friendlyMessage } from "./ErrorBanner";
 export { SkeletonList } from "./SkeletonList";
 export { FitBadge } from "./FitBadge";
+export { useDialogFocusTrap } from "./useDialogFocusTrap";

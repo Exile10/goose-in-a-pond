@@ -1,8 +1,9 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useId, useRef } from "react";
 import { Button, Chip } from "@heroui/react";
 import { Search, Check } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { ModelEntry } from "../api/types";
+import { useDialogFocusTrap } from "./shared";
 
 export type ModelRole = "chat";
 
@@ -33,21 +34,16 @@ export function ModelPickerModal({
     currentProvider && currentModel ? { provider: currentProvider, model: currentModel } : null,
   );
 
+  const titleId = useId();
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useDialogFocusTrap<HTMLDivElement>(true, onClose, searchInputRef);
+
   useEffect(() => {
     api.listModels()
       .then(setModels)
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, []);
-
-  // Close on ESC key
-  useEffect(() => {
-    function handleKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [onClose]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
@@ -83,10 +79,18 @@ export function ModelPickerModal({
 
   return (
     <div style={styles.overlay} onClick={onClose}>
-      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        style={styles.modal}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div style={styles.header}>
-          <h2 style={styles.title}>Select {ROLE_LABELS[role]} Model</h2>
+          <h2 id={titleId} style={styles.title}>Select {ROLE_LABELS[role]} Model</h2>
           <button style={styles.closeBtn} onClick={onClose} aria-label="Close">✕</button>
         </div>
 
@@ -94,11 +98,11 @@ export function ModelPickerModal({
         <div style={styles.searchWrap}>
           <Search size={14} style={styles.searchIcon} />
           <input
+            ref={searchInputRef}
             style={styles.searchInput}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search models…"
-            autoFocus
             aria-label="Search models"
           />
         </div>
@@ -226,7 +230,6 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: "var(--font-body)",
     background: "var(--color-bg)",
     color: "var(--color-text)",
-    outline: "none",
     boxSizing: "border-box",
     userSelect: "text",
   },

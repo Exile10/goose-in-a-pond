@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useState, useId } from "react";
 import { Button } from "@heroui/react";
 import { X, Check } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { refreshHomeData } from "../hub/state/hubDataStore";
+import { useDialogFocusTrap } from "../components/shared";
 
 // ── Colour / icon templates ───────────────────────────────────────────────────
 
@@ -77,6 +78,8 @@ export function NewRoutineModal({ onClose, onCreated }: Props) {
   const [timeLabel, setTimeLabel]   = useState("On demand");
   const [saving, setSaving]         = useState(false);
   const [error, setError]           = useState<string | null>(null);
+  const titleId = useId();
+  const dialogRef = useDialogFocusTrap<HTMLDivElement>(true, onClose);
 
   function toggleAction(action: string) {
     setSelectedActions((prev) =>
@@ -122,10 +125,18 @@ export function NewRoutineModal({ onClose, onCreated }: Props) {
 
   return (
     <div className="sched-modal__overlay" onClick={onClose}>
-      <div className="sched-modal__dialog nr-dialog" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="sched-modal__dialog nr-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="sched-modal__header">
-          <h2 className="sched-modal__title">New Routine</h2>
+          <h2 id={titleId} className="sched-modal__title">New Routine</h2>
           <button className="sched-modal__close" onClick={onClose} aria-label="Close">
             <X size={16} />
           </button>

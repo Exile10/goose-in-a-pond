@@ -70,50 +70,52 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
     else if (k === "thermo") void control({ target: target >= 74 ? 66 : target + 1 });
   }
 
-  function openCtrl(e: React.MouseEvent) {
-    e.stopPropagation();
+  function openCtrl() {
     window.dispatchEvent(new CustomEvent("hub:device", { detail: device.id }));
   }
 
   return (
-    <div
-      className="dtile"
-      role="button"
-      tabIndex={0}
-      onClick={handle}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handle(); }}
-      data-active={active}
-      style={{
-        background: bg,
-        color: fg,
-        ...(active ? {} : { border }),
-      }}
-    >
-      <div className="dtile__top">
-        <span className="dtile__name" style={{ color: fg }}>{device.name}</span>
-        <button
-          className="dtile__dots"
-          onClick={openCtrl}
-          aria-label={`${device.name} controls`}
-          style={{ color: active ? "rgba(255,255,255,.7)" : "#C4C4CC" }}
-        >
-          <HubIco d={dotsEl} size={16} />
-        </button>
-      </div>
-      {k === "thermo" ? (
-        <div className="dtile__temp">
-          {st.cur ?? device.value}<span>°</span>
+    // A "..." controls button can't be nested inside the tile's own button
+    // (nested interactive controls are invalid a11y-wise). They're siblings
+    // instead: the tile is the primary toggle, the dots button is absolutely
+    // positioned over its corner via .dtile-wrap in hub.css.
+    <div className="dtile-wrap">
+      <button
+        className="dtile"
+        onClick={handle}
+        data-active={active}
+        style={{
+          background: bg,
+          color: fg,
+          ...(active ? {} : { border }),
+        }}
+      >
+        <div className="dtile__top">
+          <span className="dtile__name" style={{ color: fg }}>{device.name}</span>
         </div>
-      ) : <div style={{ flex: 1 }} />}
-      <div className="dtile__bottom">
-        <span
-          className="dtile__icon"
-          style={{ background: active ? "rgba(255,255,255,.22)" : "var(--tile-iconbg,#F4F4F7)" }}
-        >
-          <HubIco d={iconEl ?? ""} size={size === "lg" ? 20 : 18} color={accentIcon} sw={2} />
-        </span>
-        <span className="dtile__status" style={{ color: sub }}>{statusText}</span>
-      </div>
+        {k === "thermo" ? (
+          <div className="dtile__temp">
+            {st.cur ?? device.value}<span>°</span>
+          </div>
+        ) : <div style={{ flex: 1 }} />}
+        <div className="dtile__bottom">
+          <span
+            className="dtile__icon"
+            style={{ background: active ? "rgba(255,255,255,.22)" : "var(--tile-iconbg,#F4F4F7)" }}
+          >
+            <HubIco d={iconEl ?? ""} size={size === "lg" ? 20 : 18} color={accentIcon} sw={2} />
+          </span>
+          <span className="dtile__status" style={{ color: sub }}>{statusText}</span>
+        </div>
+      </button>
+      <button
+        className="dtile__dots"
+        onClick={openCtrl}
+        aria-label={`${device.name} controls`}
+        style={{ color: active ? "rgba(255,255,255,.7)" : "#C4C4CC" }}
+      >
+        <HubIco d={dotsEl} size={16} />
+      </button>
     </div>
   );
 }

@@ -275,7 +275,7 @@ function DeviceControl({ deviceId, onClose }: DeviceControlProps) {
   const tintBg = KIND_TINTBG[k];
 
   return (
-    <Modal onClose={onClose}>
+    <Modal label={`${device.name} controls`} onClose={onClose}>
       <div className="dc-head">
         <span className="dc-head__icon" style={{ background: tintBg, color: tint }}>
           {k === "lock"
@@ -327,7 +327,7 @@ function CameraModal({ camId, onClose }: CameraModalProps) {
     { t: "7:30 AM", label: "Motion", icon: HP_PATHS.bolt },
   ];
   return (
-    <Modal onClose={onClose} wide>
+    <Modal label={`${cam.name} camera`} onClose={onClose} wide>
       <div className="camm">
         <div className="camm__feed">
           <CameraFeed cam={cam} interactive={false} />
@@ -477,7 +477,7 @@ function CategorySheet({ catId, onClose }: CategorySheetProps) {
   const iconPath = HP_PATHS[cat.icon as keyof typeof HP_PATHS];
 
   return (
-    <Modal onClose={onClose}>
+    <Modal label={cat.label} onClose={onClose}>
       <div className="dc-head">
         <span className="dc-head__icon" style={{ background: cat.bg, color: cat.color }}>
           {iconPath && <HubIco d={iconPath} size={20} color={cat.color} />}

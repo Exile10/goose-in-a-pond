@@ -479,6 +479,8 @@ export function Canvas() {
             <button
               onClick={() => setLayout("grid")}
               title="Grid layout"
+              aria-label="Grid layout"
+              aria-pressed={layout === "grid"}
               className={`canvas-layout-toggle__btn${layout === "grid" ? " is-active" : ""}`}
             >
               <Grid3X3 size={14} />
@@ -486,6 +488,8 @@ export function Canvas() {
             <button
               onClick={() => setLayout("stack")}
               title="Stack layout"
+              aria-label="Stack layout"
+              aria-pressed={layout === "stack"}
               className={`canvas-layout-toggle__btn${layout === "stack" ? " is-active" : ""}`}
             >
               <Rows3 size={14} />
@@ -495,6 +499,7 @@ export function Canvas() {
             size="sm"
             variant={voiceMode ? "primary" : "outline"}
             onPress={() => setVoiceMode((v) => !v)}
+            aria-pressed={voiceMode}
           >
             <Mic size={14} /> Voice mode
           </Button>
@@ -567,7 +572,13 @@ export function Canvas() {
                     </div>
                   </div>
                 </div>
-                <button className="chat-dock__icon-btn" onClick={() => setDockOpen(false)} title="Hide chat">
+                <button
+                  className="chat-dock__icon-btn"
+                  onClick={() => setDockOpen(false)}
+                  title="Hide chat"
+                  aria-label="Hide chat"
+                  aria-expanded={dockOpen}
+                >
                   <ChevronLeft size={14} />
                 </button>
               </div>
@@ -677,7 +688,12 @@ export function Canvas() {
               )}
             </>
           ) : (
-            <button className="chat-dock__pill" onClick={() => setDockOpen(true)} title="Show chat">
+            <button
+              className="chat-dock__pill"
+              onClick={() => setDockOpen(true)}
+              title="Show chat"
+              aria-expanded={dockOpen}
+            >
               <GooseAvatar size={24} />
               <span>Chat</span>
               <span className="chat-dock__count">
