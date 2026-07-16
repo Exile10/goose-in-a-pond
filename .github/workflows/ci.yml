@@ -60,7 +60,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get install -y libasound2-dev
+        # `update` first: the runner image ships a cached apt index, and when a
+        # mirror supersedes a package version the stale index 404s the install
+        # (this flaked both PR #188 and #189 on 2026-07-16).
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: cargo fmt
         run: cargo fmt --check
