@@ -27,6 +27,10 @@ pub struct VisionPipelineConfig {
     /// Minimum interval between emitted events — continuous motion produces
     /// one event per interval, not one per frame.
     pub min_event_interval: Duration,
+    /// When set, the triggering frame is saved as a JPEG and the event's
+    /// `snapshot_path` points at it (bounded per-camera retention). `None`
+    /// keeps the pipeline write-free (tests, RAM-only deployments).
+    pub snapshots: Option<crate::snapshot::SnapshotConfig>,
 }
 
 impl Default for VisionPipelineConfig {
@@ -35,6 +39,7 @@ impl Default for VisionPipelineConfig {
             camera_id: "camera-1".to_string(),
             motion: MotionConfig::default(),
             min_event_interval: Duration::from_secs(10),
+            snapshots: None,
         }
     }
 }
@@ -89,12 +94,24 @@ pub async fn run_vision_pipeline(
             None => ("motion".to_string(), Some(changed_fraction.min(1.0))),
         };
 
+        // Best-effort snapshot of the triggering frame: a failed write (full
+        // disk, bad mount) must never suppress the event itself.
+        let snapshot_path = cfg.snapshots.as_ref().and_then(|snap_cfg| {
+            match crate::snapshot::write_snapshot(snap_cfg, &cfg.camera_id, &frame) {
+                Ok(path) => Some(path.to_string_lossy().into_owned()),
+                Err(e) => {
+                    tracing::warn!(camera = %cfg.camera_id, error = %e, "snapshot write failed");
+                    None
+                }
+            }
+        });
+
         let mut event = CameraEvent {
             id: None,
             camera_id: cfg.camera_id.clone(),
             event_type,
             confidence,
-            snapshot_path: None,
+            snapshot_path,
             metadata: Some(
                 serde_json::json!({ "changed_fraction": changed_fraction, "source": "vision" })
                     .to_string(),
@@ -184,6 +201,7 @@ mod tests {
             camera_id: "backyard-cam".into(),
             motion: MotionConfig::default(),
             min_event_interval: Duration::from_secs(60),
+            snapshots: None,
         }
     }
 
@@ -278,6 +296,40 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event_type, "pet", "classifier label used");
         assert_eq!(stored[0].confidence, Some(0.9));
+    }
+
+    /// #175 follow-up: with snapshots configured, the emitted event carries a
+    /// `snapshot_path` pointing at a real JPEG of the triggering frame.
+    #[tokio::test]
+    async fn motion_event_carries_a_snapshot_of_the_triggering_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let frames = VecDeque::from(vec![flat(20), with_square(20)]);
+        let storage = Arc::new(MockCameraStorage::new());
+        let bus = Arc::new(InProcessEventBus::new());
+        let mut cfg = cfg();
+        cfg.snapshots = Some(crate::snapshot::SnapshotConfig::new(
+            tmp.path().to_path_buf(),
+        ));
+
+        run_vision_pipeline(
+            Box::new(ScriptedFrameSource(frames)),
+            None,
+            storage.clone(),
+            bus,
+            cfg,
+        )
+        .await;
+
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let path = stored[0]
+            .snapshot_path
+            .as_deref()
+            .expect("event must carry a snapshot path");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "snapshot file missing: {path}"
+        );
     }
 
     #[tokio::test]

@@ -2214,6 +2214,11 @@ async fn run_server(
                 changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
                 ..Default::default()
             },
+            // Save the triggering frame per event (bounded per-camera
+            // retention) so the dashboard can show WHAT moved (#175 follow-up).
+            snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
+                data_dir.join("snapshots"),
+            )),
             ..Default::default()
         };
         match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {

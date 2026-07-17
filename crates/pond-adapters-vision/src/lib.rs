@@ -20,7 +20,9 @@
 mod ffmpeg_source;
 mod motion;
 mod pipeline;
+mod snapshot;
 
 pub use ffmpeg_source::{CaptureConfig, FfmpegFrameSource};
 pub use motion::{MotionConfig, MotionDetector};
 pub use pipeline::{run_vision_pipeline, VisionPipelineConfig};
+pub use snapshot::SnapshotConfig;
