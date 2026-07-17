@@ -438,6 +438,77 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
         .get_or_init(|| crate::middleware::RateLimiter::new(10, std::time::Duration::from_secs(60)))
 }
 
+/// Record a pairing outcome in the unified event log (category `Auth`,
+/// `Sensitive` — surfaceable by the audit tools, never the payload itself)
+/// and push a security notification to connected devices (#164 follow-up).
+/// Both are best-effort: they must never change the handshake response.
+async fn emit_pairing_outcome(state: &AppState, paired: bool, device_name: Option<&str>) {
+    use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
+
+    let action = if paired {
+        "auth.device_paired"
+    } else {
+        "auth.pairing_verify_failed"
+    };
+    if let Some(event_log) = state.event_log.as_ref() {
+        let mut event =
+            Event::new(EventCategory::Auth, action).sensitivity(PrivacySensitivity::Sensitive);
+        if let Some(name) = device_name {
+            event = event.attr("device_name", name);
+        }
+        if let Err(e) = event_log.append(event).await {
+            tracing::warn!(error = %e, action, "failed to record pairing event");
+        }
+    }
+
+    let Some(sender) = state.notification_sender.as_ref() else {
+        return;
+    };
+    // Debounce failure ALERTS (not the events above): a brute-force burst
+    // should produce one phone alert per window, not one per guess.
+    if !paired {
+        static LAST_FAILURE_ALERT: std::sync::Mutex<Option<std::time::Instant>> =
+            std::sync::Mutex::new(None);
+        const FAILURE_ALERT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+        let mut last = LAST_FAILURE_ALERT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| at.elapsed() < FAILURE_ALERT_WINDOW) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+
+    let (category, title, body) = if paired {
+        (
+            "info",
+            "New device paired".to_string(),
+            format!(
+                "\"{}\" was just paired with this Pond and can now access it.",
+                device_name.unwrap_or("A new device")
+            ),
+        )
+    } else {
+        (
+            "alert",
+            "Failed pairing attempt".to_string(),
+            "A device failed pairing verification. If this wasn't you, \
+             issue a fresh pairing code."
+                .to_string(),
+        )
+    };
+    let notification = pond_core::mcp::ports::notification::Notification {
+        id: uuid::Uuid::new_v4().to_string(),
+        target: "broadcast".to_string(),
+        category: category.to_string(),
+        title,
+        body,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: None,
+    };
+    if let Err(e) = sender.broadcast(notification).await {
+        tracing::warn!(error = %e, action, "failed to push pairing notification");
+    }
+}
+
 /// Phase 2 of pairing: client proves the pairing code via MAC (public).
 async fn handshake_verify(
     State(state): State<Arc<AppState>>,
@@ -456,11 +527,15 @@ async fn handshake_verify(
         ));
     }
     let Json(request) = body.map_err(|_| bad_body())?;
-    let resp = state
-        .handshake
-        .verify_handshake(request)
-        .await
-        .map_err(|e| handshake_error("verify", e))?;
+    let device_name = request.device_name.clone();
+    let resp = match state.handshake.verify_handshake(request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            emit_pairing_outcome(&state, false, device_name.as_deref()).await;
+            return Err(handshake_error("verify", e));
+        }
+    };
+    emit_pairing_outcome(&state, resp.accepted, device_name.as_deref()).await;
     Ok(Json(resp))
 }
 
