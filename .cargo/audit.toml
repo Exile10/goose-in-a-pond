@@ -7,19 +7,16 @@
 
 [advisories]
 ignore = [
-    # lopdf 0.40: stack overflow via deeply nested PDF objects (7.5 high).
-    # Owned by goose-mcp inside the pinned goose submodule
-    # (jarida-io/Goose:giap-patches-rmcp-1.5) — not upgradable from this repo.
-    # Fix: bump lopdf to >=0.42 on the goose patch branch. GIAP itself never
-    # feeds untrusted PDFs to lopdf (developer-tools path in goose).
-    "RUSTSEC-2026-0187",
+    # (RUSTSEC-2026-0187 — lopdf stack overflow — was removed here after
+    # bumping lopdf to 0.42 on the goose patch branch, jarida-io/Goose PR #4.)
 
     # quick-xml 0.36/0.37: quadratic duplicate-attribute check (7.5) …
     "RUSTSEC-2026-0194",
     # … and unbounded namespace-declaration allocation DoS (7.5).
-    # Both owned by docx-rs/office crates under goose-mcp (goose submodule);
-    # fix requires quick-xml >=0.41 upstream. GIAP does not parse untrusted
-    # XML/DOCX through these paths.
+    # Owned by docx-rs under goose-mcp (goose submodule). BLOCKED UPSTREAM:
+    # docx-rs 0.4.20 is the latest release (checked 2026-07-16) and still
+    # requires quick-xml 0.36; the fix needs docx-rs to ship quick-xml >=0.41.
+    # GIAP does not parse untrusted XML/DOCX through these paths.
     "RUSTSEC-2026-0195",
 
     # rsa: Marvin timing side-channel (5.9 medium). NO fixed release exists
