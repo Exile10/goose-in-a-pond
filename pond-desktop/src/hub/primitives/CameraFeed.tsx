@@ -15,14 +15,21 @@ export function CameraFeed({ cam, h = 120, big = false, interactive = true }: Ca
     }
   }
 
+  // When `big` renders its own "Expand camera" button below, the outer tile
+  // must not ALSO be a focusable role="button" — that nests a focusable
+  // element inside a focusable element, which axe (and screen readers)
+  // rightly flag. The inner button already provides the same action via
+  // keyboard; the outer onClick remains as a mouse-only convenience.
+  const tileIsButton = interactive && !big;
+
   return (
     <div
       className="cam"
       style={{ height: h, cursor: interactive ? "pointer" : "default" }}
       onClick={open}
-      role={interactive ? "button" : undefined}
-      tabIndex={interactive ? 0 : undefined}
-      onKeyDown={(e) => { if (interactive && (e.key === "Enter" || e.key === " ")) open(); }}
+      role={tileIsButton ? "button" : undefined}
+      tabIndex={tileIsButton ? 0 : undefined}
+      onKeyDown={(e) => { if (tileIsButton && (e.key === "Enter" || e.key === " ")) open(); }}
     >
       <div
         className="cam__img"

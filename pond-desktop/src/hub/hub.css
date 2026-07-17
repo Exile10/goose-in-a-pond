@@ -508,6 +508,8 @@
 }
 
 /* ─── Device tile ─── */
+.dtile-wrap { position: relative; display: flex; }
+
 .dtile {
   border: none;
   cursor: pointer;
@@ -516,6 +518,8 @@
   border-radius: 18px;
   padding: 14px;
   display: flex;
+  flex: 1;
+  width: 100%;
   flex-direction: column;
   min-height: 110px;
   transition: transform 0.12s, box-shadow 0.2s;
@@ -534,7 +538,21 @@
 }
 
 .dtile__name { font-size: 13.5px; font-weight: 700; line-height: 1.25; }
-.dtile__dots { display: flex; background: none; border: none; cursor: pointer; padding: 0; }
+
+/* Sibling of .dtile (see DeviceTile.tsx) — pinned over its top-right
+   corner rather than nested inside the tile's own <button>. */
+.dtile-wrap .dtile__dots {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 1;
+  display: flex;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+}
 .dtile__temp { font-size: 34px; font-weight: 800; letter-spacing: -1px; line-height: 1; margin: 6px 0; }
 .dtile__temp span { font-size: 20px; font-weight: 700; }
 .dtile__bottom { display: flex; align-items: center; gap: 9px; margin-top: 10px; }
@@ -1554,6 +1572,7 @@ body,
   box-shadow: 0 30px 80px rgba(0,0,0,.35);
   animation: hub-pop .22s cubic-bezier(.2,.8,.3,1);
 }
+.hubmodal:focus-visible { outline: 2px solid var(--pp); outline-offset: 2px; }
 .hubmodal::-webkit-scrollbar { width: 0; }
 .hubmodal--wide { width: 880px; }
 @keyframes hub-pop {
