@@ -212,6 +212,7 @@ export function Sidebar() {
           onClick={toggleCollapsed}
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!collapsed}
         >
           {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
         </button>

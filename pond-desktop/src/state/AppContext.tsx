@@ -9,6 +9,7 @@ import React, {
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "../api/PondApiClient";
+import { refreshHomeData } from "../hub/state/hubDataStore";
 import {
   reducer,
   buildInitialState,
@@ -137,6 +138,11 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
           }
         })
         .catch(() => {});
+      // hubDataStore fires its own fetch on module import, which can race
+      // ahead of this readiness check and lose (silently falling back to
+      // mock data with nothing to retry it). Re-fetch now that we know a
+      // round-trip to the server actually works.
+      void refreshHomeData();
       return;
     }
 
@@ -172,6 +178,12 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
             console.warn("Could not establish a session (pairing rejected).");
           }
           await ensureOnboarded();
+          // hubDataStore fires its own fetch on module import, which almost
+          // always races ahead of the session token being set above — that
+          // first fetch runs unauthenticated, fails, and permanently caches
+          // mock fallback data with nothing to retry it afterward. Re-fetch
+          // now that the token is actually in place.
+          void refreshHomeData();
         })
         .catch((err) => console.warn("Connect failed (non-fatal):", err));
     };

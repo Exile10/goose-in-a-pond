@@ -66,7 +66,7 @@ export function RecipeBuilderModal({ onClose, onCreated }: RecipeBuilderModalPro
   };
 
   return (
-    <HubModal onClose={onClose}>
+    <HubModal label="Create a routine" onClose={onClose}>
       <form className="rb-form" onSubmit={handleSubmit}>
         <header className="rb-form__head">
           <span className="rb-form__icon">
