@@ -6993,6 +6993,10 @@ async fn install_marketplace_handler(
             }
         }
     }
+    env.insert(
+        crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+        crate::oauth_callback::internal_extension_token().to_string(),
+    );
 
     let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
         name: ext.id.clone(),
@@ -7458,6 +7462,10 @@ async fn oauth_callback_handler(
                                 env.insert(sr.key.clone(), val);
                             }
                         }
+                        env.insert(
+                            crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                            crate::oauth_callback::internal_extension_token().to_string(),
+                        );
 
                         // Remove the running extension and re-add with new env
                         let _ = mgr.remove_extension(ext_id).await;
@@ -7527,9 +7535,21 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
 /// Uses the stored refresh token to obtain a new access token.
 async fn oauth_refresh_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    match crate::middleware::extract_bearer_token(&headers) {
+        Ok(token) if token == crate::oauth_callback::internal_extension_token() => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Invalid or missing internal token"})),
+            )
+                .into_response()
+        }
+    }
 
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
@@ -7620,6 +7640,10 @@ async fn oauth_refresh_handler(
                                         env.insert(sr.key.clone(), val);
                                     }
                                 }
+                                env.insert(
+                                    crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                                    crate::oauth_callback::internal_extension_token().to_string(),
+                                );
                                 let _ = mgr.remove_extension(&ext.id).await;
                                 let req =
                                     pond_core::mcp::ports::extension_manager::AddExtensionRequest {

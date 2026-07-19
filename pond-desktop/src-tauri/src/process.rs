@@ -24,10 +24,7 @@ impl ServerProcess {
         // the WebView talks to the same instance, instead of falling back to
         // 4000 and racing the parent for the port.
         let (url, parent_managed) = match std::env::var("GIAP_SERVER_PORT") {
-            Ok(port) if !port.is_empty() => (
-                format!("http://127.0.0.1:{}", port),
-                true,
-            ),
+            Ok(port) if !port.is_empty() => (format!("http://127.0.0.1:{}", port), true),
             _ => ("http://127.0.0.1:4000".to_string(), false),
         };
         Self {
@@ -41,10 +38,7 @@ impl ServerProcess {
     /// Try to connect to a running pond-server; if none is found, spawn the
     /// bundled binary from the app's resource directory.
     #[allow(dead_code)]
-    pub async fn connect_or_spawn(
-        &self,
-        resource_dir: &std::path::Path,
-    ) -> Result<String, String> {
+    pub async fn connect_or_spawn(&self, resource_dir: &std::path::Path) -> Result<String, String> {
         self.ensure_running(resource_dir).await
     }
 
@@ -100,10 +94,17 @@ impl ServerProcess {
         })?;
 
         tracing::info!("Spawning pond-server from {}", binary_path.display());
-        let child = Command::new(&binary_path)
-            .arg("serve")
-            .arg("--port")
-            .arg("4000")
+        let mut cmd = Command::new(&binary_path);
+        cmd.arg("serve").arg("--port").arg("4000");
+        // In dev builds, ground the child's cwd at the repo root so extension
+        // paths like `extensions/music/src/server.ts` resolve regardless of
+        // where `tauri dev` itself was invoked from. No-op in production
+        // bundles, where this compile-time path won't exist on the user's
+        // machine and the binary's own resource-relative paths are absolute.
+        if let Some(root) = dev_repo_root() {
+            cmd.current_dir(root);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn pond-server: {e}"))?;
 
@@ -183,6 +184,18 @@ impl Default for ServerProcess {
     }
 }
 
+/// Resolves to the workspace root (`src-tauri/../..`) baked in at compile
+/// time, but only if that path still exists on disk — true on the dev
+/// machine that built this binary, false anywhere else (e.g. a bundled app
+/// on an end user's machine).
+fn dev_repo_root() -> Option<std::path::PathBuf> {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .ok()
+}
+
 fn server_binary_name() -> &'static str {
     if cfg!(windows) {
         "pond-server.exe"
@@ -191,7 +204,10 @@ fn server_binary_name() -> &'static str {
     }
 }
 
-fn resolve_binary_path(resource_dir: &std::path::Path, binary_name: &str) -> Option<std::path::PathBuf> {
+fn resolve_binary_path(
+    resource_dir: &std::path::Path,
+    binary_name: &str,
+) -> Option<std::path::PathBuf> {
     // Optional override for local debugging and tests.
     if let Ok(override_path) = std::env::var("POND_SERVER_BIN") {
         let path = std::path::PathBuf::from(override_path);
@@ -218,7 +234,13 @@ fn candidate_binary_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_binary_paths, resolve_binary_path};
+    use super::{candidate_binary_paths, dev_repo_root, resolve_binary_path};
+
+    #[test]
+    fn dev_repo_root_resolves_to_the_actual_workspace_root() {
+        let root = dev_repo_root().expect("resolvable in this dev checkout");
+        assert!(root.join("extensions").join("music").is_dir());
+    }
 
     #[test]
     fn candidate_paths_include_bundle_dev_and_cwd_locations() {
@@ -226,7 +248,10 @@ mod tests {
         let paths = candidate_binary_paths(&resource_dir, "pond-server");
 
         assert_eq!(paths.len(), 3);
-        assert_eq!(paths[0], std::path::PathBuf::from("/tmp/resources/pond-server"));
+        assert_eq!(
+            paths[0],
+            std::path::PathBuf::from("/tmp/resources/pond-server")
+        );
         assert_eq!(
             paths[1],
             std::path::PathBuf::from("/tmp/resources/../binaries/pond-server")
@@ -236,15 +261,14 @@ mod tests {
 
     #[test]
     fn resolve_binary_path_uses_override_when_present() {
-        let test_bin = std::env::temp_dir().join(format!(
-            "pond-server-test-{}",
-            std::process::id()
-        ));
+        let test_bin =
+            std::env::temp_dir().join(format!("pond-server-test-{}", std::process::id()));
         std::fs::write(&test_bin, b"#!/bin/sh\n").expect("should write temp binary");
 
         std::env::set_var("POND_SERVER_BIN", &test_bin);
 
-        let resolved = resolve_binary_path(std::path::Path::new("/definitely/missing"), "pond-server");
+        let resolved =
+            resolve_binary_path(std::path::Path::new("/definitely/missing"), "pond-server");
 
         std::env::remove_var("POND_SERVER_BIN");
         std::fs::remove_file(&test_bin).expect("should remove temp binary");
