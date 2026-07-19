@@ -31,6 +31,19 @@ export interface WeatherApiResponse {
   forecast?: WeatherForecastDayResponse[];
 }
 
+// ── Music ────────────────────────────────────────────────────
+export interface NowPlayingApiResponse {
+  connected: boolean;
+  playing?: boolean;
+  track?: string;
+  artist?: string;
+  album_art?: string | null;
+  progress_ms?: number;
+  duration_ms?: number;
+}
+
+export type MusicControlAction = "play" | "pause" | "next" | "previous";
+
 // ── Settings ─────────────────────────────────────────────────
 export interface Settings {
   // Identity

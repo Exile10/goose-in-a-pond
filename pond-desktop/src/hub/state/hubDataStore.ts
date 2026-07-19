@@ -1,6 +1,14 @@
 import { useSyncExternalStore } from "react";
 import { api } from "../../api/PondApiClient";
-import type { AgentRecipe, Device, Schedule, Settings, WeatherApiResponse } from "../../api/types";
+import type {
+  AgentRecipe,
+  Device,
+  MusicControlAction,
+  NowPlayingApiResponse,
+  Schedule,
+  Settings,
+  WeatherApiResponse,
+} from "../../api/types";
 import {
   HOME as MOCK_HOME,
   type CameraData,
@@ -8,6 +16,7 @@ import {
   type DeviceData,
   type DeviceKind,
   type HomeData,
+  type NowPlayingData,
   type RoomData,
   type SceneData,
   type WeatherData,
@@ -255,6 +264,23 @@ function weatherFromApi(w: WeatherApiResponse | null): WeatherData {
   };
 }
 
+function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
+  if (!np || !np.connected) return { ...MOCK_HOME.nowPlaying, connected: false };
+  // Connected but nothing actively playing (Spotify's 204 case) — show an
+  // honest idle state instead of the mock/demo track, so a real connection
+  // never gets mistaken for the decorative filler.
+  const progress = np.progress_ms ?? 0;
+  const duration = np.duration_ms ?? 0;
+  return {
+    track: np.track || "Nothing playing",
+    artist: np.artist || "",
+    elapsed: duration > 0 ? progress / duration : 0,
+    hue: MOCK_HOME.nowPlaying.hue,
+    connected: true,
+    playing: np.playing ?? false,
+  };
+}
+
 function todayDateStr(): string {
   // "Monday, June 1"
   const d = new Date();
@@ -267,12 +293,13 @@ async function load() {
   if (state.loading) return;
   state.loading = true;
   try {
-    const [settings, devices, schedules, recipes, weather] = await Promise.allSettled([
+    const [settings, devices, schedules, recipes, weather, nowPlaying] = await Promise.allSettled([
       api.getSettings(),
       api.listDevices(),
       api.listSchedules(),
       api.listRecipes(),
       api.getWeather(),
+      api.getNowPlaying(),
     ]);
 
     const sOK = settings.status === "fulfilled" ? (settings.value as Settings) : null;
@@ -280,6 +307,7 @@ async function load() {
     const schOK = schedules.status === "fulfilled" ? schedules.value : [];
     const rcOK = recipes.status === "fulfilled" ? recipes.value : [];
     const wOK = weather.status === "fulfilled" ? weather.value : null;
+    const npOK = nowPlaying.status === "fulfilled" ? nowPlaying.value : null;
 
     // Partition devices into controllable + cameras
     const ctlDevices: DeviceData[] = [];
@@ -313,6 +341,7 @@ async function load() {
       categories,
       scenes,
       weather: weatherFromApi(wOK),
+      nowPlaying: nowPlayingFromApi(npOK),
     };
     state.routines = routinesFromRecipes(rcOK);
     state.loaded = true;
@@ -328,6 +357,12 @@ async function load() {
 if (typeof window !== "undefined") {
   // Fire-and-forget; UI renders mock until load resolves.
   void load();
+  // Now-playing changes on its own (user starts/stops playback elsewhere),
+  // unlike the rest of the dashboard — poll it so the widget catches up
+  // without requiring a manual refresh action.
+  setInterval(() => {
+    void refreshNowPlaying();
+  }, 10_000);
 }
 
 // ─── Public API ───────────────────────────────────────────────
@@ -350,6 +385,27 @@ export function useRoutines(): RoutineDetail[] {
 
 export function refreshHomeData(): Promise<void> {
   return load();
+}
+
+/** Re-fetches just the now-playing snapshot, without the full dashboard reload. */
+export async function refreshNowPlaying(): Promise<void> {
+  try {
+    const np = await api.getNowPlaying();
+    state.data = { ...state.data, nowPlaying: nowPlayingFromApi(np) };
+    emit();
+  } catch {
+    // keep whatever was last known
+  }
+}
+
+/** Sends a playback control action, then re-syncs from Spotify's actual state. */
+export async function controlNowPlaying(action: MusicControlAction): Promise<void> {
+  try {
+    await api.controlMusic(action);
+  } catch {
+    // ignore — Spotify may report no active device etc; nothing more to do here
+  }
+  await refreshNowPlaying();
 }
 
 // Test hook: reset to mock data and clear subscribers — used by vitest tests.

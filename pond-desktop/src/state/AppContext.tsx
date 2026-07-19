@@ -9,6 +9,7 @@ import React, {
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "../api/PondApiClient";
+import { refreshHomeData } from "../hub/state/hubDataStore";
 import {
   reducer,
   buildInitialState,
@@ -119,6 +120,15 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       scheduleEsRef.current = null;
     };
   }, [state.serverOnline, state.serverUrl]);
+
+  // Hub data (weather, now-playing, devices, ...) is loaded once at module
+  // import time, which races the server's boot — cold start with models can
+  // take well over a minute. Re-trigger once the server actually reports
+  // online so the dashboard doesn't stay stuck on mock data indefinitely.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    void refreshHomeData();
+  }, [state.serverOnline]);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];
