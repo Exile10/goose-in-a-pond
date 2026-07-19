@@ -205,6 +205,13 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_motion_threshold")]
     pub vision_motion_threshold: f64,
 
+    /// ONNX detector that labels motion events (person/pet/package), e.g.
+    /// "yolox_nano.onnx". Relative paths resolve under
+    /// `<data_dir>/models/vision/`. Empty (default) = events stay plain
+    /// "motion". Requires a `vision-onnx` build + the ONNX Runtime library.
+    #[serde(default = "Settings::default_vision_classifier_model")]
+    pub vision_classifier_model: String,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -592,6 +599,7 @@ impl Default for Settings {
             vision_camera_id: Self::default_vision_camera_id(),
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
+            vision_classifier_model: Self::default_vision_classifier_model(),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -762,6 +770,9 @@ impl Settings {
     }
     fn default_vision_motion_threshold() -> f64 {
         0.05
+    }
+    fn default_vision_classifier_model() -> String {
+        "".to_string()
     }
     fn default_mic_enabled() -> bool {
         true
@@ -1151,6 +1162,10 @@ mod tests {
             // Voice-latency tuning knob (#105): the default is derived from the
             // command-chaining harness; operators override via the settings API.
             "voice_max_turns",
+            // Vision classifier model file (#130 follow-up): an operator knob
+            // that also requires a `vision-onnx` build; UI wiring comes with
+            // the Models-tab vision section, not before.
+            "vision_classifier_model",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
