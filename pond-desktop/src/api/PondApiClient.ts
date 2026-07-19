@@ -35,6 +35,8 @@ import {
   type SessionMessage,
   type SessionMessageToolCall,
   type SessionSummary,
+  type MusicControlAction,
+  type NowPlayingApiResponse,
   type Settings,
   type UsageSummary,
   type TranscribeResponse,
@@ -270,6 +272,16 @@ export class PondApiClient {
 
   getWeather(): Promise<WeatherApiResponse> {
     return this.get("/api/v1/weather");
+  }
+
+  // ── Music ─────────────────────────────────────────────────
+
+  getNowPlaying(): Promise<NowPlayingApiResponse> {
+    return this.get("/api/v1/music/now-playing");
+  }
+
+  controlMusic(action: MusicControlAction): Promise<{ ok: boolean }> {
+    return this.post("/api/v1/music/control", { action });
   }
 
   // ── Devices ───────────────────────────────────────────────

@@ -68,6 +68,9 @@ export interface NowPlayingData {
   artist: string;
   elapsed: number;
   hue: number;
+  /** Whether Spotify is connected — gates real playback controls vs. the cosmetic demo toggle. */
+  connected: boolean;
+  playing: boolean;
 }
 
 export interface TodoItem {
@@ -152,7 +155,7 @@ export const HOME: HomeData = {
     { id: "away",    name: "Away",         icon: "away",  active: false },
     { id: "focus",   name: "Focus",        icon: "focus", active: false },
   ],
-  nowPlaying: { track: "Weightless", artist: "Marconi Union", elapsed: 0.42, hue: 265 },
+  nowPlaying: { track: "Weightless", artist: "Marconi Union", elapsed: 0.42, hue: 265, connected: false, playing: true },
   todos: [
     { t: "Water the plants",    done: true },
     { t: "Call plumber re: leak", done: false },

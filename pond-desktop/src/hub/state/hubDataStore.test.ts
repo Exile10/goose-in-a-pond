@@ -7,6 +7,7 @@ vi.mock("../../api/PondApiClient", () => ({
     listSchedules: vi.fn(),
     listRecipes: vi.fn().mockResolvedValue([]),
     getWeather: vi.fn().mockResolvedValue({ enabled: false }),
+    getNowPlaying: vi.fn().mockResolvedValue({ connected: false }),
   },
 }));
 
@@ -20,6 +21,7 @@ const apiMock = api as unknown as {
   listSchedules: ReturnType<typeof vi.fn>;
   listRecipes: ReturnType<typeof vi.fn>;
   getWeather: ReturnType<typeof vi.fn>;
+  getNowPlaying: ReturnType<typeof vi.fn>;
 };
 
 describe("hubDataStore", () => {
@@ -32,6 +34,8 @@ describe("hubDataStore", () => {
     apiMock.listRecipes.mockResolvedValue([]);
     apiMock.getWeather.mockReset();
     apiMock.getWeather.mockResolvedValue({ enabled: false });
+    apiMock.getNowPlaying.mockReset();
+    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
   });
 
   it("falls back to mock data when API returns empty devices", async () => {
