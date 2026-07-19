@@ -59,6 +59,18 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(&bytes)
 }
 
+/// Env var name spawned extension subprocesses read to auth to
+/// server-to-server routes (e.g. `/oauth/refresh`) without a handshake token.
+pub const INTERNAL_TOKEN_ENV_KEY: &str = "GIAP_INTERNAL_TOKEN";
+
+/// Shared with spawned extension subprocesses via [`INTERNAL_TOKEN_ENV_KEY`].
+/// Generated once per process run, never persisted.
+static INTERNAL_EXTENSION_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn internal_extension_token() -> &'static str {
+    INTERNAL_EXTENSION_TOKEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +107,14 @@ mod tests {
         assert_ne!(s1, s2);
         // 16 bytes base64url → 22 chars
         assert!(s1.len() >= 20);
+    }
+
+    #[test]
+    fn internal_extension_token_is_stable_and_nonempty() {
+        let t1 = internal_extension_token();
+        let t2 = internal_extension_token();
+        assert_eq!(t1, t2);
+        assert!(!t1.is_empty());
     }
 
     #[test]
