@@ -175,7 +175,7 @@ export class PondApiClient {
       }
       if (!res.ok) {
         let msg = res.statusText;
-        try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+        try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
         throw new ApiError(res.status, msg);
       }
       // 204 No Content and any other empty body — return undefined cast to T
@@ -883,7 +883,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1094,7 +1094,7 @@ export class PondApiClient {
 
     if (!res.ok || !res.body) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1230,7 +1230,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1255,7 +1255,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
