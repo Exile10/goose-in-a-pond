@@ -2200,8 +2200,7 @@ async fn run_server(
     // Vision pipeline (#130): camera frames → on-device motion detection →
     // camera_events + EventBus, so #92 rules and the activity feed react to
     // what the camera sees. Opt-in (`vision_enabled` + a camera URL) because
-    // it needs a camera and ffmpeg on the device. Classifier is None for now —
-    // events are plain "motion" until the ONNX pet/package model lands.
+    // it needs a camera and ffmpeg on the device.
     if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
         let capture = pond_adapters_vision::CaptureConfig {
             input: settings.vision_camera_url.trim().to_string(),
@@ -2221,13 +2220,51 @@ async fn run_server(
             )),
             ..Default::default()
         };
+
+        // Optional ONNX classifier: upgrades "motion" into person/pet/package
+        // when a model is configured AND this is a `vision-onnx` build. Load
+        // failures degrade to unlabelled motion — never block the pipeline.
+        #[cfg(feature = "vision-onnx")]
+        let classifier: Option<
+            std::sync::Arc<dyn pond_core::user_data::ports::vision::VisionClassifier>,
+        > = {
+            let configured = settings.vision_classifier_model.trim();
+            if configured.is_empty() {
+                None
+            } else {
+                let path = std::path::Path::new(configured);
+                let resolved = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    data_dir.join("models").join("vision").join(path)
+                };
+                match pond_adapters_vision_onnx::OnnxVisionClassifier::new(&resolved) {
+                    Ok(c) => Some(std::sync::Arc::new(c)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vision classifier unavailable; events stay \"motion\"");
+                        None
+                    }
+                }
+            }
+        };
+        #[cfg(not(feature = "vision-onnx"))]
+        let classifier = {
+            if !settings.vision_classifier_model.trim().is_empty() {
+                tracing::warn!(
+                    "vision_classifier_model is set but this build lacks the `vision-onnx` \
+                     feature; events stay \"motion\""
+                );
+            }
+            None
+        };
+
         match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
             Ok(source) => {
                 let storage = camera_storage.clone();
                 let bus = event_bus.clone();
                 tokio::spawn(pond_adapters_vision::run_vision_pipeline(
                     Box::new(source),
-                    None,
+                    classifier,
                     storage,
                     bus,
                     pipeline_cfg,
