@@ -7837,6 +7837,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-matter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "pond-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+]
+
+[[package]]
 name = "pond-adapters-mcp-memory"
 version = "0.1.0"
 dependencies = [
@@ -8146,6 +8162,7 @@ dependencies = [
  "pond-adapters-goose",
  "pond-adapters-llamafile",
  "pond-adapters-local-inference",
+ "pond-adapters-matter",
  "pond-adapters-mcp-memory",
  "pond-adapters-ollama",
  "pond-adapters-piper",

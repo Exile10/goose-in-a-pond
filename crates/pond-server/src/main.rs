@@ -1796,11 +1796,48 @@ async fn run_server(
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
+    // Device actuation backend (#195): the Matter controller when configured
+    // and reachable, else the logging stub. The bridge halves (event stream +
+    // node cache) are spawned further down where the EventBus exists.
     #[cfg(feature = "goose-agent")]
-    // Device actuation backend — logging stub until MQTT/HTTP/IR or HA-MCP land.
-    let device_control: Arc<
-        dyn pond_core::user_data::ports::device_control::DeviceControlPort,
-    > = Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new());
+    let (device_control, matter_bridge_parts): (
+        Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>,
+        Option<(
+            Arc<pond_adapters_matter::MatterClient>,
+            tokio::sync::mpsc::Receiver<pond_adapters_matter::MatterEvent>,
+            pond_adapters_matter::NodeCache,
+        )>,
+    ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
+        match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
+            Ok((client, events)) => {
+                let cache: pond_adapters_matter::NodeCache =
+                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+                tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
+                (
+                    Arc::new(pond_adapters_matter::MatterDeviceControl::new(
+                        client.clone(),
+                        cache.clone(),
+                    )),
+                    Some((client, events, cache)),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Matter controller unreachable; device control falls back to the logging stub"
+                );
+                (
+                    Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+                    None,
+                )
+            }
+        }
+    } else {
+        (
+            Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+            None,
+        )
+    };
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
@@ -2195,6 +2232,32 @@ async fn run_server(
             event_bus.subscribe(),
             sched,
         ));
+    }
+
+    // Matter bridge (#195): syncs commissioned fabric nodes into the device
+    // registry and turns sensor attribute updates into BusEvent::Sensor, so
+    // #92 rules and the activity feed react to Matter sensors natively.
+    #[cfg(feature = "goose-agent")]
+    if let Some((matter_client, matter_events, matter_cache)) = matter_bridge_parts {
+        let registry = device_registry.clone();
+        let bus = event_bus.clone();
+        tokio::spawn(async move {
+            match pond_adapters_matter::run_matter_bridge(
+                matter_client,
+                matter_events,
+                matter_cache,
+                registry,
+                bus,
+            )
+            .await
+            {
+                Ok(()) => tracing::warn!(
+                    "Matter bridge stopped (controller connection closed); \
+                     restart pond-server to reconnect"
+                ),
+                Err(e) => tracing::warn!(error = %e, "Matter bridge failed"),
+            }
+        });
     }
 
     // Vision pipeline (#130): camera frames → on-device motion detection →
