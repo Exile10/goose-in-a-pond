@@ -279,12 +279,12 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
                     title={isCalibrated ? `${transcriptions.length} calibration variant${transcriptions.length !== 1 ? "s" : ""}` : "Not calibrated"}
                   />
                   {" "}
-                  <span style={{ fontSize: 11, color: "#94a3b8" }}>
+                  <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
                     {isCalibrated ? `${transcriptions.length} variant${transcriptions.length !== 1 ? "s" : ""}` : "not calibrated"}
                   </span>
                 </>
               ) : (
-                <span style={{ color: "#94a3b8", fontStyle: "italic" }}>not set</span>
+                <span style={{ color: "var(--color-text-tertiary)", fontStyle: "italic" }}>not set</span>
               )}
             </span>
           </span>

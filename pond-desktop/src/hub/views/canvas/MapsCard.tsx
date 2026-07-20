@@ -18,9 +18,9 @@ const ROUTES: Route[] = [
 ];
 
 function trafficColor(t: Route["traffic"]): string {
-  if (t === "Light")    return "#16A34A";
-  if (t === "Clear")    return "#0EA5E9";
-  return "#D97706";
+  if (t === "Light")    return "#15803D";
+  if (t === "Clear")    return "#0369A1";
+  return "#92400E";
 }
 
 const NAV_ICON_PATH  = "M3 11l19-9-9 19-2-8-8-2z";
@@ -114,7 +114,7 @@ export function MapsCard(): React.ReactElement {
             <HubIco
               d={NAV_ICON_PATH}
               size={14}
-              color={r.best ? "#7C3AED" : "#94A3B8"}
+              color={r.best ? "#7C3AED" : "var(--color-text-tertiary)"}
               sw={1.75}
             />
             <div style={{ flex: 1, marginLeft: 10 }}>
@@ -138,7 +138,10 @@ export function MapsCard(): React.ReactElement {
               <div
                 style={{
                   fontSize: 11,
-                  color: "#94A3B8",
+                  // The purple "best route" background (#F5F3FF) drops the
+                  // general tertiary-text token just under 4.5:1 — darken it
+                  // for that row specifically.
+                  color: r.best ? "#4B5570" : "var(--color-text-tertiary)",
                   marginTop: 2,
                   display: "flex",
                   gap: 8,

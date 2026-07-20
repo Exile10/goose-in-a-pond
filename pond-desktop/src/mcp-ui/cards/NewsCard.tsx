@@ -16,7 +16,7 @@ const TAG_STYLES: Record<string, { bg: string; color: string }> = {
   business:   { bg: "#DCFCE7", color: "#15803D" },
   health:     { bg: "#CFFAFE", color: "#0E7490" },
   science:    { bg: "#DBEAFE", color: "#1D4ED8" },
-  sports:     { bg: "#FFE4E6", color: "#DC2626" },
+  sports:     { bg: "#FFE4E6", color: "#B91C1C" },
   // Common extras
   politics:   { bg: "#FEF3C7", color: "#92400E" },
   finance:    { bg: "#DCFCE7", color: "#15803D" },
@@ -168,7 +168,7 @@ function NewsCard({ data, variant }: McpCardProps) {
               <span
                 style={{
                   fontSize: 11,
-                  color: "#94A3B8",
+                  color: "var(--color-text-tertiary)",
                   flexShrink: 0,
                   marginTop: 1,
                   fontWeight: 500,

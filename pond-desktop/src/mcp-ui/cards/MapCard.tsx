@@ -21,10 +21,10 @@ function Ico({ d, size = 16, color = "currentColor" }: { d: string; size?: numbe
 
 function trafficColor(t: string): string {
   const lower = (t || "").toLowerCase();
-  if (lower === "light" || lower === "low") return "#16A34A";
-  if (lower === "clear" || lower === "free") return "#0EA5E9";
+  if (lower === "light" || lower === "low") return "#15803D";
+  if (lower === "clear" || lower === "free") return "#0369A1";
   if (lower === "heavy" || lower === "congested") return "#DC2626";
-  return "#D97706"; // moderate / default
+  return "#92400E"; // moderate / default
 }
 
 function MapCard({ data, variant }: McpCardProps) {
@@ -70,7 +70,7 @@ function MapCard({ data, variant }: McpCardProps) {
       {/* Routes */}
       <div style={{ padding: "10px 14px", flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
         {routes.length === 0 ? (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "16px 0", color: "#94A3B8", fontSize: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "16px 0", color: "var(--color-text-tertiary)", fontSize: 12 }}>
             No routes available
           </div>
         ) : (
@@ -82,7 +82,7 @@ function MapCard({ data, variant }: McpCardProps) {
                 background: r.best ? "#F5F3FF" : "#FAFAFA",
                 border: `1px solid ${r.best ? "#DDD6FE" : "#F1F5F9"}`,
               }}>
-                <Ico d="M3 11l19-9-9 19-2-8-8-2z" size={14} color={r.best ? "#7C3AED" : "#94A3B8"} />
+                <Ico d="M3 11l19-9-9 19-2-8-8-2z" size={14} color={r.best ? "#7C3AED" : "var(--color-text-tertiary)"} />
                 <div style={{ flex: 1, marginLeft: 10 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontSize: 13, fontWeight: 700, color: "#18181B" }}>{r.name}</span>
@@ -90,7 +90,9 @@ function MapCard({ data, variant }: McpCardProps) {
                       <span style={{ fontSize: 10, fontWeight: 700, background: "#7C3AED", color: "#fff", padding: "1px 7px", borderRadius: 999 }}>Fastest</span>
                     )}
                   </div>
-                  <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 2, display: "flex", gap: 8, fontWeight: 500 }}>
+                  {/* The purple "best route" background (#F5F3FF) drops the general
+                      tertiary-text token just under 4.5:1 — darken it for that row. */}
+                  <div style={{ fontSize: 11, color: r.best ? "#4B5570" : "var(--color-text-tertiary)", marginTop: 2, display: "flex", gap: 8, fontWeight: 500 }}>
                     {dist && <span>{dist}</span>}
                     {r.traffic && (
                       <span style={{ color: trafficColor(r.traffic), fontWeight: 600 }}>

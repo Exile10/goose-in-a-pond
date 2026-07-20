@@ -56,7 +56,7 @@ function CalendarCard({ data, variant }: McpCardProps) {
       {/* Events */}
       <div style={{ padding: "10px 16px 14px", display: "flex", flexDirection: "column", gap: 8, flex: 1 }}>
         {events.length === 0 ? (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "24px 0", color: "#94A3B8", fontSize: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "24px 0", color: "var(--color-text-tertiary)", fontSize: 12 }}>
             No events scheduled
           </div>
         ) : (
@@ -67,15 +67,15 @@ function CalendarCard({ data, variant }: McpCardProps) {
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
                   <span style={{ fontSize: 11, fontWeight: 700, color: "#64748B" }}>{ev.time}</span>
                   {(ev.duration ?? ev.dur) && (
-                    <span style={{ fontSize: 10, background: "#F1F5F9", color: "#94A3B8", padding: "1px 7px", borderRadius: 6, fontWeight: 600 }}>
+                    <span style={{ fontSize: 10, background: "#F1F5F9", color: "var(--color-text-tertiary)", padding: "1px 7px", borderRadius: 6, fontWeight: 600 }}>
                       {ev.duration ?? ev.dur}
                     </span>
                   )}
                 </div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: "#18181B" }}>{ev.title}</div>
                 {(ev.location ?? ev.loc) && (
-                  <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 2, display: "flex", alignItems: "center", gap: 4, fontWeight: 500 }}>
-                    <Ico d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" size={10} color="#94A3B8" />
+                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 2, display: "flex", alignItems: "center", gap: 4, fontWeight: 500 }}>
+                    <Ico d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" size={10} color="var(--color-text-tertiary)" />
                     {ev.location ?? ev.loc}
                   </div>
                 )}

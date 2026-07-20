@@ -318,7 +318,7 @@ export function RoomsDetail({ go }: RoomsDetailProps) {
                               width: 6,
                               height: 6,
                               borderRadius: "50%",
-                              background: d.is_online ? "#22c55e" : "#94a3b8",
+                              background: d.is_online ? "#22c55e" : "var(--color-text-tertiary)",
                               display: "inline-block",
                               flexShrink: 0,
                             }}

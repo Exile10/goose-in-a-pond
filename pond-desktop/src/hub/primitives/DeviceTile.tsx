@@ -18,7 +18,7 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   let active = false;
   let bg = "var(--tile-bg,#fff)";
   let fg = "var(--tile-fg,#18181B)";
-  let sub = "var(--tile-sub,#94A3B8)";
+  let sub = "var(--tile-sub,#566178)";
   let iconEl: string | React.ReactNode;
   let statusText = "";
   let accentIcon = "var(--tile-icon,#CBD5E1)";
@@ -112,7 +112,7 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
         className="dtile__dots"
         onClick={openCtrl}
         aria-label={`${device.name} controls`}
-        style={{ color: active ? "rgba(255,255,255,.7)" : "#C4C4CC" }}
+        style={{ color: active ? "rgba(255,255,255,.7)" : "var(--tile-icon,#566178)" }}
       >
         <HubIco d={dotsEl} size={16} />
       </button>

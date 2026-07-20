@@ -427,7 +427,7 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
             visibleMems.map((m) => {
               const dotColor = m.segment
                 ? SEG_COLOR[m.segment]
-                : "#94A3B8";
+                : "var(--color-text-tertiary)";
               const isDeleting = deleting === m.id;
 
               return (
