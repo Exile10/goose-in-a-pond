@@ -14,24 +14,7 @@
     "security": {
       "csp": null
     },
-    "windows": [
-      {
-        "label": "canvas",
-        "title": "GIAP Canvas",
-        "url": "canvas.html",
-        "width": 400,
-        "height": 600,
-        "minWidth": 300,
-        "minHeight": 300,
-        "resizable": true,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false
-      }
-    ]
+    "windows": []
   },
   "bundle": {
     "active": true,
