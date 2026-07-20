@@ -2200,8 +2200,7 @@ async fn run_server(
     // Vision pipeline (#130): camera frames → on-device motion detection →
     // camera_events + EventBus, so #92 rules and the activity feed react to
     // what the camera sees. Opt-in (`vision_enabled` + a camera URL) because
-    // it needs a camera and ffmpeg on the device. Classifier is None for now —
-    // events are plain "motion" until the ONNX pet/package model lands.
+    // it needs a camera and ffmpeg on the device.
     if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
         let capture = pond_adapters_vision::CaptureConfig {
             input: settings.vision_camera_url.trim().to_string(),
@@ -2221,13 +2220,66 @@ async fn run_server(
             )),
             ..Default::default()
         };
+
+        // Optional ONNX classifier: upgrades "motion" into person/pet/package
+        // on `vision-onnx` builds. An empty `vision_classifier_model` means
+        // "the default YOLOX-Nano", auto-downloaded on first run exactly like
+        // whisper/piper/face models; an explicit value points at an
+        // operator-managed file (no auto-download). Any failure degrades to
+        // unlabelled motion — never blocks the pipeline.
+        #[cfg(feature = "vision-onnx")]
+        let classifier: Option<
+            std::sync::Arc<dyn pond_core::user_data::ports::vision::VisionClassifier>,
+        > = {
+            let configured = settings.vision_classifier_model.trim();
+            let resolved = if configured.is_empty() {
+                model_download::download_vision_classifier(&data_dir)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!("vision classifier auto-download failed: {e:#}");
+                    })
+                    .ok()
+            } else {
+                let path = std::path::Path::new(configured);
+                Some(if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    model_download::vision_models_dir(&data_dir).join(path)
+                })
+            };
+            resolved.and_then(|model_path| {
+                match pond_adapters_vision_onnx::OnnxVisionClassifier::new(&model_path) {
+                    Ok(c) => Some(
+                        std::sync::Arc::new(c)
+                            as std::sync::Arc<
+                                dyn pond_core::user_data::ports::vision::VisionClassifier,
+                            >,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vision classifier unavailable; events stay \"motion\"");
+                        None
+                    }
+                }
+            })
+        };
+        #[cfg(not(feature = "vision-onnx"))]
+        let classifier = {
+            if !settings.vision_classifier_model.trim().is_empty() {
+                tracing::warn!(
+                    "vision_classifier_model is set but this build lacks the `vision-onnx` \
+                     feature; events stay \"motion\""
+                );
+            }
+            None
+        };
+
         match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
             Ok(source) => {
                 let storage = camera_storage.clone();
                 let bus = event_bus.clone();
                 tokio::spawn(pond_adapters_vision::run_vision_pipeline(
                     Box::new(source),
-                    None,
+                    classifier,
                     storage,
                     bus,
                     pipeline_cfg,

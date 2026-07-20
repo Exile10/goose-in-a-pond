@@ -1,0 +1,25 @@
+[package]
+name = "pond-adapters-vision-onnx"
+description = "ONNX vision classifier (#130 follow-up) — labels motion events (person/pet/package) via a small local detector (YOLOX-Nano; NanoDet-Plus planned)"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core   = { workspace = true }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+image       = { workspace = true }
+ndarray     = "0.17"
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+# ort v2 load-dynamic — same setup as pond-adapters-face-onnx: links the
+# system ONNX Runtime at runtime (ORT_DYLIB_PATH or default search path), so
+# GIAP's build stays light and Jetson operators can swap in a CUDA/TensorRT
+# ORT without recompiling.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-18"] }
+
+[dev-dependencies]
+chrono = { workspace = true }
