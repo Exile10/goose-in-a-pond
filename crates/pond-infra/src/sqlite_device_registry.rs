@@ -75,7 +75,10 @@ fn row_to_device(row: DeviceRow) -> Device {
 #[async_trait]
 impl DeviceRegistry for SqliteDeviceRegistry {
     async fn register(&self, request: RegisterDeviceRequest) -> Result<Device> {
-        let id = Uuid::new_v4().to_string();
+        let id = request
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let caps_json = serde_json::to_string(&request.capabilities)?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -165,6 +168,7 @@ mod tests {
 
     fn req(name: &str) -> RegisterDeviceRequest {
         RegisterDeviceRequest {
+            id: None,
             name: name.to_string(),
             device_type: "gotg".to_string(),
             hostname: Some("phone.local".to_string()),
@@ -210,10 +214,25 @@ mod tests {
         assert!(updated.is_online);
     }
 
+    /// #195: bridge-supplied stable ids are honoured verbatim, so re-syncs
+    /// address the same row instead of accumulating duplicates.
+    #[tokio::test]
+    async fn register_honours_caller_supplied_stable_id() {
+        let (reg, _tmp) = make_registry().await;
+        let with_id = RegisterDeviceRequest {
+            id: Some("matter-2".to_string()),
+            ..req("Virtual OnOff Light")
+        };
+        let dev = reg.register(with_id).await.unwrap();
+        assert_eq!(dev.id, "matter-2");
+        assert!(reg.get_device("matter-2").await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn register_persists_room() {
         let (reg, _tmp) = make_registry().await;
         let with_room = RegisterDeviceRequest {
+            id: None,
             room: Some("Living Room".to_string()),
             ..req("Living Room Lamp")
         };

@@ -33,6 +33,11 @@ pub struct Device {
 /// Request to register a new device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterDeviceRequest {
+    /// Stable caller-supplied id (e.g. `"matter-3"` from the Matter bridge,
+    /// #195) so re-syncs address the same row. `None` = the registry
+    /// generates a UUID, which remains the default for API registrations.
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub device_type: String,
     pub hostname: Option<String>,
