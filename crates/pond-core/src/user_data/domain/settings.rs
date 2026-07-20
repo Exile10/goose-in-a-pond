@@ -205,10 +205,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_motion_threshold")]
     pub vision_motion_threshold: f64,
 
-    /// ONNX detector that labels motion events (person/pet/package), e.g.
-    /// "yolox_nano.onnx". Relative paths resolve under
-    /// `<data_dir>/models/vision/`. Empty (default) = events stay plain
-    /// "motion". Requires a `vision-onnx` build + the ONNX Runtime library.
+    /// ONNX detector that labels motion events (person/pet/package). Empty
+    /// (default) = the bundled YOLOX-Nano, auto-downloaded on first serve of
+    /// a `vision-onnx` build; a value names an operator-managed file
+    /// (relative paths resolve under `<data_dir>/models/vision/`, no
+    /// auto-download). Builds without the `vision-onnx` feature ignore this
+    /// and emit plain "motion". Needs the ONNX Runtime library at startup.
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
 

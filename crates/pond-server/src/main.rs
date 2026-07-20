@@ -2222,30 +2222,45 @@ async fn run_server(
         };
 
         // Optional ONNX classifier: upgrades "motion" into person/pet/package
-        // when a model is configured AND this is a `vision-onnx` build. Load
-        // failures degrade to unlabelled motion — never block the pipeline.
+        // on `vision-onnx` builds. An empty `vision_classifier_model` means
+        // "the default YOLOX-Nano", auto-downloaded on first run exactly like
+        // whisper/piper/face models; an explicit value points at an
+        // operator-managed file (no auto-download). Any failure degrades to
+        // unlabelled motion — never blocks the pipeline.
         #[cfg(feature = "vision-onnx")]
         let classifier: Option<
             std::sync::Arc<dyn pond_core::user_data::ports::vision::VisionClassifier>,
         > = {
             let configured = settings.vision_classifier_model.trim();
-            if configured.is_empty() {
-                None
+            let resolved = if configured.is_empty() {
+                model_download::download_vision_classifier(&data_dir)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!("vision classifier auto-download failed: {e:#}");
+                    })
+                    .ok()
             } else {
                 let path = std::path::Path::new(configured);
-                let resolved = if path.is_absolute() {
+                Some(if path.is_absolute() {
                     path.to_path_buf()
                 } else {
-                    data_dir.join("models").join("vision").join(path)
-                };
-                match pond_adapters_vision_onnx::OnnxVisionClassifier::new(&resolved) {
-                    Ok(c) => Some(std::sync::Arc::new(c)),
+                    model_download::vision_models_dir(&data_dir).join(path)
+                })
+            };
+            resolved.and_then(|model_path| {
+                match pond_adapters_vision_onnx::OnnxVisionClassifier::new(&model_path) {
+                    Ok(c) => Some(
+                        std::sync::Arc::new(c)
+                            as std::sync::Arc<
+                                dyn pond_core::user_data::ports::vision::VisionClassifier,
+                            >,
+                    ),
                     Err(e) => {
                         tracing::warn!(error = %e, "vision classifier unavailable; events stay \"motion\"");
                         None
                     }
                 }
-            }
+            })
         };
         #[cfg(not(feature = "vision-onnx"))]
         let classifier = {
