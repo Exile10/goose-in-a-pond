@@ -196,6 +196,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth/callback", get(oauth_callback_handler))
         .route("/oauth/refresh", post(oauth_refresh_handler))
         .route("/oauth/providers", get(oauth_providers_handler))
+        // ── Music (Spotify) ────────────────────────────────────────────────────
+        .route("/music/now-playing", get(music_now_playing_handler))
+        .route("/music/control", post(music_control_handler))
         // ── Extension Marketplace ─────────────────────────────────────────────
         .route("/marketplace", get(list_marketplace_handler))
         .route(
@@ -7068,6 +7071,10 @@ async fn install_marketplace_handler(
             }
         }
     }
+    env.insert(
+        crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+        crate::oauth_callback::internal_extension_token().to_string(),
+    );
 
     let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
         name: ext.id.clone(),
@@ -7533,6 +7540,10 @@ async fn oauth_callback_handler(
                                 env.insert(sr.key.clone(), val);
                             }
                         }
+                        env.insert(
+                            crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                            crate::oauth_callback::internal_extension_token().to_string(),
+                        );
 
                         // Remove the running extension and re-add with new env
                         let _ = mgr.remove_extension(ext_id).await;
@@ -7602,9 +7613,21 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
 /// Uses the stored refresh token to obtain a new access token.
 async fn oauth_refresh_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    match crate::middleware::extract_bearer_token(&headers) {
+        Ok(token) if token == crate::oauth_callback::internal_extension_token() => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Invalid or missing internal token"})),
+            )
+                .into_response()
+        }
+    }
 
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
@@ -7695,6 +7718,10 @@ async fn oauth_refresh_handler(
                                         env.insert(sr.key.clone(), val);
                                     }
                                 }
+                                env.insert(
+                                    crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                                    crate::oauth_callback::internal_extension_token().to_string(),
+                                );
                                 let _ = mgr.remove_extension(&ext.id).await;
                                 let req =
                                     pond_core::mcp::ports::extension_manager::AddExtensionRequest {
@@ -7769,6 +7796,156 @@ async fn oauth_providers_handler(
         })
         .collect();
     Json(json!({"providers": list}))
+}
+
+// ── Music (Spotify) ──────────────────────────────────────────────────────────
+
+/// Refreshes the stored Spotify access token using the stored refresh token.
+/// Returns the new access token, or `None` if refresh isn't possible.
+async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
+    let repo = state.secret_repo.as_ref()?;
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
+    let provider = providers.iter().find(|p| p.id == "spotify")?;
+    let refresh_token = repo.get(&provider.refresh_key).await.ok().flatten()?;
+    let client_id = repo
+        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| provider.bundled_client_id.clone());
+
+    let resp = state
+        .http_client
+        .post(&provider.token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let access_token = body["access_token"].as_str()?.to_string();
+    let _ = repo.set(&provider.token_key, &access_token).await;
+    if let Some(new_refresh) = body["refresh_token"].as_str() {
+        let _ = repo.set(&provider.refresh_key, new_refresh).await;
+    }
+    Some(access_token)
+}
+
+/// Calls the Spotify Web API with the stored access token, transparently
+/// refreshing and retrying once on a 401. Returns `None` when there's no
+/// token to try at all (Spotify not connected) or refresh fails.
+async fn spotify_api_call(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+) -> Option<reqwest::Response> {
+    let repo = state.secret_repo.as_ref()?;
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
+    let provider = providers.iter().find(|p| p.id == "spotify")?;
+    let token = repo.get(&provider.token_key).await.ok().flatten()?;
+    let url = format!("https://api.spotify.com/v1{path}");
+
+    let resp = state
+        .http_client
+        .request(method.clone(), &url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .ok()?;
+
+    if resp.status() != StatusCode::UNAUTHORIZED {
+        return Some(resp);
+    }
+
+    let refreshed = refresh_spotify_access_token(state).await?;
+    state
+        .http_client
+        .request(method, &url)
+        .bearer_auth(&refreshed)
+        .send()
+        .await
+        .ok()
+}
+
+/// `GET /api/v1/music/now-playing` — Spotify playback snapshot for the dashboard widget.
+async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(resp) =
+        spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing").await
+    else {
+        return Json(json!({"connected": false})).into_response();
+    };
+
+    if !resp.status().is_success() {
+        // 204 = nothing currently playing; other failures degrade the same way
+        // so the widget can just show an idle state either way.
+        return Json(json!({"connected": true, "playing": false})).into_response();
+    }
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let item = &body["item"];
+
+    Json(json!({
+        "connected": true,
+        "playing": body["is_playing"].as_bool().unwrap_or(false),
+        "track": item["name"].as_str().unwrap_or(""),
+        "artist": item["artists"][0]["name"].as_str().unwrap_or(""),
+        "album_art": item["album"]["images"][0]["url"].as_str(),
+        "progress_ms": body["progress_ms"].as_i64().unwrap_or(0),
+        "duration_ms": item["duration_ms"].as_i64().unwrap_or(0),
+    }))
+    .into_response()
+}
+
+/// `POST /api/v1/music/control` — body `{ "action": "play"|"pause"|"next"|"previous" }`.
+async fn music_control_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let (method, path) = match body["action"].as_str().unwrap_or("") {
+        "play" => (reqwest::Method::PUT, "/me/player/play"),
+        "pause" => (reqwest::Method::PUT, "/me/player/pause"),
+        "next" => (reqwest::Method::POST, "/me/player/next"),
+        "previous" => (reqwest::Method::POST, "/me/player/previous"),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Unknown action"})),
+            )
+                .into_response()
+        }
+    };
+
+    let Some(resp) = spotify_api_call(&state, method, path).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Spotify not connected"})),
+        )
+            .into_response();
+    };
+
+    match resp.status() {
+        s if s.is_success() => Json(json!({"ok": true})).into_response(),
+        StatusCode::NOT_FOUND => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "No active Spotify device. Open Spotify on a device first."})),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "Spotify request failed"})),
+        )
+            .into_response(),
+    }
 }
 
 // ── Prompt Templates ─────────────────────────────────────────────────────────

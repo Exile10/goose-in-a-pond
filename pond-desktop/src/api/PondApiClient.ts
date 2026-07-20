@@ -35,6 +35,8 @@ import {
   type SessionMessage,
   type SessionMessageToolCall,
   type SessionSummary,
+  type MusicControlAction,
+  type NowPlayingApiResponse,
   type Settings,
   type UsageSummary,
   type TranscribeResponse,
@@ -175,7 +177,7 @@ export class PondApiClient {
       }
       if (!res.ok) {
         let msg = res.statusText;
-        try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+        try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
         throw new ApiError(res.status, msg);
       }
       // 204 No Content and any other empty body — return undefined cast to T
@@ -270,6 +272,16 @@ export class PondApiClient {
 
   getWeather(): Promise<WeatherApiResponse> {
     return this.get("/api/v1/weather");
+  }
+
+  // ── Music ─────────────────────────────────────────────────
+
+  getNowPlaying(): Promise<NowPlayingApiResponse> {
+    return this.get("/api/v1/music/now-playing");
+  }
+
+  controlMusic(action: MusicControlAction): Promise<{ ok: boolean }> {
+    return this.post("/api/v1/music/control", { action });
   }
 
   // ── Devices ───────────────────────────────────────────────
@@ -883,7 +895,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1094,7 +1106,7 @@ export class PondApiClient {
 
     if (!res.ok || !res.body) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1230,7 +1242,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 
@@ -1255,7 +1267,7 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
-      try { msg = (await res.json()).message ?? msg; } catch { /* ignore */ }
+      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
       throw new ApiError(res.status, msg);
     }
 

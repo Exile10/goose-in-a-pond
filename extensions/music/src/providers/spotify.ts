@@ -51,7 +51,10 @@ export class SpotifyProvider implements MusicProvider {
     try {
       const refreshResp = await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.GIAP_INTERNAL_TOKEN ?? ''}`,
+        },
         body: JSON.stringify({ provider: 'spotify' }),
       });
       if (!refreshResp.ok) return false;
