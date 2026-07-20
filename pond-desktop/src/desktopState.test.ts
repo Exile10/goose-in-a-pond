@@ -12,11 +12,13 @@ describe("desktopState", () => {
   it("normalizes the desktop mode with a gui fallback", () => {
     expect(normalizeDesktopMode("gui")).toBe("gui");
     expect(normalizeDesktopMode("voice")).toBe("voice");
-    expect(normalizeDesktopMode("canvas")).toBe("canvas");
+    // "canvas" was a real mode before Canvas was consolidated into a GuiSection —
+    // a stale persisted value should now self-heal back to "gui".
+    expect(normalizeDesktopMode("canvas")).toBe("gui");
     expect(normalizeDesktopMode("unexpected")).toBe("gui");
     expect(normalizeDesktopMode(null)).toBe("gui");
     expect(normalizeDesktopMode(undefined)).toBe("gui");
-    expect(DESKTOP_MODES).toEqual(["gui", "voice", "canvas"]);
+    expect(DESKTOP_MODES).toEqual(["gui", "voice"]);
   });
 
   it("normalizes the gui section with a dashboard fallback", () => {

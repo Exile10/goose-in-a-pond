@@ -1,5 +1,4 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@heroui/react";
 import { SIDEBAR_GROUPS, type GuiSection } from "../desktopState";
 import { useAppState, useAppDispatch } from "../state/AppContext";
@@ -103,13 +102,8 @@ export function Sidebar() {
     dispatch({ type: "SET_MODE", payload: "voice" });
   }
 
-  async function switchToCanvas() {
-    try {
-      await invoke("show_canvas");
-      dispatch({ type: "SET_MODE", payload: "canvas" });
-    } catch {
-      dispatch({ type: "SET_SECTION", payload: "canvas" });
-    }
+  function switchToCanvas() {
+    dispatch({ type: "SET_SECTION", payload: "canvas" });
   }
 
   return (
