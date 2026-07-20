@@ -83,7 +83,11 @@ pub async fn run(app: AppHandle, base_url: String) {
                                 notify(&app, "Device Offline", &format!("{} went offline", d.name));
                             }
                             Some(false) if d.is_online => {
-                                notify(&app, "Device Online", &format!("{} is back online", d.name));
+                                notify(
+                                    &app,
+                                    "Device Online",
+                                    &format!("{} is back online", d.name),
+                                );
                             }
                             _ => {}
                         }
@@ -143,7 +147,9 @@ pub async fn run(app: AppHandle, base_url: String) {
                             } else {
                                 // Notify on NEW completed/failed runs only.
                                 for run in runs.iter().take(3) {
-                                    let is_finished = run.status.as_deref()
+                                    let is_finished = run
+                                        .status
+                                        .as_deref()
                                         .map(|s| s == "completed" || s == "failed")
                                         .unwrap_or(false);
                                     if is_finished && !seen_run_ids.contains(&run.id) {
@@ -238,7 +244,8 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        let end = s.char_indices()
+        let end = s
+            .char_indices()
             .nth(max_len.saturating_sub(3))
             .map(|(i, _)| i)
             .unwrap_or(max_len.saturating_sub(3));

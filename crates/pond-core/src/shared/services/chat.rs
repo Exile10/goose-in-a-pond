@@ -69,6 +69,21 @@ fn is_dismissal_or_exit_phrase(text: &str) -> bool {
     !matches!(classify_voice_command(text), VoiceCommand::Normal)
 }
 
+/// Truncate a tool-result payload to the NDJSON contract's 2000-char cap.
+///
+/// The contract specifies `content` is "truncated to 2000 chars". We count
+/// Unicode scalar values (chars), not bytes, and cut on a char boundary so the
+/// serialized JSON is always valid. Sub-cap payloads are returned unchanged.
+const TOOL_RESULT_MAX_CHARS: usize = 2000;
+
+fn truncate_tool_result(content: &str) -> String {
+    if content.chars().count() <= TOOL_RESULT_MAX_CHARS {
+        content.to_string()
+    } else {
+        content.chars().take(TOOL_RESULT_MAX_CHARS).collect()
+    }
+}
+
 /// Human-readable announcement spoken while an MCP tool is executing.
 fn tool_announcement(tool: &str) -> String {
     let name = tool.split("__").last().unwrap_or(tool);
@@ -1103,7 +1118,23 @@ pub struct ChatService {
     memory_extractor: Option<Arc<dyn MemoryExtractor>>,
     memory_extraction_service: Option<Arc<MemoryExtractionService>>,
     memory_repo: Option<Arc<dyn MemoryRepository>>,
+    /// Optional workflow-event sink. When set (e.g. the `--json-events` NDJSON
+    /// writer), `emit_event` forwards every event to it in addition to tracing.
+    /// `None` is zero-cost — `emit_event` only ever traces. `Arc` keeps clone
+    /// cheap so the Q2-26 speculative task (which clones the service) carries
+    /// the same sink and streams `Token` events from the spawned job.
+    event_sink: Option<WorkflowEventSink>,
+    /// Whether `run_loop` prints its human-facing banners/prompts to stdout.
+    /// Defaults to `true` (the interactive terminal experience). Set `false`
+    /// in `--json-events` mode so stdout carries NOTHING but NDJSON lines —
+    /// human diagnostics still go to stderr via `eprintln!`/tracing.
+    stdout_diagnostics: bool,
 }
+
+/// A pluggable workflow-event observer. `run_chat`'s `--json-events` mode wires
+/// an NDJSON stdout writer here; the desktop shell parses those lines. Kept as a
+/// bare `Fn` so `pond-core` stays framework-free.
+pub type WorkflowEventSink = Arc<dyn Fn(&WorkflowEvent) + Send + Sync>;
 
 impl ChatService {
     pub fn new(
@@ -1125,6 +1156,8 @@ impl ChatService {
             memory_extractor: None,
             memory_extraction_service: None,
             memory_repo: None,
+            event_sink: None,
+            stdout_diagnostics: true,
         }
     }
 
@@ -1202,6 +1235,27 @@ impl ChatService {
     /// limit, instead of simply dropping old messages via `trim_to_budget`.
     pub fn with_context_compactor(mut self, compactor: ContextCompactor) -> Self {
         self.compactor = Some(compactor);
+        self
+    }
+
+    /// Attach a workflow-event sink. Every `emit_event` call forwards to it in
+    /// addition to tracing. Used by `pond-server chat --json-events` to write
+    /// the NDJSON contract to stdout.
+    ///
+    /// The sink is invoked synchronously from the loop, so keep it cheap
+    /// (a buffered line write + flush). It is cloned into the speculative task,
+    /// so `Token` deltas from a speculative stream reach it too.
+    pub fn with_event_sink(mut self, sink: WorkflowEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Control whether `run_loop` prints human-facing banners/prompts to stdout.
+    ///
+    /// Pass `false` in `--json-events` mode so stdout carries only NDJSON lines;
+    /// diagnostics continue to reach stderr (`eprintln!`) and tracing.
+    pub fn with_stdout_diagnostics(mut self, enabled: bool) -> Self {
+        self.stdout_diagnostics = enabled;
         self
     }
 
@@ -1631,7 +1685,12 @@ impl ChatService {
 
         while let Some(event_result) = stream.next().await {
             match event_result? {
-                AgentStreamEvent::ToolCall { tool, .. } => {
+                AgentStreamEvent::ToolCall { id, tool, .. } => {
+                    // Surface the tool invocation to the event sink (NDJSON).
+                    self.emit_event(WorkflowEvent::ToolCall {
+                        tool: tool.clone(),
+                        id: id.clone(),
+                    });
                     // Flush any buffered text before announcing the tool
                     if !sentence_buf.trim().is_empty() {
                         let chunk = sentence_buf.trim().to_string();
@@ -1668,9 +1727,18 @@ impl ChatService {
                             "[Q2-26 TTFT] {}ms from-fire",
                             fired_at.elapsed().as_millis()
                         );
-                        self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Speak));
+                        self.emit_event(WorkflowEvent::StateChanged {
+                            state: WorkflowState::Speak,
+                        });
                         spoken_first = true;
                     }
+                    // Stream the (thought-filtered) delta to the event sink so the
+                    // desktop caption feed updates token-by-token. Emitted before
+                    // buffering so a partial that never completes a sentence still
+                    // reaches the UI.
+                    self.emit_event(WorkflowEvent::Token {
+                        content: content.clone(),
+                    });
                     full_text.push_str(&content);
                     sentence_buf.push_str(&content);
 
@@ -1727,8 +1795,14 @@ impl ChatService {
                 AgentStreamEvent::Error { content } => {
                     return Err(anyhow::anyhow!("Agent stream error: {}", content));
                 }
+                AgentStreamEvent::ToolResult { id, tool, content } => {
+                    // Surface the tool result to the event sink (NDJSON).
+                    // Not spoken — informational only. Truncate to the contract's
+                    // 2000-char cap so a huge tool payload cannot bloat one line.
+                    let content = truncate_tool_result(&content);
+                    self.emit_event(WorkflowEvent::ToolResult { tool, id, content });
+                }
                 AgentStreamEvent::Status { .. }
-                | AgentStreamEvent::ToolResult { .. }
                 | AgentStreamEvent::Thinking { .. }
                 | AgentStreamEvent::ReviewStatus { .. }
                 | AgentStreamEvent::ReviewRevision { .. } => {
@@ -1820,8 +1894,15 @@ impl ChatService {
             .await?;
 
         self.persist_assistant_response(response_text).await?;
+        // Prefer an LLM-summarized title when a provider is attached; otherwise
+        // (the live GooseAdapter voice path builds ChatService WITHOUT a
+        // provider) fall back to the deterministic first-message-derived title
+        // so the chat sidebar shows a readable topic, never a raw session id.
+        // `ensure_session_title` is guarded on `title.is_none()`, so it no-ops
+        // when the LLM path already set one.
         self.maybe_generate_title(confirmed_message, response_text)
             .await;
+        self.ensure_session_title().await;
         Ok(())
     }
 
@@ -1926,6 +2007,25 @@ impl ChatService {
         // interruptible.
         let mut pending_input: Option<String> = None;
 
+        // Human-facing stdout print, suppressed in `--json-events` mode so
+        // stdout carries NOTHING but NDJSON lines. Diagnostics still reach
+        // stderr (`eprintln!`) and tracing regardless of this flag.
+        macro_rules! diag {
+            ($($arg:tt)*) => {
+                if self.stdout_diagnostics {
+                    println!($($arg)*);
+                }
+            };
+        }
+        macro_rules! diag_inline {
+            ($($arg:tt)*) => {
+                if self.stdout_diagnostics {
+                    print!($($arg)*);
+                    let _ = io::stdout().flush();
+                }
+            };
+        }
+
         loop {
             // `speculative`, when present, is a (provisional_transcript, job)
             // pair: an LLM response already streaming for a provisional
@@ -1934,16 +2034,19 @@ impl ChatService {
             let (input, speculative) = if let Some(text) = pending_input.take() {
                 // Interrupt gave us pre-captured text — skip listen phase.
                 // Emit events so the UI/state machine stays consistent.
-                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Listen,
+                });
                 (Some(text), None)
             } else if first_turn {
                 // ── Wait for wake word ──
-                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Wait));
-                println!(
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Wait,
+                });
+                diag!(
                     "\n  🟢 {} (type \"exit\" to quit)",
                     self.wake_word_detector.activation_prompt()
                 );
-                io::stdout().flush()?;
 
                 let activation = self
                     .wake_word_detector
@@ -1951,9 +2054,10 @@ impl ChatService {
                     .await?;
 
                 // ── Listen (one-breath or fresh recording) ──
-                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
-                print!("  {}", self.voice_input.prompt());
-                io::stdout().flush()?;
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Listen,
+                });
+                diag_inline!("  {}", self.voice_input.prompt());
 
                 if let Some(wav) = activation.captured_audio {
                     self.voice_input.prime_with_captured(wav);
@@ -1962,9 +2066,10 @@ impl ChatService {
                 self.listen_with_speculative_chat().await?
             } else {
                 // ── Conversational turn — listen without wake word ──
-                self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
-                println!("\n  🎧 Listening for your reply...");
-                io::stdout().flush()?;
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Listen,
+                });
+                diag!("\n  🎧 Listening for your reply...");
 
                 self.listen_with_speculative_chat().await?
             };
@@ -1985,14 +2090,16 @@ impl ChatService {
                 None if first_turn => {
                     // Stdin EOF — exit the loop
                     abort_speculative(speculative);
-                    self.emit_event(WorkflowEvent::Exit);
-                    println!("\n  ⏹ End of input.");
+                    self.emit_event(WorkflowEvent::Exit {
+                        reason: "stdin_eof".to_string(),
+                    });
+                    diag!("\n  ⏹ End of input.");
                     break;
                 }
                 None => {
                     // Conversational mode, no speech — reset to wake word
                     abort_speculative(speculative);
-                    println!("  💤 No speech detected, returning to wake word mode.");
+                    diag!("  💤 No speech detected, returning to wake word mode.");
                     first_turn = true;
                     continue;
                 }
@@ -2000,7 +2107,7 @@ impl ChatService {
                     // Empty transcription — fall back to wake word mode
                     abort_speculative(speculative);
                     if !first_turn {
-                        println!("  💤 No speech detected, returning to wake word mode.");
+                        diag!("  💤 No speech detected, returning to wake word mode.");
                     }
                     first_turn = true;
                     continue;
@@ -2014,7 +2121,7 @@ impl ChatService {
                 VoiceCommand::Dismissal => {
                     abort_speculative(speculative);
                     let farewell = "Until next time. Just say my name when you need me.";
-                    println!("  🫡 {}", farewell);
+                    diag!("  🫡 {}", farewell);
                     if let Err(e) = self.voice_output.speak(farewell).await {
                         tracing::warn!("TTS farewell failed: {}", e);
                     }
@@ -2025,11 +2132,13 @@ impl ChatService {
                 VoiceCommand::Exit => {
                     abort_speculative(speculative);
                     let farewell = "Goodbye! I'll be here whenever you need me.";
-                    println!("  👋 {}", farewell);
+                    diag!("  👋 {}", farewell);
                     if let Err(e) = self.voice_output.speak(farewell).await {
                         tracing::warn!("TTS farewell failed: {}", e);
                     }
-                    self.emit_event(WorkflowEvent::Exit);
+                    self.emit_event(WorkflowEvent::Exit {
+                        reason: "dismissed".to_string(),
+                    });
                     break;
                 }
                 VoiceCommand::Normal => {}
@@ -2038,10 +2147,18 @@ impl ChatService {
             // Conversation is active — subsequent turns skip the wake word
             first_turn = false;
 
+            // Confirmed user utterance — surface to the event sink (NDJSON
+            // `transcript`) before the LLM starts. Legacy UserInput retained
+            // for the tracing hook.
+            self.emit_event(WorkflowEvent::Transcript {
+                text: input.clone(),
+            });
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
             // ── Thinking → Speak (streaming), with wake-word interrupt ──
-            self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Thinking));
+            self.emit_event(WorkflowEvent::StateChanged {
+                state: WorkflowState::Thinking,
+            });
 
             // ── Q2-26 phantom-turn gate ─────────────────────────────────────
             // A speculative job (if any) streamed a response for a *provisional*
@@ -2081,6 +2198,33 @@ impl ChatService {
                 let fired_at = std::time::Instant::now();
                 tokio::spawn(async move { svc.stream_response_inner(msg, fired_at).await })
             });
+
+            // ── InstantActivation race guard ─────────────────────────────────
+            // The wake-word interrupt race is ONLY correct for detectors that
+            // actually wait for real audio. `InstantActivation` (stdin /
+            // --no-wake-word / whisper-load-failure fallback) resolves instantly
+            // and would win the race before any turn could complete, aborting
+            // EVERY turn. When the detector cannot interrupt, await the turn
+            // directly — no race, no phantom abort. Real streaming detectors
+            // keep the barge-in race below.
+            if !self.wake_word_detector.supports_interruption() {
+                let chat_result = chat_handle.await;
+                if !self.finalize_confirmed_turn(chat_result, &input).await {
+                    first_turn = true;
+                }
+                continue;
+            }
+
+            // Race the agent response against the wake word detector.
+            // If the user says the wake word during inference or TTS playback,
+            // interrupt immediately: stop TTS, drop the stream, and process
+            // the new speech as a fresh request.
+            //
+            // `chat_handle` is either the reusable speculative job (already
+            // streaming, NO persistence) or a fresh non-persisting stream.
+            // Either way it is raced against the wake interrupt identically, so
+            // barge-in works the same. Persistence happens AFTER it completes,
+            // via persist_confirmed_turn — so exactly one confirmed turn lands.
             let wake_fut = self.wake_word_detector.wait_for_activation_with_audio();
 
             tokio::pin!(chat_handle);
@@ -2089,30 +2233,13 @@ impl ChatService {
             tokio::select! {
                 chat_result = &mut chat_handle => {
                     // Normal completion — agent finished before any interrupt.
-                    match chat_result {
-                        Ok(Ok(response_text)) => {
-                            // Persist the confirmed turn exactly once (user +
-                            // assistant), keyed to the confirmed transcript.
-                            if let Err(e) =
-                                self.persist_confirmed_turn(&input, &response_text).await
-                            {
-                                tracing::warn!("Failed to persist confirmed turn: {}", e);
-                            }
-                            self.emit_event(WorkflowEvent::AgentOutput(response_text));
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("  ❌ Error: {}", e);
-                            first_turn = true;
-                        }
-                        Err(join_err) => {
-                            eprintln!("  ❌ Error: {}", join_err);
-                            first_turn = true;
-                        }
+                    if !self.finalize_confirmed_turn(chat_result, &input).await {
+                        first_turn = true;
                     }
                 }
                 wake_result = &mut wake_fut => {
                     // Wake word detected during inference/TTS — INTERRUPT
-                    println!("\n  🔄 Interrupted! Listening for new request...");
+                    diag!("\n  🔄 Interrupted! Listening for new request...");
 
                     // Stop any in-progress TTS playback and background listeners
                     self.voice_output.stop_speaking();
@@ -2126,6 +2253,8 @@ impl ChatService {
                     // `stream_response_inner` (NO persistence), so an interrupted
                     // response never leaves a partial turn in pond_system.db —
                     // persistence only happens on normal completion above.
+                    // No TurnComplete is emitted either — the turn was never
+                    // committed.
                     chat_handle.abort();
 
                     // Capture the user's new speech (wake word may include trailing audio).
@@ -2134,9 +2263,10 @@ impl ChatService {
                     // the next iteration wraps it in tokio::select! again.
                     match wake_result {
                         Ok(activation) => {
-                            self.emit_event(WorkflowEvent::StateChanged(WorkflowState::Listen));
-                            print!("  {}", self.voice_input.prompt());
-                            let _ = io::stdout().flush();
+                            self.emit_event(WorkflowEvent::StateChanged {
+                                state: WorkflowState::Listen,
+                            });
+                            diag_inline!("  {}", self.voice_input.prompt());
 
                             if let Some(wav) = activation.captured_audio {
                                 self.voice_input.prime_with_captured(wav);
@@ -2149,7 +2279,7 @@ impl ChatService {
                                 }
                                 _ => {
                                     // No speech after interrupt — return to wake word mode
-                                    println!("  💤 No speech after interrupt.");
+                                    diag!("  💤 No speech after interrupt.");
                                     first_turn = true;
                                 }
                             }
@@ -2166,10 +2296,58 @@ impl ChatService {
         Ok(())
     }
 
-    /// Hook point for future event subscribers (logging, UI, etc.).
+    /// Finalize a completed (non-interrupted) chat turn: persist it exactly
+    /// once, then emit the terminal events. Shared by both the raced and the
+    /// non-raced (`supports_interruption() == false`) paths so persistence and
+    /// event emission never drift between them.
+    ///
+    /// Returns `true` on success, `false` on a stream/join error (the caller
+    /// then resets to wake-word mode). On error NOTHING is persisted and NO
+    /// `TurnComplete` is emitted — the exactly-once + none-on-failure invariant.
+    async fn finalize_confirmed_turn(
+        &self,
+        chat_result: std::result::Result<Result<String>, tokio::task::JoinError>,
+        input: &str,
+    ) -> bool {
+        match chat_result {
+            Ok(Ok(response_text)) => {
+                // Persist the confirmed turn exactly once (user + assistant),
+                // keyed to the confirmed transcript.
+                if let Err(e) = self.persist_confirmed_turn(input, &response_text).await {
+                    tracing::warn!("Failed to persist confirmed turn: {}", e);
+                    self.emit_event(WorkflowEvent::Error {
+                        message: format!("failed to persist turn: {e}"),
+                    });
+                    return false;
+                }
+                self.emit_event(WorkflowEvent::AgentOutput(response_text));
+                self.emit_event(WorkflowEvent::TurnComplete {
+                    session_id: self.session_id.clone(),
+                });
+                true
+            }
+            Ok(Err(e)) => {
+                eprintln!("  ❌ Error: {}", e);
+                self.emit_event(WorkflowEvent::Error {
+                    message: e.to_string(),
+                });
+                false
+            }
+            Err(join_err) => {
+                eprintln!("  ❌ Error: {}", join_err);
+                self.emit_event(WorkflowEvent::Error {
+                    message: join_err.to_string(),
+                });
+                false
+            }
+        }
+    }
+
+    /// Emit a workflow event: trace it, then forward to the optional sink
+    /// (e.g. the `--json-events` NDJSON writer). `None` sink is zero-cost.
     fn emit_event(&self, event: WorkflowEvent) {
         match &event {
-            WorkflowEvent::StateChanged(state) => {
+            WorkflowEvent::StateChanged { state } => {
                 tracing::debug!("Workflow state: {}", state);
             }
             WorkflowEvent::UserInput(text) => {
@@ -2178,9 +2356,34 @@ impl ChatService {
             WorkflowEvent::AgentOutput(text) => {
                 tracing::debug!("Agent output: {}", text);
             }
-            WorkflowEvent::Exit => {
-                tracing::debug!("Workflow exit requested");
+            WorkflowEvent::Exit { reason } => {
+                tracing::debug!("Workflow exit requested: {}", reason);
             }
+            WorkflowEvent::Ready { session_id } => {
+                tracing::debug!(session_id = %session_id, "Voice session ready");
+            }
+            WorkflowEvent::Transcript { text } => {
+                tracing::debug!("Transcript: {}", text);
+            }
+            WorkflowEvent::Token { .. } => {
+                // High-frequency — do not trace per-token.
+            }
+            WorkflowEvent::ToolCall { tool, id } => {
+                tracing::debug!(tool = %tool, id = %id, "Tool call");
+            }
+            WorkflowEvent::ToolResult { tool, id, .. } => {
+                tracing::debug!(tool = %tool, id = %id, "Tool result");
+            }
+            WorkflowEvent::TurnComplete { session_id } => {
+                tracing::debug!(session_id = %session_id, "Turn complete");
+            }
+            WorkflowEvent::Error { message } => {
+                tracing::debug!("Workflow error: {}", message);
+            }
+        }
+
+        if let Some(sink) = &self.event_sink {
+            sink(&event);
         }
     }
 }
@@ -3050,5 +3253,319 @@ mod tests {
 
         let _service =
             ChatService::new(agent, session_id, storage).with_voice_output(Arc::new(PrintOutput));
+    }
+
+    // ── InstantActivation race fix + event sink (terminal-voice-in-desktop) ──
+    //
+    // These are the CI-visible regressions for the class of bug where the
+    // run_loop select! interrupt race fired before every turn could complete
+    // whenever the wired detector resolved instantly (InstantActivation).
+    // pond-server is check-only in CI, so this coverage lives in pond-core.
+
+    /// Plays a scripted list of utterances, then `None` (EOF) so `run_loop`
+    /// exits cleanly. Mirrors the pond-server pipeline test's double.
+    struct ScriptedListenInput {
+        script: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+    }
+
+    impl ScriptedListenInput {
+        fn new(lines: impl IntoIterator<Item = &'static str>) -> Self {
+            let mut deque: std::collections::VecDeque<Option<String>> =
+                lines.into_iter().map(|s| Some(s.to_string())).collect();
+            deque.push_back(None); // trailing None → end-of-input (stdin EOF)
+            Self {
+                script: std::sync::Mutex::new(deque),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceInput for ScriptedListenInput {
+        async fn listen(&self) -> Result<Option<String>> {
+            Ok(self.script.lock().unwrap().pop_front().flatten())
+        }
+    }
+
+    /// Captures every string passed to `speak()`.
+    #[derive(Default)]
+    struct CapturingSpeak {
+        spoken: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceOutput for CapturingSpeak {
+        async fn speak(&self, text: &str) -> Result<()> {
+            self.spoken.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    /// A thread-safe collector for the event sink.
+    #[derive(Clone, Default)]
+    struct EventCollector {
+        events: Arc<std::sync::Mutex<Vec<WorkflowEvent>>>,
+    }
+
+    impl EventCollector {
+        fn sink(&self) -> WorkflowEventSink {
+            let events = self.events.clone();
+            Arc::new(move |ev: &WorkflowEvent| {
+                events.lock().unwrap().push(ev.clone());
+            })
+        }
+
+        fn ndjson_events(&self) -> Vec<WorkflowEvent> {
+            // Only the events that map to an NDJSON contract line.
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.to_ndjson().is_some())
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_loop_completes_turn_under_instant_activation() {
+        // REGRESSION (InstantActivation race): with the default InstantActivation
+        // detector (stdin / --no-wake-word), run_loop used to abort every turn
+        // via the interrupt race. The turn must now complete and reach speak().
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "instant-race".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let output = Arc::new(CapturingSpeak::default());
+        let input = Arc::new(ScriptedListenInput::new(["what is the capital of France"]));
+
+        // Default wake-word detector is InstantActivation (supports_interruption=false).
+        let svc = ChatService::new(agent, session_id, storage)
+            .with_voice_input(input)
+            .with_voice_output(output.clone());
+
+        svc.run_loop().await.unwrap();
+
+        let spoken = output.spoken.lock().unwrap().clone();
+        assert!(
+            spoken.iter().any(|s| s.contains("what is the capital")),
+            "the turn must complete and reach speak(); got: {spoken:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_persists_exactly_one_turn_under_instant_activation() {
+        // The completed turn must persist exactly one user + one assistant
+        // message — no phantom turns, no double-persist.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "instant-persist".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let input = Arc::new(ScriptedListenInput::new(["hello there"]));
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()));
+
+        svc.run_loop().await.unwrap();
+
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "exactly one user + one assistant message must persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_derives_deterministic_session_title_without_provider() {
+        // The live GooseAdapter voice path builds ChatService WITHOUT a
+        // provider, so the LLM title path never runs. persist_confirmed_turn
+        // must still derive a readable deterministic title from the first
+        // utterance so the chat sidebar never shows a raw session id.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "title-voice-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let input = Arc::new(ScriptedListenInput::new([
+            "how do I reset the router password",
+        ]));
+        // No .with_provider() — mirrors the live voice path.
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()));
+
+        svc.run_loop().await.unwrap();
+
+        let session = storage.get_session(&session_id).await.unwrap();
+        assert_eq!(
+            session.title.as_deref(),
+            Some("how do I reset the router"),
+            "voice turn must derive a deterministic title without a provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_emits_contract_event_sequence_for_a_turn() {
+        // Asserts the NDJSON event sequence for a single scripted turn:
+        // state changes in order, transcript exactly once, tokens streamed,
+        // turn_complete exactly once on completion, exit stdin_eof at the end.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "seq-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let collector = EventCollector::default();
+        let input = Arc::new(ScriptedListenInput::new(["tell me a joke"]));
+        let svc = ChatService::new(agent, session_id.clone(), storage)
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_event_sink(collector.sink());
+
+        svc.run_loop().await.unwrap();
+
+        let events = collector.ndjson_events();
+
+        // The turn's states must appear in order Wait → Listen → Thinking →
+        // Speak. (After the turn the loop keeps cycling Wait/Listen while the
+        // script drains to EOF, so assert the ordered prefix, not equality.)
+        let states: Vec<WorkflowState> = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::StateChanged { state } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        let turn_states = &states[..4.min(states.len())];
+        assert_eq!(
+            turn_states,
+            [
+                WorkflowState::Wait,
+                WorkflowState::Listen,
+                WorkflowState::Thinking,
+                WorkflowState::Speak,
+            ],
+            "the turn's state transitions must be Wait→Listen→Thinking→Speak; got {states:?}"
+        );
+        // Thinking must precede Speak, and both occur exactly once for one turn.
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| **s == WorkflowState::Thinking)
+                .count(),
+            1,
+            "exactly one Thinking for one turn"
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| **s == WorkflowState::Speak)
+                .count(),
+            1,
+            "exactly one Speak for one turn"
+        );
+
+        // Exactly one transcript, carrying the confirmed utterance.
+        let transcripts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::Transcript { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transcripts, vec!["tell me a joke"], "one transcript event");
+
+        // At least one token streamed.
+        let token_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::Token { .. }))
+            .count();
+        assert!(
+            token_count >= 1,
+            "tokens must be streamed; got {token_count}"
+        );
+
+        // Exactly one turn_complete on completion.
+        let turn_complete_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TurnComplete { .. }))
+            .count();
+        assert_eq!(
+            turn_complete_count, 1,
+            "exactly one turn_complete on completion"
+        );
+
+        // Ready is NOT emitted by run_loop (the CLI emits it after model load);
+        // exit(stdin_eof) is the last contract event.
+        match events.last() {
+            Some(WorkflowEvent::Exit { reason }) => assert_eq!(reason, "stdin_eof"),
+            other => panic!("last event must be exit(stdin_eof); got {other:?}"),
+        }
+    }
+
+    /// A detector that supports interruption and interrupts immediately, to
+    /// prove the interrupt path (interruptible detector) emits ZERO
+    /// turn_complete and persists NOTHING.
+    struct AlwaysInterruptDetector;
+
+    #[async_trait::async_trait]
+    impl StreamingWakeWordDetector for AlwaysInterruptDetector {
+        async fn wait_for_activation_with_audio(
+            &self,
+        ) -> Result<crate::models::ports::wake_word::WakeWordActivation> {
+            // First call (Wait phase): return quickly so the loop enters Listen.
+            // The interrupt race then re-enters here and wins immediately.
+            Ok(crate::models::ports::wake_word::WakeWordActivation {
+                captured_audio: None,
+            })
+        }
+        fn supports_interruption(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_persists_nothing_and_emits_no_turn_complete() {
+        // With an interruptible detector that fires instantly, the in-flight
+        // turn is aborted: NO persistence, NO turn_complete. This is the
+        // exactly-once / none-on-interrupt invariant on the interrupt path.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "interrupt-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let collector = EventCollector::default();
+        // Listen returns text on the first turn, then None so the loop can end
+        // after the interrupt stashes/discards.
+        let input = Arc::new(ScriptedListenInput::new(["a long question"]));
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_wake_word_detector(Arc::new(AlwaysInterruptDetector))
+            .with_event_sink(collector.sink());
+
+        // MockAgent sleeps 300ms before streaming, so the instant wake future
+        // wins the race deterministically.
+        svc.run_loop().await.unwrap();
+
+        // Nothing persisted — the interrupted turn never committed.
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        assert!(
+            msgs.is_empty(),
+            "an interrupted turn must persist nothing; found {} messages",
+            msgs.len()
+        );
+
+        // No turn_complete emitted for the interrupted turn.
+        let turn_complete_count = collector
+            .ndjson_events()
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TurnComplete { .. }))
+            .count();
+        assert_eq!(
+            turn_complete_count, 0,
+            "an interrupted turn must NOT emit turn_complete"
+        );
     }
 }

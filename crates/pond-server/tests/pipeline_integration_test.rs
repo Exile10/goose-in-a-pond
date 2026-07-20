@@ -89,6 +89,9 @@ fn ollama_response(content: &str) -> serde_json::Value {
     })
 }
 
+// Only the `legacy-subprocess`-gated voice pipeline test builds a service via
+// this helper; gate it too so the default build has no dead-code warning.
+#[cfg(feature = "legacy-subprocess")]
 async fn make_chat_service(ollama_uri: &str, voice_out: Arc<CapturingVoiceOutput>) -> ChatService {
     let agent = Arc::new(MockAgent::new());
     let storage = Arc::new(InMemorySessionStorage::new());
@@ -106,64 +109,76 @@ async fn make_chat_service(ollama_uri: &str, voice_out: Arc<CapturingVoiceOutput
 
 /// Full text-mode loop exercising all four states:
 ///   Wait (InstantActivation) → Listen (ScriptedVoiceInput) →
-///   Think (OllamaProvider/wiremock) → Speak (CapturingVoiceOutput)
+///   Think (Agent port = MockAgent echo) → Speak (CapturingVoiceOutput)
 ///
 /// Uses `run_loop()` so the Speak state is actually reached — `chat_once()`
 /// alone does not invoke the voice output component.
+///
+/// Regression guard for the InstantActivation race: with the default
+/// InstantActivation detector, `run_loop` used to abort every turn via the
+/// interrupt race before it could complete, so voice output stayed empty. The
+/// turn must now complete and reach `speak()`.
+///
+/// Note: the Speak state consumes the `Agent` port's response, NOT the
+/// `LlmProvider`. In tests the agent is `MockAgent`, which echoes the input;
+/// the provider is only used for session-title generation. So the spoken text
+/// is the echoed utterance, not the wiremock Ollama body.
 #[tokio::test]
 async fn text_mode_listen_think_speak() {
-    let server = MockServer::start().await;
-    // Handle any number of requests (response + optional title generation)
-    Mock::given(method("POST"))
-        .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(ollama_response("Paris is the capital of France.")),
-        )
-        .mount(&server)
-        .await;
-
     let agent = Arc::new(MockAgent::new());
     let storage = Arc::new(InMemorySessionStorage::new());
     let session_id = "text-mode-test".to_string();
     storage.create_session(session_id.clone()).await.unwrap();
-    let provider = Arc::new(OllamaProvider::new(Some(&server.uri()), Some("llama3.2")));
     let output = Arc::new(CapturingVoiceOutput::default());
     let input = Arc::new(ScriptedVoiceInput::new(["What is the capital of France?"]));
 
     // InstantActivation is the default wake-word detector in ChatService::new()
     let svc = ChatService::new(agent, session_id, storage)
-        .with_provider(provider)
         .with_voice_input(input)
         .with_voice_output(output.clone());
 
     svc.run_loop().await.unwrap();
 
+    // The turn completed and the agent's (echoed) response reached the speaker.
     assert!(
-        output.spoken().iter().any(|s| s.contains("Paris")),
-        "voice output should have received the LLM response; got: {:?}",
+        output
+            .spoken()
+            .iter()
+            .any(|s| s.contains("What is the capital of France?")),
+        "voice output should have received the agent response; got: {:?}",
         output.spoken()
     );
 }
 
-/// Multi-turn text pipeline: the second call must include the first exchange
-/// in the history sent to Ollama.
+/// Multi-turn text pipeline: two `chat_once()` calls on the same session must
+/// both persist to the authoritative session store, in order.
 ///
-/// Tests `chat_once()` directly (not `run_loop()`) to inspect request bodies.
+/// Architecture note: `ChatService` routes chat turns through the `Agent` port
+/// (GooseAdapter in prod, `MockAgent` echo in tests), which owns its own
+/// conversation history. The `LlmProvider` (wiremock Ollama here) is used only
+/// for session-title generation, not for chat completion — so history is NOT
+/// sent to Ollama on chat turns. This test therefore asserts persistence into
+/// `SessionStorage` (the single source of truth the REST API reads), which is
+/// where multi-turn continuity actually lives.
 #[tokio::test]
 async fn multi_turn_history_preserved_across_chat_once_calls() {
     let server = MockServer::start().await;
-    // Respond to all requests (first turn, title generation, second turn, etc.)
+    // The provider is only hit for title generation; respond to any request.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(ollama_response("My name is Goose.")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(ollama_response("A short title.")))
         .mount(&server)
         .await;
 
-    let output = Arc::new(CapturingVoiceOutput::default());
-    let svc = make_chat_service(&server.uri(), output.clone()).await;
+    let agent = Arc::new(MockAgent::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let session_id = "multi-turn-test".to_string();
+    storage.create_session(session_id.clone()).await.unwrap();
+    let provider = Arc::new(OllamaProvider::new(Some(&server.uri()), Some("llama3.2")));
+
+    let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+        .with_provider(provider)
+        .with_voice_output(Arc::new(CapturingVoiceOutput::default()));
 
     let first = svc
         .chat_once("What is your name?".to_string())
@@ -174,37 +189,25 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
         .await
         .unwrap();
 
-    assert!(
-        first.to_lowercase().contains("goose"),
-        "first response should contain 'goose'; got: {}",
-        first
-    );
-    assert!(
-        second.to_lowercase().contains("goose"),
-        "second response should contain 'goose'; got: {}",
-        second
-    );
+    // The Agent port echoes the input.
+    assert_eq!(first, "Echo: What is your name?");
+    assert_eq!(second, "Echo: What did you say your name was?");
 
-    // Inspect the second request to confirm history was sent
-    let requests = server.received_requests().await.unwrap();
-    // Find the request that contains the second user message
-    let second_turn = requests.iter().find(|r| {
-        let body = String::from_utf8_lossy(&r.body);
-        body.contains("What did you say your name was?")
-    });
-    let body: serde_json::Value = serde_json::from_slice(&second_turn.unwrap().body).unwrap();
-
-    let contents: Vec<&str> = body["messages"]
-        .as_array()
-        .unwrap()
+    // Both turns are persisted, in order, to the authoritative session store.
+    let messages = storage.get_messages(&session_id).await.unwrap();
+    let contents: Vec<&str> = messages
         .iter()
-        .filter_map(|m| m["content"].as_str())
+        .map(|m| m.message.content.as_str())
         .collect();
-
-    assert!(
-        contents.iter().any(|c| c.contains("What is your name?")),
-        "first user turn must appear in second request history; messages: {:?}",
-        contents
+    assert_eq!(
+        contents,
+        vec![
+            "What is your name?",
+            "Echo: What is your name?",
+            "What did you say your name was?",
+            "Echo: What did you say your name was?",
+        ],
+        "both turns must persist to session storage in order; got: {contents:?}"
     );
 }
 

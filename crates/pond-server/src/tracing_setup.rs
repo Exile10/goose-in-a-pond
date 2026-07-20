@@ -172,6 +172,24 @@ impl LogDrainHandle {
 /// The returned [`LogDrainHandle`] must be kept alive; call
 /// [`drain_into`](LogDrainHandle::drain_into) once the database pool is ready.
 pub fn init_tracing(debug: bool, data_dir: &Path) -> LogDrainHandle {
+    init_tracing_with_console(debug, data_dir, ConsoleSink::Stdout)
+}
+
+/// Where the human-readable console log layer writes.
+///
+/// `pond-server chat --json-events` uses `Stderr` so stdout carries NOTHING
+/// but the NDJSON contract lines; every other command keeps `Stdout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleSink {
+    Stdout,
+    Stderr,
+}
+
+pub fn init_tracing_with_console(
+    debug: bool,
+    data_dir: &Path,
+    console: ConsoleSink,
+) -> LogDrainHandle {
     let filter_str = if debug {
         "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn"
     } else {
@@ -190,9 +208,20 @@ pub fn init_tracing(debug: bool, data_dir: &Path) -> LogDrainHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let db_layer = EventLogLayer { tx }.with_filter(TraceFilter);
 
+    // Route the console fmt layer to stdout or stderr. In `--json-events` mode
+    // stdout is reserved for NDJSON, so diagnostics go to stderr.
+    let console_layer = match console {
+        ConsoleSink::Stdout => tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout as fn() -> std::io::Stdout)
+            .boxed(),
+        ConsoleSink::Stderr => tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr as fn() -> std::io::Stderr)
+            .boxed(),
+    };
+
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(console_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking_file)

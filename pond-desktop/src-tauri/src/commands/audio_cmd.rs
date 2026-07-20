@@ -101,9 +101,7 @@ pub async fn start_recording(
 
 /// Stop recording. Waits for the capture thread to drain, then returns WAV bytes.
 #[tauri::command]
-pub async fn stop_recording(
-    audio_state: State<'_, AudioState>,
-) -> Result<Vec<u8>, String> {
+pub async fn stop_recording(audio_state: State<'_, AudioState>) -> Result<Vec<u8>, String> {
     // Run blocking stop on a thread pool so we don't block the Tauri async runtime
     let samples = audio_state.samples.clone();
     let is_recording = audio_state.is_recording.clone();
@@ -181,7 +179,14 @@ pub async fn record_with_vad(
     session_id: Option<String>,
     server: State<'_, ServerProcess>,
     speculative_llm: State<'_, SpeculativeLlmSlot>,
+    voice: State<'_, crate::chat_process::VoiceChatProcess>,
 ) -> Result<VadRecording, String> {
+    // A terminal-voice child owns the mic exclusively while it is active —
+    // refuse to open a second capture stream that would fight it for the device.
+    if voice.is_active() {
+        return Err("voice session active".to_string());
+    }
+
     let base_url = server.get_url();
 
     // Build the on_asr_ready callback that fires the LLM as soon as the
@@ -200,13 +205,14 @@ pub async fn record_with_vad(
         let sid = sid.clone();
         rt.spawn(async move {
             let client = reqwest::Client::new();
-            let mut req = client
-                .post(format!("{}/api/v1/chat/stream", bu))
-                .json(&serde_json::json!({
-                    "message": text,
-                    "session_id": sid,
-                    "voice_mode": true,
-                }));
+            let mut req =
+                client
+                    .post(format!("{}/api/v1/chat/stream", bu))
+                    .json(&serde_json::json!({
+                        "message": text,
+                        "session_id": sid,
+                        "voice_mode": true,
+                    }));
             if !at.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", at));
             }
@@ -215,7 +221,11 @@ pub async fn record_with_vad(
                 Ok(response) => {
                     tracing::debug!("Q2-26: speculative LLM request sent for {:?}", text);
                     let mut guard = slot.lock().await;
-                    *guard = Some(SpeculativeLlmEntry { transcript: text, response, fired_at });
+                    *guard = Some(SpeculativeLlmEntry {
+                        transcript: text,
+                        response,
+                        fired_at,
+                    });
                 }
                 Err(e) => tracing::warn!("Q2-26: speculative LLM fetch failed: {e}"),
             }
@@ -225,9 +235,9 @@ pub async fn record_with_vad(
     tokio::task::spawn_blocking(move || {
         audio::record_with_vad(
             &app,
-            10,   // max 10s waiting for speech to start
-            30,   // hard cap on total recording
-            400,  // end-of-speech silence threshold (ms)
+            10,  // max 10s waiting for speech to start
+            30,  // hard cap on total recording
+            400, // end-of-speech silence threshold (ms)
             &base_url,
             &auth_token,
             Some(on_asr_ready),
@@ -264,9 +274,11 @@ pub async fn play_ping() -> Result<(), String> {
             rodio::buffer::SamplesBuffer::new(1, rate, data)
         };
 
-        sink.append(tone(1047.0, 100).mix(
-            rodio::source::Zero::<f32>::new(1, rate).take_duration(Duration::from_millis(0)),
-        ));
+        sink.append(
+            tone(1047.0, 100).mix(
+                rodio::source::Zero::<f32>::new(1, rate).take_duration(Duration::from_millis(0)),
+            ),
+        );
         sink.append(tone(1319.0, 120));
         sink.sleep_until_end();
         Ok::<_, String>(())
@@ -297,14 +309,19 @@ pub async fn start_wake_listener(
     let base_url = server.get_url();
     let variants = variants.unwrap_or_default();
     let pipeline_active = pipeline_flag.0.clone();
-    audio::start_wake_listener(&wake_state, wake_word, variants, base_url, app, pipeline_active)
+    audio::start_wake_listener(
+        &wake_state,
+        wake_word,
+        variants,
+        base_url,
+        app,
+        pipeline_active,
+    )
 }
 
 /// Stop the passive wake-word listening loop.
 #[tauri::command]
-pub async fn stop_wake_listener(
-    wake_state: State<'_, WakeListenerState>,
-) -> Result<(), String> {
+pub async fn stop_wake_listener(wake_state: State<'_, WakeListenerState>) -> Result<(), String> {
     audio::stop_wake_listener(&wake_state);
     Ok(())
 }
@@ -329,6 +346,9 @@ pub async fn stop_wake_listener(
 ///   `tts-start`
 ///   `tts-end`
 ///   `pipeline-error`  — string
+// A Tauri command's parameters are each an injected argument (states + DTO
+// fields), so the arity is inherent to the command surface, not a smell.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn run_voice_pipeline(
     app: AppHandle,
@@ -342,8 +362,15 @@ pub async fn run_voice_pipeline(
     kill_switch: State<'_, AudioKillSwitch>,
     pipeline_flag: State<'_, PipelineActive>,
     speculative_llm: State<'_, SpeculativeLlmSlot>,
+    voice: State<'_, crate::chat_process::VoiceChatProcess>,
 ) -> Result<(), String> {
     use crate::tts_text;
+
+    // A terminal-voice child owns the mic and speaker exclusively while active —
+    // do not run the HTTP transcribe → chat → TTS pipeline in parallel with it.
+    if voice.is_active() {
+        return Err("voice session active".to_string());
+    }
 
     // Reset kill switch at the start of each pipeline run.
     kill_switch.0.store(false, Ordering::Relaxed);
@@ -355,7 +382,9 @@ pub async fn run_voice_pipeline(
     // RAII guard — clears the flag on all exit paths (Ok, Err, panic).
     struct PipelineGuard(Arc<AtomicBool>);
     impl Drop for PipelineGuard {
-        fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
     }
     let _pipeline_guard = PipelineGuard(pipeline_flag.0.clone());
 
@@ -385,14 +414,11 @@ pub async fn run_voice_pipeline(
             transcribe_req = transcribe_req.header("Authorization", auth.as_str());
         }
 
-        let transcript_res = transcribe_req
-            .send()
-            .await
-            .map_err(|e| {
-                let msg = format!("Transcribe request failed: {e}");
-                let _ = app.emit("pipeline-error", &msg);
-                msg
-            })?;
+        let transcript_res = transcribe_req.send().await.map_err(|e| {
+            let msg = format!("Transcribe request failed: {e}");
+            let _ = app.emit("pipeline-error", &msg);
+            msg
+        })?;
 
         if !transcript_res.status().is_success() {
             let msg = format!("Transcribe error: {}", transcript_res.status());
@@ -410,20 +436,37 @@ pub async fn run_voice_pipeline(
     // ── Strip Whisper artifacts (matching CLI's false-positive curbing) ──
     let transcript = tts_text::strip_whisper_artifacts(&raw_transcript);
     if transcript.is_empty() {
-        tracing::debug!("Pipeline: artifact-only transcript stripped: {:?}", raw_transcript);
+        tracing::debug!(
+            "Pipeline: artifact-only transcript stripped: {:?}",
+            raw_transcript
+        );
         let _ = app.emit("tts-end", ());
         return Ok(());
     }
 
-    let _ = app.emit("transcript", TranscriptResult { text: transcript.clone() });
+    let _ = app.emit(
+        "transcript",
+        TranscriptResult {
+            text: transcript.clone(),
+        },
+    );
 
     // ── Dismissal / farewell handling (matching CLI's "bye" / "exit") ────
     if let Some((farewell, is_exit)) = tts_text::check_dismissal(&transcript) {
-        let _ = app.emit("transcript", TranscriptResult { text: farewell.to_string() });
+        let _ = app.emit(
+            "transcript",
+            TranscriptResult {
+                text: farewell.to_string(),
+            },
+        );
         // Speak the farewell via TTS (interruptible — wake word can still barge in)
         match fetch_tts_bytes(&client, &base_url, farewell).await {
-            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, kill_flag.clone()).await; }
-            Err(e)    => { tracing::debug!("Farewell TTS skipped: {e}"); }
+            Ok(bytes) => {
+                let _ = play_wav_bytes_interruptible(bytes, kill_flag.clone()).await;
+            }
+            Err(e) => {
+                tracing::debug!("Farewell TTS skipped: {e}");
+            }
         }
         let _ = app.emit("tts-end", ());
         // Emit a special event so VoiceMode knows to reset to wake word
@@ -432,14 +475,18 @@ pub async fn run_voice_pipeline(
     }
 
     // ── 2. Quip — fills silence during LLM inference (after transcription) ──
-    let quip_text   = pick_quip();
+    let quip_text = pick_quip();
     let quip_client = client.clone();
-    let quip_url    = base_url.clone();
-    let quip_kill   = kill_flag.clone();
+    let quip_url = base_url.clone();
+    let quip_kill = kill_flag.clone();
     let quip_handle = tokio::spawn(async move {
         match fetch_tts_bytes(&quip_client, &quip_url, quip_text).await {
-            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, quip_kill).await; }
-            Err(e)    => { tracing::debug!("Quip TTS skipped: {e}"); }
+            Ok(bytes) => {
+                let _ = play_wav_bytes_interruptible(bytes, quip_kill).await;
+            }
+            Err(e) => {
+                tracing::debug!("Quip TTS skipped: {e}");
+            }
         }
     });
 
@@ -489,13 +536,17 @@ pub async fn run_voice_pipeline(
     // A subtle rhythmic pulse that fills the silence between the quip and the
     // first real sentence. Stopped via an atomic flag when TTS starts.
     let thinking_active = std::sync::Arc::new(AtomicBool::new(true));
-    let thinking_flag   = thinking_active.clone();
-    let tone_kill       = kill_flag.clone();
-    let thinking_tone   = tokio::task::spawn_blocking(move || {
+    let thinking_flag = thinking_active.clone();
+    let tone_kill = kill_flag.clone();
+    let thinking_tone = tokio::task::spawn_blocking(move || {
         use rodio::{OutputStream, Sink};
 
-        let Ok((_stream, handle)) = OutputStream::try_default() else { return };
-        let Ok(sink) = Sink::try_new(&handle) else { return };
+        let Ok((_stream, handle)) = OutputStream::try_default() else {
+            return;
+        };
+        let Ok(sink) = Sink::try_new(&handle) else {
+            return;
+        };
         sink.set_volume(0.08); // very quiet — ambient, not distracting
 
         // Generate a soft 1-second pulse: gentle sine fade-in/out at 440 Hz
@@ -528,10 +579,10 @@ pub async fn run_voice_pipeline(
     // On first sentence: stops the thinking tone, drains the quip, then speaks.
     let (tts_tx, mut tts_rx) = tokio::sync::mpsc::channel::<String>(16);
     let tts_client = client.clone();
-    let tts_url    = base_url.clone();
-    let tts_app    = app.clone();
-    let tts_kill   = kill_flag.clone();
-    let tts_task   = tokio::spawn(async move {
+    let tts_url = base_url.clone();
+    let tts_app = app.clone();
+    let tts_kill = kill_flag.clone();
+    let tts_task = tokio::spawn(async move {
         let mut quip_done = false;
         let mut quip = Some(quip_handle);
 
@@ -539,7 +590,9 @@ pub async fn run_voice_pipeline(
             // Kill switch — stop all audio immediately (wake word barge-in)
             if tts_kill.load(Ordering::Relaxed) {
                 thinking_active.store(false, Ordering::Relaxed);
-                if let Some(h) = quip.take() { h.abort(); }
+                if let Some(h) = quip.take() {
+                    h.abort();
+                }
                 break;
             }
 
@@ -553,8 +606,12 @@ pub async fn run_voice_pipeline(
                 let _ = tts_app.emit("tts-start", ());
             }
             match fetch_tts_bytes(&tts_client, &tts_url, &text).await {
-                Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, tts_kill.clone()).await; }
-                Err(e)    => { tracing::warn!("Sentence TTS failed: {e}"); }
+                Ok(bytes) => {
+                    let _ = play_wav_bytes_interruptible(bytes, tts_kill.clone()).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Sentence TTS failed: {e}");
+                }
             }
         }
 
@@ -568,8 +625,8 @@ pub async fn run_voice_pipeline(
     });
 
     // ── SSE parsing — extract text for TTS while emitting events to UI ──────
-    let mut sentence_buf    = String::new();
-    let mut thought_filter  = crate::thought_filter::ThoughtFilter::new();
+    let mut sentence_buf = String::new();
+    let mut thought_filter = crate::thought_filter::ThoughtFilter::new();
     // Line buffer for cross-chunk SSE lines — HTTP chunked transfer can split
     // at any byte boundary, so a partial JSON line at the end of one chunk must
     // be joined with the start of the next chunk.
@@ -585,9 +642,16 @@ pub async fn run_voice_pipeline(
             tracing::info!(
                 "[Q2-26 TTFT] {}ms ({})",
                 ttft_ms,
-                if used_speculative { "speculative" } else { "fresh" }
+                if used_speculative {
+                    "speculative"
+                } else {
+                    "fresh"
+                }
             );
-            let _ = app.emit("ttft", serde_json::json!({ "ms": ttft_ms, "speculative": used_speculative }));
+            let _ = app.emit(
+                "ttft",
+                serde_json::json!({ "ms": ttft_ms, "speculative": used_speculative }),
+            );
             ttft_logged = true;
         }
         line_buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -598,13 +662,19 @@ pub async fn run_voice_pipeline(
             line_buf = line_buf[newline_pos + 1..].to_string();
 
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // Forward every SSE line to the frontend for transcript/card display.
             dispatch_sse_event(&app, line);
 
-            let Some(data) = line.strip_prefix("data: ") else { continue };
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
 
             // ��─ Tool call → flush buffer, speak announcement ────────────
             if val.get("type").and_then(|t| t.as_str()) == Some("tool_call") {
@@ -616,16 +686,23 @@ pub async fn run_voice_pipeline(
                         let _ = tts_tx.send(spoken).await;
                     }
                 }
-                let tool = val.get("tool").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let tool = val
+                    .get("tool")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
                 let _ = tts_tx.send(tts_text::tool_announcement(tool)).await;
                 continue;
             }
 
             // ── Text token → filter + buffer + split sentences ──────────
             let content = if val.get("type").and_then(|t| t.as_str()) == Some("text") {
-                val.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
+                val.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
             } else {
-                val.get("token").and_then(|t| t.as_str()).map(|s| s.to_string())
+                val.get("token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             };
 
             if let Some(content) = content {
@@ -654,9 +731,13 @@ pub async fn run_voice_pipeline(
         if let Some(data) = trailing.strip_prefix("data: ") {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                 let content = if val.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    val.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
+                    val.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
                 } else {
-                    val.get("token").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    val.get("token")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 };
                 if let Some(content) = content {
                     let visible = thought_filter.push(&content);
@@ -715,7 +796,10 @@ async fn fetch_tts_bytes(
         return Err(format!("TTS server error: {}", res.status()));
     }
 
-    res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 /// Play WAV bytes through the system audio output via rodio.

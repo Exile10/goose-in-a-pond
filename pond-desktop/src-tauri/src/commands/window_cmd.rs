@@ -61,7 +61,10 @@ pub async fn position_canvas(app: AppHandle, position: String) -> Result<(), Str
     let scale = monitor.scale_factor();
 
     let (x, y) = match position.as_str() {
-        "left" => (20.0, (screen_size.height as f64 / scale - win_size.height as f64 / scale) / 2.0),
+        "left" => (
+            20.0,
+            (screen_size.height as f64 / scale - win_size.height as f64 / scale) / 2.0,
+        ),
         "center" => (
             (screen_size.width as f64 / scale - win_size.width as f64 / scale) / 2.0,
             (screen_size.height as f64 / scale - win_size.height as f64 / scale) / 2.0,

@@ -25,6 +25,26 @@ impl VoiceOutput for PrintOutput {
     }
 }
 
+/// VoiceOutput that discards all output. Used when the response is surfaced by
+/// another channel and stdout must stay clean — e.g. `pond-server chat
+/// --json-events`, where the assistant text is streamed as NDJSON `token`
+/// events and stdout carries NOTHING but the JSON contract lines. Also handy
+/// for headless runs and tests that assert on the event sink, not on TTS.
+pub struct SilentOutput;
+
+impl Default for SilentOutput {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl VoiceOutput for SilentOutput {
+    async fn speak(&self, _text: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +60,13 @@ mod tests {
     async fn print_output_compiles_as_voice_output() {
         // Verify it type-checks as Arc<dyn VoiceOutput>
         let _out: Arc<dyn VoiceOutput> = Arc::new(PrintOutput);
+    }
+
+    #[tokio::test]
+    async fn silent_output_speaks_nothing() {
+        let out = SilentOutput;
+        // speak() must succeed and write nothing to stdout.
+        assert!(out.speak("this must not print").await.is_ok());
+        let _out: Arc<dyn VoiceOutput> = Arc::new(SilentOutput);
     }
 }
