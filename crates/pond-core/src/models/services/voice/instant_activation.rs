@@ -28,6 +28,15 @@ impl StreamingWakeWordDetector for InstantActivation {
     fn activation_prompt(&self) -> &str {
         "Type your message"
     }
+
+    /// `InstantActivation` resolves immediately, so it must NOT participate in
+    /// `run_loop`'s interrupt race — otherwise the wake future would win before
+    /// any turn completes and every turn would be aborted. Returning `false`
+    /// makes `run_loop` await the turn directly in stdin / `--no-wake-word` /
+    /// whisper-load-failure fallback modes.
+    fn supports_interruption(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -40,6 +49,15 @@ mod tests {
         let detector = InstantActivation;
         let activation = detector.wait_for_activation_with_audio().await.unwrap();
         assert!(activation.captured_audio.is_none());
+    }
+
+    #[test]
+    fn instant_activation_does_not_support_interruption() {
+        // Critical: InstantActivation resolves instantly, so run_loop must not
+        // race turns against it. Guards the class of bug where every turn is
+        // aborted before it can complete in stdin / --no-wake-word mode.
+        let detector = InstantActivation;
+        assert!(!detector.supports_interruption());
     }
 
     #[tokio::test]

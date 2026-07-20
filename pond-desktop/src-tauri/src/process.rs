@@ -24,10 +24,7 @@ impl ServerProcess {
         // the WebView talks to the same instance, instead of falling back to
         // 4000 and racing the parent for the port.
         let (url, parent_managed) = match std::env::var("GIAP_SERVER_PORT") {
-            Ok(port) if !port.is_empty() => (
-                format!("http://127.0.0.1:{}", port),
-                true,
-            ),
+            Ok(port) if !port.is_empty() => (format!("http://127.0.0.1:{}", port), true),
             _ => ("http://127.0.0.1:4000".to_string(), false),
         };
         Self {
@@ -41,10 +38,7 @@ impl ServerProcess {
     /// Try to connect to a running pond-server; if none is found, spawn the
     /// bundled binary from the app's resource directory.
     #[allow(dead_code)]
-    pub async fn connect_or_spawn(
-        &self,
-        resource_dir: &std::path::Path,
-    ) -> Result<String, String> {
+    pub async fn connect_or_spawn(&self, resource_dir: &std::path::Path) -> Result<String, String> {
         self.ensure_running(resource_dir).await
     }
 
@@ -183,7 +177,7 @@ impl Default for ServerProcess {
     }
 }
 
-fn server_binary_name() -> &'static str {
+pub(crate) fn server_binary_name() -> &'static str {
     if cfg!(windows) {
         "pond-server.exe"
     } else {
@@ -191,8 +185,13 @@ fn server_binary_name() -> &'static str {
     }
 }
 
-fn resolve_binary_path(resource_dir: &std::path::Path, binary_name: &str) -> Option<std::path::PathBuf> {
-    // Optional override for local debugging and tests.
+pub(crate) fn resolve_binary_path(
+    resource_dir: &std::path::Path,
+    binary_name: &str,
+) -> Option<std::path::PathBuf> {
+    // Optional override for local debugging and tests. Highest priority so the
+    // dev flow (POND_SERVER_BIN pointing at target/release/pond-server) keeps
+    // working even inside a packaged app.
     if let Ok(override_path) = std::env::var("POND_SERVER_BIN") {
         let path = std::path::PathBuf::from(override_path);
         if path.exists() {
@@ -200,9 +199,30 @@ fn resolve_binary_path(resource_dir: &std::path::Path, binary_name: &str) -> Opt
         }
     }
 
+    // Bundled sidecar (Tauri 2 externalBin). The macOS bundler copies the
+    // sidecar into Contents/MacOS/ next to the main executable and strips the
+    // target-triple suffix, so it lives as a *sibling* of our own binary
+    // (e.g. `<App>.app/Contents/MacOS/pond-server`). Probe there first — before
+    // the dev/workspace fallbacks below — so a packaged app never falls back to
+    // a stray `binaries/` folder in the cwd. In `tauri dev` nothing is placed
+    // next to the dev executable, so this candidate simply does not exist and
+    // resolution falls through cleanly.
+    if let Some(sidecar) = current_exe_sibling(binary_name) {
+        return Some(sidecar);
+    }
+
     candidate_binary_paths(resource_dir, binary_name)
         .into_iter()
         .find(|p| p.exists())
+}
+
+/// Path to a binary sitting next to the currently-running executable, if it
+/// exists. Used to locate the Tauri-bundled `pond-server` sidecar, which the
+/// macOS bundler places in `Contents/MacOS/` alongside the main app binary.
+fn current_exe_sibling(binary_name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join(binary_name);
+    candidate.exists().then_some(candidate)
 }
 
 fn candidate_binary_paths(
@@ -218,7 +238,13 @@ fn candidate_binary_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_binary_paths, resolve_binary_path};
+    use super::{candidate_binary_paths, current_exe_sibling, resolve_binary_path};
+
+    /// These tests mutate the process-global `POND_SERVER_BIN` env var, which is
+    /// not safe to interleave with other tests reading it. Rust runs tests in a
+    /// module concurrently by default, so serialize the env-touching ones behind
+    /// a single mutex to keep them hermetic.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn candidate_paths_include_bundle_dev_and_cwd_locations() {
@@ -226,7 +252,10 @@ mod tests {
         let paths = candidate_binary_paths(&resource_dir, "pond-server");
 
         assert_eq!(paths.len(), 3);
-        assert_eq!(paths[0], std::path::PathBuf::from("/tmp/resources/pond-server"));
+        assert_eq!(
+            paths[0],
+            std::path::PathBuf::from("/tmp/resources/pond-server")
+        );
         assert_eq!(
             paths[1],
             std::path::PathBuf::from("/tmp/resources/../binaries/pond-server")
@@ -236,19 +265,76 @@ mod tests {
 
     #[test]
     fn resolve_binary_path_uses_override_when_present() {
-        let test_bin = std::env::temp_dir().join(format!(
-            "pond-server-test-{}",
-            std::process::id()
-        ));
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let test_bin =
+            std::env::temp_dir().join(format!("pond-server-test-{}", std::process::id()));
         std::fs::write(&test_bin, b"#!/bin/sh\n").expect("should write temp binary");
 
         std::env::set_var("POND_SERVER_BIN", &test_bin);
 
-        let resolved = resolve_binary_path(std::path::Path::new("/definitely/missing"), "pond-server");
+        let resolved =
+            resolve_binary_path(std::path::Path::new("/definitely/missing"), "pond-server");
 
         std::env::remove_var("POND_SERVER_BIN");
         std::fs::remove_file(&test_bin).expect("should remove temp binary");
 
         assert_eq!(resolved, Some(test_bin));
+    }
+
+    /// The bundled sidecar sits next to the running executable. Prove the helper
+    /// resolves it by dropping a file next to `current_exe()` and asserting it is
+    /// found. Uses a unique name so it never collides with a real binary or a
+    /// concurrent test run sharing the same target/ directory.
+    #[test]
+    fn current_exe_sibling_resolves_bundled_sidecar() {
+        let exe = std::env::current_exe().expect("current_exe should be available in tests");
+        let dir = exe.parent().expect("exe should have a parent dir");
+
+        let name = format!("pond-server-sidecar-probe-{}", std::process::id());
+        let sidecar = dir.join(&name);
+        std::fs::write(&sidecar, b"#!/bin/sh\n").expect("should write sibling probe");
+
+        let resolved = current_exe_sibling(&name);
+
+        std::fs::remove_file(&sidecar).expect("should remove sibling probe");
+
+        assert_eq!(resolved, Some(sidecar));
+    }
+
+    /// Absent a sibling, the helper returns None so resolution falls through to
+    /// the dev/workspace fallbacks (the `tauri dev` case).
+    #[test]
+    fn current_exe_sibling_returns_none_when_absent() {
+        let missing = format!("pond-server-absent-{}", std::process::id());
+        assert_eq!(current_exe_sibling(&missing), None);
+    }
+
+    /// Precedence: the POND_SERVER_BIN override must win even when a bundled
+    /// sidecar exists next to the current executable, so the dev flow is never
+    /// shadowed by a stray sibling binary.
+    #[test]
+    fn override_takes_precedence_over_current_exe_sibling() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let exe = std::env::current_exe().expect("current_exe should be available in tests");
+        let dir = exe.parent().expect("exe should have a parent dir");
+
+        let name = format!("pond-server-precedence-{}", std::process::id());
+        let sidecar = dir.join(&name);
+        std::fs::write(&sidecar, b"#!/bin/sh\n").expect("should write sibling probe");
+
+        let override_bin =
+            std::env::temp_dir().join(format!("pond-server-override-{}", std::process::id()));
+        std::fs::write(&override_bin, b"#!/bin/sh\n").expect("should write override binary");
+        std::env::set_var("POND_SERVER_BIN", &override_bin);
+
+        let resolved = resolve_binary_path(std::path::Path::new("/definitely/missing"), &name);
+
+        std::env::remove_var("POND_SERVER_BIN");
+        std::fs::remove_file(&sidecar).expect("should remove sibling probe");
+        std::fs::remove_file(&override_bin).expect("should remove override binary");
+
+        assert_eq!(resolved, Some(override_bin));
     }
 }

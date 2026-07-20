@@ -241,8 +241,28 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     // recording-started: no-op (callers set their own state)
     // recording-aborted: VoiceMode handles state transition itself
 
+    // ── Per-turn pipeline events (legacy HTTP path) ──────────────────────────
+    // EVENT OWNERSHIP NOTE: these listeners handle the OLD per-turn HTTP
+    // pipeline events emitted by audio_cmd.rs / canvas_feed.rs in the Tauri
+    // shell (transcript, response-token, tool-result, tts-start, tts-end).
+    //
+    // DOUBLE-DISPATCH FIX: AppContext is the SOLE owner of these legacy events.
+    // TauriVoiceBackend ALSO registered listeners for the same events, creating
+    // a verified double-dispatch bug (every event caused two reducer dispatches,
+    // corrupting the role guard at reducer.ts:201). TauriVoiceBackend's duplicate
+    // listeners have been removed from this registration path; it now only
+    // registers audio-level, wake-word-detected, wake-word-interrupt, and
+    // voice-dismissed (events it uniquely owns through its callback interface).
+    //
+    // The NEW voice-* events (voice-ready, voice-state, voice-transcript,
+    // voice-token, voice-tool-call, voice-tool-result, voice-done, voice-error,
+    // voice-session-ended) are the EXCLUSIVE domain of useVoiceSession and
+    // are NEVER registered here. They come from a completely separate Rust
+    // code path (chat_process.rs NDJSON reader) and never fire alongside the
+    // legacy per-turn events — so there is no cross-talk between the two paths.
+
     // Transcript (user text after ASR)
-    // Rust emits TranscriptResult { text: String } → payload is { text: "..." }
+    // Rust emits TranscriptResult { text: String } -> payload is { text: "..." }
     listen<{ text: string }>("transcript", (e) => {
       const msg: TranscriptMessage = {
         id: nextTranscriptId(),
@@ -282,7 +302,8 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       },
     ).then((u) => unlisten.push(u));
 
-    // TTS playback
+    // TTS playback (legacy per-turn pipeline only — NOT emitted by the child
+    // process path; the child signals state via voice-state events instead)
     listen("tts-start", () => {
       dispatch({ type: "SET_VOICE_STATE", payload: "speaking" });
     }).then((u) => unlisten.push(u));

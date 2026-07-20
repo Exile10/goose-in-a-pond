@@ -10,7 +10,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "stage:server": "bash ../scripts/stage-server-sidecar.sh",
+    "bundle:app": "npm run stage:server && npm run tauri build"
   },
   "dependencies": {
     "@fontsource-variable/comfortaa": "^5.2.8",

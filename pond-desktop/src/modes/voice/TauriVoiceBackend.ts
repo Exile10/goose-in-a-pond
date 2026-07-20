@@ -5,6 +5,28 @@
 // All microphone capture, ASR, LLM streaming, TTS playback, and
 // wake word detection run in the Rust sidecar; this class bridges
 // the event channel to the VoiceBackend callback interface.
+//
+// EVENT OWNERSHIP NOTE (double-dispatch fix):
+//   AppContext.tsx is the SOLE owner of the legacy per-turn pipeline
+//   events: transcript, response-token, tool-result, tts-start, tts-end.
+//   TauriVoiceBackend used to also register listeners for those same
+//   events, causing every event to dispatch into the reducer twice —
+//   a verified bug that corrupted the role guard at reducer.ts:201.
+//
+//   This class now registers ONLY the events it uniquely owns via its
+//   callback interface:
+//     - audio-level  (onAudioLevel)
+//     - wake-word-detected  (onWakeDetected)
+//     - wake-word-interrupt  (onWakeInterrupt)
+//     - voice-dismissed  (onDismissed)
+//     - pipeline-error  (onError — still registered here so callers
+//       can handle errors through the backend interface; AppContext
+//       also listens to pipeline-error for Canvas mode compatibility)
+//
+//   The NEW voice-* events (voice-ready, voice-state, voice-transcript,
+//   voice-token, voice-tool-call, voice-tool-result, voice-done,
+//   voice-error, voice-session-ended) are the EXCLUSIVE domain of
+//   useVoiceSession.  This class never registers any voice-* listener.
 // ────────────────────────────────────────────────────────────
 
 import { invoke } from "@tauri-apps/api/core";
@@ -18,21 +40,6 @@ import type {
 } from "./VoiceBackend";
 
 /** Tauri event payload types (mirrors Rust-side structs). */
-interface ResponseTokenPayload {
-  token: string;
-  done: boolean;
-  session_id?: string;
-}
-
-interface TranscriptPayload {
-  text: string;
-}
-
-interface ToolResultPayload {
-  tool: string;
-  data?: Record<string, unknown>;
-}
-
 interface PipelineErrorPayload {
   message?: string;
 }
@@ -68,50 +75,22 @@ export class TauriVoiceBackend implements VoiceBackend {
   }
 
   // ── Tauri event registration ──────────────────────────────
+  //
+  // ONLY events exclusively owned by TauriVoiceBackend are registered here.
+  // See the EVENT OWNERSHIP NOTE at the top of this file.
 
   private registerListeners(): void {
+    // audio-level: emitted by audio.rs during VAD recording
     this.unlisteners.push(
       listen<number>("audio-level", (e) => {
         this.onAudioLevel?.(e.payload);
       }),
     );
 
-    this.unlisteners.push(
-      listen<TranscriptPayload>("transcript", (e) => {
-        this.onTranscript?.(e.payload.text);
-      }),
-    );
-
-    this.unlisteners.push(
-      listen<ResponseTokenPayload>("response-token", (e) => {
-        this.onAgentToken?.(e.payload.token, e.payload.done);
-        if (e.payload.done && e.payload.session_id) {
-          this.onSessionId?.(e.payload.session_id);
-        }
-      }),
-    );
-
-    this.unlisteners.push(
-      listen<ToolResultPayload>("tool-result", (e) => {
-        this.onToolCall?.({
-          tool: e.payload.tool,
-          data: e.payload.data ?? {},
-        });
-      }),
-    );
-
-    this.unlisteners.push(
-      listen("tts-start", () => {
-        this.onStateChange?.("speaking");
-      }),
-    );
-
-    this.unlisteners.push(
-      listen("tts-end", () => {
-        this.onStateChange?.("idle");
-      }),
-    );
-
+    // pipeline-error: emitted by audio_cmd.rs on pipeline failure.
+    // Also listened to by AppContext for Canvas mode; both registrations
+    // are intentional — the callback interface notifies the orchestration
+    // hook, while AppContext surfaces the error to the global state.
     this.unlisteners.push(
       listen<string | PipelineErrorPayload>("pipeline-error", (e) => {
         const msg =
@@ -122,6 +101,7 @@ export class TauriVoiceBackend implements VoiceBackend {
       }),
     );
 
+    // wake-word-detected: emitted by audio.rs with the captured WAV bytes
     this.unlisteners.push(
       listen<number[]>("wake-word-detected", (e) => {
         const bytes = new Uint8Array(e.payload);
@@ -129,12 +109,14 @@ export class TauriVoiceBackend implements VoiceBackend {
       }),
     );
 
+    // wake-word-interrupt: barge-in detected during active pipeline
     this.unlisteners.push(
       listen("wake-word-interrupt", () => {
         this.onWakeInterrupt?.();
       }),
     );
 
+    // voice-dismissed: farewell phrase or explicit dismissal from Rust
     this.unlisteners.push(
       listen<boolean>("voice-dismissed", (e) => {
         this.onDismissed?.(e.payload);

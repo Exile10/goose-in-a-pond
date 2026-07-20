@@ -1,19 +1,28 @@
 // ────────────────────────────────────────────────────────────
 // VoiceMode — Pure UI component
 //
-// Zero backend logic. Orb-centric layout: large VoiceOrb as the
-// visual hero, state label below it, live caption for last turn,
-// scrollable full transcript, state-appropriate action buttons.
-// All logic in useVoicePipeline.
+// In Tauri: drives the persistent child-process voice session via
+// useVoiceSession. Entering voice mode starts the session; leaving
+// stops it. The orb, transcript, and context cards are all fed by
+// the voice-* Tauri events owned by useVoiceSession.
+//
+// In a plain browser: falls back to the existing per-turn HTTP
+// pipeline via useVoicePipeline (WebVoiceBackend). The browser path
+// is intentionally preserved and unchanged.
+//
+// Zero backend logic lives here — it delegates entirely to the
+// appropriate hook for the runtime.
 // ────────────────────────────────────────────────────────────
 
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { Button } from "@heroui/react";
-import { ChevronLeft, Mic, Square, Trash2 } from "lucide-react";
+import { ChevronLeft, Mic, Square, Trash2, Radio } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
 import { TranscriptFeed } from "../../components/TranscriptFeed";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { useVoicePipeline } from "./useVoicePipeline";
+import { useVoiceSession } from "./useVoiceSession";
+import { isTauriEnv } from "./VoiceBackend";
 
 // ── CountdownRing (inline SVG) ─────────────────────────────
 
@@ -40,7 +49,7 @@ function CountdownRing({ seconds, maxSeconds }: { seconds: number; maxSeconds: n
   );
 }
 
-// ── State labels & colors ──────────────────────────────────
+// ── State labels and colors ────────────────────────────────
 
 const STATE_LABELS: Record<string, string> = {
   idle:      "Tap to talk",
@@ -49,6 +58,7 @@ const STATE_LABELS: Record<string, string> = {
   thinking:  "Thinking…",
   speaking:  "Speaking…",
   error:     "Error",
+  // connecting is a VoiceMode-local transient label, not a VoiceState
 };
 
 const STATE_COLORS: Record<string, string> = {
@@ -58,11 +68,147 @@ const STATE_COLORS: Record<string, string> = {
   thinking:  "#FF9500",
   speaking:  "#34C759",
   error:     "#FF3B30",
+  connecting: "#8E8E93",
 };
 
-// ── Component ──────────────────────────────────────────────
+// ── VoiceMode (Tauri child-process path) ──────────────────
 
-export function VoiceMode() {
+function VoiceModeChildProcess() {
+  const state = useAppState();
+  const dispatch = useAppDispatch();
+  const session = useVoiceSession();
+
+  const { voiceState } = state;
+  const isConnecting = session.connecting;
+  const isError     = voiceState === "error";
+  const serverDown  = !state.serverOnline;
+
+  // Start the session on mount; stop it on unmount.
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    session.startSession();
+
+    return () => {
+      // Stop when VoiceMode unmounts (user navigates back to GUI).
+      session.stopSession();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stateLabel = serverDown
+    ? "Server offline"
+    : isConnecting
+      ? "Connecting…"
+      : isError && state.voiceError
+        ? state.voiceError
+        : STATE_LABELS[voiceState] ?? "Tap to talk";
+
+  const stateColor = isConnecting
+    ? STATE_COLORS.connecting
+    : STATE_COLORS[voiceState] ?? "#8E8E93";
+
+  const lastMsg = state.transcript.length > 0
+    ? state.transcript[state.transcript.length - 1]
+    : null;
+  const showCaption =
+    lastMsg !== null &&
+    (voiceState === "recording" || voiceState === "thinking" || voiceState === "speaking");
+
+  function backToGui() {
+    dispatch({ type: "SET_MODE", payload: "gui" });
+  }
+
+  return (
+    <div className="vm-root">
+
+      {/* Header */}
+      <div className="vm-header">
+        <Button variant="ghost" size="sm" onPress={backToGui} aria-label="Back">
+          <ChevronLeft size={14} /> Back
+        </Button>
+        {state.sessionId && (
+          <span className="vm-session-hint">Session {state.sessionId.slice(0, 6)}</span>
+        )}
+        <Button
+          variant="ghost" size="sm"
+          onPress={session.clearConversation}
+          isDisabled={state.transcript.length === 0}
+          aria-label="Clear conversation"
+        >
+          <Trash2 size={13} />
+        </Button>
+      </div>
+
+      {/* Stage: orb + state label + live caption */}
+      <div className="vm-stage">
+        <VoiceOrb state={isConnecting ? "idle" : voiceState} size="xl" audioLevel={0} />
+
+        <div className="vm-state-row">
+          {isConnecting && (
+            <Radio size={14} style={{ color: "var(--color-accent)", opacity: 0.8 }} />
+          )}
+          <span className="vm-state-label" style={{ color: stateColor }}>
+            {stateLabel}
+          </span>
+        </div>
+
+        {showCaption && (
+          <p className={`vm-live-caption vm-live-caption--${lastMsg!.role}`}>
+            {lastMsg!.text || "…"}
+          </p>
+        )}
+      </div>
+
+      {/* Transcript panel */}
+      {state.transcript.length > 0 && (
+        <div className="vm-transcript">
+          <TranscriptFeed
+            messages={state.transcript}
+            contextCards={state.contextCards}
+            compact
+          />
+        </div>
+      )}
+
+      {/* Action bar */}
+      <div className="vm-action-bar">
+        {isError && (
+          <Button
+            variant="ghost"
+            onPress={() => {
+              dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+              dispatch({ type: "SET_VOICE_ERROR", payload: null });
+            }}
+          >
+            Dismiss
+          </Button>
+        )}
+
+        {!isConnecting && !isError && session.sessionActive && (
+          <Button
+            variant="ghost" size="sm"
+            onPress={() => session.stopSession()}
+            isDisabled={serverDown}
+          >
+            <Square size={13} fill="currentColor" /> Stop session
+          </Button>
+        )}
+
+        <p className="vm-hint">
+          <kbd className="vm-kbd">&lceil;&Sigma;V</kbd>
+          {" / "}
+          <kbd className="vm-kbd">Ctrl+Shift+V</kbd>
+          {" to activate"}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── VoiceMode (browser HTTP pipeline path) ─────────────────
+
+function VoiceModePipeline() {
   const state = useAppState();
   const dispatch = useAppDispatch();
   const pipeline = useVoicePipeline();
@@ -82,7 +228,6 @@ export function VoiceMode() {
       ? state.voiceError
       : STATE_LABELS[voiceState];
 
-  // Last transcript line for live caption
   const lastMsg = state.transcript.length > 0
     ? state.transcript[state.transcript.length - 1]
     : null;
@@ -95,7 +240,7 @@ export function VoiceMode() {
   return (
     <div className="vm-root">
 
-      {/* ── Header ──────────────────────────────────────── */}
+      {/* Header */}
       <div className="vm-header">
         <Button variant="ghost" size="sm" onPress={backToGui} aria-label="Back">
           <ChevronLeft size={14} /> Back
@@ -113,7 +258,7 @@ export function VoiceMode() {
         </Button>
       </div>
 
-      {/* ── Stage: orb + state label + live caption ─────── */}
+      {/* Stage: orb + state label + live caption */}
       <div className="vm-stage">
         <VoiceOrb state={voiceState} size="xl" audioLevel={pipeline.audioLevel} />
 
@@ -133,7 +278,7 @@ export function VoiceMode() {
         )}
       </div>
 
-      {/* ── Transcript panel ─────────────────────────────── */}
+      {/* Transcript panel */}
       {state.transcript.length > 0 && (
         <div className="vm-transcript">
           <TranscriptFeed
@@ -144,7 +289,7 @@ export function VoiceMode() {
         </div>
       )}
 
-      {/* ── Action bar ───────────────────────────────────── */}
+      {/* Action bar */}
       <div className="vm-action-bar">
         {isIdle && (
           <Button
@@ -214,4 +359,16 @@ export function VoiceMode() {
       </div>
     </div>
   );
+}
+
+// ── Public export: selects the correct path at runtime ──────
+
+export function VoiceMode() {
+  // Select the Tauri child-process path when running inside Tauri, and the
+  // plain browser HTTP pipeline otherwise.  isTauriEnv() checks for
+  // window.__TAURI_INTERNALS__ — the same guard used by createVoiceBackend().
+  if (isTauriEnv()) {
+    return <VoiceModeChildProcess />;
+  }
+  return <VoiceModePipeline />;
 }

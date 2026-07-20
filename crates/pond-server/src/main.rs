@@ -65,7 +65,7 @@ use pond_core::prompts::build_system_prompt;
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
-use pond_core::shared::services::print_output::PrintOutput;
+use pond_core::shared::services::print_output::{PrintOutput, SilentOutput};
 use pond_core::shared::services::stdin_input::StdinInput;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -177,6 +177,19 @@ enum Commands {
         /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
         #[arg(long)]
         tts_model: Option<std::path::PathBuf>,
+
+        /// Session id for conversation continuity + history. Defaults to
+        /// "default-session". The desktop shell passes a per-session uuid so
+        /// the chat sidebar can read history via GET /api/v1/sessions/{id}/messages.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Emit the workflow as newline-delimited JSON (NDJSON) on stdout, one
+        /// event per line. In this mode stdout carries NOTHING but JSON lines
+        /// (no banners, prompts, or emoji — those go to stderr); the Tauri shell
+        /// parses these lines to drive the desktop voice UI.
+        #[arg(long)]
+        json_events: bool,
     },
 
     /// Show system status
@@ -448,8 +461,17 @@ async fn async_main() -> Result<()> {
             no_wake_word,
             tts,
             tts_model,
+            session_id,
+            json_events,
         }) => {
-            let _log = tracing_setup::init_tracing(false, &data_dir);
+            // In --json-events mode, route diagnostics to stderr so stdout is
+            // reserved for NDJSON contract lines only.
+            let console = if json_events {
+                tracing_setup::ConsoleSink::Stderr
+            } else {
+                tracing_setup::ConsoleSink::Stdout
+            };
+            let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console);
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
@@ -458,6 +480,8 @@ async fn async_main() -> Result<()> {
                 no_wake_word,
                 tts.as_deref(),
                 tts_model,
+                session_id.as_deref(),
+                json_events,
             )
             .await
         }
@@ -487,7 +511,18 @@ async fn async_main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            run_chat(None, None, "stdin", None, true, Some("none"), None).await
+            run_chat(
+                None,
+                None,
+                "stdin",
+                None,
+                true,
+                Some("none"),
+                None,
+                None,
+                false,
+            )
+            .await
         }
     }
 }
@@ -2578,6 +2613,7 @@ fn spawn_desktop_app(server_port: u16) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
     model: Option<&str>,
@@ -2586,14 +2622,27 @@ async fn run_chat(
     no_wake_word: bool,
     tts: Option<&str>,
     tts_model: Option<std::path::PathBuf>,
+    session_id_arg: Option<&str>,
+    json_events: bool,
 ) -> Result<()> {
-    println!("  ╔═══════════════════════════════════════╗");
-    println!(
+    // In `--json-events` mode, stdout carries NOTHING but NDJSON lines. All the
+    // human-facing banners/prompts below route through `out!`, which no-ops when
+    // json_events is set. Diagnostics still reach stderr via `eprintln!`.
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            if !json_events {
+                println!($($arg)*);
+            }
+        };
+    }
+
+    out!("  ╔═══════════════════════════════════════╗");
+    out!(
         "  ║   🦆  Goose-in-a-Pond  v{}       ║",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  ║   Wait → Listen → Think → Speak      ║");
-    println!("  ╚═══════════════════════════════════════╝");
+    out!("  ║   Wait → Listen → Think → Speak      ║");
+    out!("  ╚═══════════════════════════════════════╝");
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -2632,9 +2681,10 @@ async fn run_chat(
             &effective_tts_owned
         }
     };
-    println!(
+    out!(
         "  Provider: {} (model: {})",
-        effective_provider, effective_model
+        effective_provider,
+        effective_model
     );
 
     // Resolve the whisper ggml model path (used by both the in-process backend
@@ -2665,7 +2715,7 @@ async fn run_chat(
                 });
         let whisper_model = data_dir.join("models").join(&whisper_filename);
         if !whisper_model.exists() {
-            println!(
+            out!(
                 "  📥 STT model not found — downloading ({})...",
                 whisper_model_name
             );
@@ -2676,10 +2726,10 @@ async fn run_chat(
                 match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
                 {
                     Ok(_) => {}
-                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                    Err(e) => out!("  ⚠  STT model download failed: {}", e),
                 }
             } else {
-                println!(
+                out!(
                     "  ⚠  STT model '{}' not in catalog — cannot download",
                     whisper_model_name
                 );
@@ -2757,7 +2807,12 @@ async fn run_chat(
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
-    let session_id = "default-session".to_string();
+    // `--session-id` replaces the historical hardcoded "default-session" so the
+    // desktop shell can pass a per-session uuid; the UI then reads history via
+    // GET /api/v1/sessions/{id}/messages. Defaults to "default-session" when
+    // absent (backward compatible). ensure_session_title still derives a
+    // readable sidebar title from the first user message on this session.
+    let session_id = session_id_arg.unwrap_or("default-session").to_string();
 
     // ── Build repos for GooseAdapter (before db.system is consumed) ───────────────
     let settings_repo_arc: Arc<
@@ -2865,8 +2920,17 @@ async fn run_chat(
             s.chat_model = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
+        // `--provider mock` routes to the MockAgent backend so the loop runs
+        // deterministically offline (no llamafile/network/models) — used by the
+        // json-events spawn-binary contract test. Any other provider uses the
+        // live GooseAdapter, which selects its own provider/model via the DB.
+        let agent_backend = if effective_provider == "mock" {
+            "mock"
+        } else {
+            "goose"
+        };
         let (a, _ext_mgr, _tc, _tr) = build_goose_backend(
-            "goose",
+            agent_backend,
             &llamafile_url,
             &data_dir,
             weather,
@@ -2899,7 +2963,7 @@ async fn run_chat(
         let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
         match file_template {
             Some(tmpl) => {
-                println!(
+                out!(
                     "  Prompt:   custom ({})",
                     prompt_dir.join("system.md").display()
                 );
@@ -2930,9 +2994,11 @@ async fn run_chat(
                 )
             }
             None => {
-                println!(
+                out!(
                     "  Assistant: {} / style: {} / user: {}",
-                    settings.assistant_name, settings.prompt_style, settings.user_name
+                    settings.assistant_name,
+                    settings.prompt_style,
+                    settings.user_name
                 );
                 build_system_prompt(&settings)
             }
@@ -2955,13 +3021,36 @@ async fn run_chat(
     let mut chat_service =
         ChatService::new(agent, session_id.clone(), storage).with_system_prompt(system_prompt);
 
+    // ── NDJSON event sink (--json-events) ──────────────────────────────────────
+    // Writes one serialized WorkflowEvent per line to stdout with immediate
+    // flush. In this mode the run_loop's human-facing prints are suppressed
+    // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
+    // Tauri shell parses these lines to drive the desktop voice UI.
+    if json_events {
+        use std::io::Write as _;
+        let sink: pond_core::shared::services::chat::WorkflowEventSink =
+            Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {
+                if let Some(line) = event.to_ndjson() {
+                    let mut stdout = std::io::stdout().lock();
+                    // Best-effort: a broken pipe means the shell went away; the
+                    // loop will exit on stdin EOF shortly after regardless.
+                    let _ = stdout.write_all(line.as_bytes());
+                    let _ = stdout.write_all(b"\n");
+                    let _ = stdout.flush();
+                }
+            });
+        chat_service = chat_service
+            .with_event_sink(sink)
+            .with_stdout_diagnostics(false);
+    }
+
     // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
     // When GooseAdapter is active it selects the provider internally via the DB.
     // This block runs only in builds without the goose-agent feature.
     #[cfg(not(feature = "goose-agent"))]
     match effective_provider {
         "ollama" => {
-            println!(
+            out!(
                 "  Model:    {} (ollama @ {}, max_tokens={}, temp={})",
                 effective_model,
                 pond_adapters_ollama::DEFAULT_HOST,
@@ -2986,7 +3075,7 @@ async fn run_chat(
                     .flatten()
                     .and_then(|r| r.hf_id)
                     .unwrap_or_else(|| effective_model.to_string());
-                println!("  Model:    {} (local GGUF in-process)", hf_model_id);
+                out!("  Model:    {} (local GGUF in-process)", hf_model_id);
                 let llm = Arc::new(
                     LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?,
                 );
@@ -2994,12 +3083,12 @@ async fn run_chat(
             }
             #[cfg(not(feature = "local-inference"))]
             {
-                eprintln!(
+                eout!(
                     "  WARN: --provider local requires the `local-inference` feature (not compiled in).\n\
                      Falling back to llamafile. Rebuild with:\n  \
                      cargo run -p pond-server --features local-inference -- chat --provider local"
                 );
-                println!(
+                out!(
                     "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
                     effective_model,
                     llamafile_url,
@@ -3016,9 +3105,12 @@ async fn run_chat(
         }
         _ => {
             // "llamafile" and any unrecognised value — use the llamafile process started above.
-            println!(
+            out!(
                 "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
-                effective_model, llamafile_url, settings.llm_max_tokens, settings.llm_temperature,
+                effective_model,
+                llamafile_url,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
             );
             let llm = Arc::new(
                 LlamafileProvider::new(Some(&llamafile_url))
@@ -3038,8 +3130,8 @@ async fn run_chat(
             Some(p) => match WhisperRsInput::new(p.clone()) {
                 Ok(w) => Some(Arc::new(w)),
                 Err(e) => {
-                    println!("  ⚠  In-process whisper load failed: {}", e);
-                    println!("     Falling back to stdin input.");
+                    out!("  ⚠  In-process whisper load failed: {}", e);
+                    out!("     Falling back to stdin input.");
                     None
                 }
             },
@@ -3051,11 +3143,11 @@ async fn run_chat(
 
     let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
         ("whisper", Some(backend)) => {
-            println!("  Input:    whisper (in-process via whisper.cpp)");
+            out!("  Input:    whisper (in-process via whisper.cpp)");
             backend.clone() as Arc<dyn VoiceInput>
         }
         _ => {
-            println!("  Input:    stdin");
+            out!("  Input:    stdin");
             Arc::new(StdinInput::new())
         }
     };
@@ -3070,18 +3162,18 @@ async fn run_chat(
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
 
         if transcriptions.is_empty() {
-            println!(
+            out!(
                 "  Wake word: \"{}\" (no calibration — using raw phrase)",
                 trigger
             );
         } else {
-            println!(
+            out!(
                 "  Wake word: \"{}\" ({} calibrated variants)",
                 trigger,
                 transcriptions.len()
             );
         }
-        println!(
+        out!(
             "  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
             settings.voice_kws_energy_threshold,
             settings.voice_kws_cooldown_ms,
@@ -3105,6 +3197,16 @@ async fn run_chat(
     };
 
     // ── Wire TTS output ──
+    // The text/print fallback (no piper): in --json-events mode this MUST NOT
+    // write to stdout (the assistant text is already streamed as NDJSON `token`
+    // events), so use SilentOutput. Otherwise PrintOutput echoes to stdout.
+    let text_fallback = || -> Arc<dyn VoiceOutput> {
+        if json_events {
+            Arc::new(SilentOutput)
+        } else {
+            Arc::new(PrintOutput)
+        }
+    };
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "piper" => {
             // Resolve model path: CLI arg → settings → warn and fall back to text
@@ -3113,12 +3215,12 @@ async fn run_chat(
             } else if !settings.voice_tts_voice.is_empty() {
                 Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
             } else {
-                println!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
-                println!("     Set a piper voice in the web UI, then restart. Using text output.");
+                out!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
+                out!("     Set a piper voice in the web UI, then restart. Using text output.");
                 None
             };
             match model_path_opt {
-                None => Arc::new(PrintOutput),
+                None => text_fallback(),
                 Some(model_path) => {
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
@@ -3127,9 +3229,9 @@ async fn run_chat(
                         std::path::PathBuf::from(format!("{}.json", model_path.display()));
                     if !model_path.exists() || !config_path.exists() {
                         if model_path.exists() {
-                            println!("  📥 TTS model config (.json) missing — downloading...");
+                            out!("  📥 TTS model config (.json) missing — downloading...");
                         } else {
-                            println!("  📥 TTS model not found — downloading configured voice...");
+                            out!("  📥 TTS model not found — downloading configured voice...");
                         }
                         // Look up in DB by filename to get the correct download URL.
                         let voice_filename = settings.voice_tts_voice.as_str();
@@ -3152,7 +3254,7 @@ async fn run_chat(
                             )
                             .await;
                         } else {
-                            println!(
+                            out!(
                                 "  ⚠  Piper voice '{}' not in model catalog — cannot download",
                                 voice_filename
                             );
@@ -3175,8 +3277,8 @@ async fn run_chat(
                     #[cfg(not(feature = "legacy-subprocess"))]
                     {
                         if !model_path.exists() || !config_path.exists() {
-                            println!("  TTS:      piper unavailable (model or config missing) — falling back to print");
-                            Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                            out!("  TTS:      piper unavailable (model or config missing) — falling back to print");
+                            text_fallback()
                         } else {
                             match PiperRsOutput::new(model_path.clone(), config_path) {
                                 Ok(out) => {
@@ -3184,7 +3286,7 @@ async fn run_chat(
                                         Some(d) => out.with_espeak_data(d),
                                         None => out,
                                     };
-                                    println!(
+                                    out!(
                                         "  TTS:      piper-rs ({})",
                                         model_path
                                             .file_name()
@@ -3194,11 +3296,11 @@ async fn run_chat(
                                     Arc::new(out) as Arc<dyn VoiceOutput>
                                 }
                                 Err(e) => {
-                                    println!(
+                                    out!(
                                         "  TTS:      piper unavailable (load failed: {}) — falling back to print",
                                         e
                                     );
-                                    Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                                    text_fallback()
                                 }
                             }
                         }
@@ -3208,15 +3310,15 @@ async fn run_chat(
                     #[cfg(feature = "legacy-subprocess")]
                     {
                         if piper_process::find_binary(&data_dir).is_none() {
-                            println!("  📥 TTS binary not found — downloading...");
+                            out!("  📥 TTS binary not found — downloading...");
                             match model_download::download_piper_binary(&data_dir).await {
                                 Ok(_) => {}
-                                Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                                Err(e) => out!("  ⚠  TTS binary download failed: {}", e),
                             }
                         }
                         match piper_process::find_binary(&data_dir) {
                             Some(bin) => {
-                                println!(
+                                out!(
                                     "  TTS:      piper ({})",
                                     model_path.file_name().unwrap_or_default().to_string_lossy()
                                 );
@@ -3227,8 +3329,8 @@ async fn run_chat(
                                 Arc::new(out) as Arc<dyn VoiceOutput>
                             }
                             None => {
-                                println!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                                Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                                out!("  TTS:      piper unavailable (binary not found) — falling back to print");
+                                text_fallback()
                             }
                         }
                     }
@@ -3236,13 +3338,44 @@ async fn run_chat(
             }
         }
         _ => {
-            println!("  TTS:      print");
-            Arc::new(PrintOutput)
+            out!("  TTS:      print");
+            text_fallback()
         }
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
-    chat_service.run_loop().await?;
+    // ── Emit `ready` (contract) ────────────────────────────────────────────────
+    // All models are loaded and every adapter is wired; announce readiness
+    // before entering the wait loop. run_loop emits the terminal `exit` event
+    // itself (stdin_eof on EOF, dismissed on hard exit); on an unexpected loop
+    // error we emit `exit` with reason "error" below.
+    if json_events {
+        use pond_core::shared::domain::agent::WorkflowEvent;
+        use std::io::Write as _;
+        let write_line = |ev: &WorkflowEvent| {
+            if let Some(line) = ev.to_ndjson() {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(line.as_bytes());
+                let _ = stdout.write_all(b"\n");
+                let _ = stdout.flush();
+            }
+        };
+        write_line(&WorkflowEvent::Ready {
+            session_id: session_id.clone(),
+        });
+
+        if let Err(e) = chat_service.run_loop().await {
+            write_line(&WorkflowEvent::Error {
+                message: e.to_string(),
+            });
+            write_line(&WorkflowEvent::Exit {
+                reason: "error".to_string(),
+            });
+            return Err(e);
+        }
+    } else {
+        chat_service.run_loop().await?;
+    }
 
     Ok(())
 }
@@ -4567,7 +4700,18 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
+                run_chat(
+                    None,
+                    None,
+                    "stdin",
+                    None,
+                    true,
+                    Some("none"),
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
             }
             "2" => {
                 let data_dir = default_data_dir();
