@@ -1371,7 +1371,8 @@ const DEEPPIXBIS_DEFAULT_URL: &str =
 #[cfg(feature = "face-onnx")]
 const ANTISPOOF_2_APPROX_MB: u64 = 13;
 
-#[cfg(feature = "face-onnx")]
+// Shared by the face (#face-onnx) and vision (#vision-onnx) downloaders.
+#[cfg(any(feature = "face-onnx", feature = "vision-onnx"))]
 fn env_url_override(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
@@ -1635,6 +1636,49 @@ async fn run_cmd(cmd: &mut tokio::process::Command, label: &str) -> Result<()> {
         return Err(anyhow!("{} failed (exit {})", label, status));
     }
     Ok(())
+}
+
+// ── Vision classifier model (#130 follow-up) ─────────────────────────────────
+//
+// YOLOX-Nano (Apache-2.0, ~3.7 MB) from the official Megvii release — labels
+// motion events person/pet/package via pond-adapters-vision-onnx. Mirrors the
+// face-model pattern: fetched automatically at serve startup on `vision-onnx`
+// builds so a fresh `cargo run` works out of the box, env-overridable mirror.
+
+/// On-disk directory where vision models live: `<data_dir>/models/vision/`.
+#[cfg(feature = "vision-onnx")]
+pub fn vision_models_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join("vision")
+}
+
+/// Filename of the default vision classifier (the auto-downloaded model).
+/// `vision_classifier_model` left empty resolves to this file.
+#[cfg(feature = "vision-onnx")]
+pub const VISION_CLASSIFIER_DEFAULT_FILE: &str = "yolox_nano.onnx";
+
+#[cfg(feature = "vision-onnx")]
+const VISION_CLASSIFIER_DEFAULT_URL: &str =
+    "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx";
+#[cfg(feature = "vision-onnx")]
+const VISION_CLASSIFIER_APPROX_MB: u64 = 4;
+
+/// Ensure the default vision classifier model is on disk, downloading it on
+/// first run. No-op when the file already exists. Override the mirror with
+/// `POND_VISION_CLASSIFIER_URL`.
+#[cfg(feature = "vision-onnx")]
+pub async fn download_vision_classifier(data_dir: &Path) -> Result<PathBuf> {
+    let dir = vision_models_dir(data_dir);
+    tokio::fs::create_dir_all(&dir).await?;
+    let dest = dir.join(VISION_CLASSIFIER_DEFAULT_FILE);
+    if dest.exists() {
+        println!("  ✅ YOLOX-Nano vision classifier already present");
+        return Ok(dest);
+    }
+    let url = env_url_override("POND_VISION_CLASSIFIER_URL")
+        .unwrap_or_else(|| VISION_CLASSIFIER_DEFAULT_URL.to_string());
+    println!("  📥 YOLOX-Nano vision classifier not found — downloading from {url}");
+    download_file(&url, &dest, VISION_CLASSIFIER_APPROX_MB).await?;
+    Ok(dest)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
