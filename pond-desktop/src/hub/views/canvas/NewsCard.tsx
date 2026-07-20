@@ -19,11 +19,11 @@ const NEWS_ITEMS: NewsItem[] = [
   },
   {
     headline: "Global summit addresses climate resilience funding",
-    tag: "World",    tagColor: "#92400E", tagBg: "#FEF9C3", ago: "4h",
+    tag: "World",    tagColor: "var(--color-warning-fg)", tagBg: "#FEF9C3", ago: "4h",
   },
   {
     headline: "NVIDIA reports record revenue on Jetson platform growth",
-    tag: "Business", tagColor: "#15803D", tagBg: "#DCFCE7", ago: "6h",
+    tag: "Business", tagColor: "var(--color-success-fg)", tagBg: "#DCFCE7", ago: "6h",
   },
   {
     headline: "New CRISPR technique targets inherited cardiac conditions",

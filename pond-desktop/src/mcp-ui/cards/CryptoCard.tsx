@@ -27,7 +27,7 @@ function MiniSparkline({ data, positive }: { data: number[]; positive: boolean }
       <polyline
         points={points}
         fill="none"
-        stroke={positive ? "#15803D" : "#B91C1C"}
+        stroke={positive ? "var(--color-success-fg)" : "var(--color-destructive-fg)"}
         strokeWidth="1.75"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -92,7 +92,7 @@ function CryptoCard({ data, variant }: McpCardProps) {
             alignItems: "center",
             gap: 5,
             background: "#DCFCE7",
-            color: "#15803D",
+            color: "var(--color-success-fg)",
             fontSize: 11,
             fontWeight: 600,
             padding: "3px 8px",
@@ -105,7 +105,7 @@ function CryptoCard({ data, variant }: McpCardProps) {
               width: 6,
               height: 6,
               borderRadius: "50%",
-              background: "#15803D",
+              background: "var(--color-success-fg)",
               display: "inline-block",
               animation: "pulse-dot 1.8s ease-in-out infinite",
             }}
@@ -153,7 +153,7 @@ function CryptoCard({ data, variant }: McpCardProps) {
                   style={{
                     fontSize: 11,
                     fontWeight: 800,
-                    color: positive ? "#15803D" : "#B91C1C",
+                    color: positive ? "var(--color-success-fg)" : "var(--color-destructive-fg)",
                     lineHeight: 1,
                   }}
                 >
@@ -227,7 +227,7 @@ function CryptoCard({ data, variant }: McpCardProps) {
                   style={{
                     fontSize: 11,
                     fontWeight: 700,
-                    color: positive ? "#15803D" : "#B91C1C",
+                    color: positive ? "var(--color-success-fg)" : "var(--color-destructive-fg)",
                     lineHeight: 1,
                     display: "inline-flex",
                     alignItems: "center",

@@ -89,18 +89,18 @@ function RoomButton({ config }: RoomButtonProps): React.ReactElement {
         <HubIco
           d={on ? BULB_ON_PATH : BULB_OFF_PATH}
           size={18}
-          color={on ? "#92400E" : "var(--color-text-tertiary)"}
+          color={on ? "var(--color-warning-fg)" : "var(--color-text-tertiary)"}
           fill={on ? "#FDE68A" : "none"}
           sw={1.75}
         />
       </div>
-      <div style={{ fontSize: 12, fontWeight: 700, color: on ? "#92400E" : "#64748B" }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: on ? "var(--color-warning-fg)" : "#64748B" }}>
         {config.label}
       </div>
       <div
         style={{
           fontSize: 11,
-          color: on ? "#92400E" : "var(--color-text-tertiary)",
+          color: on ? "var(--color-warning-fg)" : "var(--color-text-tertiary)",
           marginTop: 2,
           fontWeight: 500,
           display: "flex",
@@ -108,7 +108,7 @@ function RoomButton({ config }: RoomButtonProps): React.ReactElement {
         }}
       >
         <span>{config.temp}</span>
-        <span style={{ fontWeight: 700, color: on ? "#92400E" : "var(--color-text-tertiary)" }}>
+        <span style={{ fontWeight: 700, color: on ? "var(--color-warning-fg)" : "var(--color-text-tertiary)" }}>
           {on ? "On" : "Off"}
         </span>
       </div>
@@ -142,7 +142,7 @@ export function SmartHomeCard(): React.ReactElement {
     <div className="mc">
       <div className="mc-header">
         <div className="mc-header-left">
-          <HubIco d={HOME_PATH} size={15} color="#92400E" sw={1.75} />
+          <HubIco d={HOME_PATH} size={15} color="var(--color-warning-fg)" sw={1.75} />
           <span className="mc-title">Home status</span>
         </div>
         <span
@@ -199,7 +199,7 @@ export function SmartHomeCard(): React.ReactElement {
               style={{
                 fontSize: 12,
                 fontWeight: 700,
-                color: "#15803D",
+                color: "var(--color-success-fg)",
                 background: "#F0FDF4",
                 padding: "2px 9px",
                 borderRadius: 999,

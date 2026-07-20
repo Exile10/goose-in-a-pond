@@ -105,7 +105,7 @@ export function WeatherCard(): React.ReactElement {
             64
             <span style={{ fontSize: 26, fontWeight: 600, letterSpacing: 0 }}>°F</span>
           </div>
-          <div style={{ fontSize: 15, fontWeight: 700, color: "#0369A1", marginTop: 4 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "var(--color-info-fg)", marginTop: 4 }}>
             Clear
           </div>
           <div style={{ fontSize: 12, color: "#0EA5E9", marginTop: 2, fontWeight: 500 }}>
