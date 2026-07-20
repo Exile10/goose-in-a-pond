@@ -55,7 +55,7 @@ function SmartHomeCard({ data, variant }: McpCardProps) {
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px 10px", gap: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <Ico d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" size={15} color="#F59E0B" />
+          <Ico d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" size={15} color="#92400E" />
           <span style={{ fontSize: 13, fontWeight: 700, color: "#18181B" }}>Home status</span>
         </div>
         <span style={{ fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999, background: "#F0FDF4", color: "#166534", display: "flex", alignItems: "center", gap: 5 }}>
@@ -66,7 +66,7 @@ function SmartHomeCard({ data, variant }: McpCardProps) {
 
       {/* Light count */}
       <div style={{ padding: "0 16px 10px" }}>
-        <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>
+        <span style={{ fontSize: 12, color: "var(--color-text-tertiary)", fontWeight: 600 }}>
           {litCount} light{litCount !== 1 ? "s" : ""} on
         </span>
       </div>
@@ -88,19 +88,19 @@ function SmartHomeCard({ data, variant }: McpCardProps) {
             >
               <div style={{ marginBottom: 6 }}>
                 {on ? (
-                  <svg width={18} height={18} viewBox="0 0 24 24" fill="#FDE68A" stroke="#F59E0B" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width={18} height={18} viewBox="0 0 24 24" fill="#FDE68A" stroke="#92400E" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M9 18h6M12 2v1M4.93 4.93l.7.7M2 12h1M4.93 19.07l.7-.7M21 12h1M19.07 4.93l-.7.7M19.07 19.07l-.7-.7M12 6a6 6 0 1 0 0 12 6 6 0 0 0 0-12z" />
                   </svg>
                 ) : (
-                  <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="#CBD5E1" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="var(--color-text-tertiary)" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M9 18h6M12 2v1M4.93 4.93l.7.7M2 12h1M21 12h1M17 17A7 7 0 0 0 7 7" />
                   </svg>
                 )}
               </div>
               <div style={{ fontSize: 12, fontWeight: 700, color: on ? "#92400E" : "#64748B" }}>{r.label}</div>
-              <div style={{ fontSize: 11, color: on ? "#D97706" : "#94A3B8", marginTop: 2, fontWeight: 500, display: "flex", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 11, color: on ? "#92400E" : "var(--color-text-tertiary)", marginTop: 2, fontWeight: 500, display: "flex", justifyContent: "space-between" }}>
                 <span>{r.temp ?? ""}</span>
-                <span style={{ fontWeight: 700, color: on ? "#F59E0B" : "#CBD5E1" }}>{on ? "On" : "Off"}</span>
+                <span style={{ fontWeight: 700, color: on ? "#92400E" : "var(--color-text-tertiary)" }}>{on ? "On" : "Off"}</span>
               </div>
             </button>
           );
@@ -114,11 +114,11 @@ function SmartHomeCard({ data, variant }: McpCardProps) {
           <div style={{ padding: "10px 16px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
             {sensors.map((s, i) => (
               <div key={i} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <Ico d={sensorIconPath(s.label)} size={14} color="#94A3B8" />
+                <Ico d={sensorIconPath(s.label)} size={14} color="var(--color-text-tertiary)" />
                 <span style={{ flex: 1, fontSize: 12, fontWeight: 600, color: "#475569" }}>{s.label}</span>
                 <span style={{
                   fontSize: 12, fontWeight: 700,
-                  color: (s.ok !== false) ? "#16A34A" : "#F59E0B",
+                  color: (s.ok !== false) ? "#15803D" : "#92400E",
                   background: (s.ok !== false) ? "#F0FDF4" : "#FEF9C3",
                   padding: "2px 9px", borderRadius: 999,
                 }}>

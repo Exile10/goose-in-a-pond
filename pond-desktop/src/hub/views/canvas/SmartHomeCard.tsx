@@ -89,7 +89,7 @@ function RoomButton({ config }: RoomButtonProps): React.ReactElement {
         <HubIco
           d={on ? BULB_ON_PATH : BULB_OFF_PATH}
           size={18}
-          color={on ? "#F59E0B" : "#CBD5E1"}
+          color={on ? "#92400E" : "var(--color-text-tertiary)"}
           fill={on ? "#FDE68A" : "none"}
           sw={1.75}
         />
@@ -100,7 +100,7 @@ function RoomButton({ config }: RoomButtonProps): React.ReactElement {
       <div
         style={{
           fontSize: 11,
-          color: on ? "#D97706" : "#94A3B8",
+          color: on ? "#92400E" : "var(--color-text-tertiary)",
           marginTop: 2,
           fontWeight: 500,
           display: "flex",
@@ -108,7 +108,7 @@ function RoomButton({ config }: RoomButtonProps): React.ReactElement {
         }}
       >
         <span>{config.temp}</span>
-        <span style={{ fontWeight: 700, color: on ? "#F59E0B" : "#CBD5E1" }}>
+        <span style={{ fontWeight: 700, color: on ? "#92400E" : "var(--color-text-tertiary)" }}>
           {on ? "On" : "Off"}
         </span>
       </div>
@@ -126,7 +126,7 @@ function LitCount(): React.ReactElement {
 
   const count = [s0, s1, s2, s3].filter((s) => s.on).length;
   return (
-    <span style={{ fontSize: 12, color: "#94A3B8", fontWeight: 600 }}>
+    <span style={{ fontSize: 12, color: "var(--color-text-tertiary)", fontWeight: 600 }}>
       {count} light{count !== 1 ? "s" : ""} on
     </span>
   );
@@ -142,7 +142,7 @@ export function SmartHomeCard(): React.ReactElement {
     <div className="mc">
       <div className="mc-header">
         <div className="mc-header-left">
-          <HubIco d={HOME_PATH} size={15} color="#F59E0B" sw={1.75} />
+          <HubIco d={HOME_PATH} size={15} color="#92400E" sw={1.75} />
           <span className="mc-title">Home status</span>
         </div>
         <span
@@ -191,7 +191,7 @@ export function SmartHomeCard(): React.ReactElement {
       >
         {SENSORS.map((s, i) => (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <HubIco d={s.iconPath} size={14} color="#94A3B8" sw={1.5} />
+            <HubIco d={s.iconPath} size={14} color="var(--color-text-tertiary)" sw={1.5} />
             <span style={{ flex: 1, fontSize: 12, fontWeight: 600, color: "#475569" }}>
               {s.label}
             </span>
@@ -199,7 +199,7 @@ export function SmartHomeCard(): React.ReactElement {
               style={{
                 fontSize: 12,
                 fontWeight: 700,
-                color: "#16A34A",
+                color: "#15803D",
                 background: "#F0FDF4",
                 padding: "2px 9px",
                 borderRadius: 999,
