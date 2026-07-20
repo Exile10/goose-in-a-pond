@@ -18,9 +18,9 @@ const ROUTES: Route[] = [
 ];
 
 function trafficColor(t: Route["traffic"]): string {
-  if (t === "Light")    return "#15803D";
-  if (t === "Clear")    return "#0369A1";
-  return "#92400E";
+  if (t === "Light")    return "var(--color-success-fg)";
+  if (t === "Clear")    return "var(--color-info-fg)";
+  return "var(--color-warning-fg)";
 }
 
 const NAV_ICON_PATH  = "M3 11l19-9-9 19-2-8-8-2z";

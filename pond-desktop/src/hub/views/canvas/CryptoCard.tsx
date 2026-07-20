@@ -73,7 +73,7 @@ export function CryptoCard(): React.ReactElement {
                   style={{
                     fontSize: 11,
                     fontWeight: 800,
-                    color: up ? "#15803D" : "#B91C1C",
+                    color: up ? "var(--color-success-fg)" : "var(--color-destructive-fg)",
                   }}
                 >
                   {c.sym}
@@ -96,7 +96,7 @@ export function CryptoCard(): React.ReactElement {
                   style={{
                     fontSize: 11,
                     fontWeight: 700,
-                    color: up ? "#15803D" : "#B91C1C",
+                    color: up ? "var(--color-success-fg)" : "var(--color-destructive-fg)",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "flex-end",
@@ -104,7 +104,7 @@ export function CryptoCard(): React.ReactElement {
                     marginTop: 2,
                   }}
                 >
-                  <HubIco d={up ? UP_ARROW : DOWN_ARROW} size={11} color={up ? "#15803D" : "#B91C1C"} sw={2} />
+                  <HubIco d={up ? UP_ARROW : DOWN_ARROW} size={11} color={up ? "var(--color-success-fg)" : "var(--color-destructive-fg)"} sw={2} />
                   {up ? "+" : ""}{c.chg.toFixed(2)}%
                 </div>
               </div>

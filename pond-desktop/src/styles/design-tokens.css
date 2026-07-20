@@ -95,19 +95,20 @@
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
   --color-success-soft:     rgba(52, 199, 89, 0.12);
-  --color-success-fg:       #0C763F;  /* darkened from #0e8a4a — was 4.4:1 on white, under AA */
+  --color-success-fg:       #15803D;  /* darkened from #0e8a4a — was 4.4:1 on white, under AA. Matches the shade already used for .mc-chip--green / .debrief-chip--kept. */
   --color-warning:          #FF9500;
   --color-warning-soft:     rgba(255, 149, 0, 0.12);
-  --color-warning-fg:       #8A6400;  /* darkened from #b08000 — was 3.5:1 on white, under AA */
+  --color-warning-fg:       #92400E;  /* darkened from #b08000 — was 3.5:1 on white, under AA. Matches the shade already used for .mc-chip--amber / .debrief-chip--removing. */
   --color-destructive:      #FF3B30;
   --color-destructive-soft: rgba(255, 59, 48, 0.10);
+  --color-destructive-fg:   #B91C1C;  /* dark red for text on destructive-soft/light-red backgrounds — #DC2626 alone was 4.0:1 on some of them, under AA */
   --color-neutral:          #6C6C71;  /* darkened from #8E8E93 — was 2.9:1 on white, under AA */
   --color-neutral-soft:     rgba(142, 142, 147, 0.12);
 
   /* Info (used in segment banners, role chip primary) */
   --color-info:             #0072f5;
   --color-info-soft:        rgba(0, 114, 245, 0.05);
-  --color-info-fg:          #366894;  /* darkened from #4d94d4 — was 3.0:1 on white, under AA */
+  --color-info-fg:          #0369A1;  /* darkened from #4d94d4 — was 3.0:1 on white, under AA */
   --color-info-dark:        #0058c4;  /* dark blue for text/icons */
   --color-info-icon-bg:     rgba(0, 114, 245, 0.10);
 

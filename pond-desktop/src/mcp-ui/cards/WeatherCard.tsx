@@ -243,14 +243,14 @@ const styles = {
   condition: {
     fontSize: 15,
     fontWeight: 700,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     marginTop: 4,
     lineHeight: 1.2,
   },
   conditionCompact: {
     fontSize: 13,
     fontWeight: 700,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     marginTop: 2,
     lineHeight: 1.2,
   },
@@ -330,7 +330,7 @@ const styles = {
   },
   loadingText: {
     fontSize: 13,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     fontWeight: 500,
   },
 } as const;
@@ -371,7 +371,7 @@ function WeatherCard({ data, variant }: McpCardProps) {
       <div style={styles.loading}>
         <Loader
           size={22}
-          style={{ animation: "weather-spin 1.5s linear infinite", color: "#0369A1" }}
+          style={{ animation: "weather-spin 1.5s linear infinite", color: "var(--color-info-fg)" }}
         />
         <span style={styles.loadingText}>Fetching weather...</span>
         <style>{spinKeyframes}</style>

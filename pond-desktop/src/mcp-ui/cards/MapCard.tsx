@@ -21,10 +21,10 @@ function Ico({ d, size = 16, color = "currentColor" }: { d: string; size?: numbe
 
 function trafficColor(t: string): string {
   const lower = (t || "").toLowerCase();
-  if (lower === "light" || lower === "low") return "#15803D";
-  if (lower === "clear" || lower === "free") return "#0369A1";
+  if (lower === "light" || lower === "low") return "var(--color-success-fg)";
+  if (lower === "clear" || lower === "free") return "var(--color-info-fg)";
   if (lower === "heavy" || lower === "congested") return "#DC2626";
-  return "#92400E"; // moderate / default
+  return "var(--color-warning-fg)"; // moderate / default
 }
 
 function MapCard({ data, variant }: McpCardProps) {
