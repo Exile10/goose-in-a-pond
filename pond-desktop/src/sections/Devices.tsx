@@ -3,6 +3,7 @@ import { Button, Separator } from "@heroui/react";
 import { Monitor, Cpu, Activity, Power, Settings, Plus, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
+import { refreshHomeData } from "../hub/state/hubDataStore";
 
 const DEVICE_TYPES = [
   { value: "host",          label: "Host / PC" },
@@ -87,6 +88,7 @@ export function Devices() {
       });
       closeForm();
       load();
+      void refreshHomeData();
     } catch (e) {
       setFormError(String(e));
     } finally {
@@ -106,6 +108,7 @@ export function Devices() {
         args: { device_id: d.id, power: !d.is_online },
       });
       load();
+      void refreshHomeData();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -119,6 +122,7 @@ export function Devices() {
       await api.unregisterDevice(d.id);
       setDetail(null);
       load();
+      void refreshHomeData();
     } catch (e) {
       setError(String(e));
     } finally {
