@@ -154,6 +154,8 @@ fn is_public_route(path: &str) -> bool {
             | "/test/speak"
             | "/dev/goose"
             | "/profiles"         // POST — create profile during onboarding
+            | "/oauth/callback"   // browser redirect target; protected by PKCE state nonce instead
+            | "/oauth/refresh"    // called by extension subprocesses; checked against internal_extension_token
     )
     // PUT /settings is public so onboarding steps can save before completion
     || path == "/settings"
@@ -329,6 +331,9 @@ mod tests {
         assert!(is_public_route("/api/v1/onboard"));
         assert!(is_public_route("/api/v1/onboard/status"));
         assert!(is_public_route("/api/v1/transcribe"));
+        assert!(is_public_route("/api/v1/oauth/callback"));
+        assert!(is_public_route("/api/v1/oauth/refresh"));
+        assert!(!is_public_route("/api/v1/oauth/authorize"));
         assert!(!is_public_route("/api/v1/chat"));
         assert!(!is_public_route("/api/v1/devices"));
         // PUT /settings is public so onboarding wizard steps can save before handshake completes
