@@ -172,6 +172,7 @@ impl SettingsRepository for SqliteSettingsRepository {
             "vision_motion_threshold",
             settings.vision_motion_threshold.to_string()
         );
+        upsert!("vision_classifier_model", &settings.vision_classifier_model);
         // Privacy / sensor access
         upsert!(
             "mic_enabled",
@@ -696,6 +697,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
                 s.vision_motion_threshold = v;
             }
         }
+        "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
         // Privacy / sensor access
         "mic_enabled" => s.mic_enabled = value == "true",
         "cameras_enabled" => s.cameras_enabled = value == "true",

@@ -142,14 +142,30 @@ impl GooseAdapter {
         // Ensure a Goose session exists for extension management.
         // Extensions are added/removed on this session; chat sessions inherit them.
         // Try to reuse an existing session, or create a new one.
+        let current_dir = std::env::current_dir().unwrap_or_default();
         let ext_session_id = {
             let existing = session_manager.list_sessions().await.unwrap_or_default();
             if let Some(session) = existing.first() {
+                // A reused session's `working_dir` is frozen at whatever it was
+                // when first created, potentially days/restarts ago from a
+                // different cwd. Extension subprocesses spawn with THIS
+                // directory, so keep it pinned to the current process's cwd
+                // on every startup rather than letting it go stale.
+                if session.working_dir != current_dir {
+                    if let Err(e) = session_manager
+                        .update(&session.id)
+                        .working_dir(current_dir.clone())
+                        .apply()
+                        .await
+                    {
+                        tracing::warn!("Failed to refresh extension session working_dir: {e}");
+                    }
+                }
                 session.id.clone()
             } else {
                 match session_manager
                     .create_session(
-                        std::env::current_dir().unwrap_or_default(),
+                        current_dir.clone(),
                         "giap-extensions".to_string(),
                         goose::session::session_manager::SessionType::User,
                         GooseMode::Auto,

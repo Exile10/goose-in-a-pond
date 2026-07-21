@@ -94,10 +94,17 @@ impl ServerProcess {
         })?;
 
         tracing::info!("Spawning pond-server from {}", binary_path.display());
-        let child = Command::new(&binary_path)
-            .arg("serve")
-            .arg("--port")
-            .arg("4000")
+        let mut cmd = Command::new(&binary_path);
+        cmd.arg("serve").arg("--port").arg("4000");
+        // In dev builds, ground the child's cwd at the repo root so extension
+        // paths like `extensions/music/src/server.ts` resolve regardless of
+        // where `tauri dev` itself was invoked from. No-op in production
+        // bundles, where this compile-time path won't exist on the user's
+        // machine and the binary's own resource-relative paths are absolute.
+        if let Some(root) = dev_repo_root() {
+            cmd.current_dir(root);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn pond-server: {e}"))?;
 
@@ -177,6 +184,18 @@ impl Default for ServerProcess {
     }
 }
 
+/// Resolves to the workspace root (`src-tauri/../..`) baked in at compile
+/// time, but only if that path still exists on disk — true on the dev
+/// machine that built this binary, false anywhere else (e.g. a bundled app
+/// on an end user's machine).
+fn dev_repo_root() -> Option<std::path::PathBuf> {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .ok()
+}
+
 pub(crate) fn server_binary_name() -> &'static str {
     if cfg!(windows) {
         "pond-server.exe"
@@ -238,13 +257,19 @@ fn candidate_binary_paths(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_binary_paths, current_exe_sibling, resolve_binary_path};
+    use super::{candidate_binary_paths, current_exe_sibling, dev_repo_root, resolve_binary_path};
 
     /// These tests mutate the process-global `POND_SERVER_BIN` env var, which is
     /// not safe to interleave with other tests reading it. Rust runs tests in a
     /// module concurrently by default, so serialize the env-touching ones behind
     /// a single mutex to keep them hermetic.
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dev_repo_root_resolves_to_the_actual_workspace_root() {
+        let root = dev_repo_root().expect("resolvable in this dev checkout");
+        assert!(root.join("extensions").join("music").is_dir());
+    }
 
     #[test]
     fn candidate_paths_include_bundle_dev_and_cwd_locations() {

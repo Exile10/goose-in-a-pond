@@ -113,6 +113,12 @@ jobs:
       - name: cargo check (production binary — pond-server + goose adapter)
         run: cargo check -p pond-server -p pond-adapters-goose
 
+      # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
+      # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/
+      # preprocess tests run here too — they need no ONNX Runtime library.
+      - name: cargo test (vision classifier — pond-adapters-vision-onnx)
+        run: cargo test -p pond-adapters-vision-onnx
+
   # 2: Frontend ─────────────────────────────────────────────────────────
   # Runs Vitest unit tests and Playwright E2E tests.
   # Playwright spins up the Vite dev server itself (no pond-server process needed —
