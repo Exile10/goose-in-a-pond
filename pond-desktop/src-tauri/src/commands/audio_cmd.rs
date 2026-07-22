@@ -507,14 +507,20 @@ pub async fn run_voice_pipeline(
     }
 
     // ── 2. Quip — fills silence during LLM inference (after transcription) ──
+    // Deliberately does NOT use the shared audio_handle: the quip plays
+    // concurrently with the thinking tone, and both can still be draining
+    // when the first real sentence starts — three sinks briefly competing for
+    // one shared mixer produced audible choppiness. Each gets its own
+    // independent stream instead; only the sequential per-sentence TTS
+    // playback below reuses the shared handle (that's what the persistent
+    // stream was meant to fix: churn *between sentences* of one response).
     let quip_text   = pick_quip();
     let quip_client = client.clone();
     let quip_url    = base_url.clone();
     let quip_kill   = kill_flag.clone();
-    let quip_audio  = audio_handle.clone();
     let quip_handle = tokio::spawn(async move {
         match fetch_tts_bytes(&quip_client, &quip_url, quip_text).await {
-            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, quip_kill, quip_audio).await; }
+            Ok(bytes) => { let _ = play_wav_bytes_interruptible(bytes, quip_kill, None).await; }
             Err(e)    => { tracing::debug!("Quip TTS skipped: {e}"); }
         }
     });
@@ -567,17 +573,11 @@ pub async fn run_voice_pipeline(
     let thinking_active = std::sync::Arc::new(AtomicBool::new(true));
     let thinking_flag   = thinking_active.clone();
     let tone_kill       = kill_flag.clone();
-    let tone_audio      = audio_handle.clone();
+    // Own stream, not the shared handle — see the quip comment above for why.
     let thinking_tone   = tokio::task::spawn_blocking(move || {
         use rodio::{OutputStream, Sink};
 
-        let (_owned_stream, handle) = match tone_audio {
-            Some(h) => (None, h),
-            None => {
-                let Ok((stream, handle)) = OutputStream::try_default() else { return };
-                (Some(stream), handle)
-            }
-        };
+        let Ok((_owned_stream, handle)) = OutputStream::try_default() else { return };
         let Ok(sink) = Sink::try_new(&handle) else { return };
         sink.set_volume(0.08); // very quiet — ambient, not distracting
 
