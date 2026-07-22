@@ -52,10 +52,14 @@ rsync -az --delete "${REPO_ROOT}/pond-desktop/dist/" "${HOST}:${REMOTE_REPO}/pon
 echo "==> [3/4] Release build on the Jetson (CUDA sm_87) — this is the slow step"
 # CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin; without it the
 # build ships compute_80 PTX that the driver JIT-compiles at first model load.
+# whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in
+# ~1-2.6s instead of a multi-second all-6-core CPU burst).
 ssh "$HOST" "cd ~/${REMOTE_REPO} \
   && PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true \
      CMAKE_CUDA_ARCHITECTURES=87 \
-     cargo build -p pond-server --features pond-adapters-local-inference/cuda --release"
+     cargo build -p pond-server \
+       --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
+       --release"
 
 echo "==> [4/4] Restarting service + health check"
 ssh "$HOST" "systemctl --user restart goose-in-a-pond.service && sleep 4 \

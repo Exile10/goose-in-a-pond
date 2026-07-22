@@ -1266,14 +1266,14 @@ async fn run_server(
             .await
         {
             Some((proc, port)) => (Some(proc), port),
-            None => (None, ports::LLAMAFILE),
+            None => (None, ports::llamafile_port()),
         }
     } else {
         println!(
             "  ⏭  LLM: llamafile skipped (provider = {})",
             settings.chat_provider
         );
-        (None, ports::LLAMAFILE)
+        (None, ports::llamafile_port())
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
@@ -2868,7 +2868,7 @@ async fn run_chat(
 
     // Auto-start llamafile only when the provider is explicitly "llamafile".
     // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
-    let mut llamafile_port = ports::LLAMAFILE;
+    let mut llamafile_port = ports::llamafile_port();
     let _llamafile_guard = if effective_provider == "llamafile" {
         match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model))
             .await
@@ -5720,7 +5720,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let settings = settings_repo.get().await.unwrap_or_default();
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
     // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
-    let llamafile_url = format!("http://127.0.0.1:{}", ports::LLAMAFILE);
+    let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
     // Wire weather from settings so giap__get_current_weather MCP tool is available.
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled

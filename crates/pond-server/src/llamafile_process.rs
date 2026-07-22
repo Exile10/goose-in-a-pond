@@ -152,7 +152,7 @@ pub async fn try_start(
     model_service: std::sync::Arc<pond_core::models::services::model_service::ModelService>,
     model_name: Option<&str>,
 ) -> Option<(LlamafileProcess, u16)> {
-    let base_port = crate::ports::LLAMAFILE;
+    let base_port = crate::ports::llamafile_port();
 
     if is_running(base_port).await {
         println!("  🧠 LLM already running at {}", url_for(base_port));
