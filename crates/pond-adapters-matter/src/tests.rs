@@ -82,13 +82,14 @@ async fn mock_matter_server(nodes: Value, push_events: Vec<Value>) -> (String, R
     (url, received)
 }
 
-/// The live MVD light from the real session: OnOff + LevelControl on ep 13.
+/// Same cluster layout as the light commissioned in the live session
+/// (OnOff + LevelControl on endpoint 13) — identical for real bulbs.
 fn light_node_json() -> Value {
     json!({
         "node_id": 2,
         "available": true,
         "attributes": {
-            "0/40/5": "Virtual OnOff Light",
+            "0/40/5": "Living Room Light",
             "13/6/0": false,
             "13/8/0": 1
         }
@@ -181,7 +182,7 @@ async fn bridge_syncs_fabric_nodes_into_the_device_registry() {
         start_adapter(json!([light_node_json(), occupancy_node_json()]), vec![]).await;
 
     let light = registry.get_device("matter-2").await.unwrap().unwrap();
-    assert_eq!(light.name, "Virtual OnOff Light");
+    assert_eq!(light.name, "Living Room Light");
     assert_eq!(light.device_type, "light");
     assert_eq!(light.capabilities, vec!["power", "brightness"]);
 
