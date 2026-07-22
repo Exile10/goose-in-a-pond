@@ -54,3 +54,8 @@ llama.log
 # Throwaway verification screenshots dropped at the repo root by Playwright /
 # manual UI checks (real assets live under */src/assets/)
 /*.png
+
+# Regenerated Playwright output (report + last-run state) — pure test
+# artifacts that churn on every run; never part of the source tree
+pond-desktop/playwright-report/
+pond-desktop/test-results/
