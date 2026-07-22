@@ -961,7 +961,10 @@ fn wake_listener_thread(
                                         }
                                     }
 
-                                    if silent_for >= POST_TRIGGER_SILENCE {
+                                    // Require heard_speech first, or a pre-command pause
+                                    // (e.g. "goose" ... "what's the weather") ends the
+                                    // window early and ships only the wake word.
+                                    if silent_for >= POST_TRIGGER_SILENCE && heard_speech {
                                         break;
                                     }
                                 }
@@ -985,6 +988,20 @@ fn wake_listener_thread(
                                     continuation.len() as u64 * 1000 / native_rate as u64,
                                 );
 
+                                // NOTE: deliberately NOT pre-arming `pipeline_active` here.
+                                // `run_voice_pipeline`'s own `compare_exchange(false, true, ..)`
+                                // (audio_cmd.rs) is the single source of truth for pipeline
+                                // ownership — it claims the flag once the command actually
+                                // starts running. Setting it here too, before that call ever
+                                // happens, means the compare_exchange finds it already `true`
+                                // and treats the real, first invocation as a duplicate: the
+                                // pipeline silently no-ops (no transcribe/chat/TTS, no events),
+                                // leaving the UI stuck on "thinking" and the flag never
+                                // legitimately released. There is a narrow window between this
+                                // emit and the frontend's `invoke("run_voice_pipeline")` where a
+                                // second "goose" would be treated as a fresh activation instead
+                                // of a barge-in — acceptable, since it's far rarer than breaking
+                                // every first activation.
                                 let _ = app.emit("wake-word-detected", command_wav);
                             }
 

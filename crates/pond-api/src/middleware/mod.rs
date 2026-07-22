@@ -148,6 +148,7 @@ fn is_public_route(path: &str) -> bool {
             | "/onboard/complete"
             | "/onboard/status"
             | "/transcribe"
+            | "/tts"              // public — local Piper, no user data leaked
             | "/voice/calibrate"   // POST/DELETE — used during onboarding WakeWord step
             | "/system/info"
             | "/test"
@@ -331,6 +332,7 @@ mod tests {
         assert!(is_public_route("/api/v1/onboard"));
         assert!(is_public_route("/api/v1/onboard/status"));
         assert!(is_public_route("/api/v1/transcribe"));
+        assert!(is_public_route("/api/v1/tts"));
         assert!(is_public_route("/api/v1/oauth/callback"));
         assert!(is_public_route("/api/v1/oauth/refresh"));
         assert!(!is_public_route("/api/v1/oauth/authorize"));

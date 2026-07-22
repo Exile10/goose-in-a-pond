@@ -101,6 +101,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
             as Arc<dyn OnboardingRepository + Send + Sync>,
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
+        transcribe_audio: None,
         session_storage,
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),

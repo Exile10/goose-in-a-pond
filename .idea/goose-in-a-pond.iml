@@ -45,6 +45,9 @@
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-sdk/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-agent/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-inference/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-vision/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-hf-cache/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-hf-cache/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/target" />

@@ -103,6 +103,7 @@ async fn make_app(handshake: Arc<dyn Handshake>) -> Harness {
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake,
         whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
         session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
         http_client: reqwest::Client::new(),
         agent: Arc::new(MockAgent::new()),

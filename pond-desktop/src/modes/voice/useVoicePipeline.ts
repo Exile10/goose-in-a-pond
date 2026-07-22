@@ -44,10 +44,23 @@ export function useVoicePipeline(): VoicePipelineAPI {
   const noSpeechTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wakeVariantsRef = useRef<string[]>([]);
 
   // Keep latest state accessible without stale closures
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // Re-arm the wake listener whenever we land back in "wait" without a
+  // pipeline having run (no speech / dismissal / manual abort). runPipeline's
+  // own finally block handles the case where a pipeline DID run — this
+  // covers every dead-end path that skips it. Kept as a ref (reassigned
+  // every render, called from closures created in effects) so it never
+  // captures a stale `wakeWord`.
+  const restartWakeListenerRef = useRef<() => void>(() => {});
+  restartWakeListenerRef.current = () => {
+    const backend = backendRef.current;
+    if (backend && wakeWord) backend.startWakeListener(wakeWord, wakeVariantsRef.current);
+  };
 
   // ── Cleanup helpers ────────────────────────────────────
 
@@ -143,7 +156,10 @@ export function useVoicePipeline(): VoicePipelineAPI {
         dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
         // If soft dismissal and wake word configured, return to wait
         if (!isExit && wakeWord) {
-          setTimeout(() => dispatch({ type: "SET_VOICE_STATE", payload: "wait" }), 500);
+          setTimeout(() => {
+            dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
+            restartWakeListenerRef.current();
+          }, 500);
         }
       };
     });
@@ -177,9 +193,11 @@ export function useVoicePipeline(): VoicePipelineAPI {
     // Load calibrated variants
     api.getSettings().then((s) => {
       const variants: string[] = (s as Record<string, unknown>).voice_wake_word_transcriptions as string[] ?? [];
+      wakeVariantsRef.current = variants;
       backend.startWakeListener(wakeWord, variants);
       dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
     }).catch(() => {
+      wakeVariantsRef.current = [];
       backend.startWakeListener(wakeWord, []);
       dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
     });
@@ -190,13 +208,20 @@ export function useVoicePipeline(): VoicePipelineAPI {
   // ── Conversational turn-taking ─────────────────────────
   // After Goose finishes speaking, auto-start recording.
   // If no speech within 8s, return to wake listening or idle.
+  //
+  // Also fires on a "thinking" -> "idle" transition: that's what a
+  // barge-in during thinking looks like (onWakeInterrupt sets state
+  // straight to "idle" without ever reaching "speaking"). Without this,
+  // interrupting mid-thought correctly stops the thinking tone but never
+  // starts listening for the follow-up — indistinguishable from the
+  // barge-in "not working" at all.
 
   useEffect(() => {
     const prev = prevStateRef.current;
     const curr = state.voiceState;
     prevStateRef.current = curr;
 
-    if (prev === "speaking" && curr === "idle") {
+    if ((prev === "speaking" || prev === "thinking") && curr === "idle") {
       // Goose finished speaking — auto-listen for next turn
       const backend = backendRef.current;
       if (!backend) return;
@@ -218,6 +243,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
         } else {
           // No speech detected — return to wake listening or idle
           dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });
+          restartWakeListenerRef.current();
         }
       });
 
@@ -227,6 +253,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
         if (stateRef.current.voiceState === "recording") {
           backend.abortRecording();
           dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });
+          restartWakeListenerRef.current();
         }
       }, NO_SPEECH_TIMEOUT_MS);
     }
@@ -297,6 +324,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
         });
       } else {
         dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });
+        restartWakeListenerRef.current();
       }
     });
   }
@@ -310,6 +338,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
     // We need a different approach — just let VAD naturally resolve
     backend.abortRecording();
     dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });
+    restartWakeListenerRef.current();
   }
 
   function abort() {
@@ -319,6 +348,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
     backend.abortRecording();
     backend.cancelPipeline();
     dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });
+    restartWakeListenerRef.current();
   }
 
   function clearConversation() {

@@ -502,7 +502,7 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  📂 Data directory: {}", data_dir.display());
 
     // Step 1: Check + auto-install system dependencies (Linux/macOS only)
-    println!("\n  [1/6] Checking system dependencies...");
+    println!("\n  [1/8] Checking system dependencies...");
     if system_deps::ensure_system_deps().await {
         println!("  ✅ System dependencies OK");
     } else {
@@ -513,7 +513,7 @@ async fn run_setup(model: &str) -> Result<()> {
     }
 
     // Step 2: Initialize databases + seed model catalog
-    println!("\n  [2/6] Initializing databases...");
+    println!("\n  [2/8] Initializing databases...");
     let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
@@ -611,7 +611,7 @@ async fn run_setup(model: &str) -> Result<()> {
         }
     };
     println!(
-        "\n  [3/6] Downloading Whisper ASR model ({})...",
+        "\n  [3/8] Downloading Whisper ASR model ({})...",
         effective_model
     );
     println!("  📁 Target: {}", expected_path.display());
@@ -633,19 +633,19 @@ async fn run_setup(model: &str) -> Result<()> {
     // Default build runs Whisper in-process via whisper-rs; no second binary needed.
     #[cfg(feature = "legacy-subprocess")]
     {
-        println!("\n  [4/6] Downloading whisper-server binary (legacy-subprocess)...");
+        println!("\n  [4/8] Downloading whisper-server binary (legacy-subprocess)...");
         let _ = model_download::download_whisper_binary(&data_dir).await;
     }
     #[cfg(not(feature = "legacy-subprocess"))]
     {
-        println!("\n  [4/6] Whisper runs in-process — no binary download needed.");
+        println!("\n  [4/8] Whisper runs in-process — no binary download needed.");
     }
 
     // Step 5: Piper TTS binary — only with the legacy-subprocess escape valve.
     // Default build runs Piper in-process via piper-rs.
     #[cfg(feature = "legacy-subprocess")]
     {
-        println!("\n  [5/6] Setting up Piper TTS subprocess (legacy-subprocess)...");
+        println!("\n  [5/8] Setting up Piper TTS subprocess (legacy-subprocess)...");
         let piper_bin_ok = model_download::download_piper_binary(&data_dir)
             .await
             .is_ok();
@@ -658,19 +658,104 @@ async fn run_setup(model: &str) -> Result<()> {
     }
     #[cfg(not(feature = "legacy-subprocess"))]
     {
-        println!(
-            "\n  [5/6] Piper runs in-process — select a voice model in the web Settings page."
-        );
+        println!("\n  [5/8] Checking Piper TTS voice model...");
+        let tts_dir = model_download::tts_models_dir(&data_dir);
+        let has_voice_model = std::fs::read_dir(&tts_dir)
+            .ok()
+            .map(|mut d| {
+                d.any(|e| {
+                    e.ok()
+                        .and_then(|e| e.path().extension().map(|x| x == "onnx"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if has_voice_model {
+            println!("  ✅ Piper voice model found.");
+        } else {
+            println!("  ⚠  No Piper voice model downloaded yet.");
+            println!("     Go to Settings → Voice in the web UI to download a voice.");
+        }
     }
 
     // Step 6: ONNX Runtime — detect or auto-download
-    println!("\n  [6/7] Checking ONNX Runtime...");
+    println!("\n  [6/8] Checking ONNX Runtime...");
     ensure_onnx_runtime();
+    match std::env::var("ORT_DYLIB_PATH") {
+        Ok(p) => println!("  ✅ ONNX Runtime: {}", p),
+        Err(_) => {
+            println!("  ⚠  ONNX Runtime not found — Piper TTS and face recognition will not work.");
+            println!("     Install manually: brew install onnxruntime  (macOS)");
+            println!("     or: apt install libonnxruntime-dev  (Linux)");
+        }
+    }
 
-    // Step 7 (face-onnx feature only): face recognition models
+    // Step 7: espeak-ng-data — required by piper-rs for phonemization
+    println!("\n  [7/8] Checking espeak-ng-data...");
+    {
+        let espeak_path = data_dir.join("bin").join("espeak-ng-data");
+        if espeak_path.exists() {
+            println!("  ✅ espeak-ng-data found at {}", espeak_path.display());
+        } else {
+            // Check if espeak-ng is installed via Homebrew and create the symlink
+            let brew_path = std::path::Path::new("/opt/homebrew/share/espeak-ng-data");
+            let usr_path = std::path::Path::new("/usr/share/espeak-ng-data");
+            let source = if brew_path.exists() {
+                Some(brew_path)
+            } else if usr_path.exists() {
+                Some(usr_path)
+            } else {
+                None
+            };
+            if let Some(src) = source {
+                if let Some(parent) = espeak_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                #[cfg(unix)]
+                match std::os::unix::fs::symlink(src, &espeak_path) {
+                    Ok(_) => println!("  ✅ Created espeak-ng-data symlink → {}", src.display()),
+                    Err(e) => println!("  ⚠  Could not symlink espeak-ng-data: {e}"),
+                }
+                #[cfg(not(unix))]
+                println!("  ⚠  espeak-ng-data not found at expected path. Install espeak-ng.");
+            } else {
+                println!("  ⚠  espeak-ng-data not found. Piper TTS will fail.");
+                println!("     Run: brew install espeak-ng");
+            }
+        }
+    }
+
+    // Step 8: Microphone access check
+    println!("\n  [8/8] Checking microphone access...");
+    {
+        use cpal::traits::HostTrait;
+        let host = cpal::default_host();
+        match host.default_input_device() {
+            Some(dev) => {
+                use cpal::traits::DeviceTrait;
+                let name = dev.name().unwrap_or_else(|_| "unknown".to_string());
+                println!("  ✅ Microphone available: {}", name);
+            }
+            None => {
+                println!("  ⚠  No microphone input device found.");
+                #[cfg(target_os = "macos")]
+                {
+                    println!("     On macOS this usually means microphone permission is denied.");
+                    println!("     Go to System Settings → Privacy & Security → Microphone");
+                    println!("     and enable access for your terminal app.");
+                }
+                #[cfg(target_os = "linux")]
+                println!(
+                    "     Check that ALSA or PulseAudio is configured and a mic is connected."
+                );
+            }
+        }
+    }
+
+    // Step 9 (face-onnx feature only): face recognition models
     #[cfg(feature = "face-onnx")]
     {
-        println!("\n  [7/7] Setting up face recognition models...");
+        println!("\n  [9/9] Setting up face recognition models...");
         if let Err(e) = model_download::download_face_models(&data_dir).await {
             println!("  ⚠  Face model setup failed: {} — face recognition will be disabled until you add the files manually", e);
         }
@@ -984,6 +1069,25 @@ async fn run_server(
     } else {
         format!("http://127.0.0.1:{}", whisper_port)
     };
+
+    // In-process whisper for the HTTP transcribe route — avoids the external
+    // whisper.cpp subprocess. Built here so AppState can hold the closure without
+    // depending on pond-adapters-whisper.
+    let transcribe_audio: Option<Arc<dyn Fn(Vec<u8>) -> anyhow::Result<String> + Send + Sync>> =
+        whisper_model_path.as_ref().and_then(|p| {
+            match WhisperRsInput::new(p.clone()) {
+                Ok(w) => {
+                    let w = Arc::new(w);
+                    Some(Arc::new(move |wav_bytes: Vec<u8>| {
+                        w.transcribe_wav_bytes(&wav_bytes)
+                    }) as Arc<dyn Fn(Vec<u8>) -> anyhow::Result<String> + Send + Sync>)
+                }
+                Err(e) => {
+                    tracing::warn!("in-process whisper init failed, transcribe route will proxy to external: {e}");
+                    None
+                }
+            }
+        });
 
     // Piper voice path — None when no voice is configured (skips all piper startup).
     // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
@@ -2327,6 +2431,7 @@ async fn run_server(
         onboarding_repo,
         handshake: handshake.clone(),
         whisper_url: whisper_url.clone(),
+        transcribe_audio,
         session_storage,
         http_client: reqwest::Client::new(),
         agent,
@@ -2648,6 +2753,10 @@ async fn run_chat(
     println!("  ╚═══════════════════════════════════════╝");
 
     let data_dir = default_data_dir();
+    // Must run before any ONNX-dependent init (Piper TTS). `serve` and `setup`
+    // already call this; without it here ORT_DYLIB_PATH is never set and
+    // Piper::new() hangs indefinitely.
+    ensure_onnx_runtime();
     let db = Database::init(&data_dir).await?;
 
     // Install the audit MCP server's read handle so the giap-audit extension works

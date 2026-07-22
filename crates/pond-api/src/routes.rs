@@ -891,7 +891,10 @@ struct TtsRequest {
 /// Synthesise speech server-side and return WAV audio bytes.
 ///
 /// Priority order:
-/// 1. Piper HTTP server (if running — see `AppState.piper_http_port`)
+/// 1. In-process `VoiceOutput` (`AppState.tts` — the default build's
+///    `PiperRsOutput`, no subprocess or extra port involved).
+/// 2. Legacy Piper HTTP server (if running — see `AppState.piper_http_port`),
+///    for `--features legacy-subprocess` builds.
 async fn tts_synthesise(
     State(state): State<Arc<AppState>>,
     body: Result<Json<TtsRequest>, JsonRejection>,
@@ -909,6 +912,30 @@ async fn tts_synthesise(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "'text' must not be empty"})),
         ));
+    }
+
+    if let Some(tts) = &state.tts {
+        match tts.synthesize(text).await {
+            Ok(Some(wav_bytes)) => {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "audio/wav")
+                    .body(Body::from(wav_bytes))
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("Failed to build TTS response: {}", e)})),
+                        )
+                    });
+            }
+            Ok(None) => {
+                // Engine ran but produced no audio (e.g. silent/empty synthesis) —
+                // fall through to the legacy HTTP path rather than erroring.
+            }
+            Err(e) => {
+                tracing::warn!("in-process TTS synthesis failed, trying legacy HTTP path: {e}");
+            }
+        }
     }
 
     let Some(port) = state.piper_http_port else {
@@ -4505,7 +4532,27 @@ async fn transcribe(
         )
     })?;
 
-    // Forward to whisper.cpp /inference
+    // In-process transcription — no external binary needed.
+    if let Some(transcribe_fn) = &state.transcribe_audio {
+        let fn_clone = transcribe_fn.clone();
+        let transcript = tokio::task::spawn_blocking(move || fn_clone(bytes))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("transcription task panicked: {e}")})),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("transcription failed: {e}")})),
+                )
+            })?;
+        return Ok(Json(json!({"text": transcript})));
+    }
+
+    // Forward to external whisper.cpp /inference
     let whisper_url = format!("{}/inference", state.whisper_url);
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename)

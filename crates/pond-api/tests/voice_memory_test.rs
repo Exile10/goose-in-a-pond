@@ -102,6 +102,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: String::new(),
+        transcribe_audio: None,
         session_storage,
         http_client: ReqwestClient::new(),
         agent,
