@@ -183,10 +183,13 @@ fn main() {
             tray::build_tray(&handle)?;
 
             // Reap any leftover terminal-voice child from a previous run that
-            // crashed or was force-killed before it could stop cleanly. This
-            // mirrors ServerProcess's orphan-cleanup discipline and guarantees
-            // the VoiceChildActive flag starts false so the mic paths are not
-            // spuriously gated on launch.
+            // crashed or was force-killed before it could stop cleanly, and
+            // reset the VoiceChildActive flag so the mic paths are not spuriously
+            // gated on launch. A freshly-constructed VoiceChatProcess has an
+            // empty in-memory slot, so this relies on the pidfile written at
+            // spawn to find a child orphaned by a hard kill of the shell — the
+            // pid is validated (alive AND a live `pond-server chat` process)
+            // before it is killed, so a reused pid is never touched.
             handle.state::<VoiceChatProcess>().cleanup_orphaned_child();
 
             // Connect to (or spawn) pond-server in background

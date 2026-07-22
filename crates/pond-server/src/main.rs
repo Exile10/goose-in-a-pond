@@ -2665,6 +2665,23 @@ fn spawn_desktop_app(server_port: u16) {
     }
 }
 
+/// Write one `WorkflowEvent` to stdout as a single NDJSON line (JSON + `\n`,
+/// flushed immediately). This is the single framing helper for the
+/// `--json-events` contract; both the streaming event sink and the
+/// `ready`/`error`/`exit` lifecycle emissions in `run_chat` route through it so
+/// they can never drift into two inconsistently-framed families on the same
+/// pipe. Broken-pipe/partial-write errors are ignored: a dead shell means the
+/// child is being torn down anyway.
+fn write_ndjson_line(ev: &pond_core::shared::domain::agent::WorkflowEvent) {
+    use std::io::Write as _;
+    if let Some(line) = ev.to_ndjson() {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(line.as_bytes());
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
@@ -2679,12 +2696,20 @@ async fn run_chat(
 ) -> Result<()> {
     // In `--json-events` mode, stdout carries NOTHING but NDJSON lines. All the
     // human-facing banners/prompts below route through `out!`, which no-ops when
-    // json_events is set. Diagnostics still reach stderr via `eprintln!`.
+    // json_events is set. Diagnostics still reach stderr via `eout!`.
     macro_rules! out {
         ($($arg:tt)*) => {
             if !json_events {
                 println!($($arg)*);
             }
+        };
+    }
+
+    // Error/diagnostic output. Always writes to stderr, so it survives
+    // `--json-events` mode (which reserves stdout exclusively for NDJSON).
+    macro_rules! eout {
+        ($($arg:tt)*) => {
+            eprintln!($($arg)*);
         };
     }
 
@@ -2966,7 +2991,10 @@ async fn run_chat(
     #[cfg(feature = "goose-agent")]
     let agent: Arc<dyn Agent> = {
         // Persist CLI overrides so GooseAdapter reads the right provider + model.
-        if provider.is_some() || model.is_some() {
+        // `--provider mock` is a test/dev-only shortcut that routes to MockAgent and
+        // never consults the DB provider, so we must NOT write "mock" into the user's
+        // real settings — a later `serve` would read it back and break live chat.
+        if (provider.is_some() || model.is_some()) && effective_provider != "mock" {
             let mut s = settings.clone();
             s.chat_provider = effective_provider.to_string();
             s.chat_model = effective_model.to_string();
@@ -3079,17 +3107,9 @@ async fn run_chat(
     // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
     // Tauri shell parses these lines to drive the desktop voice UI.
     if json_events {
-        use std::io::Write as _;
         let sink: pond_core::shared::services::chat::WorkflowEventSink =
             Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {
-                if let Some(line) = event.to_ndjson() {
-                    let mut stdout = std::io::stdout().lock();
-                    // Best-effort: a broken pipe means the shell went away; the
-                    // loop will exit on stdin EOF shortly after regardless.
-                    let _ = stdout.write_all(line.as_bytes());
-                    let _ = stdout.write_all(b"\n");
-                    let _ = stdout.flush();
-                }
+                write_ndjson_line(event);
             });
         chat_service = chat_service
             .with_event_sink(sink)
@@ -3182,12 +3202,42 @@ async fn run_chat(
             Some(p) => match WhisperRsInput::new(p.clone()) {
                 Ok(w) => Some(Arc::new(w)),
                 Err(e) => {
+                    // Whisper was explicitly requested but failed to load. Under
+                    // --json-events, out! is a no-op, so a bare warning would leave
+                    // the desktop shell with a deaf session and zero diagnostics.
+                    // Surface it on stderr (eout!) AND as an NDJSON error event so
+                    // the UI can tell voice input is unavailable before we degrade
+                    // to stdin (which the shell holds open and never writes to).
+                    eout!("  WARN: In-process whisper load failed: {}", e);
+                    eout!("     Falling back to stdin input.");
                     out!("  ⚠  In-process whisper load failed: {}", e);
                     out!("     Falling back to stdin input.");
+                    if json_events {
+                        write_ndjson_line(
+                            &pond_core::shared::domain::agent::WorkflowEvent::Error {
+                                message: format!(
+                                    "voice input unavailable: whisper model failed to load ({e}); falling back to stdin"
+                                ),
+                            },
+                        );
+                    }
                     None
                 }
             },
-            None => None,
+            None => {
+                // whisper requested but no usable model path (download failed or
+                // model not in catalog — already warned above via out!). Same
+                // deaf-session hazard under --json-events: surface it.
+                eout!("  WARN: whisper model unavailable — falling back to stdin input.");
+                if json_events {
+                    write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
+                        message:
+                            "voice input unavailable: whisper model missing; falling back to stdin"
+                                .to_string(),
+                    });
+                }
+                None
+            }
         }
     } else {
         None
@@ -3259,6 +3309,20 @@ async fn run_chat(
             Arc::new(PrintOutput)
         }
     };
+    // Same as text_fallback, but first surfaces WHY voice output is unavailable as
+    // a non-fatal NDJSON error event. Under --json-events the SilentOutput fallback
+    // makes a broken-TTS session protocol-indistinguishable from a working one
+    // (state:speak + tokens stream while zero audio plays); this lets the UI tell
+    // the user the response is text-only and why. Non-json runs get PrintOutput and
+    // still see the answer, so only the event differs.
+    let tts_unavailable = |reason: &str| -> Arc<dyn VoiceOutput> {
+        if json_events {
+            write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
+                message: format!("voice output unavailable: {reason}; response is text-only"),
+            });
+        }
+        text_fallback()
+    };
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "piper" => {
             // Resolve model path: CLI arg → settings → warn and fall back to text
@@ -3272,7 +3336,7 @@ async fn run_chat(
                 None
             };
             match model_path_opt {
-                None => text_fallback(),
+                None => tts_unavailable("piper requested but no voice model configured"),
                 Some(model_path) => {
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
@@ -3330,7 +3394,7 @@ async fn run_chat(
                     {
                         if !model_path.exists() || !config_path.exists() {
                             out!("  TTS:      piper unavailable (model or config missing) — falling back to print");
-                            text_fallback()
+                            tts_unavailable("piper model or config missing")
                         } else {
                             match PiperRsOutput::new(model_path.clone(), config_path) {
                                 Ok(out) => {
@@ -3352,7 +3416,7 @@ async fn run_chat(
                                         "  TTS:      piper unavailable (load failed: {}) — falling back to print",
                                         e
                                     );
-                                    text_fallback()
+                                    tts_unavailable(&format!("piper load failed: {e}"))
                                 }
                             }
                         }
@@ -3382,7 +3446,7 @@ async fn run_chat(
                             }
                             None => {
                                 out!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                                text_fallback()
+                                tts_unavailable("piper binary not found")
                             }
                         }
                     }
@@ -3390,6 +3454,8 @@ async fn run_chat(
             }
         }
         _ => {
+            // Text output was explicitly selected (effective_tts != "piper"); this
+            // is not a failure, so no error event — text-only is the intended mode.
             out!("  TTS:      print");
             text_fallback()
         }
@@ -3403,24 +3469,15 @@ async fn run_chat(
     // error we emit `exit` with reason "error" below.
     if json_events {
         use pond_core::shared::domain::agent::WorkflowEvent;
-        use std::io::Write as _;
-        let write_line = |ev: &WorkflowEvent| {
-            if let Some(line) = ev.to_ndjson() {
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(line.as_bytes());
-                let _ = stdout.write_all(b"\n");
-                let _ = stdout.flush();
-            }
-        };
-        write_line(&WorkflowEvent::Ready {
+        write_ndjson_line(&WorkflowEvent::Ready {
             session_id: session_id.clone(),
         });
 
         if let Err(e) = chat_service.run_loop().await {
-            write_line(&WorkflowEvent::Error {
+            write_ndjson_line(&WorkflowEvent::Error {
                 message: e.to_string(),
             });
-            write_line(&WorkflowEvent::Exit {
+            write_ndjson_line(&WorkflowEvent::Exit {
                 reason: "error".to_string(),
             });
             return Err(e);

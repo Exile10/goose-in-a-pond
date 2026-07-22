@@ -12,6 +12,7 @@
     "test": "vitest run",
     "tauri": "tauri",
     "stage:server": "bash ../scripts/stage-server-sidecar.sh",
+    "stage:server:stub": "bash ../scripts/stage-server-sidecar-stub.sh",
     "bundle:app": "npm run stage:server && npm run tauri build"
   },
   "dependencies": {
