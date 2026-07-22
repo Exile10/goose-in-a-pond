@@ -112,6 +112,8 @@ fn missing_deps() -> Vec<&'static str> {
     if !has_pkg_config() {
         missing.push("pkg-config");
     }
+    // ALSA is Linux-only; macOS uses CoreAudio which is always available.
+    #[cfg(target_os = "linux")]
     if !pkg_config_exists("alsa") {
         missing.push("ALSA dev headers (libasound2-dev)");
     }

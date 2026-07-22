@@ -129,6 +129,10 @@ pub struct AppState {
     pub onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
     /// Base URL of the whisper.cpp server (e.g. "http://127.0.0.1:9000").
     pub whisper_url: String,
+    /// In-process transcription callback. When `Some`, the `POST /api/v1/transcribe`
+    /// handler uses this instead of proxying to the external whisper server.
+    /// Receives raw WAV bytes, returns the transcript string.
+    pub transcribe_audio: Option<Arc<dyn Fn(Vec<u8>) -> anyhow::Result<String> + Send + Sync>>,
     /// Session storage for conversation persistence.
     pub session_storage: Arc<dyn SessionStorage>,
     /// Shared HTTP client — reuse across requests to get connection pooling.

@@ -113,6 +113,7 @@ fn main() {
         .manage(audio_cmd::AudioKillSwitch::new())
         .manage(audio_cmd::PipelineActive::new())
         .manage(audio_cmd::SpeculativeLlmSlot::new())
+        .manage(audio_cmd::SharedAudioOutput::new())
         // ── Commands ─────────────────────────────────────────────────────────
         .invoke_handler(tauri::generate_handler![
             server_cmd::get_server_url,
