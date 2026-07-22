@@ -214,6 +214,47 @@ describe("reducer — context cards", () => {
     expect(next.contextCards[0].tool).toBe("giap__weather");
   });
 
+  it("UPDATE_CONTEXT_CARD merges data into the most-recent matching card", () => {
+    const c1 = card({ id: 1, callId: "call-1", data: { id: "call-1" } });
+    const c2 = card({ id: 2, callId: "call-2", data: { id: "call-2" } });
+    const s = { ...BASE, contextCards: [c1, c2] };
+    const next = reducer(s, {
+      type: "UPDATE_CONTEXT_CARD",
+      payload: { callId: "call-1", data: { result: "22C" } },
+    });
+    expect(next.contextCards[0].data).toMatchObject({ id: "call-1", result: "22C" });
+    // c2 is unchanged
+    expect(next.contextCards[1].data).toEqual({ id: "call-2" });
+  });
+
+  it("UPDATE_CONTEXT_CARD is a no-op when no card matches and no tool is given", () => {
+    const c = card({ id: 1, callId: "call-1" });
+    const s = { ...BASE, contextCards: [c] };
+    const next = reducer(s, {
+      type: "UPDATE_CONTEXT_CARD",
+      payload: { callId: "nonexistent", data: { result: "x" } },
+    });
+    expect(next).toBe(s); // same reference = no change
+  });
+
+  it("UPDATE_CONTEXT_CARD upserts an orphan result as a new card when a tool is provided", () => {
+    const c = card({ id: 1, callId: "call-1" });
+    const s = { ...BASE, contextCards: [c] };
+    const next = reducer(s, {
+      type: "UPDATE_CONTEXT_CARD",
+      payload: { callId: "orphan", tool: "giap__news", data: { result: "headline" } },
+    });
+    // The orphan result surfaces as its own card rather than being dropped.
+    expect(next.contextCards).toHaveLength(2);
+    expect(next.contextCards[1]).toMatchObject({
+      tool: "giap__news",
+      callId: "orphan",
+      data: { result: "headline" },
+    });
+    // The pre-existing card is untouched.
+    expect(next.contextCards[0]).toBe(c);
+  });
+
   it("CLEAR_CONTEXT_CARDS empties the card list", () => {
     const s = { ...BASE, contextCards: [card(), card({ id: 2 })] };
     const next = reducer(s, { type: "CLEAR_CONTEXT_CARDS" });

@@ -180,6 +180,16 @@ test.describe("Voice session child-process mode (Architecture A)", () => {
     await expect(page.getByText(/e2e-ch/i)).toBeVisible({ timeout: 5_000 });
   });
 
+  test("voice-state wait -> wake-word listening label appears (finding 17)", async ({ page }) => {
+    await navigateToVoiceMode(page);
+    await emitEvent(page, "voice-ready", { session_id: "sess-wait" });
+    await page.waitForTimeout(100);
+
+    await emitEvent(page, "voice-state", "wait");
+    // STATE_LABELS["wait"] = "Listening for wake word..." — orb shows the dedicated wait state
+    await expect(page.getByText(/listening for wake word/i).first()).toBeVisible({ timeout: 5_000 });
+  });
+
   test("voice-state listen -> Listening label appears", async ({ page }) => {
     await navigateToVoiceMode(page);
     await emitEvent(page, "voice-ready", { session_id: "sess-1" });

@@ -47,8 +47,18 @@ impl Default for AudioState {
 
 /// Managed state for the background wake-word listening loop.
 pub struct WakeListenerState {
+    /// The user-facing "listener wanted" flag. Set true on start and flipped
+    /// false *eagerly* by `stop_wake_listener` (it is also the loop's stop
+    /// signal), so it goes false before the OS thread has actually torn down
+    /// its cpal input stream.
     pub is_running: Arc<AtomicBool>,
     pub stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    /// True while the listener's OS thread is actually alive and (may be)
+    /// holding the mic. Set true at spawn and cleared ONLY by the thread itself
+    /// as it exits — after its cpal input stream has been dropped. Unlike
+    /// `is_running`, this is a faithful "mic released" signal, so a mic handoff
+    /// (voice child spawn) can wait on it before opening the device.
+    pub thread_active: Arc<AtomicBool>,
 }
 
 impl WakeListenerState {
@@ -56,7 +66,14 @@ impl WakeListenerState {
         Self {
             is_running: Arc::new(AtomicBool::new(false)),
             stop_tx: Arc::new(Mutex::new(None)),
+            thread_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the listener's OS thread is still alive (and may hold the mic).
+    /// See [`WakeListenerState::thread_active`].
+    pub fn thread_is_active(&self) -> bool {
+        self.thread_active.load(Ordering::SeqCst)
     }
 }
 
@@ -616,12 +633,16 @@ pub fn start_wake_listener(
     app: tauri::AppHandle,
     pipeline_active: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // Cancel any existing listener first
+    // Cancel any existing listener first, then wait for its thread to actually
+    // release the mic so a fast restart does not open two cpal input streams.
     stop_wake_listener(state);
+    wait_for_wake_thread_exit(state, Duration::from_secs(1));
 
     state.is_running.store(true, Ordering::SeqCst);
+    state.thread_active.store(true, Ordering::SeqCst);
 
     let is_running = Arc::clone(&state.is_running);
+    let thread_active = Arc::clone(&state.thread_active);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
 
@@ -636,12 +657,35 @@ pub fn start_wake_listener(
             pipeline_active,
         );
         is_running.store(false, Ordering::SeqCst);
+        // Cleared last: the cpal input stream owned by wake_listener_thread has
+        // been dropped by the time we reach here, so this is the faithful
+        // "mic released" signal a mic handoff waits on.
+        thread_active.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             tracing::error!("Wake listener thread error: {e}");
         }
     });
 
     Ok(())
+}
+
+/// Block (bounded) until the wake listener's OS thread has exited and released
+/// the mic, or the timeout elapses. Returns `true` if the thread exited within
+/// the budget, `false` on timeout (the caller may then proceed with a warning).
+///
+/// Used during the mic handoff to the voice child: `stop_wake_listener` only
+/// *signals* the thread and flips `is_running` eagerly, so without this a fast
+/// handoff could open the child's mic while the listener still holds the device.
+pub fn wait_for_wake_thread_exit(state: &WakeListenerState, timeout: Duration) -> bool {
+    const POLL: Duration = Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !state.thread_is_active() {
+            return true;
+        }
+        thread::sleep(POLL);
+    }
+    !state.thread_is_active()
 }
 
 /// Stop the background wake-word listening loop.

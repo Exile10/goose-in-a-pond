@@ -90,7 +90,14 @@ fn pick_quip() -> &'static str {
 pub async fn start_recording(
     app: AppHandle,
     audio_state: State<'_, AudioState>,
+    voice: State<'_, crate::chat_process::VoiceChatProcess>,
 ) -> Result<(), String> {
+    // A terminal-voice child owns the mic exclusively while active — refuse to
+    // open a second capture stream that would fight it for the device.
+    if voice.is_active() {
+        return Err("voice session active".to_string());
+    }
+
     let app_clone = app.clone();
     audio::start_capture(&audio_state, move |level| {
         let _ = app_clone.emit("audio-level", level);
@@ -305,7 +312,15 @@ pub async fn start_wake_listener(
     wake_state: State<'_, WakeListenerState>,
     server: State<'_, ServerProcess>,
     pipeline_flag: State<'_, PipelineActive>,
+    voice: State<'_, crate::chat_process::VoiceChatProcess>,
 ) -> Result<(), String> {
+    // A terminal-voice child owns the mic exclusively while active — refuse to
+    // start the shell's own wake listener, which would open a competing cpal
+    // capture stream on the same device.
+    if voice.is_active() {
+        return Err("voice session active".to_string());
+    }
+
     let base_url = server.get_url();
     let variants = variants.unwrap_or_default();
     let pipeline_active = pipeline_flag.0.clone();

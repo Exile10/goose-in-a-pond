@@ -144,7 +144,9 @@ impl VoiceInput for WhisperInput {
             // but the user may still be speaking.  Decode what we have, continue
             // recording from the mic until silence, combine, then transcribe.
             let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-                println!("  🎤 Listening...");
+                // stderr: adapter may be wired into the --json-events chat path,
+                // whose stdout is reserved exclusively for NDJSON.
+                eprintln!("  🎤 Listening...");
 
                 // Decode the pre-captured 16kHz WAV.
                 let (captured_samples, captured_rate) = decode_wav_mono_f32(&wav)?;
@@ -181,7 +183,8 @@ impl VoiceInput for WhisperInput {
         } else {
             // Normal path: VAD-aware recording — waits for speech, stops on silence.
             let wav_bytes = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-                println!("  🎤 Listening...");
+                // stderr: see the sibling branch above (NDJSON stdout contract).
+                eprintln!("  🎤 Listening...");
                 let (samples, sample_rate, _speculative) = record_mono_f32_vad(
                     10,         // max 10s waiting for speech to start
                     max_record, // hard cap on total recording
@@ -1208,7 +1211,9 @@ fn detection_loop(
                 transcript,
                 triggers
             );
-            println!("  🟢 Wake word detected!");
+            // stderr: this detector runs on the --json-events chat path, whose
+            // stdout is reserved exclusively for NDJSON.
+            eprintln!("  🟢 Wake word detected!");
             play_wake_ping();
 
             // VAD-gated post-trigger: poll every 50 ms and exit as soon as the

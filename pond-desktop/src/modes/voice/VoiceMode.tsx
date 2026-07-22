@@ -14,7 +14,7 @@
 // appropriate hook for the runtime.
 // ────────────────────────────────────────────────────────────
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect } from "react";
 import { Button } from "@heroui/react";
 import { ChevronLeft, Mic, Square, Trash2, Radio } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
@@ -83,11 +83,12 @@ function VoiceModeChildProcess() {
   const isError     = voiceState === "error";
   const serverDown  = !state.serverOnline;
 
-  // Start the session on mount; stop it on unmount.
-  const startedRef = useRef(false);
+  // Start the session on mount; stop it on every cleanup.
+  // No startedRef guard — the effect is symmetric so React StrictMode's
+  // dev double-invoke (mount -> cleanup -> mount) results in
+  // start/stop/start and lands with a live session.  The Rust-side
+  // is_active() check prevents a double-spawn on the second start.
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
     session.startSession();
 
     return () => {
@@ -189,7 +190,6 @@ function VoiceModeChildProcess() {
           <Button
             variant="ghost" size="sm"
             onPress={() => session.stopSession()}
-            isDisabled={serverDown}
           >
             <Square size={13} fill="currentColor" /> Stop session
           </Button>

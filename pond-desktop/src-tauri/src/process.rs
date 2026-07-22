@@ -188,7 +188,7 @@ impl Default for ServerProcess {
 /// time, but only if that path still exists on disk — true on the dev
 /// machine that built this binary, false anywhere else (e.g. a bundled app
 /// on an end user's machine).
-fn dev_repo_root() -> Option<std::path::PathBuf> {
+pub(crate) fn dev_repo_root() -> Option<std::path::PathBuf> {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")

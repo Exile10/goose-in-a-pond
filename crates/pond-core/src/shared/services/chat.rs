@@ -76,12 +76,15 @@ fn is_dismissal_or_exit_phrase(text: &str) -> bool {
 /// serialized JSON is always valid. Sub-cap payloads are returned unchanged.
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
-fn truncate_tool_result(content: &str) -> String {
-    if content.chars().count() <= TOOL_RESULT_MAX_CHARS {
-        content.to_string()
-    } else {
-        content.chars().take(TOOL_RESULT_MAX_CHARS).collect()
+fn truncate_tool_result(mut content: String) -> String {
+    // Find the byte offset of the (MAX+1)-th char. `char_indices().nth(N)`
+    // early-exits after N+1 chars, so sub-cap payloads pay at most a bounded
+    // scan and never a full `chars().count()`; the caller owns the String, so we
+    // truncate in place with zero extra allocation on either branch.
+    if let Some((byte_idx, _)) = content.char_indices().nth(TOOL_RESULT_MAX_CHARS) {
+        content.truncate(byte_idx);
     }
+    content
 }
 
 /// Human-readable announcement spoken while an MCP tool is executing.
@@ -1772,6 +1775,20 @@ impl ChatService {
                     // dropped from history. (#153)
                     let tail = thought_filter.flush();
                     if !tail.is_empty() {
+                        // Emit the tail as a Token too, so the desktop caption/
+                        // transcript (built solely from `Token` events) matches the
+                        // text that is spoken and persisted — otherwise the UI bubble
+                        // ends short of the reply. Mirror the streamed-delta path:
+                        // ensure Speak has fired first so Token never precedes it.
+                        if !spoken_first {
+                            self.emit_event(WorkflowEvent::StateChanged {
+                                state: WorkflowState::Speak,
+                            });
+                            spoken_first = true;
+                        }
+                        self.emit_event(WorkflowEvent::Token {
+                            content: tail.clone(),
+                        });
                         full_text.push_str(&tail);
                         sentence_buf.push_str(&tail);
                     }
@@ -1799,7 +1816,7 @@ impl ChatService {
                     // Surface the tool result to the event sink (NDJSON).
                     // Not spoken — informational only. Truncate to the contract's
                     // 2000-char cap so a huge tool payload cannot bloat one line.
-                    let content = truncate_tool_result(&content);
+                    let content = truncate_tool_result(content);
                     self.emit_event(WorkflowEvent::ToolResult { tool, id, content });
                 }
                 AgentStreamEvent::Status { .. }
@@ -1823,6 +1840,17 @@ impl ChatService {
         // complete on this path too — the second, previously-unfixed flush. (#153)
         let tail = thought_filter.flush();
         if !tail.is_empty() {
+            // Emit the tail as a Token too (see the Done branch): keep the caption
+            // feed in sync with the spoken/persisted text on the no-Done path.
+            if !spoken_first {
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Speak,
+                });
+                spoken_first = true;
+            }
+            self.emit_event(WorkflowEvent::Token {
+                content: tail.clone(),
+            });
             full_text.push_str(&tail);
             sentence_buf.push_str(&tail);
         }
@@ -2301,9 +2329,16 @@ impl ChatService {
     /// non-raced (`supports_interruption() == false`) paths so persistence and
     /// event emission never drift between them.
     ///
-    /// Returns `true` on success, `false` on a stream/join error (the caller
-    /// then resets to wake-word mode). On error NOTHING is persisted and NO
-    /// `TurnComplete` is emitted — the exactly-once + none-on-failure invariant.
+    /// Returns `true` when the loop should stay in conversational mode, `false`
+    /// on a stream/join error (the caller then resets to wake-word mode).
+    ///
+    /// On a stream/join error NOTHING is persisted. On a *persistence* failure the
+    /// reply was already fully streamed and spoken to the user, so we do NOT reset
+    /// to wake-word mode (that would kick the user out mid-conversation for a reply
+    /// they just heard): we log + emit an `Error` for observability, SKIP
+    /// `TurnComplete` (persistence is that event's contract — the turn is absent
+    /// from history), and return `true` to keep the loop alive. `TurnComplete` is
+    /// still emitted exactly once, and only when the turn actually persisted.
     async fn finalize_confirmed_turn(
         &self,
         chat_result: std::result::Result<Result<String>, tokio::task::JoinError>,
@@ -2314,11 +2349,15 @@ impl ChatService {
                 // Persist the confirmed turn exactly once (user + assistant),
                 // keyed to the confirmed transcript.
                 if let Err(e) = self.persist_confirmed_turn(input, &response_text).await {
+                    // Persistence failed (e.g. transient SQLITE_BUSY from serve +
+                    // child both writing the WAL). The reply is already spoken, so
+                    // surface the error but keep the conversation going — no
+                    // TurnComplete (nothing landed in history), no wake-word reset.
                     tracing::warn!("Failed to persist confirmed turn: {}", e);
                     self.emit_event(WorkflowEvent::Error {
                         message: format!("failed to persist turn: {e}"),
                     });
-                    return false;
+                    return true;
                 }
                 self.emit_event(WorkflowEvent::AgentOutput(response_text));
                 self.emit_event(WorkflowEvent::TurnComplete {
@@ -2405,6 +2444,41 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
+    }
+
+    // ── truncate_tool_result (NDJSON 2000-char cap) ──────────────────────
+
+    #[test]
+    fn truncate_tool_result_leaves_sub_cap_payload_unchanged() {
+        let s = "small result".to_string();
+        assert_eq!(truncate_tool_result(s), "small result");
+    }
+
+    #[test]
+    fn truncate_tool_result_returns_exactly_cap_chars_unchanged() {
+        // Exactly TOOL_RESULT_MAX_CHARS chars — must not be truncated.
+        let s = "x".repeat(TOOL_RESULT_MAX_CHARS);
+        let out = truncate_tool_result(s.clone());
+        assert_eq!(out.chars().count(), TOOL_RESULT_MAX_CHARS);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn truncate_tool_result_caps_oversized_payload_at_char_boundary() {
+        let s = "y".repeat(TOOL_RESULT_MAX_CHARS + 500);
+        let out = truncate_tool_result(s);
+        assert_eq!(out.chars().count(), TOOL_RESULT_MAX_CHARS);
+    }
+
+    #[test]
+    fn truncate_tool_result_cuts_on_utf8_boundary_not_mid_codepoint() {
+        // Multi-byte chars straddling the cap must not corrupt the string.
+        // "é" is 2 bytes; a naive byte cut at 2000 could split one.
+        let s = "é".repeat(TOOL_RESULT_MAX_CHARS + 10);
+        let out = truncate_tool_result(s);
+        assert_eq!(out.chars().count(), TOOL_RESULT_MAX_CHARS);
+        // Still valid UTF-8 (would panic on a mid-codepoint truncate).
+        assert!(out.chars().all(|c| c == 'é'));
     }
 
     // ── derive_title_from_text / ensure_session_title (DEF-7) ────────────
@@ -3326,6 +3400,128 @@ mod tests {
         }
     }
 
+    /// Session storage whose `add_message` always fails — simulates a transient
+    /// persist failure (e.g. SQLITE_BUSY from serve + child WAL contention).
+    /// Everything else delegates to an in-memory store so setup/reads work.
+    struct FailingAddStorage {
+        inner: InMemorySessionStorage,
+    }
+
+    impl FailingAddStorage {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySessionStorage::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::user_data::ports::session_storage::SessionStorage for FailingAddStorage {
+        async fn create_session(
+            &self,
+            session_id: String,
+        ) -> std::result::Result<
+            crate::user_data::domain::session::Session,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.create_session(session_id).await
+        }
+        async fn get_session(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<
+            crate::user_data::domain::session::Session,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.get_session(session_id).await
+        }
+        async fn add_message(
+            &self,
+            _session_id: String,
+            _message: crate::user_data::domain::session::SessionMessage,
+        ) -> std::result::Result<
+            crate::user_data::domain::session::SessionMessage,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            Err(
+                crate::user_data::ports::session_storage::SessionStorageError::StorageError(
+                    "simulated SQLITE_BUSY".to_string(),
+                ),
+            )
+        }
+        async fn get_messages(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<
+            Vec<crate::user_data::domain::session::SessionMessage>,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.get_messages(session_id).await
+        }
+        async fn update_title(
+            &self,
+            session_id: &str,
+            title: String,
+        ) -> std::result::Result<(), crate::user_data::ports::session_storage::SessionStorageError>
+        {
+            self.inner.update_title(session_id, title).await
+        }
+        async fn delete_session(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<(), crate::user_data::ports::session_storage::SessionStorageError>
+        {
+            self.inner.delete_session(session_id).await
+        }
+        async fn list_sessions(
+            &self,
+        ) -> std::result::Result<
+            Vec<crate::user_data::domain::session::Session>,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.list_sessions().await
+        }
+        async fn get_messages_paginated(
+            &self,
+            session_id: &str,
+            limit: usize,
+            offset: usize,
+        ) -> std::result::Result<
+            Vec<crate::user_data::domain::session::SessionMessage>,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner
+                .get_messages_paginated(session_id, limit, offset)
+                .await
+        }
+        async fn get_recent_messages(
+            &self,
+            session_id: &str,
+            limit: usize,
+        ) -> std::result::Result<
+            Vec<crate::user_data::domain::session::SessionMessage>,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.get_recent_messages(session_id, limit).await
+        }
+        async fn count_messages(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<u64, crate::user_data::ports::session_storage::SessionStorageError>
+        {
+            self.inner.count_messages(session_id).await
+        }
+        async fn first_user_message(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<
+            Option<String>,
+            crate::user_data::ports::session_storage::SessionStorageError,
+        > {
+            self.inner.first_user_message(session_id).await
+        }
+    }
+
     #[tokio::test]
     async fn run_loop_completes_turn_under_instant_activation() {
         // REGRESSION (InstantActivation race): with the default InstantActivation
@@ -3502,6 +3698,110 @@ mod tests {
             Some(WorkflowEvent::Exit { reason }) => assert_eq!(reason, "stdin_eof"),
             other => panic!("last event must be exit(stdin_eof); got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn thought_filter_tail_is_emitted_as_token_and_matches_persisted_text() {
+        // REGRESSION (#153, event stream): when ThoughtFilter's lookahead holds
+        // back the final bytes of a response, the flushed tail is appended to the
+        // persisted/spoken text but was NOT emitted as a Token — so the desktop
+        // caption (built solely from Token events) ended short of the reply.
+        //
+        // The response text here ends in a partial sentinel prefix ("<end_of_tu"),
+        // which the filter withholds in Normal state until flush(). MockAgent
+        // echoes the user message, so we drive the tail deterministically via the
+        // utterance. The invariant we lock: the concatenation of all Token event
+        // contents equals the persisted assistant message text.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "tail-token-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let collector = EventCollector::default();
+        let input = Arc::new(ScriptedListenInput::new(["the code is 42<end_of_tu"]));
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_event_sink(collector.sink());
+
+        svc.run_loop().await.unwrap();
+
+        let events = collector.events.lock().unwrap().clone();
+
+        // Concatenate every Token event's content (in emit order).
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::Token { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // The persisted assistant message is the ground truth for the reply text.
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m.message.role == crate::models::domain::message::Role::Assistant)
+            .expect("assistant turn must persist");
+
+        assert_eq!(
+            streamed, assistant.message.content,
+            "the streamed Token events must reconstruct the full persisted reply, \
+             including the ThoughtFilter tail flushed at stream end"
+        );
+        // Sanity: the reply's trailing bytes (withheld by the filter's lookahead
+        // and released only at flush) reached the Token stream.
+        assert!(
+            streamed.ends_with("<end_of_tu"),
+            "the withheld tail must reach the Token stream; got {streamed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_persist_failure_keeps_loop_alive_and_skips_turn_complete() {
+        // REGRESSION: a transient persist failure (SQLITE_BUSY from serve + child
+        // WAL contention) used to hard-fail the turn — resetting to wake-word mode
+        // mid-conversation for a reply the user already heard. Now finalize must:
+        //   - emit an Error event (observability),
+        //   - NOT emit TurnComplete (persistence is that event's contract),
+        //   - return true so the loop stays in conversational mode.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(FailingAddStorage::new());
+        let session_id = "persist-fail-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let collector = EventCollector::default();
+        let svc = ChatService::new(agent, session_id.clone(), storage)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_event_sink(collector.sink());
+
+        // Drive finalize_confirmed_turn directly with a successfully-streamed reply
+        // whose persistence will fail (add_message always errors).
+        let stayed_conversational = svc
+            .finalize_confirmed_turn(Ok(Ok("the answer is 42".to_string())), "what is the answer")
+            .await;
+
+        assert!(
+            stayed_conversational,
+            "persist failure must NOT reset to wake-word mode — the reply was already spoken"
+        );
+
+        let events = collector.events.lock().unwrap().clone();
+
+        let error_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::Error { .. }))
+            .count();
+        assert_eq!(error_count, 1, "exactly one Error event on persist failure");
+
+        let turn_complete_count = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TurnComplete { .. }))
+            .count();
+        assert_eq!(
+            turn_complete_count, 0,
+            "no TurnComplete when the turn failed to persist"
+        );
     }
 
     /// A detector that supports interruption and interrupts immediately, to

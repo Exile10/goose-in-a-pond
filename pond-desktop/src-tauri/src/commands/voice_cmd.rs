@@ -32,8 +32,16 @@ pub async fn start_voice_session(
     // Serialize with any concurrent start/stop.
     let _guard = voice.lifecycle_guard().await;
 
-    // Refuse to double-spawn.
+    // A session is already live (e.g. a fast StrictMode remount fired a second
+    // start before the teardown finished). Don't double-spawn — but also don't
+    // return an error the frontend would flash as a failure and land a dead
+    // voice screen. Report success with the existing session id: the live child
+    // keeps running and the caller stays in sync with it.
     if voice.is_active() {
+        if let Some(session_id) = voice.current_session_id() {
+            tracing::debug!("start_voice_session: session already active, returning live id");
+            return Ok(session_id);
+        }
         return Err("voice session already active".to_string());
     }
 
@@ -45,6 +53,16 @@ pub async fn start_voice_session(
     voice.set_wake_was_running(wake_was_running);
     if wake_was_running {
         audio::stop_wake_listener(&wake_state);
+        // stop_wake_listener only *signals* the listener thread and flips
+        // is_running eagerly; the cpal input stream is released only when the
+        // thread actually exits. Wait (bounded) for that so we do not spawn the
+        // child's mic against a still-open capture stream. On timeout, proceed
+        // anyway with a warning rather than wedging the handoff.
+        if !audio::wait_for_wake_thread_exit(&wake_state, std::time::Duration::from_secs(1)) {
+            tracing::warn!(
+                "wake listener thread still active after 1s; spawning voice child anyway"
+            );
+        }
     }
 
     // Resolve the resource dir the same way the setup hook does, so the child
@@ -57,10 +75,6 @@ pub async fn start_voice_session(
     match voice.spawn(&app, &resource_dir) {
         Ok(session_id) => {
             tracing::info!("voice session started: {session_id}");
-            // Keep `server` referenced so the binding is used even when the
-            // resolver falls back to POND_SERVER_BIN / candidate paths — it is
-            // the same instance the child will persist turns alongside.
-            let _ = server.get_url();
             Ok(session_id)
         }
         Err(e) => {
@@ -91,8 +105,16 @@ pub async fn stop_voice_session(
     let _guard = voice.lifecycle_guard().await;
 
     if !voice.is_active() {
-        // Nothing to stop, but make sure any stale wake-restore intent is clear.
+        // The child already exited on its own (e.g. it said "goodbye", crashed,
+        // or the frontend is calling stop on `voice-session-ended` as the
+        // self-exit restore path). The stdout reader that reaped it has no wake
+        // state and never restarts the listener, so we must do it here — read
+        // the restore intent BEFORE clearing it, then mirror the normal path.
+        let should_restart = voice.wake_was_running();
         voice.set_wake_was_running(false);
+        if should_restart {
+            restart_wake_listener(&app, &wake_state, &server).await;
+        }
         return Ok(());
     }
 

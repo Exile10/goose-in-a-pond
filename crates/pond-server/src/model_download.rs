@@ -574,14 +574,16 @@ pub async fn download_piper_model_entry(
     let onnx_path = dir.join(model_filename);
     let json_path = dir.join(config_filename);
 
+    // Status lines to stderr: reachable from the --json-events chat path (see
+    // download_file), where stdout is reserved exclusively for NDJSON.
     if onnx_path.exists() {
-        println!("  ✅ Already downloaded: {}", onnx_path.display());
+        eprintln!("  ✅ Already downloaded: {}", onnx_path.display());
     } else {
         download_file(model_url, &onnx_path, size_mb).await?;
     }
 
     if json_path.exists() {
-        println!("  ✅ Already downloaded: {}", json_path.display());
+        eprintln!("  ✅ Already downloaded: {}", json_path.display());
     } else {
         download_file(config_url, &json_path, 1).await?;
     }
@@ -1138,20 +1140,21 @@ async fn download_via_hf_cache(
         }
         last_printed = downloaded;
         let pct = (downloaded * 100) / effective_total.max(1);
-        print!(
+        // stderr: reachable from the --json-events chat path (see download_file).
+        eprint!(
             "\r  ⬇  {} / {} MB  ({}%)",
             downloaded / 1_048_576,
             effective_total / 1_048_576,
             pct
         );
-        std::io::stdout().flush().ok();
+        std::io::stderr().flush().ok();
     };
 
     let blob_path = fetch
         .download_to_blob(&client, token.as_deref(), progress)
         .await
         .with_context(|| format!("hf_cache fetch {repo_id}/{filename}@{revision}"))?;
-    println!();
+    eprintln!();
 
     // Symlink (or copy fallback on non-unix) the legacy dest path to the blob.
     if let Some(parent) = dest.parent() {
@@ -1160,7 +1163,7 @@ async fn download_via_hf_cache(
     let _ = tokio::fs::remove_file(dest).await;
     link_or_copy(&blob_path, dest).await?;
 
-    println!("  ✅ Saved: {}", dest.display());
+    eprintln!("  ✅ Saved: {}", dest.display());
     Ok(())
 }
 
@@ -1185,7 +1188,10 @@ async fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
 }
 
 pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
-    println!(
+    // Progress/status output goes to stderr: this downloader is reachable from the
+    // `--json-events` chat path (first-run model fetch), where stdout is reserved
+    // exclusively for NDJSON. Interactive callers still see it on the terminal.
+    eprintln!(
         "  ⬇  {} (~{} MB)",
         dest.file_name().unwrap_or_default().to_string_lossy(),
         approx_size_mb
@@ -1247,18 +1253,18 @@ pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Resul
             .map_err(|e| anyhow!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
         let pct = (downloaded * 100) / total.max(1);
-        print!(
+        eprint!(
             "\r  ⬇  {} / {} MB  ({}%)",
             downloaded / 1_048_576,
             total / 1_048_576,
             pct
         );
-        std::io::stdout().flush().ok();
+        std::io::stderr().flush().ok();
     }
 
-    println!();
+    eprintln!();
     tokio::fs::rename(&tmp, dest).await?;
-    println!("  ✅ Saved: {}", dest.display());
+    eprintln!("  ✅ Saved: {}", dest.display());
     Ok(())
 }
 
