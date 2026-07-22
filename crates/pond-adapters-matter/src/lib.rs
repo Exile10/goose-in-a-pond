@@ -23,6 +23,14 @@
 //! Commissioning stays in the controller (it owns the fabric credentials);
 //! GIAP connects, syncs nodes into its device registry under stable
 //! `matter-<node_id>` ids, and commands them. All traffic is LAN-local.
+//!
+//! This adapter is device-agnostic: it speaks Matter clusters, so real
+//! certified devices and virtual test devices (e.g. Google's Matter Virtual
+//! Device app) are indistinguishable to it — a virtual light is simply a
+//! Matter light. Devices are registered under their own announced identity
+//! (user label, else vendor product name, else "Light N"), and users address
+//! them naturally in chat ("turn off the light") via the device-control
+//! tool's name resolution.
 
 mod bridge;
 mod client;

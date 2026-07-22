@@ -128,19 +128,28 @@ pub fn endpoints_with_cluster(node: &MatterNode, cluster: u32) -> Vec<u16> {
     eps
 }
 
-/// Project a commissioned node onto GIAP's [`Device`]. Name comes from Basic
-/// Information's NodeLabel (`0/40/5`) when the operator set one; type and
-/// capabilities are inferred from the application clusters present.
+/// Project a commissioned node onto GIAP's [`Device`]. Works for ANY Matter
+/// device — real bulbs, locks, thermostats, or virtual test devices; nothing
+/// here is specific to a vendor or to test tooling. Type and capabilities are
+/// inferred from the application clusters present.
+///
+/// Naming follows what production controllers do — take the device's own
+/// identity, best source first:
+/// 1. Basic Information NodeLabel (`0/40/5`) — the user-assigned name;
+/// 2. Basic Information ProductName (`0/40/3`) — the vendor's name
+///    (e.g. "Hue color lamp");
+/// 3. `"<Type> <node_id>"` (e.g. "Light 2") — a clean, speakable fallback.
 pub fn node_to_device(node: &MatterNode) -> Device {
-    let name = node
-        .attributes
-        .get(&format!("0/{CLUSTER_BASIC_INFORMATION}/5"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Matter node {}", node.node_id));
-
     let has = |cluster: u32| !endpoints_with_cluster(node, cluster).is_empty();
+
+    let basic_info = |attribute: u32| {
+        node.attributes
+            .get(&format!("0/{CLUSTER_BASIC_INFORMATION}/{attribute}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
 
     let mut capabilities = Vec::new();
     if has(CLUSTER_ON_OFF) {
@@ -171,6 +180,17 @@ pub fn node_to_device(node: &MatterNode) -> Device {
     } else {
         "matter"
     };
+
+    let name = basic_info(5) // NodeLabel — user-assigned
+        .or_else(|| basic_info(3)) // ProductName — vendor-assigned
+        .unwrap_or_else(|| {
+            // Speakable typed fallback, e.g. "Light 2".
+            let mut typed = device_type.to_string();
+            if let Some(first) = typed.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{typed} {}", node.node_id)
+        });
 
     Device {
         id: device_id_for_node(node.node_id),
@@ -244,7 +264,7 @@ mod tests {
             "node_id": 2,
             "available": true,
             "attributes": {
-                "0/40/5": "Virtual OnOff Light",
+                "0/40/5": "Living Room Light",
                 "0/40/1": "TEST_VENDOR",
                 "13/6/0": false,
                 "13/8/0": 1,
@@ -274,11 +294,11 @@ mod tests {
 
     #[test]
     fn maps_the_live_session_light_to_a_giap_device() {
-        // Mirrors the real node commissioned during the live MVD session:
-        // OnOff + LevelControl on endpoint 13.
+        // Cluster layout mirrors the node commissioned in the live session
+        // (OnOff + LevelControl on endpoint 13) — identical for real bulbs.
         let device = node_to_device(&light_node());
         assert_eq!(device.id, "matter-2");
-        assert_eq!(device.name, "Virtual OnOff Light");
+        assert_eq!(device.name, "Living Room Light");
         assert_eq!(device.device_type, "light");
         assert_eq!(device.capabilities, vec!["power", "brightness"]);
         assert!(device.is_online);
@@ -286,6 +306,27 @@ mod tests {
             endpoints_with_cluster(&light_node(), CLUSTER_ON_OFF),
             vec![13]
         );
+    }
+
+    /// Production naming chain: user label first, then the vendor's product
+    /// name (what a real bulb reports), then a speakable typed fallback —
+    /// never a raw protocol identifier.
+    #[test]
+    fn naming_falls_back_from_label_to_product_name_to_type() {
+        let mut node = light_node();
+        // No NodeLabel -> vendor ProductName (what real bulbs carry).
+        node.attributes.remove("0/40/5");
+        node.attributes
+            .insert("0/40/3".into(), json!("Hue color lamp"));
+        assert_eq!(node_to_device(&node).name, "Hue color lamp");
+
+        // Neither -> "Light 2", not "Matter node 2".
+        node.attributes.remove("0/40/3");
+        assert_eq!(node_to_device(&node).name, "Light 2");
+
+        // Blank labels are treated as absent, not used verbatim.
+        node.attributes.insert("0/40/5".into(), json!("  "));
+        assert_eq!(node_to_device(&node).name, "Light 2");
     }
 
     #[test]
