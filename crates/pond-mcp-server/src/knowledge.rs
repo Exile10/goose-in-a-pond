@@ -94,7 +94,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("search_wikipedia");
         let query = resolve_topic(&params.0, "search_wikipedia").await;
-        println!("[wikipedia] search_wikipedia called: query={:?}", query);
+        eprintln!("[wikipedia] search_wikipedia called: query={:?}", query);
 
         if query.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -108,7 +108,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
             urlencoding::encode(&query),
             limit,
         );
-        println!("[wikipedia] GET {}", url);
+        eprintln!("[wikipedia] GET {}", url);
 
         let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.header("user-agent", WIKI_UA)
@@ -116,7 +116,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         })
         .await
         .map_err(|e| {
-            println!("[wikipedia] search request failed: {e}");
+            eprintln!("[wikipedia] search request failed: {e}");
             ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Wikipedia request failed: {e}"),
@@ -124,10 +124,10 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
             )
         })?;
 
-        println!("[wikipedia] search response status: {}", resp.status());
+        eprintln!("[wikipedia] search response status: {}", resp.status());
 
         if !resp.status().is_success() {
-            println!("[wikipedia] search failed with HTTP {}", resp.status());
+            eprintln!("[wikipedia] search failed with HTTP {}", resp.status());
             return Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Wikipedia returned HTTP {}", resp.status()),
@@ -136,7 +136,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
         }
 
         let body: serde_json::Value = resp.json().await.map_err(|e| {
-            println!("[wikipedia] failed to parse search response: {e}");
+            eprintln!("[wikipedia] failed to parse search response: {e}");
             ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Failed to parse response: {e}"),
@@ -146,7 +146,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
 
         let results = body["query"]["search"].as_array();
         let result_count = results.map(|a| a.len()).unwrap_or(0);
-        println!("[wikipedia] search returned {} results", result_count);
+        eprintln!("[wikipedia] search returned {} results", result_count);
 
         let (text, ui_results) = match results {
             Some(arr) if !arr.is_empty() => {
@@ -174,7 +174,7 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
                 Vec::new(),
             ),
         };
-        println!(
+        eprintln!(
             "[wikipedia] search_wikipedia done, returning {} chars",
             text.len()
         );
@@ -205,20 +205,20 @@ verbatim. In voice mode keep it to 1-3 sentences.")]
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("get_wikipedia_article");
         // Definitive: what did the MCP server receive from Goose?
-        println!("[wikipedia] ╔═══ MCP SERVER RECEIVED ═══");
-        println!("[wikipedia] ║ params.topic: {:?}", params.0.topic);
-        println!("[wikipedia] ║ params.extra: {:?}", params.0.extra);
-        println!("[wikipedia] ╚═══════════════════════════");
+        eprintln!("[wikipedia] ╔═══ MCP SERVER RECEIVED ═══");
+        eprintln!("[wikipedia] ║ params.topic: {:?}", params.0.topic);
+        eprintln!("[wikipedia] ║ params.extra: {:?}", params.0.extra);
+        eprintln!("[wikipedia] ╚═══════════════════════════");
 
         let topic = resolve_topic(&params.0, "get_wikipedia_article").await;
-        println!(
+        eprintln!(
             "[wikipedia] get_wikipedia_article called: topic={:?}",
             topic
         );
 
         if topic.is_empty() {
             // Nudge: return guidance as content so the model can retry
-            println!("[wikipedia] empty topic, nudging model to retry");
+            eprintln!("[wikipedia] empty topic, nudging model to retry");
             return Ok(CallToolResult::success(vec![Content::text(
                 "I need a topic to look up. Retry this tool with a 'topic' parameter \
                  containing the person, place, event, or concept to search for.",
@@ -233,7 +233,7 @@ verbatim. In voice mode keep it to 1-3 sentences.")]
             }
             Err(WikiFetchError::NotFound) => {
                 // Auto-fallback: search for the topic and fetch the top result
-                println!(
+                eprintln!(
                     "[wikipedia] exact title not found, searching for '{}'",
                     topic
                 );
@@ -259,7 +259,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("instant_answer");
         let query = resolve_topic(&params.0, "instant_answer").await;
-        println!("[knowledge] instant_answer called: query={:?}", query);
+        eprintln!("[knowledge] instant_answer called: query={:?}", query);
 
         if query.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -271,7 +271,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
             "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
             urlencoding::encode(&query),
         );
-        println!("[knowledge] GET {}", url);
+        eprintln!("[knowledge] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -280,7 +280,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[knowledge] instant_answer request failed: {e}");
+                eprintln!("[knowledge] instant_answer request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("DuckDuckGo Instant Answer", &e.to_string()),
                 )]));
@@ -288,7 +288,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         };
 
         if !resp.status().is_success() {
-            println!("[knowledge] instant_answer HTTP {}", resp.status());
+            eprintln!("[knowledge] instant_answer HTTP {}", resp.status());
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error(
                     "DuckDuckGo Instant Answer",
@@ -300,7 +300,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[knowledge] instant_answer parse failed: {e}");
+                eprintln!("[knowledge] instant_answer parse failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("DuckDuckGo Instant Answer", &e.to_string()),
                 )]));
@@ -326,7 +326,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
                 url.to_string(),
             )
         } else {
-            println!("[knowledge] instant_answer: no result for '{}'", query);
+            eprintln!("[knowledge] instant_answer: no result for '{}'", query);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No instant answer found for '{}'. Try get_wikipedia_article for a deeper lookup.",
                 query
@@ -335,7 +335,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
 
         let _ = source_url; // consumed above in formatting
         let truncated = crate::format::truncate_to_budget(&content, INSTANT_ANSWER_BUDGET);
-        println!(
+        eprintln!(
             "[knowledge] instant_answer done, returning {} chars",
             truncated.len()
         );
@@ -352,7 +352,7 @@ when asked 'what does X mean' or 'define X'.")]
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("define_word");
         let word = resolve_word(&params.0).await;
-        println!("[knowledge] define_word called: word={:?}", word);
+        eprintln!("[knowledge] define_word called: word={:?}", word);
 
         if word.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -364,7 +364,7 @@ when asked 'what does X mean' or 'define X'.")]
             "https://api.dictionaryapi.dev/api/v2/entries/en/{}",
             urlencoding::encode(&word),
         );
-        println!("[knowledge] GET {}", url);
+        eprintln!("[knowledge] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -373,7 +373,7 @@ when asked 'what does X mean' or 'define X'.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[knowledge] define_word request failed: {e}");
+                eprintln!("[knowledge] define_word request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Dictionary", &e.to_string()),
                 )]));
@@ -382,7 +382,7 @@ when asked 'what does X mean' or 'define X'.")]
 
         // 404 means the word was not found
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            println!("[knowledge] define_word: word '{}' not found", word);
+            eprintln!("[knowledge] define_word: word '{}' not found", word);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "Word '{}' not found. Check spelling or try a different word.",
                 word,
@@ -390,7 +390,7 @@ when asked 'what does X mean' or 'define X'.")]
         }
 
         if !resp.status().is_success() {
-            println!("[knowledge] define_word HTTP {}", resp.status());
+            eprintln!("[knowledge] define_word HTTP {}", resp.status());
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Dictionary", &format!("HTTP {}", resp.status())),
             )]));
@@ -399,7 +399,7 @@ when asked 'what does X mean' or 'define X'.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[knowledge] define_word parse failed: {e}");
+                eprintln!("[knowledge] define_word parse failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Dictionary", &e.to_string()),
                 )]));
@@ -408,7 +408,7 @@ when asked 'what does X mean' or 'define X'.")]
 
         let text = format_dictionary_response(&body, &word);
         let truncated = crate::format::truncate_to_budget(&text, DEFINE_WORD_BUDGET);
-        println!(
+        eprintln!(
             "[knowledge] define_word done, returning {} chars",
             truncated.len()
         );
@@ -425,7 +425,7 @@ reading recommendations, or 'who wrote X'.")]
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("search_books");
         let query = resolve_book_query(&params.0).await;
-        println!("[knowledge] search_books called: query={:?}", query);
+        eprintln!("[knowledge] search_books called: query={:?}", query);
 
         if query.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -439,7 +439,7 @@ reading recommendations, or 'who wrote X'.")]
             urlencoding::encode(&query),
             limit,
         );
-        println!("[knowledge] GET {}", url);
+        eprintln!("[knowledge] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(15))
@@ -448,7 +448,7 @@ reading recommendations, or 'who wrote X'.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[knowledge] search_books request failed: {e}");
+                eprintln!("[knowledge] search_books request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Library", &e.to_string()),
                 )]));
@@ -456,7 +456,7 @@ reading recommendations, or 'who wrote X'.")]
         };
 
         if !resp.status().is_success() {
-            println!("[knowledge] search_books HTTP {}", resp.status());
+            eprintln!("[knowledge] search_books HTTP {}", resp.status());
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Open Library", &format!("HTTP {}", resp.status())),
             )]));
@@ -465,7 +465,7 @@ reading recommendations, or 'who wrote X'.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[knowledge] search_books parse failed: {e}");
+                eprintln!("[knowledge] search_books parse failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Library", &e.to_string()),
                 )]));
@@ -504,7 +504,7 @@ reading recommendations, or 'who wrote X'.")]
         };
 
         if items.is_empty() {
-            println!("[knowledge] search_books: no results for '{}'", query);
+            eprintln!("[knowledge] search_books: no results for '{}'", query);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No books found for '{}'. Try different keywords or check the spelling.",
                 query,
@@ -513,7 +513,7 @@ reading recommendations, or 'who wrote X'.")]
 
         let header = format!("Books matching '{}':", query);
         let text = crate::format::format_list_result(&items, &header, SEARCH_BOOKS_BUDGET);
-        println!(
+        eprintln!(
             "[knowledge] search_books done, returning {} chars",
             text.len()
         );
@@ -596,7 +596,7 @@ async fn resolve_topic(params: &WikipediaQueryParams, tool_name: &str) -> String
         if let Some(t) = args.get("topic").and_then(|v| v.as_str()) {
             let trimmed = t.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[wikipedia] resolve_topic: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -609,7 +609,7 @@ async fn resolve_topic(params: &WikipediaQueryParams, tool_name: &str) -> String
     if let Some(ref t) = params.topic {
         let trimmed = t.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[wikipedia] resolve_topic: model param 'topic': {:?}",
                 trimmed
             );
@@ -625,7 +625,7 @@ async fn resolve_topic(params: &WikipediaQueryParams, tool_name: &str) -> String
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!("[wikipedia] resolve_topic: extras '{}': {:?}", key, trimmed);
+                    eprintln!("[wikipedia] resolve_topic: extras '{}': {:?}", key, trimmed);
                     return trimmed.to_string();
                 }
             }
@@ -637,7 +637,7 @@ async fn resolve_topic(params: &WikipediaQueryParams, tool_name: &str) -> String
     if !msg.is_empty() {
         let cleaned = clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[wikipedia] resolve_topic: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -645,7 +645,7 @@ async fn resolve_topic(params: &WikipediaQueryParams, tool_name: &str) -> String
         }
     }
 
-    println!("[wikipedia] resolve_topic: no topic found");
+    eprintln!("[wikipedia] resolve_topic: no topic found");
     String::new()
 }
 
@@ -727,7 +727,7 @@ async fn resolve_word(params: &DefineWordParams) -> String {
         if let Some(w) = args.get("word").and_then(|v| v.as_str()) {
             let trimmed = w.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[knowledge] resolve_word: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -740,7 +740,7 @@ async fn resolve_word(params: &DefineWordParams) -> String {
     if let Some(ref w) = params.word {
         let trimmed = w.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[knowledge] resolve_word: model param 'word': {:?}",
                 trimmed
             );
@@ -754,7 +754,7 @@ async fn resolve_word(params: &DefineWordParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!("[knowledge] resolve_word: extras '{}': {:?}", key, trimmed);
+                    eprintln!("[knowledge] resolve_word: extras '{}': {:?}", key, trimmed);
                     return trimmed.to_string();
                 }
             }
@@ -769,7 +769,7 @@ async fn resolve_word(params: &DefineWordParams) -> String {
             // Take just the first word if the message is long
             let first_word = cleaned.split_whitespace().next().unwrap_or("");
             if !first_word.is_empty() {
-                println!(
+                eprintln!(
                     "[knowledge] resolve_word: user message: {:?} -> {:?}",
                     msg, first_word
                 );
@@ -778,7 +778,7 @@ async fn resolve_word(params: &DefineWordParams) -> String {
         }
     }
 
-    println!("[knowledge] resolve_word: no word found");
+    eprintln!("[knowledge] resolve_word: no word found");
     String::new()
 }
 
@@ -841,7 +841,7 @@ async fn resolve_book_query(params: &BookSearchParams) -> String {
         if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
             let trimmed = q.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[knowledge] resolve_book_query: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -866,7 +866,7 @@ async fn resolve_book_query(params: &BookSearchParams) -> String {
     }
     if !parts.is_empty() {
         let combined = parts.join(" ");
-        println!(
+        eprintln!(
             "[knowledge] resolve_book_query: model params: {:?}",
             combined
         );
@@ -881,7 +881,7 @@ async fn resolve_book_query(params: &BookSearchParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!(
+                    eprintln!(
                         "[knowledge] resolve_book_query: extras '{}': {:?}",
                         key, trimmed
                     );
@@ -896,7 +896,7 @@ async fn resolve_book_query(params: &BookSearchParams) -> String {
     if !msg.is_empty() {
         let cleaned = clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[knowledge] resolve_book_query: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -904,7 +904,7 @@ async fn resolve_book_query(params: &BookSearchParams) -> String {
         }
     }
 
-    println!("[knowledge] resolve_book_query: no query found");
+    eprintln!("[knowledge] resolve_book_query: no query found");
     String::new()
 }
 
@@ -927,7 +927,7 @@ impl KnowledgeMcpServer {
             "https://en.wikipedia.org/w/api.php?action=query&titles={}&prop=extracts|info&explaintext=1&inprop=url&format=json&redirects=1",
             urlencoding::encode(title),
         );
-        println!("[wikipedia] GET {}", url);
+        eprintln!("[wikipedia] GET {}", url);
 
         let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.header("user-agent", WIKI_UA)
@@ -935,7 +935,7 @@ impl KnowledgeMcpServer {
         })
         .await
         .map_err(|e| {
-            println!("[wikipedia] article request failed: {e}");
+            eprintln!("[wikipedia] article request failed: {e}");
             WikiFetchError::Mcp(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Wikipedia request failed: {e}"),
@@ -943,10 +943,10 @@ impl KnowledgeMcpServer {
             ))
         })?;
 
-        println!("[wikipedia] article response status: {}", resp.status());
+        eprintln!("[wikipedia] article response status: {}", resp.status());
 
         if !resp.status().is_success() {
-            println!(
+            eprintln!(
                 "[wikipedia] article fetch failed with HTTP {}",
                 resp.status()
             );
@@ -958,7 +958,7 @@ impl KnowledgeMcpServer {
         }
 
         let body: serde_json::Value = resp.json().await.map_err(|e| {
-            println!("[wikipedia] failed to parse article response: {e}");
+            eprintln!("[wikipedia] failed to parse article response: {e}");
             WikiFetchError::Mcp(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Failed to parse response: {e}"),
@@ -991,7 +991,7 @@ impl KnowledgeMcpServer {
         // 4000 chars ~ 1000 tokens — on a 16K context there's plenty of room for the response.
         let extract = crate::format::truncate_to_budget(extract, 4000);
 
-        println!(
+        eprintln!(
             "[wikipedia] article fetched: title={:?}, extract_len={}",
             display_title,
             extract.len(),
@@ -1009,7 +1009,7 @@ impl KnowledgeMcpServer {
             "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit=1&format=json",
             urlencoding::encode(query),
         );
-        println!("[wikipedia] fallback search: GET {}", search_url);
+        eprintln!("[wikipedia] fallback search: GET {}", search_url);
 
         let resp = crate::http::traced_get_with(&self.http_client, &search_url, |b| {
             b.header("user-agent", WIKI_UA)
@@ -1017,7 +1017,7 @@ impl KnowledgeMcpServer {
         })
         .await
         .map_err(|e| {
-            println!("[wikipedia] fallback search request failed: {e}");
+            eprintln!("[wikipedia] fallback search request failed: {e}");
             ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Wikipedia search failed: {e}"),
@@ -1048,7 +1048,7 @@ impl KnowledgeMcpServer {
 
         match best_title {
             Some(found) => {
-                println!("[wikipedia] fallback found: '{}'", found);
+                eprintln!("[wikipedia] fallback found: '{}'", found);
                 match self.fetch_article_summary(found).await {
                     Ok(text) => Ok(text),
                     Err(WikiFetchError::NotFound) => Ok(format!(
@@ -1059,7 +1059,7 @@ impl KnowledgeMcpServer {
                 }
             }
             None => {
-                println!(
+                eprintln!(
                     "[wikipedia] fallback search returned no results for '{}'",
                     query
                 );
@@ -1200,7 +1200,7 @@ mod tests {
     async fn live_fetch_exact_title() {
         let server = test_server();
         let text = server.fetch_article_summary("Nairobi").await.unwrap();
-        println!("{}", text);
+        eprintln!("{}", text);
         assert!(text.contains("Nairobi"), "extract should mention Nairobi");
         assert!(
             text.contains("Kenya"),
@@ -1215,7 +1215,7 @@ mod tests {
     async fn live_vague_query_finds_article() {
         let server = test_server();
         let text = server.search_and_fetch_best("black holes").await.unwrap();
-        println!("{}", text);
+        eprintln!("{}", text);
         assert!(
             text.contains("black hole") || text.contains("Black hole"),
             "should find the Black hole article"
@@ -1228,7 +1228,7 @@ mod tests {
     async fn live_get_article_auto_resolves_vague_topic() {
         let server = test_server();
         let text = server.search_and_fetch_best("volcanoes").await.unwrap();
-        println!("{}", text);
+        eprintln!("{}", text);
         assert!(
             text.to_lowercase().contains("volcan"),
             "should resolve to a volcano-related article"
@@ -1244,7 +1244,7 @@ mod tests {
             .search_and_fetch_best("xyzzy99foobar_nonexistent")
             .await
             .unwrap();
-        println!("{}", text);
+        eprintln!("{}", text);
         assert!(
             text.contains("No Wikipedia articles found"),
             "should report no results for nonsense query"
@@ -1260,7 +1260,7 @@ mod tests {
             .search_and_fetch_best("Albert Einsten")
             .await
             .unwrap();
-        println!("{}", text);
+        eprintln!("{}", text);
         let lower = text.to_lowercase();
         assert!(
             lower.contains("einstein")
@@ -1423,7 +1423,7 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         let abstract_text = body["AbstractText"].as_str().unwrap_or("");
-        println!("instant_answer abstract: {}", abstract_text);
+        eprintln!("instant_answer abstract: {}", abstract_text);
         assert!(
             !abstract_text.is_empty(),
             "DuckDuckGo should return an abstract for Einstein"
@@ -1439,7 +1439,7 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         let result = format_dictionary_response(&body, "serendipity");
-        println!("define_word result:\n{}", result);
+        eprintln!("define_word result:\n{}", result);
         assert!(result.contains("**serendipity**"));
         assert!(
             result.to_lowercase().contains("fortunate")
@@ -1458,10 +1458,10 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         let docs = body["docs"].as_array().expect("should have docs array");
-        println!("search_books found {} results", docs.len());
+        eprintln!("search_books found {} results", docs.len());
         assert!(!docs.is_empty(), "should find Dune books");
         let first_title = docs[0]["title"].as_str().unwrap_or("");
-        println!("first result: {}", first_title);
+        eprintln!("first result: {}", first_title);
         assert!(
             first_title.to_lowercase().contains("dune"),
             "first result should be a Dune book"

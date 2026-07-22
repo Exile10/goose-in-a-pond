@@ -117,7 +117,7 @@ Look up country data: population, capital, currency, languages. Use for \
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("get_country_info");
         let country = resolve_country(&params.0).await;
-        println!("[discovery] get_country_info: country={:?}", country);
+        eprintln!("[discovery] get_country_info: country={:?}", country);
 
         if country.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -142,7 +142,7 @@ Look up country data: population, capital, currency, languages. Use for \
                 COUNTRY_FIELDS,
             )
         };
-        println!("[discovery] GET {}", url);
+        eprintln!("[discovery] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -151,7 +151,7 @@ Look up country data: population, capital, currency, languages. Use for \
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[discovery] REST Countries request failed: {e}");
+                eprintln!("[discovery] REST Countries request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("REST Countries", &e.to_string()),
                 )]));
@@ -159,7 +159,7 @@ Look up country data: population, capital, currency, languages. Use for \
         };
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            println!("[discovery] country '{}' not found", country);
+            eprintln!("[discovery] country '{}' not found", country);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "Country '{}' not found. Check spelling or try a different name/code.",
                 country,
@@ -168,7 +168,7 @@ Look up country data: population, capital, currency, languages. Use for \
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[discovery] REST Countries HTTP {status}");
+            eprintln!("[discovery] REST Countries HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("REST Countries", &format!("HTTP {status}")),
             )]));
@@ -177,7 +177,7 @@ Look up country data: population, capital, currency, languages. Use for \
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[discovery] failed to parse REST Countries response: {e}");
+                eprintln!("[discovery] failed to parse REST Countries response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("REST Countries", &e.to_string()),
                 )]));
@@ -197,7 +197,7 @@ Look up country data: population, capital, currency, languages. Use for \
         };
 
         let truncated = crate::format::truncate_to_budget(&text, COUNTRY_INFO_BUDGET);
-        println!(
+        eprintln!(
             "[discovery] get_country_info done, {} chars",
             truncated.len()
         );
@@ -214,7 +214,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("lookup_product");
         let (barcode, name) = resolve_product(&params.0).await;
-        println!(
+        eprintln!(
             "[discovery] lookup_product: barcode={:?}, name={:?}",
             barcode, name
         );
@@ -229,7 +229,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         // Barcode lookup — direct product fetch
         if let Some(ref code) = barcode {
             let url = format!("{}/api/v2/product/{}", OFF_BASE, urlencoding::encode(code));
-            println!("[discovery] GET {}", url);
+            eprintln!("[discovery] GET {}", url);
 
             let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
                 b.timeout(std::time::Duration::from_secs(10))
@@ -238,7 +238,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             {
                 Ok(r) => r,
                 Err(e) => {
-                    println!("[discovery] OFF barcode request failed: {e}");
+                    eprintln!("[discovery] OFF barcode request failed: {e}");
                     return Ok(CallToolResult::success(vec![Content::text(
                         crate::format::format_api_error("Open Food Facts", &e.to_string()),
                     )]));
@@ -247,7 +247,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
 
             if !resp.status().is_success() {
                 let status = resp.status();
-                println!("[discovery] OFF barcode HTTP {status}");
+                eprintln!("[discovery] OFF barcode HTTP {status}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Food Facts", &format!("HTTP {status}")),
                 )]));
@@ -256,7 +256,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             let body: serde_json::Value = match resp.json().await {
                 Ok(v) => v,
                 Err(e) => {
-                    println!("[discovery] failed to parse OFF barcode response: {e}");
+                    eprintln!("[discovery] failed to parse OFF barcode response: {e}");
                     return Ok(CallToolResult::success(vec![Content::text(
                         crate::format::format_api_error("Open Food Facts", &e.to_string()),
                     )]));
@@ -274,7 +274,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             let product_data = &body["product"];
             let text = format_product(product_data);
             let truncated = crate::format::truncate_to_budget(&text, PRODUCT_SINGLE_BUDGET);
-            println!(
+            eprintln!(
                 "[discovery] lookup_product (barcode) done, {} chars",
                 truncated.len()
             );
@@ -294,7 +294,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
             urlencoding::encode(query),
             limit,
         );
-        println!("[discovery] GET {}", url);
+        eprintln!("[discovery] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(15))
@@ -303,7 +303,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[discovery] OFF search request failed: {e}");
+                eprintln!("[discovery] OFF search request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Food Facts", &e.to_string()),
                 )]));
@@ -312,7 +312,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[discovery] OFF search HTTP {status}");
+            eprintln!("[discovery] OFF search HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Open Food Facts", &format!("HTTP {status}")),
             )]));
@@ -321,7 +321,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[discovery] failed to parse OFF search response: {e}");
+                eprintln!("[discovery] failed to parse OFF search response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Food Facts", &e.to_string()),
                 )]));
@@ -347,7 +347,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
                 let header = format!("Products matching '{}':", query);
                 let text =
                     crate::format::format_list_result(&items, &header, PRODUCT_SEARCH_BUDGET);
-                println!(
+                eprintln!(
                     "[discovery] lookup_product (search) done, {} items, {} chars",
                     items.len(),
                     text.len()
@@ -360,7 +360,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
 
         let header = format!("Products matching '{}':", query);
         let text = crate::format::format_list_result(&items, &header, PRODUCT_SEARCH_BUDGET);
-        println!(
+        eprintln!(
             "[discovery] lookup_product (search) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -378,7 +378,7 @@ or price comparisons. European coverage is strongest.")]
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("get_product_price");
         let product = resolve_price_product(&params.0).await;
-        println!("[discovery] get_product_price: product={:?}", product);
+        eprintln!("[discovery] get_product_price: product={:?}", product);
 
         if product.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -400,7 +400,7 @@ or price comparisons. European coverage is strongest.")]
             OFF_PRICES_BASE,
             urlencoding::encode(&product),
         );
-        println!("[discovery] GET {}", url);
+        eprintln!("[discovery] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -409,7 +409,7 @@ or price comparisons. European coverage is strongest.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[discovery] Open Prices request failed: {e}");
+                eprintln!("[discovery] Open Prices request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Prices", &e.to_string()),
                 )]));
@@ -418,7 +418,7 @@ or price comparisons. European coverage is strongest.")]
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[discovery] Open Prices HTTP {status}");
+            eprintln!("[discovery] Open Prices HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Open Prices", &format!("HTTP {status}")),
             )]));
@@ -427,7 +427,7 @@ or price comparisons. European coverage is strongest.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[discovery] failed to parse Open Prices response: {e}");
+                eprintln!("[discovery] failed to parse Open Prices response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Open Prices", &e.to_string()),
                 )]));
@@ -468,7 +468,7 @@ or price comparisons. European coverage is strongest.")]
 
         let header = format!("**{}** recent prices:", product_name);
         let text = crate::format::format_list_result(&items, &header, PRODUCT_PRICE_BUDGET);
-        println!(
+        eprintln!(
             "[discovery] get_product_price done, {} items, {} chars",
             items.len(),
             text.len()
@@ -486,7 +486,7 @@ Search the web for information not covered by other tools. Use as a LAST RESORT 
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         crate::set_current_tool("search_web");
         let query = resolve_web_query(&params.0).await;
-        println!("[discovery] search_web: query={:?}", query);
+        eprintln!("[discovery] search_web: query={:?}", query);
 
         if query.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -500,7 +500,7 @@ Search the web for information not covered by other tools. Use as a LAST RESORT 
         let searxng_url = match self.settings_repo.get().await {
             Ok(s) => s.searxng_url.filter(|u| !u.trim().is_empty()),
             Err(e) => {
-                println!("[discovery] failed to load settings: {e}");
+                eprintln!("[discovery] failed to load settings: {e}");
                 None
             }
         };
@@ -527,7 +527,7 @@ impl DiscoveryMcpServer {
             base_url.trim_end_matches('/'),
             urlencoding::encode(query),
         );
-        println!("[discovery] SearXNG GET {}", url);
+        eprintln!("[discovery] SearXNG GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -536,7 +536,7 @@ impl DiscoveryMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[discovery] SearXNG request failed: {e}");
+                eprintln!("[discovery] SearXNG request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("SearXNG", &e.to_string()),
                 )]));
@@ -545,7 +545,7 @@ impl DiscoveryMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[discovery] SearXNG HTTP {status}");
+            eprintln!("[discovery] SearXNG HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("SearXNG", &format!("HTTP {status}")),
             )]));
@@ -554,7 +554,7 @@ impl DiscoveryMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[discovery] failed to parse SearXNG response: {e}");
+                eprintln!("[discovery] failed to parse SearXNG response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("SearXNG", &e.to_string()),
                 )]));
@@ -619,7 +619,7 @@ impl DiscoveryMcpServer {
 
         let header = format!("Web search: \"{}\"", query);
         let text = crate::format::format_list_result(&items, &header, WEB_SEARCH_BUDGET);
-        println!(
+        eprintln!(
             "[discovery] search_web (SearXNG) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -649,7 +649,7 @@ impl DiscoveryMcpServer {
             DDG_IA_BASE,
             urlencoding::encode(query),
         );
-        println!("[discovery] DDG IA GET {}", url);
+        eprintln!("[discovery] DDG IA GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -658,7 +658,7 @@ impl DiscoveryMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[discovery] DDG IA request failed: {e}");
+                eprintln!("[discovery] DDG IA request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("DuckDuckGo", &e.to_string()),
                 )]));
@@ -667,7 +667,7 @@ impl DiscoveryMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[discovery] DDG IA HTTP {status}");
+            eprintln!("[discovery] DDG IA HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("DuckDuckGo", &format!("HTTP {status}")),
             )]));
@@ -676,7 +676,7 @@ impl DiscoveryMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[discovery] failed to parse DDG IA response: {e}");
+                eprintln!("[discovery] failed to parse DDG IA response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("DuckDuckGo", &e.to_string()),
                 )]));
@@ -747,7 +747,7 @@ impl DiscoveryMcpServer {
             query,
         );
         let text = crate::format::format_list_result(&items, &header, WEB_SEARCH_BUDGET);
-        println!(
+        eprintln!(
             "[discovery] search_web (DDG) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -983,7 +983,7 @@ async fn resolve_country(params: &CountryInfoParams) -> String {
         if let Some(c) = args.get("country").and_then(|v| v.as_str()) {
             let trimmed = c.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[discovery] resolve_country: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -996,7 +996,7 @@ async fn resolve_country(params: &CountryInfoParams) -> String {
     if let Some(ref c) = params.country {
         let trimmed = c.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_country: model param 'country': {:?}",
                 trimmed
             );
@@ -1010,7 +1010,7 @@ async fn resolve_country(params: &CountryInfoParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!(
+                    eprintln!(
                         "[discovery] resolve_country: extras '{}': {:?}",
                         key, trimmed
                     );
@@ -1025,7 +1025,7 @@ async fn resolve_country(params: &CountryInfoParams) -> String {
     if !msg.is_empty() {
         let cleaned = crate::clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_country: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -1033,7 +1033,7 @@ async fn resolve_country(params: &CountryInfoParams) -> String {
         }
     }
 
-    println!("[discovery] resolve_country: no country found");
+    eprintln!("[discovery] resolve_country: no country found");
     String::new()
 }
 
@@ -1046,7 +1046,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
         if let Some(b) = args.get("barcode").and_then(|v| v.as_str()) {
             let trimmed = b.trim();
             if !trimmed.is_empty() && input_is_barcode(trimmed) {
-                println!(
+                eprintln!(
                     "[discovery] resolve_product: ToolCaller barcode: {:?}",
                     trimmed
                 );
@@ -1056,7 +1056,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
         if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
             let trimmed = n.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[discovery] resolve_product: ToolCaller name: {:?}",
                     trimmed
                 );
@@ -1069,7 +1069,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
     if let Some(ref b) = params.barcode {
         let trimmed = b.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_product: model param 'barcode': {:?}",
                 trimmed
             );
@@ -1079,7 +1079,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
     if let Some(ref n) = params.name {
         let trimmed = n.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_product: model param 'name': {:?}",
                 trimmed
             );
@@ -1093,7 +1093,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!(
+                    eprintln!(
                         "[discovery] resolve_product: extras '{}' (barcode): {:?}",
                         key, trimmed
                     );
@@ -1109,13 +1109,13 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
                 if !trimmed.is_empty() {
                     // Check if it's actually a barcode
                     if input_is_barcode(trimmed) {
-                        println!(
+                        eprintln!(
                             "[discovery] resolve_product: extras '{}' (detected barcode): {:?}",
                             key, trimmed
                         );
                         return (Some(trimmed.to_string()), None);
                     }
-                    println!(
+                    eprintln!(
                         "[discovery] resolve_product: extras '{}' (name): {:?}",
                         key, trimmed
                     );
@@ -1131,13 +1131,13 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
         let cleaned = crate::clean_query_for_search(&msg);
         if !cleaned.is_empty() {
             if input_is_barcode(&cleaned) {
-                println!(
+                eprintln!(
                     "[discovery] resolve_product: user message barcode: {:?}",
                     cleaned
                 );
                 return (Some(cleaned), None);
             }
-            println!(
+            eprintln!(
                 "[discovery] resolve_product: user message name: {:?}",
                 cleaned
             );
@@ -1145,7 +1145,7 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
         }
     }
 
-    println!("[discovery] resolve_product: no product found");
+    eprintln!("[discovery] resolve_product: no product found");
     (None, None)
 }
 
@@ -1157,7 +1157,7 @@ async fn resolve_price_product(params: &ProductPriceParams) -> String {
         if let Some(p) = args.get("product").and_then(|v| v.as_str()) {
             let trimmed = p.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[discovery] resolve_price_product: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -1170,7 +1170,7 @@ async fn resolve_price_product(params: &ProductPriceParams) -> String {
     if let Some(ref p) = params.product {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_price_product: model param 'product': {:?}",
                 trimmed
             );
@@ -1184,7 +1184,7 @@ async fn resolve_price_product(params: &ProductPriceParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!(
+                    eprintln!(
                         "[discovery] resolve_price_product: extras '{}': {:?}",
                         key, trimmed
                     );
@@ -1199,7 +1199,7 @@ async fn resolve_price_product(params: &ProductPriceParams) -> String {
     if !msg.is_empty() {
         let cleaned = crate::clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_price_product: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -1207,7 +1207,7 @@ async fn resolve_price_product(params: &ProductPriceParams) -> String {
         }
     }
 
-    println!("[discovery] resolve_price_product: no product found");
+    eprintln!("[discovery] resolve_price_product: no product found");
     String::new()
 }
 
@@ -1219,7 +1219,7 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
         if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
             let trimmed = q.trim();
             if !trimmed.is_empty() {
-                println!(
+                eprintln!(
                     "[discovery] resolve_web_query: ToolCaller produced: {:?}",
                     trimmed
                 );
@@ -1232,7 +1232,7 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
     if let Some(ref q) = params.query {
         let trimmed = q.trim();
         if !trimmed.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_web_query: model param 'query': {:?}",
                 trimmed
             );
@@ -1246,7 +1246,7 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!(
+                    eprintln!(
                         "[discovery] resolve_web_query: extras '{}': {:?}",
                         key, trimmed
                     );
@@ -1261,7 +1261,7 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
     if !msg.is_empty() {
         let cleaned = crate::clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[discovery] resolve_web_query: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -1269,7 +1269,7 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
         }
     }
 
-    println!("[discovery] resolve_web_query: no query found");
+    eprintln!("[discovery] resolve_web_query: no query found");
     String::new()
 }
 
@@ -1600,7 +1600,7 @@ mod tests {
         let capitals = arr[0]["capital"].as_array().expect("should have capital");
         let cap = capitals[0].as_str().expect("capital should be string");
         assert_eq!(cap, "Nairobi");
-        println!("Kenya capital: {}", cap);
+        eprintln!("Kenya capital: {}", cap);
     }
 
     #[tokio::test]
@@ -1622,7 +1622,7 @@ mod tests {
         let status = body["status"].as_u64().unwrap_or(0);
         assert_eq!(status, 1, "product should be found");
         let name = body["product"]["product_name"].as_str().unwrap_or("");
-        println!("Product: {}", name);
+        eprintln!("Product: {}", name);
         assert!(
             name.to_lowercase().contains("nutella"),
             "barcode 3017620422003 should be Nutella"
@@ -1806,13 +1806,13 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.expect("parse failed");
         let total = body["total"].as_u64().unwrap_or(0);
-        println!("Nutella prices: {} total entries", total);
+        eprintln!("Nutella prices: {} total entries", total);
         assert!(total > 0, "should have prices for Nutella");
         let items = body["items"].as_array().expect("items array missing");
         assert!(!items.is_empty(), "should return at least one price");
         let first = &items[0];
         let price = first["price"].as_f64().expect("price field missing");
-        println!(
+        eprintln!(
             "First price: {} {}",
             price,
             first["currency"].as_str().unwrap_or("?")
@@ -1878,8 +1878,8 @@ mod tests {
         // Should have either AbstractText or RelatedTopics
         let abstract_text = body["AbstractText"].as_str().unwrap_or("");
         let related = body["RelatedTopics"].as_array();
-        println!("DDG abstract: {}", abstract_text);
-        println!(
+        eprintln!("DDG abstract: {}", abstract_text);
+        eprintln!(
             "DDG related topics: {}",
             related.map(|r| r.len()).unwrap_or(0)
         );

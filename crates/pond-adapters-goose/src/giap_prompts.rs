@@ -268,7 +268,7 @@ mod tests {
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);
-        println!("{}", rendered);
+        eprintln!("{}", rendered);
         assert!(rendered.contains("giap__get_current_weather"));
         assert!(rendered.contains("Weather integration"));
     }

@@ -233,7 +233,7 @@ impl MemoryMcpServer {
                     "No content provided to save. Tell me what you'd like me to remember.",
                 )]));
             }
-            println!(
+            eprintln!(
                 "[memory] empty content param, using user message: {:?}",
                 user_msg
             );

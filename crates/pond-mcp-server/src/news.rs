@@ -107,7 +107,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         crate::set_current_tool("get_top_stories");
         let category = resolve_category(params.0.category.as_deref());
         let limit = params.0.limit.unwrap_or(5).clamp(1, 15) as usize;
-        println!(
+        eprintln!(
             "[news] get_top_stories: category={}, limit={}",
             category, limit
         );
@@ -117,7 +117,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         let ids_resp = match crate::http::traced_get(&self.http_client, &ids_url).await {
             Ok(r) => r,
             Err(e) => {
-                println!("[news] HN story IDs fetch failed: {e}");
+                eprintln!("[news] HN story IDs fetch failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Hacker News", &e.to_string()),
                 )]));
@@ -126,7 +126,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
 
         if !ids_resp.status().is_success() {
             let status = ids_resp.status();
-            println!("[news] HN story IDs returned HTTP {status}");
+            eprintln!("[news] HN story IDs returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Hacker News", &format!("HTTP {status}")),
             )]));
@@ -135,7 +135,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         let ids: Vec<u64> = match ids_resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[news] failed to parse HN story IDs: {e}");
+                eprintln!("[news] failed to parse HN story IDs: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Hacker News", &e.to_string()),
                 )]));
@@ -143,7 +143,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         };
 
         let ids_to_fetch = &ids[..ids.len().min(limit)];
-        println!("[news] fetching {} story details", ids_to_fetch.len());
+        eprintln!("[news] fetching {} story details", ids_to_fetch.len());
 
         // 2. Fetch story details sequentially (bounded by limit)
         let mut items: Vec<String> = Vec::with_capacity(ids_to_fetch.len());
@@ -190,7 +190,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
                 }
                 _ => {
                     // Skip failed individual item fetches
-                    println!("[news] failed to fetch HN item {id}, skipping");
+                    eprintln!("[news] failed to fetch HN item {id}, skipping");
                 }
             }
         }
@@ -198,7 +198,7 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
         let category_label = category.trim_end_matches("stories");
         let header = format!("Hacker News — {} stories", category_label);
         let text = crate::format::format_list_result(&items, &header, TOP_STORIES_BUDGET);
-        println!(
+        eprintln!(
             "[news] get_top_stories done, {} items, {} chars",
             items.len(),
             text.len()
@@ -227,7 +227,7 @@ current events, or news about a topic.")]
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
             Err(e) => {
-                println!("[news] failed to load settings: {e}");
+                eprintln!("[news] failed to load settings: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("News search", "settings unavailable"),
                 )]));
@@ -250,7 +250,7 @@ current events, or news about a topic.")]
         }
 
         // Fallback: Wikimedia Featured Content Feed (no API key required)
-        println!("[news] No Guardian key — using Wikimedia feed fallback");
+        eprintln!("[news] No Guardian key — using Wikimedia feed fallback");
         self.search_news_wikimedia().await
     }
 
@@ -267,7 +267,7 @@ Get today's top news headlines and trending topics. Use for 'what's in the news'
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
             Err(e) => {
-                println!("[news] failed to load settings: {e}");
+                eprintln!("[news] failed to load settings: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Headlines", "settings unavailable"),
                 )]));
@@ -285,7 +285,7 @@ Get today's top news headlines and trending topics. Use for 'what's in the news'
         }
 
         // Fallback: Wikimedia Featured Content Feed (no API key required)
-        println!("[news] No GNews key — using Wikimedia feed fallback for headlines");
+        eprintln!("[news] No GNews key — using Wikimedia feed fallback for headlines");
         self.get_headlines_wikimedia().await
     }
 }
@@ -321,7 +321,7 @@ impl NewsMcpServer {
         params: &SearchNewsParams,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         let query = resolve_query(params).await;
-        println!("[news] search_news (Guardian): query={:?}", query);
+        eprintln!("[news] search_news (Guardian): query={:?}", query);
 
         if query.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -344,7 +344,7 @@ impl NewsMcpServer {
                 url.push_str(&format!("&section={}", urlencoding::encode(trimmed)));
             }
         }
-        println!("[news] GET {}", url.replace(api_key, "***"));
+        eprintln!("[news] GET {}", url.replace(api_key, "***"));
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -353,7 +353,7 @@ impl NewsMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[news] Guardian request failed: {e}");
+                eprintln!("[news] Guardian request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("The Guardian", &e.to_string()),
                 )]));
@@ -362,7 +362,7 @@ impl NewsMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[news] Guardian returned HTTP {status}");
+            eprintln!("[news] Guardian returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("The Guardian", &format!("HTTP {status}")),
             )]));
@@ -371,7 +371,7 @@ impl NewsMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[news] failed to parse Guardian response: {e}");
+                eprintln!("[news] failed to parse Guardian response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("The Guardian", &e.to_string()),
                 )]));
@@ -429,7 +429,7 @@ impl NewsMcpServer {
 
         let header = format!("Guardian search: \"{}\"", query);
         let text = crate::format::format_list_result(&items, &header, SEARCH_NEWS_BUDGET);
-        println!(
+        eprintln!(
             "[news] search_news (Guardian) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -483,7 +483,7 @@ impl NewsMcpServer {
             "\n\n(Source: Wikipedia current events — for keyword search, \
              add a Guardian API key in Settings.)",
         );
-        println!(
+        eprintln!(
             "[news] search_news (Wikimedia) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -533,7 +533,7 @@ impl NewsMcpServer {
                 url.push_str(&format!("&country={}", urlencoding::encode(trimmed)));
             }
         }
-        println!("[news] GET {}", url.replace(api_key, "***"));
+        eprintln!("[news] GET {}", url.replace(api_key, "***"));
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -542,7 +542,7 @@ impl NewsMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[news] GNews request failed: {e}");
+                eprintln!("[news] GNews request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("GNews", &e.to_string()),
                 )]));
@@ -551,7 +551,7 @@ impl NewsMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[news] GNews returned HTTP {status}");
+            eprintln!("[news] GNews returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("GNews", &format!("HTTP {status}")),
             )]));
@@ -560,7 +560,7 @@ impl NewsMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[news] failed to parse GNews response: {e}");
+                eprintln!("[news] failed to parse GNews response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("GNews", &e.to_string()),
                 )]));
@@ -614,7 +614,7 @@ impl NewsMcpServer {
 
         let header = format!("Headlines — {} ({})", topic, language);
         let text = crate::format::format_list_result(&items, &header, HEADLINES_BUDGET);
-        println!(
+        eprintln!(
             "[news] get_headlines (GNews) done, {} items, {} chars",
             items.len(),
             text.len()
@@ -700,7 +700,7 @@ impl NewsMcpServer {
         }
 
         let trimmed = text.trim_end().to_string();
-        println!(
+        eprintln!(
             "[news] get_headlines (Wikimedia) done, {} news + {} trending, {} chars",
             news_items.len(),
             mostread_items.len(),
@@ -749,7 +749,7 @@ impl NewsMcpServer {
             now.format("%m"),
             now.format("%d"),
         );
-        println!("[news] GET {} (Wikimedia feed)", url);
+        eprintln!("[news] GET {} (Wikimedia feed)", url);
 
         let resp = crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.header(
@@ -760,13 +760,13 @@ impl NewsMcpServer {
         })
         .await
         .map_err(|e| {
-            println!("[news] Wikimedia feed request failed: {e}");
+            eprintln!("[news] Wikimedia feed request failed: {e}");
             crate::format::format_api_error("Wikipedia (news feed)", &e.to_string())
         })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[news] Wikimedia feed returned HTTP {status}");
+            eprintln!("[news] Wikimedia feed returned HTTP {status}");
             return Err(crate::format::format_api_error(
                 "Wikipedia (news feed)",
                 &format!("HTTP {status}"),
@@ -774,7 +774,7 @@ impl NewsMcpServer {
         }
 
         resp.json::<serde_json::Value>().await.map_err(|e| {
-            println!("[news] failed to parse Wikimedia feed response: {e}");
+            eprintln!("[news] failed to parse Wikimedia feed response: {e}");
             crate::format::format_api_error("Wikipedia (news feed)", &e.to_string())
         })
     }
@@ -863,7 +863,7 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
         if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
             let trimmed = q.trim();
             if !trimmed.is_empty() {
-                println!("[news] resolve_query: ToolCaller produced: {:?}", trimmed);
+                eprintln!("[news] resolve_query: ToolCaller produced: {:?}", trimmed);
                 return trimmed.to_string();
             }
         }
@@ -873,7 +873,7 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
     if let Some(ref q) = params.query {
         let trimmed = q.trim();
         if !trimmed.is_empty() {
-            println!("[news] resolve_query: model param 'query': {:?}", trimmed);
+            eprintln!("[news] resolve_query: model param 'query': {:?}", trimmed);
             return trimmed.to_string();
         }
     }
@@ -886,7 +886,7 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
             if let Some(s) = val.as_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    println!("[news] resolve_query: extras '{}': {:?}", key, trimmed);
+                    eprintln!("[news] resolve_query: extras '{}': {:?}", key, trimmed);
                     return trimmed.to_string();
                 }
             }
@@ -898,7 +898,7 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
     if !msg.is_empty() {
         let cleaned = crate::clean_query_for_search(&msg);
         if !cleaned.is_empty() {
-            println!(
+            eprintln!(
                 "[news] resolve_query: user message: {:?} -> {:?}",
                 msg, cleaned
             );
@@ -906,7 +906,7 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
         }
     }
 
-    println!("[news] resolve_query: no query found");
+    eprintln!("[news] resolve_query: no query found");
     String::new()
 }
 
@@ -1065,7 +1065,7 @@ mod tests {
         assert!(resp.status().is_success());
         let ids: Vec<u64> = resp.json().await.expect("failed to parse HN IDs");
         assert!(!ids.is_empty(), "HN should return at least one story ID");
-        println!("HN returned {} story IDs, first: {}", ids.len(), ids[0]);
+        eprintln!("HN returned {} story IDs, first: {}", ids.len(), ids[0]);
     }
 
     #[tokio::test]
@@ -1074,7 +1074,7 @@ mod tests {
         let key = match std::env::var("GIAP_GUARDIAN_KEY") {
             Ok(k) if !k.is_empty() => k,
             _ => {
-                println!("skipping: GIAP_GUARDIAN_KEY not set");
+                eprintln!("skipping: GIAP_GUARDIAN_KEY not set");
                 return;
             }
         };
@@ -1096,7 +1096,7 @@ mod tests {
             .expect("failed to parse Guardian response");
         let results = body["response"]["results"].as_array();
         assert!(results.is_some(), "Guardian should return results array");
-        println!("Guardian returned {} results", results.unwrap().len());
+        eprintln!("Guardian returned {} results", results.unwrap().len());
     }
 
     // ── strip_html_tags tests ───────────────────────────────────────────
@@ -1183,6 +1183,6 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("parse failed");
         let news = body["news"].as_array().expect("news array missing");
         assert!(!news.is_empty(), "should have at least one news item");
-        println!("Found {} news stories", news.len());
+        eprintln!("Found {} news stories", news.len());
     }
 }
