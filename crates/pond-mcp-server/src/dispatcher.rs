@@ -781,18 +781,18 @@ mod tests {
             ),
         ];
 
-        println!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");
+        eprintln!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");
         let mut total_tools = 0;
         let mut all_tools_json = Vec::new();
 
         for (prefix, server) in &servers {
             let ctx = RequestContext::new(RequestId::Number(0), peer.clone());
             let defs = server.list_tools_bridged(ctx).await;
-            println!("[{}] {} tools", prefix, defs.len());
+            eprintln!("[{}] {} tools", prefix, defs.len());
             for (name, _desc, schema) in &defs {
                 let has_props = schema.get("properties").is_some();
                 let has_type = schema.get("type").is_some();
-                println!(
+                eprintln!(
                     "  {} — has_properties={}, has_type={}",
                     name, has_props, has_type
                 );
@@ -810,10 +810,10 @@ mod tests {
             total_tools += defs.len();
         }
 
-        println!("\n=== TOTAL: {} tools ===", total_tools);
-        println!("\n=== FIRST 2 TOOLS IN OPENAI FORMAT (what Jinja receives) ===\n");
+        eprintln!("\n=== TOTAL: {} tools ===", total_tools);
+        eprintln!("\n=== FIRST 2 TOOLS IN OPENAI FORMAT (what Jinja receives) ===\n");
         for tool in all_tools_json.iter().take(2) {
-            println!("{}\n", serde_json::to_string_pretty(tool).unwrap());
+            eprintln!("{}\n", serde_json::to_string_pretty(tool).unwrap());
         }
 
         // Sanity floor: the 6 core servers here (system/weather/knowledge/news/

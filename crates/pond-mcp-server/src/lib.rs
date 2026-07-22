@@ -96,39 +96,39 @@ pub async fn generate_params(
     let tc = tool_caller()?;
     let user_msg = last_user_message();
     if user_msg.is_empty() {
-        println!(
+        eprintln!(
             "[tool-caller] {} skipped: no user message available",
             tool_name
         );
         return None;
     }
-    println!("[tool-caller] ╔═══ ToolCaller Request ═══");
-    println!("[tool-caller] ║ tool:   {}", tool_name);
-    println!("[tool-caller] ║ query:  {:?}", user_msg);
-    println!("[tool-caller] ║ schema: {}", schema);
-    println!("[tool-caller] ╚═════════════════════════");
+    eprintln!("[tool-caller] ╔═══ ToolCaller Request ═══");
+    eprintln!("[tool-caller] ║ tool:   {}", tool_name);
+    eprintln!("[tool-caller] ║ query:  {:?}", user_msg);
+    eprintln!("[tool-caller] ║ schema: {}", schema);
+    eprintln!("[tool-caller] ╚═════════════════════════");
 
     match tc.generate_tool_call(tool_name, schema, &user_msg).await {
         Ok(args) if !args.is_empty() => {
-            println!("[tool-caller] ╔═══ ToolCaller Response ═══");
-            println!("[tool-caller] ║ status: SUCCESS");
+            eprintln!("[tool-caller] ╔═══ ToolCaller Response ═══");
+            eprintln!("[tool-caller] ║ status: SUCCESS");
             for (k, v) in &args {
-                println!("[tool-caller] ║ {}: {}", k, v);
+                eprintln!("[tool-caller] ║ {}: {}", k, v);
             }
-            println!("[tool-caller] ╚══════════════════════════");
+            eprintln!("[tool-caller] ╚══════════════════════════");
             Some(args)
         }
         Ok(_) => {
-            println!("[tool-caller] ╔═══ ToolCaller Response ═══");
-            println!("[tool-caller] ║ status: EMPTY (no args returned)");
-            println!("[tool-caller] ╚══════════════════════════");
+            eprintln!("[tool-caller] ╔═══ ToolCaller Response ═══");
+            eprintln!("[tool-caller] ║ status: EMPTY (no args returned)");
+            eprintln!("[tool-caller] ╚══════════════════════════");
             None
         }
         Err(e) => {
-            println!("[tool-caller] ╔═══ ToolCaller Response ═══");
-            println!("[tool-caller] ║ status: FAILED");
-            println!("[tool-caller] ║ error:  {e}");
-            println!("[tool-caller] ╚══════════════════════════");
+            eprintln!("[tool-caller] ╔═══ ToolCaller Response ═══");
+            eprintln!("[tool-caller] ║ status: FAILED");
+            eprintln!("[tool-caller] ║ error:  {e}");
+            eprintln!("[tool-caller] ╚══════════════════════════");
             None
         }
     }

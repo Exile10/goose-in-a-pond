@@ -397,10 +397,10 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if *last == key {
-                println!("[model-switch] provider already current: {}", key);
+                eprintln!("[model-switch] provider already current: {}", key);
                 return Ok(());
             }
-            println!(
+            eprintln!(
                 "[model-switch] provider change detected: {:?} -> {}",
                 *last, key
             );
@@ -447,7 +447,7 @@ impl GooseAdapter {
                 // Registry key is the stem (no ".gguf") — ModelConfig must match.
                 let registry_key = model_name.trim_end_matches(".gguf");
                 let cfg = goose::model::ModelConfig::new_or_fail(registry_key);
-                println!(
+                eprintln!(
                     "[model-switch] building LocalInferenceProvider for '{}'...",
                     model_name
                 );
@@ -458,7 +458,7 @@ impl GooseAdapter {
                 .await
                 {
                     Ok(p) => {
-                        println!(
+                        eprintln!(
                             "[model-switch] LocalInferenceProvider ready for '{}'",
                             model_name
                         );
@@ -466,7 +466,7 @@ impl GooseAdapter {
                         Some(Arc::new(p))
                     }
                     Err(e) => {
-                        println!(
+                        eprintln!(
                             "[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}",
                             model_name
                         );
@@ -488,20 +488,20 @@ impl GooseAdapter {
                     settings.chat_model.clone()
                 };
                 let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
-                println!(
+                eprintln!(
                     "[model-switch] building llamafile OllamaProvider for '{}'...",
                     model_name
                 );
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
                     Ok(p) => {
-                        println!(
+                        eprintln!(
                             "[model-switch] llamafile provider ready for '{}'",
                             model_name
                         );
                         Some(Arc::new(p))
                     }
                     Err(e) => {
-                        println!(
+                        eprintln!(
                             "[model-switch] FAILED to build llamafile provider for '{}': {e}",
                             model_name
                         );
@@ -520,18 +520,18 @@ impl GooseAdapter {
                 } else {
                     settings.chat_model.clone()
                 };
-                println!(
+                eprintln!(
                     "[model-switch] building Ollama provider for '{}'...",
                     model_name
                 );
                 let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
                 match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
                     Ok(p) => {
-                        println!("[model-switch] Ollama provider ready for '{}'", model_name);
+                        eprintln!("[model-switch] Ollama provider ready for '{}'", model_name);
                         Some(Arc::new(p))
                     }
                     Err(e) => {
-                        println!(
+                        eprintln!(
                             "[model-switch] FAILED to build Ollama provider for '{}': {e}",
                             model_name
                         );
@@ -541,7 +541,7 @@ impl GooseAdapter {
                 }
             }
             _ => {
-                println!(
+                eprintln!(
                     "[model-switch] unknown provider '{}', keeping current",
                     settings.chat_provider
                 );
@@ -550,7 +550,7 @@ impl GooseAdapter {
         };
 
         if let Some(p) = provider {
-            println!(
+            eprintln!(
                 "[model-switch] swapping Goose provider to {}:{} for session {}",
                 settings.chat_provider, settings.chat_model, session_id
             );
@@ -573,7 +573,7 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
-            println!(
+            eprintln!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
                 caps.vision,
@@ -592,9 +592,9 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = 0;
 
-            println!("[model-switch] swap complete, key={}", key);
+            eprintln!("[model-switch] swap complete, key={}", key);
         } else {
-            println!(
+            eprintln!(
                 "[model-switch] no provider built for {}:{}",
                 settings.chat_provider, settings.chat_model
             );
@@ -697,16 +697,16 @@ impl GooseAdapter {
                 .contains(&goose_sid);
             if needs_load {
                 let extensions = registered_extensions();
-                println!(
+                eprintln!(
                     "[goose-adapter] Loading {} GIAP extensions into session {}",
                     extensions.len(),
                     goose_sid
                 );
                 for ext_name in extensions {
-                    println!("[goose-adapter] Loading extension: {ext_name}");
+                    eprintln!("[goose-adapter] Loading extension: {ext_name}");
                     match self.add_builtin_extension(ext_name, &goose_sid).await {
-                        Ok(()) => println!("[goose-adapter]   ✓ {ext_name} loaded"),
-                        Err(e) => println!("[goose-adapter]   ✗ {ext_name} FAILED: {e}"),
+                        Ok(()) => eprintln!("[goose-adapter]   ✓ {ext_name} loaded"),
+                        Err(e) => eprintln!("[goose-adapter]   ✗ {ext_name} FAILED: {e}"),
                     }
                 }
                 self.loaded_sessions
@@ -716,9 +716,9 @@ impl GooseAdapter {
 
                 // List discovered tools to verify extensions are working
                 let tools = self.agent.list_tools(&goose_sid, None).await;
-                println!("[goose-adapter] Discovered {} tools:", tools.len());
+                eprintln!("[goose-adapter] Discovered {} tools:", tools.len());
                 for t in &tools {
-                    println!("[goose-adapter]   - {}", t.name);
+                    eprintln!("[goose-adapter]   - {}", t.name);
                 }
             }
         }

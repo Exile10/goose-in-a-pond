@@ -126,7 +126,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         )
         .unwrap_or_else(|| DEFAULT_TARGET_CURRENCIES.to_string());
 
-        println!("[finance] get_exchange_rate: from={}, to={}", from, to);
+        eprintln!("[finance] get_exchange_rate: from={}, to={}", from, to);
 
         let url = format!(
             "{}/latest?base={}&symbols={}",
@@ -134,7 +134,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
             urlencoding::encode(&from),
             urlencoding::encode(&to),
         );
-        println!("[finance] GET {}", url);
+        eprintln!("[finance] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -143,7 +143,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[finance] Frankfurter request failed: {e}");
+                eprintln!("[finance] Frankfurter request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Frankfurter (exchange rates)", &e.to_string()),
                 )]));
@@ -152,7 +152,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[finance] Frankfurter returned HTTP {status}");
+            eprintln!("[finance] Frankfurter returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error(
                     "Frankfurter (exchange rates)",
@@ -164,7 +164,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[finance] failed to parse Frankfurter response: {e}");
+                eprintln!("[finance] failed to parse Frankfurter response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Frankfurter", &e.to_string()),
                 )]));
@@ -197,7 +197,7 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         };
 
         let truncated = crate::format::truncate_to_budget(&text, EXCHANGE_RATE_BUDGET);
-        println!(
+        eprintln!(
             "[finance] get_exchange_rate done, {} chars",
             truncated.len()
         );
@@ -237,7 +237,7 @@ or 'how much is 50 pounds in shillings'.")]
         .unwrap_or_else(|| "USD".to_string());
         let to = resolve_currency_code(params.0.to.as_deref(), &params.0.extra, &["to", "target"]);
 
-        println!(
+        eprintln!(
             "[finance] convert_currency: amount={}, from={}, to={:?}",
             amount, from, to
         );
@@ -258,7 +258,7 @@ or 'how much is 50 pounds in shillings'.")]
             urlencoding::encode(&from),
             urlencoding::encode(&to),
         );
-        println!("[finance] GET {}", url);
+        eprintln!("[finance] GET {}", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -267,7 +267,7 @@ or 'how much is 50 pounds in shillings'.")]
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[finance] Frankfurter convert failed: {e}");
+                eprintln!("[finance] Frankfurter convert failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Frankfurter (conversion)", &e.to_string()),
                 )]));
@@ -276,7 +276,7 @@ or 'how much is 50 pounds in shillings'.")]
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[finance] Frankfurter convert returned HTTP {status}");
+            eprintln!("[finance] Frankfurter convert returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error(
                     "Frankfurter (conversion)",
@@ -288,7 +288,7 @@ or 'how much is 50 pounds in shillings'.")]
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[finance] failed to parse Frankfurter convert response: {e}");
+                eprintln!("[finance] failed to parse Frankfurter convert response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Frankfurter", &e.to_string()),
                 )]));
@@ -313,7 +313,7 @@ or 'how much is 50 pounds in shillings'.")]
         };
 
         let truncated = crate::format::truncate_to_budget(&text, CONVERT_CURRENCY_BUDGET);
-        println!("[finance] convert_currency done, {} chars", truncated.len());
+        eprintln!("[finance] convert_currency done, {} chars", truncated.len());
         Ok(CallToolResult::success(vec![Content::text(truncated)]))
     }
 
@@ -328,7 +328,7 @@ Get a stock's current price and daily change. Use for 'AAPL stock price', \
         crate::set_current_tool("get_stock_quote");
         // 1. Resolve symbol first (needed for both paths)
         let symbol = resolve_stock_symbol(params.0.symbol.as_deref(), &params.0.extra);
-        println!("[finance] get_stock_quote: symbol={:?}", symbol);
+        eprintln!("[finance] get_stock_quote: symbol={:?}", symbol);
 
         let symbol = match symbol {
             Some(s) => s,
@@ -344,7 +344,7 @@ Get a stock's current price and daily change. Use for 'AAPL stock price', \
         let settings = match self.settings_repo.get().await {
             Ok(s) => s,
             Err(e) => {
-                println!("[finance] failed to load settings: {e}");
+                eprintln!("[finance] failed to load settings: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Stock quotes", "settings unavailable"),
                 )]));
@@ -367,7 +367,7 @@ Get a stock's current price and daily change. Use for 'AAPL stock price', \
         }
 
         // Fallback: Yahoo Finance v8 unofficial (no API key required)
-        println!(
+        eprintln!(
             "[finance] WARNING: using unofficial Yahoo Finance endpoint (no Finnhub key configured)"
         );
         self.get_stock_quote_yahoo(&symbol).await
@@ -384,7 +384,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
         crate::set_current_tool("get_crypto_price");
         let asset = resolve_crypto_asset(params.0.asset.as_deref(), &params.0.extra);
 
-        println!("[finance] get_crypto_price: asset={:?}", asset);
+        eprintln!("[finance] get_crypto_price: asset={:?}", asset);
 
         let asset = match asset {
             Some(a) => a,
@@ -402,7 +402,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
             COINGECKO_BASE_URL,
             urlencoding::encode(&asset),
         );
-        println!("[finance] GET {}", url);
+        eprintln!("[finance] GET {}", url);
 
         let body = match self.fetch_json(&url).await {
             Ok(b) => b,
@@ -423,7 +423,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
                     COINGECKO_BASE_URL,
                     urlencoding::encode(&asset),
                 );
-                println!("[finance] ID not found, searching: GET {}", search_url);
+                eprintln!("[finance] ID not found, searching: GET {}", search_url);
 
                 match self.fetch_json(&search_url).await {
                     Ok(search_body) => {
@@ -454,7 +454,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
                                                 &text,
                                                 CRYPTO_PRICE_BUDGET,
                                             );
-                                            println!(
+                                            eprintln!(
                                                 "[finance] get_crypto_price done, {} chars",
                                                 truncated.len()
                                             );
@@ -512,7 +512,7 @@ Get cryptocurrency price and market data. Use for 'Bitcoin price', \
 
         let text = format_coingecko_price(&display_name, &symbol, data);
         let truncated = crate::format::truncate_to_budget(&text, CRYPTO_PRICE_BUDGET);
-        println!("[finance] get_crypto_price done, {} chars", truncated.len());
+        eprintln!("[finance] get_crypto_price done, {} chars", truncated.len());
 
         let ui_data = build_crypto_ui_data(&display_name, &symbol, data);
         let hint = format!("[[[mcp-ui:crypto:{}]]]\n", ui_data);
@@ -557,7 +557,7 @@ impl FinanceMcpServer {
             urlencoding::encode(symbol),
             urlencoding::encode(api_key),
         );
-        println!("[finance] GET {}", url.replace(api_key, "***"));
+        eprintln!("[finance] GET {}", url.replace(api_key, "***"));
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.timeout(std::time::Duration::from_secs(10))
@@ -566,7 +566,7 @@ impl FinanceMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[finance] Finnhub request failed: {e}");
+                eprintln!("[finance] Finnhub request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Finnhub", &e.to_string()),
                 )]));
@@ -575,7 +575,7 @@ impl FinanceMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[finance] Finnhub returned HTTP {status}");
+            eprintln!("[finance] Finnhub returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Finnhub", &format!("HTTP {status}")),
             )]));
@@ -584,7 +584,7 @@ impl FinanceMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[finance] failed to parse Finnhub response: {e}");
+                eprintln!("[finance] failed to parse Finnhub response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Finnhub", &e.to_string()),
                 )]));
@@ -601,7 +601,7 @@ impl FinanceMcpServer {
         let prev_close = body["pc"].as_f64().unwrap_or(0.0);
 
         if current == 0.0 && open == 0.0 && high == 0.0 && low == 0.0 {
-            println!("[finance] Finnhub returned all zeros for '{}'", symbol);
+            eprintln!("[finance] Finnhub returned all zeros for '{}'", symbol);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No quote found for '{}'. Check the ticker symbol — \
                  use standard US exchange symbols (e.g. AAPL, MSFT, GOOGL).",
@@ -616,7 +616,7 @@ impl FinanceMcpServer {
         );
 
         let truncated = crate::format::truncate_to_budget(&text, STOCK_QUOTE_BUDGET);
-        println!(
+        eprintln!(
             "[finance] get_stock_quote (Finnhub) done, {} chars",
             truncated.len()
         );
@@ -643,7 +643,7 @@ impl FinanceMcpServer {
             YAHOO_FINANCE_BASE_URL,
             urlencoding::encode(symbol),
         );
-        println!("[finance] GET {} (Yahoo Finance unofficial)", url);
+        eprintln!("[finance] GET {} (Yahoo Finance unofficial)", url);
 
         let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
             b.header("user-agent", "Mozilla/5.0 (compatible; GIAP/0.1)")
@@ -653,7 +653,7 @@ impl FinanceMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("[finance] Yahoo Finance request failed: {e}");
+                eprintln!("[finance] Yahoo Finance request failed: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Yahoo Finance", &e.to_string()),
                 )]));
@@ -662,7 +662,7 @@ impl FinanceMcpServer {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            println!("[finance] Yahoo Finance returned HTTP {status}");
+            eprintln!("[finance] Yahoo Finance returned HTTP {status}");
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_api_error("Yahoo Finance", &format!("HTTP {status}")),
             )]));
@@ -671,7 +671,7 @@ impl FinanceMcpServer {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("[finance] failed to parse Yahoo Finance response: {e}");
+                eprintln!("[finance] failed to parse Yahoo Finance response: {e}");
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_api_error("Yahoo Finance", &e.to_string()),
                 )]));
@@ -686,7 +686,7 @@ impl FinanceMcpServer {
         let exchange = meta["exchangeName"].as_str().unwrap_or("");
 
         if price == 0.0 && prev_close == 0.0 {
-            println!("[finance] Yahoo Finance returned no data for '{}'", symbol);
+            eprintln!("[finance] Yahoo Finance returned no data for '{}'", symbol);
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No quote found for '{}'. Check the ticker symbol — \
                  use standard US exchange symbols (e.g. AAPL, MSFT, GOOGL).",
@@ -729,7 +729,7 @@ impl FinanceMcpServer {
         );
 
         let truncated = crate::format::truncate_to_budget(&text, STOCK_QUOTE_BUDGET);
-        println!(
+        eprintln!(
             "[finance] get_stock_quote (Yahoo) done, {} chars",
             truncated.len()
         );
@@ -1208,7 +1208,7 @@ mod tests {
             .await
             .expect("failed to parse Frankfurter response");
         let eur_rate = body["rates"]["EUR"].as_f64().expect("EUR rate missing");
-        println!("USD->EUR rate: {}", eur_rate);
+        eprintln!("USD->EUR rate: {}", eur_rate);
         assert!(
             (0.5..2.0).contains(&eur_rate),
             "EUR rate should be between 0.5 and 2.0, got {}",
@@ -1244,10 +1244,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&body_text).expect("failed to parse CoinGecko response");
         let price = body["bitcoin"]["usd"].as_f64().expect("usd price missing");
-        println!("Bitcoin price: ${}", price);
+        eprintln!("Bitcoin price: ${}", price);
         assert!(price > 0.0, "Bitcoin price should be non-zero");
         let change = body["bitcoin"]["usd_24h_change"].as_f64();
-        println!("24h change: {:?}%", change);
+        eprintln!("24h change: {:?}%", change);
     }
 
     #[tokio::test]
@@ -1256,7 +1256,7 @@ mod tests {
         let key = match std::env::var("GIAP_FINNHUB_KEY") {
             Ok(k) if !k.is_empty() => k,
             _ => {
-                println!("skipping: GIAP_FINNHUB_KEY not set");
+                eprintln!("skipping: GIAP_FINNHUB_KEY not set");
                 return;
             }
         };
@@ -1271,7 +1271,7 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.expect("failed to parse Finnhub response");
         let current = body["c"].as_f64().expect("current price missing");
-        println!("AAPL price: ${}", current);
+        eprintln!("AAPL price: ${}", current);
         assert!(current > 0.0, "AAPL price should be non-zero");
     }
 
@@ -1297,7 +1297,7 @@ mod tests {
         let price = body["chart"]["result"][0]["meta"]["regularMarketPrice"]
             .as_f64()
             .expect("price missing");
-        println!("AAPL price: ${}", price);
+        eprintln!("AAPL price: ${}", price);
         assert!(price > 0.0, "AAPL price should be non-zero");
     }
 }
