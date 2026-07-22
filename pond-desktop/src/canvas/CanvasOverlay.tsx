@@ -19,6 +19,12 @@ export function CanvasOverlay() {
 
   const isRecordingRef  = useRef(false);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Tracks which transcript entry response-token should append to. Needed
+  // because the backend's own "transcript" (user text) event arrives *during*
+  // run_voice_pipeline — after the empty agent placeholder below is already
+  // seeded — so "the last message is the agent" is not a safe assumption;
+  // tokens must target this id directly instead of array position.
+  const pendingAgentIdRef = useRef<number | null>(null);
 
   // ── Silence detection ───────────────────────────────────
   const clearSilenceTimer = useCallback(() => {
@@ -56,9 +62,11 @@ export function CanvasOverlay() {
     try {
       const wavBytes = await invoke<number[]>("stop_recording");
       // Seed empty agent message for token streaming
+      const agentId = nextTranscriptId();
+      pendingAgentIdRef.current = agentId;
       setTranscript((prev) => [
         ...prev,
-        { id: nextTranscriptId(), role: "agent" as const, text: "", timestamp: Date.now() },
+        { id: agentId, role: "agent" as const, text: "", timestamp: Date.now() },
       ]);
       await invoke("run_voice_pipeline", { wavBytes, sessionId: undefined, authToken: "" });
     } catch (e) {
@@ -86,53 +94,62 @@ export function CanvasOverlay() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Tauri events ─────────────────────────────────────────
+  //
+  // Collect the listen() *promises* themselves (not their resolved unlisten
+  // functions via .then()). React 18 StrictMode double-invokes this effect in
+  // dev (mount -> cleanup -> mount again); listen() hasn't resolved yet when
+  // that first cleanup runs, so a `.then((u) => arr.push(u))` pattern leaves
+  // the array empty at cleanup time — the first mount's listeners are never
+  // removed, and every real Tauri event ends up handled twice (each
+  // response-token duplicated into local transcript state). Pushing the
+  // promise synchronously and resolving it in cleanup closes that race.
   useEffect(() => {
-    const unlisten: Array<() => void> = [];
+    const unlistenPromises: Array<Promise<() => void>> = [];
 
-    listen("canvas-start-listen", () => {
+    unlistenPromises.push(listen("canvas-start-listen", () => {
       if (!isRecordingRef.current) startRecording();
-    }).then((u) => unlisten.push(u));
+    }));
 
-    listen("canvas-hotkey", () => {
+    unlistenPromises.push(listen("canvas-hotkey", () => {
       if (isRecordingRef.current) stopAndSend();
-    }).then((u) => unlisten.push(u));
+    }));
 
     // recording-started: no longer used — startRecording() sets state
     // directly, so calibration recordings don't cross-contaminate.
 
-    listen("recording-aborted", () => {
+    unlistenPromises.push(listen("recording-aborted", () => {
       isRecordingRef.current = false;
       clearSilenceTimer();
       setOrbState("idle");
-    }).then((u) => unlisten.push(u));
+    }));
 
-    listen<number>("audio-level", (e) => {
+    unlistenPromises.push(listen<number>("audio-level", (e) => {
       const level = e.payload;
       setAudioLevel(level);
       if (isRecordingRef.current) {
         if (level > 0.015) clearSilenceTimer();
         else startSilenceTimer();
       }
-    }).then((u) => unlisten.push(u));
+    }));
 
-    listen<{ text: string }>("transcript", (e) => {
+    unlistenPromises.push(listen<{ text: string }>("transcript", (e) => {
       setTranscript((prev) => [
         ...prev,
         { id: nextTranscriptId(), role: "user" as const, text: e.payload.text, timestamp: Date.now() },
       ]);
       setOrbState("thinking");
-    }).then((u) => unlisten.push(u));
+    }));
 
-    listen<{ token: string; done: boolean }>("response-token", (e) => {
-      setTranscript((prev) => {
-        if (!prev.length) return prev;
-        const last = prev[prev.length - 1];
-        if (last.role !== "agent") return prev;
-        return [...prev.slice(0, -1), { ...last, text: last.text + e.payload.token }];
-      });
-    }).then((u) => unlisten.push(u));
+    unlistenPromises.push(listen<{ token: string; done: boolean }>("response-token", (e) => {
+      const targetId = pendingAgentIdRef.current;
+      if (targetId === null) return;
+      if (e.payload.done) { pendingAgentIdRef.current = null; return; }
+      setTranscript((prev) =>
+        prev.map((m) => (m.id === targetId ? { ...m, text: m.text + e.payload.token } : m)),
+      );
+    }));
 
-    listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number }>(
+    unlistenPromises.push(listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number }>(
       "tool-result",
       (e) => {
         setCards((prev) => [
@@ -140,19 +157,19 @@ export function CanvasOverlay() {
           { id: nextCardId(), tool: e.payload.tool, data: e.payload.data, timestamp_ms: e.payload.timestamp_ms },
         ]);
       },
-    ).then((u) => unlisten.push(u));
+    ));
 
-    listen("tts-start", () => setOrbState("speaking")).then((u) => unlisten.push(u));
-    listen("tts-end",   () => setOrbState("idle")).then((u) => unlisten.push(u));
+    unlistenPromises.push(listen("tts-start", () => setOrbState("speaking")));
+    unlistenPromises.push(listen("tts-end",   () => setOrbState("idle")));
 
-    listen<string>("pipeline-error", () => {
+    unlistenPromises.push(listen<string>("pipeline-error", () => {
       setOrbState("error");
       setTimeout(() => setOrbState("idle"), 3500);
-    }).then((u) => unlisten.push(u));
+    }));
 
     return () => {
       clearSilenceTimer();
-      unlisten.forEach((u) => u());
+      unlistenPromises.forEach((p) => p.then((u) => u()).catch(() => {}));
     };
   }, [clearSilenceTimer, startSilenceTimer]);
 
