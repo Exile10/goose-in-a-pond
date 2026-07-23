@@ -2082,6 +2082,15 @@ async fn register_push_token(
             Json(json!({ "error": "`token` too long" })),
         ));
     }
+    // Every real push token (FCM, APNs hex, `ExponentPushToken[...]`) is
+    // printable ASCII. Rejecting anything else here keeps control characters
+    // out of the logs and stops malformed tokens reaching the relays at all.
+    if !req.token.chars().all(|c| c.is_ascii_graphic()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` must be printable ASCII" })),
+        ));
+    }
 
     // The token must belong to a known, registered device.
     let exists = state.device_registry.get_device(&id).await.map_err(|e| {
