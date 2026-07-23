@@ -289,6 +289,103 @@ impl NotificationRelay for FcmPushRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pond_core::user_data::domain::push_token::PushToken;
+
+    /// A relay whose signing key is deliberately NOT an RSA key. Every test
+    /// using it exercises a branch that returns before anything is signed, so
+    /// reaching `encode` would fail the test loudly rather than silently pass.
+    /// This keeps the suite free of a committed PEM — gitleaks scans the full
+    /// history, and a private key put there could not be taken back.
+    fn relay_with(tokens: Arc<dyn PushTokenRepository>) -> FcmPushRelay {
+        FcmPushRelay {
+            account: ServiceAccount {
+                project_id: "goose-test".into(),
+                private_key: "unused".into(),
+                client_email: "svc@goose-test.iam.gserviceaccount.com".into(),
+                // Unroutable by design: if a test ever reached the network,
+                // it would hang or fail rather than quietly talk to Google.
+                token_uri: "http://127.0.0.1:1/token".into(),
+            },
+            signing_key: jsonwebtoken::EncodingKey::from_secret(b"not-an-rsa-key"),
+            push_tokens: tokens,
+            http: reqwest::Client::new(),
+            cached_token: Mutex::new(None),
+        }
+    }
+
+    #[derive(Default)]
+    struct StubTokens {
+        token: Mutex<Option<PushToken>>,
+    }
+    #[async_trait]
+    impl PushTokenRepository for StubTokens {
+        async fn upsert(&self, t: PushToken) -> Result<()> {
+            *self.token.lock().unwrap() = Some(t);
+            Ok(())
+        }
+        async fn get(&self, _device_id: &str) -> Result<Option<PushToken>> {
+            Ok(self.token.lock().unwrap().clone())
+        }
+        async fn list(&self) -> Result<Vec<PushToken>> {
+            Ok(self.token.lock().unwrap().clone().into_iter().collect())
+        }
+        async fn delete(&self, _device_id: &str) -> Result<()> {
+            *self.token.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    fn notif() -> Notification {
+        Notification {
+            id: "n-1".into(),
+            target: "dev-1".into(),
+            category: "alert".into(),
+            title: "t".into(),
+            body: "b".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            data: None,
+        }
+    }
+
+    async fn seeded(platform: PushPlatform, token: &str) -> Arc<StubTokens> {
+        let tokens = Arc::new(StubTokens::default());
+        tokens
+            .upsert(PushToken {
+                device_id: "dev-1".into(),
+                token: token.into(),
+                platform,
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+        tokens
+    }
+
+    /// A device with no registered token is a normal, silent no-op — the phone
+    /// simply has no background channel yet.
+    #[tokio::test]
+    async fn relay_without_a_registered_token_is_a_no_op() {
+        let relay = relay_with(Arc::new(StubTokens::default()));
+        relay.relay(&notif()).await.unwrap();
+    }
+
+    /// APNs and Expo tokens are skipped by design (no Apple signing key yet;
+    /// Expo is not on this delivery path). Both must return before signing.
+    #[tokio::test]
+    async fn non_fcm_platforms_are_skipped_without_touching_the_network() {
+        for platform in [PushPlatform::Apns, PushPlatform::Expo] {
+            let relay = relay_with(seeded(platform, "token-abcdefghij").await);
+            relay
+                .relay(&notif())
+                .await
+                .expect("non-FCM platforms are skipped, not errors");
+        }
+    }
+
+    // Note: this relay's own log-prefix path sits after a successful FCM send,
+    // so it is not reachable without a real RSA signing key. The redaction
+    // itself is covered directly in `push_token_log`, and end-to-end through a
+    // relay in `stub_push_relay`; both call the same helper this one does.
 
     #[test]
     fn parses_a_service_account_and_rejects_incomplete_ones() {
