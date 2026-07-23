@@ -448,10 +448,61 @@ mod tests {
             .set_body_json(json!({ "access_token": "test-access-token", "expires_in": 3600 }))
     }
 
+    /// Held by every test below that makes a real outbound call.
+    ///
+    /// The #113 egress sink is process-global and set through a `OnceLock`, so
+    /// the moment one test installs a capturing sink it is installed for the
+    /// whole binary and every concurrently running test writes into the same
+    /// buffer. Serialising is what lets `both_outbound_calls_are_recorded_as_egress`
+    /// assert an exact event count. Do not remove these guards as redundant.
+    ///
+    /// A `tokio::sync::Mutex` because the guard is held across `.await`. An
+    /// in-module lock rather than the `serial_test` crate, following the
+    /// precedent in `pond-adapters-face-onnx/src/antispoof_onnx.rs`.
+    static EGRESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The shared egress capture buffer, installing the sink on first use.
+    ///
+    /// `set_egress_sink` is first-wins, so the buffer has to be created once
+    /// and handed back to every caller — a per-test sink is not possible.
+    fn captured_egress() -> Arc<Mutex<Vec<pond_core::security::domain::event::Event>>> {
+        use async_trait::async_trait;
+        use pond_core::security::domain::event::{Event, EventQuery};
+        use pond_core::security::ports::event_log::EventLog;
+
+        struct CapturingLog(Arc<Mutex<Vec<Event>>>);
+        #[async_trait]
+        impl EventLog for CapturingLog {
+            async fn append(&self, event: Event) -> Result<()> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+                Ok(())
+            }
+            async fn query(&self, _q: EventQuery) -> Result<Vec<Event>> {
+                Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            }
+            async fn purge(&self, _q: EventQuery) -> Result<u64> {
+                Ok(0)
+            }
+        }
+
+        static CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<Event>>>> = std::sync::OnceLock::new();
+        CAPTURE
+            .get_or_init(|| {
+                let buffer = Arc::new(Mutex::new(Vec::new()));
+                pond_core::shared::services::egress::set_egress_sink(Arc::new(CapturingLog(
+                    buffer.clone(),
+                )));
+                buffer
+            })
+            .clone()
+    }
+
     /// The happy path end to end: sign an assertion, exchange it for an access
     /// token, then send the wake ping bearing that token.
     #[tokio::test]
     async fn signs_exchanges_and_sends() {
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
         use wiremock::matchers::{body_string_contains, header, method, path};
         use wiremock::{Mock, MockServer};
 
@@ -490,6 +541,8 @@ mod tests {
     /// also what keeps a burst of notifications from doubling our egress.
     #[tokio::test]
     async fn the_access_token_is_reused_across_sends() {
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer};
 
@@ -519,6 +572,8 @@ mod tests {
     /// credentials attached.
     #[tokio::test]
     async fn a_rejected_token_exchange_fails_without_sending() {
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer};
 
@@ -548,6 +603,8 @@ mod tests {
     /// would look like successful delivery.
     #[tokio::test]
     async fn a_rejected_send_is_reported() {
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer};
 
@@ -571,12 +628,94 @@ mod tests {
         assert!(err.to_string().contains("404"), "unexpected error: {err}");
     }
 
+    /// Both Google calls must appear in the activity feed (#113).
+    ///
+    /// This guards a promise, not a feature: the module docs say GIAP tells you
+    /// when it talked to Google. Drop either `record_egress` call and every
+    /// other test still passes while that promise quietly stops holding.
+    ///
+    /// The send is mocked to 404 on purpose. It makes the two events tellable
+    /// apart by status — `extract_host` strips the port, so both wiremock
+    /// servers are host `127.0.0.1` and host cannot distinguish them (harmless
+    /// in production, where real hosts differ; do not "fix" this by asserting
+    /// on host). It also pins the more important half of the guarantee: a push
+    /// that *failed* must still show up, or a silent failure looks exactly like
+    /// a push that was never attempted.
+    #[tokio::test]
+    async fn both_outbound_calls_are_recorded_as_egress() {
+        use pond_core::security::domain::event::{EventCategory, PrivacySensitivity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ok_token_response())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/goose-test/messages:send"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let captured = captured_egress();
+        captured.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "fcm-device-token").await,
+        );
+        relay.relay(&notif()).await.expect_err("404 send");
+
+        // `record_egress` spawns the append, so let it land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let events = captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| e.action == "egress.http")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected the token exchange and the send to both be recorded, got {events:#?}"
+        );
+        for ev in &events {
+            assert_eq!(ev.category, EventCategory::Network);
+            assert_eq!(ev.attributes.get("method"), Some(&"POST".into()));
+            assert_eq!(ev.attributes.get("host"), Some(&"127.0.0.1".into()));
+            // Loopback, because the mock is local — real runs classify
+            // googleapis.com as Sensitive.
+            assert_eq!(ev.privacy_sensitivity, PrivacySensitivity::Internal);
+        }
+        let statuses = events
+            .iter()
+            .filter_map(|e| e.attributes.get("status").cloned())
+            .collect::<Vec<_>>();
+        assert!(
+            statuses.contains(&200_i64.into()),
+            "token exchange not recorded: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&404_i64.into()),
+            "failed send not recorded: {statuses:?}"
+        );
+    }
+
     /// A token whose 8th byte falls inside a multi-byte character reaches the
     /// redaction path only after a successful send — the case the earlier
     /// tests could not get to. This is the panic guard on this relay's own
     /// logging.
     #[tokio::test]
     async fn a_multi_byte_token_survives_the_send_path() {
+        // Serialised: the egress sink is process-global (see EGRESS_LOCK).
+        let _egress_guard = EGRESS_LOCK.lock().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer};
 
