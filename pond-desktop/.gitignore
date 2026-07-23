@@ -9,3 +9,4 @@ src-tauri/binaries/
 # Generated test artifacts (never commit — #163 accidentally committed 214 of these)
 playwright-report/
 test-results/
+pond-desktop/kiosk-screenshots/
