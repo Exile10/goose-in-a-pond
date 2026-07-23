@@ -49,6 +49,26 @@ health-checks `GET /api/v1/health`.
 Deploys build on the Jetson's `origin` remote (the GitHub mirror), so push
 there first — or push to `jarida-io` and sync the mirror.
 
+## LLM provider & context tuning
+
+- **Provider: Ollama** (`llama3.2:3b`, ~22 tok/s warm) is the working path on the
+  Jetson, verified end-to-end with the full giap-* tool surface. First request
+  after idle pays a one-time cold model-load (~70s); warm responses are ~8s for a
+  short prompt. Keep the model resident with `OLLAMA_KEEP_ALIVE`.
+- **Set `context_window_override`** (Settings) to **16384** on the box. GIAP's
+  57-tool system prompt is ~12.5K tokens; Ollama's default `num_ctx` is 4096, so
+  without the override two-thirds of the tools are truncated out of the prompt.
+  The override flows into `GOOSE_CONTEXT_LIMIT` → Ollama `options.num_ctx` → the
+  KV cache, keeping all three consistent (commit `551b0e24`).
+- **Direct llama.cpp (`llama-server`) is NOT wired in.** It was evaluated
+  (research move R6) and deferred: Goose streams from the OpenAI endpoint and the
+  box's June llama.cpp build's `--jinja` streaming tool-call parser errors on
+  GIAP's tool payload ("expected peg-native format"), and that build benchmarked
+  *slower* than Ollama (18.6 vs 22 tok/s). Revisit with a fresh llama.cpp build.
+- **GPU clocks**: the governor idles at 306 MHz but ramps to 1020 MHz under load
+  on its own — pinning via `jetson_clocks` (needs sudo) is a latency/consistency
+  win, not a throughput multiplier.
+
 ## Gotchas
 
 - **No passwordless sudo** on the Jetson — anything touching system units,
