@@ -14,7 +14,6 @@ export type GuiSection =
   | "prompts"
   | "settings"
   | "faces"
-  | "agent"
   | "canvas"
   | "logs"
   | "hub";
@@ -62,7 +61,7 @@ export const DESKTOP_SECTIONS: Array<{ section: GuiSection; label: string }> =
 
 // Include all valid sections — some are routable but not in the sidebar
 // "hub" is hidden from the classic sidebar; entry is via Settings > "Preview Goose Hub"
-const HIDDEN_SECTIONS: GuiSection[] = ["faces", "agent", "canvas", "hub"];
+const HIDDEN_SECTIONS: GuiSection[] = ["faces", "canvas", "hub"];
 const SECTION_SET = new Set<GuiSection>([
   ...DESKTOP_SECTIONS.map((s) => s.section),
   ...HIDDEN_SECTIONS,

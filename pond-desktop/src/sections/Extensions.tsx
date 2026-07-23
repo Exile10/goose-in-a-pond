@@ -13,6 +13,7 @@ import {
   Plus,
   RefreshCw,
   Wrench,
+  Terminal,
   Download,
   Check,
   Star,
@@ -27,8 +28,8 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState } from "../state/AppContext";
-import { useConfirm } from "../components/shared";
-import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement } from "../api/types";
+import { useConfirm, ErrorBanner } from "../components/shared";
+import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement, AgentTool } from "../api/types";
 
 /** Open a URL in the system browser. Uses Tauri shell plugin when available, falls back to window.open. */
 async function openExternal(url: string) {
@@ -1009,9 +1010,78 @@ function BrowseTab({
   );
 }
 
+// ── Tools Tab ────────────────────────────────────────────────
+//
+// Flat, cross-extension MCP tool browser (moved from the old developer-only
+// Agent screen) — every tool from every enabled extension, grouped by
+// extension, with its description. Complements the per-card tool lists in
+// the Installed tab, which only show bare names.
+
+function ToolsTab() {
+  const [tools, setTools]     = useState<AgentTool[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setError(null);
+    setLoading(true);
+    api.listTools().then(setTools).catch((e) => setError(String(e))).finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (loading) return <p className="ext-status-text">Loading tools…</p>;
+  if (error)   return <ErrorBanner error={error} onRetry={load} />;
+  if (!tools.length) return (
+    <div className="empty-state">
+      <Wrench size={32} strokeWidth={1.2} />
+      <div>
+        <div className="empty-state__heading">No MCP tools loaded</div>
+        <div className="empty-state__body">Enable an extension to see the tools it provides.</div>
+      </div>
+    </div>
+  );
+
+  const byExtension: Record<string, AgentTool[]> = {};
+  for (const t of tools) {
+    (byExtension[t.extension] ??= []).push(t);
+  }
+
+  return (
+    <div className="ext-list-stack">
+      {Object.entries(byExtension).map(([ext, extTools]) => (
+        <Card key={ext} className="card">
+          <CardContent className="card-body--flush">
+            <div className="agent-ext-header">
+              <span className="ext-card__name">{ext}</span>
+              <span className="muted-12 agent-ext-count">
+                {extTools.length} tool{extTools.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+            <div>
+              {extTools.map((t) => (
+                <div key={t.name} className="tool-row">
+                  <span className="tool-row__icon"><Terminal size={14} /></span>
+                  <span className="tool-row__name">{t.name}</span>
+                  {t.description && (
+                    <span className="ext-card__tool-count tool-desc-chip">
+                      {t.description.length > 80 ? t.description.slice(0, 77) + "..." : t.description}
+                    </span>
+                  )}
+                  <span className="tool-row__spacer" />
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
 // ── Main Extensions Component ─────────────────────────────────
 
-type Tab = "installed" | "browse";
+type Tab = "installed" | "tools" | "browse";
 
 interface SecretEditState {
   /** The installed extension name being configured */
@@ -1220,6 +1290,15 @@ export function Extensions() {
           )}
         </button>
         <button
+          className={`ext-tab-bar__tab${activeTab === "tools" ? " ext-tab-bar__tab--active" : ""}`}
+          role="tab"
+          aria-selected={activeTab === "tools"}
+          onClick={() => setActiveTab("tools")}
+        >
+          <Wrench size={12} strokeWidth={2} />
+          Tools
+        </button>
+        <button
           className={`ext-tab-bar__tab${activeTab === "browse" ? " ext-tab-bar__tab--active" : ""}`}
           role="tab"
           aria-selected={activeTab === "browse"}
@@ -1299,6 +1378,8 @@ export function Extensions() {
           <AddExtensionForm onAdd={handleAdd} disabled={!state.serverOnline} />
         </>
       )}
+
+      {activeTab === "tools" && <ToolsTab />}
 
       {activeTab === "browse" && (
         <Card className="card">
