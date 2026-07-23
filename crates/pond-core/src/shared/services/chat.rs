@@ -31,6 +31,20 @@ fn resolve_voice_role(_message: &str) -> String {
     "chat".to_string()
 }
 
+/// The bare tool name, stripping any MCP server prefix
+/// (`giap-weather__get_current_weather` -> `get_current_weather`).
+///
+/// MCP tool ids are `<server>__<tool>` (see `parse_tool_name` in
+/// pond-mcp-server). The egress tracker (#113) already records the bare name via
+/// `set_current_tool`, so recording it here too keeps the activity feed
+/// consistent between a tool's `tool.call` event and its `egress.http` events.
+fn bare_tool_name(tool: &str) -> String {
+    match tool.split_once("__") {
+        Some((_, bare)) if !bare.is_empty() => bare.to_string(),
+        _ => tool.to_string(),
+    }
+}
+
 /// Voice-loop control classification for a raw transcript.
 ///
 /// This is voice-CLI UI control (turn-taking / loop lifecycle), NOT a
@@ -1385,7 +1399,7 @@ impl ChatService {
             .filter_map(|s| {
                 serde_json::from_str::<serde_json::Value>(s)
                     .ok()
-                    .and_then(|v| v.get("tool").and_then(|t| t.as_str()).map(String::from))
+                    .and_then(|v| v.get("tool").and_then(|t| t.as_str()).map(bare_tool_name))
             })
             .collect();
 
@@ -2304,6 +2318,19 @@ mod tests {
         serde_json::json!({ "tool_call_id": "id", "tool": tool, "content": "ok" }).to_string()
     }
 
+    #[test]
+    fn bare_tool_name_strips_the_mcp_prefix() {
+        assert_eq!(
+            bare_tool_name("giap-weather__get_current_weather"),
+            "get_current_weather"
+        );
+        assert_eq!(bare_tool_name("ext-filesystem__read_file"), "read_file");
+        // No prefix — unchanged.
+        assert_eq!(bare_tool_name("save_memory"), "save_memory");
+        // Degenerate: trailing separator, keep the original rather than empty.
+        assert_eq!(bare_tool_name("weird__"), "weird__");
+    }
+
     async fn service_with_log(session: &str) -> (ChatService, Arc<MockEventLog>) {
         let storage = Arc::new(InMemorySessionStorage::new());
         storage.create_session(session.to_string()).await.unwrap();
@@ -2319,9 +2346,11 @@ mod tests {
 
         service
             .persist_assistant_turn(
+                // Prefixed MCP ids as the stream delivers them; events record
+                // the bare names.
                 vec![
-                    tool_result("get_current_weather"),
-                    tool_result("save_memory"),
+                    tool_result("giap-weather__get_current_weather"),
+                    tool_result("giap-memory__save_memory"),
                 ],
                 "here you go",
                 Some((120, 34)),
