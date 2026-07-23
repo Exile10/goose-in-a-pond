@@ -471,7 +471,10 @@ async fn async_main() -> Result<()> {
             } else {
                 tracing_setup::ConsoleSink::Stdout
             };
-            let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console);
+            // Interactive voice/text chat: keep the console clean — WARN+ only
+            // for tracing; the curated turn lines + inference summary print via
+            // diag!/out!, and full detail still lands in the rolling log file.
+            let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console, true);
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
