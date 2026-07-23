@@ -39,12 +39,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::push_token_log::token_log_prefix;
+
 /// OAuth scope for FCM v1 sends.
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 /// Refresh the cached access token this long before its stated expiry.
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
-/// How much of a push token is safe to log (prefix only).
-const TOKEN_LOG_PREFIX: usize = 8;
+/// Ceiling on each outbound Google call. The relay is awaited inline in
+/// `BroadcastNotificationSender::send`, so an unbounded request would stall
+/// notification delivery behind a hung socket.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The fields GIAP needs from a Firebase service-account key file.
 #[derive(Debug, Clone, Deserialize)]
@@ -120,11 +124,15 @@ impl FcmPushRelay {
             client = %account.client_email,
             "FCM push relay active (data-only wake pings)"
         );
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .context("building the FCM HTTP client")?;
         Ok(Self {
             account,
             signing_key,
             push_tokens,
-            http: reqwest::Client::new(),
+            http,
             cached_token: Mutex::new(None),
         })
     }
@@ -258,7 +266,7 @@ impl NotificationRelay for FcmPushRelay {
             }
         };
 
-        let prefix = &stored.token[..stored.token.len().min(TOKEN_LOG_PREFIX)];
+        let prefix = token_log_prefix(&stored.token);
         if response.status().is_success() {
             tracing::info!(
                 device = %notification.target,
