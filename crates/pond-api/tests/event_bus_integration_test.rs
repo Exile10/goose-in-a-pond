@@ -81,7 +81,7 @@ async fn make_app_with_bus() -> (axum::Router, Arc<InProcessEventBus>, tempfile:
         skill_repo: Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo: Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: Some(bus.clone() as Arc<dyn EventBus>),
         event_log: None,
         push_token_repo: None,
