@@ -357,7 +357,19 @@ impl GooseAdapter {
     ///
     /// For HTTP providers (Ollama, llamafile): uses the model's reported context
     /// window from capabilities (model name heuristics).
-    fn effective_context_window(provider: &str, model: &str) -> usize {
+    ///
+    /// `override_tokens` (Settings.context_window_override, 0 = unset) wins over
+    /// every heuristic when > 0. This is the escape hatch for deployments whose
+    /// real limit is neither the model's max nor the cuda ceiling — e.g. a
+    /// Jetson running Ollama with a hand-tuned KV cache, or a tool-heavy GIAP
+    /// prompt (~12K tokens for the 57 giap-* tools) that overflows the default
+    /// heuristic and forces a compaction loop. The value flows into
+    /// GOOSE_CONTEXT_LIMIT and thus into Ollama's `options.num_ctx`, so the
+    /// reported limit, the request's num_ctx, and the KV cache all agree.
+    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+        if override_tokens > 0 {
+            return override_tokens as usize;
+        }
         match provider {
             "local" | "gguf" => {
                 // Generous ceiling — the actual allocation is constrained by
@@ -414,8 +426,11 @@ impl GooseAdapter {
         // The model hits ContextLengthExceeded long before 102K and falls into
         // the expensive emergency compaction path. Setting this env var BEFORE
         // ModelConfig::new_or_fail() ensures Goose sees the real limit.
-        let effective_ctx =
-            Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        );
         // SAFETY: set_var is unsafe in multi-threaded programs per Rust 1.66+,
         // but Goose already calls set_var for OLLAMA_HOST/OLLAMA_TIMEOUT in the
         // same code path, so we follow the existing pattern.
@@ -834,8 +849,11 @@ impl GooseAdapter {
             // Derive compact_prompt from the effective context window.
             // On small-context platforms (Jetson 3K, macOS Metal 8K), verbose
             // tool descriptions and detailed instructions waste precious tokens.
-            let effective_ctx =
-                Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+            let effective_ctx = Self::effective_context_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            );
             let compact_prompt =
                 pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                     effective_ctx,
@@ -953,8 +971,11 @@ impl GooseAdapter {
         // Derive a CompactionProfile from the effective context window so
         // memory injection doesn't eat into the already-tight KV cache on
         // small-context platforms (Jetson 3K, macOS Metal 8K).
-        let effective_ctx =
-            Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        );
         let compaction_profile =
             pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                 effective_ctx,
