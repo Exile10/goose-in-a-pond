@@ -26,9 +26,11 @@ set -euo pipefail
 
 HOST="${JETSON_HOST:-nano}"
 BRANCH="main"
+DESKTOP=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
+    --desktop) DESKTOP=true; shift ;;   # also build the native Tauri app (needs a display)
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -66,6 +68,20 @@ ssh "$HOST" "systemctl --user restart goose-in-a-pond.service && sleep 4 \
   && systemctl --user --no-pager status goose-in-a-pond.service | head -5 \
   && curl -sf -o /dev/null -w 'API: HTTP %{http_code}\n' http://127.0.0.1:8080/api/v1/health \
      || curl -sf -o /dev/null -w 'API(root): HTTP %{http_code}\n' http://127.0.0.1:8080/"
+
+if [ "$DESKTOP" = true ]; then
+  echo "==> [desktop] Ensuring WebKitGTK deps, then building the native Tauri app"
+  # install-desktop-deps.sh checks + installs the WebKitGTK stack (also enforced
+  # at compile time by pond-desktop/src-tauri/build.rs). A plain cargo build of
+  # the src-tauri crate embeds the dist synced above — no Node/cargo-tauri needed
+  # on the device (the Jetson's Node is too old for Vite).
+  ssh "$HOST" "cd ~/${REMOTE_REPO} \
+    && bash scripts/install-desktop-deps.sh \
+    && PATH=\$HOME/.cargo/bin:\$PATH SQLX_OFFLINE=true \
+       cargo build --release --manifest-path pond-desktop/src-tauri/Cargo.toml \
+    && echo 'Desktop app: ~/'${REMOTE_REPO}'/pond-desktop/src-tauri/target/release/pond-desktop'"
+  echo "    Launch on the attached display:  ssh $HOST 'DISPLAY=:0 ~/${REMOTE_REPO}/pond-desktop/src-tauri/target/release/pond-desktop'"
+fi
 
 echo ""
 echo "Deployed. Dashboard: http://nano.local:8080"
