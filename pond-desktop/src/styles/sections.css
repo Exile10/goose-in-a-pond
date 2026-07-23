@@ -3860,63 +3860,22 @@
 /* Inline icon utility (used for credential badge in marketplace card) */
 .icon-inline { display: inline; vertical-align: middle; }
 
-/* ─── Agent ─── */
-.agent-tabs { background: var(--grey-100); border-radius: 12px; padding: 4px; }
-.agent-tab { font-weight: var(--weight-semibold); }
-
-.agent-chat-card { min-height: 420px; display: flex; flex-direction: column; }
-.agent-chat-card__composer {
-  display: flex; gap: 8px; margin-top: auto; padding-top: 16px;
-}
-
-.tool-row, .extra-row {
+/* ─── MCP tool rows (Extensions > Tools tab) ─── */
+.tool-row {
   display: flex; align-items: center; gap: 10px;
   padding: 10px 12px; border-radius: 10px;
 }
-.tool-row + .tool-row, .extra-row + .extra-row { border-top: 1px solid var(--grey-100); border-radius: 0; }
+.tool-row + .tool-row { border-top: 1px solid var(--grey-100); border-radius: 0; }
 .tool-row__icon { color: var(--purple-600); }
 .tool-row__name { font-size: var(--text-base); font-family: var(--font-mono); font-weight: var(--weight-medium); }
 .tool-row__spacer { flex: 1; }
 
-.extras-add { display: flex; gap: 8px; }
-.extras-add > div:first-child { flex: 1; }
-
-.extra-row { font-size: var(--text-base); color: var(--fg); }
-
-.agent-chat-card__card-body { display: flex; flex-direction: column; gap: var(--space-3); min-height: 420px; }
-.agent-chat-card__messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
-
-.agent-bubble--user { align-self: flex-end; background: var(--color-accent); color: #fff; border-radius: var(--radius-card) var(--radius-card) 2px var(--radius-card); padding: 8px 12px; font-size: var(--text-sm); max-width: 80%; white-space: pre-wrap; }
-.agent-bubble--assistant { align-self: flex-start; background: var(--color-surface); border: 1px solid var(--grey-200); border-radius: 2px var(--radius-card) var(--radius-card) var(--radius-card); padding: 8px 12px; font-size: var(--text-sm); max-width: 90%; }
-.agent-bubble__pre { margin: 0; font-family: inherit; white-space: pre-wrap; line-height: 1.55; }
-.agent-bubble--status { align-self: flex-start; font-size: var(--text-xs); color: var(--grey-500); font-style: italic; }
-.agent-bubble--error { align-self: flex-start; font-size: var(--text-xs); color: var(--color-destructive); font-style: italic; }
-
-.agent-input { height: 36px; border: 1px solid var(--grey-200); border-radius: var(--radius-card); padding: 0 12px; font-size: var(--text-base); font-family: var(--font-body); background: var(--color-surface); color: var(--fg); width: 100%; }
-.agent-input--textarea { height: 64px; resize: vertical; padding: 8px 12px; }
-.agent-input--flex { flex: 1; width: auto; }
-
 .text-error { color: var(--color-destructive); }
 .text-error--sm { font-size: 12px; margin: 0; }
-.agent-panel { display: flex; flex-direction: column; gap: 12px; padding-top: 8px; }
 
 .agent-ext-header { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--grey-200); background: var(--grey-50); }
 .agent-ext-count { margin-left: auto; }
 .tool-desc-chip { margin-left: 6px; }
-
-.agent-extra-key { font-family: var(--font-mono); font-size: var(--text-base); color: var(--color-accent); font-weight: 600; }
-.agent-extra-preview { flex: 1; font-size: var(--text-sm); color: var(--grey-600); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.agent-recipes { display: flex; gap: 12px; padding-top: 8px; min-height: 320px; }
-.agent-recipes__list { width: 200px; flex-shrink: 0; }
-.agent-recipes__list-body { padding: 4px; }
-.agent-recipe-btn { width: 100%; text-align: left; }
-.agent-recipes__detail { flex: 1; min-width: 0; }
-.agent-recipes__detail-body { display: flex; flex-direction: column; gap: 8px; }
-.agent-recipe__name { font-weight: 600; font-size: var(--text-base); }
-.agent-recipe__desc { margin: 4px 0 0; font-size: var(--text-sm); color: var(--grey-600); }
-.agent-recipe__yaml { flex: 1; margin: 0; padding: var(--space-4); background: var(--grey-50); border: 1px solid var(--grey-200); border-radius: var(--radius-card); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--fg); line-height: 1.6; overflow: auto; white-space: pre; }
-.agent-recipe__import-code { font-family: var(--font-mono); font-size: 11px; }
 
 /* ─── Canvas ─── */
 .screen--canvas {
@@ -4369,12 +4328,10 @@
 [data-slot="tabs-indicator"] {
   display: none !important;
 }
-/* Segmented/solid variant (agent-tabs, logs toolbar) */
-.agent-tabs [role="tablist"],
+/* Segmented/solid variant (logs toolbar) */
 .logs-toolbar [role="tablist"] {
   background: var(--grey-100); border-radius: 10px; padding: 3px;
 }
-.agent-tabs [role="tab"][aria-selected="true"],
 .logs-toolbar [role="tab"][aria-selected="true"] {
   background: var(--color-accent); color: #fff; border-radius: 7px;
 }
