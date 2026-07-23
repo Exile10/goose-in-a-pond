@@ -1,6 +1,7 @@
 pub mod broadcast_notification_sender;
 pub mod db;
 pub mod fastembed_embedding;
+pub mod fcm_push_relay;
 pub mod keyring_secret_repository;
 pub mod logging_device_control;
 pub mod mock_handshake;

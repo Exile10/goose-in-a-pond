@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 hostname = { workspace = true }
 tracing = { workspace = true }
 reqwest = {workspace = true}
+jsonwebtoken = { workspace = true }
 fastembed = { workspace = true }
 # Handshake / pairing (#93): HMAC pairing proof + hashed tokens.
 sha2 = { workspace = true }
