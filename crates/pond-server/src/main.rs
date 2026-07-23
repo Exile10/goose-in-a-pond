@@ -1651,8 +1651,15 @@ async fn run_server(
     // Weather — used by the MCP weather module, not AppState.
     // The LLM calls giap__get_current_weather when it needs weather data.
     let weather: Option<Arc<dyn WeatherProvider>> = {
+        // Build the provider when weather is on and we have *either* explicit
+        // coordinates *or* a location name. Onboarding only stores a name (the
+        // coordinates default to 0), so requiring coordinates here left every
+        // onboarded install with weather permanently "not configured"; the
+        // adapter geocodes the name on demand.
         if settings.weather_enabled
-            && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+            && (settings.weather_latitude != 0.0
+                || settings.weather_longitude != 0.0
+                || !settings.weather_location_name.trim().is_empty())
         {
             let loc = if settings.weather_location_name.is_empty() {
                 format!(
@@ -1675,7 +1682,7 @@ async fn run_server(
             )))
         } else {
             tracing::info!(
-                "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)"
+                "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon or location_name)"
             );
             None
         }
@@ -2881,8 +2888,12 @@ async fn run_chat(
     }
 
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
+    // Same gate as the primary wiring above: coordinates OR a location name (the
+    // adapter geocodes the name), so an onboarded name-only config still works.
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+        && (settings.weather_latitude != 0.0
+            || settings.weather_longitude != 0.0
+            || !settings.weather_location_name.trim().is_empty())
     {
         let loc = if settings.weather_location_name.is_empty() {
             format!(
