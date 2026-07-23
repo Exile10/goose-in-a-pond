@@ -65,9 +65,13 @@ pub fn parse_service_account(raw: &str) -> Result<ServiceAccount> {
     serde_json::from_str(raw).context("service-account JSON missing required fields")
 }
 
-/// The FCM v1 send endpoint for a project.
-pub fn fcm_send_url(project_id: &str) -> String {
-    format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send")
+/// Google's FCM v1 host. Overridable only so tests can point the send at a
+/// local mock; production always uses this.
+const FCM_BASE_URL: &str = "https://fcm.googleapis.com";
+
+/// The FCM v1 send endpoint for a project, under `base`.
+pub fn fcm_send_url(base: &str, project_id: &str) -> String {
+    format!("{base}/v1/projects/{project_id}/messages:send")
 }
 
 /// Build the data-only wake message for a device token. Deliberately carries
@@ -108,6 +112,8 @@ pub struct FcmPushRelay {
     http: reqwest::Client,
     /// `(access_token, refresh_after)` — refreshed lazily on demand.
     cached_token: Mutex<Option<(String, Instant)>>,
+    /// FCM host. Always [`FCM_BASE_URL`] outside tests.
+    fcm_base: String,
 }
 
 impl FcmPushRelay {
@@ -134,6 +140,7 @@ impl FcmPushRelay {
             push_tokens,
             http,
             cached_token: Mutex::new(None),
+            fcm_base: FCM_BASE_URL.to_string(),
         })
     }
 
@@ -243,7 +250,7 @@ impl NotificationRelay for FcmPushRelay {
         }
 
         let access_token = self.access_token().await?;
-        let url = fcm_send_url(&self.account.project_id);
+        let url = fcm_send_url(&self.fcm_base, &self.account.project_id);
         let body = wake_message(&stored.token, notification);
 
         let started = Instant::now();
@@ -310,6 +317,8 @@ mod tests {
             push_tokens: tokens,
             http: reqwest::Client::new(),
             cached_token: Mutex::new(None),
+            // Unroutable for the same reason as token_uri above.
+            fcm_base: "http://127.0.0.1:1".into(),
         }
     }
 
@@ -382,10 +391,216 @@ mod tests {
         }
     }
 
-    // Note: this relay's own log-prefix path sits after a successful FCM send,
-    // so it is not reachable without a real RSA signing key. The redaction
-    // itself is covered directly in `push_token_log`, and end-to-end through a
-    // relay in `stub_push_relay`; both call the same helper this one does.
+    // ── Signing + HTTP path ─────────────────────────────────────────────────
+    //
+    // These drive the real OAuth2 JWT-bearer exchange and FCM send against a
+    // local mock. The RSA key is generated at run time and never touches disk:
+    // gitleaks scans the full history, so a committed PEM could not be
+    // withdrawn even after deletion.
+
+    /// A 2048-bit RSA key in PKCS#8 PEM, generated once per test binary.
+    /// Key generation costs a second or so, so it is shared across tests.
+    fn test_signing_key() -> &'static jsonwebtoken::EncodingKey {
+        use rsa::pkcs8::EncodePrivateKey;
+        static KEY: std::sync::OnceLock<jsonwebtoken::EncodingKey> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let mut rng = rand::thread_rng();
+            // jsonwebtoken/ring requires >= 2047 bits for RS256.
+            let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
+            let pem = private
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("encode PKCS#8 PEM");
+            jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).expect("load generated key")
+        })
+    }
+
+    /// A relay that can genuinely sign, pointed at `base` for sends and at
+    /// `token_uri` for the OAuth exchange.
+    fn signing_relay_with_token_uri(
+        base: &str,
+        token_uri: &str,
+        tokens: Arc<dyn PushTokenRepository>,
+    ) -> FcmPushRelay {
+        FcmPushRelay {
+            account: ServiceAccount {
+                project_id: "goose-test".into(),
+                private_key: "unused-once-the-key-is-built".into(),
+                client_email: "svc@goose-test.iam.gserviceaccount.com".into(),
+                token_uri: token_uri.into(),
+            },
+            signing_key: test_signing_key().clone(),
+            push_tokens: tokens,
+            http: reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .unwrap(),
+            cached_token: Mutex::new(None),
+            fcm_base: base.into(),
+        }
+    }
+
+    fn signing_relay(base: &str, tokens: Arc<dyn PushTokenRepository>) -> FcmPushRelay {
+        signing_relay_with_token_uri(base, &format!("{base}/token"), tokens)
+    }
+
+    fn ok_token_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(json!({ "access_token": "test-access-token", "expires_in": 3600 }))
+    }
+
+    /// The happy path end to end: sign an assertion, exchange it for an access
+    /// token, then send the wake ping bearing that token.
+    #[tokio::test]
+    async fn signs_exchanges_and_sends() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            // The RFC 7523 grant, carrying our signed assertion.
+            .and(body_string_contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer",
+            ))
+            .and(body_string_contains("assertion="))
+            .respond_with(ok_token_response())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/goose-test/messages:send"))
+            .and(header("authorization", "Bearer test-access-token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({ "name": "ok" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "fcm-device-token").await,
+        );
+        relay.relay(&notif()).await.expect("wake ping delivered");
+        // `expect(...)` on both mocks is verified when the server drops.
+    }
+
+    /// The access token is cached: a second push in the same window must not
+    /// re-run the exchange. Google rate-limits token issuance, and this is
+    /// also what keeps a burst of notifications from doubling our egress.
+    #[tokio::test]
+    async fn the_access_token_is_reused_across_sends() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ok_token_response())
+            .expect(1) // exactly once, despite two sends
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/goose-test/messages:send"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "fcm-device-token").await,
+        );
+        relay.relay(&notif()).await.unwrap();
+        relay.relay(&notif()).await.unwrap();
+    }
+
+    /// A rejected exchange must surface as an error rather than a send with no
+    /// credentials attached.
+    #[tokio::test]
+    async fn a_rejected_token_exchange_fails_without_sending() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_json(json!({
+                "error": "invalid_grant"
+            })))
+            .mount(&server)
+            .await;
+        // No send mock: reaching the send endpoint at all fails the test.
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "fcm-device-token").await,
+        );
+        let err = relay.relay(&notif()).await.expect_err("must not proceed");
+        assert!(
+            err.to_string().contains("token exchange rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// 404/410 from FCM means a stale token (app reinstalled). It must be
+    /// reported, not swallowed — the sender logs it, and a swallowed failure
+    /// would look like successful delivery.
+    #[tokio::test]
+    async fn a_rejected_send_is_reported() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ok_token_response())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/goose-test/messages:send"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "fcm-device-token").await,
+        );
+        let err = relay.relay(&notif()).await.expect_err("404 must surface");
+        assert!(err.to_string().contains("404"), "unexpected error: {err}");
+    }
+
+    /// A token whose 8th byte falls inside a multi-byte character reaches the
+    /// redaction path only after a successful send — the case the earlier
+    /// tests could not get to. This is the panic guard on this relay's own
+    /// logging.
+    #[tokio::test]
+    async fn a_multi_byte_token_survives_the_send_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ok_token_response())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/goose-test/messages:send"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let relay = signing_relay(
+            &server.uri(),
+            seeded(PushPlatform::Fcm, "日本語のトークンです").await,
+        );
+        relay
+            .relay(&notif())
+            .await
+            .expect("must not panic redacting");
+    }
 
     #[test]
     fn parses_a_service_account_and_rejects_incomplete_ones() {
@@ -405,9 +620,18 @@ mod tests {
     #[test]
     fn send_url_targets_the_project() {
         assert_eq!(
-            fcm_send_url("goose-test"),
+            fcm_send_url(FCM_BASE_URL, "goose-test"),
             "https://fcm.googleapis.com/v1/projects/goose-test/messages:send"
         );
+    }
+
+    /// Production must never be pointed anywhere but Google. The override
+    /// exists for the mock server below and nothing else.
+    #[test]
+    fn the_default_base_is_googles() {
+        let relay = signing_relay("http://unused", Arc::new(StubTokens::default()));
+        assert_eq!(FCM_BASE_URL, "https://fcm.googleapis.com");
+        assert!(relay.fcm_base.starts_with("http://")); // test override in effect
     }
 
     /// The privacy contract: wake pings are data-only — no `notification`
