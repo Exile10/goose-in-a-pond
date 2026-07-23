@@ -520,13 +520,18 @@ async fn handshake_verify(
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
     // Rate-limit verify attempts per source IP (applies to loopback too — this
     // endpoint is security-sensitive regardless of origin).
-    if !verify_limiter()
-        .check_rate_limit(&peer.ip().to_string())
+    if let Err(remaining) = verify_limiter()
+        .check_rate_limit_detailed(&peer.ip().to_string())
         .await
     {
+        // Tell the client how long to wait rather than leaving it to guess.
+        let retry_after = crate::middleware::retry_after_secs(remaining);
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "too many handshake attempts; slow down"})),
+            Json(json!({
+                "error": "too many handshake attempts; slow down",
+                "retry_after_secs": retry_after,
+            })),
         ));
     }
     let Json(request) = body.map_err(|_| bad_body())?;
