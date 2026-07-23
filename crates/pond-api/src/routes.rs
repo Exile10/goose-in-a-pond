@@ -6650,7 +6650,7 @@ async fn list_logs(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(repo) = &state.event_log_repo else {
+    let Some(repo) = &state.operational_log else {
         return Json(json!([])).into_response();
     };
 
@@ -6677,7 +6677,7 @@ async fn list_logs(
 async fn export_logs_csv(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Some(repo) = &state.event_log_repo else {
+    let Some(repo) = &state.operational_log else {
         return (StatusCode::NOT_IMPLEMENTED, "Event log not configured").into_response();
     };
 

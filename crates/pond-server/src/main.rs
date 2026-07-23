@@ -75,7 +75,7 @@ use pond_infra::db::Database;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_draft::SqliteDraftRepository;
-use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteEventLogRepository};
+use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteOperationalLog};
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
@@ -2033,22 +2033,24 @@ async fn run_server(
     > = None;
 
     // Capture logs pool before `db` is moved into AppState
-    let event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>> =
-        Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
+    let operational_log: Option<
+        Arc<dyn pond_core::security::ports::event_log::OperationalLogRepository>,
+    > = Some(Arc::new(SqliteOperationalLog::new(db.logs.clone())));
 
-    // Privacy/security boundary hook — wraps the event log as its audit sink.
-    // Default-allow; routes opt in to calling `allow`/`audit`.
+    // Privacy/security boundary hook — audits into the unified event log (#108)
+    // as `Auth` events, so a policy decision is correlatable with the rest of a
+    // session. Default-allow; nothing calls `audit` yet (see the adapter docs).
     let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
         Some(Arc::new(
             pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
-                SqliteEventLogRepository::new(db.logs.clone()),
+                SqliteEventLog::new(db.logs.clone()),
             )),
         ));
 
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
     // writer keeps flushing log output to disk.
-    let _file_guard = drain_handle.drain_into(event_log_repo.clone());
+    let _file_guard = drain_handle.drain_into(operational_log.clone());
 
     // Durable per-turn telemetry persisted to pond_logs.db. Falls back to the
     // in-memory store if the SQLite-backed adapter cannot be initialised.
@@ -2371,7 +2373,7 @@ async fn run_server(
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
-        event_log_repo: event_log_repo,
+        operational_log: operational_log,
         event_bus: Some(event_bus.clone()),
         event_log: Some(event_log.clone()),
         push_token_repo: Some(push_token_repo.clone()),

@@ -136,7 +136,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_log: None,
         event_bus: None,
         push_token_repo: None,

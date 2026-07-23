@@ -230,7 +230,8 @@ pub struct AppState {
     /// Read/write access to the `event_log` table in `pond_logs.db`.
     /// Used by the `/api/v1/logs` endpoint.
     /// `None` in tests.
-    pub event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>>,
+    pub operational_log:
+        Option<Arc<dyn pond_core::security::ports::event_log::OperationalLogRepository>>,
     /// In-process event bus (#91): `record_sensor` / `record_camera_event`
     /// publish here so reactive consumers (the rules engine, live dashboards)
     /// can respond. `None` in tests that don't exercise the bus.
