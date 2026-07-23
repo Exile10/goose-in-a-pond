@@ -153,20 +153,49 @@ fn main() {
             // is available when api.ts executes at module load time.
             let default_url = "http://127.0.0.1:4000";
             let init_script = format!(r#"window.__GIAP_SERVER_URL__ = "{default_url}";"#);
-            tauri::WebviewWindowBuilder::new(
+
+            // Size the window to the actual display. On a small panel — e.g. a
+            // 7-inch 1024x600 kiosk display on the Jetson — a fixed 1280x860
+            // window overflows the screen and the title bar/top rows are lost,
+            // and a 600px min-height cannot fit under the desktop's top bar. So:
+            // fit the window to the monitor, drop the min so it can shrink to a
+            // small panel, and go borderless-fullscreen on small displays so the
+            // full 1024x600 is usable UI rather than window chrome. Roomy
+            // desktops keep the comfortable windowed size.
+            let (mon_w, mon_h) = app
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| {
+                    let s = m.size();
+                    let sf = m.scale_factor();
+                    (s.width as f64 / sf, s.height as f64 / sf)
+                })
+                .unwrap_or((1280.0, 860.0));
+            let small_display = mon_w <= 1100.0 || mon_h <= 700.0;
+            let win_w = 1280.0_f64.min(mon_w);
+            let win_h = 860.0_f64.min(mon_h);
+
+            let mut builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Goose In A Pond")
-            .inner_size(1280.0, 860.0)
-            .min_inner_size(900.0, 600.0)
+            .inner_size(win_w, win_h)
+            .min_inner_size(360.0, 480.0)
             .resizable(true)
-            .decorations(true)
             .center()
-            .initialization_script(&init_script)
-            .build()
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            .initialization_script(&init_script);
+            builder = if small_display {
+                // Kiosk: no chrome, use the whole panel.
+                builder.decorations(false).fullscreen(true)
+            } else {
+                builder.decorations(true)
+            };
+            builder
+                .build()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
             // macOS native menu bar (App + Edit + View)
             #[cfg(target_os = "macos")]
