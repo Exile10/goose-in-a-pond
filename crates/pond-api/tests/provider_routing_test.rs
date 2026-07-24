@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_api::{build_router, AppState};
 use pond_core::mcp::ports::extension_manager::{
-    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
+    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort, ToolInfo,
 };
 use pond_core::models::ports::agent::{Agent, AgentRequest, AgentResponse};
 use pond_core::shared::mocks::mock_agent::MockAgent;
@@ -106,6 +106,14 @@ impl ExtensionManagerPort for StubExtensionManager {
 
     async fn list_tools(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec!["giap__get_current_weather".to_string()])
+    }
+
+    async fn list_tools_detailed(&self) -> anyhow::Result<Vec<ToolInfo>> {
+        Ok(vec![ToolInfo {
+            extension: "giap".to_string(),
+            name: "get_current_weather".to_string(),
+            description: Some("Get the current weather".to_string()),
+        }])
     }
 
     async fn set_enabled(&self, _name: &str, _enabled: bool) -> anyhow::Result<()> {
@@ -206,6 +214,7 @@ async fn make_app_with_provider(
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
+        commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -231,7 +240,7 @@ async fn make_app_with_provider(
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,
@@ -534,6 +543,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
+        commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -559,7 +569,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,
@@ -635,6 +645,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
+        commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -660,7 +671,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,

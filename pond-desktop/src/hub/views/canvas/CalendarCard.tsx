@@ -93,7 +93,7 @@ export function CalendarCard(): React.ReactElement {
                   style={{
                     fontSize: 10,
                     background: "#F1F5F9",
-                    color: "#94A3B8",
+                    color: "var(--color-text-tertiary)",
                     padding: "1px 7px",
                     borderRadius: 6,
                     fontWeight: 600,
@@ -107,7 +107,7 @@ export function CalendarCard(): React.ReactElement {
                 <div
                   style={{
                     fontSize: 11,
-                    color: "#94A3B8",
+                    color: "var(--color-text-tertiary)",
                     marginTop: 2,
                     display: "flex",
                     alignItems: "center",
@@ -115,7 +115,7 @@ export function CalendarCard(): React.ReactElement {
                     fontWeight: 500,
                   }}
                 >
-                  <HubIco d={PIN_PATH} size={10} color="#94A3B8" sw={1.5} />
+                  <HubIco d={PIN_PATH} size={10} color="var(--color-text-tertiary)" sw={1.5} />
                   {ev.loc}
                 </div>
               )}

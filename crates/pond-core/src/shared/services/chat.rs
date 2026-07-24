@@ -7,6 +7,8 @@ use crate::models::ports::wake_word::StreamingWakeWordDetector;
 use crate::models::services::context_compactor::ContextCompactor;
 use crate::models::services::instant_activation::InstantActivation;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
+use crate::security::domain::event::{Event, EventCategory, PrivacySensitivity};
+use crate::security::ports::event_log::EventLog;
 use crate::shared::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
 use crate::shared::services::print_output::PrintOutput;
 use crate::shared::services::stdin_input::StdinInput;
@@ -27,6 +29,20 @@ use uuid::Uuid;
 /// natively via MCP — no pre-classification needed.
 fn resolve_voice_role(_message: &str) -> String {
     "chat".to_string()
+}
+
+/// The bare tool name, stripping any MCP server prefix
+/// (`giap-weather__get_current_weather` -> `get_current_weather`).
+///
+/// MCP tool ids are `<server>__<tool>` (see `parse_tool_name` in
+/// pond-mcp-server). The egress tracker (#113) already records the bare name via
+/// `set_current_tool`, so recording it here too keeps the activity feed
+/// consistent between a tool's `tool.call` event and its `egress.http` events.
+fn bare_tool_name(tool: &str) -> String {
+    match tool.split_once("__") {
+        Some((_, bare)) if !bare.is_empty() => bare.to_string(),
+        _ => tool.to_string(),
+    }
 }
 
 /// Voice-loop control classification for a raw transcript.
@@ -1103,6 +1119,11 @@ pub struct ChatService {
     memory_extractor: Option<Arc<dyn MemoryExtractor>>,
     memory_extraction_service: Option<Arc<MemoryExtractionService>>,
     memory_repo: Option<Arc<dyn MemoryRepository>>,
+    /// Optional unified activity log. When set, `persist_assistant_turn` records
+    /// one Agent event, one Inference event (when token usage is known), and one
+    /// Tool event per tool call — so the activity feed reflects chat activity,
+    /// not just Auth/Network. `None` in tests and the CLI path.
+    event_log: Option<Arc<dyn EventLog>>,
 }
 
 impl ChatService {
@@ -1125,7 +1146,16 @@ impl ChatService {
             memory_extractor: None,
             memory_extraction_service: None,
             memory_repo: None,
+            event_log: None,
         }
+    }
+
+    /// Attach the unified activity log so `persist_assistant_turn` records
+    /// Agent / Inference / Tool events for each turn. Handlers that omit this
+    /// simply record nothing — best-effort, never fatal.
+    pub fn with_event_log(mut self, event_log: Arc<dyn EventLog>) -> Self {
+        self.event_log = Some(event_log);
+        self
     }
 
     /// Attach the memory extraction pipeline so `persist_assistant_turn`
@@ -1361,6 +1391,18 @@ impl ChatService {
         usage: Option<(u32, u32)>,
         model_name: Option<&str>,
     ) -> Result<()> {
+        // Extract tool names for activity events before the loop below consumes
+        // `tool_results`. Each entry is JSON carrying a `"tool"` field (built in
+        // the chat handler); entries that don't parse are skipped, not fatal.
+        let tool_names: Vec<String> = tool_results
+            .iter()
+            .filter_map(|s| {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| v.get("tool").and_then(|t| t.as_str()).map(bare_tool_name))
+            })
+            .collect();
+
         for content in tool_results {
             let sm = SessionMessage::new(
                 Uuid::new_v4().to_string(),
@@ -1394,7 +1436,69 @@ impl ChatService {
         // cheap, deterministic title from the first user message — no LLM call.
         self.ensure_session_title().await;
 
+        // Record the turn's activity in the unified log (best-effort). Uses the
+        // tool names already carried in `tool_results` and the token usage, so
+        // the activity feed reflects chat activity, not just Auth/Network.
+        self.record_turn_activity(&tool_names, usage, model_name)
+            .await;
+
         Ok(())
+    }
+
+    /// Append the Agent / Inference / Tool events for one completed turn.
+    ///
+    /// Best-effort: a failed append is logged and swallowed — observability must
+    /// never fail a turn (same contract as the auth-event and egress emitters).
+    /// Metadata only (counts, model, tool names); message content already lives
+    /// in `session_messages`, so these events stay `Internal`.
+    async fn record_turn_activity(
+        &self,
+        tool_names: &[String],
+        usage: Option<(u32, u32)>,
+        model_name: Option<&str>,
+    ) {
+        let Some(event_log) = &self.event_log else {
+            return;
+        };
+
+        let mut events = Vec::with_capacity(2 + tool_names.len());
+
+        // The turn itself.
+        events.push(
+            Event::new(EventCategory::Agent, "agent.turn")
+                .attr("tool_count", tool_names.len() as i64)
+                .session(&self.session_id)
+                .sensitivity(PrivacySensitivity::Internal),
+        );
+
+        // The inference, when token usage was reported (chat_stream path).
+        if let Some((prompt, completion)) = usage {
+            let mut ev = Event::new(EventCategory::Inference, "inference.completion")
+                .attr("prompt_tokens", prompt as i64)
+                .attr("completion_tokens", completion as i64)
+                .session(&self.session_id)
+                .sensitivity(PrivacySensitivity::Internal);
+            if let Some(model) = model_name {
+                ev = ev.attr("model", model);
+            }
+            events.push(ev);
+        }
+
+        // One per tool call.
+        for tool in tool_names {
+            events.push(
+                Event::new(EventCategory::Tool, "tool.call")
+                    .attr("tool", tool.as_str())
+                    .session(&self.session_id)
+                    .sensitivity(PrivacySensitivity::Internal),
+            );
+        }
+
+        for event in events {
+            if let Err(e) = event_log.append(event).await {
+                tracing::warn!(error = %e, "failed to record turn activity event");
+            }
+        }
     }
 
     /// Set a session title if one is not already present, deriving it
@@ -2202,6 +2306,144 @@ mod tests {
         let service = ChatService::new(agent, session_id.clone(), storage.clone());
         let result = service.chat_once("Hello!".to_string()).await.unwrap();
         assert_eq!(result, "Echo: Hello!");
+    }
+
+    // ── activity events (Agent / Inference / Tool) ───────────────────────
+
+    use crate::security::domain::event::EventCategory;
+    use crate::security::mocks::mock_event_log::MockEventLog;
+
+    /// A tool_result JSON string in the shape the chat handler builds.
+    fn tool_result(tool: &str) -> String {
+        serde_json::json!({ "tool_call_id": "id", "tool": tool, "content": "ok" }).to_string()
+    }
+
+    #[test]
+    fn bare_tool_name_strips_the_mcp_prefix() {
+        assert_eq!(
+            bare_tool_name("giap-weather__get_current_weather"),
+            "get_current_weather"
+        );
+        assert_eq!(bare_tool_name("ext-filesystem__read_file"), "read_file");
+        // No prefix — unchanged.
+        assert_eq!(bare_tool_name("save_memory"), "save_memory");
+        // Degenerate: trailing separator, keep the original rather than empty.
+        assert_eq!(bare_tool_name("weird__"), "weird__");
+    }
+
+    async fn service_with_log(session: &str) -> (ChatService, Arc<MockEventLog>) {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session(session.to_string()).await.unwrap();
+        let log = Arc::new(MockEventLog::default());
+        let service = ChatService::new(Arc::new(MockAgent::new()), session.to_string(), storage)
+            .with_event_log(log.clone());
+        (service, log)
+    }
+
+    #[tokio::test]
+    async fn turn_emits_agent_inference_and_one_tool_event_each() {
+        let (service, log) = service_with_log("sess-a").await;
+
+        service
+            .persist_assistant_turn(
+                // Prefixed MCP ids as the stream delivers them; events record
+                // the bare names.
+                vec![
+                    tool_result("giap-weather__get_current_weather"),
+                    tool_result("giap-memory__save_memory"),
+                ],
+                "here you go",
+                Some((120, 34)),
+                Some("gemma-4-E2B-it-Q4_K_M"),
+            )
+            .await
+            .unwrap();
+
+        let events = log.all();
+        let by_cat = |c: EventCategory| events.iter().filter(|e| e.category == c).count();
+        assert_eq!(by_cat(EventCategory::Agent), 1);
+        assert_eq!(by_cat(EventCategory::Inference), 1);
+        assert_eq!(by_cat(EventCategory::Tool), 2);
+
+        // Everything is Internal and carries the session id.
+        assert!(events
+            .iter()
+            .all(|e| e.privacy_sensitivity == PrivacySensitivity::Internal
+                && e.session_id.as_deref() == Some("sess-a")));
+
+        let agent = events
+            .iter()
+            .find(|e| e.category == EventCategory::Agent)
+            .unwrap();
+        assert_eq!(agent.action, "agent.turn");
+        assert_eq!(agent.attributes.get("tool_count"), Some(&2_i64.into()));
+
+        let inference = events
+            .iter()
+            .find(|e| e.category == EventCategory::Inference)
+            .unwrap();
+        assert_eq!(
+            inference.attributes.get("prompt_tokens"),
+            Some(&120_i64.into())
+        );
+        assert_eq!(
+            inference.attributes.get("completion_tokens"),
+            Some(&34_i64.into())
+        );
+        assert_eq!(
+            inference.attributes.get("model"),
+            Some(&"gemma-4-E2B-it-Q4_K_M".into())
+        );
+
+        let tools: Vec<_> = events
+            .iter()
+            .filter(|e| e.category == EventCategory::Tool)
+            .filter_map(|e| e.attributes.get("tool").cloned())
+            .collect();
+        assert!(tools.contains(&"get_current_weather".into()));
+        assert!(tools.contains(&"save_memory".into()));
+    }
+
+    /// No token usage (the agent_chat_stream path) → an Agent event but no
+    /// Inference event, since there is nothing to report.
+    #[tokio::test]
+    async fn turn_without_usage_emits_no_inference_event() {
+        let (service, log) = service_with_log("sess-b").await;
+
+        service
+            .persist_assistant_turn(vec![], "hi", None, None)
+            .await
+            .unwrap();
+
+        let events = log.all();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.category == EventCategory::Agent)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.category == EventCategory::Inference)
+                .count(),
+            0
+        );
+    }
+
+    /// Without an event log attached, persistence still succeeds and records
+    /// nothing — the feature is opt-in and never fatal.
+    #[tokio::test]
+    async fn turn_without_event_log_records_nothing_and_succeeds() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session("sess-c".to_string()).await.unwrap();
+        let service = ChatService::new(Arc::new(MockAgent::new()), "sess-c".to_string(), storage);
+
+        service
+            .persist_assistant_turn(vec![tool_result("noop")], "ok", Some((1, 1)), None)
+            .await
+            .expect("persistence must not fail without an event log");
     }
 
     // ── derive_title_from_text / ensure_session_title (DEF-7) ────────────

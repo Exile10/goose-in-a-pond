@@ -9,6 +9,26 @@ interface DeviceTileProps {
   size?: "md" | "lg";
 }
 
+// Icon + friendly label for devices that aren't a smart-home light/lock/thermostat/plug
+// (host, sensor, gotg, smart_speaker, pond, edge — the Devices section's register types).
+export const SUBTYPE_ICON: Record<string, string> = {
+  host: HP_PATHS.cpu,
+  sensor: HP_PATHS.pulse,
+  gotg: HP_PATHS.phone,
+  smart_speaker: HP_PATHS.speaker,
+  pond: HP_PATHS.goose,
+  edge: HP_PATHS.chip,
+};
+
+const SUBTYPE_LABEL: Record<string, string> = {
+  host: "Host / PC",
+  sensor: "Sensor",
+  gotg: "Mobile (GOTG)",
+  smart_speaker: "Smart speaker",
+  pond: "Pond instance",
+  edge: "Edge device",
+};
+
 export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   const [st, , control] = useDeviceState(device.id);
   const k = device.kind;
@@ -18,7 +38,7 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   let active = false;
   let bg = "var(--tile-bg,#fff)";
   let fg = "var(--tile-fg,#18181B)";
-  let sub = "var(--tile-sub,#94A3B8)";
+  let sub = "var(--tile-sub,#566178)";
   let iconEl: string | React.ReactNode;
   let statusText = "";
   let accentIcon = "var(--tile-icon,#CBD5E1)";
@@ -62,6 +82,9 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
     }
     iconEl = HP_PATHS.plug;
     statusText = on ? `On · ${st.watts}W` : "Off";
+  } else if (k === "other") {
+    iconEl = (device.subtype && SUBTYPE_ICON[device.subtype]) || HP_PATHS.sliders;
+    statusText = (device.subtype && SUBTYPE_LABEL[device.subtype]) || "Device";
   }
 
   function handle() {
@@ -112,7 +135,7 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
         className="dtile__dots"
         onClick={openCtrl}
         aria-label={`${device.name} controls`}
-        style={{ color: active ? "rgba(255,255,255,.7)" : "#C4C4CC" }}
+        style={{ color: active ? "rgba(255,255,255,.7)" : "var(--tile-icon,#566178)" }}
       >
         <HubIco d={dotsEl} size={16} />
       </button>

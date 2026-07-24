@@ -26,7 +26,6 @@ use crate::models::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStrea
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use std::sync::Arc;
 
 type MatchFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
@@ -90,6 +89,7 @@ impl Agent for DelegatingAgent {
 mod tests {
     use super::*;
     use crate::models::ports::agent::AgentStreamEvent;
+    use futures::StreamExt; // for `.boxed()` on the test stubs' streams
     use std::collections::HashMap;
 
     // ── Minimal labelled agent — echos "<label>: <message>" ──────────────────

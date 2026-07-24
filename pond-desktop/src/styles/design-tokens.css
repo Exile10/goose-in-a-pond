@@ -65,8 +65,13 @@
 
   /* Text — Jarida Charcoal */
   --color-text:           #171616;
-  --color-text-secondary: rgba(23, 22, 22, 0.55);
-  --color-text-tertiary:  rgba(23, 22, 22, 0.38);
+  /* Solid slate-blue, not alpha — alpha-over-white was landing at 4.0:1,
+     under the 4.5:1 AA minimum for normal text. Keeps the cooler tone the
+     hub/canvas icons and meta text were designed with (was #94A3B8,
+     Tailwind slate-400, at a failing 2.6:1) rather than flattening to
+     plain zinc grey. Both clear 4.5:1 on white/panel. */
+  --color-text-secondary: #566178;
+  --color-text-tertiary:  #566178;
   --color-text-disabled:  rgba(23, 22, 22, 0.25);
 
   /* Surfaces — Jarida warm whites */
@@ -90,19 +95,20 @@
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
   --color-success-soft:     rgba(52, 199, 89, 0.12);
-  --color-success-fg:       #0e8a4a;  /* dark green for text on light bg */
+  --color-success-fg:       #15803D;  /* darkened from #0e8a4a — was 4.4:1 on white, under AA. Matches the shade already used for .mc-chip--green / .debrief-chip--kept. */
   --color-warning:          #FF9500;
   --color-warning-soft:     rgba(255, 149, 0, 0.12);
-  --color-warning-fg:       #b08000;  /* dark amber for text on light bg */
+  --color-warning-fg:       #92400E;  /* darkened from #b08000 — was 3.5:1 on white, under AA. Matches the shade already used for .mc-chip--amber / .debrief-chip--removing. */
   --color-destructive:      #FF3B30;
   --color-destructive-soft: rgba(255, 59, 48, 0.10);
-  --color-neutral:          #8E8E93;
+  --color-destructive-fg:   #B91C1C;  /* dark red for text on destructive-soft/light-red backgrounds — #DC2626 alone was 4.0:1 on some of them, under AA */
+  --color-neutral:          #6C6C71;  /* darkened from #8E8E93 — was 2.9:1 on white, under AA */
   --color-neutral-soft:     rgba(142, 142, 147, 0.12);
 
   /* Info (used in segment banners, role chip primary) */
   --color-info:             #0072f5;
   --color-info-soft:        rgba(0, 114, 245, 0.05);
-  --color-info-fg:          #4d94d4;  /* muted blue text on light bg */
+  --color-info-fg:          #0369A1;  /* darkened from #4d94d4 — was 3.0:1 on white, under AA */
   --color-info-dark:        #0058c4;  /* dark blue for text/icons */
   --color-info-icon-bg:     rgba(0, 114, 245, 0.10);
 
@@ -250,7 +256,9 @@
   /* Text */
   --color-text:           #F3F1F8;
   --color-text-secondary: rgba(243, 241, 248, 0.55);
-  --color-text-tertiary:  rgba(243, 241, 248, 0.38);
+  /* Solid, not alpha — alpha-over-panel was landing at 3.3:1, under the
+     4.5:1 AA minimum for normal text. */
+  --color-text-tertiary:  #8B8696;
   --color-text-disabled:  rgba(243, 241, 248, 0.25);
 
   /* Aliases */
@@ -287,6 +295,9 @@
   --color-warning-fg:  #FBBF24;
   --color-info-fg:     #60A5FA;
   --color-info-dark:   #60A5FA;
+  /* Was inheriting the light-mode value (#8E8E93), which is too dark against
+     dark backgrounds — 4.4:1 on panel, under the 4.5:1 AA minimum. */
+  --color-neutral:     #9A9AA0;
 
   /* Semantic soft — slightly more opaque on dark */
   --color-success-soft:     rgba(52,  199,  89, 0.18);
