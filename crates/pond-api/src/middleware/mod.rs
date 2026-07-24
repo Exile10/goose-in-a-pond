@@ -4,7 +4,7 @@ pub mod onboarding_guard;
 
 use axum::{
     extract::{Request, State},
-    http::{header::HeaderMap, StatusCode},
+    http::{header, header::HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -21,7 +21,10 @@ pub enum AuthError {
     MissingToken,
     InvalidFormat,
     InvalidToken,
-    RateLimitExceeded,
+    /// Carries how long the client should wait, for `Retry-After`.
+    RateLimitExceeded {
+        retry_after_secs: u64,
+    },
 }
 
 impl IntoResponse for AuthError {
@@ -33,13 +36,22 @@ impl IntoResponse for AuthError {
                 "Invalid Authorization header format. Use: Authorization: Bearer <token>",
             ),
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid or expired token"),
-            AuthError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+            AuthError::RateLimitExceeded { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
+            }
         };
-        (
-            status,
-            serde_json::json!({ "error": error_message, "status": status.as_u16() }).to_string(),
-        )
-            .into_response()
+        let body =
+            serde_json::json!({ "error": error_message, "status": status.as_u16() }).to_string();
+        match self {
+            // RFC 9110: a 429 SHOULD tell the client how long to wait.
+            AuthError::RateLimitExceeded { retry_after_secs } => (
+                status,
+                [(header::RETRY_AFTER, retry_after_secs.to_string())],
+                body,
+            )
+                .into_response(),
+            _ => (status, body).into_response(),
+        }
     }
 }
 
@@ -56,7 +68,13 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
     Ok(auth_header[7..].to_string())
 }
 
-/// Rate limiter using token bucket algorithm
+/// Per-client fixed-window rate limiter.
+///
+/// Note this is a fixed window, not a token bucket: a client can spend its
+/// whole allowance at the end of one window and again at the start of the
+/// next, so the true worst-case burst is 2x `max_requests`. That is
+/// acceptable here — the limiter exists to stop runaway clients and online
+/// guessing, not to shape traffic precisely.
 pub struct RateLimiter {
     clients: Arc<RwLock<HashMap<String, ClientRateLimit>>>,
     max_requests: usize,
@@ -81,6 +99,15 @@ impl RateLimiter {
     }
 
     pub async fn check_rate_limit(&self, client_id: &str) -> bool {
+        self.check_rate_limit_detailed(client_id).await.is_ok()
+    }
+
+    /// As [`Self::check_rate_limit`], but on rejection reports how long the
+    /// caller should wait before retrying, for the `Retry-After` header.
+    /// Without that signal a client has nothing to base a backoff on, and a
+    /// naive one retries as fast as it can — which is exactly how a single
+    /// wedged client burns the whole per-IP budget.
+    pub async fn check_rate_limit_detailed(&self, client_id: &str) -> Result<(), Duration> {
         let mut clients = self.clients.write().await;
         let now = Instant::now();
         let client = clients
@@ -95,9 +122,12 @@ impl RateLimiter {
         }
         let allowed = if client.request_count < self.max_requests {
             client.request_count += 1;
-            true
+            Ok(())
         } else {
-            false
+            // Whatever is left of the current window.
+            Err(self
+                .window_duration
+                .saturating_sub(now.duration_since(client.window_start)))
         };
 
         // Periodic eviction of stale entries to prevent unbounded growth.
@@ -109,6 +139,12 @@ impl RateLimiter {
 
         allowed
     }
+}
+
+/// `Retry-After` is expressed in whole seconds, and a value of 0 would invite
+/// an immediate retry — round any remaining wait up to at least 1.
+pub fn retry_after_secs(remaining: Duration) -> u64 {
+    remaining.as_secs().max(1)
 }
 
 /// Routes that don't require authentication.
@@ -288,6 +324,51 @@ mod tests {
             assert!(limiter.check_rate_limit("client-1").await);
         }
         assert!(!limiter.check_rate_limit("client-1").await);
+    }
+
+    /// A rejected caller learns how long to wait, so it can back off instead
+    /// of hot-looping and holding its own budget at zero.
+    #[tokio::test]
+    async fn rejection_reports_the_remaining_window() {
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        assert!(limiter.check_rate_limit_detailed("client-1").await.is_ok());
+
+        let remaining = limiter
+            .check_rate_limit_detailed("client-1")
+            .await
+            .expect_err("second request is over the limit");
+        assert!(
+            remaining <= Duration::from_secs(60) && remaining > Duration::from_secs(55),
+            "expected roughly the full window back, got {remaining:?}"
+        );
+    }
+
+    /// `Retry-After` is in whole seconds and must never say "retry now".
+    #[test]
+    fn retry_after_never_rounds_down_to_zero() {
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_secs(42)), 42);
+    }
+
+    /// The 429 body is unchanged, but the header is what a client actually
+    /// needs to back off correctly.
+    #[test]
+    fn rate_limited_response_carries_retry_after() {
+        let response = AuthError::RateLimitExceeded {
+            retry_after_secs: 17,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "17");
+    }
+
+    /// Only the 429 carries it — a 401 must not imply "wait and retry".
+    #[test]
+    fn auth_failures_carry_no_retry_after() {
+        let response = AuthError::InvalidToken.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[tokio::test]

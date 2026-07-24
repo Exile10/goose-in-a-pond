@@ -28,6 +28,16 @@ fn default_status() -> String {
     "connected".to_string()
 }
 
+/// A single MCP tool with its owning extension and description — unlike the
+/// bare names `list_tools()` returns, this is what backs the Extensions >
+/// Tools browser in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    pub extension: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddExtensionRequest {
     pub name: String,
@@ -50,6 +60,9 @@ pub trait ExtensionManagerPort: Send + Sync {
     async fn add_extension(&self, request: AddExtensionRequest) -> Result<ExtensionInfo>;
     async fn remove_extension(&self, name: &str) -> Result<()>;
     async fn list_tools(&self) -> Result<Vec<String>>;
+    /// Same tool set as `list_tools()`, enriched with the owning extension name
+    /// and description — used by the Extensions > Tools browser.
+    async fn list_tools_detailed(&self) -> Result<Vec<ToolInfo>>;
     /// Enable or disable an extension by name.
     /// Disabled extensions are excluded when loading tools for agent sessions.
     async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()>;

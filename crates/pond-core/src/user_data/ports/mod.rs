@@ -1,4 +1,5 @@
 pub mod camera_storage;
+pub mod device_commissioning;
 pub mod device_control;
 pub mod device_controller;
 pub mod device_registry;

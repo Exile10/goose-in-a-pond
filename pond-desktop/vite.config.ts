@@ -22,16 +22,6 @@ export default defineConfig(async () => ({
     dedupe: ["react", "react-dom"],
   },
 
-  // Dual-entry: main window + canvas overlay window
-  build: {
-    rollupOptions: {
-      input: {
-        main: resolve(__dirname, "index.html"),
-        canvas: resolve(__dirname, "canvas.html"),
-      },
-    },
-  },
-
   // Vite server options for Tauri dev — don't open browser automatically
   server: {
     port: 1420,

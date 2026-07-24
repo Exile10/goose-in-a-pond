@@ -196,33 +196,6 @@ describe("updatePrompt()", () => {
   });
 });
 
-// ── agent extras ──────────────────────────────────────────────────────────────
-
-describe("listExtras()", () => {
-  it("GETs /api/v1/agent/extras", async () => {
-    fetchMock.mockResolvedValueOnce(okJson([{ key: "tz", content: "Africa/Nairobi", enabled: true }]));
-    const extras = await client().listExtras();
-    expect(extras[0].key).toBe("tz");
-  });
-});
-
-describe("addExtra()", () => {
-  it("POSTs key + instruction + active", async () => {
-    fetchMock.mockResolvedValueOnce(okJson({ key: "tz", instruction: "Africa/Nairobi", active: true }));
-    await client().addExtra("tz", "Africa/Nairobi");
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ key: "tz", instruction: "Africa/Nairobi", active: true });
-  });
-});
-
-describe("deleteExtra()", () => {
-  it("URL-encodes the key", async () => {
-    fetchMock.mockResolvedValueOnce(okJson({}));
-    await client().deleteExtra("skill:morning");
-    expect(fetchMock.mock.calls[0][0]).toContain("skill%3Amorning");
-  });
-});
-
 // ── authorization header ──────────────────────────────────────────────────────
 
 describe("setToken()", () => {

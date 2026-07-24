@@ -12,11 +12,13 @@ describe("desktopState", () => {
   it("normalizes the desktop mode with a gui fallback", () => {
     expect(normalizeDesktopMode("gui")).toBe("gui");
     expect(normalizeDesktopMode("voice")).toBe("voice");
-    expect(normalizeDesktopMode("canvas")).toBe("canvas");
+    // "canvas" was a real mode before Canvas was consolidated into a GuiSection —
+    // a stale persisted value should now self-heal back to "gui".
+    expect(normalizeDesktopMode("canvas")).toBe("gui");
     expect(normalizeDesktopMode("unexpected")).toBe("gui");
     expect(normalizeDesktopMode(null)).toBe("gui");
     expect(normalizeDesktopMode(undefined)).toBe("gui");
-    expect(DESKTOP_MODES).toEqual(["gui", "voice", "canvas"]);
+    expect(DESKTOP_MODES).toEqual(["gui", "voice"]);
   });
 
   it("normalizes the gui section with a dashboard fallback", () => {
@@ -25,7 +27,6 @@ describe("desktopState", () => {
     expect(normalizeGuiSection("models")).toBe("models");
     expect(normalizeGuiSection("prompts")).toBe("prompts");
     expect(normalizeGuiSection("settings")).toBe("settings");
-    expect(normalizeGuiSection("agent")).toBe("agent");
     expect(normalizeGuiSection("devices")).toBe("devices");
     expect(normalizeGuiSection("pairing")).toBe("pairing");
     expect(normalizeGuiSection("schedules")).toBe("schedules");
@@ -40,7 +41,7 @@ describe("desktopState", () => {
   it("DESKTOP_SECTIONS is a flat ordered list of all sidebar items", () => {
     // 12 = dashboard, chat, devices, pairing, schedules, memory, skills, logs,
     // models, prompts, settings, extensions.
-    // (canvas, faces, agent are hidden from sidebar but still routable)
+    // (canvas, faces are hidden from sidebar but still routable)
     expect(DESKTOP_SECTIONS).toHaveLength(12);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
@@ -59,7 +60,6 @@ describe("desktopState", () => {
 
   it("hidden sections are still valid for normalizeGuiSection", () => {
     expect(normalizeGuiSection("faces")).toBe("faces");
-    expect(normalizeGuiSection("agent")).toBe("agent");
     expect(normalizeGuiSection("canvas")).toBe("canvas");
   });
 
@@ -68,8 +68,6 @@ describe("desktopState", () => {
     expect(getDesktopSectionLabel("chat")).toBe("Chat");
     expect(getDesktopSectionLabel("settings")).toBe("Settings");
     expect(getDesktopSectionLabel("models")).toBe("Models");
-    // agent is not in sidebar groups — falls back to capitalized name
-    expect(getDesktopSectionLabel("agent")).toBe("Agent");
   });
 
   it("derives initials from assistant name", () => {

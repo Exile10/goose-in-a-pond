@@ -12,7 +12,7 @@
 //! - [`SecretRepository`](crate::security::ports::secret::SecretRepository)
 //!   guards key material, but is callable by anyone holding the `Arc` — there
 //!   is no per-extension scope on which secrets a caller may read.
-//! - [`EventLogRepository`](crate::security::ports::event_log::EventLogRepository)
+//! - [`OperationalLogRepository`](crate::security::ports::event_log::OperationalLogRepository)
 //!   is a generic table with no required call site, so cross-boundary access
 //!   currently leaves no consistent audit trail.
 //! - [`notification`](crate::mcp::ports::notification) has no consent gate.

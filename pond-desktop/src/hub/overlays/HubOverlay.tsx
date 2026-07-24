@@ -3,6 +3,7 @@ import { HubIco, lockEl, unlockEl, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { HubModal as Modal } from "../primitives/HubModal";
 import { CameraFeed } from "../primitives/CameraFeed";
+import { SUBTYPE_ICON } from "../primitives/DeviceTile";
 import { type DeviceData, type DeviceKind } from "../data/mockHome";
 import { useHomeData } from "../state/hubDataStore";
 import { useDeviceState, hubControlDevice } from "../state/hubStore";
@@ -253,9 +254,9 @@ function PlugControl({ device }: { device: DeviceData }) {
 }
 
 // ─── Device control modal ─────────────────────────────────────
-const KIND_TINT: Record<DeviceKind, string>   = { light: "#F59E0B", lock: "#2563EB", thermo: "#EA580C", plug: "#0D9488" };
-const KIND_TINTBG: Record<DeviceKind, string> = { light: "#FEF3C7", lock: "#DBEAFE", thermo: "#FFEDD5", plug: "#CCFBF1" };
-const KIND_ICON: Record<DeviceKind, string>   = { light: HP_PATHS.bulb, lock: "", thermo: HP_PATHS.flame, plug: HP_PATHS.plug };
+const KIND_TINT: Record<DeviceKind, string>   = { light: "#F59E0B", lock: "#2563EB", thermo: "#EA580C", plug: "#0D9488", other: "#71717A" };
+const KIND_TINTBG: Record<DeviceKind, string> = { light: "#FEF3C7", lock: "#DBEAFE", thermo: "#FFEDD5", plug: "#CCFBF1", other: "#F4F4F5" };
+const KIND_ICON: Record<DeviceKind, string>   = { light: HP_PATHS.bulb, lock: "", thermo: HP_PATHS.flame, plug: HP_PATHS.plug, other: HP_PATHS.sliders };
 
 interface DeviceControlProps {
   deviceId: string;
@@ -280,7 +281,7 @@ function DeviceControl({ deviceId, onClose }: DeviceControlProps) {
         <span className="dc-head__icon" style={{ background: tintBg, color: tint }}>
           {k === "lock"
             ? <HubIco d={lockEl} size={20} color={tint} />
-            : <HubIco d={KIND_ICON[k]} size={20} color={tint} />}
+            : <HubIco d={(k === "other" && device.subtype && SUBTYPE_ICON[device.subtype]) || KIND_ICON[k]} size={20} color={tint} />}
         </span>
         <div className="dc-head__text">
           <span className="dc-head__name">{device.name}</span>

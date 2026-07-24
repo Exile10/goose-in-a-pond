@@ -645,7 +645,7 @@ function ConsolidationBanner({
     ? "var(--color-destructive)"
     : isRunning
     ? "var(--purple-700, #6d28d9)"
-    : "#0e8a4a";
+    : "var(--color-success-fg)";
 
   return (
     <div

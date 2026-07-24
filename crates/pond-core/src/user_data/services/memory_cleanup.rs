@@ -12,9 +12,13 @@ use crate::user_data::domain::memory::{
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 
-/// Default base half-life in days (used when no config provided).
+// Test fixtures mirroring the production defaults, which live on `Settings`
+// (`default_memory_decay_base_half_life_days` / `default_memory_decay_beta`).
+// The live prune path takes these as parameters from settings; these constants
+// exist only so the tests below assert against the documented default values.
+#[cfg(test)]
 const DEFAULT_BASE_HALF_LIFE_DAYS: f32 = 11.25;
-/// Default decay curve steepness factor.
+#[cfg(test)]
 const DEFAULT_DECAY_BETA: f32 = 0.8;
 
 /// Compute the effective score of a memory after adaptive time-based decay.

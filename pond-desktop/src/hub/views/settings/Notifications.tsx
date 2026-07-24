@@ -99,7 +99,7 @@ export function NotificationsDetail({ go }: NotificationsDetailProps) {
                 <span className="dbrief__excerpt">{d.excerpt}</span>
               </span>
               <span className="dbrief__when">{d.when}</span>
-              <HubIco d={CHEVR_PATH} size={16} color="#C4C4CC" />
+              <HubIco d={CHEVR_PATH} size={16} color="var(--color-text-tertiary,#566178)" />
             </div>
           ))}
         </div>
