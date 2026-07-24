@@ -86,6 +86,7 @@ jobs:
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
+            -p pond-mesh-protocol \
             -p pond-mcp-server
 
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
@@ -104,6 +105,7 @@ jobs:
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
+            -p pond-mesh-protocol \
             -p pond-mcp-server
 
       # Gate the PRODUCTION binary's compilation (pulls the Goose submodule).
