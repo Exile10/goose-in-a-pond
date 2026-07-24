@@ -23,6 +23,9 @@ use serde_json::{json, Value};
 pub const CLUSTER_ON_OFF: u32 = 6;
 pub const CLUSTER_LEVEL_CONTROL: u32 = 8;
 pub const CLUSTER_BASIC_INFORMATION: u32 = 40;
+/// NodeLabel — the writable, user-assigned name on Basic Information. Preferred
+/// by [`node_to_device`] over the vendor ProductName.
+pub const ATTR_NODE_LABEL: u32 = 5;
 pub const CLUSTER_BOOLEAN_STATE: u32 = 69;
 pub const CLUSTER_DOOR_LOCK: u32 = 257;
 pub const CLUSTER_WINDOW_COVERING: u32 = 258;

@@ -54,11 +54,34 @@ describe("Add device — Matter vs other", () => {
     fireEvent.change(input, { target: { value: "20202021" } });
     fireEvent.click(screen.getByText("Commission"));
 
-    await waitFor(() => expect(api.commissionDevice).toHaveBeenCalledWith("20202021"));
+    // No name entered → code only, name undefined.
+    await waitFor(() => expect(api.commissionDevice).toHaveBeenCalledWith("20202021", undefined));
     // Never a manual registry write: the bridge registers what it commissions.
     expect(api.registerDevice).not.toHaveBeenCalled();
     // List reloads so the new device shows up.
     await waitFor(() => expect(mocked(api.listDevices).mock.calls.length).toBeGreaterThan(1));
+  });
+
+  it("passes a chosen name through so the device is named on commission", async () => {
+    mocked(api.commissionDevice).mockResolvedValue({
+      id: "matter-2",
+      name: "Living Room Light",
+      node_id: 2,
+    });
+    await openModal();
+
+    fireEvent.change(await screen.findByPlaceholderText(/20202021/), {
+      target: { value: "20202021" },
+    });
+    // The optional name field, alongside the code — not a separate mode.
+    fireEvent.change(screen.getByPlaceholderText("Living Room Light"), {
+      target: { value: "Living Room Light" },
+    });
+    fireEvent.click(screen.getByText("Commission"));
+
+    await waitFor(() =>
+      expect(api.commissionDevice).toHaveBeenCalledWith("20202021", "Living Room Light"),
+    );
   });
 
   it("surfaces a commissioning failure instead of closing silently", async () => {

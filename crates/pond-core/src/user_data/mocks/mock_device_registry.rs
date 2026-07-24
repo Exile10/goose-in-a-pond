@@ -31,4 +31,8 @@ impl DeviceRegistry for MockDeviceRegistry {
     async fn heartbeat(&self, _: &str) -> Result<()> {
         Ok(())
     }
+
+    async fn rename(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
 }

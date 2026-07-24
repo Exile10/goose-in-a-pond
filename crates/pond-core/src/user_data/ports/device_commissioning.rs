@@ -25,13 +25,17 @@ pub enum SetupCode {
     Passcode(u32),
 }
 
-/// A device that has just joined the fabric.
+/// A device that has just joined the fabric. Carries enough to register the
+/// device deterministically from the commission response, without waiting for
+/// the bridge's asynchronous discovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommissionedDevice {
     /// GIAP device id (`matter-<node_id>`) — the same id the bridge registers.
     pub device_id: String,
     pub name: String,
     pub node_id: u64,
+    pub device_type: String,
+    pub capabilities: Vec<String>,
 }
 
 /// Parse and validate what the user typed.
@@ -85,12 +89,30 @@ pub fn parse_setup_code(raw: &str) -> Result<SetupCode> {
     }
 }
 
-/// Driven Port: bring a device onto the local fabric.
+/// The Matter node id behind a `matter-<node_id>` device id, or `None` for any
+/// other id. Lets the generic delete path tell a Matter device (which must be
+/// decommissioned from the fabric) from a plain catalogue entry, without
+/// depending on the Matter adapter.
+pub fn matter_node_id(device_id: &str) -> Option<u64> {
+    device_id.strip_prefix("matter-")?.parse().ok()
+}
+
+/// Driven Port: bring a device onto — and off — the local fabric.
 #[async_trait]
 pub trait DeviceCommissioningPort: Send + Sync {
     /// Commission a device using its setup code. Slow by nature — pairing
     /// involves discovery, attestation, and fabric join.
-    async fn commission(&self, code: SetupCode) -> Result<CommissionedDevice>;
+    ///
+    /// When `name` is `Some`, it is written to the device's NodeLabel attribute
+    /// so the name lives on the device itself (durable across re-registration
+    /// and visible to any controller), and the returned device carries it.
+    async fn commission(&self, code: SetupCode, name: Option<String>)
+        -> Result<CommissionedDevice>;
+
+    /// Remove a node from the fabric. Deleting a Matter device must go through
+    /// here first: without it the controller keeps the node and re-announces it
+    /// on the next `start_listening`, so a "deleted" device reappears.
+    async fn decommission(&self, node_id: u64) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -127,6 +149,17 @@ mod tests {
             parse_setup_code("MT:-24J0AFN00KA0648G00").unwrap(),
             SetupCode::PairingCode("MT:-24J0AFN00KA0648G00".into())
         );
+    }
+
+    #[test]
+    fn matter_node_id_only_matches_matter_ids() {
+        assert_eq!(matter_node_id("matter-1"), Some(1));
+        assert_eq!(matter_node_id("matter-42"), Some(42));
+        // Not a Matter device — the plain delete path handles these.
+        assert_eq!(matter_node_id("pond-desktop"), None);
+        assert_eq!(matter_node_id("fe78fa4d-0f85-4d48-bfc9-cc0cfd9f7d45"), None);
+        assert_eq!(matter_node_id("matter-"), None);
+        assert_eq!(matter_node_id("matter-abc"), None);
     }
 
     #[test]
