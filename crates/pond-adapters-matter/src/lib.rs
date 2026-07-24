@@ -34,11 +34,13 @@
 
 mod bridge;
 mod client;
+mod commissioning;
 mod control;
 mod protocol;
 
 pub use bridge::run_matter_bridge;
 pub use client::{MatterClient, MatterEvent};
+pub use commissioning::MatterCommissioner;
 pub use control::{MatterDeviceControl, NodeCache};
 pub use protocol::{device_id_for_node, node_id_from_device_id, node_to_device, MatterNode};
 

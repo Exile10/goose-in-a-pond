@@ -114,6 +114,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
+        .route("/devices/commission", post(commission_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         // Push-notification token register/unregister for a paired device (#95).
@@ -2017,6 +2018,59 @@ async fn register_device(
             "registered_at": device.registered_at,
             "is_online":     device.is_online,
             "room":          device.room,
+        })),
+    ))
+}
+
+/// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
+///
+/// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
+/// name until it has joined the fabric. On success the bridge registers it from
+/// the controller's own report, so there is no second, manual registry write
+/// here — the device simply appears in the Devices list.
+async fn commission_device(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    let Some(commissioner) = state.commissioner.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is not enabled on this Pond — turn it on in Settings first."
+            })),
+        ));
+    };
+
+    let raw = req.get("code").and_then(Value::as_str).unwrap_or_default();
+    // Validated before it reaches the controller.
+    let code =
+        pond_core::user_data::ports::device_commissioning::parse_setup_code(raw).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let device = commissioner.commission(code).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id":      device.device_id,
+            "name":    device.name,
+            "node_id": device.node_id,
         })),
     ))
 }
