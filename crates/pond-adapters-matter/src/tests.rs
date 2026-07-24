@@ -17,9 +17,9 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::bridge::run_matter_bridge;
+use crate::bridge::{run_matter_bridge, run_matter_supervisor};
 use crate::client::MatterClient;
-use crate::control::{MatterDeviceControl, NodeCache};
+use crate::control::{MatterDeviceControl, NodeCache, SharedMatterClient};
 
 // ── Mock matter-server ───────────────────────────────────────────────────────
 
@@ -80,6 +80,61 @@ async fn mock_matter_server(nodes: Value, push_events: Vec<Value>) -> (String, R
     });
 
     (url, received)
+}
+
+/// A mock that accepts multiple connections and drops the FIRST one right
+/// after its `start_listening`, to force a reconnect. Returns the url and a
+/// shared count of `start_listening` calls across all connections.
+async fn mock_reconnecting_server(nodes: Value) -> (String, Arc<Mutex<u32>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let listens = Arc::new(Mutex::new(0u32));
+    let listens_srv = listens.clone();
+
+    tokio::spawn(async move {
+        let mut conn = 0u32;
+        while let Ok((stream, _)) = listener.accept().await {
+            conn += 1;
+            let drop_after_listen = conn == 1;
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                json!({"fabric_id": 1, "schema_version": 11})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let mid = frame["message_id"].as_str().unwrap().to_string();
+                if frame["command"] == "start_listening" {
+                    *listens_srv.lock().unwrap() += 1;
+                    ws.send(Message::Text(
+                        json!({"message_id": mid, "result": nodes})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    if drop_after_listen {
+                        let _ = ws.close(None).await;
+                        break;
+                    }
+                } else {
+                    ws.send(Message::Text(
+                        json!({"message_id": mid, "result": null})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    });
+
+    (url, listens)
 }
 
 /// Same cluster layout as the light commissioned in the live session
@@ -298,4 +353,77 @@ async fn occupancy_update_reaches_the_bus_and_matches_a_rule() {
         rule.matches(&view, chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap()),
         "the automation rule must match the Matter sensor update"
     );
+}
+
+/// The control port follows a swapped client: after the reconnect supervisor
+/// replaces the inner client, commands go to the new connection — no rebuild.
+#[tokio::test]
+async fn control_follows_a_swapped_client() {
+    let (url_a, recv_a) = mock_matter_server(json!([light_node_json()]), vec![]).await;
+    let (client_a, _events_a) = MatterClient::connect(&url_a).await.unwrap();
+
+    // Seed the node cache directly — this test targets the client swap, not the
+    // bridge sync (covered elsewhere).
+    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
+    cache
+        .write()
+        .await
+        .insert(2, serde_json::from_value(light_node_json()).unwrap());
+
+    let control = MatterDeviceControl::new(client_a, cache.clone());
+    let cell = control.client_handle();
+
+    control.set_power("matter-2", true).await.unwrap();
+    assert_eq!(recv_a.lock().unwrap().len(), 1, "first command → server A");
+
+    // Swap in a client on a different server.
+    let (url_b, recv_b) = mock_matter_server(json!([light_node_json()]), vec![]).await;
+    let (client_b, _events_b) = MatterClient::connect(&url_b).await.unwrap();
+    *cell.write().await = client_b;
+
+    control.set_power("matter-2", false).await.unwrap();
+    assert_eq!(
+        recv_a.lock().unwrap().len(),
+        1,
+        "server A saw no new command"
+    );
+    assert_eq!(recv_b.lock().unwrap().len(), 1, "next command → server B");
+}
+
+/// #195 acceptance: when the matter-server connection drops, the supervisor
+/// reconnects and re-runs start_listening (resyncing the fabric) without a
+/// pond-server restart.
+#[tokio::test]
+async fn supervisor_reconnects_after_the_connection_drops() {
+    let (url, listens) = mock_reconnecting_server(json!([light_node_json()])).await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
+    let cell: SharedMatterClient = Arc::new(RwLock::new(client.clone()));
+    let registry = Arc::new(InMemoryRegistry::default());
+    let bus = Arc::new(InProcessEventBus::new());
+
+    tokio::spawn(run_matter_supervisor(
+        url.clone(),
+        cell.clone(),
+        client,
+        events,
+        cache.clone(),
+        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
+        bus.clone() as Arc<dyn EventBus>,
+    ));
+
+    // First connection: start_listening (1) then drop. The supervisor backs off
+    // (~0.5-1s) and reconnects, producing a second start_listening.
+    let mut waited = 0;
+    while *listens.lock().unwrap() < 2 && waited < 60 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += 1;
+    }
+    assert_eq!(
+        *listens.lock().unwrap(),
+        2,
+        "supervisor should reconnect and re-run start_listening"
+    );
+    // The fabric was resynced on reconnect.
+    assert!(registry.get_device("matter-2").await.unwrap().is_some());
 }

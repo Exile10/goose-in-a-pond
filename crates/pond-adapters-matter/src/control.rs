@@ -26,14 +26,35 @@ use crate::protocol::{
 /// control port reads it to resolve endpoints per cluster.
 pub type NodeCache = Arc<RwLock<HashMap<u64, MatterNode>>>;
 
+/// A swappable handle to the live client. The reconnect supervisor replaces the
+/// inner `Arc<MatterClient>` after re-establishing the WebSocket, so the control
+/// port keeps working across a matter-server restart without being rebuilt
+/// (#195). Reads clone the current `Arc` and drop the lock immediately.
+pub type SharedMatterClient = Arc<RwLock<Arc<MatterClient>>>;
+
 pub struct MatterDeviceControl {
-    client: Arc<MatterClient>,
+    client: SharedMatterClient,
     nodes: NodeCache,
 }
 
 impl MatterDeviceControl {
     pub fn new(client: Arc<MatterClient>, nodes: NodeCache) -> Self {
-        Self { client, nodes }
+        Self {
+            client: Arc::new(RwLock::new(client)),
+            nodes,
+        }
+    }
+
+    /// The swappable client handle, so the reconnect supervisor can replace the
+    /// underlying connection in place after a drop.
+    pub fn client_handle(&self) -> SharedMatterClient {
+        self.client.clone()
+    }
+
+    /// The client currently in use — cloned so the lock is released before any
+    /// await on the network.
+    async fn client(&self) -> Arc<MatterClient> {
+        self.client.read().await.clone()
     }
 
     /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`.
@@ -62,7 +83,8 @@ impl MatterDeviceControl {
         name: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
-        self.client
+        self.client()
+            .await
             .send_command(
                 "device_command",
                 json!({
@@ -128,7 +150,8 @@ impl DeviceControlPort for MatterDeviceControl {
     async fn set_target_temp(&self, device_id: &str, celsius: f32) -> Result<DeviceControlOutcome> {
         let (node, ep) = self.resolve(device_id, CLUSTER_THERMOSTAT).await?;
         // Setpoints are attribute writes, not commands.
-        self.client
+        self.client()
+            .await
             .send_command(
                 "write_attribute",
                 json!({
