@@ -565,3 +565,49 @@ describe("searchLlamafileModels()", () => {
     expect(res.models[0].tag).toBe("0.9.1");
   });
 });
+
+describe("per-instance client id", () => {
+  const future = new Date(Date.now() + 3_600_000).toISOString();
+
+  // Drive the full pair() flow, capturing the client_id sent to /handshake/init.
+  function mockPairing(): () => string | undefined {
+    let sentClientId: string | undefined;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/pairing-code")) return okJson({ code: "123456", expires_at: future });
+      if (url.includes("/handshake/init")) {
+        sentClientId = JSON.parse(String(init?.body)).client_id;
+        return okJson({ challenge: "ch", challenge_id: "cid" });
+      }
+      if (url.includes("/handshake/verify")) {
+        return okJson({ accepted: true, session_token: "t", refresh_token: "r", expires_at: future });
+      }
+      return okJson({});
+    });
+    return () => sentClientId;
+  }
+
+  afterEach(() => localStorage.clear());
+
+  it("mints a persisted pond-desktop-<id>, distinct from the shared default", async () => {
+    localStorage.clear();
+    const getId = mockPairing();
+    await client().pair();
+
+    const id = getId();
+    expect(id).toMatch(/^pond-desktop-.+/);
+    expect(id).not.toBe("pond-desktop"); // the old shared id that caused revocation churn
+    expect(localStorage.getItem("giap-client-id")).toBe(id);
+  });
+
+  it("reuses the same id across instances (a restart pairs as the same client)", async () => {
+    localStorage.clear();
+    const first = mockPairing();
+    await client().pair();
+    const id1 = first();
+
+    // A second instance (simulated restart) reads the persisted id.
+    const second = mockPairing();
+    await client().pair();
+    expect(second()).toBe(id1);
+  });
+});

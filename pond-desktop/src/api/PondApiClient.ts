@@ -81,6 +81,43 @@ export class PondApiClient {
   private static readonly LS_SESSION = "giap-session-token";
   private static readonly LS_REFRESH = "giap-refresh-token";
   private static readonly LS_EXPIRES = "giap-token-expires-at";
+  private static readonly LS_CLIENT_ID = "giap-client-id";
+
+  /**
+   * A per-install client id, stable across restarts (persisted) but distinct
+   * between separate clients — a browser profile, a second machine, the Tauri
+   * app. Pairing revokes any earlier session for the *same* client id, so a
+   * shared hardcoded id made two clients ping-pong: each pair revoked the
+   * other's token, forcing an endless re-pair. Distinct ids keep distinct
+   * sessions, so they coexist. Tabs in one profile share the id (and the
+   * persisted token), so they reuse one session rather than fighting.
+   */
+  private cachedClientId: string | null = null;
+  private clientId(): string {
+    if (this.cachedClientId) return this.cachedClientId;
+    let id: string | null = null;
+    try {
+      id = localStorage.getItem(PondApiClient.LS_CLIENT_ID);
+      if (!id) {
+        id = `pond-desktop-${PondApiClient.randomId()}`;
+        localStorage.setItem(PondApiClient.LS_CLIENT_ID, id);
+      }
+    } catch {
+      // No localStorage (tests / SSR): fall back to a fresh id for this process.
+      id = `pond-desktop-${PondApiClient.randomId()}`;
+    }
+    this.cachedClientId = id;
+    return id;
+  }
+
+  private static randomId(): string {
+    try {
+      if (typeof crypto !== "undefined" && crypto.randomUUID) {
+        return crypto.randomUUID().slice(0, 8);
+      }
+    } catch { /* fall through */ }
+    return Math.random().toString(36).slice(2, 10);
+  }
 
   constructor(base?: string, token?: string | null) {
     this.base = (base ?? defaultServerUrl()).replace(/\/$/, "");
@@ -568,7 +605,8 @@ export class PondApiClient {
    * endpoint and run the full two-phase handshake — no operator typing needed.
    * On success the session+refresh tokens are stored on this client.
    */
-  async pair(clientId = "pond-desktop"): Promise<HandshakeResponse> {
+  async pair(clientId?: string): Promise<HandshakeResponse> {
+    clientId = clientId ?? this.clientId();
     // Read the current code; if none is active (e.g. the startup code expired
     // after 10 min), ISSUE a fresh one. Both endpoints are loopback-only, so the
     // same-host desktop is trusted to mint its own code — this is what makes
@@ -606,7 +644,8 @@ export class PondApiClient {
    * (needs the server's current pairing code). Returns the active session
    * token, or `null` if none could be established.
    */
-  async connect(clientId = "pond-desktop"): Promise<string | null> {
+  async connect(clientId?: string): Promise<string | null> {
+    clientId = clientId ?? this.clientId();
     // 1. Stored session token still comfortably valid.
     if (this.token && this.tokenExpiresAt && Date.now() < this.tokenExpiresAt - 60_000) {
       return this.token;
