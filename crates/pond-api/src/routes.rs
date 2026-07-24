@@ -7501,6 +7501,15 @@ async fn set_extension_secrets_handler(
 
 // ── OAuth PKCE handlers ──────────────────────────────────────────────────────
 
+/// Secret-store key for a per-provider OAuth client ID override, e.g.
+/// `"SPOTIFY_CLIENT_ID"`. Always call this with the canonical `provider.id`
+/// (never a raw request field, which may be a secret's token_key instead) —
+/// every handler that resolves a client ID must agree on this key or the
+/// authorize and token-exchange steps end up using different apps.
+fn client_id_secret_key(provider_id: &str) -> String {
+    format!("{}_CLIENT_ID", provider_id.to_uppercase())
+}
+
 /// `POST /api/v1/oauth/authorize` — Start an OAuth PKCE authorization flow.
 ///
 /// Body: `{ "provider": "spotify", "extension_id": "music" }`
@@ -7533,9 +7542,9 @@ async fn oauth_authorize_handler(
         }
     };
 
-    // Check if user has their own client ID in the secret store
+    // Check if user has their own client ID in the secret store.
     let client_id = if let Some(repo) = &state.secret_repo {
-        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        let key = client_id_secret_key(&provider.id);
         repo.get(&key)
             .await
             .ok()
@@ -7631,7 +7640,7 @@ async fn oauth_callback_handler(
 
     // Resolve client ID (user override or bundled)
     let client_id = if let Some(repo) = &state.secret_repo {
-        let key = format!("{}_CLIENT_ID", session.provider_id.to_uppercase());
+        let key = client_id_secret_key(&session.provider_id);
         repo.get(&key)
             .await
             .ok()
@@ -7811,7 +7820,7 @@ async fn oauth_refresh_handler(
     };
 
     let client_id = {
-        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        let key = client_id_secret_key(&provider.id);
         repo.get(&key)
             .await
             .ok()
@@ -7957,7 +7966,7 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
     let provider = providers.iter().find(|p| p.id == "spotify")?;
     let refresh_token = repo.get(&provider.refresh_key).await.ok().flatten()?;
     let client_id = repo
-        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+        .get(&client_id_secret_key(&provider.id))
         .await
         .ok()
         .flatten()
