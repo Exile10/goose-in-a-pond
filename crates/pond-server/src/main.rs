@@ -1806,6 +1806,16 @@ async fn run_server(
     // Device actuation backend (#195): the Matter controller when configured
     // and reachable, else the logging stub. The bridge halves (event stream +
     // node cache) are spawned further down where the EventBus exists.
+    // Matter commissioning, available only once a controller is connected.
+    // `None` means "Matter is off", which the API turns into a clear 503 rather
+    // than a confusing failure when someone submits a setup code.
+    type Commissioner =
+        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>;
+    #[cfg(feature = "goose-agent")]
+    let mut matter_commissioner: Commissioner = None;
+    #[cfg(not(feature = "goose-agent"))]
+    let matter_commissioner: Commissioner = None;
+
     #[cfg(feature = "goose-agent")]
     let (device_control, matter_bridge_parts): (
         Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>,
@@ -1820,6 +1830,10 @@ async fn run_server(
                 let cache: pond_adapters_matter::NodeCache =
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
+                // Same connection commissions new devices onto the fabric.
+                matter_commissioner = Some(Arc::new(
+                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
+                ));
                 (
                     Arc::new(pond_adapters_matter::MatterDeviceControl::new(
                         client.clone(),
@@ -2433,6 +2447,7 @@ async fn run_server(
         tts,
         settings_repo,
         profile_repo,
+        commissioner: matter_commissioner,
         device_registry,
         memory_repo,
         embedding_provider,

@@ -131,8 +131,21 @@ impl MatterClient {
         ))
     }
 
-    /// Send `command` and await its response.
+    /// Send `command` and await its response, using the default timeout.
     pub async fn send_command(&self, command: &str, args: Value) -> Result<Value> {
+        self.send_command_with_timeout(command, args, COMMAND_TIMEOUT)
+            .await
+    }
+
+    /// Send `command` with an explicit timeout. Commissioning needs this:
+    /// pairing a device onto the fabric routinely outlasts [`COMMAND_TIMEOUT`],
+    /// and cutting it short would abandon a half-commissioned node.
+    pub async fn send_command_with_timeout(
+        &self,
+        command: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = format!("giap-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.pending
