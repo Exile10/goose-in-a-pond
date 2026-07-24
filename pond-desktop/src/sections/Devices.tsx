@@ -1,6 +1,9 @@
 import { useState, useEffect } from "react";
 import { Button, Separator } from "@heroui/react";
-import { Monitor, Cpu, Activity, Power, Settings, Plus, X } from "lucide-react";
+import {
+  Monitor, Cpu, Activity, Power, Settings, Plus, X,
+  Lightbulb, Lock, Thermometer, Fan, Blinds,
+} from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
 
@@ -16,6 +19,13 @@ const DEVICE_TYPES = [
 function DeviceIcon({ kind }: { kind: string | undefined }) {
   if (kind === "host")   return <Cpu size={22} />;
   if (kind === "sensor") return <Activity size={22} />;
+  // Matter device types (inferred from clusters by the backend), so a
+  // commissioned bulb / lock / thermostat / fan / blind reads as what it is.
+  if (kind === "light")      return <Lightbulb size={22} />;
+  if (kind === "lock")       return <Lock size={22} />;
+  if (kind === "thermostat") return <Thermometer size={22} />;
+  if (kind === "fan")        return <Fan size={22} />;
+  if (kind === "covering")   return <Blinds size={22} />;
   return <Monitor size={22} />;
 }
 
