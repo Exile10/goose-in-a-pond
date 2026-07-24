@@ -48,6 +48,7 @@ async fn make_app() -> Harness {
         Arc::new(SqliteDeviceRegistry::new(pool.clone()));
     let device_id = device_registry
         .register(RegisterDeviceRequest {
+            id: None,
             name: "Phone".into(),
             device_type: "gotg".into(),
             hostname: None,
@@ -85,6 +86,7 @@ async fn make_app() -> Harness {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: device_registry.clone(),
+        commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -111,7 +113,7 @@ async fn make_app() -> Harness {
         skill_repo: Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo: Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,

@@ -7,7 +7,7 @@ use tauri::{
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "Open GIAP").build(app)?;
     let summon = MenuItemBuilder::with_id("summon", "Summon (Voice)").build(app)?;
-    let canvas = MenuItemBuilder::with_id("canvas", "Toggle Canvas").build(app)?;
+    let canvas = MenuItemBuilder::with_id("canvas", "Show Canvas").build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
@@ -41,9 +41,9 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
             "summon" => {
-                let _ = app.emit("desktop-summon", ());
+                let _ = app.emit(crate::hotkey::DESKTOP_SUMMON_EVENT, ());
             }
-            "canvas" => tray_toggle_canvas(app),
+            "canvas" => tray_show_canvas(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -76,13 +76,7 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn tray_toggle_canvas(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("canvas") {
-        if win.is_visible().unwrap_or(false) {
-            let _ = win.hide();
-        } else {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-    }
+fn tray_show_canvas(app: &AppHandle) {
+    show_main_window(app);
+    let _ = app.emit(crate::hotkey::CANVAS_TOGGLE_EVENT, ());
 }

@@ -214,6 +214,17 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
 
+    // ── Matter (#195) ──────────────────────────────────────────────────────
+    /// Whether to connect to a local Matter controller (python-matter-server)
+    /// and drive commissioned Matter devices. Off by default — requires the
+    /// controller running on the LAN.
+    #[serde(default = "Settings::default_matter_enabled")]
+    pub matter_enabled: bool,
+
+    /// WebSocket URL of the Matter controller.
+    #[serde(default = "Settings::default_matter_ws_url")]
+    pub matter_ws_url: String,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -602,6 +613,8 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
+            matter_enabled: Self::default_matter_enabled(),
+            matter_ws_url: Self::default_matter_ws_url(),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -775,6 +788,12 @@ impl Settings {
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
+    }
+    fn default_matter_enabled() -> bool {
+        false
+    }
+    fn default_matter_ws_url() -> String {
+        "ws://127.0.0.1:5580/ws".to_string()
     }
     fn default_mic_enabled() -> bool {
         true
@@ -1168,6 +1187,10 @@ mod tests {
             // that also requires a `vision-onnx` build; UI wiring comes with
             // the Models-tab vision section, not before.
             "vision_classifier_model",
+            // Matter controller connection (#195): operator knobs until the
+            // Devices tab grows a Matter section.
+            "matter_enabled",
+            "matter_ws_url",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.

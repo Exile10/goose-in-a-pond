@@ -33,7 +33,7 @@ export function CardPreview() {
       </p>
 
       {/* Row 1: Weather, Calendar, Maps */}
-      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 1 }}>
+      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: 1 }}>
         Ambient — Weather, Calendar, Maps
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "300px 300px 340px", gap: 20, marginBottom: 32 }}>
@@ -50,7 +50,7 @@ export function CardPreview() {
       </div>
 
       {/* Row 2: Crypto, Smart Home, News */}
-      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 1 }}>
+      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: 1 }}>
         Finance, Home, News
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "300px 300px 300px", gap: 20, marginBottom: 32 }}>
@@ -67,7 +67,7 @@ export function CardPreview() {
       </div>
 
       {/* Compact variants */}
-      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "#94A3B8", textTransform: "uppercase", letterSpacing: 1 }}>
+      <div style={{ marginBottom: 16, fontSize: 11, fontWeight: 700, color: "var(--color-text-tertiary)", textTransform: "uppercase", letterSpacing: 1 }}>
         Compact Variants (inline in chat)
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 260px)", gap: 16 }}>

@@ -12,9 +12,7 @@
 
 use crate::models::domain::message::{ChatMessage, Role};
 use crate::models::ports::provider::LlmProvider;
-use crate::models::services::context_budget::{
-    trim_to_budget, trim_to_budget_for_model, USABLE_HISTORY_CHARS,
-};
+use crate::models::services::context_budget::{trim_to_budget, USABLE_HISTORY_CHARS};
 use anyhow::Result;
 
 /// 4 characters per token is a common heuristic for English text.

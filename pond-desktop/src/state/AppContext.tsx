@@ -246,7 +246,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     }).then((u) => unlisten.push(u));
 
     // Recording lifecycle — voice state is now managed explicitly by
-    // VoiceMode/CanvasOverlay so calibration recordings don't corrupt it.
+    // VoiceMode so calibration recordings don't corrupt it.
     // recording-started: no-op (callers set their own state)
     // recording-aborted: VoiceMode handles state transition itself
 
@@ -302,7 +302,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
 
     // macOS menu bar — View menu items
     listen("canvas-toggle", () => {
-      dispatch({ type: "SET_MODE", payload: "canvas" });
+      dispatch({ type: "SET_SECTION", payload: "canvas" });
     }).then((u) => unlisten.push(u));
 
     listen("switch-to-voice", () => {

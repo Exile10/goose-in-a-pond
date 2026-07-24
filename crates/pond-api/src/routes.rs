@@ -114,6 +114,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
+        .route("/devices/commission", post(commission_device))
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         // Push-notification token register/unregister for a paired device (#95).
@@ -520,13 +521,18 @@ async fn handshake_verify(
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
     // Rate-limit verify attempts per source IP (applies to loopback too — this
     // endpoint is security-sensitive regardless of origin).
-    if !verify_limiter()
-        .check_rate_limit(&peer.ip().to_string())
+    if let Err(remaining) = verify_limiter()
+        .check_rate_limit_detailed(&peer.ip().to_string())
         .await
     {
+        // Tell the client how long to wait rather than leaving it to guess.
+        let retry_after = crate::middleware::retry_after_secs(remaining);
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "too many handshake attempts; slow down"})),
+            Json(json!({
+                "error": "too many handshake attempts; slow down",
+                "retry_after_secs": retry_after,
+            })),
         ));
     }
     let Json(request) = body.map_err(|_| bad_body())?;
@@ -1195,6 +1201,9 @@ fn chat_stream_inner(
                 svc,
                 state.memory_repo.clone(),
             );
+        }
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
         }
 
         // ── Persist user message ────────────────────────────────────────────
@@ -2013,6 +2022,59 @@ async fn register_device(
     ))
 }
 
+/// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
+///
+/// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
+/// name until it has joined the fabric. On success the bridge registers it from
+/// the controller's own report, so there is no second, manual registry write
+/// here — the device simply appears in the Devices list.
+async fn commission_device(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    let Some(commissioner) = state.commissioner.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is not enabled on this Pond — turn it on in Settings first."
+            })),
+        ));
+    };
+
+    let raw = req.get("code").and_then(Value::as_str).unwrap_or_default();
+    // Validated before it reaches the controller.
+    let code =
+        pond_core::user_data::ports::device_commissioning::parse_setup_code(raw).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let device = commissioner.commission(code).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id":      device.device_id,
+            "name":    device.name,
+            "node_id": device.node_id,
+        })),
+    ))
+}
+
 async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2082,6 +2144,15 @@ async fn register_push_token(
             Json(json!({ "error": "`token` too long" })),
         ));
     }
+    // Every real push token (FCM, APNs hex, `ExponentPushToken[...]`) is
+    // printable ASCII. Rejecting anything else here keeps control characters
+    // out of the logs and stops malformed tokens reaching the relays at all.
+    if !req.token.chars().all(|c| c.is_ascii_graphic()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "`token` must be printable ASCII" })),
+        ));
+    }
 
     // The token must belong to a known, registered device.
     let exists = state.device_registry.get_device(&id).await.map_err(|e| {
@@ -2149,6 +2220,44 @@ async fn get_settings(
     Ok(Json(serde_json::to_value(settings).unwrap_or(json!({}))))
 }
 
+/// Decide whether a settings save should geocode the location name into
+/// coordinates, and if so, the (trimmed) name to look up.
+///
+/// The Settings page sends the whole settings object on every save, so the
+/// latitude/longitude keys are always present (as the current values, or 0/null
+/// when blank). Detecting an *explicit* coordinate edit therefore can't just
+/// check for the key — it compares the patched value to what is stored. We
+/// geocode when a name is present and the user did not edit coordinates, and
+/// either the name changed or the coordinates are unset (0,0, the onboarding
+/// default). Pure, so the decision is unit-tested without a network call.
+#[allow(clippy::too_many_arguments)]
+fn geocode_target(
+    merged_name: &str,
+    current_name: &str,
+    merged_lat: f64,
+    merged_lon: f64,
+    patch_lat: Option<f64>,
+    patch_lon: Option<f64>,
+    current_lat: f64,
+    current_lon: f64,
+) -> Option<String> {
+    let name = merged_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // The user explicitly set coordinates only when the patch carries a value
+    // that differs from what is stored — a full-object echo of the current
+    // coordinates does not count.
+    let coords_edited =
+        patch_lat.is_some_and(|v| v != current_lat) || patch_lon.is_some_and(|v| v != current_lon);
+    if coords_edited {
+        return None;
+    }
+    let name_changed = merged_name != current_name;
+    let coords_unset = merged_lat == 0.0 && merged_lon == 0.0;
+    (name_changed || coords_unset).then(|| name.to_string())
+}
+
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
@@ -2186,7 +2295,39 @@ async fn update_settings(
             base_obj.insert(k.clone(), v.clone());
         }
     }
-    let merged: Settings = serde_json::from_value(base).unwrap_or(current);
+    let mut merged: Settings = serde_json::from_value(base).unwrap_or_else(|_| current.clone());
+
+    // Geocode-on-save: turn the location name into coordinates so the Settings
+    // page shows real lat/lon and the weather gate is satisfied without the user
+    // hand-entering coordinates. Onboarding saves through this same endpoint, so
+    // an onboarded install ends up with real coordinates and no user action.
+    // Best-effort — a failure keeps whatever coordinates were provided, since the
+    // adapter resolves the name on demand anyway.
+    let patch_lat = patch.get("weather_latitude").and_then(|v| v.as_f64());
+    let patch_lon = patch.get("weather_longitude").and_then(|v| v.as_f64());
+    if let Some(name) = geocode_target(
+        &merged.weather_location_name,
+        &current.weather_location_name,
+        merged.weather_latitude,
+        merged.weather_longitude,
+        patch_lat,
+        patch_lon,
+        current.weather_latitude,
+        current.weather_longitude,
+    ) {
+        let geocoder = pond_adapters_weather::Geocoder::new(state.http_client.clone());
+        match geocoder.geocode(&name).await {
+            Ok(geo) => {
+                merged.weather_latitude = geo.latitude;
+                merged.weather_longitude = geo.longitude;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                location = %name,
+                "geocode-on-save failed; keeping provided coordinates"
+            ),
+        }
+    }
 
     state.settings_repo.update(&merged).await.map_err(|e| {
         (
@@ -6223,24 +6364,29 @@ const TOOL_UI_RESOURCES: &[(&str, &str)] = &[(
 
 /// `GET /api/v1/agent/tools` — list all MCP tools currently loaded by the agent.
 ///
-/// Returns a flat array of tool objects. Each entry includes at minimum
-/// `{ "name": "..." }`. Tools with associated MCP App resources also
-/// include `{ "_meta": { "ui": { "resourceUri": "ui://..." } } }`.
+/// Returns a flat array of tool objects: `{ "extension": "...", "name": "...",
+/// "description": "..." | null }`. Tools with associated MCP App resources
+/// also include `{ "_meta": { "ui": { "resourceUri": "ui://..." } } }`.
 /// Returns an empty array when no extension manager is active (no-crash fallback).
 async fn list_agent_tools(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(manager) = &state.extension_manager else {
         return Json(json!([])).into_response();
     };
-    match manager.list_tools().await {
+    match manager.list_tools_detailed().await {
         Ok(tools) => {
             let enriched: Vec<Value> = tools
                 .iter()
-                .map(|tool_name| {
-                    let mut obj = json!({ "name": tool_name });
+                .map(|tool| {
+                    let full_name = format!("{}__{}", tool.extension, tool.name);
+                    let mut obj = json!({
+                        "extension": tool.extension,
+                        "name": tool.name,
+                        "description": tool.description,
+                    });
                     // Inject _meta.ui for tools that have an associated MCP App
                     for &(prefix, uri) in TOOL_UI_RESOURCES {
-                        if tool_name == prefix || tool_name.ends_with(prefix) {
+                        if full_name == prefix || full_name.ends_with(prefix) {
                             obj["_meta"] = json!({
                                 "ui": { "resourceUri": uri }
                             });
@@ -6479,11 +6625,14 @@ async fn agent_chat_stream(
     let stream = async_stream::stream! {
         let _permit = permit;
 
-        let chat_service = pond_core::shared::services::chat::ChatService::new(
+        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             agent.clone(),
             session_id.clone(),
             storage.clone(),
         );
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
+        }
 
         if storage.get_session(&session_id).await.is_err() {
             if let Err(e) = storage.create_session(session_id.clone()).await {
@@ -6650,7 +6799,7 @@ async fn list_logs(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(repo) = &state.event_log_repo else {
+    let Some(repo) = &state.operational_log else {
         return Json(json!([])).into_response();
     };
 
@@ -6677,7 +6826,7 @@ async fn list_logs(
 async fn export_logs_csv(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Some(repo) = &state.event_log_repo else {
+    let Some(repo) = &state.operational_log else {
         return (StatusCode::NOT_IMPLEMENTED, "Event log not configured").into_response();
     };
 
@@ -7352,6 +7501,15 @@ async fn set_extension_secrets_handler(
 
 // ── OAuth PKCE handlers ──────────────────────────────────────────────────────
 
+/// Secret-store key for a per-provider OAuth client ID override, e.g.
+/// `"SPOTIFY_CLIENT_ID"`. Always call this with the canonical `provider.id`
+/// (never a raw request field, which may be a secret's token_key instead) —
+/// every handler that resolves a client ID must agree on this key or the
+/// authorize and token-exchange steps end up using different apps.
+fn client_id_secret_key(provider_id: &str) -> String {
+    format!("{}_CLIENT_ID", provider_id.to_uppercase())
+}
+
 /// `POST /api/v1/oauth/authorize` — Start an OAuth PKCE authorization flow.
 ///
 /// Body: `{ "provider": "spotify", "extension_id": "music" }`
@@ -7384,9 +7542,9 @@ async fn oauth_authorize_handler(
         }
     };
 
-    // Check if user has their own client ID in the secret store
+    // Check if user has their own client ID in the secret store.
     let client_id = if let Some(repo) = &state.secret_repo {
-        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        let key = client_id_secret_key(&provider.id);
         repo.get(&key)
             .await
             .ok()
@@ -7482,7 +7640,7 @@ async fn oauth_callback_handler(
 
     // Resolve client ID (user override or bundled)
     let client_id = if let Some(repo) = &state.secret_repo {
-        let key = format!("{}_CLIENT_ID", session.provider_id.to_uppercase());
+        let key = client_id_secret_key(&session.provider_id);
         repo.get(&key)
             .await
             .ok()
@@ -7662,7 +7820,7 @@ async fn oauth_refresh_handler(
     };
 
     let client_id = {
-        let key = format!("{}_CLIENT_ID", provider_id.to_uppercase());
+        let key = client_id_secret_key(&provider.id);
         repo.get(&key)
             .await
             .ok()
@@ -7808,7 +7966,7 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
     let provider = providers.iter().find(|p| p.id == "spotify")?;
     let refresh_token = repo.get(&provider.refresh_key).await.ok().flatten()?;
     let client_id = repo
-        .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
+        .get(&client_id_secret_key(&provider.id))
         .await
         .ok()
         .flatten()
@@ -10423,6 +10581,82 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── geocode-on-save decision ─────────────────────────────────
+
+    #[test]
+    fn geocodes_when_coordinates_are_unset() {
+        // Onboarding: a name saved with 0,0 and no coord keys in the patch.
+        assert_eq!(
+            geocode_target("Nairobi", "Nairobi", 0.0, 0.0, None, None, 0.0, 0.0),
+            Some("Nairobi".to_string())
+        );
+    }
+
+    #[test]
+    fn geocodes_when_the_name_changed_even_if_old_coords_are_echoed() {
+        // Settings page sends the whole object: the new name plus the OLD
+        // coordinates (echoed, == current). Those coordinates are stale for the
+        // new city, so we must still geocode.
+        assert_eq!(
+            geocode_target(
+                "Kisumu",
+                "Nairobi",
+                -1.29,
+                36.82,
+                Some(-1.29),
+                Some(36.82),
+                -1.29,
+                36.82
+            ),
+            Some("Kisumu".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_an_unchanged_name_with_coordinates() {
+        assert_eq!(
+            geocode_target(
+                "Nairobi",
+                "Nairobi",
+                -1.29,
+                36.82,
+                Some(-1.29),
+                Some(36.82),
+                -1.29,
+                36.82
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_when_the_user_edited_coordinates() {
+        // Patched coordinates differ from stored → an explicit edit; respect it
+        // even though the name also implies a different place.
+        assert_eq!(
+            geocode_target(
+                "Nairobi",
+                "Nairobi",
+                40.0,
+                -74.0,
+                Some(40.0),
+                Some(-74.0),
+                -1.29,
+                36.82
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_an_empty_or_whitespace_name() {
+        assert_eq!(geocode_target("", "", 0.0, 0.0, None, None, 0.0, 0.0), None);
+        assert_eq!(
+            geocode_target("   ", "x", 0.0, 0.0, None, None, 0.0, 0.0),
+            None
+        );
+    }
 
     // ── Memory-fit guard (Phase 6) ───────────────────────────────
 

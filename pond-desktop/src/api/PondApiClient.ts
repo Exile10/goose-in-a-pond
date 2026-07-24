@@ -1,7 +1,6 @@
 import {
   ApiError,
   type AddExtensionRequest,
-  type AgentChatStreamRequest,
   type AgentRecipe,
   type AgentTool,
   type CalibrateResponse,
@@ -27,7 +26,6 @@ import {
   type ModelMemoryStatus,
   type OllamaModel,
   type PairingCodeResponse,
-  type PromptExtra,
   type PromptTemplate,
   type Schedule,
   type ScheduleRun,
@@ -300,6 +298,11 @@ export class PondApiClient {
     room?: string;
   }): Promise<Device> {
     return this.post<Device>("/api/v1/devices", req);
+  }
+
+  /** Commission a Matter device onto the fabric with its setup code. */
+  commissionDevice(code: string): Promise<{ id: string; name: string; node_id: number }> {
+    return this.post("/api/v1/devices/commission", { code });
   }
 
   unregisterDevice(id: string): Promise<void> {
@@ -764,29 +767,6 @@ export class PondApiClient {
     return this.post(`/api/v1/prompts/${name}/reset`);
   }
 
-  // ── Agent extras ──────────────────────────────────────────
-
-  listExtras(): Promise<PromptExtra[]> {
-    // Backend uses field name "instruction"; normalize to "content" and "enabled"
-    return this.get<Array<Record<string, unknown>>>("/api/v1/agent/extras").then((items) =>
-      items.map((e) => ({
-        key: e.key as string,
-        content: (e.content ?? e.instruction ?? "") as string,
-        enabled: (e.enabled ?? e.active ?? true) as boolean,
-      })),
-    );
-  }
-
-  addExtra(key: string, content: string): Promise<PromptExtra> {
-    // Backend expects field name "instruction" not "content"
-    return this.post<Record<string, unknown>>("/api/v1/agent/extras", { key, instruction: content, active: true })
-      .then(() => ({ key, content, enabled: true }));
-  }
-
-  deleteExtra(key: string): Promise<void> {
-    return this.del(`/api/v1/agent/extras/${encodeURIComponent(key)}`);
-  }
-
   listTools(): Promise<AgentTool[]> {
     return this.get("/api/v1/agent/tools");
   }
@@ -1068,71 +1048,6 @@ export class PondApiClient {
   searchLlamafileModels(q?: string): Promise<{ models: LlamafileRelease[] }> {
     const qs = q ? `?q=${encodeURIComponent(q)}` : "";
     return this.get(`/api/v1/models/search/llamafile${qs}`);
-  }
-
-  // ── Agent chat (agentic mode with tool calls) ─────────────
-
-  async *agentChatStream(message: string, sessionId?: string): AsyncGenerator<ChatEvent> {
-    await this.ensureTokenFresh();
-    const reqBody: AgentChatStreamRequest = { message };
-    if (sessionId) reqBody.session_id = sessionId;
-
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-
-    // Retry initial connection on network-level failures (not HTTP errors).
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120_000);
-    let res!: Response;
-    for (let attempt = 0; attempt <= 2; attempt++) {
-      try {
-        res = await fetch(`${this.base}/api/v1/agent/chat/stream`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        break;
-      } catch (e) {
-        clearTimeout(timeoutId);
-        if (e instanceof DOMException && e.name === "AbortError") {
-          throw new ApiError(408, "Request timed out");
-        }
-        if (attempt === 2) throw e;
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-      }
-    }
-
-    if (!res.ok || !res.body) {
-      let msg = res.statusText;
-      try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
-      throw new ApiError(res.status, msg);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") {
-            if (trimmed === "data: [DONE]") yield { type: "done", done: true };
-            continue;
-          }
-          const data = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
-          try { yield JSON.parse(data) as ChatEvent; } catch { /* malformed */ }
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
   }
 
   // ── Extensions ───────────────────────────────────────────

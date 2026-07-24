@@ -151,6 +151,26 @@ impl OpenMeteoWeatherAdapter {
 
     // ── Internal fetch helpers ───────────────────────────────────────────
 
+    /// Coordinates for the configured default location.
+    ///
+    /// Uses the explicit `latitude`/`longitude` when they were set. Otherwise —
+    /// onboarding stores a place *name* but no coordinates (both default to 0) —
+    /// it geocodes the name. Geocoding only runs on a weather-cache miss (the
+    /// callers check their 15-minute cache first), so this adds no per-call
+    /// network cost in the common case.
+    async fn default_location(&self) -> Result<(f64, f64, String)> {
+        if self.latitude != 0.0 || self.longitude != 0.0 {
+            return Ok((self.latitude, self.longitude, self.location_name.clone()));
+        }
+        if self.location_name.trim().is_empty() {
+            anyhow::bail!(
+                "no default weather location configured (set coordinates or a location name)"
+            );
+        }
+        let geo = self.geocoder.geocode(&self.location_name).await?;
+        Ok((geo.latitude, geo.longitude, geo.name))
+    }
+
     async fn fetch_current(&self, lat: f64, lon: f64, name: &str) -> Result<WeatherData> {
         let url = format!(
             "{}/v1/forecast\
@@ -334,9 +354,8 @@ impl WeatherProvider for OpenMeteoWeatherAdapter {
             return Ok(data);
         }
 
-        let data = self
-            .fetch_current(self.latitude, self.longitude, &self.location_name)
-            .await?;
+        let (lat, lon, name) = self.default_location().await?;
+        let data = self.fetch_current(lat, lon, &name).await?;
         self.set_cached_current(key, &data);
         Ok(data)
     }
@@ -366,9 +385,8 @@ impl WeatherProvider for OpenMeteoWeatherAdapter {
             return Ok(data);
         }
 
-        let data = self
-            .fetch_forecast(self.latitude, self.longitude, &self.location_name, days)
-            .await?;
+        let (lat, lon, name) = self.default_location().await?;
+        let data = self.fetch_forecast(lat, lon, &name, days).await?;
         self.set_cached_forecast(key, &data);
         Ok(data)
     }
@@ -588,6 +606,42 @@ mod tests {
     }
 
     // ── Location-aware tests ─────────────────────────────────────────────
+
+    /// Onboarding stores a location *name* but leaves coordinates at 0. The
+    /// default-location path must geocode the name rather than fetching for
+    /// (0, 0) — the bug that left onboarded installs "not configured".
+    #[tokio::test]
+    async fn current_geocodes_the_default_name_when_coordinates_are_unset() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_geocoding_response()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/forecast"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_current_response()))
+            .mount(&server)
+            .await;
+
+        // lat/lon = 0, name only — exactly what onboarding persists.
+        let adapter =
+            OpenMeteoWeatherAdapter::with_base_url(0.0, 0.0, "Kisumu", server.uri(), server.uri());
+        let data = adapter.current().await.unwrap();
+        assert_eq!(data.location_name, "Kisumu, Kenya");
+        assert_eq!(data.temperature_c, 24.3);
+    }
+
+    /// With no coordinates and no name there is nothing to fetch — surface a
+    /// clear error rather than silently querying (0, 0) in the ocean.
+    #[tokio::test]
+    async fn current_errors_when_neither_coordinates_nor_name_are_set() {
+        let server = MockServer::start().await;
+        let adapter =
+            OpenMeteoWeatherAdapter::with_base_url(0.0, 0.0, "", server.uri(), server.uri());
+        let err = adapter.current().await.expect_err("no location");
+        assert!(err.to_string().contains("no default weather location"));
+    }
 
     #[tokio::test]
     async fn current_for_geocodes_and_fetches() {

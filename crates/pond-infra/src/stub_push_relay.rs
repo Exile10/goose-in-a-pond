@@ -13,8 +13,7 @@ use pond_core::mcp::ports::notification::Notification;
 use pond_core::mcp::ports::notification_relay::NotificationRelay;
 use pond_core::user_data::ports::push_token::PushTokenRepository;
 
-/// How much of a push token is safe to log (prefix only).
-const TOKEN_LOG_PREFIX: usize = 8;
+use crate::push_token_log::token_log_prefix;
 
 pub struct StubPushRelay {
     push_tokens: Arc<dyn PushTokenRepository>,
@@ -36,7 +35,7 @@ impl NotificationRelay for StubPushRelay {
             );
             return Ok(());
         };
-        let prefix = &token.token[..token.token.len().min(TOKEN_LOG_PREFIX)];
+        let prefix = token_log_prefix(&token.token);
         // Scaffold: real FCM/APNs delivery is a follow-up.
         tracing::info!(
             device = %notification.target,
@@ -102,6 +101,26 @@ mod tests {
                 device_id: "dev-1".into(),
                 token: "ExponentPushToken[secret]".into(),
                 platform: PushPlatform::Expo,
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+        relay.relay(&notif()).await.unwrap();
+    }
+
+    /// Regression: a token whose 8th byte falls inside a multi-byte character
+    /// used to panic while building the log prefix. `relay` is awaited inline
+    /// in `BroadcastNotificationSender::send`, which catches errors but not
+    /// panics, so this would have taken down the whole notification send.
+    #[tokio::test]
+    async fn relay_does_not_panic_on_a_multi_byte_token() {
+        let tokens = Arc::new(StubTokens::default());
+        let relay = StubPushRelay::new(tokens.clone());
+        tokens
+            .upsert(PushToken {
+                device_id: "dev-1".into(),
+                token: "日本語のトークンです".into(),
+                platform: PushPlatform::Fcm,
                 updated_at: String::new(),
             })
             .await

@@ -252,7 +252,7 @@ export function CamerasDetail({ go }: CamerasDetailProps) {
               alignItems: "center",
               gap: 8,
               padding: "24px 0",
-              color: "#94a3b8",
+              color: "var(--color-text-tertiary)",
             }}
           >
             <HubIco d={SICN.cctv} size={28} color="#cbd5e1" />
