@@ -2153,10 +2153,36 @@ async fn run_server(
     > = Arc::new(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
+    // Real FCM relay when a service-account key is present (Path B: direct
+    // FCM v1, data-only wake pings — no Expo hop, no content through Google);
+    // otherwise the logging stub. Key location:
+    // `<data_dir>/secrets/fcm-service-account.json`, override POND_FCM_KEY_PATH.
+    let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("secrets").join("fcm-service-account.json"));
     let push_relay: Arc<dyn pond_core::mcp::ports::notification_relay::NotificationRelay> =
-        Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
-            push_token_repo.clone(),
-        ));
+        if fcm_key_path.exists() {
+            match pond_infra::fcm_push_relay::FcmPushRelay::from_key_file(
+                &fcm_key_path,
+                push_token_repo.clone(),
+            ) {
+                Ok(relay) => Arc::new(relay),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %fcm_key_path.display(),
+                        "FCM key unusable; background push falls back to the logging stub"
+                    );
+                    Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+                        push_token_repo.clone(),
+                    ))
+                }
+            }
+        } else {
+            Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+                push_token_repo.clone(),
+            ))
+        };
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
         Arc::new(
             pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(

@@ -240,6 +240,23 @@ async fn register_push_token_oversized_token_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// Non-printable-ASCII tokens are refused at the boundary: they are never
+/// real push tokens, and downstream the relays truncate the token for logging.
+#[tokio::test]
+async fn register_push_token_non_ascii_token_400() {
+    let (app, repo, device_id, _tmp) = make_app().await;
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/devices/{device_id}/push-token"),
+        true,
+        Some(serde_json::json!({ "token": "日本語のトークンです", "platform": "fcm" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(repo.get(&device_id).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn register_push_token_requires_auth() {
     let (app, _repo, device_id, _tmp) = make_app().await;

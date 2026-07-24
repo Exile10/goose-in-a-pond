@@ -403,6 +403,18 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         600,
         std::time::Duration::from_secs(60),
     ));
+    // Pairing gets its own, separate budget. Sharing one bucket with ordinary
+    // API traffic meant a single chatty or wedged client could spend the whole
+    // per-IP allowance and lock the device out of `/handshake` — and re-pairing
+    // is precisely the recovery path you reach for when a client is
+    // misbehaving. Keeping the budgets independent means API abuse can never
+    // take pairing down with it. Pairing is inherently low-volume, so a much
+    // smaller allowance is ample; `/handshake/verify` keeps its own stricter
+    // limiter on top of this (see `routes::verify_limiter`).
+    let handshake_limiter = Arc::new(middleware::RateLimiter::new(
+        30,
+        std::time::Duration::from_secs(60),
+    ));
 
     Router::new()
         // Dev test page — no auth required, returns HTML
@@ -423,7 +435,8 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         // Apply rate limiting to all routes
         .layer(axum::middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();
-            rate_limit_with_limiter(req, next, limiter)
+            let handshake_limiter = handshake_limiter.clone();
+            rate_limit_with_limiter(req, next, limiter, handshake_limiter)
         }))
         // CORS — scoped to the first-party Tauri desktop origins (#94). Browser
         // requests from other origins are rejected. Native GOTG mobile clients
@@ -467,10 +480,21 @@ fn build_cors_layer() -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+/// True for the pairing endpoints, which draw on their own rate-limit budget.
+/// Matched on a segment boundary so a merely similar path — `/handshakes` —
+/// cannot help itself to the protected pairing allowance.
+fn is_handshake_path(path: &str) -> bool {
+    match path.strip_prefix("/api/v1/handshake") {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
 async fn rate_limit_with_limiter(
     req: axum::extract::Request,
     next: Next,
     limiter: Arc<middleware::RateLimiter>,
+    handshake_limiter: Arc<middleware::RateLimiter>,
 ) -> Result<axum::response::Response, middleware::AuthError> {
     // Extract client IP from ConnectInfo<SocketAddr> (populated by
     // into_make_service_with_connect_info in main.rs).
@@ -489,8 +513,72 @@ async fn rate_limit_with_limiter(
         return Ok(next.run(req).await);
     }
 
-    if !limiter.check_rate_limit(&client_ip).await {
-        return Err(middleware::AuthError::RateLimitExceeded);
+    let limiter = if is_handshake_path(req.uri().path()) {
+        &handshake_limiter
+    } else {
+        &limiter
+    };
+    if let Err(remaining) = limiter.check_rate_limit_detailed(&client_ip).await {
+        return Err(middleware::AuthError::RateLimitExceeded {
+            retry_after_secs: middleware::retry_after_secs(remaining),
+        });
     }
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// Every pairing endpoint must draw on the pairing budget. If one of these
+    /// fell back to the shared pool, a chatty client could still lock the
+    /// device out of the recovery path it is routed here to protect.
+    #[test]
+    fn every_handshake_route_uses_the_pairing_budget() {
+        for path in [
+            "/api/v1/handshake",
+            "/api/v1/handshake/init",
+            "/api/v1/handshake/verify",
+            "/api/v1/handshake/refresh",
+            "/api/v1/handshake/revoke",
+            "/api/v1/handshake/pairing-code",
+        ] {
+            assert!(is_handshake_path(path), "{path} should use it");
+        }
+    }
+
+    /// And nothing else may draw on it — least of all the push-token endpoint,
+    /// whose retry loop is what motivated separating the two budgets.
+    #[test]
+    fn ordinary_api_routes_do_not_use_the_pairing_budget() {
+        for path in [
+            "/api/v1/devices/abc/push-token",
+            "/api/v1/chat/stream",
+            "/api/v1/notifications/stream",
+            "/api/v1/activity",
+            "/api/v1/settings",
+            // Near-misses: neither is a pairing route.
+            "/api/v1/handshakes",
+            "/api/v1/device-handshake",
+        ] {
+            assert!(!is_handshake_path(path), "{path} should not use it");
+        }
+    }
+
+    /// Exhausting one budget must leave the other untouched — the whole point
+    /// of keeping them separate.
+    #[tokio::test]
+    async fn exhausting_the_api_budget_leaves_pairing_available() {
+        let api = middleware::RateLimiter::new(2, std::time::Duration::from_secs(60));
+        let handshake = middleware::RateLimiter::new(2, std::time::Duration::from_secs(60));
+
+        let ip = "192.0.2.10";
+        while api.check_rate_limit(ip).await {}
+        assert!(!api.check_rate_limit(ip).await, "API budget is spent");
+
+        assert!(
+            handshake.check_rate_limit(ip).await,
+            "the same IP can still pair"
+        );
+    }
 }
