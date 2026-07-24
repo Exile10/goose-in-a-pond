@@ -136,7 +136,7 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         skill_repo: None,
         recipe_repo: None,
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,
