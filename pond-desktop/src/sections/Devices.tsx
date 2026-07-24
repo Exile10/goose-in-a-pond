@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Button, Separator } from "@heroui/react";
 import {
-  Monitor, Cpu, Activity, Power, Settings, Plus, X,
+  Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio,
   Lightbulb, Lock, Thermometer, Fan, Blinds,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
@@ -55,6 +55,8 @@ export function Devices() {
 
   // Form state
   const [name, setName]               = useState("");
+  const [mode, setMode]               = useState<"matter" | "manual">("matter");
+  const [setupCode, setSetupCode]     = useState("");
   const [deviceType, setDeviceType]   = useState("host");
   const [hostname, setHostname]       = useState("");
   const [room, setRoom]               = useState("");
@@ -76,12 +78,29 @@ export function Devices() {
   useEffect(() => { load(); }, []);
 
   function openForm() {
-    setName(""); setDeviceType("host"); setHostname(""); setRoom("");
+    setName(""); setDeviceType("host"); setHostname(""); setRoom(""); setSetupCode(""); setMode("matter");
     setFormError(null);
     setShowForm(true);
   }
 
   function closeForm() { setShowForm(false); setFormError(null); }
+
+  /// Commission a Matter device: GIAP pairs it onto the fabric, then the bridge
+  /// registers it from the controller's own report — so we just reload the list.
+  async function handleCommission() {
+    if (!setupCode.trim()) { setFormError("Enter the device's setup code."); return; }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      await api.commissionDevice(setupCode.trim());
+      closeForm();
+      load();
+    } catch (e) {
+      setFormError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   async function handleRegister() {
     if (!name.trim()) { setFormError("Name is required."); return; }
@@ -232,49 +251,92 @@ export function Devices() {
             <Separator />
 
             <div className="sched-modal__body">
+              {/* What you are adding decides what GIAP needs. A Matter device
+                  is commissioned onto the fabric with its setup code; anything
+                  else is a catalogue entry you describe yourself. */}
               <div className="sched-modal__field">
-                <label className="sched-modal__label">Name</label>
-                <input
-                  className="sched-modal__input"
-                  placeholder="Living Room Pi"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  autoFocus
-                />
+                <label className="sched-modal__label">What are you adding?</label>
+                <div className="dev-mode-toggle">
+                  <button
+                    type="button"
+                    className={mode === "matter" ? "dev-mode-toggle__btn dev-mode-toggle__btn--on" : "dev-mode-toggle__btn"}
+                    onClick={() => { setMode("matter"); setFormError(null); }}
+                  >
+                    <Radio size={13} /> Matter device
+                  </button>
+                  <button
+                    type="button"
+                    className={mode === "manual" ? "dev-mode-toggle__btn dev-mode-toggle__btn--on" : "dev-mode-toggle__btn"}
+                    onClick={() => { setMode("manual"); setFormError(null); }}
+                  >
+                    <Monitor size={13} /> Other device
+                  </button>
+                </div>
               </div>
 
-              <div className="sched-modal__field">
-                <label className="sched-modal__label">Device type</label>
-                <select
-                  className="sched-modal__select"
-                  value={deviceType}
-                  onChange={(e) => setDeviceType(e.target.value)}
-                >
-                  {DEVICE_TYPES.map((t) => (
-                    <option key={t.value} value={t.value}>{t.label}</option>
-                  ))}
-                </select>
-              </div>
+              {mode === "matter" ? (
+                <div className="sched-modal__field">
+                  <label className="sched-modal__label">Setup code</label>
+                  <input
+                    className="sched-modal__input"
+                    placeholder="20202021 or MT:-24J0AFN00KA0648G00"
+                    value={setupCode}
+                    onChange={(e) => setSetupCode(e.target.value)}
+                    autoFocus
+                  />
+                  <p className="sched-modal__cron-hint">
+                    The 11-digit pairing code or QR payload on the device, or its
+                    8-digit passcode. GIAP commissions it onto your fabric and it
+                    appears here with its own name — no need to describe it.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Name</label>
+                    <input
+                      className="sched-modal__input"
+                      placeholder="Living Room Pi"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      autoFocus
+                    />
+                  </div>
 
-              <div className="sched-modal__field">
-                <label className="sched-modal__label">Hostname <span className="sched-modal__cron-hint">(optional)</span></label>
-                <input
-                  className="sched-modal__input"
-                  placeholder="raspberrypi.local"
-                  value={hostname}
-                  onChange={(e) => setHostname(e.target.value)}
-                />
-              </div>
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Device type</label>
+                    <select
+                      className="sched-modal__select"
+                      value={deviceType}
+                      onChange={(e) => setDeviceType(e.target.value)}
+                    >
+                      {DEVICE_TYPES.map((t) => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                  </div>
 
-              <div className="sched-modal__field">
-                <label className="sched-modal__label">Room <span className="sched-modal__cron-hint">(optional)</span></label>
-                <input
-                  className="sched-modal__input"
-                  placeholder="Living Room"
-                  value={room}
-                  onChange={(e) => setRoom(e.target.value)}
-                />
-              </div>
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Hostname <span className="sched-modal__cron-hint">(optional)</span></label>
+                    <input
+                      className="sched-modal__input"
+                      placeholder="raspberrypi.local"
+                      value={hostname}
+                      onChange={(e) => setHostname(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Room <span className="sched-modal__cron-hint">(optional)</span></label>
+                    <input
+                      className="sched-modal__input"
+                      placeholder="Living Room"
+                      value={room}
+                      onChange={(e) => setRoom(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
 
               {formError && (
                 <p className="text-error text-error--sm">{formError}</p>
@@ -285,14 +347,26 @@ export function Devices() {
 
             <div className="sched-modal__footer">
               <Button size="sm" variant="ghost" onPress={closeForm}>Cancel</Button>
-              <Button
-                size="sm"
-                variant="primary"
-                isDisabled={submitting || !name.trim()}
-                onPress={handleRegister}
-              >
-                {submitting ? "Registering…" : "Register"}
-              </Button>
+              {mode === "matter" ? (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  isDisabled={submitting || !setupCode.trim()}
+                  onPress={handleCommission}
+                >
+                  {/* Commissioning is slow — say so rather than looking hung. */}
+                  {submitting ? "Commissioning…" : "Commission"}
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  isDisabled={submitting || !name.trim()}
+                  onPress={handleRegister}
+                >
+                  {submitting ? "Registering…" : "Register"}
+                </Button>
+              )}
             </div>
           </div>
         </div>
