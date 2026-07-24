@@ -15,9 +15,11 @@ use tokio::sync::RwLock;
 
 use crate::client::MatterClient;
 use crate::protocol::{
-    brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, node_id_from_device_id,
-    MatterNode, ATTR_OCCUPIED_HEATING_SETPOINT, CLUSTER_DOOR_LOCK, CLUSTER_LEVEL_CONTROL,
-    CLUSTER_ON_OFF, CLUSTER_THERMOSTAT,
+    brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, hue_to_matter,
+    node_id_from_device_id, position_open_to_lift_100ths, saturation_to_matter, MatterNode,
+    ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT, CLUSTER_COLOR_CONTROL,
+    CLUSTER_DOOR_LOCK, CLUSTER_FAN_CONTROL, CLUSTER_LEVEL_CONTROL, CLUSTER_ON_OFF,
+    CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING,
 };
 
 /// Shared node cache: the bridge keeps it current from server events; the
@@ -182,6 +184,90 @@ impl DeviceControlPort for MatterDeviceControl {
             device_id,
             DeviceStatePatch {
                 locked: Some(locked),
+                ..Default::default()
+            },
+        ))
+    }
+
+    async fn set_color(
+        &self,
+        device_id: &str,
+        hue_degrees: u16,
+        saturation_percent: u8,
+    ) -> Result<DeviceControlOutcome> {
+        let sat = saturation_percent.min(100);
+        let (node, ep) = self.resolve(device_id, CLUSTER_COLOR_CONTROL).await?;
+        self.command(
+            node,
+            ep,
+            CLUSTER_COLOR_CONTROL,
+            "MoveToHueAndSaturation",
+            json!({
+                "hue": hue_to_matter(hue_degrees),
+                "saturation": saturation_to_matter(sat),
+                "transitionTime": 0,
+                "optionsMask": 0,
+                "optionsOverride": 0,
+            }),
+        )
+        .await?;
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch {
+                hue: Some(hue_degrees % 360),
+                saturation: Some(sat),
+                ..Default::default()
+            },
+        ))
+    }
+
+    async fn set_fan_speed(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
+        let pct = percent.min(100);
+        let (node, ep) = self.resolve(device_id, CLUSTER_FAN_CONTROL).await?;
+        // Fan speed is the `PercentSetting` attribute (0–100), not a command.
+        self.client
+            .send_command(
+                "write_attribute",
+                json!({
+                    "node_id": node,
+                    "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_PERCENT_SETTING}"),
+                    "value": pct,
+                }),
+            )
+            .await?;
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch {
+                fan_speed: Some(pct),
+                on: Some(pct > 0),
+                ..Default::default()
+            },
+        ))
+    }
+
+    async fn set_position(
+        &self,
+        device_id: &str,
+        percent_open: u8,
+    ) -> Result<DeviceControlOutcome> {
+        let pct = percent_open.min(100);
+        let (node, ep) = self.resolve(device_id, CLUSTER_WINDOW_COVERING).await?;
+        self.command(
+            node,
+            ep,
+            CLUSTER_WINDOW_COVERING,
+            "GoToLiftPercentage",
+            json!({
+                // Matter lift is hundredths-of-a-percent CLOSED; GIAP speaks
+                // percent open.
+                "liftPercent100thsValue": position_open_to_lift_100ths(pct),
+            }),
+        )
+        .await?;
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch {
+                position: Some(pct),
                 ..Default::default()
             },
         ))

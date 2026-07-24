@@ -77,7 +77,7 @@ const KIND_FROM_TYPE: Record<string, DeviceKind> = {
   smart_plug: "plug",
 };
 
-function inferKind(d: Device): DeviceKind | "camera" | null {
+function inferKind(d: Device): DeviceKind | "camera" {
   const t = (d.device_type ?? "").toLowerCase();
   if (t === "camera") return "camera";
   if (KIND_FROM_TYPE[t]) return KIND_FROM_TYPE[t];
@@ -86,7 +86,9 @@ function inferKind(d: Device): DeviceKind | "camera" | null {
   const mk = typeof meta.kind === "string" ? meta.kind.toLowerCase() : "";
   if (mk === "camera") return "camera";
   if (KIND_FROM_TYPE[mk]) return KIND_FROM_TYPE[mk];
-  return null;
+  // Unrecognized types (host, sensor, gotg, smart_speaker, pond, edge, …) still
+  // need a room tile — fall back to a generic kind instead of dropping the device.
+  return "other";
 }
 
 function deviceFromApi(d: Device, kind: DeviceKind): DeviceData {
@@ -99,6 +101,7 @@ function deviceFromApi(d: Device, kind: DeviceKind): DeviceData {
     id: d.id,
     name: d.name,
     kind,
+    subtype: d.device_type,
     on,
     locked,
     target,
@@ -142,7 +145,7 @@ function deriveRooms(devs: DeviceData[]): RoomData[] {
   return Array.from(seen.values());
 }
 
-const CATEGORY_TEMPLATE: Record<DeviceKind, Omit<CategoryData, "status">> = {
+const CATEGORY_TEMPLATE: Record<Exclude<DeviceKind, "other">, Omit<CategoryData, "status">> = {
   light:  { id: "lights",  label: "Lights",   icon: "bulb",   color: "#D97706", bg: "#FEF3C7" },
   lock:   { id: "locks",   label: "Locks",    icon: "lock",   color: "#2563EB", bg: "#DBEAFE" },
   thermo: { id: "climate", label: "Climate",  icon: "thermo", color: "#EA580C", bg: "#FFEDD5" },
@@ -157,7 +160,7 @@ function deriveCategories(devs: DeviceData[], cams: CameraData[]): CategoryData[
     icon: "shieldCheck", color: "#16A34A", bg: "#DCFCE7",
   });
 
-  const byKind: Record<DeviceKind, DeviceData[]> = { light: [], lock: [], thermo: [], plug: [] };
+  const byKind: Record<DeviceKind, DeviceData[]> = { light: [], lock: [], thermo: [], plug: [], other: [] };
   for (const d of devs) byKind[d.kind].push(d);
 
   if (byKind.lock.length) {
@@ -315,7 +318,7 @@ async function load() {
     for (const d of dOK) {
       const k = inferKind(d);
       if (k === "camera") cams.push(cameraFromApi(d));
-      else if (k) ctlDevices.push(deviceFromApi(d, k));
+      else ctlDevices.push(deviceFromApi(d, k));
     }
 
     // If backend has no devices at all, keep mock devices/cameras as a friendly demo.

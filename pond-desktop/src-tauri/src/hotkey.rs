@@ -7,6 +7,11 @@ pub const DEFAULT_HOTKEY: &str = "CmdOrCtrl+Shift+G";
 /// Dedicated voice summon hotkey: Cmd/Ctrl + Shift + V
 pub const DEFAULT_SUMMON_HOTKEY: &str = "CmdOrCtrl+Shift+V";
 
+/// Tauri event names shared by every trigger (hotkey, menu bar, tray) that
+/// can bring up Canvas / start a voice summon, so they can't drift apart.
+pub const CANVAS_TOGGLE_EVENT: &str = "canvas-toggle";
+pub const DESKTOP_SUMMON_EVENT: &str = "desktop-summon";
+
 /// Managed state that tracks the currently registered canvas hotkey string.
 /// Needed so `re_register_hotkey` can unregister the *current* hotkey rather
 /// than always falling back to the compile-time default.
@@ -22,11 +27,8 @@ impl HotkeyState {
     }
 }
 
-/// Register the canvas toggle hotkey.
-/// When triggered:
-///   - Canvas hidden + not recording  → show canvas + start listening
-///   - Canvas visible + recording     → stop recording (commit utterance)
-///   - Canvas visible + idle          → hide canvas
+/// Register the canvas hotkey: brings the main window forward, switches it
+/// to the Canvas section, and starts a voice summon turn.
 pub fn register_canvas_hotkey(app: &AppHandle) -> Result<(), String> {
     let shortcut = parse_shortcut(DEFAULT_HOTKEY)?;
 
@@ -49,7 +51,7 @@ pub fn register_summon_hotkey(app: &AppHandle) -> Result<(), String> {
     app.global_shortcut()
         .on_shortcut(shortcut, move |app_handle, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
-                let _ = app_handle.emit("desktop-summon", ());
+                let _ = app_handle.emit(DESKTOP_SUMMON_EVENT, ());
             }
         })
         .map_err(|e| format!("Failed to register summon hotkey: {e}"))?;
@@ -87,20 +89,12 @@ pub fn re_register_hotkey(app: &AppHandle, hotkey: &str, state: &HotkeyState) ->
 }
 
 fn handle_hotkey(app: &AppHandle) {
-    let canvas = match app.get_webview_window("canvas") {
-        Some(w) => w,
-        None => return,
-    };
-
-    if canvas.is_visible().unwrap_or(false) {
-        // Emit event so the frontend can decide whether to stop recording or hide
-        let _ = app.emit("canvas-hotkey", ());
-    } else {
-        let _ = canvas.show();
-        let _ = canvas.set_focus();
-        // Tell the canvas to start listening
-        let _ = app.emit("canvas-start-listen", ());
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
     }
+    let _ = app.emit(CANVAS_TOGGLE_EVENT, ());
+    let _ = app.emit(DESKTOP_SUMMON_EVENT, ());
 }
 
 /// Parse a human-readable shortcut string like "CmdOrCtrl+Shift+G" into a Shortcut.

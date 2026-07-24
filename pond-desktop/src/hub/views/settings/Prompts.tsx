@@ -351,7 +351,7 @@ export function PromptsDetail({ go }: PromptsDetailProps) {
         )}
         <div className="prompt-foot">
           <span className="prompt-foot__tok">
-            <HubIco d={CPU_PATH} size={13} color="#94A3B8" />
+            <HubIco d={CPU_PATH} size={13} color="var(--color-text-tertiary)" />
             ~{tokens.toLocaleString()} tokens
             {dirty && !loading && (
               <span

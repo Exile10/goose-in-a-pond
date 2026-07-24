@@ -1,9 +1,15 @@
-//! SQLite-backed event-log adapters (`pond_logs.db`).
+//! SQLite-backed log adapters (`pond_logs.db`). Two stores, two purposes:
 //!
-//! - [`SqliteEventLogRepository`] — the legacy `event_log` table (migration 0001),
-//!   still used by the desktop Logs screen.
+//! - [`SqliteOperationalLog`] — the `event_log` table (migration 0001). Drained
+//!   `tracing` output, backing the Logs viewer. Its only writer is
+//!   `pond-server`'s tracing drain.
 //! - [`SqliteEventLog`] — the unified, typed, append-only `events` table
-//!   (migration 0004, #109) implementing [`EventLog`].
+//!   (migration 0004, #109) implementing [`EventLog`]. The authoritative record
+//!   of what the assistant did.
+//!
+//! The two are kept apart on purpose: the drain mirrors every INFO+ line, so
+//! merging them would bury the activity feed in log noise. See
+//! [`pond_core::security::ports::audit`] for which to reach for.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -13,21 +19,23 @@ use sqlx::{Pool, Row, Sqlite};
 use std::sync::Arc;
 
 use pond_core::security::domain::event::{Event, EventQuery, PrivacySensitivity};
-use pond_core::security::ports::event_log::{EventLog, EventLogRepository, LogEntry};
+use pond_core::security::ports::event_log::{
+    EventLog, OperationalLogEntry, OperationalLogRepository,
+};
 
-pub struct SqliteEventLogRepository {
+pub struct SqliteOperationalLog {
     pool: Pool<Sqlite>,
 }
 
-impl SqliteEventLogRepository {
+impl SqliteOperationalLog {
     pub fn new(pool: Pool<Sqlite>) -> Self {
         Self { pool }
     }
 }
 
 #[async_trait]
-impl EventLogRepository for SqliteEventLogRepository {
-    async fn list(&self, limit: u32, level: Option<&str>) -> Result<Vec<LogEntry>> {
+impl OperationalLogRepository for SqliteOperationalLog {
+    async fn list(&self, limit: u32, level: Option<&str>) -> Result<Vec<OperationalLogEntry>> {
         let rows = match level {
             Some(lvl) => {
                 sqlx::query(
@@ -55,7 +63,7 @@ impl EventLogRepository for SqliteEventLogRepository {
 
         Ok(rows
             .iter()
-            .map(|r| LogEntry {
+            .map(|r| OperationalLogEntry {
                 id: r.get("id"),
                 timestamp: r.get("timestamp"),
                 level: r.get("level"),

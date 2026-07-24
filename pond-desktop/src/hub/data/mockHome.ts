@@ -27,12 +27,14 @@ export interface RoomData {
   icon: string;
 }
 
-export type DeviceKind = "light" | "lock" | "thermo" | "plug";
+export type DeviceKind = "light" | "lock" | "thermo" | "plug" | "other";
 
 export interface DeviceData {
   id: string;
   name: string;
   kind: DeviceKind;
+  /** Raw backend device_type (host, sensor, gotg, smart_speaker, pond, edge, …), used to pick an icon when kind is "other". */
+  subtype?: string;
   on?: boolean;
   locked?: boolean;
   value?: number;

@@ -390,7 +390,7 @@
 /* Model role + token meta below agent bubble */
 .bubble__meta {
   font-size: 10px;
-  color: var(--mut, #94A3B8);
+  color: var(--mut, #566178);
   font-family: var(--font-mono, monospace);
   margin-top: 4px;
   padding-left: 2px;

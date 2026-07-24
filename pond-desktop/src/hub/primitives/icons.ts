@@ -60,6 +60,12 @@ export const HP_PATHS = {
   max:         "M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M16 21h3a2 2 0 0 0 2-2v-3M8 21H5a2 2 0 0 1-2-2v-3",
   person:      "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM5 21a8 8 0 0 1 14 0",
   speaker:     "M11 5L6 9H2v6h4l5 4zM19 5a10 10 0 0 1 0 14M15.5 8.5a5 5 0 0 1 0 7",
+  // Generic device-kind icons (Devices section "Register device" types that
+  // aren't a light/lock/thermostat/plug — host, sensor, mobile, edge, …)
+  cpu:         "M20 17a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H9.5a2 2 0 0 0-2 1.57L5 14.5A2 2 0 0 0 7 17M16 17H7M12 17v4M8 21h8",
+  pulse:       "M22 12h-4l-3 9L9 3l-3 9H2",
+  phone:       "M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM12 18h.01",
+  chip:        "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3",
 } as const;
 
 export type HpIconKey = keyof typeof HP_PATHS;

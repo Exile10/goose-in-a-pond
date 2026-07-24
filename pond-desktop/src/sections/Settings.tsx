@@ -645,7 +645,7 @@ function SettingsRow({ iconPath, color, bg, label, sub, value, badge, onClick }:
       </span>
       {badge && <span className="set-row__badge">{badge}</span>}
       {value && <span className="set-row__value">{value}</span>}
-      <HubIco d={HP_PATHS.chevR} size={17} color="#C4C4CC" />
+      <HubIco d={HP_PATHS.chevR} size={17} color="var(--color-text-tertiary,#566178)" />
     </div>
   );
 }

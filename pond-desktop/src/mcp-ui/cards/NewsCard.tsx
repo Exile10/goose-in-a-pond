@@ -12,20 +12,20 @@ interface NewsItem {
 
 const TAG_STYLES: Record<string, { bg: string; color: string }> = {
   tech:       { bg: "#EDE9FE", color: "#7C3AED" },
-  world:      { bg: "#FEF9C3", color: "#92400E" },
-  business:   { bg: "#DCFCE7", color: "#15803D" },
+  world:      { bg: "#FEF9C3", color: "var(--color-warning-fg)" },
+  business:   { bg: "#DCFCE7", color: "var(--color-success-fg)" },
   health:     { bg: "#CFFAFE", color: "#0E7490" },
   science:    { bg: "#DBEAFE", color: "#1D4ED8" },
-  sports:     { bg: "#FFE4E6", color: "#DC2626" },
+  sports:     { bg: "#FFE4E6", color: "var(--color-destructive-fg)" },
   // Common extras
-  politics:   { bg: "#FEF3C7", color: "#92400E" },
-  finance:    { bg: "#DCFCE7", color: "#15803D" },
-  economy:    { bg: "#DCFCE7", color: "#15803D" },
+  politics:   { bg: "#FEF3C7", color: "var(--color-warning-fg)" },
+  finance:    { bg: "#DCFCE7", color: "var(--color-success-fg)" },
+  economy:    { bg: "#DCFCE7", color: "var(--color-success-fg)" },
   education:  { bg: "#DBEAFE", color: "#1D4ED8" },
   culture:    { bg: "#EDE9FE", color: "#7C3AED" },
   entertainment: { bg: "#FCE7F3", color: "#BE185D" },
   climate:    { bg: "#CFFAFE", color: "#0E7490" },
-  energy:     { bg: "#FEF9C3", color: "#92400E" },
+  energy:     { bg: "#FEF9C3", color: "var(--color-warning-fg)" },
 };
 
 const FALLBACK_TAG_STYLE = { bg: "#F1F5F9", color: "#475569" };
@@ -168,7 +168,7 @@ function NewsCard({ data, variant }: McpCardProps) {
               <span
                 style={{
                   fontSize: 11,
-                  color: "#94A3B8",
+                  color: "var(--color-text-tertiary)",
                   flexShrink: 0,
                   marginTop: 1,
                   fontWeight: 500,

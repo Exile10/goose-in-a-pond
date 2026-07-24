@@ -75,7 +75,7 @@ use pond_infra::db::Database;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_draft::SqliteDraftRepository;
-use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteEventLogRepository};
+use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteOperationalLog};
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
 use pond_infra::sqlite_memory::SqliteMemoryRepository;
@@ -1651,8 +1651,15 @@ async fn run_server(
     // Weather — used by the MCP weather module, not AppState.
     // The LLM calls giap__get_current_weather when it needs weather data.
     let weather: Option<Arc<dyn WeatherProvider>> = {
+        // Build the provider when weather is on and we have *either* explicit
+        // coordinates *or* a location name. Onboarding only stores a name (the
+        // coordinates default to 0), so requiring coordinates here left every
+        // onboarded install with weather permanently "not configured"; the
+        // adapter geocodes the name on demand.
         if settings.weather_enabled
-            && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+            && (settings.weather_latitude != 0.0
+                || settings.weather_longitude != 0.0
+                || !settings.weather_location_name.trim().is_empty())
         {
             let loc = if settings.weather_location_name.is_empty() {
                 format!(
@@ -1675,7 +1682,7 @@ async fn run_server(
             )))
         } else {
             tracing::info!(
-                "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon)"
+                "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon or location_name)"
             );
             None
         }
@@ -1799,6 +1806,16 @@ async fn run_server(
     // Device actuation backend (#195): the Matter controller when configured
     // and reachable, else the logging stub. The bridge halves (event stream +
     // node cache) are spawned further down where the EventBus exists.
+    // Matter commissioning, available only once a controller is connected.
+    // `None` means "Matter is off", which the API turns into a clear 503 rather
+    // than a confusing failure when someone submits a setup code.
+    type Commissioner =
+        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>;
+    #[cfg(feature = "goose-agent")]
+    let mut matter_commissioner: Commissioner = None;
+    #[cfg(not(feature = "goose-agent"))]
+    let matter_commissioner: Commissioner = None;
+
     #[cfg(feature = "goose-agent")]
     let (device_control, matter_bridge_parts): (
         Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>,
@@ -1809,6 +1826,29 @@ async fn run_server(
             pond_adapters_matter::SharedMatterClient,
         )>,
     ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
+        // Auto-setup: install + start a controller when the URL is loopback and
+        // nothing is serving it yet. A remote URL is someone else's server, and
+        // an already-live port is reused as-is.
+        _matter_server_child =
+            match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
+                Some(port) => {
+                    match pond_adapters_matter::ensure_matter_server(
+                        &data_dir,
+                        port,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+                    {
+                        Ok(child) => child,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Matter controller auto-setup failed");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
         match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
             Ok((client, events)) => {
                 let cache: pond_adapters_matter::NodeCache =
@@ -1822,6 +1862,17 @@ async fn run_server(
                 // keeps working across a matter-server restart (#195).
                 let client_handle = control.client_handle();
                 (control, Some((client, events, cache, client_handle)))
+                // Same connection commissions new devices onto the fabric.
+                matter_commissioner = Some(Arc::new(
+                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
+                ));
+                (
+                    Arc::new(pond_adapters_matter::MatterDeviceControl::new(
+                        client.clone(),
+                        cache.clone(),
+                    )),
+                    Some((client, events, cache)),
+                )
             }
             Err(e) => {
                 tracing::warn!(
@@ -1835,6 +1886,8 @@ async fn run_server(
             }
         }
     } else {
+        // Matter disabled: nothing to install, nothing to start.
+        _matter_server_child = None;
         (
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             None,
@@ -2072,22 +2125,24 @@ async fn run_server(
     > = None;
 
     // Capture logs pool before `db` is moved into AppState
-    let event_log_repo: Option<Arc<dyn pond_core::security::ports::event_log::EventLogRepository>> =
-        Some(Arc::new(SqliteEventLogRepository::new(db.logs.clone())));
+    let operational_log: Option<
+        Arc<dyn pond_core::security::ports::event_log::OperationalLogRepository>,
+    > = Some(Arc::new(SqliteOperationalLog::new(db.logs.clone())));
 
-    // Privacy/security boundary hook — wraps the event log as its audit sink.
-    // Default-allow; routes opt in to calling `allow`/`audit`.
+    // Privacy/security boundary hook — audits into the unified event log (#108)
+    // as `Auth` events, so a policy decision is correlatable with the rest of a
+    // session. Default-allow; nothing calls `audit` yet (see the adapter docs).
     let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
         Some(Arc::new(
             pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
-                SqliteEventLogRepository::new(db.logs.clone()),
+                SqliteEventLog::new(db.logs.clone()),
             )),
         ));
 
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
     // writer keeps flushing log output to disk.
-    let _file_guard = drain_handle.drain_into(event_log_repo.clone());
+    let _file_guard = drain_handle.drain_into(operational_log.clone());
 
     // Durable per-turn telemetry persisted to pond_logs.db. Falls back to the
     // in-memory store if the SQLite-backed adapter cannot be initialised.
@@ -2155,10 +2210,36 @@ async fn run_server(
     > = Arc::new(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
+    // Real FCM relay when a service-account key is present (Path B: direct
+    // FCM v1, data-only wake pings — no Expo hop, no content through Google);
+    // otherwise the logging stub. Key location:
+    // `<data_dir>/secrets/fcm-service-account.json`, override POND_FCM_KEY_PATH.
+    let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| data_dir.join("secrets").join("fcm-service-account.json"));
     let push_relay: Arc<dyn pond_core::mcp::ports::notification_relay::NotificationRelay> =
-        Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
-            push_token_repo.clone(),
-        ));
+        if fcm_key_path.exists() {
+            match pond_infra::fcm_push_relay::FcmPushRelay::from_key_file(
+                &fcm_key_path,
+                push_token_repo.clone(),
+            ) {
+                Ok(relay) => Arc::new(relay),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %fcm_key_path.display(),
+                        "FCM key unusable; background push falls back to the logging stub"
+                    );
+                    Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+                        push_token_repo.clone(),
+                    ))
+                }
+            }
+        } else {
+            Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(
+                push_token_repo.clone(),
+            ))
+        };
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
         Arc::new(
             pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
@@ -2398,6 +2479,7 @@ async fn run_server(
         tts,
         settings_repo,
         profile_repo,
+        commissioner: matter_commissioner,
         device_registry,
         memory_repo,
         embedding_provider,
@@ -2434,7 +2516,7 @@ async fn run_server(
         skill_repo: Some(skill_repo.clone()),
         recipe_repo: Some(recipe_repo.clone()),
         llamafile_manager: Some(llamafile_manager),
-        event_log_repo: event_log_repo,
+        operational_log: operational_log,
         event_bus: Some(event_bus.clone()),
         event_log: Some(event_log.clone()),
         push_token_repo: Some(push_token_repo.clone()),
@@ -2944,8 +3026,12 @@ async fn run_chat(
     }
 
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
+    // Same gate as the primary wiring above: coordinates OR a location name (the
+    // adapter geocodes the name), so an onboarded name-only config still works.
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
+        && (settings.weather_latitude != 0.0
+            || settings.weather_longitude != 0.0
+            || !settings.weather_location_name.trim().is_empty())
     {
         let loc = if settings.weather_location_name.is_empty() {
             format!(
