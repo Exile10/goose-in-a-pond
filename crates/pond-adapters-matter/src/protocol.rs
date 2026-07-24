@@ -25,13 +25,18 @@ pub const CLUSTER_LEVEL_CONTROL: u32 = 8;
 pub const CLUSTER_BASIC_INFORMATION: u32 = 40;
 pub const CLUSTER_BOOLEAN_STATE: u32 = 69;
 pub const CLUSTER_DOOR_LOCK: u32 = 257;
+pub const CLUSTER_WINDOW_COVERING: u32 = 258;
+pub const CLUSTER_FAN_CONTROL: u32 = 514;
 pub const CLUSTER_THERMOSTAT: u32 = 513;
+pub const CLUSTER_COLOR_CONTROL: u32 = 768;
 pub const CLUSTER_TEMPERATURE: u32 = 1026;
 pub const CLUSTER_HUMIDITY: u32 = 1029;
 pub const CLUSTER_OCCUPANCY: u32 = 1030;
 
 /// Thermostat `OccupiedHeatingSetpoint` attribute id.
 pub const ATTR_OCCUPIED_HEATING_SETPOINT: u32 = 18;
+/// FanControl `PercentSetting` attribute id — a 0–100 write, no command.
+pub const ATTR_FAN_PERCENT_SETTING: u32 = 2;
 
 /// A commissioned node as reported by `start_listening` / node events.
 #[derive(Debug, Clone, Deserialize)]
@@ -255,6 +260,25 @@ pub fn celsius_to_setpoint(celsius: f32) -> i16 {
         .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
+/// Map a 0–360° hue onto Matter ColorControl's 0–254 hue scale (360° wraps to
+/// 0, matching the circular hue space).
+pub fn hue_to_matter(degrees: u16) -> u8 {
+    ((u32::from(degrees % 360) * 254 + 180) / 360) as u8
+}
+
+/// Map a 0–100 saturation percentage onto Matter's 0–254 saturation scale.
+pub fn saturation_to_matter(percent: u8) -> u8 {
+    ((u16::from(percent.min(100)) * 254 + 50) / 100) as u8
+}
+
+/// Map a GIAP covering position (0–100 percent **open**) onto Matter
+/// WindowCovering's lift value in hundredths-of-a-percent **closed**
+/// (`GoToLiftPercentage`): 0 = fully open, 10000 = fully closed. GIAP speaks in
+/// "percent open" because that is how users phrase it ("open the blinds 50%").
+pub fn position_open_to_lift_100ths(percent_open: u8) -> u16 {
+    u16::from(100 - percent_open.min(100)) * 100
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +395,25 @@ mod tests {
         assert_eq!(brightness_to_level(200), 254); // clamped
         assert_eq!(celsius_to_setpoint(21.5), 2150);
         assert_eq!(celsius_to_setpoint(-5.25), -525);
+    }
+
+    #[test]
+    fn color_fan_covering_conversions_hit_matter_scales() {
+        // Hue: 0–360° onto 0–254, with 360° wrapping back to 0.
+        assert_eq!(hue_to_matter(0), 0);
+        assert_eq!(hue_to_matter(360), 0);
+        assert_eq!(hue_to_matter(180), 127);
+        assert_eq!(hue_to_matter(720), 0); // wraps
+
+        // Saturation: 0–100% onto 0–254.
+        assert_eq!(saturation_to_matter(0), 0);
+        assert_eq!(saturation_to_matter(100), 254);
+        assert_eq!(saturation_to_matter(200), 254); // clamped
+
+        // Covering: percent-open inverted to Matter's lift (100ths closed).
+        assert_eq!(position_open_to_lift_100ths(100), 0); // fully open
+        assert_eq!(position_open_to_lift_100ths(0), 10000); // fully closed
+        assert_eq!(position_open_to_lift_100ths(50), 5000);
+        assert_eq!(position_open_to_lift_100ths(200), 0); // clamped open
     }
 }

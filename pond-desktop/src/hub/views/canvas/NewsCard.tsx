@@ -19,11 +19,11 @@ const NEWS_ITEMS: NewsItem[] = [
   },
   {
     headline: "Global summit addresses climate resilience funding",
-    tag: "World",    tagColor: "#D97706", tagBg: "#FEF9C3", ago: "4h",
+    tag: "World",    tagColor: "var(--color-warning-fg)", tagBg: "#FEF9C3", ago: "4h",
   },
   {
     headline: "NVIDIA reports record revenue on Jetson platform growth",
-    tag: "Business", tagColor: "#16A34A", tagBg: "#DCFCE7", ago: "6h",
+    tag: "Business", tagColor: "var(--color-success-fg)", tagBg: "#DCFCE7", ago: "6h",
   },
   {
     headline: "New CRISPR technique targets inherited cardiac conditions",
@@ -96,7 +96,7 @@ export function NewsCard(): React.ReactElement {
             <span
               style={{
                 fontSize: 11,
-                color: "#94A3B8",
+                color: "var(--color-text-tertiary)",
                 flexShrink: 0,
                 marginTop: 1,
                 fontWeight: 500,

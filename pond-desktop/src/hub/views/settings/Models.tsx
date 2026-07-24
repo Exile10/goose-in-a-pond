@@ -253,7 +253,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
               <SkeletonRow />
             </>
           ) : llmModels.length === 0 ? (
-            <p style={{ margin: 0, fontSize: 13, color: "#94a3b8", padding: "8px 0" }}>
+            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-tertiary)", padding: "8px 0" }}>
               No language models found. Download one to get started.
             </p>
           ) : (
@@ -269,7 +269,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
               return (
                 <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
                   <span className="mrow__icon">
-                    <HubIco d={SICN.cpu} size={16} color={active ? "#7C3AED" : "#94A3B8"} />
+                    <HubIco d={SICN.cpu} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                   </span>
                   <div className="mrow__text">
                     <span className="mrow__name">{m.display_name ?? m.name}</span>
@@ -315,7 +315,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
               <SkeletonRow />
             </>
           ) : asrModels.length === 0 && ttsModels.length === 0 ? (
-            <p style={{ margin: 0, fontSize: 13, color: "#94a3b8", padding: "8px 0" }}>
+            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-tertiary)", padding: "8px 0" }}>
               No speech models found.
             </p>
           ) : (
@@ -327,7 +327,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                 return (
                   <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
                     <span className="mrow__icon">
-                      <HubIco d={SICN.ear} size={16} color={active ? "#7C3AED" : "#94A3B8"} />
+                      <HubIco d={SICN.ear} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                     </span>
                     <div className="mrow__text">
                       <span className="mrow__name">{m.display_name ?? m.name}</span>
@@ -361,7 +361,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                 return (
                   <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
                     <span className="mrow__icon">
-                      <HubIco d={SICN.speaker} size={16} color={active ? "#7C3AED" : "#94A3B8"} />
+                      <HubIco d={SICN.speaker} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                     </span>
                     <div className="mrow__text">
                       <span className="mrow__name">{m.display_name ?? m.name}</span>

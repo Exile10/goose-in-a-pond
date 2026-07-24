@@ -49,7 +49,7 @@ export function IconRail({ active, go }: IconRailProps) {
                 <HubIco
                   d={HP_PATHS[n.iconKey]}
                   size={22}
-                  color={isActive ? "var(--pp)" : "#94A3B8"}
+                  color={isActive ? "var(--pp)" : "var(--color-text-tertiary)"}
                 />
               </span>
               <span className="irail__label">{n.label}</span>
