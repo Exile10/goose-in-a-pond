@@ -32,3 +32,6 @@ tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
