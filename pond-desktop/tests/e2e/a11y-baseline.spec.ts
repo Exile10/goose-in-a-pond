@@ -11,7 +11,6 @@ import { mockAllApiRoutes } from "./helpers/api-mocks";
 async function scanAndAssert(page: import("@playwright/test").Page, label: string) {
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa"])
-    .disableRules(["color-contrast"])
     .analyze();
   expect(results.violations, `${label}: ${JSON.stringify(results.violations, null, 2)}`).toEqual([]);
 }

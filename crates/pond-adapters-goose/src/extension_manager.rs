@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use goose::agents::extension::Envs;
 use goose::agents::{Agent as GooseAgent, ExtensionConfig};
 use pond_core::mcp::ports::extension_manager::{
-    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
+    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort, ToolInfo,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,6 +37,19 @@ impl GiapGooseExtensionManager {
     }
 }
 
+/// GIAP tool names are fully-qualified as `"ext_name__tool_name"`. Splits a
+/// tool's name into (extension, bare tool name), falling back to the
+/// `"default"` extension bucket for tools with no `__` separator.
+fn split_tool_name(full_name: &str) -> (String, String) {
+    match full_name.find("__") {
+        Some(sep) => (
+            full_name[..sep].to_string(),
+            full_name[sep + 2..].to_string(),
+        ),
+        None => ("default".to_string(), full_name.to_string()),
+    }
+}
+
 #[async_trait]
 impl ExtensionManagerPort for GiapGooseExtensionManager {
     async fn list_extensions(&self) -> Result<Vec<ExtensionInfo>> {
@@ -46,20 +59,8 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
         let mut ext_map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for tool in &tools {
-            let name = tool.name.as_ref();
-            if let Some(sep) = name.find("__") {
-                let ext_name = &name[..sep];
-                let tool_name = &name[sep + 2..];
-                ext_map
-                    .entry(ext_name.to_string())
-                    .or_default()
-                    .push(tool_name.to_string());
-            } else {
-                ext_map
-                    .entry("default".to_string())
-                    .or_default()
-                    .push(name.to_string());
-            }
+            let (ext_name, tool_name) = split_tool_name(tool.name.as_ref());
+            ext_map.entry(ext_name).or_default().push(tool_name);
         }
 
         let disabled = self.disabled.read().await;
@@ -250,6 +251,21 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
     async fn list_tools(&self) -> Result<Vec<String>> {
         let tools = self.agent.list_tools(&self.session_id, None).await;
         Ok(tools.iter().map(|t| t.name.as_ref().to_string()).collect())
+    }
+
+    async fn list_tools_detailed(&self) -> Result<Vec<ToolInfo>> {
+        let tools = self.agent.list_tools(&self.session_id, None).await;
+        Ok(tools
+            .iter()
+            .map(|t| {
+                let (extension, name) = split_tool_name(t.name.as_ref());
+                ToolInfo {
+                    extension,
+                    name,
+                    description: t.description.as_ref().map(|d| d.to_string()),
+                }
+            })
+            .collect())
     }
 
     async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {

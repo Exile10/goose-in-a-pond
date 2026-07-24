@@ -7,7 +7,6 @@
 use crate::user_data::domain::memory::{MemoryEventKind, MemoryFragment};
 use crate::user_data::ports::memory_extractor::MemoryExtractor;
 use crate::user_data::ports::memory_repository::MemoryRepository;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const MIN_MESSAGE_LEN: usize = 15;

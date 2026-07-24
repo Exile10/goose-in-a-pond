@@ -29,7 +29,7 @@ export function CardChrome({ app, children }: CardChromeProps): React.ReactEleme
             if (e.key === "Enter" || e.key === " ") e.preventDefault();
           }}
         >
-          <HubIco d={dotsEl} size={15} color="#C4C4CC" sw={0} fill="currentColor" />
+          <HubIco d={dotsEl} size={15} color="var(--color-text-tertiary,#566178)" sw={0} fill="currentColor" />
         </span>
       </div>
       {children}

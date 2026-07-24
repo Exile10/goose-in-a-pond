@@ -45,6 +45,7 @@ async fn make_app() -> (
         Arc::new(SqliteDeviceRegistry::new(pool.clone()));
     let device_id = device_registry
         .register(RegisterDeviceRequest {
+            id: None,
             name: "Phone".into(),
             device_type: "gotg".into(),
             hostname: None,
@@ -76,6 +77,7 @@ async fn make_app() -> (
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: device_registry.clone(),
+        commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -102,7 +104,7 @@ async fn make_app() -> (
         skill_repo: Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo: Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: Some(push_repo.clone()),
@@ -237,6 +239,23 @@ async fn register_push_token_oversized_token_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Non-printable-ASCII tokens are refused at the boundary: they are never
+/// real push tokens, and downstream the relays truncate the token for logging.
+#[tokio::test]
+async fn register_push_token_non_ascii_token_400() {
+    let (app, repo, device_id, _tmp) = make_app().await;
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/devices/{device_id}/push-token"),
+        true,
+        Some(serde_json::json!({ "token": "日本語のトークンです", "platform": "fcm" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(repo.get(&device_id).await.unwrap().is_none());
 }
 
 #[tokio::test]
