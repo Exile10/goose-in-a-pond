@@ -1825,6 +1825,29 @@ async fn run_server(
             pond_adapters_matter::NodeCache,
         )>,
     ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
+        // Auto-setup: install + start a controller when the URL is loopback and
+        // nothing is serving it yet. A remote URL is someone else's server, and
+        // an already-live port is reused as-is.
+        _matter_server_child =
+            match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
+                Some(port) => {
+                    match pond_adapters_matter::ensure_matter_server(
+                        &data_dir,
+                        port,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+                    {
+                        Ok(child) => child,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Matter controller auto-setup failed");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
         match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
             Ok((client, events)) => {
                 let cache: pond_adapters_matter::NodeCache =
@@ -1854,6 +1877,8 @@ async fn run_server(
             }
         }
     } else {
+        // Matter disabled: nothing to install, nothing to start.
+        _matter_server_child = None;
         (
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             None,
