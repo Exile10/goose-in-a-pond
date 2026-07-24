@@ -565,3 +565,61 @@ describe("searchLlamafileModels()", () => {
     expect(res.models[0].tag).toBe("0.9.1");
   });
 });
+
+describe("re-authentication after a rejected token", () => {
+  const future = new Date(Date.now() + 3_600_000).toISOString();
+
+  function seedStaleSession() {
+    // The client thinks its token is valid (future expiry), but the server
+    // rejects it — exactly the post-restart / rotated-token case. A refresh
+    // token is present so re-auth resolves without a full pairing.
+    localStorage.setItem("giap-session-token", "stale");
+    localStorage.setItem("giap-refresh-token", "r1");
+    localStorage.setItem("giap-token-expires-at", future);
+  }
+
+  afterEach(() => localStorage.clear());
+
+  it("re-pairs once for a burst of concurrent 401s and reuses the token", async () => {
+    seedStaleSession();
+    let refreshCalls = 0;
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/refresh")) {
+        refreshCalls += 1;
+        return okJson({ accepted: true, session_token: "fresh", refresh_token: "r2", expires_at: future });
+      }
+      const auth = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
+      // The stale token is rejected; the refreshed one succeeds.
+      return auth === "Bearer stale"
+        ? errJson(401, "Invalid or expired token")
+        : okJson([{ id: "d1", name: "Lamp", is_online: true }]);
+    });
+
+    const api = client();
+    // Five concurrent calls all carry the stale token and 401 together.
+    await Promise.all([
+      api.listDevices(), api.listDevices(), api.listDevices(),
+      api.listDevices(), api.listDevices(),
+    ]);
+
+    // Coalesced: one refresh for the whole burst, not one per request.
+    expect(refreshCalls).toBe(1);
+  });
+
+  it("surfaces the retry result once re-authenticated", async () => {
+    seedStaleSession();
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/refresh")) {
+        return okJson({ accepted: true, session_token: "fresh", refresh_token: "r2", expires_at: future });
+      }
+      const auth = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
+      return auth === "Bearer stale"
+        ? errJson(401, "Invalid or expired token")
+        : okJson([{ id: "d1", name: "Lamp", is_online: true }]);
+    });
+
+    const devices = await client().listDevices();
+    expect(devices[0].name).toBe("Lamp");
+  });
+});
