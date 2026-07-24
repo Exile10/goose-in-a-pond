@@ -33,6 +33,13 @@ use crate::protocol::{node_to_device, MatterNode, ATTR_NODE_LABEL, CLUSTER_BASIC
 /// a minute on a busy network. Well past the default command timeout.
 const COMMISSION_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Removal is slow too: the controller first tries to unpair from the device,
+/// which for an unreachable node waits out an mDNS/CHIP timeout (~15-30s)
+/// before removing the node from its own storage. The default 15s command
+/// timeout is shorter than that, so GIAP would give up while the server was
+/// still finishing — reporting a failure for a removal that actually happened.
+const DECOMMISSION_TIMEOUT: Duration = Duration::from_secs(90);
+
 pub struct MatterCommissioner {
     client: Arc<MatterClient>,
 }
@@ -99,10 +106,24 @@ impl DeviceCommissioningPort for MatterCommissioner {
     }
 
     async fn decommission(&self, node_id: u64) -> Result<()> {
-        self.client
-            .send_command("remove_node", json!({ "node_id": node_id }))
+        match self
+            .client
+            .send_command_with_timeout(
+                "remove_node",
+                json!({ "node_id": node_id }),
+                DECOMMISSION_TIMEOUT,
+            )
             .await
-            .context("removing the node from the fabric failed")?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            // A node the controller no longer knows is already in the desired
+            // end state, so the delete should proceed rather than be refused —
+            // this is what lets an interrupted earlier removal be cleaned up.
+            Err(e) if e.to_string().to_lowercase().contains("does not exist") => {
+                tracing::info!(node_id, "matter: node already absent from fabric");
+                Ok(())
+            }
+            Err(e) => Err(e).context("removing the node from the fabric failed"),
+        }
     }
 }
