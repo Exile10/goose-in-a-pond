@@ -16,6 +16,7 @@ members = [
     "crates/pond-adapters-vision-onnx",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
+    "crates/pond-mesh-protocol",
     # Independent agent + inference engine (no Goose dependency — future primary path)
     "crates/pond-agent",
     "crates/pond-inference",
@@ -146,8 +147,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 ndarray = "0.16"
 fastembed = { version = "=5.16.0", default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
 
+# ── Private mesh (#132) building blocks — shared by pond-mesh-protocol and,
+# later, the libp2p/lightning/mesh-inference adapter crates.
+blake3       = "1.8"
+ed25519-dalek = "2"
+prost        = "0.14"
+
 # Internal workspace crates
 pond-core              = { path = "crates/pond-core" }
+pond-mesh-protocol      = { path = "crates/pond-mesh-protocol" }
 pond-api               = { path = "crates/pond-api" }
 pond-hf-cache          = { path = "crates/pond-hf-cache" }
 pond-infra             = { path = "crates/pond-infra" }
