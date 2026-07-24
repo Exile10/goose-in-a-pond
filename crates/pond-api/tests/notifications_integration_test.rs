@@ -112,7 +112,7 @@ async fn make_app() -> Harness {
         skill_repo: Some(Arc::new(SqliteSkillRepository::new(pool.clone()))),
         recipe_repo: Some(Arc::new(SqliteRecipeRepository::new(pool.clone()))),
         llamafile_manager: None,
-        event_log_repo: None,
+        operational_log: None,
         event_bus: None,
         event_log: None,
         push_token_repo: None,

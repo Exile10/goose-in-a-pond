@@ -23,7 +23,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
-use pond_core::security::ports::event_log::EventLogRepository;
+use pond_core::security::ports::event_log::OperationalLogRepository;
 
 // ── Internal channel entry ────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ impl LogDrainHandle {
     /// are discarded (file logging still works).
     ///
     /// Returns a [`FileWriterGuard`] that must be held until the process exits.
-    pub fn drain_into(self, repo: Option<Arc<dyn EventLogRepository>>) -> FileWriterGuard {
+    pub fn drain_into(self, repo: Option<Arc<dyn OperationalLogRepository>>) -> FileWriterGuard {
         let LogDrainHandle { rx, file_guard } = self;
         if let Some(repo) = repo {
             let mut rx = rx;
