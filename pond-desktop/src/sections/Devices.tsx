@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Button, Separator } from "@heroui/react";
 import {
-  Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio,
+  Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
@@ -19,6 +19,7 @@ const DEVICE_TYPES = [
 
 function DeviceIcon({ kind }: { kind: string | undefined }) {
   if (kind === "host")   return <Cpu size={22} />;
+  if (kind === "gotg")   return <Smartphone size={22} />; // the mobile companion
   if (kind === "sensor") return <Activity size={22} />;
   // Matter device types (inferred from clusters by the backend), so a
   // commissioned bulb / lock / thermostat / fan / blind reads as what it is.
@@ -93,7 +94,7 @@ export function Devices() {
     setSubmitting(true);
     setFormError(null);
     try {
-      await api.commissionDevice(setupCode.trim());
+      await api.commissionDevice(setupCode.trim(), name.trim() || undefined);
       closeForm();
       load();
     } catch (e) {
@@ -279,21 +280,37 @@ export function Devices() {
               </div>
 
               {mode === "matter" ? (
-                <div className="sched-modal__field">
-                  <label className="sched-modal__label">Setup code</label>
-                  <input
-                    className="sched-modal__input"
-                    placeholder="20202021 or MT:-24J0AFN00KA0648G00"
-                    value={setupCode}
-                    onChange={(e) => setSetupCode(e.target.value)}
-                    autoFocus
-                  />
-                  <p className="sched-modal__cron-hint">
-                    The 11-digit pairing code or QR payload on the device, or its
-                    8-digit passcode. GIAP commissions it onto your fabric and it
-                    appears here with its own name — no need to describe it.
-                  </p>
-                </div>
+                <>
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Setup code</label>
+                    <input
+                      className="sched-modal__input"
+                      placeholder="20202021 or MT:-24J0AFN00KA0648G00"
+                      value={setupCode}
+                      onChange={(e) => setSetupCode(e.target.value)}
+                      autoFocus
+                    />
+                    <p className="sched-modal__cron-hint">
+                      The 11-digit pairing code or QR payload on the device, or
+                      its 8-digit passcode. GIAP commissions it onto your fabric.
+                    </p>
+                  </div>
+
+                  <div className="sched-modal__field">
+                    <label className="sched-modal__label">Name <span className="sched-modal__cron-hint">(optional)</span></label>
+                    <input
+                      className="sched-modal__input"
+                      placeholder="Living Room Light"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                    <p className="sched-modal__cron-hint">
+                      Written to the device so GIAP and other apps use it — say
+                      "turn on the living room light". Left blank, the device's
+                      own name is used.
+                    </p>
+                  </div>
+                </>
               ) : (
                 <>
                   <div className="sched-modal__field">

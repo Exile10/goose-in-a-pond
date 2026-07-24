@@ -19,7 +19,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::bridge::{run_matter_bridge, run_matter_supervisor};
 use crate::client::MatterClient;
+use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, NodeCache, SharedMatterClient};
+use pond_core::user_data::ports::device_commissioning::{DeviceCommissioningPort, SetupCode};
 
 // ── Mock matter-server ───────────────────────────────────────────────────────
 
@@ -426,4 +428,150 @@ async fn supervisor_reconnects_after_the_connection_drops() {
     );
     // The fabric was resynced on reconnect.
     assert!(registry.get_device("matter-2").await.unwrap().is_some());
+}
+
+/// A mock that answers commissioning commands with a node and records every
+/// frame, so a commission/decommission can be asserted end to end.
+async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let received: ReceivedCommands = Arc::new(Mutex::new(Vec::new()));
+    let received_srv = received.clone();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            json!({"fabric_id": 1, "schema_version": 11})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            let mid = frame["message_id"].as_str().unwrap().to_string();
+            received_srv.lock().unwrap().push(frame.clone());
+            // Commissioning returns the freshly joined node; everything else
+            // (write_attribute, remove_node) succeeds with null.
+            let result = match frame["command"].as_str().unwrap() {
+                "commission_with_code" | "commission_on_network" => node.clone(),
+                _ => Value::Null,
+            };
+            ws.send(Message::Text(
+                json!({"message_id": mid, "result": result})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        }
+    });
+
+    (url, received)
+}
+
+/// A named commission writes the name to the device's NodeLabel and returns it
+/// as the device name — so chat resolution and other controllers both see it.
+#[tokio::test]
+async fn commission_with_name_writes_nodelabel() {
+    let (url, received) = mock_commissioning_server(light_node_json()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+
+    let dev = commissioner
+        .commission(SetupCode::Passcode(20202021), Some("Living Room".into()))
+        .await
+        .unwrap();
+
+    // The user's name wins over the cluster-derived one, and the full identity
+    // is returned so the endpoint can register without waiting for the bridge.
+    assert_eq!(dev.name, "Living Room");
+    assert_eq!(dev.device_id, "matter-2");
+    assert_eq!(dev.device_type, "light");
+    assert_eq!(dev.capabilities, vec!["power", "brightness"]);
+
+    // NodeLabel (0/40/5) was written on the device with that name.
+    let frames = received.lock().unwrap().clone();
+    let write = frames
+        .iter()
+        .find(|f| f["command"] == "write_attribute")
+        .expect("a NodeLabel write");
+    assert_eq!(write["args"]["node_id"], 2);
+    assert_eq!(write["args"]["attribute_path"], "0/40/5");
+    assert_eq!(write["args"]["value"], "Living Room");
+}
+
+/// An un-named commission touches no NodeLabel and keeps the device's own name.
+#[tokio::test]
+async fn commission_without_name_leaves_nodelabel_alone() {
+    let (url, received) = mock_commissioning_server(light_node_json()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+
+    let dev = commissioner
+        .commission(SetupCode::Passcode(20202021), None)
+        .await
+        .unwrap();
+
+    assert_eq!(dev.name, "Living Room Light"); // from the node's own label
+    let frames = received.lock().unwrap().clone();
+    assert!(
+        !frames.iter().any(|f| f["command"] == "write_attribute"),
+        "no NodeLabel write when no name is given"
+    );
+}
+
+/// Decommissioning removes the node from the fabric, so a deleted device does
+/// not re-announce itself on the next start_listening.
+#[tokio::test]
+async fn decommission_sends_remove_node() {
+    let (url, received) = mock_commissioning_server(light_node_json()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+
+    commissioner.decommission(2).await.unwrap();
+
+    let frames = received.lock().unwrap().clone();
+    let remove = frames
+        .iter()
+        .find(|f| f["command"] == "remove_node")
+        .expect("a remove_node frame");
+    assert_eq!(remove["args"]["node_id"], 2);
+}
+
+/// Regression: `send_command_with_timeout` must honour its argument, not the
+/// 15s default. Commissioning relies on the longer window; a silent bug here
+/// would cut real pairings short.
+#[tokio::test]
+async fn send_command_honours_its_timeout_argument() {
+    // A server that greets, then never answers a command.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            json!({"fabric_id": 1, "schema_version": 11})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(_)) = ws.next().await {} // read, never reply
+    });
+
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let start = std::time::Instant::now();
+    let res = client
+        .send_command_with_timeout("noop", json!({}), Duration::from_millis(200))
+        .await;
+
+    assert!(res.is_err(), "a never-answered command must error");
+    // If the argument were ignored it would block on the 15s default.
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "timed out on the 200ms argument, not COMMAND_TIMEOUT"
+    );
 }
