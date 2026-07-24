@@ -17,7 +17,6 @@ import { Models } from "../sections/Models";
 import { Prompts } from "../sections/Prompts";
 import { Settings } from "../sections/Settings";
 import { Faces } from "../sections/Faces";
-import { Agent } from "../sections/Agent";
 import { Canvas } from "../sections/Canvas";
 import { Logs } from "../sections/Logs";
 import { Extensions } from "../sections/Extensions";
@@ -38,7 +37,6 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "prompts":   return <Prompts />;
     case "settings":  return <Settings />;
     case "faces":     return <Faces />;
-    case "agent":     return <Agent />;
     case "canvas":    return <Canvas />;
     case "logs":      return <Logs />;
     case "hub":       return null; // rendered by GuiMode before this switch
