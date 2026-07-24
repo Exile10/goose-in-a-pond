@@ -161,7 +161,7 @@ function EditableRow({ label, value, onSave, placeholder, testId }: EditableRowP
     <Row
       label={label}
       sub={value || placeholder}
-      control={<HubIco d={CHEVR_PATH} size={16} color="#C4C4CC" />}
+      control={<HubIco d={CHEVR_PATH} size={16} color="var(--color-text-tertiary,#566178)" />}
       onClick={startEdit}
     />
   );
@@ -346,7 +346,7 @@ export function AccountDetail({ go }: AccountDetailProps) {
         />
         <Row
           label="Help &amp; feedback"
-          control={<HubIco d={CHEVR_PATH} size={16} color="#C4C4CC" />}
+          control={<HubIco d={CHEVR_PATH} size={16} color="var(--color-text-tertiary,#566178)" />}
           onClick={() => {
             /* TODO: open help/feedback modal */
           }}

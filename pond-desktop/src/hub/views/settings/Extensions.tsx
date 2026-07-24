@@ -91,7 +91,7 @@ function McpRow({ ext, toggling, onToggle }: McpRowProps) {
           style={{ transform: open ? "rotate(180deg)" : "none" }}
           disabled={ext.tools.length === 0}
         >
-          <HubIco d={CHEVD_PATH} size={16} color="#94A3B8" />
+          <HubIco d={CHEVD_PATH} size={16} color="var(--color-text-tertiary)" />
         </button>
         {/* Controlled toggle — reads ext.enabled directly */}
         <button
@@ -193,14 +193,14 @@ function MarketplaceModal({ installedNames, onClose, onInstalled }: MarketplaceM
             aria-label="Close marketplace"
             style={{ transform: "none" }}
           >
-            <X size={16} color="#94A3B8" />
+            <X size={16} color="var(--color-text-tertiary)" />
           </button>
         </div>
 
         {/* Body */}
         <div className="ext2-mkt-body">
           {loading && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "16px 0", color: "#94a3b8", fontSize: 13 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "16px 0", color: "var(--color-text-tertiary)", fontSize: 13 }}>
               <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
               Loading marketplace…
             </div>
@@ -212,7 +212,7 @@ function MarketplaceModal({ installedNames, onClose, onInstalled }: MarketplaceM
             </div>
           )}
           {!loading && !error && sorted.length === 0 && (
-            <p style={{ margin: 0, fontSize: 13, color: "#94a3b8", padding: "12px 0" }}>
+            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-tertiary)", padding: "12px 0" }}>
               No extensions available in the marketplace right now.
             </p>
           )}
@@ -258,7 +258,7 @@ function MarketplaceModal({ installedNames, onClose, onInstalled }: MarketplaceM
                     </button>
                   )}
                 </div>
-                <div style={{ fontSize: 11, color: "#94a3b8", paddingTop: 2, paddingLeft: 36 }}>
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", paddingTop: 2, paddingLeft: 36 }}>
                   by {m.author} · {m.category}
                   {m.required_secrets.length > 0 && " · requires credentials"}
                 </div>
@@ -346,7 +346,7 @@ function AddServerModal({ onClose, onAdded }: AddServerModalProps) {
             aria-label="Close"
             style={{ transform: "none" }}
           >
-            <X size={16} color="#94A3B8" />
+            <X size={16} color="var(--color-text-tertiary)" />
           </button>
         </div>
 
@@ -402,7 +402,7 @@ function AddServerModal({ onClose, onAdded }: AddServerModalProps) {
               </div>
               <div className="ext2-form-row">
                 <label className="ext2-form-label" htmlFor="add-ext-args">
-                  Args <span style={{ color: "#94a3b8", fontWeight: 400 }}>(comma-separated)</span>
+                  Args <span style={{ color: "var(--color-text-tertiary)", fontWeight: 400 }}>(comma-separated)</span>
                 </label>
                 <input
                   id="add-ext-args"
@@ -643,7 +643,7 @@ export function ExtensionsDetail({ go }: ExtensionsDetailProps) {
                 <SkeletonExtRow />
               </>
             ) : extensions.length === 0 ? (
-              <div style={{ padding: "12px 0", fontSize: 13, color: "#94a3b8", textAlign: "center" }}>
+              <div style={{ padding: "12px 0", fontSize: 13, color: "var(--color-text-tertiary)", textAlign: "center" }}>
                 No extensions registered. Browse the marketplace or add a server.
               </div>
             ) : (
