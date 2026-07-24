@@ -171,12 +171,12 @@ impl McpToolDispatcher {
         let schedule_server = scheduler.map(|s| ScheduleMcpServer::new(s, settings_repo.clone()));
         let system_server = SystemMcpServer::new();
         let device_server = DeviceMcpServer::new(
-            device_registry,
+            device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
             recipe_repo,
         );
-        let device_control_server = DeviceControlMcpServer::new(device_control);
+        let device_control_server = DeviceControlMcpServer::new(device_control, device_registry);
         let news_server = NewsMcpServer::new(http_client.clone(), settings_repo.clone());
         let finance_server = FinanceMcpServer::new(http_client.clone(), settings_repo.clone());
         let discovery_server = DiscoveryMcpServer::new(http_client, settings_repo);

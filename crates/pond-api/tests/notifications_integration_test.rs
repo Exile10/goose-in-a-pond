@@ -48,6 +48,7 @@ async fn make_app() -> Harness {
         Arc::new(SqliteDeviceRegistry::new(pool.clone()));
     let device_id = device_registry
         .register(RegisterDeviceRequest {
+            id: None,
             name: "Phone".into(),
             device_type: "gotg".into(),
             hostname: None,

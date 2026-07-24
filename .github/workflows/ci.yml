@@ -82,6 +82,7 @@ jobs:
             -p pond-adapters-llamafile \
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
+            -p pond-adapters-matter \
             -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
@@ -100,6 +101,7 @@ jobs:
             -p pond-adapters-llamafile \
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
+            -p pond-adapters-matter \
             -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
