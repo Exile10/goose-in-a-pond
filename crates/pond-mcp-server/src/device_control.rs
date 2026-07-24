@@ -43,6 +43,18 @@ pub struct SetDeviceStateParams {
     /// Lock (true) or unlock (false).
     #[serde(default)]
     pub locked: Option<bool>,
+    /// Colour hue in degrees (0–360). Pair with `saturation`.
+    #[serde(default)]
+    pub hue: Option<u16>,
+    /// Colour saturation as a 0–100 percentage. Pair with `hue`.
+    #[serde(default)]
+    pub saturation: Option<u8>,
+    /// Fan speed as a 0–100 percentage.
+    #[serde(default)]
+    pub fan_speed: Option<u8>,
+    /// Covering position as a 0–100 percentage OPEN (100 = fully open).
+    #[serde(default)]
+    pub position: Option<u8>,
     /// Absorbs any unexpected fields a small model might emit.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -75,7 +87,7 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "Control a smart device: turn power on/off, set brightness (0-100), set thermostat target temperature, or lock/unlock. Use when the user asks to change a device's state. device_id accepts the registered id, the device's name, or a natural reference like \"the light\" when it is unambiguous."
+        description = "Control a smart device: turn power on/off, set brightness (0-100), set thermostat target temperature (°C), lock/unlock, set colour (hue 0-360 + saturation 0-100), set fan speed (0-100), or set a covering/blind position (0-100 percent open). Use when the user asks to change a device's state. device_id accepts the registered id, the device's name, or a natural reference like \"the light\" when it is unambiguous."
     )]
     async fn set_device_state(
         &self,
@@ -95,10 +107,15 @@ impl DeviceControlMcpServer {
             && p.brightness.is_none()
             && p.target_temp.is_none()
             && p.locked.is_none()
+            && p.hue.is_none()
+            && p.saturation.is_none()
+            && p.fan_speed.is_none()
+            && p.position.is_none()
         {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
-                 brightness (0-100), target_temp (°C), locked (true/false)."
+                 brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
+                 saturation (0-100), fan_speed (0-100), or position (0-100 percent open)."
             ))]));
         }
 
@@ -171,6 +188,42 @@ impl DeviceControlMcpServer {
             match self.control.set_locked(device_id, locked).await {
                 Ok(_) => applied.push(format!("locked={locked}")),
                 Err(e) => return Ok(guidance(format!("Couldn't (un)lock '{device_id}': {e}"))),
+            }
+        }
+        // Colour: hue and saturation are one action. If only one is given, keep
+        // the other at a sensible default (full saturation for a bare hue).
+        if p.hue.is_some() || p.saturation.is_some() {
+            let hue = p.hue.unwrap_or(0) % 360;
+            let sat = p.saturation.unwrap_or(100).min(100);
+            match self.control.set_color(device_id, hue, sat).await {
+                Ok(_) => applied.push(format!("colour=hue {hue}°/sat {sat}%")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set colour on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(speed) = p.fan_speed {
+            let pct = speed.min(100);
+            match self.control.set_fan_speed(device_id, pct).await {
+                Ok(_) => applied.push(format!("fan_speed={pct}%")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set fan speed on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(open) = p.position {
+            let pct = open.min(100);
+            match self.control.set_position(device_id, pct).await {
+                Ok(_) => applied.push(format!("position={pct}% open")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set position on '{device_id}': {e}"
+                    )))
+                }
             }
         }
 
