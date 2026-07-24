@@ -1201,6 +1201,9 @@ fn chat_stream_inner(
                 state.memory_repo.clone(),
             );
         }
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
+        }
 
         // ── Persist user message ────────────────────────────────────────────
         if let Err(e) = chat_service.persist_user_message(&req.message).await {
@@ -6568,11 +6571,14 @@ async fn agent_chat_stream(
     let stream = async_stream::stream! {
         let _permit = permit;
 
-        let chat_service = pond_core::shared::services::chat::ChatService::new(
+        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             agent.clone(),
             session_id.clone(),
             storage.clone(),
         );
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
+        }
 
         if storage.get_session(&session_id).await.is_err() {
             if let Err(e) = storage.create_session(session_id.clone()).await {
