@@ -39,10 +39,9 @@ mod control;
 mod protocol;
 mod server_setup;
 
-pub use bridge::run_matter_bridge;
+pub use bridge::{run_matter_bridge, run_matter_supervisor};
 pub use client::{MatterClient, MatterEvent};
-pub use commissioning::MatterCommissioner;
-pub use control::{MatterDeviceControl, NodeCache};
+pub use control::{MatterDeviceControl, NodeCache, SharedMatterClient};
 pub use protocol::{device_id_for_node, node_id_from_device_id, node_to_device, MatterNode};
 pub use server_setup::{ensure_running as ensure_matter_server, local_port_from_ws_url};
 

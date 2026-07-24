@@ -1823,6 +1823,7 @@ async fn run_server(
             Arc<pond_adapters_matter::MatterClient>,
             tokio::sync::mpsc::Receiver<pond_adapters_matter::MatterEvent>,
             pond_adapters_matter::NodeCache,
+            pond_adapters_matter::SharedMatterClient,
         )>,
     ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
         // Auto-setup: install + start a controller when the URL is loopback and
@@ -1853,6 +1854,14 @@ async fn run_server(
                 let cache: pond_adapters_matter::NodeCache =
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
+                let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
+                    client.clone(),
+                    cache.clone(),
+                ));
+                // The supervisor swaps this handle on reconnect so the control
+                // keeps working across a matter-server restart (#195).
+                let client_handle = control.client_handle();
+                (control, Some((client, events, cache, client_handle)))
                 // Same connection commissions new devices onto the fabric.
                 matter_commissioner = Some(Arc::new(
                     pond_adapters_matter::MatterCommissioner::new(client.clone()),
@@ -2312,26 +2321,24 @@ async fn run_server(
     // registry and turns sensor attribute updates into BusEvent::Sensor, so
     // #92 rules and the activity feed react to Matter sensors natively.
     #[cfg(feature = "goose-agent")]
-    if let Some((matter_client, matter_events, matter_cache)) = matter_bridge_parts {
+    if let Some((matter_client, matter_events, matter_cache, matter_client_handle)) =
+        matter_bridge_parts
+    {
         let registry = device_registry.clone();
         let bus = event_bus.clone();
-        tokio::spawn(async move {
-            match pond_adapters_matter::run_matter_bridge(
-                matter_client,
-                matter_events,
-                matter_cache,
-                registry,
-                bus,
-            )
-            .await
-            {
-                Ok(()) => tracing::warn!(
-                    "Matter bridge stopped (controller connection closed); \
-                     restart pond-server to reconnect"
-                ),
-                Err(e) => tracing::warn!(error = %e, "Matter bridge failed"),
-            }
-        });
+        let matter_url = settings.matter_ws_url.trim().to_string();
+        // Supervised: on connection loss it reconnects with backoff and swaps
+        // the fresh client into the control's handle (#195), so a matter-server
+        // restart no longer needs a pond-server restart. Never returns.
+        tokio::spawn(pond_adapters_matter::run_matter_supervisor(
+            matter_url,
+            matter_client_handle,
+            matter_client,
+            matter_events,
+            matter_cache,
+            registry,
+            bus,
+        ));
     }
 
     // Vision pipeline (#130): camera frames → on-device motion detection →
