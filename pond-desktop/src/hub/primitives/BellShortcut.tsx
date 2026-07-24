@@ -14,7 +14,7 @@ export function BellShortcut({ count, active = false, onClick }: BellShortcutPro
       onClick={onClick}
       aria-label={count > 0 ? `Notifications — ${count} unread` : "Notifications"}
     >
-      <Bell size={20} color={active ? "var(--pp)" : "#94A3B8"} strokeWidth={2} />
+      <Bell size={20} color={active ? "var(--pp)" : "var(--color-text-tertiary)"} strokeWidth={2} />
       {count > 0 && (
         <span className="bell-shortcut__count" aria-hidden="true">
           {count > 99 ? "99+" : count}

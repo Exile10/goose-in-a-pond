@@ -50,7 +50,7 @@ function CloudIcon({ size = 32 }: { size?: number }) {
       <path
         d="M6.5 19a4.5 4.5 0 0 1-.42-8.98A7 7 0 0 1 19.5 12a4.5 4.5 0 0 1-1 8.98H6.5Z"
         fill="#CBD5E1"
-        stroke="#94A3B8"
+        stroke="var(--color-text-tertiary)"
         strokeWidth="1.5"
         strokeLinejoin="round"
       />
@@ -70,7 +70,7 @@ function RainIcon({ size = 32 }: { size?: number }) {
       <path
         d="M6.5 16a4.5 4.5 0 0 1-.42-8.98A7 7 0 0 1 19.5 9a4.5 4.5 0 0 1-1 8.98H6.5Z"
         fill="#CBD5E1"
-        stroke="#94A3B8"
+        stroke="var(--color-text-tertiary)"
         strokeWidth="1.5"
         strokeLinejoin="round"
       />
@@ -94,7 +94,7 @@ function SnowIcon({ size = 32 }: { size?: number }) {
       <path
         d="M6.5 16a4.5 4.5 0 0 1-.42-8.98A7 7 0 0 1 19.5 9a4.5 4.5 0 0 1-1 8.98H6.5Z"
         fill="#CBD5E1"
-        stroke="#94A3B8"
+        stroke="var(--color-text-tertiary)"
         strokeWidth="1.5"
         strokeLinejoin="round"
       />
@@ -116,7 +116,7 @@ function StormIcon({ size = 32 }: { size?: number }) {
     >
       <path
         d="M6.5 16a4.5 4.5 0 0 1-.42-8.98A7 7 0 0 1 19.5 9a4.5 4.5 0 0 1-1 8.98H6.5Z"
-        fill="#94A3B8"
+        fill="var(--color-text-tertiary)"
         stroke="#64748B"
         strokeWidth="1.5"
         strokeLinejoin="round"
@@ -243,14 +243,14 @@ const styles = {
   condition: {
     fontSize: 15,
     fontWeight: 700,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     marginTop: 4,
     lineHeight: 1.2,
   },
   conditionCompact: {
     fontSize: 13,
     fontWeight: 700,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     marginTop: 2,
     lineHeight: 1.2,
   },
@@ -314,7 +314,7 @@ const styles = {
   },
   loTemp: {
     fontSize: 11,
-    color: "#94A3B8",
+    color: "var(--color-text-tertiary)",
     fontWeight: 500,
     lineHeight: 1,
   },
@@ -330,7 +330,7 @@ const styles = {
   },
   loadingText: {
     fontSize: 13,
-    color: "#0369A1",
+    color: "var(--color-info-fg)",
     fontWeight: 500,
   },
 } as const;
@@ -371,7 +371,7 @@ function WeatherCard({ data, variant }: McpCardProps) {
       <div style={styles.loading}>
         <Loader
           size={22}
-          style={{ animation: "weather-spin 1.5s linear infinite", color: "#0369A1" }}
+          style={{ animation: "weather-spin 1.5s linear infinite", color: "var(--color-info-fg)" }}
         />
         <span style={styles.loadingText}>Fetching weather...</span>
         <style>{spinKeyframes}</style>

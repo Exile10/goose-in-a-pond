@@ -220,7 +220,7 @@ export function LogsDetail({ go }: LogsDetailProps) {
                 padding: "24px 0",
                 textAlign: "center",
                 fontSize: 13,
-                color: "#94a3b8",
+                color: "var(--color-text-tertiary)",
               }}
               role="status"
             >

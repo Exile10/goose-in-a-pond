@@ -30,7 +30,7 @@ function WeatherIcon({ cond, size = 20 }: WeatherIconProps): React.ReactElement 
         <path
           d="M17.5 19H9a7 7 0 1 1 6.71-9h.79a4.5 4.5 0 1 1 1 9z"
           fill="#CBD5E1"
-          stroke="#94A3B8"
+          stroke="var(--color-text-tertiary)"
           strokeWidth="1"
         />
       </svg>
@@ -105,7 +105,7 @@ export function WeatherCard(): React.ReactElement {
             64
             <span style={{ fontSize: 26, fontWeight: 600, letterSpacing: 0 }}>°F</span>
           </div>
-          <div style={{ fontSize: 15, fontWeight: 700, color: "#0369A1", marginTop: 4 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "var(--color-info-fg)", marginTop: 4 }}>
             Clear
           </div>
           <div style={{ fontSize: 12, color: "#0EA5E9", marginTop: 2, fontWeight: 500 }}>
@@ -186,7 +186,7 @@ export function WeatherCard(): React.ReactElement {
             </span>
             <WeatherIcon cond={d.cond} size={18} />
             <span style={{ fontSize: 13, fontWeight: 800, color: "#1E293B" }}>{d.hi}°</span>
-            <span style={{ fontSize: 11, color: "#94A3B8", fontWeight: 500 }}>{d.lo}°</span>
+            <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", fontWeight: 500 }}>{d.lo}°</span>
           </div>
         ))}
       </div>

@@ -105,7 +105,7 @@ function SettingsRow({
       </span>
       {badge && <span className="set-row__badge">{badge}</span>}
       {value && <span className="set-row__value">{value}</span>}
-      <HubIco d={CHEVR} size={17} color="#C4C4CC" />
+      <HubIco d={CHEVR} size={17} color="var(--color-text-tertiary,#566178)" />
     </div>
   );
 }
