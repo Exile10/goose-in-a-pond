@@ -523,6 +523,47 @@ async fn commission_without_name_leaves_nodelabel_alone() {
     );
 }
 
+/// A node the controller no longer knows is already in the desired end state,
+/// so decommission treats "does not exist" as success — letting a delete that
+/// an earlier interrupted removal left half-done finish cleanly.
+#[tokio::test]
+async fn decommission_treats_already_gone_as_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            json!({"fabric_id": 1, "schema_version": 11})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            let mid = frame["message_id"].as_str().unwrap();
+            // Answer remove_node with the controller's real not-found error.
+            ws.send(Message::Text(
+                json!({
+                    "message_id": mid,
+                    "error_code": 1,
+                    "details": "Node 2 does not exist or has not been interviewed."
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        }
+    });
+
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+    // Not an error: the node is already off the fabric.
+    commissioner.decommission(2).await.unwrap();
+}
+
 /// Decommissioning removes the node from the fabric, so a deleted device does
 /// not re-announce itself on the next start_listening.
 #[tokio::test]
