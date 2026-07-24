@@ -12,7 +12,7 @@ mod tray;
 mod tts_text;
 
 use audio::{AudioState, WakeListenerState};
-use commands::{audio_cmd, desktop_cmd, server_cmd, window_cmd};
+use commands::{audio_cmd, desktop_cmd, server_cmd};
 use process::ServerProcess;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -62,7 +62,7 @@ fn build_macos_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<t
     let toggle_canvas = MenuItem::with_id(
         app,
         "toggle-canvas",
-        "Toggle Canvas Overlay",
+        "Show Canvas",
         true,
         Some("CmdOrCtrl+Shift+G"),
     )?;
@@ -119,11 +119,6 @@ fn main() {
             server_cmd::set_server_url,
             server_cmd::server_health,
             server_cmd::ensure_server_running,
-            window_cmd::show_canvas,
-            window_cmd::hide_canvas,
-            window_cmd::toggle_canvas,
-            window_cmd::canvas_visible,
-            window_cmd::position_canvas,
             audio_cmd::start_recording,
             audio_cmd::stop_recording,
             audio_cmd::abort_recording,
@@ -335,7 +330,7 @@ fn main() {
         })
         // Handle macOS View menu items — emit events dispatched by AppContext
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "toggle-canvas" => { let _ = app.emit("canvas-toggle", ()); }
+            "toggle-canvas" => { let _ = app.emit(hotkey::CANVAS_TOGGLE_EVENT, ()); }
             "voice-mode"    => { let _ = app.emit("switch-to-voice", ()); }
             _ => {}
         })
