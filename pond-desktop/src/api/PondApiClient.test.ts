@@ -273,8 +273,10 @@ describe("chatStream()", () => {
     expect(events.find((e) => e.type === "done")).toBeDefined();
   });
 
-  it("throws ApiError when chat endpoint returns non-2xx", async () => {
-    fetchMock.mockResolvedValueOnce(errJson(401, "unauthorized"));
+  it("throws ApiError when chat endpoint returns a non-auth error", async () => {
+    // A 500 is a genuine failure and still throws; a 401 is handled separately
+    // (re-authenticate and retry) — see the re-authentication suite.
+    fetchMock.mockResolvedValueOnce(errJson(500, "internal error"));
     const gen = client().chatStream("hi");
     await expect(gen.next()).rejects.toBeInstanceOf(ApiError);
   });
@@ -604,6 +606,31 @@ describe("re-authentication after a rejected token", () => {
     ]);
 
     // Coalesced: one refresh for the whole burst, not one per request.
+    expect(refreshCalls).toBe(1);
+  });
+
+  it("re-authenticates the chat stream on a 401 instead of erroring", async () => {
+    seedStaleSession();
+    let refreshCalls = 0;
+    const emptySse = () =>
+      new Response(new ReadableStream({ start: (c) => c.close() }), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/refresh")) {
+        refreshCalls += 1;
+        return okJson({ accepted: true, session_token: "fresh", refresh_token: "r2", expires_at: future });
+      }
+      const auth = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
+      // The chat stream is rejected on the stale token, accepted on the fresh one.
+      return auth === "Bearer stale" ? errJson(401, "Invalid or expired token") : emptySse();
+    });
+
+    // Consuming the stream must not throw — it recovers and completes.
+    const api = client();
+    for await (const _ of api.chatStream("hi", undefined, "stale")) { /* drain */ }
     expect(refreshCalls).toBe(1);
   });
 
