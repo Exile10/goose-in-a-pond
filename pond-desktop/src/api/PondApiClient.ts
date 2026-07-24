@@ -896,6 +896,31 @@ export class PondApiClient {
       }
     }
 
+    // A rejected token (the server rotated it, or an app-held token went stale)
+    // must not surface as a chat error. Re-authenticate once — coalesced with
+    // any concurrent 401s — and reconnect with the fresh token. Unlike request(),
+    // this SSE path used to just throw, which is why a chat send could fail with
+    // "Invalid or expired token" while background calls quietly re-paired. This
+    // also stops an SSE reconnect from re-pairing every cycle.
+    if (res.status === 401) {
+      const fresh = await this.reauthenticate();
+      if (fresh) {
+        headers["Authorization"] = `Bearer ${fresh}`;
+        const retryController = new AbortController();
+        const retryTimeout = setTimeout(() => retryController.abort(), 120_000);
+        try {
+          res = await fetch(`${this.base}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: retryController.signal,
+          });
+        } finally {
+          clearTimeout(retryTimeout);
+        }
+      }
+    }
+
     if (!res.ok) {
       let msg = res.statusText;
       try { msg = (await res.json()).error ?? msg; } catch { /* ignore */ }
