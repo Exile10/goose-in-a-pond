@@ -103,6 +103,9 @@ lru = "0.16"
 once_cell = "1.20"
 rand = "0.8"
 regex = "1.12"
+# Test-only: generates a throwaway RSA key so the FCM relay's signing path can
+# be exercised without committing a PEM (gitleaks scans full history).
+rsa = { version = "0.9", features = ["pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "form", "json","rustls"] }
 schemars = { default-features = false, version = "1.0" }
 serde = { version = "1.0", features = ["derive"] }
