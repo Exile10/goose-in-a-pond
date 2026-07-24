@@ -6237,24 +6237,29 @@ const TOOL_UI_RESOURCES: &[(&str, &str)] = &[(
 
 /// `GET /api/v1/agent/tools` — list all MCP tools currently loaded by the agent.
 ///
-/// Returns a flat array of tool objects. Each entry includes at minimum
-/// `{ "name": "..." }`. Tools with associated MCP App resources also
-/// include `{ "_meta": { "ui": { "resourceUri": "ui://..." } } }`.
+/// Returns a flat array of tool objects: `{ "extension": "...", "name": "...",
+/// "description": "..." | null }`. Tools with associated MCP App resources
+/// also include `{ "_meta": { "ui": { "resourceUri": "ui://..." } } }`.
 /// Returns an empty array when no extension manager is active (no-crash fallback).
 async fn list_agent_tools(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(manager) = &state.extension_manager else {
         return Json(json!([])).into_response();
     };
-    match manager.list_tools().await {
+    match manager.list_tools_detailed().await {
         Ok(tools) => {
             let enriched: Vec<Value> = tools
                 .iter()
-                .map(|tool_name| {
-                    let mut obj = json!({ "name": tool_name });
+                .map(|tool| {
+                    let full_name = format!("{}__{}", tool.extension, tool.name);
+                    let mut obj = json!({
+                        "extension": tool.extension,
+                        "name": tool.name,
+                        "description": tool.description,
+                    });
                     // Inject _meta.ui for tools that have an associated MCP App
                     for &(prefix, uri) in TOOL_UI_RESOURCES {
-                        if tool_name == prefix || tool_name.ends_with(prefix) {
+                        if full_name == prefix || full_name.ends_with(prefix) {
                             obj["_meta"] = json!({
                                 "ui": { "resourceUri": uri }
                             });

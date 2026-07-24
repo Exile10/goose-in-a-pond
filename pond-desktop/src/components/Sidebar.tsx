@@ -16,7 +16,6 @@ import {
   PenLine,
   Puzzle,
   Settings,
-  Bot,
   Bell,
   ChevronLeft,
   ChevronRight,
@@ -44,7 +43,6 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   settings:      Settings,
   face:          ScanFace,
   canvas:        Layers,
-  agent:         Bot,
   bell:          Bell,
   notifications: Bell,
 };

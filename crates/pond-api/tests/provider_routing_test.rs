@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_api::{build_router, AppState};
 use pond_core::mcp::ports::extension_manager::{
-    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort,
+    AddExtensionRequest, ExtensionInfo, ExtensionManagerPort, ToolInfo,
 };
 use pond_core::models::ports::agent::{Agent, AgentRequest, AgentResponse};
 use pond_core::shared::mocks::mock_agent::MockAgent;
@@ -106,6 +106,14 @@ impl ExtensionManagerPort for StubExtensionManager {
 
     async fn list_tools(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec!["giap__get_current_weather".to_string()])
+    }
+
+    async fn list_tools_detailed(&self) -> anyhow::Result<Vec<ToolInfo>> {
+        Ok(vec![ToolInfo {
+            extension: "giap".to_string(),
+            name: "get_current_weather".to_string(),
+            description: Some("Get the current weather".to_string()),
+        }])
     }
 
     async fn set_enabled(&self, _name: &str, _enabled: bool) -> anyhow::Result<()> {
