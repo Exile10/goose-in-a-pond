@@ -27,6 +27,18 @@ pub struct DeviceStatePatch {
     pub target_temp: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked: Option<bool>,
+    /// Colour hue in degrees (0–360).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hue: Option<u16>,
+    /// Colour saturation as a 0–100 percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<u8>,
+    /// Fan speed as a 0–100 percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_speed: Option<u8>,
+    /// Covering position as a 0–100 percentage **open** (100 = fully open).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u8>,
 }
 
 /// Outcome of a control action.
@@ -60,6 +72,38 @@ pub trait DeviceControlPort: Send + Sync {
 
     /// Lock or unlock a device.
     async fn set_locked(&self, device_id: &str, locked: bool) -> Result<DeviceControlOutcome>;
+
+    // ── Optional capabilities ────────────────────────────────────────────
+    //
+    // Not every backend speaks these. They default to an "unsupported" error so
+    // a backend opts in by overriding, rather than every implementor being
+    // forced to write a stub. The MCP tool surfaces the error to the user as a
+    // plain "this device can't do that".
+
+    /// Set colour by hue (0–360 degrees) and saturation (0–100 percent).
+    async fn set_color(
+        &self,
+        device_id: &str,
+        _hue_degrees: u16,
+        _saturation_percent: u8,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support colour control")
+    }
+
+    /// Set fan speed as a 0–100 percentage.
+    async fn set_fan_speed(&self, device_id: &str, _percent: u8) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support fan control")
+    }
+
+    /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage
+    /// **open** — 100 is fully open, 0 fully closed.
+    async fn set_position(
+        &self,
+        device_id: &str,
+        _percent_open: u8,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support position control")
+    }
 }
 
 #[cfg(test)]
