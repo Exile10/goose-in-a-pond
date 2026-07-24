@@ -1,4 +1,4 @@
-export type DesktopMode = "gui" | "voice" | "canvas";
+export type DesktopMode = "gui" | "voice";
 
 export type GuiSection =
   | "dashboard"
@@ -19,7 +19,7 @@ export type GuiSection =
   | "logs"
   | "hub";
 
-export const DESKTOP_MODES: DesktopMode[] = ["gui", "voice", "canvas"];
+export const DESKTOP_MODES: DesktopMode[] = ["gui", "voice"];
 
 export type SidebarGroup = {
   label: string | null;
@@ -69,7 +69,7 @@ const SECTION_SET = new Set<GuiSection>([
 ]);
 
 export function normalizeDesktopMode(value: string | null | undefined): DesktopMode {
-  return value === "voice" || value === "canvas" || value === "gui" ? value : "gui";
+  return value === "voice" || value === "gui" ? value : "gui";
 }
 
 export function normalizeGuiSection(value: string | null | undefined): GuiSection {

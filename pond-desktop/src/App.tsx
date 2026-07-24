@@ -24,8 +24,6 @@ export function App() {
     );
   }
 
-  // Canvas mode uses a separate Tauri window (canvas.html / canvas-main.tsx).
-  // The main window shows GUI or Voice.
   if (mode === "voice") return <VoiceMode />;
   return <GuiMode />;
 }
