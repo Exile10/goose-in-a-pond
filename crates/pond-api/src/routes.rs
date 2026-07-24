@@ -2163,6 +2163,44 @@ async fn get_settings(
     Ok(Json(serde_json::to_value(settings).unwrap_or(json!({}))))
 }
 
+/// Decide whether a settings save should geocode the location name into
+/// coordinates, and if so, the (trimmed) name to look up.
+///
+/// The Settings page sends the whole settings object on every save, so the
+/// latitude/longitude keys are always present (as the current values, or 0/null
+/// when blank). Detecting an *explicit* coordinate edit therefore can't just
+/// check for the key — it compares the patched value to what is stored. We
+/// geocode when a name is present and the user did not edit coordinates, and
+/// either the name changed or the coordinates are unset (0,0, the onboarding
+/// default). Pure, so the decision is unit-tested without a network call.
+#[allow(clippy::too_many_arguments)]
+fn geocode_target(
+    merged_name: &str,
+    current_name: &str,
+    merged_lat: f64,
+    merged_lon: f64,
+    patch_lat: Option<f64>,
+    patch_lon: Option<f64>,
+    current_lat: f64,
+    current_lon: f64,
+) -> Option<String> {
+    let name = merged_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // The user explicitly set coordinates only when the patch carries a value
+    // that differs from what is stored — a full-object echo of the current
+    // coordinates does not count.
+    let coords_edited =
+        patch_lat.is_some_and(|v| v != current_lat) || patch_lon.is_some_and(|v| v != current_lon);
+    if coords_edited {
+        return None;
+    }
+    let name_changed = merged_name != current_name;
+    let coords_unset = merged_lat == 0.0 && merged_lon == 0.0;
+    (name_changed || coords_unset).then(|| name.to_string())
+}
+
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
@@ -2200,7 +2238,39 @@ async fn update_settings(
             base_obj.insert(k.clone(), v.clone());
         }
     }
-    let merged: Settings = serde_json::from_value(base).unwrap_or(current);
+    let mut merged: Settings = serde_json::from_value(base).unwrap_or_else(|_| current.clone());
+
+    // Geocode-on-save: turn the location name into coordinates so the Settings
+    // page shows real lat/lon and the weather gate is satisfied without the user
+    // hand-entering coordinates. Onboarding saves through this same endpoint, so
+    // an onboarded install ends up with real coordinates and no user action.
+    // Best-effort — a failure keeps whatever coordinates were provided, since the
+    // adapter resolves the name on demand anyway.
+    let patch_lat = patch.get("weather_latitude").and_then(|v| v.as_f64());
+    let patch_lon = patch.get("weather_longitude").and_then(|v| v.as_f64());
+    if let Some(name) = geocode_target(
+        &merged.weather_location_name,
+        &current.weather_location_name,
+        merged.weather_latitude,
+        merged.weather_longitude,
+        patch_lat,
+        patch_lon,
+        current.weather_latitude,
+        current.weather_longitude,
+    ) {
+        let geocoder = pond_adapters_weather::Geocoder::new(state.http_client.clone());
+        match geocoder.geocode(&name).await {
+            Ok(geo) => {
+                merged.weather_latitude = geo.latitude;
+                merged.weather_longitude = geo.longitude;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                location = %name,
+                "geocode-on-save failed; keeping provided coordinates"
+            ),
+        }
+    }
 
     state.settings_repo.update(&merged).await.map_err(|e| {
         (
@@ -10442,6 +10512,82 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── geocode-on-save decision ─────────────────────────────────
+
+    #[test]
+    fn geocodes_when_coordinates_are_unset() {
+        // Onboarding: a name saved with 0,0 and no coord keys in the patch.
+        assert_eq!(
+            geocode_target("Nairobi", "Nairobi", 0.0, 0.0, None, None, 0.0, 0.0),
+            Some("Nairobi".to_string())
+        );
+    }
+
+    #[test]
+    fn geocodes_when_the_name_changed_even_if_old_coords_are_echoed() {
+        // Settings page sends the whole object: the new name plus the OLD
+        // coordinates (echoed, == current). Those coordinates are stale for the
+        // new city, so we must still geocode.
+        assert_eq!(
+            geocode_target(
+                "Kisumu",
+                "Nairobi",
+                -1.29,
+                36.82,
+                Some(-1.29),
+                Some(36.82),
+                -1.29,
+                36.82
+            ),
+            Some("Kisumu".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_an_unchanged_name_with_coordinates() {
+        assert_eq!(
+            geocode_target(
+                "Nairobi",
+                "Nairobi",
+                -1.29,
+                36.82,
+                Some(-1.29),
+                Some(36.82),
+                -1.29,
+                36.82
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_when_the_user_edited_coordinates() {
+        // Patched coordinates differ from stored → an explicit edit; respect it
+        // even though the name also implies a different place.
+        assert_eq!(
+            geocode_target(
+                "Nairobi",
+                "Nairobi",
+                40.0,
+                -74.0,
+                Some(40.0),
+                Some(-74.0),
+                -1.29,
+                36.82
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_geocode_an_empty_or_whitespace_name() {
+        assert_eq!(geocode_target("", "", 0.0, 0.0, None, None, 0.0, 0.0), None);
+        assert_eq!(
+            geocode_target("   ", "x", 0.0, 0.0, None, None, 0.0, 0.0),
+            None
+        );
+    }
 
     // ── Memory-fit guard (Phase 6) ───────────────────────────────
 
