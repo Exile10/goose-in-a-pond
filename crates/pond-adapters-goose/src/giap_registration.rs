@@ -99,7 +99,7 @@ pub fn register_giap_extensions(
 
     if settings.ext_device_enabled {
         pond_mcp_server::init_device_deps(
-            device_registry,
+            device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
             recipe_repo,
@@ -107,8 +107,10 @@ pub fn register_giap_extensions(
         register_builtin_extension("giap-device", pond_mcp_server::spawn_device_server);
         registered.push("giap-device".into());
 
-        // Device actuation surface (set_device_state) — grouped with device read.
-        pond_mcp_server::init_device_control_deps(device_control);
+        // Device actuation surface (set_device_state) — grouped with device
+        // read. The registry lets the tool resolve natural references
+        // ("the light") to registered device ids.
+        pond_mcp_server::init_device_control_deps(device_control, device_registry);
         register_builtin_extension(
             "giap-device-control",
             pond_mcp_server::spawn_device_control_server,

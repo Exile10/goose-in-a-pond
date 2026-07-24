@@ -173,6 +173,16 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.vision_motion_threshold.to_string()
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
+        // Matter (#195)
+        upsert!(
+            "matter_enabled",
+            if settings.matter_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("matter_ws_url", &settings.matter_ws_url);
         // Privacy / sensor access
         upsert!(
             "mic_enabled",
@@ -698,6 +708,9 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
+        // Matter (#195)
+        "matter_enabled" => s.matter_enabled = value == "true",
+        "matter_ws_url" => s.matter_ws_url = value.to_string(),
         // Privacy / sensor access
         "mic_enabled" => s.mic_enabled = value == "true",
         "cameras_enabled" => s.cameras_enabled = value == "true",
