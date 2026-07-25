@@ -299,7 +299,9 @@ impl WhisperRsInput {
         let ctx_for_speculative = ctx_arc.clone();
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
             if let Some(wav) = captured {
-                println!("  🎤 Listening...");
+                // Diagnostic to stderr: this adapter is wired into the
+                // `--json-events` chat path, whose stdout is reserved for NDJSON.
+                eprintln!("  🎤 Listening...");
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
                 let (fresh_samples, fresh_rate) =
                     record_mono_f32_until_silence(max_record, silence_ms)?;
@@ -313,7 +315,8 @@ impl WhisperRsInput {
                 }
                 Ok(SpeechCapture::Samples(combined))
             } else {
-                println!("  🎤 Listening...");
+                // stderr: see the sibling branch above (NDJSON stdout contract).
+                eprintln!("  🎤 Listening...");
                 let speculative_spawn: Box<SpeculativeSpawn> = Box::new(move |samples, rate| {
                     let ctx = ctx_for_speculative.clone();
                     std::thread::spawn(move || -> Result<String> {

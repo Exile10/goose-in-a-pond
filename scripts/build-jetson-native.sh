@@ -55,13 +55,12 @@ sudo apt-get install -y \
   libsqlite3-dev
 
 if [ "$DESKTOP" = true ]; then
-  echo "Installing Tauri/GTK dependencies..."
-  sudo apt-get install -y \
-    libwebkit2gtk-4.1-dev \
-    libgtk-3-dev \
-    librsvg2-dev \
-    patchelf \
-    libayatana-appindicator3-dev
+  echo "Installing Tauri/WebKitGTK dependencies..."
+  # Single source of truth for the desktop build deps (checks + installs the
+  # full WebKitGTK set: webkit2gtk-4.1, gtk-3, libsoup-3.0, javascriptcoregtk,
+  # plus rsvg/patchelf/appindicator). Also enforced at compile time by
+  # pond-desktop/src-tauri/build.rs.
+  bash "$(dirname "${BASH_SOURCE[0]}")/install-desktop-deps.sh"
 fi
 
 # ── 2b. Build the web UI (embedded into the single-executable server) ────────

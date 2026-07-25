@@ -4,7 +4,6 @@
 /// Instead we keep only Arc/AtomicBool in managed state and run the cpal stream
 /// on a dedicated OS thread that lives as long as recording is active.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tauri::{Emitter, Manager};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -12,6 +11,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 use crate::commands::audio_cmd::TranscriptResult;
 
@@ -47,8 +47,18 @@ impl Default for AudioState {
 
 /// Managed state for the background wake-word listening loop.
 pub struct WakeListenerState {
+    /// The user-facing "listener wanted" flag. Set true on start and flipped
+    /// false *eagerly* by `stop_wake_listener` (it is also the loop's stop
+    /// signal), so it goes false before the OS thread has actually torn down
+    /// its cpal input stream.
     pub is_running: Arc<AtomicBool>,
     pub stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    /// True while the listener's OS thread is actually alive and (may be)
+    /// holding the mic. Set true at spawn and cleared ONLY by the thread itself
+    /// as it exits — after its cpal input stream has been dropped. Unlike
+    /// `is_running`, this is a faithful "mic released" signal, so a mic handoff
+    /// (voice child spawn) can wait on it before opening the device.
+    pub thread_active: Arc<AtomicBool>,
 }
 
 impl WakeListenerState {
@@ -56,7 +66,14 @@ impl WakeListenerState {
         Self {
             is_running: Arc::new(AtomicBool::new(false)),
             stop_tx: Arc::new(Mutex::new(None)),
+            thread_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the listener's OS thread is still alive (and may hold the mic).
+    /// See [`WakeListenerState::thread_active`].
+    pub fn thread_is_active(&self) -> bool {
+        self.thread_active.load(Ordering::SeqCst)
     }
 }
 
@@ -88,7 +105,13 @@ where
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
 
     thread::spawn(move || {
-        let result = capture_thread(samples_arc, is_recording_arc.clone(), native_rate_arc, on_level, stop_rx);
+        let result = capture_thread(
+            samples_arc,
+            is_recording_arc.clone(),
+            native_rate_arc,
+            on_level,
+            stop_rx,
+        );
         is_recording_arc.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             tracing::error!("Audio capture thread error: {e}");
@@ -205,7 +228,8 @@ where
                         let mono: Vec<i16> = data
                             .chunks(channels)
                             .map(|ch| {
-                                let avg = ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
+                                let avg =
+                                    ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
                                 avg as i16
                             })
                             .collect();
@@ -221,7 +245,9 @@ where
         _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
     };
 
-    stream.play().map_err(|e| format!("Stream play error: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Stream play error: {e}"))?;
 
     // Block until stop signal or is_recording goes false
     loop {
@@ -388,9 +414,9 @@ pub fn record_with_vad(
     auth_token: &str,
     on_asr_ready: Option<OnAsrReady>,
 ) -> Result<(Vec<u8>, Option<String>), String> {
-    const SPEECH_RMS: f32  = 0.010; // onset threshold — lowered for better sensitivity
+    const SPEECH_RMS: f32 = 0.010; // onset threshold — lowered for better sensitivity
     const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
-    const POLL_MS: u64     = 30;
+    const POLL_MS: u64 = 30;
 
     let host = cpal::default_host();
     let device = host
@@ -415,44 +441,50 @@ pub fn record_with_vad(
     let app_emitter = app.clone();
 
     let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let mono: Vec<i16> = data
-                    .chunks(channels)
-                    .map(|ch| {
-                        let avg = ch.iter().copied().sum::<f32>() / ch.len() as f32;
-                        (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-                    })
-                    .collect();
-                let rms = compute_rms(&mono);
-                let _ = app_emitter.emit("audio-level", rms);
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::error!("Audio stream error: {e}"),
-            None,
-        ).map_err(|e| format!("Build stream error: {e}"))?,
-        SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let mono: Vec<i16> = data
-                    .chunks(channels)
-                    .map(|ch| {
-                        let avg = ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
-                        avg as i16
-                    })
-                    .collect();
-                let rms = compute_rms(&mono);
-                let _ = app_emitter.emit("audio-level", rms);
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::error!("Audio stream error: {e}"),
-            None,
-        ).map_err(|e| format!("Build stream error: {e}"))?,
+        SampleFormat::F32 => device
+            .build_input_stream(
+                &stream_config,
+                move |data: &[f32], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels)
+                        .map(|ch| {
+                            let avg = ch.iter().copied().sum::<f32>() / ch.len() as f32;
+                            (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                        })
+                        .collect();
+                    let rms = compute_rms(&mono);
+                    let _ = app_emitter.emit("audio-level", rms);
+                    samples_writer.lock().unwrap().extend_from_slice(&mono);
+                },
+                |e| tracing::error!("Audio stream error: {e}"),
+                None,
+            )
+            .map_err(|e| format!("Build stream error: {e}"))?,
+        SampleFormat::I16 => device
+            .build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels)
+                        .map(|ch| {
+                            let avg = ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
+                            avg as i16
+                        })
+                        .collect();
+                    let rms = compute_rms(&mono);
+                    let _ = app_emitter.emit("audio-level", rms);
+                    samples_writer.lock().unwrap().extend_from_slice(&mono);
+                },
+                |e| tracing::error!("Audio stream error: {e}"),
+                None,
+            )
+            .map_err(|e| format!("Build stream error: {e}"))?,
         _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
     };
 
-    stream.play().map_err(|e| format!("Stream play error: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Stream play error: {e}"))?;
 
     // ── Phase 1: wait for speech onset ──────────────────────────────────────
     let max_wait_ms = max_wait_secs as u64 * 1000;
@@ -550,10 +582,7 @@ pub fn record_with_vad(
                 asr_text_early = None;
             }
             SilenceEvent::Confirmed => {
-                tracing::debug!(
-                    "VAD: end-of-speech confirmed ({}ms recorded)",
-                    recorded_ms
-                );
+                tracing::debug!("VAD: end-of-speech confirmed ({}ms recorded)", recorded_ms);
                 confirmed = true;
                 break;
             }
@@ -604,24 +633,59 @@ pub fn start_wake_listener(
     app: tauri::AppHandle,
     pipeline_active: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // Cancel any existing listener first
+    // Cancel any existing listener first, then wait for its thread to actually
+    // release the mic so a fast restart does not open two cpal input streams.
     stop_wake_listener(state);
+    wait_for_wake_thread_exit(state, Duration::from_secs(1));
 
     state.is_running.store(true, Ordering::SeqCst);
+    state.thread_active.store(true, Ordering::SeqCst);
 
     let is_running = Arc::clone(&state.is_running);
+    let thread_active = Arc::clone(&state.thread_active);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     *state.stop_tx.lock().unwrap() = Some(stop_tx);
 
     thread::spawn(move || {
-        let result = wake_listener_thread(app, wake_word, variants, base_url, is_running.clone(), stop_rx, pipeline_active);
+        let result = wake_listener_thread(
+            app,
+            wake_word,
+            variants,
+            base_url,
+            is_running.clone(),
+            stop_rx,
+            pipeline_active,
+        );
         is_running.store(false, Ordering::SeqCst);
+        // Cleared last: the cpal input stream owned by wake_listener_thread has
+        // been dropped by the time we reach here, so this is the faithful
+        // "mic released" signal a mic handoff waits on.
+        thread_active.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             tracing::error!("Wake listener thread error: {e}");
         }
     });
 
     Ok(())
+}
+
+/// Block (bounded) until the wake listener's OS thread has exited and released
+/// the mic, or the timeout elapses. Returns `true` if the thread exited within
+/// the budget, `false` on timeout (the caller may then proceed with a warning).
+///
+/// Used during the mic handoff to the voice child: `stop_wake_listener` only
+/// *signals* the thread and flips `is_running` eagerly, so without this a fast
+/// handoff could open the child's mic while the listener still holds the device.
+pub fn wait_for_wake_thread_exit(state: &WakeListenerState, timeout: Duration) -> bool {
+    const POLL: Duration = Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !state.thread_is_active() {
+            return true;
+        }
+        thread::sleep(POLL);
+    }
+    !state.thread_is_active()
 }
 
 /// Stop the background wake-word listening loop.
@@ -689,15 +753,15 @@ fn wake_listener_thread(
         .map_err(|e| format!("Cannot get default input config: {e}"))?;
 
     let native_rate = config.sample_rate().0;
-    let channels    = config.channels() as usize;
-    let sample_fmt  = config.sample_format();
+    let channels = config.channels() as usize;
+    let sample_fmt = config.sample_format();
 
     // Ring buffer written by the cpal callback, drained by the VAD loop.
     let ring: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
-    let ring_fill   = Arc::clone(&ring);
+    let ring_fill = Arc::clone(&ring);
 
     let stream_cfg = cpal::StreamConfig {
-        channels:    config.channels(),
+        channels: config.channels(),
         sample_rate: cpal::SampleRate(native_rate),
         buffer_size: cpal::BufferSize::Default,
     };
@@ -728,11 +792,7 @@ fn wake_listener_thread(
                     let mono: Vec<i16> = data
                         .chunks(channels)
                         .map(|ch| {
-                            let avg = ch
-                                .iter()
-                                .map(|&s| s as i32)
-                                .sum::<i32>()
-                                / ch.len() as i32;
+                            let avg = ch.iter().map(|&s| s as i32).sum::<i32>() / ch.len() as i32;
                             avg as i16
                         })
                         .collect();
@@ -744,7 +804,9 @@ fn wake_listener_thread(
             .map_err(|e| format!("Build stream error: {e}"))?,
         _ => return Err(format!("Unsupported sample format: {:?}", sample_fmt)),
     };
-    stream.play().map_err(|e| format!("Stream play error: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Stream play error: {e}"))?;
 
     // ── HTTP client (re-used across ASR calls) ──────────────────────────────
     let client = reqwest::blocking::Client::builder()
@@ -758,7 +820,13 @@ fn wake_listener_thread(
     let normalize = |s: &str| -> String {
         s.to_lowercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+            .map(|c| {
+                if c.is_alphanumeric() || c.is_whitespace() {
+                    c
+                } else {
+                    ' '
+                }
+            })
             .collect::<String>()
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -773,15 +841,19 @@ fn wake_listener_thread(
     tracing::info!(
         "Wake listener armed — triggers: {:?} (from {} calibrated variant{})",
         triggers,
-        if variants.is_empty() { 0 } else { variants.len() },
+        if variants.is_empty() {
+            0
+        } else {
+            variants.len()
+        },
         if variants.len() == 1 { "" } else { "s" },
     );
 
     // ── VAD state ───────────────────────────────────────────────────────────
-    let mut onset_frames:   u32      = 0;  // consecutive above-threshold frames
-    let mut tail_frames:    u32      = 0;  // consecutive silence frames while in speech
-    let mut in_speech:      bool     = false;
-    let mut speech_buf:     Vec<i16> = Vec::new();
+    let mut onset_frames: u32 = 0; // consecutive above-threshold frames
+    let mut tail_frames: u32 = 0; // consecutive silence frames while in speech
+    let mut in_speech: bool = false;
+    let mut speech_buf: Vec<i16> = Vec::new();
 
     // ── Main loop ───────────────────────────────────────────────────────────
     'vad: loop {
@@ -810,8 +882,8 @@ fn wake_listener_thread(
                 speech_buf.extend_from_slice(&frame); // keep pre-roll
                 if onset_frames >= ONSET_FRAMES {
                     // Confirmed speech — transition to SPEECH state
-                    in_speech    = true;
-                    tail_frames  = 0;
+                    in_speech = true;
+                    tail_frames = 0;
                     tracing::debug!("VAD → SPEECH ({} pre-roll samples)", speech_buf.len());
                 }
             } else {
@@ -829,8 +901,8 @@ fn wake_listener_thread(
                 tail_frames = 0; // speech resumed — reset tail
             }
 
-            let end_of_speech  = tail_frames >= TAIL_FRAMES;
-            let buffer_maxed   = speech_buf.len() >= MAX_SPEECH_SAMPLES;
+            let end_of_speech = tail_frames >= TAIL_FRAMES;
+            let buffer_maxed = speech_buf.len() >= MAX_SPEECH_SAMPLES;
 
             if end_of_speech || buffer_maxed {
                 tracing::debug!(
@@ -878,18 +950,30 @@ fn wake_listener_thread(
                     }
 
                     #[derive(serde::Deserialize)]
-                    struct Tr { text: String }
+                    struct Tr {
+                        text: String,
+                    }
                     if let Ok(t) = res.json::<Tr>() {
                         // Strip Whisper artifacts before matching
                         let cleaned = crate::tts_text::strip_whisper_artifacts(&t.text);
                         if cleaned.is_empty() {
-                            tracing::debug!("Wake ASR: artifact-only transcript stripped: {:?}", t.text);
+                            tracing::debug!(
+                                "Wake ASR: artifact-only transcript stripped: {:?}",
+                                t.text
+                            );
                             break 'asr;
                         }
                         // Normalize transcript identically to the trigger phrases
-                        let transcript: String = cleaned.to_lowercase()
+                        let transcript: String = cleaned
+                            .to_lowercase()
                             .chars()
-                            .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+                            .map(|c| {
+                                if c.is_alphanumeric() || c.is_whitespace() {
+                                    c
+                                } else {
+                                    ' '
+                                }
+                            })
                             .collect::<String>()
                             .split_whitespace()
                             .collect::<Vec<_>>()
@@ -911,7 +995,10 @@ fn wake_listener_thread(
                                 // 50ms. Emit a lightweight interrupt event (no audio
                                 // capture needed; conversational turn-taking will
                                 // handle the next recording after the pipeline ends).
-                                tracing::info!("Wake word '{}' — barge-in interrupt (pipeline active)", wake_word);
+                                tracing::info!(
+                                    "Wake word '{}' — barge-in interrupt (pipeline active)",
+                                    wake_word
+                                );
                                 let _ = app.emit("wake-word-interrupt", ());
 
                                 // Drain the ring buffer so we don't re-process the
@@ -919,7 +1006,10 @@ fn wake_listener_thread(
                                 ring.lock().unwrap().clear();
                             } else {
                                 // ── Initial activation: one-breath flow ─────────
-                                tracing::info!("Wake word '{}' detected — capturing command audio", wake_word);
+                                tracing::info!(
+                                    "Wake word '{}' detected — capturing command audio",
+                                    wake_word
+                                );
 
                                 // speech_buf already contains the FULL utterance that
                                 // was just transcribed (wake word + any command in the
@@ -928,9 +1018,9 @@ fn wake_listener_thread(
                                 // Additionally, capture any continuation speech: the
                                 // user might pause briefly between wake word and
                                 // command ("hey goose" [brief pause] "what time is it").
-                                const POST_TRIGGER_MS: u64       = 2000;
-                                const POST_TRIGGER_SILENCE: u64  = 400;
-                                const POLL_MS: u64               = 30;
+                                const POST_TRIGGER_MS: u64 = 2000;
+                                const POST_TRIGGER_SILENCE: u64 = 400;
+                                const POLL_MS: u64 = 30;
 
                                 let mut continuation: Vec<i16> = Vec::new();
                                 let mut elapsed: u64 = 0;
@@ -974,8 +1064,7 @@ fn wake_listener_thread(
                                 } else {
                                     full_audio
                                 };
-                                let command_wav = encode_wav(&pcm_16k, 16000)
-                                    .unwrap_or_default();
+                                let command_wav = encode_wav(&pcm_16k, 16000).unwrap_or_default();
 
                                 let duration_ms = pcm_16k.len() as u64 * 1000 / 16000;
                                 tracing::info!(
@@ -992,8 +1081,8 @@ fn wake_listener_thread(
                             // is always-on and never exits on detection.
                             speech_buf.clear();
                             onset_frames = 0;
-                            tail_frames  = 0;
-                            in_speech    = false;
+                            tail_frames = 0;
+                            in_speech = false;
                             continue 'vad;
                         }
                     }
@@ -1002,8 +1091,8 @@ fn wake_listener_thread(
                 // Reset VAD state for next utterance
                 speech_buf.clear();
                 onset_frames = 0;
-                tail_frames  = 0;
-                in_speech    = false;
+                tail_frames = 0;
+                in_speech = false;
             }
         }
     }
@@ -1053,8 +1142,8 @@ mod tests {
             eprintln!("set PIPELINE_TEST_BASE_URL to run this test");
             return;
         };
-        let wav_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/blobs/jfk.wav");
+        let wav_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");
         let wav = std::fs::read(&wav_path).expect("jfk.wav fixture missing");
         const SILENCE_MS: u64 = 400; // matches record_with_vad's confirmation window
 
@@ -1072,10 +1161,16 @@ mod tests {
         let wav_clone = wav.clone();
         let handle = thread::spawn(move || transcribe_via_http(&base_url_clone, "", wav_clone));
         thread::sleep(Duration::from_millis(SILENCE_MS));
-        let overlapped_transcript = handle.join().unwrap().expect("overlapped transcribe failed");
+        let overlapped_transcript = handle
+            .join()
+            .unwrap()
+            .expect("overlapped transcribe failed");
         let overlapped_elapsed = overlapped_start.elapsed();
 
-        assert_eq!(serial_transcript, overlapped_transcript, "same audio should transcribe identically");
+        assert_eq!(
+            serial_transcript, overlapped_transcript,
+            "same audio should transcribe identically"
+        );
         println!(
             "serial: {:?}  overlapped: {:?}  saved: {:?}",
             serial_elapsed,
@@ -1127,7 +1222,10 @@ mod tests {
         assert_eq!(vad.on_rms(QUIET, THRESHOLD), SilenceEvent::SpawnSpeculative);
         assert_eq!(vad.on_rms(QUIET, THRESHOLD), SilenceEvent::None);
         // False pause — speech resumes before confirmation.
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), SilenceEvent::DiscardSpeculative);
+        assert_eq!(
+            vad.on_rms(SPEECH, THRESHOLD),
+            SilenceEvent::DiscardSpeculative
+        );
         assert_eq!(vad.on_rms(SPEECH, THRESHOLD), SilenceEvent::None);
     }
 
@@ -1136,7 +1234,10 @@ mod tests {
         let mut vad = VadSilenceTracker::new(360, 30);
         vad.on_rms(SPEECH, THRESHOLD);
         assert_eq!(vad.on_rms(QUIET, THRESHOLD), SilenceEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), SilenceEvent::DiscardSpeculative);
+        assert_eq!(
+            vad.on_rms(SPEECH, THRESHOLD),
+            SilenceEvent::DiscardSpeculative
+        );
         // New silence run after the false pause — spawns again, independent
         // of the discarded one.
         assert_eq!(vad.on_rms(QUIET, THRESHOLD), SilenceEvent::SpawnSpeculative);

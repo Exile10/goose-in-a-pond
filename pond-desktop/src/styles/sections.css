@@ -5114,3 +5114,260 @@
 .dev-mode-toggle__btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 36px; border: 1px solid var(--grey-300); border-radius: 8px; background: var(--color-surface); color: var(--fg); font-size: var(--text-base); font-family: var(--font-body); cursor: pointer; }
 .dev-mode-toggle__btn:hover { border-color: var(--grey-400); }
 .dev-mode-toggle__btn--on { border-color: var(--color-primary); color: var(--color-primary); background: var(--color-primary-soft, var(--color-surface)); font-weight: 600; }
+
+/* =============================================================================
+   KIOSK RESPONSIVE — 7-inch panel (1024x600 primary, 800x480 secondary)
+   All rules are additive; nothing below overrides desktop (>=1280px) layout.
+   Strategy:
+     - max-height: 640px catches both 600 and 480 viewport heights.
+     - Combined (max-width + max-height) queries fine-tune the tightest case.
+     - Touch targets stay >=40px on all interactive elements.
+   ============================================================================= */
+
+/* ── 1. Short-viewport baseline (height ≤ 640px, any width) ──────────────── */
+@media (max-height: 640px) {
+
+  /* App shell content area: cut bottom padding; reduce top/side padding */
+  .app-content {
+    padding: var(--space-3) var(--space-5) var(--space-4);
+  }
+
+  /* Page header: tighten bottom margin */
+  .page-header {
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+  }
+
+  /* Screen gap (vertical stacking of cards) */
+  .screen { gap: 12px; }
+  .screen--dashboard { gap: 10px; }
+
+  /* Dashboard dash-grid: reduce gap */
+  .dash-grid { gap: 12px; }
+
+  /* Voice card: make it compact */
+  .voice-card {
+    gap: 14px;
+  }
+  .voice-card__icon {
+    width: 32px; height: 32px;
+  }
+  .voice-card__text h3 { font-size: var(--text-base); margin-bottom: 2px; }
+  .voice-card__text p  { font-size: var(--text-sm); margin-bottom: 4px; }
+  .voice-card__cta {
+    padding-top: 10px;
+    margin-top: 10px;
+  }
+
+  /* Card content inner padding */
+  [data-slot="card-content"] { padding: 12px 14px !important; }
+  .card-header { padding: 10px 14px 6px; }
+
+  /* Quick actions gap */
+  .quick-actions { gap: 1px; }
+  .quick-action { padding: 8px 10px; }
+  .quick-action__icon { width: 26px; height: 26px; }
+
+  /* Metrics: 2-col instead of 4-col on short views */
+  .metrics { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .metric { padding: 8px 10px; }
+
+  /* Role grid: keep 2 cols but shrink chip padding */
+  .role-chip__body { padding: 6px 8px; }
+
+  /* Sidebar: tighten vertical spacing */
+  .sidebar {
+    padding: 8px 0 8px;
+  }
+  .sidebar__brand {
+    padding: var(--space-1) var(--space-3) var(--space-2);
+  }
+  .sidebar__logo { width: 28px; height: 28px; }
+  .sidebar__logo img { width: 20px; height: 20px; }
+  .sidebar__brand-name { font-size: 13px; }
+  .sidebar__nav {
+    padding: 2px 8px;
+    gap: 10px;
+  }
+  .sidebar__group-label {
+    padding: 4px 8px 2px;
+  }
+
+  /* Sidebar items: 40px touch target minimum */
+  .sidebar__item {
+    padding: 9px 10px;
+    min-height: 40px;
+  }
+
+  .sidebar__bottom-nav { padding: 2px 8px; }
+  .sidebar__footer { padding: 6px 12px 8px; }
+
+  /* Schedules / devices grids: 2-col at short height to see more on screen */
+  .sched-card { padding: 12px; gap: 10px; }
+  .sched-card__icon { width: 38px; height: 38px; border-radius: 11px; }
+  .device-card { padding: 12px; gap: 10px; }
+  .device-card__icon { width: 38px; height: 38px; border-radius: 11px; }
+
+  /* Chat screen height (accounts for shorter viewport) */
+  .screen--chat { height: calc(100vh - 56px); }
+
+  /* Chat composer: limit textarea growth */
+  .chat-composer__textarea { max-height: 80px; }
+
+  /* Model selector dropdown: constrain height */
+  .model-selector-dropdown { max-height: 260px; }
+
+  /* Session dropdown: constrain height */
+  .session-dropdown { max-height: 300px; }
+
+  /* Memory add form: compress field grid */
+  .mem-add-form__fields { grid-template-columns: 1fr 1fr; gap: 6px; }
+
+  /* Activity layout: single col on short screens */
+  .act-layout { grid-template-columns: 1fr; }
+  .act-privacy { display: none; } /* hidden on kiosk; user scrolls the feed */
+
+  /* Onboarding: reduce hero/step vertical padding */
+  .onb-step { padding: var(--space-4); }
+}
+
+/* ── 2. Kiosk width (≤ 1100px) combined with short height ────────────────── */
+@media (max-width: 1100px) and (max-height: 640px) {
+
+  /* Sidebar: collapse to icon-rail style at this combined breakpoint */
+  .sidebar {
+    width: var(--sidebar-width-collapsed);
+    min-width: var(--sidebar-width-collapsed);
+    padding-right: 0;
+  }
+  .sidebar__brand {
+    justify-content: center;
+    padding: var(--space-1) 0 var(--space-2);
+  }
+  .sidebar__brand-name { display: none; }
+  .sidebar__actions { flex-direction: column; align-items: center; padding: 0; gap: 3px; }
+  .sidebar__action-btn { flex: none; }
+  .sidebar__nav { padding: 2px 0; }
+  .sidebar__item {
+    justify-content: center;
+    padding: 9px 0;
+    min-height: 44px;
+  }
+  /* Hide label text + group labels — only icon shown at 52px */
+  .sidebar__item > span:not(.sidebar__icon),
+  .sidebar__group-label,
+  .sidebar__brand-name,
+  .sidebar__avatar-name {
+    display: none !important;
+  }
+  /* Action buttons: icon-only by hiding text via font-size trick.
+     SVG uses px width/height so is unaffected by font-size: 0. */
+  .sidebar__action-btn {
+    font-size: 0 !important;
+    overflow: hidden;
+    width: 36px !important;
+    min-width: 36px !important;
+    max-width: 36px !important;
+    flex: none !important;
+    padding: 0 !important;
+    justify-content: center;
+  }
+  .sidebar__actions {
+    justify-content: center;
+    gap: 4px;
+  }
+  .sidebar__footer { padding: 6px 0 6px; align-items: center; }
+  .sidebar__bottom-nav { padding: 2px 0; }
+
+  /* Dashboard: stack to single column */
+  .dash-grid { grid-template-columns: 1fr; }
+
+  /* Schedules/devices: 2 cols at 1024px (already handled above by existing rule) */
+  .sched-grid { grid-template-columns: repeat(2, 1fr); }
+  .devices-grid { grid-template-columns: repeat(2, 1fr); }
+
+  /* App content: adjust side padding for collapsed sidebar */
+  .app-content { padding: var(--space-3) var(--space-4) var(--space-4); }
+}
+
+/* ── 3. Very short height (≤ 500px — 800x480 target) ─────────────────────── */
+@media (max-height: 500px) {
+
+  /* Tighten everything further */
+  .app-content { padding: var(--space-2) var(--space-4) var(--space-3); }
+
+  .screen { gap: 8px; }
+  .screen--dashboard { gap: 8px; }
+  .dash-grid { gap: 8px; }
+
+  [data-slot="card-content"] { padding: 10px 12px !important; }
+  .card-header { padding: 8px 12px 4px; }
+
+  /* Voice card: horizontal, no border-top CTA */
+  .voice-card { gap: 10px; }
+  .voice-card__cta { padding-top: 8px; margin-top: 8px; }
+
+  /* Sidebar: shrink to 44px icon strip */
+  .sidebar {
+    width: 44px;
+    min-width: 44px;
+  }
+  .sidebar__item {
+    padding: 8px 0;
+    min-height: 40px;
+  }
+  .sidebar__logo { width: 26px; height: 26px; }
+  .sidebar__logo img { width: 18px; height: 18px; }
+
+  /* Hide sidebar group labels */
+  .sidebar__group-label { display: none; }
+
+  /* Metrics: 2 cols */
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+
+  /* Chat */
+  .screen--chat { height: calc(100vh - 44px); }
+  .chat-composer__textarea { max-height: 60px; }
+
+  /* Model selector */
+  .model-selector-dropdown { max-height: 200px; }
+
+  /* Sched/devices: 2 cols */
+  .sched-grid { grid-template-columns: repeat(2, 1fr); }
+  .devices-grid { grid-template-columns: repeat(2, 1fr); }
+
+  /* Page header */
+  .page-header { padding-bottom: 6px; margin-bottom: 2px; }
+  .page-header__title { font-size: var(--text-base); }
+}
+
+/* ── 4. Touch target safety net (all kiosk viewports) ────────────────────── */
+@media (max-width: 1100px) and (max-height: 640px) {
+
+  /* Ensure all sidebar nav items, quick-actions, and notif rows meet 40px */
+  .sidebar__item,
+  .quick-action,
+  .notif-row,
+  .session-dropdown__item,
+  .set-row,
+  .srow,
+  .model-row,
+  .giap-model-row,
+  .mem-card,
+  .act-row {
+    min-height: 40px;
+  }
+
+  /* HeroUI buttons: enforce 40px tap height */
+  .button--sm { height: 36px !important; min-height: 36px !important; }
+  .button--md { height: 40px !important; min-height: 40px !important; }
+
+  /* Sidebar footer actions */
+  .sidebar__action-btn { height: 40px !important; }
+
+  /* Hub icon rail items */
+  .irail__item { min-height: 44px; }
+
+  /* Notif badge CTA */
+  .notif-row__cta { min-height: 32px; padding: 4px 2px; }
+}

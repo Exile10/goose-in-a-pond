@@ -104,6 +104,15 @@ pub struct GooseAdapter {
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
     /// local inference providers to reuse their KV-cache for the stable portion.
     last_prefix_hash: Mutex<u64>,
+    /// GIAP session storage — read-only source of the rolling conversation
+    /// summary for the deterministic turn trimmer. Optional: without it the
+    /// trimmer still runs, just without a summary splice.
+    giap_session_storage:
+        Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
+    /// Last engine-reported prompt token count per GIAP session — feedback
+    /// for the trimmer's chars/4 estimate. OnceLock<Arc<..>> so the 'static
+    /// stream closure can hold a handle.
+    last_prompt_tokens_arc: std::sync::OnceLock<Arc<Mutex<HashMap<String, u32>>>>,
     /// Cached tool set from the last list_tools() call. Invalidated when
     /// extensions are added/removed. Avoids re-querying all MCP servers every turn.
     cached_tools: tokio::sync::RwLock<Option<std::collections::HashSet<String>>>,
@@ -209,6 +218,8 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
+            giap_session_storage: None,
+            last_prompt_tokens_arc: std::sync::OnceLock::new(),
             cached_tools: tokio::sync::RwLock::new(None),
             defaults_stripped: Mutex::new(HashSet::new()),
         })
@@ -357,7 +368,19 @@ impl GooseAdapter {
     ///
     /// For HTTP providers (Ollama, llamafile): uses the model's reported context
     /// window from capabilities (model name heuristics).
-    fn effective_context_window(provider: &str, model: &str) -> usize {
+    ///
+    /// `override_tokens` (Settings.context_window_override, 0 = unset) wins over
+    /// every heuristic when > 0. This is the escape hatch for deployments whose
+    /// real limit is neither the model's max nor the cuda ceiling — e.g. a
+    /// Jetson running Ollama with a hand-tuned KV cache, or a tool-heavy GIAP
+    /// prompt (~12K tokens for the 57 giap-* tools) that overflows the default
+    /// heuristic and forces a compaction loop. The value flows into
+    /// GOOSE_CONTEXT_LIMIT and thus into Ollama's `options.num_ctx`, so the
+    /// reported limit, the request's num_ctx, and the KV cache all agree.
+    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+        if override_tokens > 0 {
+            return override_tokens as usize;
+        }
         match provider {
             "local" | "gguf" => {
                 // Generous ceiling — the actual allocation is constrained by
@@ -397,12 +420,13 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if *last == key {
-                println!("[model-switch] provider already current: {}", key);
+                tracing::debug!("[model-switch] provider already current: {}", key);
                 return Ok(());
             }
-            println!(
+            tracing::debug!(
                 "[model-switch] provider change detected: {:?} -> {}",
-                *last, key
+                *last,
+                key
             );
         }
 
@@ -414,14 +438,26 @@ impl GooseAdapter {
         // The model hits ContextLengthExceeded long before 102K and falls into
         // the expensive emergency compaction path. Setting this env var BEFORE
         // ModelConfig::new_or_fail() ensures Goose sees the real limit.
-        let effective_ctx =
-            Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        );
         // SAFETY: set_var is unsafe in multi-threaded programs per Rust 1.66+,
         // but Goose already calls set_var for OLLAMA_HOST/OLLAMA_TIMEOUT in the
         // same code path, so we follow the existing pattern.
         #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("GOOSE_CONTEXT_LIMIT", effective_ctx.to_string());
+            // Hybrid compaction: GIAP owns trimming (deterministic, in-turn)
+            // and summarization (idle). A threshold >= 1.0 disables goose's
+            // own auto-compaction, which would stall the turn with an LLM
+            // summarization pass mid-conversation on-device.
+            if settings.hybrid_compaction_enabled {
+                std::env::set_var("GOOSE_AUTO_COMPACT_THRESHOLD", "1.0");
+            } else {
+                std::env::remove_var("GOOSE_AUTO_COMPACT_THRESHOLD");
+            }
         }
         tracing::info!(
             provider = %settings.chat_provider,
@@ -430,129 +466,138 @@ impl GooseAdapter {
             "Set GOOSE_CONTEXT_LIMIT to match actual KV-cache / provider limit"
         );
 
-        let provider: Option<Arc<dyn Provider>> = match settings.chat_provider.as_str() {
-            // In-process GGUF inference via llama.cpp — no HTTP server needed.
-            // Registers the model in Goose's local_model_registry so
-            // LocalInferenceProvider can locate the .gguf file on disk.
-            "local" | "gguf" => {
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
-                // Register the GGUF model path in Goose's global registry
-                if let Some(ref dd) = self.data_dir {
-                    Self::register_gguf_model(&model_name, dd);
-                }
-                // Registry key is the stem (no ".gguf") — ModelConfig must match.
-                let registry_key = model_name.trim_end_matches(".gguf");
-                let cfg = goose::model::ModelConfig::new_or_fail(registry_key);
-                println!(
-                    "[model-switch] building LocalInferenceProvider for '{}'...",
-                    model_name
-                );
-                match goose::providers::local_inference::LocalInferenceProvider::from_env(
-                    cfg,
-                    vec![],
-                )
-                .await
-                {
-                    Ok(p) => {
-                        println!(
-                            "[model-switch] LocalInferenceProvider ready for '{}'",
-                            model_name
-                        );
-                        tracing::info!("Built LocalInferenceProvider for model '{}'", model_name);
-                        Some(Arc::new(p))
+        let provider: Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)> =
+            match settings.chat_provider.as_str() {
+                // In-process GGUF inference via llama.cpp — no HTTP server needed.
+                // Registers the model in Goose's local_model_registry so
+                // LocalInferenceProvider can locate the .gguf file on disk.
+                "local" | "gguf" => {
+                    let model_name = if settings.chat_model.is_empty() {
+                        "llamafile".to_string()
+                    } else {
+                        settings.chat_model.clone()
+                    };
+                    // Register the GGUF model path in Goose's global registry
+                    if let Some(ref dd) = self.data_dir {
+                        Self::register_gguf_model(&model_name, dd);
                     }
-                    Err(e) => {
-                        println!(
+                    // Registry key is the stem (no ".gguf") — ModelConfig must match.
+                    let registry_key = model_name.trim_end_matches(".gguf");
+                    let cfg = goose_providers::model::ModelConfig::new(registry_key);
+                    tracing::debug!(
+                        "[model-switch] building LocalInferenceProvider for '{}'...",
+                        model_name
+                    );
+                    // Wire the HF-token / config resolvers before first use — the
+                    // ProviderDef path does this; the direct constructor does not.
+                    goose::providers::local_inference::configure_local_inference();
+                    match goose::providers::local_inference::LocalInferenceProvider::from_env()
+                        .await
+                    {
+                        Ok(p) => {
+                            tracing::debug!(
+                                "[model-switch] LocalInferenceProvider ready for '{}'",
+                                model_name
+                            );
+                            tracing::info!(
+                                "Built LocalInferenceProvider for model '{}'",
+                                model_name
+                            );
+                            Some((Arc::new(p), cfg))
+                        }
+                        Err(e) => {
+                            tracing::debug!(
                             "[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}",
                             model_name
                         );
-                        tracing::warn!(
-                            "Failed to build local inference provider for '{}': {e}",
-                            model_name
-                        );
-                        None
+                            tracing::warn!(
+                                "Failed to build local inference provider for '{}': {e}",
+                                model_name
+                            );
+                            None
+                        }
                     }
                 }
-            }
-            // llamafile uses the Ollama wire protocol over HTTP.
-            "llamafile" => {
-                std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
-                std::env::set_var("OLLAMA_TIMEOUT", "600");
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
-                let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
-                println!(
-                    "[model-switch] building llamafile OllamaProvider for '{}'...",
-                    model_name
-                );
-                match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
-                    Ok(p) => {
-                        println!(
-                            "[model-switch] llamafile provider ready for '{}'",
-                            model_name
-                        );
-                        Some(Arc::new(p))
-                    }
-                    Err(e) => {
-                        println!(
-                            "[model-switch] FAILED to build llamafile provider for '{}': {e}",
-                            model_name
-                        );
-                        tracing::warn!("Failed to build llamafile provider: {e}");
-                        None
-                    }
-                }
-            }
-            "ollama" => {
-                let ollama_host = std::env::var("GIAP_OLLAMA_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-                std::env::set_var("OLLAMA_HOST", &ollama_host);
-                std::env::set_var("OLLAMA_TIMEOUT", "600");
-                let model_name = if settings.chat_model.is_empty() {
-                    "llama3.2".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
-                println!(
-                    "[model-switch] building Ollama provider for '{}'...",
-                    model_name
-                );
-                let cfg = goose::model::ModelConfig::new_or_fail(&model_name);
-                match goose::providers::ollama::OllamaProvider::from_env(cfg).await {
-                    Ok(p) => {
-                        println!("[model-switch] Ollama provider ready for '{}'", model_name);
-                        Some(Arc::new(p))
-                    }
-                    Err(e) => {
-                        println!(
-                            "[model-switch] FAILED to build Ollama provider for '{}': {e}",
-                            model_name
-                        );
-                        tracing::warn!("Failed to build ollama provider: {e}");
-                        None
+                // llamafile uses the Ollama wire protocol over HTTP.
+                "llamafile" => {
+                    std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
+                    std::env::set_var("OLLAMA_TIMEOUT", "600");
+                    let model_name = if settings.chat_model.is_empty() {
+                        "llamafile".to_string()
+                    } else {
+                        settings.chat_model.clone()
+                    };
+                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                    tracing::debug!(
+                        "[model-switch] building llamafile OllamaProvider for '{}'...",
+                        model_name
+                    );
+                    match goose::providers::ollama_def::from_env(None).await {
+                        Ok(p) => {
+                            tracing::debug!(
+                                "[model-switch] llamafile provider ready for '{}'",
+                                model_name
+                            );
+                            Some((Arc::new(p), cfg))
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "[model-switch] FAILED to build llamafile provider for '{}': {e}",
+                                model_name
+                            );
+                            tracing::warn!("Failed to build llamafile provider: {e}");
+                            None
+                        }
                     }
                 }
-            }
-            _ => {
-                println!(
-                    "[model-switch] unknown provider '{}', keeping current",
-                    settings.chat_provider
-                );
-                None
-            }
-        };
+                "ollama" => {
+                    let ollama_host = std::env::var("GIAP_OLLAMA_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                    std::env::set_var("OLLAMA_HOST", &ollama_host);
+                    std::env::set_var("OLLAMA_TIMEOUT", "600");
+                    let model_name = if settings.chat_model.is_empty() {
+                        "llama3.2".to_string()
+                    } else {
+                        settings.chat_model.clone()
+                    };
+                    tracing::debug!(
+                        "[model-switch] building Ollama provider for '{}'...",
+                        model_name
+                    );
+                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                    match goose::providers::ollama_def::from_env(None).await {
+                        Ok(p) => {
+                            tracing::debug!(
+                                "[model-switch] Ollama provider ready for '{}'",
+                                model_name
+                            );
+                            Some((Arc::new(p), cfg))
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "[model-switch] FAILED to build Ollama provider for '{}': {e}",
+                                model_name
+                            );
+                            tracing::warn!("Failed to build ollama provider: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    tracing::debug!(
+                        "[model-switch] unknown provider '{}', keeping current",
+                        settings.chat_provider
+                    );
+                    None
+                }
+            };
 
-        if let Some(p) = provider {
-            println!(
+        if let Some((p, model_cfg)) = provider {
+            tracing::debug!(
                 "[model-switch] swapping Goose provider to {}:{} for session {}",
-                settings.chat_provider, settings.chat_model, session_id
+                settings.chat_provider,
+                settings.chat_model,
+                session_id
             );
             tracing::info!(
                 target: "giap::trace",
@@ -562,7 +607,7 @@ impl GooseAdapter {
                 model = %settings.chat_model,
                 "Switching Goose provider"
             );
-            self.agent.update_provider(p, session_id).await?;
+            self.agent.update_provider(p, model_cfg, session_id).await?;
             *self
                 .last_provider_key
                 .lock()
@@ -573,7 +618,7 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
-            println!(
+            tracing::debug!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
                 caps.vision,
@@ -592,14 +637,168 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = 0;
 
-            println!("[model-switch] swap complete, key={}", key);
+            tracing::debug!("[model-switch] swap complete, key={}", key);
         } else {
-            println!(
+            tracing::debug!(
                 "[model-switch] no provider built for {}:{}",
-                settings.chat_provider, settings.chat_model
+                settings.chat_provider,
+                settings.chat_model
             );
         }
         Ok(())
+    }
+
+    /// Arc-clone handle for the per-session last-prompt-token feedback map,
+    /// usable inside the 'static stream closure.
+    fn last_prompt_tokens_handle(&self) -> Arc<Mutex<HashMap<String, u32>>> {
+        // The map lives behind the adapter's Arc; expose a shared handle by
+        // storing it in an Arc on first use. (Field is Mutex<HashMap>; wrap
+        // the read/write through a dedicated Arc kept in self via OnceLock.)
+        self.last_prompt_tokens_arc
+            .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    /// Deterministically trim goose's stored conversation for this session:
+    /// strip stale <system-context> blocks from prior user turns, splice the
+    /// rolling <conversation-summary>, and drop the oldest complete turns
+    /// beyond the profile's history budget. Never calls a model; errors are
+    /// logged and skipped — a failed trim must never block the turn.
+    async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
+        use pond_core::models::services::context::context_budget::CompactionProfile;
+        use pond_core::models::services::context::turn_trimmer::{
+            trim_history, TrimMessage, TrimRole,
+        };
+
+        let conversation = match self.session_manager.get_session(goose_sid, true).await {
+            Ok(s) => match s.conversation {
+                Some(c) => c,
+                None => return,
+            },
+            Err(e) => {
+                tracing::debug!("trim: goose session unavailable: {e}");
+                return;
+            }
+        };
+        let source = conversation.messages().clone();
+        if source.is_empty() {
+            return;
+        }
+
+        // Rolling summary from GIAP storage (idle-refreshed).
+        let rolling_summary = match &self.giap_session_storage {
+            Some(storage) => storage
+                .get_rolling_summary(giap_session_id)
+                .await
+                .ok()
+                .and_then(|(s, _)| s),
+            None => None,
+        };
+
+        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let last_real = self
+            .last_prompt_tokens_handle()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(giap_session_id)
+            .copied();
+
+        let trim_input: Vec<TrimMessage> = source
+            .iter()
+            .enumerate()
+            .map(|(index, m)| {
+                let has_tool_response = m.content.iter().any(|c| {
+                    matches!(
+                        c,
+                        goose::conversation::message::MessageContent::ToolResponse(_)
+                    )
+                });
+                let text = m.as_concat_text();
+                let role = if has_tool_response {
+                    TrimRole::ToolResult
+                } else {
+                    match m.role {
+                        rmcp::model::Role::User => TrimRole::User,
+                        rmcp::model::Role::Assistant => TrimRole::Assistant,
+                    }
+                };
+                let is_summary = text.trim_start().starts_with("<conversation-summary>");
+                TrimMessage {
+                    index,
+                    role,
+                    text,
+                    is_summary,
+                }
+            })
+            .collect();
+
+        let outcome = trim_history(trim_input, &profile, rolling_summary.as_deref(), last_real);
+        if !outcome.changed {
+            return;
+        }
+
+        // Rebuild: original messages survive untouched unless (a) they are the
+        // spliced summary (fresh user message) or (b) their text changed AND
+        // they are plain-text messages — structured messages (tool requests /
+        // responses, thinking) are never rewritten, only kept or dropped.
+        let mut rebuilt: Vec<goose::conversation::message::Message> = Vec::new();
+        for tm in &outcome.messages {
+            if tm.is_summary || tm.index == usize::MAX {
+                rebuilt.push(goose::conversation::message::Message::user().with_text(&tm.text));
+                continue;
+            }
+            let original = &source[tm.index];
+            let text_only = original
+                .content
+                .iter()
+                .all(|c| matches!(c, goose::conversation::message::MessageContent::Text(_)));
+            if text_only && original.as_concat_text() != tm.text {
+                let mut m = match original.role {
+                    rmcp::model::Role::User => {
+                        goose::conversation::message::Message::user().with_text(&tm.text)
+                    }
+                    rmcp::model::Role::Assistant => {
+                        goose::conversation::message::Message::assistant().with_text(&tm.text)
+                    }
+                };
+                m.id = original.id.clone();
+                m.created = original.created;
+                rebuilt.push(m);
+            } else {
+                rebuilt.push(original.clone());
+            }
+        }
+
+        let rebuilt_conversation = goose::conversation::Conversation::new_unvalidated(rebuilt);
+        match self
+            .session_manager
+            .replace_conversation(goose_sid, &rebuilt_conversation)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "giap::trace",
+                kind = "history_trim",
+                session_id = %giap_session_id,
+                dropped_turns = outcome.dropped_turns,
+                estimated_tokens = outcome.estimated_tokens,
+                summary_spliced = rolling_summary.is_some(),
+            ),
+            Err(e) => tracing::warn!("trim: replace_conversation failed: {e}"),
+        }
+    }
+
+    /// Attach GIAP session storage so the deterministic turn trimmer can
+    /// splice the rolling `<conversation-summary>` into the model's history.
+    pub fn with_giap_session_storage(
+        mut self,
+        storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    ) -> Self {
+        self.giap_session_storage = Some(storage);
+        self
     }
 
     /// Register a GGUF model in Goose's global `local_model_registry` so that
@@ -612,7 +811,7 @@ impl GooseAdapter {
     /// Idempotent: skips registration if the model is already known.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, ModelSettings,
+            get_registry, LocalModelEntry, LocalModelStorage, ModelSettings, ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -648,8 +847,9 @@ impl GooseAdapter {
 
                 if needs_register {
                     let mut settings = ModelSettings::default();
-                    settings.native_tool_calling = true;
-                    settings.use_jinja = true;
+                    // GIAP's local GGUFs (gemma family) support llama.cpp native
+                    // tool calling; force it rather than relying on Auto detection.
+                    settings.tool_calling = ToolCallingMode::ForceNative;
                     let entry = LocalModelEntry {
                         id: stem.clone(),
                         repo_id: format!("local/{}", stem),
@@ -657,11 +857,16 @@ impl GooseAdapter {
                         quantization: String::new(),
                         local_path,
                         source_url: String::new(),
+                        backend_id: None,
+                        // GIAP owns the file under its own data dir — Goose must
+                        // not treat it as deletable Goose-managed storage.
+                        storage: LocalModelStorage::ManualPath,
                         settings,
                         size_bytes: 0,
                         mmproj_path: None,
                         mmproj_source_url: None,
                         mmproj_size_bytes: 0,
+                        mmproj_checked: false,
                         shard_files: vec![],
                     };
                     match registry.add_model(entry) {
@@ -672,8 +877,8 @@ impl GooseAdapter {
                     }
                 } else if let Some(entry) = registry.get_model(&stem) {
                     let mut s = entry.settings.clone();
-                    if !s.native_tool_calling {
-                        s.native_tool_calling = true;
+                    if s.tool_calling == ToolCallingMode::Auto {
+                        s.tool_calling = ToolCallingMode::ForceNative;
                         let _ = registry.update_model_settings(&stem, s);
                     }
                 }
@@ -707,16 +912,16 @@ impl GooseAdapter {
                 .contains(&goose_sid);
             if needs_load {
                 let extensions = registered_extensions();
-                println!(
-                    "[goose-adapter] Loading {} GIAP extensions into session {}",
-                    extensions.len(),
-                    goose_sid
-                );
+                let total = extensions.len();
+                let mut loaded = 0usize;
                 for ext_name in extensions {
-                    println!("[goose-adapter] Loading extension: {ext_name}");
                     match self.add_builtin_extension(ext_name, &goose_sid).await {
-                        Ok(()) => println!("[goose-adapter]   ✓ {ext_name} loaded"),
-                        Err(e) => println!("[goose-adapter]   ✗ {ext_name} FAILED: {e}"),
+                        Ok(()) => {
+                            loaded += 1;
+                            tracing::debug!("giap extension loaded: {ext_name}");
+                        }
+                        // A failed extension is a real problem — surface it.
+                        Err(e) => tracing::warn!("giap extension failed to load: {ext_name}: {e}"),
                     }
                 }
                 self.loaded_sessions
@@ -724,12 +929,16 @@ impl GooseAdapter {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(goose_sid.clone());
 
-                // List discovered tools to verify extensions are working
+                // Verify tools are discovered; enumerate at debug, summarise once at info.
                 let tools = self.agent.list_tools(&goose_sid, None).await;
-                println!("[goose-adapter] Discovered {} tools:", tools.len());
                 for t in &tools {
-                    println!("[goose-adapter]   - {}", t.name);
+                    tracing::debug!("giap tool available: {}", t.name);
                 }
+                tracing::info!(
+                    target: "giap::trace",
+                    "giap extensions ready: {loaded}/{total} loaded, {} tools",
+                    tools.len()
+                );
             }
         }
 
@@ -844,8 +1053,11 @@ impl GooseAdapter {
             // Derive compact_prompt from the effective context window.
             // On small-context platforms (Jetson 3K, macOS Metal 8K), verbose
             // tool descriptions and detailed instructions waste precious tokens.
-            let effective_ctx =
-                Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+            let effective_ctx = Self::effective_context_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            );
             let compact_prompt =
                 pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                     effective_ctx,
@@ -869,6 +1081,11 @@ impl GooseAdapter {
                 available_tools,
                 thinking_enabled,
                 compact_prompt,
+                // Local llama.cpp providers inject the full tools JSON via the
+                // model's chat template (native tool calling) — the prompt
+                // template must not render its own "Available tools:" listing
+                // on top of that, or every schema is fed to the model twice.
+                native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
@@ -939,19 +1156,29 @@ impl GooseAdapter {
             self.agent.override_system_prompt(system_prompt).await;
         }
 
+        // Extras and skills are appended AFTER the partitioned prompt and sit
+        // OUTSIDE prefix_hash by design (see models/services/prompt_builder.rs).
+        // Each body is wrapped in an <extension-notes> envelope so small models
+        // can tell injected extension guidance apart from the core prompt
+        // sections of the v2 tag skeleton.
         if let Ok(extras) = extras_result {
             for extra in extras {
-                self.agent
-                    .extend_system_prompt(extra.key, extra.instruction)
-                    .await;
+                let body = format!(
+                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
+                    extra.key, extra.instruction
+                );
+                self.agent.extend_system_prompt(extra.key, body).await;
             }
         }
 
         if let Ok(skills) = skills_result {
             for skill in skills {
-                self.agent
-                    .extend_system_prompt(format!("skill:{}", skill.name), skill.content)
-                    .await;
+                let key = format!("skill:{}", skill.name);
+                let body = format!(
+                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
+                    key, skill.content
+                );
+                self.agent.extend_system_prompt(key, body).await;
             }
         }
 
@@ -963,8 +1190,11 @@ impl GooseAdapter {
         // Derive a CompactionProfile from the effective context window so
         // memory injection doesn't eat into the already-tight KV cache on
         // small-context platforms (Jetson 3K, macOS Metal 8K).
-        let effective_ctx =
-            Self::effective_context_window(&settings.chat_provider, &settings.chat_model);
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        );
         let compaction_profile =
             pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                 effective_ctx,
@@ -1226,8 +1456,12 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
-        let session_mgr = self.session_manager.clone();
-        let goose_sid_for_usage = goose_sid.clone();
+        let last_prompt_tokens_map = self.last_prompt_tokens_handle();
+
+        // ── Deterministic in-turn trim (hybrid compaction, GIAP-owned) ──
+        if settings.hybrid_compaction_enabled {
+            self.trim_goose_history(&goose_sid, &session_id).await;
+        }
 
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
@@ -1268,6 +1502,8 @@ impl GooseAdapter {
                 }
             };
 
+            let mut turn_stats = pond_core::shared::domain::turn_stats::TurnStats::default();
+            let mut saw_usage = false;
             while let Some(event_result) = goose_stream.next().await {
                 match event_result {
                     Ok(event) => match event {
@@ -1359,6 +1595,44 @@ impl GooseAdapter {
                         goose::agents::AgentEvent::HistoryReplaced(_) => {
                             yield Ok(AgentStreamEvent::Status { content: "Compacting context...".to_string() });
                         }
+                        // Per-inference usage from the provider. A turn can hold
+                        // several inferences (tool round-trips): the FINAL one's
+                        // input is the turn's real context load; outputs sum.
+                        goose::agents::AgentEvent::Usage(pu) => {
+                            saw_usage = true;
+                            turn_stats.inference_count += 1;
+                            if let Some(input) = pu.usage.input_tokens {
+                                turn_stats.prompt_tokens = input.max(0) as u32;
+                            }
+                            if let Some(output) = pu.usage.output_tokens {
+                                turn_stats.completion_tokens += output.max(0) as u32;
+                            }
+                            if let Some(stats) = &pu.stats {
+                                if turn_stats.ttft_ms.is_none() {
+                                    turn_stats.ttft_ms = stats.time_to_first_token_ms;
+                                }
+                                if let Some(load) = stats.model_load_ms {
+                                    turn_stats.model_load_ms =
+                                        Some(turn_stats.model_load_ms.unwrap_or(0) + load);
+                                }
+                                if let Some(prefill) = stats.prefill_ms {
+                                    turn_stats.prefill_ms =
+                                        Some(turn_stats.prefill_ms.unwrap_or(0) + prefill);
+                                }
+                                if let Some(elapsed) = stats.elapsed_ms {
+                                    let decode =
+                                        elapsed.saturating_sub(stats.prefill_ms.unwrap_or(0));
+                                    turn_stats.decode_ms =
+                                        Some(turn_stats.decode_ms.unwrap_or(0) + decode);
+                                }
+                                if let Some(n_ctx) = stats.effective_context_tokens {
+                                    turn_stats.context_limit_tokens = Some(n_ctx as u32);
+                                }
+                                if let Some(draft) = &stats.draft {
+                                    turn_stats.draft_accept_rate = Some(draft.accept_rate as f32);
+                                }
+                            }
+                        }
                         _ => {}
                     },
                     Err(e) => {
@@ -1366,27 +1640,28 @@ impl GooseAdapter {
                     }
                 }
             }
-            // Read real token usage from Goose's session metrics (tracked by
-            // the provider during inference). Fall back to chars/4 heuristic
-            // if the session isn't available or counts are missing.
-            let usage = match session_mgr.get_session(&goose_sid_for_usage, false).await {
-                Ok(goose_session) => {
-                    let input = goose_session.accumulated_input_tokens
-                        .map(|t| t.max(0) as u32)
-                        .unwrap_or((user_msg_len / 4).max(1) as u32);
-                    let output = goose_session.accumulated_output_tokens
-                        .map(|t| t.max(0) as u32)
-                        .unwrap_or((total_output_chars / 4).max(1) as u32);
-                    pond_core::models::ports::provider::UsageStats {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                    }
+            // Per-turn usage from the provider's per-inference Usage events.
+            // Fall back to the chars/4 heuristic only when the provider emitted
+            // no Usage events at all (some HTTP providers).
+            let usage = if saw_usage {
+                turn_stats.context_used_tokens = Some(turn_stats.prompt_tokens);
+                pond_core::models::ports::provider::UsageStats {
+                    prompt_tokens: turn_stats.prompt_tokens,
+                    completion_tokens: turn_stats.completion_tokens,
                 }
-                Err(_) => pond_core::models::ports::provider::UsageStats {
+            } else {
+                pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: (user_msg_len / 4).max(1) as u32,
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
-                },
+                }
             };
+            turn_stats.finalize_rates();
+            if saw_usage {
+                last_prompt_tokens_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_id.clone(), turn_stats.prompt_tokens);
+            }
             let total_latency_ms = turn_start.elapsed().as_millis() as u64;
             tracing::info!(
                 target: "giap::trace",
@@ -1395,8 +1670,15 @@ impl GooseAdapter {
                 prompt_tokens = usage.prompt_tokens,
                 completion_tokens = usage.completion_tokens,
                 total_latency_ms,
+                ttft_ms = turn_stats.ttft_ms,
+                prefill_ms = turn_stats.prefill_ms,
+                decode_tok_per_sec = turn_stats.decode_tok_per_sec,
+                context_used_tokens = turn_stats.context_used_tokens,
+                context_limit_tokens = turn_stats.context_limit_tokens,
+                inference_count = turn_stats.inference_count,
             );
-            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage) });
+            let stats = saw_usage.then_some(turn_stats);
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage), stats });
         };
 
         Ok(Box::pin(stream))

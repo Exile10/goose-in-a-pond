@@ -404,6 +404,19 @@
   color: var(--color-destructive);
 }
 
+/* Per-turn inference stats footer */
+.turn-stats-footer {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+  margin-top: 4px;
+  padding-left: 2px;
+  line-height: 1.4;
+}
+
 /* Voice icon button in header */
 .chat2__voice-btn {
   width: 42px;

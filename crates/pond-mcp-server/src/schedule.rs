@@ -253,12 +253,12 @@ impl ScheduleMcpServer {
         _ctx: RequestContext<RoleServer>,
         params: Parameters<CreateScheduleParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        println!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
-        println!("[schedule] ║ params.name:  {:?}", params.0.name);
-        println!("[schedule] ║ params.cron:  {:?}", params.0.cron);
-        println!("[schedule] ║ params.prompt: {:?}", params.0.prompt);
-        println!("[schedule] ║ params.extra: {:?}", params.0.extra);
-        println!("[schedule] ╚═══════════════════════════");
+        eprintln!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
+        eprintln!("[schedule] ║ params.name:  {:?}", params.0.name);
+        eprintln!("[schedule] ║ params.cron:  {:?}", params.0.cron);
+        eprintln!("[schedule] ║ params.prompt: {:?}", params.0.prompt);
+        eprintln!("[schedule] ║ params.extra: {:?}", params.0.extra);
+        eprintln!("[schedule] ╚═══════════════════════════");
 
         let user_msg = crate::last_user_message();
 
@@ -267,7 +267,7 @@ impl ScheduleMcpServer {
 
         let (tc_cron, tc_prompt, tc_name) =
             if let Some(args) = crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await {
-                println!("[schedule] ToolCaller generated: {:?}", args);
+                eprintln!("[schedule] ToolCaller generated: {:?}", args);
                 (
                     args.get("cron")
                         .and_then(|v| v.as_str())

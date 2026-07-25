@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 pub struct InMemorySessionStorage {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     messages: Arc<RwLock<HashMap<String, Vec<SessionMessage>>>>,
+    rolling_summaries: Arc<RwLock<HashMap<String, (String, String)>>>,
 }
 
 impl InMemorySessionStorage {
@@ -18,6 +19,7 @@ impl InMemorySessionStorage {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             messages: Arc::new(RwLock::new(HashMap::new())),
+            rolling_summaries: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -160,6 +162,32 @@ impl SessionStorage for InMemorySessionStorage {
                 .find(|m| m.message.role == Role::User)
                 .map(|m| m.message.content.clone())
         }))
+    }
+
+    async fn get_rolling_summary(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        Ok(self
+            .rolling_summaries
+            .read()
+            .await
+            .get(session_id)
+            .map(|(s, id)| (Some(s.clone()), Some(id.clone())))
+            .unwrap_or((None, None)))
+    }
+
+    async fn set_rolling_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.rolling_summaries.write().await.insert(
+            session_id.to_string(),
+            (summary.to_string(), through_message_id.to_string()),
+        );
+        Ok(())
     }
 }
 

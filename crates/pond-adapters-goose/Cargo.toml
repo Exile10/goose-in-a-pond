@@ -19,6 +19,9 @@ pond-core             = { path = "../pond-core", features = ["test-mocks"] }
 pond-mcp-server       = { path = "../pond-mcp-server" }
 pond-adapters-weather = { path = "../pond-adapters-weather" }
 goose            = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls", "local-inference"] }
+# ModelConfig and the Provider trait moved into the extracted goose-providers
+# crate and are not re-exported as types from `goose`.
+goose-providers  = { path = "../../goose/crates/goose-providers", default-features = false }
 rmcp             = { workspace = true }
 reqwest          = { workspace = true }
 anyhow = "1.0"
@@ -32,6 +35,9 @@ tracing = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = "0.7"
+# Default features on purpose: they include `builtins` (the `default`/`join`
+# filters), which goose's own minijinja dependency turns off.
+minijinja = "2.18"
 
 [dev-dependencies]
 tempfile = { workspace = true }

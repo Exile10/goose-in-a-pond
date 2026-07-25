@@ -4,10 +4,10 @@ use futures::StreamExt;
 use goose::agents::{Agent as GooseAgent, AgentConfig, ExtensionConfig, GoosePlatform};
 use goose::config::GooseMode;
 use goose::conversation::message::Message;
-use goose::model::ModelConfig;
 use goose::providers::base::{MessageStream, Provider, ProviderUsage};
-use goose::providers::errors::ProviderError;
 use goose::session::SessionManager;
+use goose_providers::errors::ProviderError;
+use goose_providers::model::ModelConfig;
 use rmcp::model::Tool;
 use serde_json::json;
 use std::sync::Arc;
@@ -25,14 +25,12 @@ impl Provider for MockInterceptProvider {
     async fn stream(
         &self,
         model_config: &ModelConfig,
-        session_id: &str,
         system: &str,
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         println!("=== MOCK PROVIDER RECEIVED PAYLOAD ===");
         println!("Model: {}", model_config.model_name);
-        println!("Session ID: {}", session_id);
         println!("System Prompt:\n{}\n", system);
 
         println!("Tools:");
@@ -62,10 +60,6 @@ impl Provider for MockInterceptProvider {
         Ok(goose::providers::base::stream_from_single_message(
             msg, usage,
         ))
-    }
-
-    fn get_model_config(&self) -> ModelConfig {
-        ModelConfig::new_or_fail("mock_model")
     }
 }
 
@@ -121,7 +115,11 @@ async fn main() -> Result<()> {
     // Inject our mock provider!
     let provider = MockInterceptProvider;
     agent
-        .update_provider(Arc::new(provider), &session_id)
+        .update_provider(
+            Arc::new(provider),
+            ModelConfig::new("mock_model"),
+            &session_id,
+        )
         .await?;
 
     // Override the system prompt like `GooseAdapter` does

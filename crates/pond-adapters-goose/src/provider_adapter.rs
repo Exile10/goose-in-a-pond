@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::conversation::message::Message as GooseMessage;
 use goose::providers::base::Provider as GooseProvider;
+use goose_providers::model::ModelConfig;
 use pond_core::models::domain::message::{ChatMessage, Role};
 use pond_core::models::ports::provider::LlmProvider;
 use std::sync::Arc;
@@ -10,16 +11,18 @@ use std::sync::Arc;
 ///
 /// Bridges pond's `LlmProvider` port to Goose's `Provider` trait.
 /// Converts between pond `ChatMessage` and Goose `Message` types.
+/// Goose providers are model-agnostic; the `ModelConfig` selects the model
+/// per call, so this adapter carries it alongside the provider.
 pub struct GooseProviderAdapter {
     provider: Arc<dyn GooseProvider>,
-    session_id: String,
+    model_config: ModelConfig,
 }
 
 impl GooseProviderAdapter {
-    pub fn new(provider: Arc<dyn GooseProvider>, session_id: String) -> Self {
+    pub fn new(provider: Arc<dyn GooseProvider>, model_config: ModelConfig) -> Self {
         Self {
             provider,
-            session_id,
+            model_config,
         }
     }
 
@@ -61,8 +64,9 @@ impl GooseProviderAdapter {
 #[async_trait]
 impl LlmProvider for GooseProviderAdapter {
     fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
-        let name = self.provider.get_model_config().model_name.clone();
-        pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(&name)
+        pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
+            &self.model_config.model_name,
+        )
     }
 
     async fn complete(
@@ -78,13 +82,10 @@ impl LlmProvider for GooseProviderAdapter {
             .map(Self::to_goose_message)
             .collect();
 
-        let model_config = self.provider.get_model_config();
-
         let (response, _usage) = self
             .provider
             .complete(
-                &model_config,
-                &self.session_id,
+                &self.model_config,
                 system_prompt,
                 &goose_messages,
                 &[], // no tools for direct completion
@@ -96,6 +97,6 @@ impl LlmProvider for GooseProviderAdapter {
     }
 
     fn model_name(&self) -> String {
-        self.provider.get_model_config().model_name.clone()
+        self.model_config.model_name.clone()
     }
 }

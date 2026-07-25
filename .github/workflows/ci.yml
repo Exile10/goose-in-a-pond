@@ -42,14 +42,17 @@ jobs:
           sudo apt-get clean || true
           df -h /
 
-      # Clone goose directly at the giap-patches-rmcp-1.5 branch HEAD.
-      # Bypasses submodule SHA pinning — the stored SHA may be unreachable after
-      # force-pushes. This branch is goose-main pinned to rmcp =1.5.0 (the old
-      # giap-patches MCP-session panic→warning patch is already subsumed upstream).
+      # Clone goose directly at the fork's main branch HEAD.
+      # Bypasses submodule SHA pinning. jarida-io/Goose:main is upstream main
+      # (2026-07 sync) + the GIAP patch set (see docs/goose-patch-management.md).
+      # NOTE: parent main's ci.yml still names giap-patches-rmcp-1.5 until this
+      # branch merges — a BREAKING future sync must be staged on a side branch
+      # and only fast-forwarded into fork main together with the parent-side
+      # port, or older parent branches fail CI on fresh runs.
       - name: Checkout goose submodule
         run: |
           rm -rf goose
-          git clone --depth=1 --branch giap-patches-rmcp-1.5 https://github.com/jarida-io/Goose goose
+          git clone --depth=1 --branch main https://github.com/jarida-io/Goose goose
 
       - uses: dtolnay/rust-toolchain@stable
         with:

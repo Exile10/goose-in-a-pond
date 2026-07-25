@@ -14,3 +14,37 @@ vi.mock("framer-motion", () => ({
 if (typeof Element !== "undefined" && !Element.prototype.getAnimations) {
   Element.prototype.getAnimations = () => [];
 }
+
+// happy-dom 20 implements Storage via prototype accessors, which vitest's
+// global copying flattens into a bare object — localStorage.setItem ends up
+// undefined in tests. Replace it with a real in-memory Storage so client code
+// (token persistence, per-instance client id) behaves as in the browser.
+if (typeof globalThis.localStorage?.setItem !== "function") {
+  const store = new Map<string, string>();
+  const memoryStorage: Storage = {
+    get length() {
+      return store.size;
+    },
+    getItem: (k: string) => (store.has(k) ? (store.get(k) as string) : null),
+    setItem: (k: string, v: string) => {
+      store.set(k, String(v));
+    },
+    removeItem: (k: string) => {
+      store.delete(k);
+    },
+    clear: () => {
+      store.clear();
+    },
+    key: (i: number) => [...store.keys()][i] ?? null,
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    value: memoryStorage,
+    configurable: true,
+  });
+  if (typeof window !== "undefined") {
+    Object.defineProperty(window, "localStorage", {
+      value: memoryStorage,
+      configurable: true,
+    });
+  }
+}
