@@ -77,6 +77,10 @@ export class PondApiClient {
   private refreshToken: string | null = null;
   private tokenExpiresAt: number | null = null;
   private refreshPromise: Promise<void> | null = null;
+  // In-flight reactive re-authentication (after a 401). Shared so a burst of
+  // concurrent 401s re-pairs once and reuses the resulting token, instead of
+  // each request running its own handshake (a self-inflicted pairing storm).
+  private reauthPromise: Promise<string | null> | null = null;
 
   private static readonly LS_SESSION = "giap-session-token";
   private static readonly LS_REFRESH = "giap-refresh-token";
@@ -167,10 +171,9 @@ export class PondApiClient {
       });
       clearTimeout(timeoutId);
       if (res.status === 401 && !_retry) {
-        // Server restarted — in-memory session token was cleared. Re-handshake
-        // using the persisted refresh token, then retry once.
-        this.setToken(null);
-        await this.connect();
+        // The stored token was rejected (e.g. the server rotated it). Re-pair
+        // once, coalesced, then retry — see reauthenticate().
+        await this.reauthenticate();
         return this.request<T>(method, path, body, timeout, true);
       }
       if (!res.ok) {
@@ -610,6 +613,26 @@ export class PondApiClient {
    * (needs the server's current pairing code). Returns the active session
    * token, or `null` if none could be established.
    */
+  /**
+   * Re-authenticate after a rejected token, coalescing concurrent callers.
+   *
+   * A stale token fails every in-flight request at once (page load fires
+   * several), and without this each one would independently drop the token and
+   * run a full handshake — the burst of pairings seen in the server log. Here
+   * the first caller drops the rejected token and re-pairs; everyone else
+   * awaits the same promise and picks up the one fresh token. The token is
+   * cleared inside the shared body (once), so a late caller can't null a token
+   * a concurrent re-pair just obtained.
+   */
+  private reauthenticate(clientId = "pond-desktop"): Promise<string | null> {
+    if (this.reauthPromise) return this.reauthPromise;
+    this.reauthPromise = (async () => {
+      this.setToken(null); // force connect() past its "still-valid token" path
+      return this.connect(clientId);
+    })().finally(() => { this.reauthPromise = null; });
+    return this.reauthPromise;
+  }
+
   async connect(clientId = "pond-desktop"): Promise<string | null> {
     // 1. Stored session token still comfortably valid.
     if (this.token && this.tokenExpiresAt && Date.now() < this.tokenExpiresAt - 60_000) {
@@ -874,6 +897,31 @@ export class PondApiClient {
         }
         if (attempt === 2) throw e;
         await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+
+    // A rejected token (the server rotated it, or an app-held token went stale)
+    // must not surface as a chat error. Re-authenticate once — coalesced with
+    // any concurrent 401s — and reconnect with the fresh token. Unlike request(),
+    // this SSE path used to just throw, which is why a chat send could fail with
+    // "Invalid or expired token" while background calls quietly re-paired. This
+    // also stops an SSE reconnect from re-pairing every cycle.
+    if (res.status === 401) {
+      const fresh = await this.reauthenticate();
+      if (fresh) {
+        headers["Authorization"] = `Bearer ${fresh}`;
+        const retryController = new AbortController();
+        const retryTimeout = setTimeout(() => retryController.abort(), 120_000);
+        try {
+          res = await fetch(`${this.base}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: retryController.signal,
+          });
+        } finally {
+          clearTimeout(retryTimeout);
+        }
       }
     }
 
