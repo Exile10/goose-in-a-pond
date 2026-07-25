@@ -298,6 +298,11 @@ pub struct Settings {
     #[serde(default)]
     pub context_window_override: u32,
 
+    /// Show the per-turn inference stats footer (TTFT, tok/s, context) under
+    /// assistant messages in the desktop/web chat UIs.
+    #[serde(default)]
+    pub show_turn_stats: bool,
+
     /// GIAP-owned hybrid compaction (deterministic in-turn trim + idle rolling
     /// summary). When true, Goose's own auto-compaction is disabled for the
     /// live path. Default false until burn-in on-device.
@@ -628,6 +633,7 @@ impl Default for Settings {
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
             context_window_override: 0,
+            show_turn_stats: false,
             hybrid_compaction_enabled: false,
             summary_idle_secs: Self::default_summary_idle_secs(),
             agent_backend: Self::default_agent_backend(),
@@ -1269,6 +1275,7 @@ mod tests {
             "schedule_result_notify",
             "searxng_url",
             "show_thinking",
+            "show_turn_stats",
             "telemetry_enabled",
             "thinking_mode",
             "timezone",

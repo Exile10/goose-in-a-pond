@@ -213,6 +213,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.context_window_override.to_string()
         );
         upsert!(
+            "show_turn_stats",
+            if settings.show_turn_stats {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
             "hybrid_compaction_enabled",
             if settings.hybrid_compaction_enabled {
                 "true"
@@ -719,6 +727,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
                 s.context_window_override = v;
             }
         }
+        "show_turn_stats" => s.show_turn_stats = value == "true",
         "hybrid_compaction_enabled" => s.hybrid_compaction_enabled = value == "true",
         "summary_idle_secs" => {
             if let Ok(v) = value.parse() {
