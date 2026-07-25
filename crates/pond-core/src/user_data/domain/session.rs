@@ -9,6 +9,13 @@ pub struct SessionMessage {
     pub session_id: String,
     pub message: ChatMessage,
     pub created_at: DateTime<Utc>,
+    /// Real prompt-token count for the turn this message completed
+    /// (assistant rows only; None for user/tool rows and old rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    /// Real completion-token count for this assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
 }
 
 impl SessionMessage {
@@ -18,7 +25,16 @@ impl SessionMessage {
             session_id,
             message,
             created_at: Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
+    }
+
+    /// Attach the turn's real token counts (assistant rows).
+    pub fn with_token_counts(mut self, prompt: Option<u32>, completion: Option<u32>) -> Self {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self
     }
 }
 

@@ -1676,6 +1676,91 @@ async fn run_server(
         tracing::info!("memory consolidation enabled — triggers after 15 min inactivity");
     }
 
+    // ── Idle rolling-summary refresh (hybrid compaction, soft half) ──────
+    // Same contract as memory consolidation: inactivity-based, interruptible,
+    // never at startup. One loop serves every session in pond_system.db —
+    // including voice-child sessions, which share the DB. The refreshed
+    // summary reaches the model via the deterministic turn trimmer's
+    // <conversation-summary> splice.
+    if settings.hybrid_compaction_enabled {
+        let sum_storage = session_storage.clone();
+        let sum_provider = llm_provider.clone();
+        let sum_activity = last_user_activity.clone();
+        let idle_secs = settings.summary_idle_secs.max(30) as u64;
+
+        tokio::spawn(async move {
+            // "Never at startup": only sessions that saw a message AFTER this
+            // process started are candidates.
+            let started_at = chrono::Utc::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                let idle_for = sum_activity.read().await.elapsed();
+                if idle_for < std::time::Duration::from_secs(idle_secs) {
+                    continue;
+                }
+                let provider = match sum_provider.read().await.clone() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let sessions = match sum_storage.list_sessions().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for session in sessions {
+                    if session.updated_at < started_at {
+                        continue;
+                    }
+                    // Abort the refresh the moment activity resumes — the
+                    // on-device engine is serial and a user turn must never
+                    // wait behind a summary pass.
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let watcher_activity = sum_activity.clone();
+                    let watcher_cancel = cancel.clone();
+                    let baseline = idle_for;
+                    let watcher = tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            if watcher_activity.read().await.elapsed() < baseline {
+                                watcher_cancel.cancel();
+                                break;
+                            }
+                        }
+                    });
+
+                    let svc =
+                        pond_core::shared::services::session_summary::SessionSummaryService::new(
+                            provider.clone(),
+                            sum_storage.clone(),
+                        );
+                    match svc.refresh(&session.id, &cancel).await {
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::Refreshed { through_message_id }) => {
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "summary_refresh",
+                                session_id = %session.id,
+                                through_message_id = %through_message_id,
+                            );
+                        }
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::Cancelled) => {
+                            tracing::debug!("summary refresh cancelled by user activity");
+                            watcher.abort();
+                            break; // user is back — stop the whole sweep
+                        }
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::NothingToDo) => {}
+                        Err(e) => tracing::debug!("summary refresh failed: {e}"),
+                    }
+                    watcher.abort();
+                }
+            }
+        });
+        tracing::info!(
+            "hybrid compaction enabled — rolling-summary refresh after {}s idle",
+            settings.summary_idle_secs.max(30)
+        );
+    }
+
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
     // terminal in real time. Polls every second and only surfaces rows added
     // after startup, so existing history is not replayed.
@@ -3012,6 +3097,8 @@ async fn run_chat(
         } else {
             "goose"
         };
+        let trim_storage: Arc<dyn SessionStorage> =
+            Arc::new(SqliteSessionStorage::new(db.system.clone()));
         let (a, _ext_mgr, _tc, _tr) = build_goose_backend(
             agent_backend,
             &llamafile_url,
@@ -3028,7 +3115,7 @@ async fn run_chat(
             extras_repo,
             draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-            None,               // session_storage — not needed for goose backend
+            Some(trim_storage), // powers the trimmer's summary splice
             input == "whisper", // voice_mode
         )
         .await;
@@ -5276,6 +5363,12 @@ async fn build_goose_backend(
     .await
     {
         Ok(adapter) => {
+            // Session storage powers the deterministic turn trimmer's
+            // rolling-summary splice (hybrid compaction).
+            let adapter = match session_storage {
+                Some(storage) => adapter.with_giap_session_storage(storage),
+                None => adapter,
+            };
             if voice_mode {
                 adapter.set_voice_mode(true);
             }

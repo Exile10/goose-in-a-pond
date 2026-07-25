@@ -212,6 +212,15 @@ impl SettingsRepository for SqliteSettingsRepository {
             "context_window_override",
             settings.context_window_override.to_string()
         );
+        upsert!(
+            "hybrid_compaction_enabled",
+            if settings.hybrid_compaction_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("summary_idle_secs", settings.summary_idle_secs.to_string());
         // Answer review
         upsert!("review_mode", &settings.review_mode);
         upsert!("review_max_rounds", settings.review_max_rounds.to_string());
@@ -708,6 +717,12 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "context_window_override" => {
             if let Ok(v) = value.parse() {
                 s.context_window_override = v;
+            }
+        }
+        "hybrid_compaction_enabled" => s.hybrid_compaction_enabled = value == "true",
+        "summary_idle_secs" => {
+            if let Ok(v) = value.parse() {
+                s.summary_idle_secs = v;
             }
         }
         // Answer review

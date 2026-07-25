@@ -80,6 +80,8 @@ fn goose_message_to_pond(msg: &GooseMessage, session_id: &str) -> SessionMessage
             tool_call_id: None,
         },
         created_at,
+        prompt_tokens: None,
+        completion_tokens: None,
     }
 }
 

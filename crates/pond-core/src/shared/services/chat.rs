@@ -1464,7 +1464,8 @@ impl ChatService {
             Uuid::new_v4().to_string(),
             self.session_id.clone(),
             ChatMessage::assistant(assistant_text),
-        );
+        )
+        .with_token_counts(usage.map(|(p, _)| p), usage.map(|(_, c)| c));
         self.session_storage
             .add_message(self.session_id.clone(), sm)
             .await?;
@@ -1616,7 +1617,8 @@ impl ChatService {
             .await?;
 
         // Persist the assistant response and generate a title if needed.
-        self.persist_assistant_response(&outcome.text).await?;
+        self.persist_assistant_response(&outcome.text, outcome.usage.as_ref())
+            .await?;
         self.maybe_generate_title(&message, &outcome.text).await;
         self.record_turn_outcome(&outcome).await;
         Ok(outcome.text)
@@ -2030,12 +2032,20 @@ impl ChatService {
     /// `chat_stream_once` so the Q2-26 speculative path can persist the
     /// assistant turn *after* the transcript is confirmed, not during the
     /// speculative stream.
-    async fn persist_assistant_response(&self, full_text: &str) -> Result<()> {
+    async fn persist_assistant_response(
+        &self,
+        full_text: &str,
+        usage: Option<&crate::models::ports::provider::UsageStats>,
+    ) -> Result<()> {
         let assistant_msg = ChatMessage::assistant(full_text.to_string());
         let session_msg = SessionMessage::new(
             Uuid::new_v4().to_string(),
             self.session_id.clone(),
             assistant_msg,
+        )
+        .with_token_counts(
+            usage.map(|u| u.prompt_tokens),
+            usage.map(|u| u.completion_tokens),
         );
         self.session_storage
             .add_message(self.session_id.clone(), session_msg)
@@ -2056,6 +2066,7 @@ impl ChatService {
         &self,
         confirmed_message: &str,
         response_text: &str,
+        usage: Option<&crate::models::ports::provider::UsageStats>,
     ) -> Result<()> {
         let user_msg = ChatMessage::user(confirmed_message.to_string());
         let session_msg = SessionMessage::new(
@@ -2067,7 +2078,8 @@ impl ChatService {
             .add_message(self.session_id.clone(), session_msg)
             .await?;
 
-        self.persist_assistant_response(response_text).await?;
+        self.persist_assistant_response(response_text, usage)
+            .await?;
         // Prefer an LLM-summarized title when a provider is attached; otherwise
         // (the live GooseAdapter voice path builds ChatService WITHOUT a
         // provider) fall back to the deterministic first-message-derived title
@@ -2495,7 +2507,10 @@ impl ChatService {
                 let response_text = outcome.text.clone();
                 // Persist the confirmed turn exactly once (user + assistant),
                 // keyed to the confirmed transcript.
-                if let Err(e) = self.persist_confirmed_turn(input, &response_text).await {
+                if let Err(e) = self
+                    .persist_confirmed_turn(input, &response_text, outcome.usage.as_ref())
+                    .await
+                {
                     // Persistence failed (e.g. transient SQLITE_BUSY from serve +
                     // child both writing the WAL). The reply is already spoken, so
                     // surface the error but keep the conversation going — no
@@ -2931,7 +2946,11 @@ mod tests {
 
         // Confirmed transcript differs — commit the CONFIRMED one.
         service
-            .persist_confirmed_turn("what's the weather", &response.text)
+            .persist_confirmed_turn(
+                "what's the weather",
+                &response.text,
+                response.usage.as_ref(),
+            )
             .await
             .unwrap();
 
