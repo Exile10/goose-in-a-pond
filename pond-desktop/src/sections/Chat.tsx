@@ -11,7 +11,8 @@ import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
 import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
-import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary } from "../api/types";
+import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
+import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { filterThinking } from "../lib/thinkFilter";
 
 // Module-level counter — shared across session loads and live sends
@@ -51,6 +52,7 @@ interface Message {
   thinkingBlocks?: string[];
   modelRole?: string;
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
+  turnStats?: TurnStats;
   error?: boolean;
   historyToolNames?: string[];
 }
@@ -90,6 +92,7 @@ export function Chat() {
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [availableModels, setAvailableModels]     = useState<ModelEntry[]>([]);
   const [modelSwitching, setModelSwitching]       = useState(false);
+  const [showTurnStats, setShowTurnStats]         = useState(false);
 
   const bottomRef        = useRef<HTMLDivElement>(null);
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
@@ -188,6 +191,15 @@ export function Chat() {
       document.removeEventListener("keydown", handleKey);
     };
   }, [showModelSelector]);
+
+  // Load show_turn_stats once the server is reachable (cold-start safe:
+  // re-runs on the offline->online transition like the session loader below).
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    api.getSettings().then((s) => {
+      setShowTurnStats(s.show_turn_stats ?? false);
+    }).catch(() => {});
+  }, [state.serverOnline]);
 
   // Load most recent session on mount
   useEffect(() => {
@@ -355,6 +367,14 @@ export function Chat() {
           if (ev.model_name && ev.model_role) {
             dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: ev.model_name, modelRole: ev.model_role, completionTokens: ev.usage?.completion_tokens ?? 0 } });
           }
+        } else if (ev.type === "turn_stats") {
+          // Attach by id, not array position — a mid-stream session switch
+          // replaces `messages` with another conversation's history, and the
+          // stats must never land on one of those messages.
+          const stats = ev as unknown as TurnStats;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
+          );
         }
       }
     } catch (e) {
@@ -520,6 +540,10 @@ export function Chat() {
                       <> · {msg.tokenUsage.completion_tokens} tokens</>
                     )}
                   </span>
+                )}
+                {/* Inference stats footer */}
+                {msg.role === "agent" && !msg.streaming && showTurnStats && msg.turnStats && (
+                  <TurnStatsFooter stats={msg.turnStats} />
                 )}
               </div>
             </div>

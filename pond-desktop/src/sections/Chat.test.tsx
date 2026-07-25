@@ -12,6 +12,7 @@ vi.mock("../api/PondApiClient", () => ({
     listSessions: vi.fn(),
     getSessionMessages: vi.fn(),
     setToken: vi.fn(),
+    getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false }),
   },
 }));
 

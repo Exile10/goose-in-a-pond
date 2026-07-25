@@ -2,13 +2,14 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { filterThinking } from "../../lib/thinkFilter";
-import type { ChatEvent } from "../../api/types";
+import type { ChatEvent, TurnStats } from "../../api/types";
 import { HubIco, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { GooseAvatar } from "./chat/GooseAvatar";
 import { TypingIndicator } from "./chat/TypingIndicator";
 import { ResultCard } from "./chat/ResultCard";
 import type { CardKind } from "./chat/ResultCard";
+import { TurnStatsFooter } from "../../components/TurnStatsFooter";
 import "./chat.css";
 
 // ── Types ─────────────────────────────────────────────────────
@@ -19,6 +20,7 @@ interface ChatMessage {
   text: string;
   card?: CardKind;
   streaming?: boolean;
+  turnStats?: TurnStats;
 }
 
 // ── Constants ─────────────────────────────────────────────────
@@ -87,11 +89,13 @@ export function ChatHubView() {
       .then((s) => {
         const name = s.user_name?.trim() ?? "";
         setMsgs(makeSeed(name));
+        setShowTurnStats(s.show_turn_stats ?? false);
       })
       .catch(() => {});
   }, [state.serverOnline]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [showTurnStats, setShowTurnStats] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -190,6 +194,13 @@ export function ChatHubView() {
                 },
               ];
             });
+          } else if (ev.type === "turn_stats") {
+            // Attach by id, not array position, so a message-list refresh
+            // mid-stream can never misdirect the stats.
+            const stats = ev as unknown as TurnStats;
+            setMsgs((prev) =>
+              prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
+            );
           } else if (ev.done && ev.session_id) {
             sessionIdRef.current = ev.session_id;
             dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
@@ -277,6 +288,9 @@ export function ChatHubView() {
                 <div className="ch-card">
                   <ResultCard kind={m.card} />
                 </div>
+              )}
+              {m.who === "goose" && !m.streaming && showTurnStats && m.turnStats && (
+                <TurnStatsFooter stats={m.turnStats} />
               )}
             </div>
           </div>
