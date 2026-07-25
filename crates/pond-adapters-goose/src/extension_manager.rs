@@ -153,6 +153,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     envs: Envs::new(env_map),
                     env_keys: vec![],
                     timeout: None,
+                    cwd: None,
                     bundled: None,
                     available_tools: vec![],
                 }

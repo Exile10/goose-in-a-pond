@@ -36,9 +36,9 @@ pub use tool_caller::ToolCallerEngine;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
+use goose_providers::model::ModelConfig;
 use pond_adapters_goose::provider_adapter::GooseProviderAdapter;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
@@ -73,10 +73,7 @@ impl LocalInferenceLlmAdapter {
     /// `complete()` call via `InferenceRuntime::get_or_init()` (global
     /// singleton, thread-safe `StdMutex<Weak<>>`).
     pub async fn new(model_id: &str) -> Result<Self> {
-        let model_config = ModelConfig {
-            model_name: model_id.to_string(),
-            ..Default::default()
-        };
+        let model_config = ModelConfig::new(model_id);
 
         // On Jetson Orin Nano (CUDA build) apply hardware-specific settings to
         // the model registry entry so llama-cpp-2 picks them up at load time.
@@ -91,13 +88,13 @@ impl LocalInferenceLlmAdapter {
             "initialising LocalInferenceProvider for model: {}",
             model_id
         );
-        let provider = LocalInferenceProvider::from_env(model_config, vec![]).await?;
-        let session_id = uuid::Uuid::new_v4().to_string();
+        goose::providers::local_inference::configure_local_inference();
+        let provider = LocalInferenceProvider::from_env().await?;
 
         Ok(Self {
             inner: GooseProviderAdapter::new(
                 Arc::new(provider) as Arc<dyn GooseProvider>,
-                session_id,
+                model_config,
             ),
         })
     }
@@ -114,7 +111,8 @@ impl LocalInferenceLlmAdapter {
     /// - Raw filename: `"gemma-4-E2B-it-Q4_K_M.gguf"` (file must exist in `$data_dir/models/gguf/`)
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, model_id_from_repo, LocalModelEntry, ModelSettings,
+            get_registry, model_id_from_repo, LocalModelEntry, LocalModelStorage, ModelSettings,
+            ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -162,8 +160,7 @@ impl LocalInferenceLlmAdapter {
                     Ok(mut registry) => {
                         if !registry.has_model(&stem) {
                             let mut settings = ModelSettings::default();
-                            settings.native_tool_calling = true;
-                            settings.use_jinja = true;
+                            settings.tool_calling = ToolCallingMode::ForceNative;
                             let entry = LocalModelEntry {
                                 id: stem.clone(),
                                 repo_id: format!("local/{}", stem),
@@ -171,11 +168,14 @@ impl LocalInferenceLlmAdapter {
                                 quantization: String::new(),
                                 local_path,
                                 source_url: String::new(),
+                                backend_id: None,
+                                storage: LocalModelStorage::ManualPath,
                                 settings,
                                 size_bytes: 0,
                                 mmproj_path: None,
                                 mmproj_source_url: None,
                                 mmproj_size_bytes: 0,
+                                mmproj_checked: false,
                                 shard_files: vec![],
                             };
                             if let Err(e) = registry.add_model(entry) {
@@ -183,8 +183,8 @@ impl LocalInferenceLlmAdapter {
                             }
                         } else if let Some(entry) = registry.get_model(&stem) {
                             let mut s = entry.settings.clone();
-                            if !s.native_tool_calling {
-                                s.native_tool_calling = true;
+                            if s.tool_calling == ToolCallingMode::Auto {
+                                s.tool_calling = ToolCallingMode::ForceNative;
                                 let _ = registry.update_model_settings(&stem, s);
                             }
                         }
@@ -220,8 +220,7 @@ impl LocalInferenceLlmAdapter {
                 Ok(mut registry) => {
                     if !registry.has_model(&id) {
                         let mut settings = ModelSettings::default();
-                        settings.native_tool_calling = true;
-                        settings.use_jinja = true;
+                        settings.tool_calling = ToolCallingMode::ForceNative;
                         let entry = LocalModelEntry {
                             id: id.clone(),
                             repo_id: repo_id.to_string(),
@@ -229,11 +228,14 @@ impl LocalInferenceLlmAdapter {
                             quantization: quantization.to_string(),
                             local_path,
                             source_url,
+                            backend_id: None,
+                            storage: LocalModelStorage::ManualPath,
                             settings,
                             size_bytes: 0,
                             mmproj_path: None,
                             mmproj_source_url: None,
                             mmproj_size_bytes: 0,
+                            mmproj_checked: false,
                             shard_files: vec![],
                         };
                         if let Err(e) = registry.add_model(entry) {
@@ -241,8 +243,8 @@ impl LocalInferenceLlmAdapter {
                         }
                     } else if let Some(entry) = registry.get_model(&id) {
                         let mut s = entry.settings.clone();
-                        if !s.native_tool_calling {
-                            s.native_tool_calling = true;
+                        if s.tool_calling == ToolCallingMode::Auto {
+                            s.tool_calling = ToolCallingMode::ForceNative;
                             let _ = registry.update_model_settings(&id, s);
                         }
                     }
@@ -262,7 +264,7 @@ impl LocalInferenceLlmAdapter {
     #[cfg(not(feature = "cuda"))]
     fn apply_platform_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, ModelSettings,
+            get_registry, ModelSettings, ToolCallingMode,
         };
 
         let settings = ModelSettings {
@@ -278,13 +280,11 @@ impl LocalInferenceLlmAdapter {
             flash_attention: Some(true),
             // Unified memory — mlock is unnecessary and can cause issues.
             use_mlock: false,
-            // Jinja ON — Gemma 4's GGUF embeds a Jinja2 template that renders
-            // tool schemas into its native <|tool>declaration:NAME{...}<tool|> format.
-            // Without this, the model never sees tools in the format it was trained on.
-            use_jinja: true,
-            // Native tool calling ON — Gemma 4 produces <|tool_call>call:NAME{...}<tool_call|>
-            // which Goose's tool_parsing.rs already recognizes.
-            native_tool_calling: true,
+            // Native tool calling forced ON — Gemma 4 produces
+            // <|tool_call>call:NAME{...}<tool_call|> in its trained format. The
+            // GGUF's embedded (Jinja) chat template renders tool declarations;
+            // ChatTemplate::Embedded is the default so no override is needed.
+            tool_calling: ToolCallingMode::ForceNative,
             // Thinking OFF — GIAP handles thinking display through its own
             // PromptState + ThoughtFilter pipeline, not llama.cpp's native
             // reasoning_format which causes Gemma 4 E2B to produce immediate EOS.
@@ -349,7 +349,7 @@ impl LocalInferenceLlmAdapter {
     #[cfg(feature = "cuda")]
     fn apply_jetson_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, ModelSettings,
+            get_registry, ModelSettings, ToolCallingMode,
         };
 
         let jetson_settings = ModelSettings {
@@ -370,10 +370,10 @@ impl LocalInferenceLlmAdapter {
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
-            // Jinja ON — Gemma 4 needs Jinja for native tool declarations.
-            use_jinja: true,
-            // Native tool calling — Gemma 4 produces tool calls in its trained format.
-            native_tool_calling: true,
+            // Native tool calling forced ON — Gemma 4 produces tool calls in its
+            // trained format; the GGUF's embedded (Jinja) chat template renders the
+            // declarations (ChatTemplate::Embedded is the default).
+            tool_calling: ToolCallingMode::ForceNative,
             // Thinking OFF — GIAP handles thinking via PromptState + ThoughtFilter.
             ..Default::default()
         };

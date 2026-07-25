@@ -20,9 +20,9 @@ tracing = { workspace = true }
 reqwest = {workspace = true}
 fastembed = { workspace = true }
 # Handshake / pairing (#93): HMAC pairing proof + hashed tokens.
-sha2 = { workspace = true }
+sha2 = "0.10"
 hmac = { workspace = true }
-rand = { workspace = true }
+rand = "0.8"
 base64 = { workspace = true }
 subtle = { workspace = true }
 once_cell = { workspace = true }
