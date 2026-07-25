@@ -300,9 +300,13 @@ export class PondApiClient {
     return this.post<Device>("/api/v1/devices", req);
   }
 
-  /** Commission a Matter device onto the fabric with its setup code. */
-  commissionDevice(code: string): Promise<{ id: string; name: string; node_id: number }> {
-    return this.post("/api/v1/devices/commission", { code });
+  /** Commission a Matter device onto the fabric with its setup code, optionally
+   *  naming it (written to the device and used as its GIAP name). */
+  commissionDevice(
+    code: string,
+    name?: string,
+  ): Promise<{ id: string; name: string; node_id: number }> {
+    return this.post("/api/v1/devices/commission", name ? { code, name } : { code });
   }
 
   unregisterDevice(id: string): Promise<void> {
