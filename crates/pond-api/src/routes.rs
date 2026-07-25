@@ -2025,9 +2025,15 @@ async fn register_device(
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
 ///
 /// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
-/// name until it has joined the fabric. On success the bridge registers it from
-/// the controller's own report, so there is no second, manual registry write
-/// here — the device simply appears in the Devices list.
+/// name until it has joined the fabric. Optionally takes a `name`, which is
+/// written to the device's NodeLabel and stored as its registry name so chat
+/// resolution ("turn on the living room light") matches it.
+///
+/// The registry row is ensured here from the commission response rather than
+/// left to the bridge: the bridge's discovery is asynchronous, so relying on it
+/// would race the user's chosen name. Registering by device id is idempotent —
+/// whichever of the two runs first, the other sees the row and does not
+/// duplicate it.
 async fn commission_device(
     State(state): State<Arc<AppState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -2058,12 +2064,53 @@ async fn commission_device(
             )
         })?;
 
-    let device = commissioner.commission(code).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": e.to_string()})),
+    // Optional user-chosen name, trimmed; empty is treated as absent.
+    let name = req
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let device = commissioner
+        .commission(code, name.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    // Ensure the registry row exists with the intended name, regardless of
+    // whether the bridge got there first.
+    let registry = &state.device_registry;
+    let exists = registry
+        .get_device(&device.device_id)
+        .await
+        .map(|d| d.is_some())
+        .unwrap_or(false);
+    if exists {
+        if name.is_some() {
+            if let Err(e) = registry.rename(&device.device_id, &device.name).await {
+                tracing::warn!(device = %device.device_id, error = %e, "commission: rename failed");
+            }
+        }
+    } else if let Err(e) = registry
+        .register(
+            pond_core::user_data::ports::device_registry::RegisterDeviceRequest {
+                id: Some(device.device_id.clone()),
+                name: device.name.clone(),
+                device_type: device.device_type.clone(),
+                hostname: None,
+                capabilities: device.capabilities.clone(),
+                room: None,
+            },
         )
-    })?;
+        .await
+    {
+        tracing::warn!(device = %device.device_id, error = %e, "commission: registry write failed");
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -2079,6 +2126,30 @@ async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    // A Matter device must leave the fabric before its row is removed, or the
+    // controller re-announces it on the next start_listening and it reappears.
+    // If we cannot reach the controller to do so, the delete is refused rather
+    // than half-applied.
+    if let Some(node_id) = pond_core::user_data::ports::device_commissioning::matter_node_id(&id) {
+        let Some(commissioner) = state.commissioner.clone() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "Matter is off, so this device cannot be removed from the fabric. \
+                              Enable Matter and try again."
+                })),
+            ));
+        };
+        commissioner.decommission(node_id).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": format!("could not remove the device from the fabric: {e}")
+                })),
+            )
+        })?;
+    }
+
     state.device_registry.unregister(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

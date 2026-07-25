@@ -63,4 +63,13 @@ pub trait DeviceRegistry: Send + Sync {
 
     /// Update device last-seen / online status.
     async fn heartbeat(&self, device_id: &str) -> Result<()>;
+
+    /// Set a device's display name. Used when a Matter device is commissioned
+    /// with a user-chosen name (the bridge may have registered it first under a
+    /// fallback name), so the registry name — which chat resolution matches on —
+    /// reflects what the user typed. Default errors so the many test doubles need
+    /// no body; real registries override it.
+    async fn rename(&self, device_id: &str, _name: &str) -> Result<()> {
+        anyhow::bail!("this registry does not support renaming device '{device_id}'")
+    }
 }
