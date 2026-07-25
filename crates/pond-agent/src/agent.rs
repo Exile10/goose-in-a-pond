@@ -241,6 +241,9 @@ impl PondAgent {
             available_tools,
             thinking_enabled,
             compact_prompt: false,
+            // TODO(Q2-05): derive from the provider like GooseAdapter does
+            // (matches "local" | "gguf") when PondAgent is stabilised.
+            native_tools_json: false,
             prefix_hash: None,
         };
 
@@ -627,6 +630,8 @@ impl Agent for PondAgent {
                         session_id: session_id_persist.clone(),
                         message: msg,
                         created_at: chrono::Utc::now(),
+                        prompt_tokens: None,
+                        completion_tokens: None,
                     };
                     if let Err(e) = storage_ref
                         .add_message(session_id_persist.clone(), sm)
@@ -643,6 +648,7 @@ impl Agent for PondAgent {
                     session_id,
                     model_role,
                     usage: Some(total_usage),
+                    stats: None,
                 }))
                 .await;
         });

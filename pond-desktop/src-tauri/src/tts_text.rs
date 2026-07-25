@@ -45,13 +45,34 @@ pub fn strip_whisper_artifacts(text: &str) -> String {
 
     let lower = cleaned.to_lowercase();
     const EXACT_HALLUCINATIONS: &[&str] = &[
-        ".", "..", "...", ",", "!", "?",
-        "thank you", "thanks for watching", "thanks for listening",
-        "thanks", "you", "bye", "bye bye", "okay",
-        "the end", "subtitles by", "subtitle",
-        "so", "um", "uh", "hmm", "huh", "ah", "oh",
-        "i'm sorry", "i don't know",
-        "please subscribe", "like and subscribe",
+        ".",
+        "..",
+        "...",
+        ",",
+        "!",
+        "?",
+        "thank you",
+        "thanks for watching",
+        "thanks for listening",
+        "thanks",
+        "you",
+        "bye",
+        "bye bye",
+        "okay",
+        "the end",
+        "subtitles by",
+        "subtitle",
+        "so",
+        "um",
+        "uh",
+        "hmm",
+        "huh",
+        "ah",
+        "oh",
+        "i'm sorry",
+        "i don't know",
+        "please subscribe",
+        "like and subscribe",
     ];
     if EXACT_HALLUCINATIONS.iter().any(|h| lower == *h) {
         return String::new();
@@ -74,9 +95,17 @@ pub fn strip_whisper_artifacts(text: &str) -> String {
 /// Dismissal phrases that signal the user wants to end the conversation
 /// and return to wake word mode. NOT a hard exit — just "go to sleep".
 const DISMISSAL_PHRASES: &[&str] = &[
-    "bye", "goodbye", "good bye", "dismissed", "go to sleep",
-    "that's all", "thats all", "never mind", "nevermind",
-    "stop", "stop listening",
+    "bye",
+    "goodbye",
+    "good bye",
+    "dismissed",
+    "go to sleep",
+    "that's all",
+    "thats all",
+    "never mind",
+    "nevermind",
+    "stop",
+    "stop listening",
 ];
 
 /// Hard exit phrases that signal full voice pipeline shutdown.
@@ -103,9 +132,9 @@ pub fn tool_announcement(tool: &str) -> String {
     let name = tool.split("__").last().unwrap_or(tool);
     match name {
         "get_current_weather" | "get_weather" => "Let me check the weather.".to_string(),
-        "get_devices" | "list_devices"        => "Checking your devices.".to_string(),
-        "set_schedule" | "create_schedule"    => "Setting that up.".to_string(),
-        "save_memory"                         => "Got it, I'll remember that.".to_string(),
+        "get_devices" | "list_devices" => "Checking your devices.".to_string(),
+        "set_schedule" | "create_schedule" => "Setting that up.".to_string(),
+        "save_memory" => "Got it, I'll remember that.".to_string(),
         other => format!("Let me {}.", other.replace('_', " ")),
     }
 }
@@ -142,7 +171,9 @@ pub fn split_sentences(text: &str) -> (Vec<String>, String) {
                 let after = &remainder[next..];
                 if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
                     sentences.push(remainder[..next].to_string());
-                    remainder = after.trim_start_matches(|c: char| c == ' ' || c == '\n').to_string();
+                    remainder = after
+                        .trim_start_matches(|c: char| c == ' ' || c == '\n')
+                        .to_string();
                     found = true;
                     break;
                 }
@@ -220,7 +251,8 @@ fn strip_line_prefix(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("> ").or_else(|| line.strip_prefix('>')) {
         return rest.trim_start();
     }
-    if let Some(rest) = line.strip_prefix("- ")
+    if let Some(rest) = line
+        .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
         .or_else(|| line.strip_prefix("+ "))
     {
@@ -267,9 +299,7 @@ fn strip_inline_md(s: &str) -> String {
             }
         }
 
-        if chars.get(i..i + 2) == Some(&['*', '*'])
-            || chars.get(i..i + 2) == Some(&['_', '_'])
-        {
+        if chars.get(i..i + 2) == Some(&['*', '*']) || chars.get(i..i + 2) == Some(&['_', '_']) {
             let marker = [chars[i], chars[i + 1]];
             if let Some(close) = find_marker_close(&chars, i + 2, &marker) {
                 out.push_str(&chars[i + 2..close].iter().collect::<String>());
@@ -363,129 +393,232 @@ fn find_marker_close(chars: &[char], start: usize, marker: &[char]) -> Option<us
 /// Unit suffixes matched after a number. Sorted longest-first for greedy matching.
 const UNIT_SUFFIXES: &[(&str, &str)] = &[
     // ── Compound / slash units ──
-    ("km/h",  " kilometers per hour"),
-    ("mi/h",  " miles per hour"),
-    ("KB/s",  " kilobytes per second"),
-    ("MB/s",  " megabytes per second"),
-    ("m/s",   " meters per second"),
-    ("ft/s",  " feet per second"),
+    ("km/h", " kilometers per hour"),
+    ("mi/h", " miles per hour"),
+    ("KB/s", " kilobytes per second"),
+    ("MB/s", " megabytes per second"),
+    ("m/s", " meters per second"),
+    ("ft/s", " feet per second"),
     ("fl oz", " fluid ounces"),
     // ── Data (IEC binary) ──
-    ("KiB", " kibibytes"), ("MiB", " mebibytes"), ("GiB", " gibibytes"), ("TiB", " tebibytes"),
+    ("KiB", " kibibytes"),
+    ("MiB", " mebibytes"),
+    ("GiB", " gibibytes"),
+    ("TiB", " tebibytes"),
     // ── Data speed ──
-    ("kbps", " kilobits per second"), ("Mbps", " megabits per second"), ("Gbps", " gigabits per second"),
+    ("kbps", " kilobits per second"),
+    ("Mbps", " megabits per second"),
+    ("Gbps", " gigabits per second"),
     // ── Energy (long) ──
-    ("kWh", " kilowatt hours"), ("kcal", " kilocalories"), ("BTU", " B T U"),
+    ("kWh", " kilowatt hours"),
+    ("kcal", " kilocalories"),
+    ("BTU", " B T U"),
     // ── Frequency ──
-    ("THz", " terahertz"), ("GHz", " gigahertz"), ("MHz", " megahertz"), ("kHz", " kilohertz"),
+    ("THz", " terahertz"),
+    ("GHz", " gigahertz"),
+    ("MHz", " megahertz"),
+    ("kHz", " kilohertz"),
     // ── Power ──
-    ("GW", " gigawatts"), ("MW", " megawatts"), ("kW", " kilowatts"), ("mW", " milliwatts"),
+    ("GW", " gigawatts"),
+    ("MW", " megawatts"),
+    ("kW", " kilowatts"),
+    ("mW", " milliwatts"),
     // ── Voltage ──
-    ("kV", " kilovolts"), ("mV", " millivolts"),
+    ("kV", " kilovolts"),
+    ("mV", " millivolts"),
     // ── Current ──
-    ("mA", " milliamps"), ("μA", " microamps"),
+    ("mA", " milliamps"),
+    ("μA", " microamps"),
     // ── Resistance ──
-    ("MΩ", " megaohms"), ("kΩ", " kilohms"),
+    ("MΩ", " megaohms"),
+    ("kΩ", " kilohms"),
     // ── Pressure ──
-    ("MPa", " megapascals"), ("kPa", " kilopascals"),
+    ("MPa", " megapascals"),
+    ("kPa", " kilopascals"),
     ("mmHg", " millimeters of mercury"),
-    ("atm", " atmospheres"), ("bar", " bar"), ("psi", " P S I"),
+    ("atm", " atmospheres"),
+    ("bar", " bar"),
+    ("psi", " P S I"),
     // ── Energy ──
-    ("MJ", " megajoules"), ("kJ", " kilojoules"),
-    ("cal", " calories"), ("eV", " electron volts"), ("Wh", " watt hours"),
+    ("MJ", " megajoules"),
+    ("kJ", " kilojoules"),
+    ("cal", " calories"),
+    ("eV", " electron volts"),
+    ("Wh", " watt hours"),
     // ── Sound ──
-    ("dBA", " D B A"), ("dB", " decibels"),
+    ("dBA", " D B A"),
+    ("dB", " decibels"),
     // ── Duration ──
-    ("hrs", " hours"), ("sec", " seconds"), ("min", " minutes"),
-    ("ms", " milliseconds"), ("ns", " nanoseconds"), ("μs", " microseconds"),
+    ("hrs", " hours"),
+    ("sec", " seconds"),
+    ("min", " minutes"),
+    ("ms", " milliseconds"),
+    ("ns", " nanoseconds"),
+    ("μs", " microseconds"),
     ("hr", " hours"),
     // ── Data storage ──
-    ("KB", " kilobytes"), ("MB", " megabytes"), ("GB", " gigabytes"),
-    ("TB", " terabytes"), ("PB", " petabytes"), ("EB", " exabytes"),
+    ("KB", " kilobytes"),
+    ("MB", " megabytes"),
+    ("GB", " gigabytes"),
+    ("TB", " terabytes"),
+    ("PB", " petabytes"),
+    ("EB", " exabytes"),
     // ── Speed ──
-    ("mph", " miles per hour"), ("bps", " bits per second"),
+    ("mph", " miles per hour"),
+    ("bps", " bits per second"),
     // ── Area (with superscript) ──
-    ("km²", " square kilometers"), ("cm²", " square centimeters"),
-    ("m²", " square meters"), ("ft²", " square feet"), ("in²", " square inches"),
-    ("cm³", " cubic centimeters"), ("m³", " cubic meters"),
+    ("km²", " square kilometers"),
+    ("cm²", " square centimeters"),
+    ("m²", " square meters"),
+    ("ft²", " square feet"),
+    ("in²", " square inches"),
+    ("cm³", " cubic centimeters"),
+    ("m³", " cubic meters"),
     ("ha", " hectares"),
     // ── Length ──
-    ("km", " kilometers"), ("cm", " centimeters"), ("mm", " millimeters"),
-    ("nm", " nanometers"), ("μm", " micrometers"),
-    ("mi", " miles"), ("ft", " feet"), ("yd", " yards"),
+    ("km", " kilometers"),
+    ("cm", " centimeters"),
+    ("mm", " millimeters"),
+    ("nm", " nanometers"),
+    ("μm", " micrometers"),
+    ("mi", " miles"),
+    ("ft", " feet"),
+    ("yd", " yards"),
     // ── Weight ──
-    ("kg", " kilograms"), ("mg", " milligrams"), ("μg", " micrograms"),
-    ("lbs", " pounds"), ("lb", " pounds"), ("oz", " ounces"), ("st", " stone"),
+    ("kg", " kilograms"),
+    ("mg", " milligrams"),
+    ("μg", " micrograms"),
+    ("lbs", " pounds"),
+    ("lb", " pounds"),
+    ("oz", " ounces"),
+    ("st", " stone"),
     // ── Volume ──
-    ("mL", " milliliters"), ("dL", " deciliters"), ("kL", " kiloliters"),
-    ("gal", " gallons"), ("qt", " quarts"), ("pt", " pints"),
+    ("mL", " milliliters"),
+    ("dL", " deciliters"),
+    ("kL", " kiloliters"),
+    ("gal", " gallons"),
+    ("qt", " quarts"),
+    ("pt", " pints"),
     // ── Single-char units (last — shortest match) ──
-    ("Hz", " hertz"), ("Pa", " pascals"),
-    ("W", " watts"), ("V", " volts"), ("A", " amps"),
-    ("J", " joules"), ("Ω", " ohms"), ("L", " liters"),
-    ("m", " meters"), ("g", " grams"),
+    ("Hz", " hertz"),
+    ("Pa", " pascals"),
+    ("W", " watts"),
+    ("V", " volts"),
+    ("A", " amps"),
+    ("J", " joules"),
+    ("Ω", " ohms"),
+    ("L", " liters"),
+    ("m", " meters"),
+    ("g", " grams"),
 ];
 
 /// Currency symbols: (char, singular, plural).
 const CURRENCY_SYMBOLS: &[(char, &str, &str)] = &[
-    ('$', "dollar",   "dollars"),
-    ('£', "pound",    "pounds"),
-    ('€', "euro",     "euros"),
-    ('¥', "yen",      "yen"),
-    ('₹', "rupee",    "rupees"),
-    ('₽', "ruble",    "rubles"),
-    ('₩', "won",      "won"),
-    ('₪', "shekel",   "shekels"),
-    ('₦', "naira",    "naira"),
-    ('₱', "peso",     "pesos"),
-    ('₺', "lira",     "lira"),
-    ('₴', "hryvnia",  "hryvnias"),
-    ('₵', "cedi",     "cedis"),
-    ('₡', "colon",    "colones"),
-    ('₫', "dong",     "dong"),
-    ('₭', "kip",      "kip"),
-    ('₮', "tugrik",   "tugriks"),
-    ('₧', "peseta",   "pesetas"),
-    ('₣', "franc",    "francs"),
+    ('$', "dollar", "dollars"),
+    ('£', "pound", "pounds"),
+    ('€', "euro", "euros"),
+    ('¥', "yen", "yen"),
+    ('₹', "rupee", "rupees"),
+    ('₽', "ruble", "rubles"),
+    ('₩', "won", "won"),
+    ('₪', "shekel", "shekels"),
+    ('₦', "naira", "naira"),
+    ('₱', "peso", "pesos"),
+    ('₺', "lira", "lira"),
+    ('₴', "hryvnia", "hryvnias"),
+    ('₵', "cedi", "cedis"),
+    ('₡', "colon", "colones"),
+    ('₫', "dong", "dong"),
+    ('₭', "kip", "kip"),
+    ('₮', "tugrik", "tugriks"),
+    ('₧', "peseta", "pesetas"),
+    ('₣', "franc", "francs"),
 ];
 
 /// Standalone single-character symbols.
 const STANDALONE_SYMBOLS: &[(char, &str)] = &[
-    ('±', "plus or minus "), ('×', " times "), ('÷', " divided by "),
-    ('∞', "infinity"), ('≈', "approximately "), ('≤', "less than or equal to "),
-    ('≥', "greater than or equal to "), ('≠', "not equal to "),
-    ('√', "square root of "), ('π', "pi"),
-    ('²', " squared"), ('³', " cubed"),
-    ('½', "one half"), ('⅓', "one third"), ('⅔', "two thirds"),
-    ('¼', "one quarter"), ('¾', "three quarters"),
-    ('⅕', "one fifth"), ('⅖', "two fifths"), ('⅗', "three fifths"), ('⅘', "four fifths"),
-    ('⅙', "one sixth"), ('⅚', "five sixths"),
-    ('⅛', "one eighth"), ('⅜', "three eighths"), ('⅝', "five eighths"), ('⅞', "seven eighths"),
-    ('©', "copyright"), ('®', "registered"), ('™', "trademark"),
-    ('§', "section"), ('¶', "paragraph"),
-    ('†', ""), ('‡', ""),
+    ('±', "plus or minus "),
+    ('×', " times "),
+    ('÷', " divided by "),
+    ('∞', "infinity"),
+    ('≈', "approximately "),
+    ('≤', "less than or equal to "),
+    ('≥', "greater than or equal to "),
+    ('≠', "not equal to "),
+    ('√', "square root of "),
+    ('π', "pi"),
+    ('²', " squared"),
+    ('³', " cubed"),
+    ('½', "one half"),
+    ('⅓', "one third"),
+    ('⅔', "two thirds"),
+    ('¼', "one quarter"),
+    ('¾', "three quarters"),
+    ('⅕', "one fifth"),
+    ('⅖', "two fifths"),
+    ('⅗', "three fifths"),
+    ('⅘', "four fifths"),
+    ('⅙', "one sixth"),
+    ('⅚', "five sixths"),
+    ('⅛', "one eighth"),
+    ('⅜', "three eighths"),
+    ('⅝', "five eighths"),
+    ('⅞', "seven eighths"),
+    ('©', "copyright"),
+    ('®', "registered"),
+    ('™', "trademark"),
+    ('§', "section"),
+    ('¶', "paragraph"),
+    ('†', ""),
+    ('‡', ""),
     ('•', ", "),
     ('—', ", "),
 ];
 
 /// Common abbreviations with periods.
 const ABBREVIATIONS: &[(&str, &str)] = &[
-    ("e.g.",  "for example"), ("i.e.",  "that is"), ("etc.",  "etcetera"),
-    ("vs.",   "versus"), ("approx.", "approximately"),
-    ("dept.", "department"), ("govt.", "government"),
-    ("inc.",  "incorporated"), ("corp.", "corporation"), ("ltd.",  "limited"),
-    ("prof.", "professor"), ("dr.", "doctor"), ("mr.", "mister"),
-    ("mrs.",  "missus"), ("ms.", "miss"), ("jr.", "junior"), ("sr.", "senior"),
-    ("st.",   "saint"), ("ave.", "avenue"), ("blvd.", "boulevard"),
-    ("ft.",   "fort"), ("mt.", "mount"),
-    ("no.",   "number"), ("vol.", "volume"), ("ch.", "chapter"),
-    ("pg.",   "page"), ("fig.", "figure"),
-    ("max.",  "maximum"), ("min.", "minimum"), ("temp.", "temperature"),
-    ("est.",  "established"),
-    ("jan.", "January"), ("feb.", "February"), ("mar.", "March"),
-    ("apr.", "April"), ("jun.", "June"), ("jul.", "July"),
-    ("aug.", "August"), ("sep.", "September"), ("oct.", "October"),
-    ("nov.", "November"), ("dec.", "December"),
+    ("e.g.", "for example"),
+    ("i.e.", "that is"),
+    ("etc.", "etcetera"),
+    ("vs.", "versus"),
+    ("approx.", "approximately"),
+    ("dept.", "department"),
+    ("govt.", "government"),
+    ("inc.", "incorporated"),
+    ("corp.", "corporation"),
+    ("ltd.", "limited"),
+    ("prof.", "professor"),
+    ("dr.", "doctor"),
+    ("mr.", "mister"),
+    ("mrs.", "missus"),
+    ("ms.", "miss"),
+    ("jr.", "junior"),
+    ("sr.", "senior"),
+    ("st.", "saint"),
+    ("ave.", "avenue"),
+    ("blvd.", "boulevard"),
+    ("ft.", "fort"),
+    ("mt.", "mount"),
+    ("no.", "number"),
+    ("vol.", "volume"),
+    ("ch.", "chapter"),
+    ("pg.", "page"),
+    ("fig.", "figure"),
+    ("max.", "maximum"),
+    ("min.", "minimum"),
+    ("temp.", "temperature"),
+    ("est.", "established"),
+    ("jan.", "January"),
+    ("feb.", "February"),
+    ("mar.", "March"),
+    ("apr.", "April"),
+    ("jun.", "June"),
+    ("jul.", "July"),
+    ("aug.", "August"),
+    ("sep.", "September"),
+    ("oct.", "October"),
+    ("nov.", "November"),
+    ("dec.", "December"),
 ];
 
 /// Convert symbols and abbreviations to their spoken equivalents.
@@ -531,7 +664,9 @@ pub fn normalize_for_speech(text: &str) -> String {
             let next_digit = chars.get(i + 1).map_or(false, |c| c.is_ascii_digit());
             if prev_digit && next_digit {
                 let mut j = i + 1;
-                while j < len && chars[j].is_ascii_digit() { j += 1; }
+                while j < len && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
                 let has_unit = try_read_unit_suffix(&chars, j).is_some();
                 if has_unit {
                     out.push(ch);
@@ -557,15 +692,35 @@ pub fn normalize_for_speech(text: &str) -> String {
         // ── Degree symbol ──
         if ch == '°' {
             match chars.get(i + 1) {
-                Some('C') | Some('c') => { out.push_str(" degrees Celsius");    i += 2; continue; }
-                Some('F') | Some('f') => { out.push_str(" degrees Fahrenheit"); i += 2; continue; }
-                Some('K') | Some('k') => { out.push_str(" kelvin");             i += 2; continue; }
-                _                     => { out.push_str(" degrees");            i += 1; continue; }
+                Some('C') | Some('c') => {
+                    out.push_str(" degrees Celsius");
+                    i += 2;
+                    continue;
+                }
+                Some('F') | Some('f') => {
+                    out.push_str(" degrees Fahrenheit");
+                    i += 2;
+                    continue;
+                }
+                Some('K') | Some('k') => {
+                    out.push_str(" kelvin");
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    out.push_str(" degrees");
+                    i += 1;
+                    continue;
+                }
             }
         }
 
         // ── Percent ──
-        if ch == '%' { out.push_str(" percent"); i += 1; continue; }
+        if ch == '%' {
+            out.push_str(" percent");
+            i += 1;
+            continue;
+        }
 
         // ── Currency symbols (table-driven) ──
         if let Some(&(_, singular, plural)) = CURRENCY_SYMBOLS.iter().find(|&&(c, _, _)| c == ch) {
@@ -585,32 +740,49 @@ pub fn normalize_for_speech(text: &str) -> String {
         if ch == '&' {
             let prev_space = i == 0 || chars[i - 1].is_whitespace();
             let next_space = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
-            if prev_space || next_space { out.push_str("and"); i += 1; continue; }
+            if prev_space || next_space {
+                out.push_str("and");
+                i += 1;
+                continue;
+            }
         }
 
         // ── At-sign ──
         if ch == '@' {
             let prev_space = i == 0 || chars[i - 1].is_whitespace();
             let next_space = chars.get(i + 1).map_or(true, |c| c.is_whitespace());
-            if prev_space || next_space { out.push_str("at"); i += 1; continue; }
+            if prev_space || next_space {
+                out.push_str("at");
+                i += 1;
+                continue;
+            }
         }
 
         // ── Number sign: #5 → "number 5" ──
         if ch == '#' && chars.get(i + 1).map_or(false, |c| c.is_ascii_digit()) {
-            out.push_str("number "); i += 1; continue;
+            out.push_str("number ");
+            i += 1;
+            continue;
         }
 
         // ── En dash: 3–5 → "3 to 5", otherwise a pause ──
         if ch == '–' {
             let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
             let next_digit = chars.get(i + 1).map_or(false, |c| c.is_ascii_digit());
-            if prev_digit && next_digit { out.push_str(" to "); } else { out.push_str(", "); }
-            i += 1; continue;
+            if prev_digit && next_digit {
+                out.push_str(" to ");
+            } else {
+                out.push_str(", ");
+            }
+            i += 1;
+            continue;
         }
 
         // ── Standalone symbol table ──
         if let Some(&(_, spoken)) = STANDALONE_SYMBOLS.iter().find(|&&(c, _)| c == ch) {
-            out.push_str(spoken); i += 1; continue;
+            out.push_str(spoken);
+            i += 1;
+            continue;
         }
 
         out.push(ch);
@@ -628,16 +800,27 @@ fn try_read_unit_suffix(chars: &[char], i: usize) -> Option<(String, usize)> {
     } else {
         (i, 0usize)
     };
-    if unit_start >= len { return None; }
+    if unit_start >= len {
+        return None;
+    }
 
     for &(suffix, spoken) in UNIT_SUFFIXES {
         let suffix_chars: Vec<char> = suffix.chars().collect();
         let slen = suffix_chars.len();
-        if unit_start + slen > len { continue; }
-        let matches = suffix_chars.iter().enumerate().all(|(j, &sc)| chars[unit_start + j] == sc);
-        if !matches { continue; }
+        if unit_start + slen > len {
+            continue;
+        }
+        let matches = suffix_chars
+            .iter()
+            .enumerate()
+            .all(|(j, &sc)| chars[unit_start + j] == sc);
+        if !matches {
+            continue;
+        }
         let after = unit_start + slen;
-        if after < len && chars[after].is_alphabetic() { continue; }
+        if after < len && chars[after].is_alphabetic() {
+            continue;
+        }
         return Some((spoken.to_string(), space_consumed + slen));
     }
     None
@@ -649,7 +832,9 @@ fn try_read_abbreviation(chars: &[char], i: usize) -> Option<(String, usize)> {
     let at_boundary = i == 0
         || chars[i - 1].is_whitespace()
         || matches!(chars[i - 1], '(' | ',' | '"' | '\'' | '[');
-    if !at_boundary { return None; }
+    if !at_boundary {
+        return None;
+    }
 
     let window_end = (i + 10).min(len);
     let window: String = chars[i..window_end]
@@ -692,9 +877,13 @@ fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
     while j < len && chars[j].is_ascii_digit() && j - h_start < 2 {
         j += 1;
     }
-    if j == h_start { return None; }
+    if j == h_start {
+        return None;
+    }
     let hour: u32 = chars[h_start..j].iter().collect::<String>().parse().ok()?;
-    if hour > 23 { return None; }
+    if hour > 23 {
+        return None;
+    }
     let hour_str: String = chars[h_start..j].iter().collect();
 
     let mut minute_str: Option<String> = None;
@@ -703,7 +892,9 @@ fn try_read_time(chars: &[char], start: usize) -> Option<(String, usize)> {
         let d2 = chars.get(j + 2)?;
         if d1.is_ascii_digit() && d2.is_ascii_digit() {
             let min: u32 = format!("{}{}", d1, d2).parse().ok()?;
-            if min > 59 { return None; }
+            if min > 59 {
+                return None;
+            }
             minute_str = Some(format!("{}{}", d1, d2));
             j += 3;
         } else {

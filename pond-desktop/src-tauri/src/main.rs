@@ -3,6 +3,7 @@
 
 mod audio;
 mod canvas_feed;
+mod chat_process;
 mod commands;
 mod hotkey;
 mod notifications;
@@ -12,7 +13,8 @@ mod tray;
 mod tts_text;
 
 use audio::{AudioState, WakeListenerState};
-use commands::{audio_cmd, desktop_cmd, server_cmd};
+use chat_process::VoiceChatProcess;
+use commands::{audio_cmd, desktop_cmd, server_cmd, voice_cmd};
 use process::ServerProcess;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -107,6 +109,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         // ── Managed state ────────────────────────────────────────────────────
         .manage(ServerProcess::new())
+        .manage(VoiceChatProcess::new())
         .manage(AudioState::new())
         .manage(WakeListenerState::new())
         .manage(hotkey::HotkeyState::new())
@@ -127,6 +130,9 @@ fn main() {
             audio_cmd::run_voice_pipeline,
             audio_cmd::start_wake_listener,
             audio_cmd::stop_wake_listener,
+            voice_cmd::start_voice_session,
+            voice_cmd::stop_voice_session,
+            voice_cmd::voice_session_active,
             desktop_cmd::enable_autostart,
             desktop_cmd::disable_autostart,
             desktop_cmd::is_autostart_enabled,
@@ -142,20 +148,49 @@ fn main() {
             // is available when api.ts executes at module load time.
             let default_url = "http://127.0.0.1:4000";
             let init_script = format!(r#"window.__GIAP_SERVER_URL__ = "{default_url}";"#);
-            tauri::WebviewWindowBuilder::new(
+
+            // Size the window to the actual display. On a small panel — e.g. a
+            // 7-inch 1024x600 kiosk display on the Jetson — a fixed 1280x860
+            // window overflows the screen and the title bar/top rows are lost,
+            // and a 600px min-height cannot fit under the desktop's top bar. So:
+            // fit the window to the monitor, drop the min so it can shrink to a
+            // small panel, and go borderless-fullscreen on small displays so the
+            // full 1024x600 is usable UI rather than window chrome. Roomy
+            // desktops keep the comfortable windowed size.
+            let (mon_w, mon_h) = app
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| {
+                    let s = m.size();
+                    let sf = m.scale_factor();
+                    (s.width as f64 / sf, s.height as f64 / sf)
+                })
+                .unwrap_or((1280.0, 860.0));
+            let small_display = mon_w <= 1100.0 || mon_h <= 700.0;
+            let win_w = 1280.0_f64.min(mon_w);
+            let win_h = 860.0_f64.min(mon_h);
+
+            let mut builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Goose In A Pond")
-            .inner_size(1280.0, 860.0)
-            .min_inner_size(900.0, 600.0)
+            .inner_size(win_w, win_h)
+            .min_inner_size(360.0, 480.0)
             .resizable(true)
-            .decorations(true)
             .center()
-            .initialization_script(&init_script)
-            .build()
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            .initialization_script(&init_script);
+            builder = if small_display {
+                // Kiosk: no chrome, use the whole panel.
+                builder.decorations(false).fullscreen(true)
+            } else {
+                builder.decorations(true)
+            };
+            builder
+                .build()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
             // macOS native menu bar (App + Edit + View)
             #[cfg(target_os = "macos")]
@@ -170,6 +205,16 @@ fn main() {
 
             // Build system tray
             tray::build_tray(&handle)?;
+
+            // Reap any leftover terminal-voice child from a previous run that
+            // crashed or was force-killed before it could stop cleanly, and
+            // reset the VoiceChildActive flag so the mic paths are not spuriously
+            // gated on launch. A freshly-constructed VoiceChatProcess has an
+            // empty in-memory slot, so this relies on the pidfile written at
+            // spawn to find a child orphaned by a hard kill of the shell — the
+            // pid is validated (alive AND a live `pond-server chat` process)
+            // before it is killed, so a reused pid is never touched.
+            handle.state::<VoiceChatProcess>().cleanup_orphaned_child();
 
             // Connect to (or spawn) pond-server in background
             let handle_server = handle.clone();
@@ -236,7 +281,10 @@ fn main() {
                 let mut last_recovery_error: Option<String> = None;
 
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                        HEALTH_CHECK_INTERVAL_SECS,
+                    ))
+                    .await;
                     let server = handle_health.state::<ServerProcess>();
                     let url = server.get_url();
                     if server.health_check(&url).await {
@@ -297,11 +345,13 @@ fn main() {
                             );
                         }
                         Err(e) => {
-                            consecutive_recovery_failures = consecutive_recovery_failures.saturating_add(1);
-                            let backoff_secs = calculate_recovery_backoff_secs(consecutive_recovery_failures);
+                            consecutive_recovery_failures =
+                                consecutive_recovery_failures.saturating_add(1);
+                            let backoff_secs =
+                                calculate_recovery_backoff_secs(consecutive_recovery_failures);
                             let error_message = e.clone();
-                            next_recovery_attempt = Instant::now()
-                                + tokio::time::Duration::from_secs(backoff_secs);
+                            next_recovery_attempt =
+                                Instant::now() + tokio::time::Duration::from_secs(backoff_secs);
                             last_recovery_error = Some(error_message.clone());
 
                             tray::set_tray_tooltip(&handle_health, "Disconnected");
@@ -330,8 +380,12 @@ fn main() {
         })
         // Handle macOS View menu items — emit events dispatched by AppContext
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "toggle-canvas" => { let _ = app.emit(hotkey::CANVAS_TOGGLE_EVENT, ()); }
-            "voice-mode"    => { let _ = app.emit("switch-to-voice", ()); }
+            "toggle-canvas" => {
+                let _ = app.emit(hotkey::CANVAS_TOGGLE_EVENT, ());
+            }
+            "voice-mode" => {
+                let _ = app.emit("switch-to-voice", ());
+            }
             _ => {}
         })
         // Keep app alive in tray when main window is closed
@@ -346,7 +400,16 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Failed to build Goose In A Pond desktop app")
         .run(|app, event| {
-            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                // Kill the terminal-voice child first so it releases the mic and
+                // speaker before we tear down the server it persists alongside.
+                // std::process::Child is NOT killed automatically on parent
+                // exit (and this shell is panic=abort), so this is the only
+                // guaranteed reap for the voice child.
+                app.state::<VoiceChatProcess>().kill();
                 let server = app.state::<ServerProcess>();
                 server.shutdown();
             }

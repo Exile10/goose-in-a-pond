@@ -19,6 +19,22 @@ pub const WHISPER: u16 = 9000;
 /// llamafile LLM subprocess (loopback only).
 pub const LLAMAFILE: u16 = 8080;
 
+/// The effective llamafile / llama-server base port.
+///
+/// `GIAP_LLAMAFILE_PORT` overrides the [`LLAMAFILE`] default. This matters when
+/// pond-server itself is bound to 8080 (its second-choice serve port): the
+/// llamafile fast-path probe ("something is answering on the port") would then
+/// hit pond-server's own dashboard and wire the LLM provider back at itself.
+/// The override also lets an externally managed OpenAI-compatible server
+/// (e.g. llama.cpp's `llama-server` on the Jetson) own the port — the provider
+/// path simply uses whatever answers there.
+pub fn llamafile_port() -> u16 {
+    std::env::var("GIAP_LLAMAFILE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LLAMAFILE)
+}
+
 /// Piper TTS in-process HTTP bridge (loopback only).
 pub const PIPER_TTS: u16 = 8282;
 

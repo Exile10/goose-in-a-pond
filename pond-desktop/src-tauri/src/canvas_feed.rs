@@ -92,7 +92,13 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
             },
         );
         if !session_id.is_empty() {
-            let _ = app.emit("session-created", SessionCreated { session_id, model_role });
+            let _ = app.emit(
+                "session-created",
+                SessionCreated {
+                    session_id,
+                    model_role,
+                },
+            );
         }
         return;
     }
@@ -148,10 +154,7 @@ pub fn dispatch_sse_event(app: &AppHandle, line: &str) {
                 .unwrap_or("unknown")
                 .to_string();
             // tool_result has the actual output in "content"
-            let content = value
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let content = value.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let data = if content.is_empty() {
                 serde_json::json!({})
             } else {

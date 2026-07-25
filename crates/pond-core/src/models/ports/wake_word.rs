@@ -43,6 +43,24 @@ pub trait StreamingWakeWordDetector: Send + Sync {
     fn activation_prompt(&self) -> &str {
         "Waiting for activation..."
     }
+
+    /// Whether this detector can meaningfully interrupt an in-flight turn.
+    ///
+    /// `run_loop` races the streaming agent turn against
+    /// `wait_for_activation_with_audio()` so a spoken wake word can barge in
+    /// mid-inference/mid-TTS. That race is only correct for detectors that
+    /// actually **wait** for real audio.
+    ///
+    /// A detector that resolves *immediately* (e.g. [`InstantActivation`] in
+    /// stdin / `--no-wake-word` / whisper-load-failure fallback) would win the
+    /// race before any turn could complete, aborting every turn. Such detectors
+    /// return `false` so `run_loop` awaits the turn directly without the
+    /// interrupt race. Real streaming detectors keep the default `true`.
+    ///
+    /// [`InstantActivation`]: crate::models::services::instant_activation::InstantActivation
+    fn supports_interruption(&self) -> bool {
+        true
+    }
 }
 
 // ── WakeWordDetector (deprecated, provided via blanket impl) ──────────────────

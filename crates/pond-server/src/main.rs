@@ -65,7 +65,7 @@ use pond_core::prompts::build_system_prompt;
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
-use pond_core::shared::services::print_output::PrintOutput;
+use pond_core::shared::services::print_output::{PrintOutput, SilentOutput};
 use pond_core::shared::services::stdin_input::StdinInput;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -177,6 +177,19 @@ enum Commands {
         /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
         #[arg(long)]
         tts_model: Option<std::path::PathBuf>,
+
+        /// Session id for conversation continuity + history. Defaults to
+        /// "default-session". The desktop shell passes a per-session uuid so
+        /// the chat sidebar can read history via GET /api/v1/sessions/{id}/messages.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Emit the workflow as newline-delimited JSON (NDJSON) on stdout, one
+        /// event per line. In this mode stdout carries NOTHING but JSON lines
+        /// (no banners, prompts, or emoji — those go to stderr); the Tauri shell
+        /// parses these lines to drive the desktop voice UI.
+        #[arg(long)]
+        json_events: bool,
     },
 
     /// Show system status
@@ -448,8 +461,20 @@ async fn async_main() -> Result<()> {
             no_wake_word,
             tts,
             tts_model,
+            session_id,
+            json_events,
         }) => {
-            let _log = tracing_setup::init_tracing(false, &data_dir);
+            // In --json-events mode, route diagnostics to stderr so stdout is
+            // reserved for NDJSON contract lines only.
+            let console = if json_events {
+                tracing_setup::ConsoleSink::Stderr
+            } else {
+                tracing_setup::ConsoleSink::Stdout
+            };
+            // Interactive voice/text chat: keep the console clean — WARN+ only
+            // for tracing; the curated turn lines + inference summary print via
+            // diag!/out!, and full detail still lands in the rolling log file.
+            let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console, true);
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
@@ -458,6 +483,8 @@ async fn async_main() -> Result<()> {
                 no_wake_word,
                 tts.as_deref(),
                 tts_model,
+                session_id.as_deref(),
+                json_events,
             )
             .await
         }
@@ -487,7 +514,18 @@ async fn async_main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            run_chat(None, None, "stdin", None, true, Some("none"), None).await
+            run_chat(
+                None,
+                None,
+                "stdin",
+                None,
+                true,
+                Some("none"),
+                None,
+                None,
+                false,
+            )
+            .await
         }
     }
 }
@@ -1231,14 +1269,14 @@ async fn run_server(
             .await
         {
             Some((proc, port)) => (Some(proc), port),
-            None => (None, ports::LLAMAFILE),
+            None => (None, ports::llamafile_port()),
         }
     } else {
         println!(
             "  ⏭  LLM: llamafile skipped (provider = {})",
             settings.chat_provider
         );
-        (None, ports::LLAMAFILE)
+        (None, ports::llamafile_port())
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
@@ -1636,6 +1674,91 @@ async fn run_server(
             }
         });
         tracing::info!("memory consolidation enabled — triggers after 15 min inactivity");
+    }
+
+    // ── Idle rolling-summary refresh (hybrid compaction, soft half) ──────
+    // Same contract as memory consolidation: inactivity-based, interruptible,
+    // never at startup. One loop serves every session in pond_system.db —
+    // including voice-child sessions, which share the DB. The refreshed
+    // summary reaches the model via the deterministic turn trimmer's
+    // <conversation-summary> splice.
+    if settings.hybrid_compaction_enabled {
+        let sum_storage = session_storage.clone();
+        let sum_provider = llm_provider.clone();
+        let sum_activity = last_user_activity.clone();
+        let idle_secs = settings.summary_idle_secs.max(30) as u64;
+
+        tokio::spawn(async move {
+            // "Never at startup": only sessions that saw a message AFTER this
+            // process started are candidates.
+            let started_at = chrono::Utc::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                let idle_for = sum_activity.read().await.elapsed();
+                if idle_for < std::time::Duration::from_secs(idle_secs) {
+                    continue;
+                }
+                let provider = match sum_provider.read().await.clone() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let sessions = match sum_storage.list_sessions().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for session in sessions {
+                    if session.updated_at < started_at {
+                        continue;
+                    }
+                    // Abort the refresh the moment activity resumes — the
+                    // on-device engine is serial and a user turn must never
+                    // wait behind a summary pass.
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let watcher_activity = sum_activity.clone();
+                    let watcher_cancel = cancel.clone();
+                    let baseline = idle_for;
+                    let watcher = tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            if watcher_activity.read().await.elapsed() < baseline {
+                                watcher_cancel.cancel();
+                                break;
+                            }
+                        }
+                    });
+
+                    let svc =
+                        pond_core::shared::services::session_summary::SessionSummaryService::new(
+                            provider.clone(),
+                            sum_storage.clone(),
+                        );
+                    match svc.refresh(&session.id, &cancel).await {
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::Refreshed { through_message_id }) => {
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "summary_refresh",
+                                session_id = %session.id,
+                                through_message_id = %through_message_id,
+                            );
+                        }
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::Cancelled) => {
+                            tracing::debug!("summary refresh cancelled by user activity");
+                            watcher.abort();
+                            break; // user is back — stop the whole sweep
+                        }
+                        Ok(pond_core::shared::services::session_summary::RefreshOutcome::NothingToDo) => {}
+                        Err(e) => tracing::debug!("summary refresh failed: {e}"),
+                    }
+                    watcher.abort();
+                }
+            }
+        });
+        tracing::info!(
+            "hybrid compaction enabled — rolling-summary refresh after {}s idle",
+            settings.summary_idle_secs.max(30)
+        );
     }
 
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
@@ -2822,6 +2945,24 @@ fn spawn_desktop_app(server_port: u16) {
     }
 }
 
+/// Write one `WorkflowEvent` to stdout as a single NDJSON line (JSON + `\n`,
+/// flushed immediately). This is the single framing helper for the
+/// `--json-events` contract; both the streaming event sink and the
+/// `ready`/`error`/`exit` lifecycle emissions in `run_chat` route through it so
+/// they can never drift into two inconsistently-framed families on the same
+/// pipe. Broken-pipe/partial-write errors are ignored: a dead shell means the
+/// child is being torn down anyway.
+fn write_ndjson_line(ev: &pond_core::shared::domain::agent::WorkflowEvent) {
+    use std::io::Write as _;
+    if let Some(line) = ev.to_ndjson() {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(line.as_bytes());
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
     model: Option<&str>,
@@ -2830,14 +2971,35 @@ async fn run_chat(
     no_wake_word: bool,
     tts: Option<&str>,
     tts_model: Option<std::path::PathBuf>,
+    session_id_arg: Option<&str>,
+    json_events: bool,
 ) -> Result<()> {
-    println!("  ╔═══════════════════════════════════════╗");
-    println!(
+    // In `--json-events` mode, stdout carries NOTHING but NDJSON lines. All the
+    // human-facing banners/prompts below route through `out!`, which no-ops when
+    // json_events is set. Diagnostics still reach stderr via `eout!`.
+    macro_rules! out {
+        ($($arg:tt)*) => {
+            if !json_events {
+                println!($($arg)*);
+            }
+        };
+    }
+
+    // Error/diagnostic output. Always writes to stderr, so it survives
+    // `--json-events` mode (which reserves stdout exclusively for NDJSON).
+    macro_rules! eout {
+        ($($arg:tt)*) => {
+            eprintln!($($arg)*);
+        };
+    }
+
+    out!("  ╔═══════════════════════════════════════╗");
+    out!(
         "  ║   🦆  Goose-in-a-Pond  v{}       ║",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  ║   Wait → Listen → Think → Speak      ║");
-    println!("  ╚═══════════════════════════════════════╝");
+    out!("  ║   Wait → Listen → Think → Speak      ║");
+    out!("  ╚═══════════════════════════════════════╝");
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
@@ -2876,9 +3038,10 @@ async fn run_chat(
             &effective_tts_owned
         }
     };
-    println!(
+    out!(
         "  Provider: {} (model: {})",
-        effective_provider, effective_model
+        effective_provider,
+        effective_model
     );
 
     // Resolve the whisper ggml model path (used by both the in-process backend
@@ -2909,7 +3072,7 @@ async fn run_chat(
                 });
         let whisper_model = data_dir.join("models").join(&whisper_filename);
         if !whisper_model.exists() {
-            println!(
+            out!(
                 "  📥 STT model not found — downloading ({})...",
                 whisper_model_name
             );
@@ -2920,10 +3083,10 @@ async fn run_chat(
                 match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
                 {
                     Ok(_) => {}
-                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
+                    Err(e) => out!("  ⚠  STT model download failed: {}", e),
                 }
             } else {
-                println!(
+                out!(
                     "  ⚠  STT model '{}' not in catalog — cannot download",
                     whisper_model_name
                 );
@@ -2985,7 +3148,7 @@ async fn run_chat(
 
     // Auto-start llamafile only when the provider is explicitly "llamafile".
     // Other providers (ollama, local, gguf, openai, etc.) manage their own process or need no process.
-    let mut llamafile_port = ports::LLAMAFILE;
+    let mut llamafile_port = ports::llamafile_port();
     let _llamafile_guard = if effective_provider == "llamafile" {
         match llamafile_process::try_start(&data_dir, chat_model_service, Some(effective_model))
             .await
@@ -3001,7 +3164,12 @@ async fn run_chat(
     };
     let llamafile_url = llamafile_process::url_for(llamafile_port);
 
-    let session_id = "default-session".to_string();
+    // `--session-id` replaces the historical hardcoded "default-session" so the
+    // desktop shell can pass a per-session uuid; the UI then reads history via
+    // GET /api/v1/sessions/{id}/messages. Defaults to "default-session" when
+    // absent (backward compatible). ensure_session_title still derives a
+    // readable sidebar title from the first user message on this session.
+    let session_id = session_id_arg.unwrap_or("default-session").to_string();
 
     // ── Build repos for GooseAdapter (before db.system is consumed) ───────────────
     let settings_repo_arc: Arc<
@@ -3107,14 +3275,28 @@ async fn run_chat(
     #[cfg(feature = "goose-agent")]
     let agent: Arc<dyn Agent> = {
         // Persist CLI overrides so GooseAdapter reads the right provider + model.
-        if provider.is_some() || model.is_some() {
+        // `--provider mock` is a test/dev-only shortcut that routes to MockAgent and
+        // never consults the DB provider, so we must NOT write "mock" into the user's
+        // real settings — a later `serve` would read it back and break live chat.
+        if (provider.is_some() || model.is_some()) && effective_provider != "mock" {
             let mut s = settings.clone();
             s.chat_provider = effective_provider.to_string();
             s.chat_model = effective_model.to_string();
             settings_repo_arc.update(&s).await.ok();
         }
+        // `--provider mock` routes to the MockAgent backend so the loop runs
+        // deterministically offline (no llamafile/network/models) — used by the
+        // json-events spawn-binary contract test. Any other provider uses the
+        // live GooseAdapter, which selects its own provider/model via the DB.
+        let agent_backend = if effective_provider == "mock" {
+            "mock"
+        } else {
+            "goose"
+        };
+        let trim_storage: Arc<dyn SessionStorage> =
+            Arc::new(SqliteSessionStorage::new(db.system.clone()));
         let (a, _ext_mgr, _tc, _tr) = build_goose_backend(
-            "goose",
+            agent_backend,
             &llamafile_url,
             &data_dir,
             weather,
@@ -3129,7 +3311,7 @@ async fn run_chat(
             extras_repo,
             draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-            None,               // session_storage — not needed for goose backend
+            Some(trim_storage), // powers the trimmer's summary splice
             input == "whisper", // voice_mode
         )
         .await;
@@ -3147,7 +3329,7 @@ async fn run_chat(
         let file_template = std::fs::read_to_string(prompt_dir.join("system.md")).ok();
         match file_template {
             Some(tmpl) => {
-                println!(
+                out!(
                     "  Prompt:   custom ({})",
                     prompt_dir.join("system.md").display()
                 );
@@ -3178,9 +3360,11 @@ async fn run_chat(
                 )
             }
             None => {
-                println!(
+                out!(
                     "  Assistant: {} / style: {} / user: {}",
-                    settings.assistant_name, settings.prompt_style, settings.user_name
+                    settings.assistant_name,
+                    settings.prompt_style,
+                    settings.user_name
                 );
                 build_system_prompt(&settings)
             }
@@ -3202,6 +3386,30 @@ async fn run_chat(
 
     let mut chat_service =
         ChatService::new(agent, session_id.clone(), storage).with_system_prompt(system_prompt);
+    if let Some(model_name) = model {
+        chat_service = chat_service.with_model_name(model_name);
+    }
+    // Durable per-turn telemetry (TTFT, tok/s, context) for voice turns —
+    // same turn_metrics table the REST path writes.
+    match SqliteTelemetry::new(db.logs.clone()).await {
+        Ok(telemetry) => chat_service = chat_service.with_telemetry(Arc::new(telemetry)),
+        Err(e) => tracing::warn!("voice telemetry disabled (init failed): {e}"),
+    }
+
+    // ── NDJSON event sink (--json-events) ──────────────────────────────────────
+    // Writes one serialized WorkflowEvent per line to stdout with immediate
+    // flush. In this mode the run_loop's human-facing prints are suppressed
+    // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
+    // Tauri shell parses these lines to drive the desktop voice UI.
+    if json_events {
+        let sink: pond_core::shared::services::chat::WorkflowEventSink =
+            Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {
+                write_ndjson_line(event);
+            });
+        chat_service = chat_service
+            .with_event_sink(sink)
+            .with_stdout_diagnostics(false);
+    }
 
     // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
     // When GooseAdapter is active it selects the provider internally via the DB.
@@ -3209,7 +3417,7 @@ async fn run_chat(
     #[cfg(not(feature = "goose-agent"))]
     match effective_provider {
         "ollama" => {
-            println!(
+            out!(
                 "  Model:    {} (ollama @ {}, max_tokens={}, temp={})",
                 effective_model,
                 pond_adapters_ollama::DEFAULT_HOST,
@@ -3234,7 +3442,7 @@ async fn run_chat(
                     .flatten()
                     .and_then(|r| r.hf_id)
                     .unwrap_or_else(|| effective_model.to_string());
-                println!("  Model:    {} (local GGUF in-process)", hf_model_id);
+                out!("  Model:    {} (local GGUF in-process)", hf_model_id);
                 let llm = Arc::new(
                     LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?,
                 );
@@ -3242,12 +3450,12 @@ async fn run_chat(
             }
             #[cfg(not(feature = "local-inference"))]
             {
-                eprintln!(
+                eout!(
                     "  WARN: --provider local requires the `local-inference` feature (not compiled in).\n\
                      Falling back to llamafile. Rebuild with:\n  \
                      cargo run -p pond-server --features local-inference -- chat --provider local"
                 );
-                println!(
+                out!(
                     "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
                     effective_model,
                     llamafile_url,
@@ -3264,9 +3472,12 @@ async fn run_chat(
         }
         _ => {
             // "llamafile" and any unrecognised value — use the llamafile process started above.
-            println!(
+            out!(
                 "  Model:    {} (llamafile @ {}, max_tokens={}, temp={})",
-                effective_model, llamafile_url, settings.llm_max_tokens, settings.llm_temperature,
+                effective_model,
+                llamafile_url,
+                settings.llm_max_tokens,
+                settings.llm_temperature,
             );
             let llm = Arc::new(
                 LlamafileProvider::new(Some(&llamafile_url))
@@ -3286,12 +3497,42 @@ async fn run_chat(
             Some(p) => match WhisperRsInput::new(p.clone()) {
                 Ok(w) => Some(Arc::new(w)),
                 Err(e) => {
-                    println!("  ⚠  In-process whisper load failed: {}", e);
-                    println!("     Falling back to stdin input.");
+                    // Whisper was explicitly requested but failed to load. Under
+                    // --json-events, out! is a no-op, so a bare warning would leave
+                    // the desktop shell with a deaf session and zero diagnostics.
+                    // Surface it on stderr (eout!) AND as an NDJSON error event so
+                    // the UI can tell voice input is unavailable before we degrade
+                    // to stdin (which the shell holds open and never writes to).
+                    eout!("  WARN: In-process whisper load failed: {}", e);
+                    eout!("     Falling back to stdin input.");
+                    out!("  ⚠  In-process whisper load failed: {}", e);
+                    out!("     Falling back to stdin input.");
+                    if json_events {
+                        write_ndjson_line(
+                            &pond_core::shared::domain::agent::WorkflowEvent::Error {
+                                message: format!(
+                                    "voice input unavailable: whisper model failed to load ({e}); falling back to stdin"
+                                ),
+                            },
+                        );
+                    }
                     None
                 }
             },
-            None => None,
+            None => {
+                // whisper requested but no usable model path (download failed or
+                // model not in catalog — already warned above via out!). Same
+                // deaf-session hazard under --json-events: surface it.
+                eout!("  WARN: whisper model unavailable — falling back to stdin input.");
+                if json_events {
+                    write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
+                        message:
+                            "voice input unavailable: whisper model missing; falling back to stdin"
+                                .to_string(),
+                    });
+                }
+                None
+            }
         }
     } else {
         None
@@ -3299,11 +3540,11 @@ async fn run_chat(
 
     let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
         ("whisper", Some(backend)) => {
-            println!("  Input:    whisper (in-process via whisper.cpp)");
+            out!("  Input:    whisper (in-process via whisper.cpp)");
             backend.clone() as Arc<dyn VoiceInput>
         }
         _ => {
-            println!("  Input:    stdin");
+            out!("  Input:    stdin");
             Arc::new(StdinInput::new())
         }
     };
@@ -3318,18 +3559,18 @@ async fn run_chat(
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
 
         if transcriptions.is_empty() {
-            println!(
+            out!(
                 "  Wake word: \"{}\" (no calibration — using raw phrase)",
                 trigger
             );
         } else {
-            println!(
+            out!(
                 "  Wake word: \"{}\" ({} calibrated variants)",
                 trigger,
                 transcriptions.len()
             );
         }
-        println!(
+        out!(
             "  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
             settings.voice_kws_energy_threshold,
             settings.voice_kws_cooldown_ms,
@@ -3353,6 +3594,30 @@ async fn run_chat(
     };
 
     // ── Wire TTS output ──
+    // The text/print fallback (no piper): in --json-events mode this MUST NOT
+    // write to stdout (the assistant text is already streamed as NDJSON `token`
+    // events), so use SilentOutput. Otherwise PrintOutput echoes to stdout.
+    let text_fallback = || -> Arc<dyn VoiceOutput> {
+        if json_events {
+            Arc::new(SilentOutput)
+        } else {
+            Arc::new(PrintOutput)
+        }
+    };
+    // Same as text_fallback, but first surfaces WHY voice output is unavailable as
+    // a non-fatal NDJSON error event. Under --json-events the SilentOutput fallback
+    // makes a broken-TTS session protocol-indistinguishable from a working one
+    // (state:speak + tokens stream while zero audio plays); this lets the UI tell
+    // the user the response is text-only and why. Non-json runs get PrintOutput and
+    // still see the answer, so only the event differs.
+    let tts_unavailable = |reason: &str| -> Arc<dyn VoiceOutput> {
+        if json_events {
+            write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
+                message: format!("voice output unavailable: {reason}; response is text-only"),
+            });
+        }
+        text_fallback()
+    };
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "piper" => {
             // Resolve model path: CLI arg → settings → warn and fall back to text
@@ -3361,12 +3626,12 @@ async fn run_chat(
             } else if !settings.voice_tts_voice.is_empty() {
                 Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
             } else {
-                println!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
-                println!("     Set a piper voice in the web UI, then restart. Using text output.");
+                out!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
+                out!("     Set a piper voice in the web UI, then restart. Using text output.");
                 None
             };
             match model_path_opt {
-                None => Arc::new(PrintOutput),
+                None => tts_unavailable("piper requested but no voice model configured"),
                 Some(model_path) => {
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
@@ -3375,9 +3640,9 @@ async fn run_chat(
                         std::path::PathBuf::from(format!("{}.json", model_path.display()));
                     if !model_path.exists() || !config_path.exists() {
                         if model_path.exists() {
-                            println!("  📥 TTS model config (.json) missing — downloading...");
+                            out!("  📥 TTS model config (.json) missing — downloading...");
                         } else {
-                            println!("  📥 TTS model not found — downloading configured voice...");
+                            out!("  📥 TTS model not found — downloading configured voice...");
                         }
                         // Look up in DB by filename to get the correct download URL.
                         let voice_filename = settings.voice_tts_voice.as_str();
@@ -3400,7 +3665,7 @@ async fn run_chat(
                             )
                             .await;
                         } else {
-                            println!(
+                            out!(
                                 "  ⚠  Piper voice '{}' not in model catalog — cannot download",
                                 voice_filename
                             );
@@ -3423,8 +3688,8 @@ async fn run_chat(
                     #[cfg(not(feature = "legacy-subprocess"))]
                     {
                         if !model_path.exists() || !config_path.exists() {
-                            println!("  TTS:      piper unavailable (model or config missing) — falling back to print");
-                            Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                            out!("  TTS:      piper unavailable (model or config missing) — falling back to print");
+                            tts_unavailable("piper model or config missing")
                         } else {
                             match PiperRsOutput::new(model_path.clone(), config_path) {
                                 Ok(out) => {
@@ -3432,7 +3697,7 @@ async fn run_chat(
                                         Some(d) => out.with_espeak_data(d),
                                         None => out,
                                     };
-                                    println!(
+                                    out!(
                                         "  TTS:      piper-rs ({})",
                                         model_path
                                             .file_name()
@@ -3442,11 +3707,11 @@ async fn run_chat(
                                     Arc::new(out) as Arc<dyn VoiceOutput>
                                 }
                                 Err(e) => {
-                                    println!(
+                                    out!(
                                         "  TTS:      piper unavailable (load failed: {}) — falling back to print",
                                         e
                                     );
-                                    Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                                    tts_unavailable(&format!("piper load failed: {e}"))
                                 }
                             }
                         }
@@ -3456,15 +3721,15 @@ async fn run_chat(
                     #[cfg(feature = "legacy-subprocess")]
                     {
                         if piper_process::find_binary(&data_dir).is_none() {
-                            println!("  📥 TTS binary not found — downloading...");
+                            out!("  📥 TTS binary not found — downloading...");
                             match model_download::download_piper_binary(&data_dir).await {
                                 Ok(_) => {}
-                                Err(e) => println!("  ⚠  TTS binary download failed: {}", e),
+                                Err(e) => out!("  ⚠  TTS binary download failed: {}", e),
                             }
                         }
                         match piper_process::find_binary(&data_dir) {
                             Some(bin) => {
-                                println!(
+                                out!(
                                     "  TTS:      piper ({})",
                                     model_path.file_name().unwrap_or_default().to_string_lossy()
                                 );
@@ -3475,8 +3740,8 @@ async fn run_chat(
                                 Arc::new(out) as Arc<dyn VoiceOutput>
                             }
                             None => {
-                                println!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                                Arc::new(PrintOutput) as Arc<dyn VoiceOutput>
+                                out!("  TTS:      piper unavailable (binary not found) — falling back to print");
+                                tts_unavailable("piper binary not found")
                             }
                         }
                     }
@@ -3484,13 +3749,37 @@ async fn run_chat(
             }
         }
         _ => {
-            println!("  TTS:      print");
-            Arc::new(PrintOutput)
+            // Text output was explicitly selected (effective_tts != "piper"); this
+            // is not a failure, so no error event — text-only is the intended mode.
+            out!("  TTS:      print");
+            text_fallback()
         }
     };
     chat_service = chat_service.with_voice_output(voice_out);
 
-    chat_service.run_loop().await?;
+    // ── Emit `ready` (contract) ────────────────────────────────────────────────
+    // All models are loaded and every adapter is wired; announce readiness
+    // before entering the wait loop. run_loop emits the terminal `exit` event
+    // itself (stdin_eof on EOF, dismissed on hard exit); on an unexpected loop
+    // error we emit `exit` with reason "error" below.
+    if json_events {
+        use pond_core::shared::domain::agent::WorkflowEvent;
+        write_ndjson_line(&WorkflowEvent::Ready {
+            session_id: session_id.clone(),
+        });
+
+        if let Err(e) = chat_service.run_loop().await {
+            write_ndjson_line(&WorkflowEvent::Error {
+                message: e.to_string(),
+            });
+            write_ndjson_line(&WorkflowEvent::Exit {
+                reason: "error".to_string(),
+            });
+            return Err(e);
+        }
+    } else {
+        chat_service.run_loop().await?;
+    }
 
     Ok(())
 }
@@ -4815,7 +5104,18 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(None, None, "stdin", None, true, Some("none"), None).await?;
+                run_chat(
+                    None,
+                    None,
+                    "stdin",
+                    None,
+                    true,
+                    Some("none"),
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
             }
             "2" => {
                 let data_dir = default_data_dir();
@@ -5259,6 +5559,12 @@ async fn build_goose_backend(
     .await
     {
         Ok(adapter) => {
+            // Session storage powers the deterministic turn trimmer's
+            // rolling-summary splice (hybrid compaction).
+            let adapter = match session_storage {
+                Some(storage) => adapter.with_giap_session_storage(storage),
+                None => adapter,
+            };
             if voice_mode {
                 adapter.set_voice_mode(true);
             }
@@ -5715,7 +6021,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let settings = settings_repo.get().await.unwrap_or_default();
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
     // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
-    let llamafile_url = format!("http://127.0.0.1:{}", ports::LLAMAFILE);
+    let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
     // Wire weather from settings so giap__get_current_weather MCP tool is available.
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled

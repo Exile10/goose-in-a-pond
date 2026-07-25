@@ -100,6 +100,8 @@ mod tests {
                 tool_call_id: None,
             },
             created_at: chrono::Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 
@@ -180,12 +182,16 @@ mod tests {
                 }],
             ),
             created_at: chrono::Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         };
         let tool_result = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: "test".to_string(),
             message: ChatMessage::tool_result("sunny", "call-1"),
             created_at: chrono::Utc::now(),
+            prompt_tokens: None,
+            completion_tokens: None,
         };
 
         let stored = vec![

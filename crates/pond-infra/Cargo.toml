@@ -21,9 +21,9 @@ reqwest = {workspace = true}
 jsonwebtoken = { workspace = true }
 fastembed = { workspace = true }
 # Handshake / pairing (#93): HMAC pairing proof + hashed tokens.
-sha2 = { workspace = true }
+sha2 = "0.10"
 hmac = { workspace = true }
-rand = { workspace = true }
+rand = "0.8"
 base64 = { workspace = true }
 subtle = { workspace = true }
 once_cell = { workspace = true }
@@ -33,4 +33,6 @@ tempfile = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
 rsa = { workspace = true }
-rand = { workspace = true }
+# NOTE: no dev-dependency on `rand` — tests use the [dependencies] rand 0.8
+# (the API `thread_rng`/`OsRng` here and rsa 0.9's rand_core 0.6 both need it);
+# a second, newer rand would hand rustc two rlib candidates (E0464).

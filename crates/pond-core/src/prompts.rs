@@ -13,6 +13,13 @@
 //! - `build_system_prompt_from_template(settings, content)` — backwards-compat; no state/profile.
 //! - `build_system_prompt(settings)` — legacy; uses hard-coded `PROMPT_*` constants (routes, main, tests)
 //! - `SYSTEM_PROMPT` — in tests and absolute last-resort fallback
+//!
+//! ## Temporal context
+//! Goose's own prompt system exposes an hourly-resolution `current_date_time`
+//! template variable. GIAP templates deliberately do NOT use it: minute-level
+//! date/time lives in the per-turn `<system-context>` block of the user message
+//! (assembled by `GooseAdapter`), keeping the system prompt stable for KV-cache
+//! prefix reuse.
 
 use crate::user_data::domain::settings::Settings;
 
@@ -68,6 +75,10 @@ pub struct PromptState {
     /// detailed instructions to save tokens).  Derived from
     /// [`CompactionProfile::use_compact_prompt()`].
     pub compact_prompt: bool,
+    /// True when the provider injects the full tools JSON via the model's chat
+    /// template (local llama.cpp native tool calling) — the template must then
+    /// NOT render its own tool list, which would double-feed every schema.
+    pub native_tools_json: bool,
     /// Hash of the static prefix portion of the system prompt.
     ///
     /// When this value matches the previous turn's hash, the static prefix
@@ -230,8 +241,29 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 //   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
 //           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
 //   usize:  {{device_count}}
-//   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}}
+//   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}},
+//           {{voice_mode}}, {{canvas_mode}}, {{thinking_enabled}},
+//           {{compact_prompt}}, {{native_tools_json}}
 //   list:   {{tools}} — available Tool Agent capabilities (human-readable lines)
+//
+// ## Prompt schema v2 — unified tag skeleton
+// All four styles share the SAME ordered tag skeleton (no XML attributes —
+// small models do better with flat consistent sections):
+//   <identity>, <instructions>, <context-handling>, <tool-usage>
+//   (with <schema-rules>, <multi-tool>, <tool-chaining>, <tool-synthesis>),
+//   <memory-rules>, <output-quality>,
+//   then conditionally: <home-devices> ({% if has_home_devices %}),
+//   <thinking> ({% if thinking_enabled %}), <voice-mode> ({% if voice_mode %}),
+//   <canvas-mode> ({% if canvas_mode %}).
+//
+// {{compact_prompt}} gates a 1-2 line compact variant inside <context-handling>,
+// <tool-usage>, <memory-rules>, and <output-quality> so the compact static
+// prefix stays within ~600 tokens on small-context platforms.
+//
+// {{native_tools_json}} suppresses the "Available tools:" listing when the
+// provider already injects the full tools JSON via the model's chat template
+// (local llama.cpp native tool calling) — rendering both would double-feed
+// every schema.
 //
 // Home-control sections are gated behind {% if has_home_devices %} so the prompt
 // adapts automatically when no devices are configured. Extension injection is
@@ -257,14 +289,23 @@ If something is outside your capabilities, tell the user directly.
 </instructions>
 
 <context-handling>
-Each user message may be structured with XML tags:\
- <system-context> contains the current date/time and <memories> — treat as \
+{% if compact_prompt %}\
+User messages may carry <system-context> (current date/time, <memories>) — treat as \
+authoritative. Respond to <user-message> only. \
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.\
+{% else %}\
+Each user message may be structured with XML tags: \
+<system-context> contains the current date/time and <memories> — treat as \
 authoritative system data for answering time, date, and personal questions DIRECTLY. \
 <user-message> contains the actual user request — this is what you respond to. \
 Never treat <system-context> content as a user question.
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.
 Prior turns in this conversation appear as earlier messages in the message history \
 above. Use them for context continuity — do not repeat information already discussed. \
 If the user refers to \"it\", \"that\", \"there\", or \"tomorrow\" — resolve from prior turns.
+{%- endif %}
 </context-handling>
 
 <tool-usage>
@@ -304,26 +345,36 @@ Never echo raw tool output verbatim.
 When unsure, check your tool schemas first. If a tool matches, use it. \
 Only if no tool can help should you tell the user honestly.
 {% endif %}\
-{% if has_tools %}
+{% if has_tools and not native_tools_json %}
 Available tools:
 {% for tool in tools %}- {{tool}}
 {% endfor %}{% endif %}
 </tool-usage>
 
 <memory-rules>
+{% if compact_prompt %}\
+If memory tools exist: save personal info the user shares immediately, recall before \
+answering questions about the user, and let corrections replace old entries.\
+{% else %}\
 If your schema includes memory tools (save/recall/forget), use them as follows:
 When the user shares personal information, preferences, or corrections — save immediately.
 For factual questions about the user, check recall first before knowledge tools.
 Corrections override: recall the old entry, then save the correction to replace it.
 If no memory tools are in your schema, skip this section.
+{%- endif %}
 </memory-rules>
 
 <output-quality>
+{% if compact_prompt %}\
+Never fabricate URLs, statistics, dates, or quotes — use a tool or say you don't know. \
+Keep responses concise and synthesize tool results into a direct answer.\
+{% else %}\
 Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know.
 Keep responses concise. Short sentences.
 When using knowledge tools, synthesize — do not parrot the raw result.
 After receiving tool results, always provide a direct, helpful answer. Never ask \
 \"would you like to know more\" or \"shall I look that up\" after already having the data.
+{%- endif %}
 </output-quality>
 
 {% if has_home_devices %}
@@ -379,32 +430,54 @@ General copilot: writing, research, coding, planning{% if has_home_devices %}, h
 Only use tools in your schema. Do not invent commands outside available tools.
 </instructions>
 <context-handling>
+{% if compact_prompt %}\
+User messages may carry <system-context> (date/time, <memories>) — treat as \
+authoritative. Respond to <user-message> only. \
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.\
+{% else %}\
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.
 Earlier turns appear above in the message history — use for context, do not repeat.
+{%- endif %}
 </context-handling>
 <tool-usage>
 Your tools are defined by the schemas below. Match requests to tool descriptions. \
 Use for live/real-time data. Unsure? Check schemas first. No match? Say so honestly.
-RULE: Real-time requests MUST trigger the matching tool. Never guess when a tool has live data.
+<schema-rules>
+Real-time requests MUST trigger the matching tool. Never guess when a tool has live data. \
+Supply required parameters; infer values from context.
+</schema-rules>
 <multi-tool>
 Multiple topics = multiple calls IN ONE RESPONSE. Emit all together for parallel execution.
 </multi-tool>
 <tool-chaining>
 Tool says call another? DO IT immediately. Keep going until complete.
 </tool-chaining>
+<tool-synthesis>
 After results: synthesize directly. No follow-ups. No re-calls.
-{% if has_tools %}
+</tool-synthesis>
+{% if has_tools and not native_tools_json %}
 Available tools:
 {% for tool in tools %}- {{tool}}
 {% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
+{% if compact_prompt %}\
+Memory tools: save personal info immediately, recall before lookups, corrections override.\
+{% else %}\
 If memory tools are available: save personal info immediately, recall before knowledge lookups, \
 corrections override previous entries.
+{%- endif %}
 </memory-rules>
 <output-quality>
+{% if compact_prompt %}\
+Never fabricate — use a tool or say you don't know. Synthesize, do not parrot.\
+{% else %}\
 Never fabricate. Use a tool or say you don't know. Synthesize — do not parrot.
+{%- endif %}
 </output-quality>
 {% if has_home_devices %}
 <home-devices>
@@ -412,6 +485,11 @@ Never fabricate. Use a tool or say you don't know. Synthesize — do not parrot.
 Door/alarm: require explicit confirmation. Unknown device: say not set up yet.
 </home-devices>
 {% endif %}
+{%- if thinking_enabled %}
+<thinking>
+Hard problems: reason step by step first, then answer.
+</thinking>
+{%- endif %}
 {% if voice_mode %}
 <voice-mode>
 Responses read aloud via TTS. Short, conversational, no formatting. Spell out symbols.
@@ -442,12 +520,26 @@ No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delim
 Only use tools in your schema. Do not invent commands outside your available tools.
 </instructions>
 <context-handling>
+{% if compact_prompt %}\
+User messages may carry <system-context> (current date/time, <memories>) — treat as \
+authoritative. Respond to <user-message> only. \
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.\
+{% else %}\
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
+A <conversation-summary> block may appear in earlier history — it accurately \
+summarizes older turns; use it for continuity and never repeat or quote it.
 Prior turns appear above in the message history — use for continuity, \
 resolve pronouns and references from earlier turns.
+{%- endif %}
 </context-handling>
 <tool-usage>
+{% if compact_prompt %}\
+Your tools are defined in the schema below. Use them for any live, real-time, or \
+factual data. Emit parallel calls for multi-part requests, chain when a result \
+directs a next step, and synthesize immediately after results — no follow-ups.\
+{% else %}\
 Your capabilities are defined entirely by the tool schemas below. Each schema specifies: \
 name, description (WHEN to use), and parameter definitions (WHAT to pass). \
 Read descriptions carefully — they are your dispatch guide.
@@ -475,19 +567,30 @@ Present key data points clearly. Cite sources when available.
 </tool-synthesis>
 When unsure, scan your tool schemas. If one matches, use it. Only if no tool applies, \
 tell the user honestly.
-{% if has_tools %}
+{% endif %}\
+{% if has_tools and not native_tools_json %}
 Available tools:
 {% for tool in tools %}- {{tool}}
 {% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
+{% if compact_prompt %}\
+Memory tools: save personal info immediately, recall before lookups, corrections \
+override previous entries.\
+{% else %}\
 If memory tools are available in your schema: save personal info immediately, \
 check recall before knowledge lookups, corrections override previous entries.
+{%- endif %}
 </memory-rules>
 <output-quality>
+{% if compact_prompt %}\
+Never fabricate URLs, statistics, dates, or quotes — use a tool or say you don't know. \
+Be precise; synthesize and cite sources rather than parroting raw output.\
+{% else %}\
 Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know.
 Keep responses precise. Prefer exact values and concrete examples.
 When using knowledge tools, synthesize and cite the source — do not parrot raw output.
+{%- endif %}
 </output-quality>
 {% if has_home_devices %}
 <home-devices>
@@ -534,15 +637,31 @@ No lists or formatting — just natural conversation.
 I only use the tools I've been given — nothing outside my available schema.
 </instructions>
 <context-handling>
+{% if compact_prompt %}\
+Your messages may carry <system-context> (time, date, <memories>) — I treat it as \
+authoritative. I only answer <user-message>. \
+A <conversation-summary> block may appear earlier in our chat — it accurately \
+summarizes older turns; I use it for continuity and never repeat or quote it.\
+{% else %}\
 Your messages have XML tags: <system-context> is my live context (time, date, \
 <memories>). <user-message> is your actual question. I only respond to <user-message>. \
+A <conversation-summary> block may appear earlier in our chat — it accurately \
+summarizes older turns; I use it for continuity and never repeat or quote it.
 Earlier turns appear above in our conversation — I use them to remember what we discussed.
+{%- endif %}
 </context-handling>
 <tool-usage>
+{% if compact_prompt %}\
+My tools are in the schemas below — I use them for anything live or current, make \
+all calls for multi-part questions at once, follow chained tool instructions right \
+away, and give a direct answer as soon as results arrive.\
+{% else %}\
 My tools are listed in the schemas below — each one tells me what it does and when \
 to use it. I read the descriptions to figure out which tool matches your question.
+<schema-rules>
 Whenever you ask about anything current or happening right now, I check my tools to \
 get the real answer. I only skip if it's a plain fact or something already in our context.
+</schema-rules>
 <multi-tool>
 If you ask about more than one thing, I'll make all the tool calls at once so they \
 run in parallel. I won't stop halfway through your question.
@@ -552,22 +671,35 @@ Sometimes a tool will tell me to call another tool for the full answer. When tha
 happens, I follow through right away without asking. I keep going until I have a \
 complete answer.
 </tool-chaining>
+<tool-synthesis>
 Once I get tool results, I give you a direct answer right away. No 'would you like \
 to know more' — the result is the answer.
-{% if has_tools %}
+</tool-synthesis>
+{% endif %}\
+{% if has_tools and not native_tools_json %}
 Available tools:
 {% for tool in tools %}- {{tool}}
 {% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
+{% if compact_prompt %}\
+With memory tools: I save personal info you share right away, check memories before \
+looking things up, and corrections replace what I saved before.\
+{% else %}\
 If I have memory tools: when you tell me something personal, I save it right away. \
 If you correct something, I recall the old one first, then save the update. \
 I check my memories before looking things up, in case you've already told me.
+{%- endif %}
 </memory-rules>
 <output-quality>
+{% if compact_prompt %}\
+I never make up URLs, numbers, dates, or quotes — I look it up or say I don't know, \
+and I summarize results naturally instead of dumping raw info.\
+{% else %}\
 I never make up URLs, numbers, dates, or quotes. If I don't know, I'll say so or \
 look it up. When I do look something up, I'll summarise it naturally instead of \
 just dumping the raw info.
+{%- endif %}
 </output-quality>
 {% if has_home_devices %}
 <home-devices>
@@ -578,6 +710,12 @@ If I don't recognise a device I'll let you know and offer to add it.
 I'll always ask before doing anything outside your home network.
 </home-devices>
 {% endif %}
+{%- if thinking_enabled %}
+<thinking>
+For tricky questions I take a moment to think it through step by step before \
+answering — a good answer beats a fast one.
+</thinking>
+{%- endif %}
 {% if voice_mode %}
 <voice-mode>
 You're in voice mode right now — I'm listening through the microphone and speaking my \
@@ -672,7 +810,10 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// - `String`:  `assistant_name`, `user_name`, `personality`, `timezone`, `location`,
 ///              `current_date`, `current_time`, `online_device_names`
 /// - `usize`:   `device_count`
-/// - `bool`:    `has_home_devices`, `atypical_speech`
+/// - `bool`:    `has_home_devices`, `atypical_speech`, `has_tools`, `voice_mode`,
+///              `canvas_mode`, `thinking_enabled`, `compact_prompt`,
+///              `native_tools_json`
+/// - `list`:    `tools`
 ///
 /// On any Tera render error the function logs a warning and falls back to the plain
 /// `render_template()` substitution so the system prompt is never silenced.
@@ -747,6 +888,14 @@ pub fn render_jinja_template(
     ctx.insert(
         "compact_prompt",
         &state.map(|s| s.compact_prompt).unwrap_or(false),
+    );
+
+    // Native tool calling — the provider injects the full tools JSON via the
+    // model's chat template, so templates must skip their own "Available
+    // tools:" listing to avoid double-feeding every schema.
+    ctx.insert(
+        "native_tools_json",
+        &state.map(|s| s.native_tools_json).unwrap_or(false),
     );
 
     // Profile context
@@ -1343,5 +1492,254 @@ mod tests {
         assert_eq!(content, PROMPT_TECHNICAL);
         let (content, _) = builtin_template_content("warm").unwrap();
         assert_eq!(content, PROMPT_WARM);
+    }
+
+    // ── Prompt schema v2 golden tests ────────────────────────────────────────
+
+    /// All four built-in styles, by name, for golden-test iteration.
+    const ALL_STYLES: &[(&str, &str)] = &[
+        ("balanced", PROMPT_BALANCED),
+        ("concise", PROMPT_CONCISE),
+        ("technical", PROMPT_TECHNICAL),
+        ("warm", PROMPT_WARM),
+    ];
+
+    /// The unified ordered tag skeleton every style must contain.
+    /// Conditional tags (<home-devices>, <thinking>, <voice-mode>,
+    /// <canvas-mode>) are still present in the RAW template inside their
+    /// {% if %} gates, so they are checked here too.
+    const SKELETON_TAGS: &[&str] = &[
+        "identity",
+        "instructions",
+        "context-handling",
+        "tool-usage",
+        "memory-rules",
+        "output-quality",
+        "home-devices",
+        "thinking",
+        "voice-mode",
+        "canvas-mode",
+    ];
+
+    /// Extract structural tags from a RAW template constant.
+    ///
+    /// A structural tag is a line whose trimmed content is exactly `<name>` or
+    /// `</name>` — prose mentions like `<system-context>` or
+    /// `<conversation-summary>` sit mid-sentence and are ignored. Returns
+    /// `(tag_name, is_open)` in document order.
+    fn structural_tags(raw: &str) -> Vec<(String, bool)> {
+        raw.lines()
+            .filter_map(|line| {
+                let t = line.trim();
+                if t.len() > 2 && t.starts_with('<') && t.ends_with('>') && !t.contains(' ') {
+                    let inner = &t[1..t.len() - 1];
+                    match inner.strip_prefix('/') {
+                        Some(name) => Some((name.to_string(), false)),
+                        None => Some((inner.to_string(), true)),
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// PromptState for golden-test renders.
+    fn v2_state(compact: bool, tools: bool, native: bool) -> PromptState {
+        PromptState {
+            compact_prompt: compact,
+            available_tools: if tools {
+                giap_tool_description_lines().to_vec()
+            } else {
+                Vec::new()
+            },
+            native_tools_json: native,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v2_every_style_renders_without_tera_errors() {
+        // render_jinja_template silently falls back to plain substitution on a
+        // Tera error, which leaves {% ... %} blocks unrendered — so leftover
+        // Jinja syntax in the output IS the error signal.
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                for tools in [false, true] {
+                    let state = v2_state(compact, tools, false);
+                    let out = render_jinja_template(raw, &s, Some(&state), None);
+                    assert!(
+                        !out.contains("{%") && !out.contains("{{"),
+                        "style '{name}' (compact={compact}, tools={tools}) left \
+                         unrendered Jinja syntax — Tera render failed"
+                    );
+                    assert!(!out.is_empty(), "style '{name}' rendered empty");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v2_all_styles_share_identical_balanced_tag_set() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut tag_sets: Vec<(&str, BTreeSet<String>)> = Vec::new();
+        for (name, raw) in ALL_STYLES {
+            let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+            for (tag, is_open) in structural_tags(raw) {
+                let entry = counts.entry(tag).or_default();
+                if is_open {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+            }
+            for (tag, (opens, closes)) in &counts {
+                assert_eq!(
+                    opens, closes,
+                    "style '{name}': tag <{tag}> is unbalanced ({opens} open / {closes} close)"
+                );
+            }
+            tag_sets.push((name, counts.into_keys().collect()));
+        }
+
+        let (first_name, first_set) = &tag_sets[0];
+        for (name, set) in &tag_sets[1..] {
+            assert_eq!(
+                set, first_set,
+                "style '{name}' tag set differs from '{first_name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_skeleton_tags_present_and_ordered() {
+        for (name, raw) in ALL_STYLES {
+            let mut prev_pos = 0usize;
+            let mut prev_tag = "(start)";
+            for tag in SKELETON_TAGS {
+                let needle = format!("<{tag}>");
+                let pos = raw
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("style '{name}': missing skeleton tag <{tag}>"));
+                assert!(
+                    pos >= prev_pos,
+                    "style '{name}': <{tag}> appears before <{prev_tag}> — skeleton order broken"
+                );
+                prev_pos = pos;
+                prev_tag = tag;
+            }
+        }
+    }
+
+    #[test]
+    fn v2_native_tools_json_suppresses_tool_listing() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            // native_tools_json=false + tools present → listing rendered
+            let listed = render_jinja_template(raw, &s, Some(&v2_state(false, true, false)), None);
+            assert!(
+                listed.contains("Available tools:"),
+                "style '{name}': tool listing must render when native_tools_json=false"
+            );
+            assert!(
+                listed.contains("wikipedia"),
+                "style '{name}': tool description lines must render"
+            );
+
+            // native_tools_json=true → NO listing (provider feeds tools JSON
+            // via the chat template), but the behavioral <tool-usage> text stays
+            let native = render_jinja_template(raw, &s, Some(&v2_state(false, true, true)), None);
+            assert!(
+                !native.contains("Available tools:"),
+                "style '{name}': tool listing must NOT render when native_tools_json=true \
+                 (would double-feed every schema)"
+            );
+            assert!(
+                native.contains("<tool-usage>"),
+                "style '{name}': behavioral tool-usage section must survive native_tools_json"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_compact_static_prefix_within_token_budget() {
+        use crate::models::services::prompt_builder::build_prompt_partition;
+
+        // The realistic small-context configuration: compact prompt AND native
+        // tool calling (local llama.cpp), temporals blanked by the partition
+        // exactly as prompt_builder does per turn. Budget: ~600 tokens at the
+        // chars/4 heuristic = 2400 chars.
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            let state = PromptState {
+                current_date: "Thursday, 1 May 2026".to_string(),
+                current_time: "14:32".to_string(),
+                compact_prompt: true,
+                native_tools_json: true,
+                available_tools: giap_tool_description_lines().to_vec(),
+                ..Default::default()
+            };
+            let partition = build_prompt_partition(&s, None, &state, raw);
+            let chars = partition.static_prefix.chars().count();
+            // Budget tracking — visible with `cargo test -- --nocapture`.
+            eprintln!(
+                "compact static prefix '{name}': {chars} chars (~{} tokens)",
+                chars / 4
+            );
+            assert!(
+                chars <= 2400,
+                "style '{name}': compact static prefix is {chars} chars — exceeds \
+                 2400 (~600 tokens at chars/4)"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_all_styles_mention_conversation_summary() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            assert!(
+                raw.contains("<conversation-summary>"),
+                "style '{name}': raw template must mention <conversation-summary>"
+            );
+            // Both full and compact renders must carry the summary contract.
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                assert!(
+                    out.contains("<conversation-summary>"),
+                    "style '{name}' (compact={compact}): rendered prompt must mention \
+                     <conversation-summary>"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_thinking_section_in_every_style() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            let on = render_jinja_template(
+                raw,
+                &s,
+                Some(&PromptState {
+                    thinking_enabled: true,
+                    ..Default::default()
+                }),
+                None,
+            );
+            assert!(
+                on.contains("<thinking>"),
+                "style '{name}': <thinking> must render when thinking_enabled=true"
+            );
+
+            let off = render_jinja_template(raw, &s, Some(&PromptState::default()), None);
+            assert!(
+                !off.contains("<thinking>"),
+                "style '{name}': <thinking> must be hidden when thinking_enabled=false"
+            );
+        }
     }
 }

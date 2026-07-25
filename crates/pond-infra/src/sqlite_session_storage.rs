@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use pond_core::models::domain::message::{ChatMessage, Role, ToolCallRecord};
 use pond_core::user_data::domain::session::{Session, SessionMessage};
 use pond_core::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 
 // ── Raw DB row types ──────────────────────────────────────────────────────────
 
@@ -31,6 +31,8 @@ struct MessageRow {
     tool_call_id: Option<String>,
     tool_calls_json: Option<String>,
     created_at: String,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -102,6 +104,8 @@ impl TryFrom<MessageRow> for SessionMessage {
                 tool_call_id: r.tool_call_id,
             },
             created_at: parse_dt(&r.created_at),
+            prompt_tokens: r.prompt_tokens.map(|v| v as u32),
+            completion_tokens: r.completion_tokens.map(|v| v as u32),
         })
     }
 }
@@ -148,6 +152,46 @@ impl SessionStorage for SqliteSessionStorage {
         }
     }
 
+    async fn get_rolling_summary(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        let row = sqlx::query(
+            "SELECT rolling_summary, rolling_summary_through_id FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get("rolling_summary"),
+                    r.get("rolling_summary_through_id"),
+                )
+            })
+            .unwrap_or((None, None)))
+    }
+
+    async fn set_rolling_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        sqlx::query(
+            "UPDATE sessions SET rolling_summary = ?, rolling_summary_through_id = ?, \
+             rolling_summary_updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(summary)
+        .bind(through_message_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
     async fn add_message(
         &self,
         session_id: String,
@@ -165,8 +209,9 @@ impl SessionStorage for SqliteSessionStorage {
 
         sqlx::query(
             "INSERT INTO session_messages \
-                 (id, session_id, role, content, tool_call_id, tool_calls_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                 (id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
+                  prompt_tokens, completion_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)",
         )
         .bind(&message.id)
         .bind(&session_id)
@@ -174,6 +219,8 @@ impl SessionStorage for SqliteSessionStorage {
         .bind(&message.message.content)
         .bind(&message.message.tool_call_id)
         .bind(&tool_calls_json)
+        .bind(message.prompt_tokens.map(|v| v as i64))
+        .bind(message.completion_tokens.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
@@ -194,7 +241,8 @@ impl SessionStorage for SqliteSessionStorage {
         self.get_session(session_id).await?; // guard: session must exist
 
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
+             prompt_tokens, completion_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -254,7 +302,8 @@ impl SessionStorage for SqliteSessionStorage {
         self.get_session(session_id).await?; // guard: session must exist
 
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
+             prompt_tokens, completion_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -279,7 +328,8 @@ impl SessionStorage for SqliteSessionStorage {
 
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at \
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
+             prompt_tokens, completion_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -742,5 +792,40 @@ mod tests {
             assert_eq!(msgs.len(), 1);
             assert_eq!(msgs[0].message.content, "Remember me");
         }
+    }
+
+    #[tokio::test]
+    async fn token_counts_round_trip_and_default_null() {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let s = SqliteSessionStorage::new(db.system);
+        s.create_session("tok".to_string()).await.unwrap();
+
+        s.add_message(
+            "tok".to_string(),
+            SessionMessage::new(
+                "u1".to_string(),
+                "tok".to_string(),
+                ChatMessage::user("question"),
+            ),
+        )
+        .await
+        .unwrap();
+        s.add_message(
+            "tok".to_string(),
+            SessionMessage::new(
+                "a1".to_string(),
+                "tok".to_string(),
+                ChatMessage::assistant("answer"),
+            )
+            .with_token_counts(Some(1930), Some(87)),
+        )
+        .await
+        .unwrap();
+
+        let msgs = s.get_messages("tok").await.unwrap();
+        assert_eq!(msgs[0].prompt_tokens, None, "user rows carry no counts");
+        assert_eq!(msgs[1].prompt_tokens, Some(1930));
+        assert_eq!(msgs[1].completion_tokens, Some(87));
     }
 }

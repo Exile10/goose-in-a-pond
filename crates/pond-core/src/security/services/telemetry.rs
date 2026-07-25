@@ -99,6 +99,12 @@ mod tests {
             context_utilization_pct: 30.0 + turn_number as f32,
             model_name: "test-model".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            prefill_ms: None,
+            model_load_ms: None,
+            decode_tok_per_sec: None,
+            prefill_tok_per_sec: None,
+            context_limit_tokens: None,
+            inference_count: None,
         }
     }
 

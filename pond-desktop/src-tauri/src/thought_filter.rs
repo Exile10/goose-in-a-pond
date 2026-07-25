@@ -7,15 +7,18 @@
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
 const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
-    ("<|tool_call>",      "<tool_call|>"),
-    ("<think>",           "</think>"),
-    ("<thought>",         "</thought>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
 ];
 
 /// Standalone sentinels that get silently dropped wherever they appear.
 const STANDALONE_SENTINELS: &[&str] = &[
-    "<eos>", "<|eos|>", "<end_of_turn>",
-    "</think>", "</thought>",
+    "<eos>",
+    "<|eos|>",
+    "<end_of_turn>",
+    "</think>",
+    "</thought>",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +95,11 @@ impl ThoughtFilter {
 
 fn max_normal_lookahead() -> usize {
     let opens = PAIRED_TAGS.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
-    let stand = STANDALONE_SENTINELS.iter().map(|s| s.len()).max().unwrap_or(0);
+    let stand = STANDALONE_SENTINELS
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
     opens.max(stand)
 }
 
@@ -135,26 +142,17 @@ mod tests {
 
     #[test]
     fn strips_channel_thought() {
-        assert_eq!(
-            run(&["<|channel>thought reasoning<channel|>Hi!"]),
-            "Hi!",
-        );
+        assert_eq!(run(&["<|channel>thought reasoning<channel|>Hi!"]), "Hi!",);
     }
 
     #[test]
     fn strips_think_block() {
-        assert_eq!(
-            run(&["<think>reasoning</think>Answer."]),
-            "Answer.",
-        );
+        assert_eq!(run(&["<think>reasoning</think>Answer."]), "Answer.",);
     }
 
     #[test]
     fn strips_thought_block() {
-        assert_eq!(
-            run(&["<thought>reasoning</thought>Answer."]),
-            "Answer.",
-        );
+        assert_eq!(run(&["<thought>reasoning</thought>Answer."]), "Answer.",);
     }
 
     #[test]

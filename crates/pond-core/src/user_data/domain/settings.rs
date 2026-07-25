@@ -309,6 +309,22 @@ pub struct Settings {
     #[serde(default)]
     pub context_window_override: u32,
 
+    /// Show the per-turn inference stats footer (TTFT, tok/s, context) under
+    /// assistant messages in the desktop/web chat UIs.
+    #[serde(default)]
+    pub show_turn_stats: bool,
+
+    /// GIAP-owned hybrid compaction (deterministic in-turn trim + idle rolling
+    /// summary). When true, Goose's own auto-compaction is disabled for the
+    /// live path. Default false until burn-in on-device.
+    #[serde(default)]
+    pub hybrid_compaction_enabled: bool,
+
+    /// Idle seconds before the rolling-summary refresh may run (never at
+    /// startup; a new turn cancels an in-flight refresh).
+    #[serde(default = "Settings::default_summary_idle_secs")]
+    pub summary_idle_secs: u32,
+
     // ── Agent behaviour ────────────────────────────────────────────────────────
     /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
     /// "goose" uses Block's Goose framework with all MCP extensions, cloud provider support.
@@ -630,6 +646,9 @@ impl Default for Settings {
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
             context_window_override: 0,
+            show_turn_stats: false,
+            hybrid_compaction_enabled: false,
+            summary_idle_secs: Self::default_summary_idle_secs(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
@@ -831,6 +850,10 @@ impl Settings {
     fn default_review_pass_threshold() -> u8 {
         3
     }
+    fn default_summary_idle_secs() -> u32 {
+        120
+    }
+
     fn default_agent_backend() -> String {
         "goose".to_string()
     }
@@ -1177,6 +1200,11 @@ mod tests {
     fn every_settings_field_is_dispositioned() {
         // Advanced retention knobs, tuned via backend/config — intentionally no UI.
         const HEADLESS_BY_DESIGN: &[&str] = &[
+            // Hybrid-compaction rollout flags: operator knobs for the
+            // deterministic-trim + idle-summary pipeline; flipped via the
+            // settings API during on-device burn-in, no UI control planned.
+            "hybrid_compaction_enabled",
+            "summary_idle_secs",
             "retention_events_days",
             "retention_events_by_category",
             "retention_sensitive_days",
@@ -1270,6 +1298,7 @@ mod tests {
             "schedule_result_notify",
             "searxng_url",
             "show_thinking",
+            "show_turn_stats",
             "telemetry_enabled",
             "thinking_mode",
             "timezone",

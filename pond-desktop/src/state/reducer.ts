@@ -85,6 +85,7 @@ export type AppAction =
   | { type: "APPEND_AGENT_TOKEN"; payload: { token: string; done: boolean } }
   | { type: "CLEAR_TRANSCRIPT" }
   | { type: "PUSH_CONTEXT_CARD"; payload: ContextCard }
+  | { type: "UPDATE_CONTEXT_CARD"; payload: { callId: string; data: Record<string, unknown>; tool?: string } }
   | { type: "CLEAR_CONTEXT_CARDS" }
   | { type: "VOICE_ACTIVATE" }
   | { type: "SET_LAST_RESPONSE_META"; payload: LastResponseMeta }
@@ -215,6 +216,38 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "PUSH_CONTEXT_CARD":
       return { ...state, contextCards: [...state.contextCards, action.payload] };
+
+    case "UPDATE_CONTEXT_CARD": {
+      // Merge data into the most-recent card matching the callId.
+      const { callId, data, tool } = action.payload;
+      let updated = false;
+      const cards = state.contextCards.map((c) => {
+        if (!updated && c.callId === callId) {
+          updated = true;
+          return { ...c, data: { ...c.data, ...data } };
+        }
+        return c;
+      });
+      if (updated) return { ...state, contextCards: cards };
+      // No matching tool_call card. The tool_call event normally pushes the card
+      // before its result arrives, but if the result is orphaned (the call card
+      // was never pushed, or the transcript was cleared between call and result)
+      // and the event carries a tool name, surface it as its own card instead of
+      // silently dropping the result. Without a tool name there is nothing
+      // meaningful to render, so keep the no-op (and the stable state reference)
+      // to avoid orphan cards and spurious re-renders.
+      if (tool) {
+        const card: ContextCard = {
+          id: nextCardId(),
+          tool,
+          callId,
+          data,
+          timestamp_ms: Date.now(),
+        };
+        return { ...state, contextCards: [...state.contextCards, card] };
+      }
+      return state;
+    }
 
     case "CLEAR_CONTEXT_CARDS":
       return { ...state, contextCards: [] };

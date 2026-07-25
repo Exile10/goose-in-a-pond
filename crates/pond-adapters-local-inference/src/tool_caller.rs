@@ -7,9 +7,9 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::conversation::message::Message;
-use goose::model::ModelConfig;
 use goose::providers::base::Provider as GooseProvider;
 use goose::providers::local_inference::LocalInferenceProvider;
+use goose_providers::model::ModelConfig;
 use pond_core::mcp::ports::tools::tool_caller::ToolCaller;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +22,6 @@ use std::sync::Arc;
 pub struct ToolCallerEngine {
     provider: Arc<dyn GooseProvider>,
     model_config: ModelConfig,
-    session_id: String,
 }
 
 impl ToolCallerEngine {
@@ -35,15 +34,13 @@ impl ToolCallerEngine {
         // GooseAdapter::register_gguf_model in goose_agent.rs).
         register_tool_model(model_id, data_dir);
 
-        let model_config = ModelConfig {
-            model_name: normalise_model_id(model_id),
-            temperature: Some(0.0), // deterministic output
-            max_tokens: Some(256),  // tool calls are short
-            ..Default::default()
-        };
+        let mut model_config = ModelConfig::new(normalise_model_id(model_id));
+        model_config.temperature = Some(0.0); // deterministic output
+        model_config.max_tokens = Some(256); // tool calls are short
 
         println!("[tool_caller] loading specialist model: {}", model_id);
-        let provider = LocalInferenceProvider::from_env(model_config.clone(), vec![])
+        goose::providers::local_inference::configure_local_inference();
+        let provider = LocalInferenceProvider::from_env()
             .await
             .map_err(|e| anyhow!("Failed to load tool-caller model '{}': {e}", model_id))?;
         println!("[tool_caller] specialist model loaded: {}", model_id);
@@ -51,7 +48,6 @@ impl ToolCallerEngine {
         Ok(Self {
             provider: Arc::new(provider),
             model_config,
-            session_id: "tool-caller-static".to_string(),
         })
     }
 }
@@ -101,7 +97,6 @@ impl ToolCaller for ToolCallerEngine {
             .provider
             .complete(
                 &self.model_config,
-                &self.session_id,
                 &system,
                 &messages,
                 &[], // No tools — declarations are in the system prompt
@@ -362,7 +357,7 @@ fn parse_tool_call_json(
 /// Register a GGUF model in Goose's global registry so LocalInferenceProvider can find it.
 fn register_tool_model(model_id: &str, data_dir: &Path) {
     use goose::providers::local_inference::local_model_registry::{
-        get_registry, LocalModelEntry, ModelSettings,
+        get_registry, LocalModelEntry, LocalModelStorage, ModelSettings, ToolCallingMode,
     };
 
     let gguf_dir = data_dir.join("models").join("gguf");
@@ -391,13 +386,14 @@ fn register_tool_model(model_id: &str, data_dir: &Path) {
                     quantization: String::new(),
                     local_path,
                     source_url: String::new(),
+                    backend_id: None,
+                    storage: LocalModelStorage::ManualPath,
                     settings: ModelSettings {
-                        // Jinja OFF — we build FunctionGemma's exact prompt format
-                        // ourselves in generate_tool_call(). Jinja would double-render.
-                        use_jinja: false,
-                        // Native tool calling ON — but we pass no tools to complete(),
-                        // so this only affects how the provider handles the response.
-                        native_tool_calling: true,
+                        // Native tool calling forced ON — but we pass no tools to
+                        // complete(), so this only affects response handling. The
+                        // prompt is FunctionGemma's exact format built in
+                        // generate_tool_call(); the embedded chat template renders it.
+                        tool_calling: ToolCallingMode::ForceNative,
                         // Dynamic context from available memory.
                         context_size: None,
                         ..ModelSettings::default()
@@ -406,6 +402,7 @@ fn register_tool_model(model_id: &str, data_dir: &Path) {
                     mmproj_path: None,
                     mmproj_source_url: None,
                     mmproj_size_bytes: 0,
+                    mmproj_checked: false,
                     shard_files: vec![],
                 };
                 match registry.add_model(entry) {

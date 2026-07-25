@@ -197,6 +197,9 @@ export interface Settings {
   vision_camera_id?: string;
   vision_fps?: number;
   vision_motion_threshold?: number;
+
+  // Inference stats display
+  show_turn_stats?: boolean;
 }
 
 // ── Consolidation ────────────────────────────────────────────
@@ -391,7 +394,24 @@ export interface ChatStreamRequest {
   voice_mode?: boolean;
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats";
+
+// Per-turn inference performance stats emitted by the backend after each assistant turn.
+// All timing/throughput fields may be null when the provider does not report them.
+export interface TurnStats {
+  type: "turn_stats";
+  ttft_ms: number | null;
+  prefill_ms: number | null;
+  decode_tok_per_sec: number | null;
+  prefill_tok_per_sec: number | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  context_used_tokens: number | null;
+  context_limit_tokens: number | null;
+  context_pct: number | null;
+  model_load_ms: number | null;
+  inference_count: number;
+}
 
 export interface ChatEvent {
   type: ChatEventType;

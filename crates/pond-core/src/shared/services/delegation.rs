@@ -118,7 +118,7 @@ mod tests {
             let model_role = request.model_role.clone();
             let stream = async_stream::stream! {
                 yield Ok(AgentStreamEvent::Text { content: text });
-                yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None });
+                yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None, stats: None });
             };
             Ok(stream.boxed())
         }
@@ -231,7 +231,7 @@ mod tests {
                 let role = request.model_role.clone();
                 let stream = async_stream::stream! {
                     yield Ok(AgentStreamEvent::Text { content: text });
-                    yield Ok(AgentStreamEvent::Done { session_id: sid, model_role: role, usage: None });
+                    yield Ok(AgentStreamEvent::Done { session_id: sid, model_role: role, usage: None, stats: None });
                 };
                 Ok(stream.boxed())
             }

@@ -13,7 +13,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 fs2 = { workspace = true }
 reqwest = { workspace = true }
-thiserror = { workspace = true }
+thiserror = "1.0"
 tokio = { workspace = true }
 url = { workspace = true }
 

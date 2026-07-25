@@ -2,6 +2,11 @@ node_modules/
 dist/
 src-tauri/target/
 
+# Staged pond-server sidecar (built on demand by scripts/stage-server-sidecar.sh).
+# A large release binary — never committed; produced fresh per target/host.
+src-tauri/binaries/
+
 # Generated test artifacts (never commit — #163 accidentally committed 214 of these)
 playwright-report/
 test-results/
+pond-desktop/kiosk-screenshots/

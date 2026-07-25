@@ -1251,6 +1251,7 @@ fn chat_stream_inner(
 
         let mut usage_prompt_tokens: u32 = 0;
         let mut usage_completion_tokens: u32 = 0;
+        let mut turn_stats: Option<pond_core::shared::domain::turn_stats::TurnStats> = None;
 
         let model_name_for_done = settings.chat_model.clone();
 
@@ -1366,10 +1367,28 @@ fn chat_stream_inner(
                                 AgentStreamEvent::ReviewRevision { content, score, rounds } => {
                                     Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                                 }
-                                AgentStreamEvent::Done { usage, .. } => {
+                                AgentStreamEvent::Done { usage, stats, .. } => {
                                     if let Some(u) = usage {
                                         usage_prompt_tokens = u.prompt_tokens;
                                         usage_completion_tokens = u.completion_tokens;
+                                    }
+                                    if let Some(s) = stats {
+                                        let payload = json!({
+                                            "type": "turn_stats",
+                                            "ttft_ms": s.ttft_ms,
+                                            "prefill_ms": s.prefill_ms,
+                                            "decode_tok_per_sec": s.decode_tok_per_sec,
+                                            "prefill_tok_per_sec": s.prefill_tok_per_sec,
+                                            "prompt_tokens": s.prompt_tokens,
+                                            "completion_tokens": s.completion_tokens,
+                                            "context_used_tokens": s.context_used_tokens,
+                                            "context_limit_tokens": s.context_limit_tokens,
+                                            "context_pct": s.context_pct(),
+                                            "model_load_ms": s.model_load_ms,
+                                            "inference_count": s.inference_count,
+                                        });
+                                        turn_stats = Some(s);
+                                        yield Ok(Event::default().data(payload.to_string()));
                                     }
                                     continue;
                                 }
@@ -1535,8 +1554,13 @@ fn chat_stream_inner(
         if settings.telemetry_enabled {
             if let Some(ref telemetry) = state.telemetry {
                 let total_latency_ms = turn_start.elapsed().as_millis() as u64;
-                let ttft_ms = ttft_instant
-                    .map(|t| t.duration_since(turn_start).as_millis() as u64)
+                // Prefer the engine's own TTFT; fall back to first-SSE-text time.
+                let ttft_ms = turn_stats
+                    .as_ref()
+                    .and_then(|s| s.ttft_ms)
+                    .or_else(|| {
+                        ttft_instant.map(|t| t.duration_since(turn_start).as_millis() as u64)
+                    })
                     .unwrap_or(total_latency_ms);
 
                 // Estimate turn number from existing telemetry for this session.
@@ -1546,14 +1570,22 @@ fn chat_stream_inner(
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
 
-                let context_limit = if settings.context_window_override > 0 {
-                    settings.context_window_override
-                } else {
-                    state.agent.capabilities().context_window_tokens
-                };
-                let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
+                // Prefer the engine-reported context window over settings/capability
+                // guesses; the engine knows the real n_ctx it allocated.
+                let context_limit = turn_stats
+                    .as_ref()
+                    .and_then(|s| s.context_limit_tokens)
+                    .unwrap_or(if settings.context_window_override > 0 {
+                        settings.context_window_override
+                    } else {
+                        state.agent.capabilities().context_window_tokens
+                    });
+                let context_used = turn_stats
+                    .as_ref()
+                    .and_then(|s| s.context_used_tokens)
+                    .unwrap_or(usage_prompt_tokens + usage_completion_tokens);
                 let context_utilization_pct = if context_limit > 0 {
-                    (estimated_tokens as f32 / context_limit as f32) * 100.0
+                    (context_used as f32 / context_limit as f32) * 100.0
                 } else {
                     0.0
                 };
@@ -1571,6 +1603,12 @@ fn chat_stream_inner(
                     context_utilization_pct,
                     model_name: model_name_for_done.clone(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    prefill_ms: turn_stats.as_ref().and_then(|s| s.prefill_ms),
+                    model_load_ms: turn_stats.as_ref().and_then(|s| s.model_load_ms),
+                    decode_tok_per_sec: turn_stats.as_ref().and_then(|s| s.decode_tok_per_sec),
+                    prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
+                    context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
+                    inference_count: turn_stats.as_ref().map(|s| s.inference_count),
                 };
 
                 if let Err(e) = telemetry.record_turn(metrics).await {

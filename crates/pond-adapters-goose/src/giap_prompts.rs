@@ -33,9 +33,21 @@
 //!
 //! See individual template files in `src/prompts/` for per-template variables.
 
-use goose::prompt_template::render_string;
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use serde::Serialize;
+
+/// Render `template` with minijinja's default feature set.
+///
+/// Goose's own `prompt_template::render_string` builds minijinja without the
+/// `builtins` feature since the 2026-07 upstream sync, which drops filters like
+/// `default` and `join` that these templates rely on. Rendering with our own
+/// environment keeps the templates working regardless of how goose trims its
+/// minijinja features.
+fn render_string<T: Serialize>(template: &str, context: &T) -> Result<String, minijinja::Error> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    env.render_str(template, context)
+}
 
 // ── Embedded template files ───────────────────────────────────────────────────
 
@@ -268,7 +280,7 @@ mod tests {
         }];
 
         let rendered = GiapPrompts::render_tool_guidance(&extensions);
-        println!("{}", rendered);
+        eprintln!("{}", rendered);
         assert!(rendered.contains("giap__get_current_weather"));
         assert!(rendered.contains("Weather integration"));
     }

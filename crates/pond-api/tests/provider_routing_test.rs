@@ -157,6 +157,7 @@ impl Agent for ToolCallingAgent {
                 session_id: request.session_id,
                 model_role: request.model_role,
                 usage: None,
+                stats: None,
             });
         };
         Ok(futures::stream::StreamExt::boxed(stream))

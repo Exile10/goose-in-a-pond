@@ -172,13 +172,56 @@ impl LogDrainHandle {
 /// The returned [`LogDrainHandle`] must be kept alive; call
 /// [`drain_into`](LogDrainHandle::drain_into) once the database pool is ready.
 pub fn init_tracing(debug: bool, data_dir: &Path) -> LogDrainHandle {
+    // Non-interactive commands (serve, setup, status, …) keep the normal INFO
+    // console. The interactive `chat` path opts into a quiet console directly.
+    init_tracing_with_console(debug, data_dir, ConsoleSink::Stdout, false)
+}
+
+/// Where the human-readable console log layer writes.
+///
+/// `pond-server chat --json-events` uses `Stderr` so stdout carries NOTHING
+/// but the NDJSON contract lines; every other command keeps `Stdout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleSink {
+    Stdout,
+    Stderr,
+}
+
+pub fn init_tracing_with_console(
+    debug: bool,
+    data_dir: &Path,
+    console: ConsoleSink,
+    console_quiet: bool,
+) -> LogDrainHandle {
+    // ggml / llama.cpp / whisper.cpp route their verbose per-load and per-token
+    // logs into tracing at INFO (via llama-cpp-2's send_logs_to_tracing). On the
+    // interactive voice-chat path that dumps the model-load banner and tensor
+    // tables straight onto the console, drowning the voice UI. Carve those
+    // targets down to WARN so only genuine errors survive; inference is surfaced
+    // as a clean one-line summary instead (see ChatService turn completion).
+    // `RUST_LOG` still overrides everything for a full-verbosity debug session.
     let filter_str = if debug {
-        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn"
+        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn,\
+         llama-cpp-2=warn,ggml=warn,whisper=warn"
     } else {
-        "info"
+        "info,llama-cpp-2=warn,ggml=warn,whisper=warn"
     };
-    let env_filter =
+    let rust_log_set = std::env::var("RUST_LOG").is_ok();
+
+    // Per-layer filters so the console can be quieter than the file (a single
+    // shared filter would couple them). The FILE always gets the full detail;
+    // the CONSOLE, on the interactive voice-chat path (`console_quiet`), is
+    // dropped to WARN so only real warnings/errors reach it — the curated,
+    // human-facing turn lines are printed directly (via `diag!`/`out!`, not
+    // tracing) and are unaffected. `RUST_LOG`, when set, wins for BOTH so a
+    // debug session sees everything on the console too.
+    let file_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter_str.into());
+    let console_filter = if console_quiet && !rust_log_set {
+        tracing_subscriber::EnvFilter::new("warn")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter_str.into())
+    };
 
     // ── Rolling file appender ────────────────────────────────────────────
     // Produces daily files: <data_dir>/logs/pond.log.YYYY-MM-DD
@@ -190,13 +233,26 @@ pub fn init_tracing(debug: bool, data_dir: &Path) -> LogDrainHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let db_layer = EventLogLayer { tx }.with_filter(TraceFilter);
 
+    // Route the console fmt layer to stdout or stderr. In `--json-events` mode
+    // stdout is reserved for NDJSON, so diagnostics go to stderr.
+    let console_layer = match console {
+        ConsoleSink::Stdout => tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout as fn() -> std::io::Stdout)
+            .with_filter(console_filter)
+            .boxed(),
+        ConsoleSink::Stderr => tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr as fn() -> std::io::Stderr)
+            .with_filter(console_filter)
+            .boxed(),
+    };
+
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(console_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking_file)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(file_filter),
         )
         .with(db_layer)
         .init();

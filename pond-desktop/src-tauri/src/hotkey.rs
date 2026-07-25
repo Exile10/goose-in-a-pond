@@ -64,7 +64,11 @@ pub fn register_summon_hotkey(app: &AppHandle) -> Result<(), String> {
 ///
 /// Reads the currently registered hotkey from `HotkeyState`, unregisters it,
 /// registers the new one, and updates the stored value.
-pub fn re_register_hotkey(app: &AppHandle, hotkey: &str, state: &HotkeyState) -> Result<(), String> {
+pub fn re_register_hotkey(
+    app: &AppHandle,
+    hotkey: &str,
+    state: &HotkeyState,
+) -> Result<(), String> {
     // Unregister whichever hotkey is currently active
     {
         let current = state.current.lock().unwrap();
