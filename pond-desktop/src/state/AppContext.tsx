@@ -179,7 +179,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "SERVER_ONLINE" });
       // connect() reuses a persisted token / refresh across restarts and only
       // falls back to a fresh pairing-code pair when neither is usable.
-      api.connect("pond-desktop")
+      api.connect()
         .then(async (token) => {
           if (token) {
             dispatch({ type: "SET_SESSION_TOKEN", payload: token });
