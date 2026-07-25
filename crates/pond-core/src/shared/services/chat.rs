@@ -1132,6 +1132,21 @@ pub struct ChatService {
     /// in `--json-events` mode so stdout carries NOTHING but NDJSON lines —
     /// human diagnostics still go to stderr via `eprintln!`/tracing.
     stdout_diagnostics: bool,
+    /// Optional per-turn telemetry sink. When set, confirmed voice turns
+    /// record a `TurnMetrics` row exactly like the REST path does.
+    telemetry: Option<Arc<dyn crate::security::ports::telemetry::TelemetryPort>>,
+    /// Model identifier for telemetry rows (the CLI knows `--model`).
+    model_name: Option<String>,
+}
+
+/// Result of one non-persisting agent stream: the streamed/spoken text plus
+/// the usage and performance stats carried by the agent's `Done` event.
+#[derive(Debug)]
+struct TurnOutcome {
+    text: String,
+    usage: Option<crate::models::ports::provider::UsageStats>,
+    stats: Option<crate::shared::domain::turn_stats::TurnStats>,
+    total_latency_ms: u64,
 }
 
 /// A pluggable workflow-event observer. `run_chat`'s `--json-events` mode wires
@@ -1161,7 +1176,24 @@ impl ChatService {
             memory_repo: None,
             event_sink: None,
             stdout_diagnostics: true,
+            telemetry: None,
+            model_name: None,
         }
+    }
+
+    /// Attach a telemetry sink so confirmed voice turns record `TurnMetrics`.
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<dyn crate::security::ports::telemetry::TelemetryPort>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Set the model identifier used in telemetry rows.
+    pub fn with_model_name(mut self, model_name: impl Into<String>) -> Self {
+        self.model_name = Some(model_name.into());
+        self
     }
 
     /// Attach the memory extraction pipeline so `persist_assistant_turn`
@@ -1579,14 +1611,15 @@ impl ChatService {
             .await?;
 
         // Stream + speak (no persistence inside).
-        let full_text = self
+        let outcome = self
             .stream_response_inner(message.clone(), fired_at)
             .await?;
 
         // Persist the assistant response and generate a title if needed.
-        self.persist_assistant_response(&full_text).await?;
-        self.maybe_generate_title(&message, &full_text).await;
-        Ok(full_text)
+        self.persist_assistant_response(&outcome.text).await?;
+        self.maybe_generate_title(&message, &outcome.text).await;
+        self.record_turn_outcome(&outcome).await;
+        Ok(outcome.text)
     }
 
     /// Streams a response through the Agent and speaks it, returning the full
@@ -1600,7 +1633,7 @@ impl ChatService {
         &self,
         message: String,
         fired_at: std::time::Instant,
-    ) -> Result<String> {
+    ) -> Result<TurnOutcome> {
         // The LLM handles tool routing natively via MCP — no pre-classification needed.
         // This path is only ever reached via run_loop (the voice CLI loop),
         // so voice_mode is unconditionally true here — this gets the TTS-friendly
@@ -1637,6 +1670,8 @@ impl ChatService {
         }
 
         let mut stream = self.agent.chat_stream(request).await?;
+        let mut turn_usage: Option<crate::models::ports::provider::UsageStats> = None;
+        let mut turn_stats: Option<crate::shared::domain::turn_stats::TurnStats> = None;
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
@@ -1726,7 +1761,10 @@ impl ChatService {
                     }
 
                     if !spoken_first {
-                        tracing::info!(
+                        // From-fire, user-perceived first-text latency (includes
+                        // quip/tone time). The engine-level TTFT arrives in the
+                        // Done event's TurnStats and is what the summary prints.
+                        tracing::debug!(
                             "[Q2-26 TTFT] {}ms from-fire",
                             fired_at.elapsed().as_millis()
                         );
@@ -1768,7 +1806,9 @@ impl ChatService {
                         );
                     }
                 }
-                AgentStreamEvent::Done { .. } => {
+                AgentStreamEvent::Done { usage, stats, .. } => {
+                    turn_usage = usage;
+                    turn_stats = stats;
                     // Flush any tail held back by the thought filter. Also append to
                     // full_text so the returned + persisted message includes the
                     // withheld lookahead bytes — otherwise the tail is spoken but
@@ -1877,7 +1917,113 @@ impl ChatService {
         // No persistence here — the caller (chat_stream_once for a confirmed
         // transcript, or run_loop's persist_confirmed_turn for the reused
         // speculative result) owns writing this turn to session storage.
-        Ok(full_text)
+        Ok(TurnOutcome {
+            text: full_text,
+            usage: turn_usage,
+            stats: turn_stats,
+            total_latency_ms: fired_at.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Record a completed turn's usage + performance: session token totals,
+    /// an optional `TurnMetrics` row, and the console summary line. Failures
+    /// are logged, never fatal — the reply was already delivered.
+    async fn record_turn_outcome(&self, outcome: &TurnOutcome) {
+        if let Some(usage) = &outcome.usage {
+            if let Err(e) = self
+                .session_storage
+                .increment_usage(
+                    &self.session_id,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    self.model_name.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!("failed to increment session usage: {e}");
+            }
+        }
+        if let (Some(telemetry), Some(stats)) = (&self.telemetry, &outcome.stats) {
+            let turn_number = telemetry
+                .get_turns(&self.session_id)
+                .await
+                .map(|v| v.len() as u32)
+                .unwrap_or(0)
+                + 1;
+            let metrics = crate::security::domain::turn_metrics::TurnMetrics {
+                session_id: self.session_id.clone(),
+                turn_number,
+                prompt_tokens: stats.prompt_tokens,
+                completion_tokens: stats.completion_tokens,
+                ttft_ms: stats.ttft_ms.unwrap_or(outcome.total_latency_ms),
+                total_latency_ms: outcome.total_latency_ms,
+                tool_name: None,
+                tool_latency_ms: None,
+                tool_cache_hit: None,
+                context_utilization_pct: stats.context_pct().unwrap_or(0.0),
+                model_name: self.model_name.clone().unwrap_or_default(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                prefill_ms: stats.prefill_ms,
+                model_load_ms: stats.model_load_ms,
+                decode_tok_per_sec: stats.decode_tok_per_sec,
+                prefill_tok_per_sec: stats.prefill_tok_per_sec,
+                context_limit_tokens: stats.context_limit_tokens,
+                inference_count: Some(stats.inference_count),
+            };
+            if let Err(e) = telemetry.record_turn(metrics).await {
+                tracing::debug!("failed to record voice turn metrics: {e}");
+            }
+        }
+        self.print_turn_summary(outcome);
+    }
+
+    /// One clean console line per turn — the "inference = summaries" contract.
+    /// Suppressed in `--json-events` mode (stdout is NDJSON-only there).
+    fn print_turn_summary(&self, outcome: &TurnOutcome) {
+        if !self.stdout_diagnostics {
+            return;
+        }
+        let Some(stats) = &outcome.stats else {
+            return;
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ttft) = stats.ttft_ms {
+            parts.push(format!("ttft {ttft}ms"));
+        }
+        match (stats.prefill_ms, stats.prefill_tok_per_sec) {
+            (Some(prefill), Some(rate)) => parts.push(format!(
+                "prefill {} tok in {:.1}s ({:.0} tok/s)",
+                stats.prompt_tokens,
+                prefill as f32 / 1000.0,
+                rate
+            )),
+            _ => parts.push(format!("prompt {} tok", stats.prompt_tokens)),
+        }
+        if let (Some(decode), Some(rate)) = (stats.decode_ms, stats.decode_tok_per_sec) {
+            parts.push(format!(
+                "decode {} tok in {:.1}s ({:.1} tok/s)",
+                stats.completion_tokens,
+                decode as f32 / 1000.0,
+                rate
+            ));
+        }
+        if let (Some(used), Some(limit)) = (stats.context_used_tokens, stats.context_limit_tokens) {
+            parts.push(format!(
+                "ctx {used}/{limit} ({:.0}%)",
+                stats.context_pct().unwrap_or(0.0)
+            ));
+        }
+        if let Some(load) = stats.model_load_ms {
+            if load > 0 {
+                parts.push(format!("load {:.1}s", load as f32 / 1000.0));
+            }
+        }
+        if stats.inference_count > 1 {
+            parts.push(format!("{} inferences", stats.inference_count));
+        }
+        if !parts.is_empty() {
+            println!("  [turn] {}", parts.join(" | "));
+        }
     }
 
     /// Persist a single assistant message to session storage. Split out of
@@ -1959,7 +2105,7 @@ impl ChatService {
         &self,
     ) -> Result<(
         Option<String>,
-        Option<(String, tokio::task::JoinHandle<Result<String>>)>,
+        Option<(String, tokio::task::JoinHandle<Result<TurnOutcome>>)>,
     )> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpeculativeSignal>();
         let callback: Box<dyn Fn(SpeculativeSignal) + Send + Sync> = Box::new(move |signal| {
@@ -1972,7 +2118,7 @@ impl ChatService {
         // `(spec_transcript, handle)` — the transcript the job was fired on is
         // retained so `run_loop` can confirm it matches the final transcript
         // before persisting anything.
-        let mut speculative: Option<(String, tokio::task::JoinHandle<Result<String>>)> = None;
+        let mut speculative: Option<(String, tokio::task::JoinHandle<Result<TurnOutcome>>)> = None;
 
         loop {
             tokio::select! {
@@ -2106,7 +2252,7 @@ impl ChatService {
             // live speculative job so it stops speaking and never persists.
             // Helper: aborts + silences the speculative job if one is running.
             let abort_speculative =
-                |spec: Option<(String, tokio::task::JoinHandle<Result<String>>)>| {
+                |spec: Option<(String, tokio::task::JoinHandle<Result<TurnOutcome>>)>| {
                     if let Some((_, handle)) = spec {
                         handle.abort();
                         self.voice_output.stop_speaking();
@@ -2341,11 +2487,12 @@ impl ChatService {
     /// still emitted exactly once, and only when the turn actually persisted.
     async fn finalize_confirmed_turn(
         &self,
-        chat_result: std::result::Result<Result<String>, tokio::task::JoinError>,
+        chat_result: std::result::Result<Result<TurnOutcome>, tokio::task::JoinError>,
         input: &str,
     ) -> bool {
         match chat_result {
-            Ok(Ok(response_text)) => {
+            Ok(Ok(outcome)) => {
+                let response_text = outcome.text.clone();
                 // Persist the confirmed turn exactly once (user + assistant),
                 // keyed to the confirmed transcript.
                 if let Err(e) = self.persist_confirmed_turn(input, &response_text).await {
@@ -2359,6 +2506,7 @@ impl ChatService {
                     });
                     return true;
                 }
+                self.record_turn_outcome(&outcome).await;
                 self.emit_event(WorkflowEvent::AgentOutput(response_text));
                 self.emit_event(WorkflowEvent::TurnComplete {
                     session_id: self.session_id.clone(),
@@ -2650,7 +2798,7 @@ mod tests {
             "the handle must carry the provisional transcript for the confirm-vs-spec gate"
         );
         let response = handle.await.unwrap().unwrap();
-        assert_eq!(response, "Echo: hello");
+        assert_eq!(response.text, "Echo: hello");
 
         // The speculative stream persists NOTHING — the run_loop gate owns
         // persistence after confirmation. Storage must still be empty here.
@@ -2752,7 +2900,7 @@ mod tests {
             .stream_response_inner("hello".to_string(), std::time::Instant::now())
             .await
             .unwrap();
-        assert_eq!(response, "Echo: hello");
+        assert_eq!(response.text, "Echo: hello");
 
         let msgs = storage.get_messages(&session_id).await.unwrap();
         assert!(
@@ -2783,7 +2931,7 @@ mod tests {
 
         // Confirmed transcript differs — commit the CONFIRMED one.
         service
-            .persist_confirmed_turn("what's the weather", &response)
+            .persist_confirmed_turn("what's the weather", &response.text)
             .await
             .unwrap();
 
@@ -3778,7 +3926,15 @@ mod tests {
         // Drive finalize_confirmed_turn directly with a successfully-streamed reply
         // whose persistence will fail (add_message always errors).
         let stayed_conversational = svc
-            .finalize_confirmed_turn(Ok(Ok("the answer is 42".to_string())), "what is the answer")
+            .finalize_confirmed_turn(
+                Ok(Ok(TurnOutcome {
+                    text: "the answer is 42".to_string(),
+                    usage: None,
+                    stats: None,
+                    total_latency_ms: 0,
+                })),
+                "what is the answer",
+            )
             .await;
 
         assert!(

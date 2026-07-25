@@ -471,7 +471,7 @@ impl pond_core::models::ports::agent::Agent for ToolEmittingMockAgent {
                 content: "Sunny, 28°C".to_string(),
             });
             yield Ok(AgentStreamEvent::Text { content: "Tool done".to_string() });
-            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None });
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None, stats: None });
         };
         Ok(stream.boxed())
     }
@@ -626,4 +626,106 @@ async fn chat_stream_persists_tool_result_rows() {
         roles
     );
     assert_eq!(messages.last().unwrap()["role"], "assistant");
+}
+
+/// A mock agent whose Done event carries TurnStats — verifies the /chat/stream
+/// SSE surface emits the `turn_stats` event with the engine numbers.
+struct StatsEmittingMockAgent;
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::agent::Agent for StatsEmittingMockAgent {
+    async fn chat(
+        &self,
+        request: pond_core::models::ports::agent::AgentRequest,
+    ) -> anyhow::Result<pond_core::models::ports::agent::AgentResponse> {
+        Ok(pond_core::models::ports::agent::AgentResponse {
+            text: format!("Echo: {}", request.message),
+            metadata: Default::default(),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        request: pond_core::models::ports::agent::AgentRequest,
+    ) -> anyhow::Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<pond_core::models::ports::agent::AgentStreamEvent>,
+        >,
+    > {
+        use futures::StreamExt;
+        use pond_core::models::ports::agent::AgentStreamEvent;
+        let session_id = request.session_id.clone();
+        let model_role = request.model_role.clone();
+        let stream = async_stream::stream! {
+            yield Ok(AgentStreamEvent::Text { content: "Fast answer".to_string() });
+            let mut stats = pond_core::shared::domain::turn_stats::TurnStats {
+                ttft_ms: Some(412),
+                prefill_ms: Some(2000),
+                decode_ms: Some(4000),
+                prompt_tokens: 1000,
+                completion_tokens: 88,
+                context_used_tokens: Some(1000),
+                context_limit_tokens: Some(3072),
+                inference_count: 1,
+                ..Default::default()
+            };
+            stats.finalize_rates();
+            yield Ok(AgentStreamEvent::Done {
+                session_id,
+                model_role,
+                usage: Some(pond_core::models::ports::provider::UsageStats {
+                    prompt_tokens: 1000,
+                    completion_tokens: 88,
+                }),
+                stats: Some(stats),
+            });
+        };
+        Ok(stream.boxed())
+    }
+}
+
+/// The SSE stream must surface a `turn_stats` event carrying the engine's
+/// per-turn performance numbers when the agent's Done event includes them.
+#[tokio::test]
+async fn chat_stream_emits_turn_stats_event() {
+    let (app, _tmp) = make_app_with_agent(Arc::new(StatsEmittingMockAgent)).await;
+
+    let stream_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": "stats-test",
+                        "message": "how fast are you?"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stream_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(stream_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+
+    let stats_line = body
+        .lines()
+        .find(|l| l.contains("\"type\":\"turn_stats\""))
+        .unwrap_or_else(|| panic!("no turn_stats SSE event in body: {body}"));
+    let payload: serde_json::Value =
+        serde_json::from_str(stats_line.trim_start_matches("data: ")).unwrap();
+    assert_eq!(payload["ttft_ms"], 412);
+    assert_eq!(payload["prompt_tokens"], 1000);
+    assert_eq!(payload["completion_tokens"], 88);
+    assert_eq!(payload["context_limit_tokens"], 3072);
+    assert_eq!(payload["decode_tok_per_sec"], 22.0);
+    assert_eq!(payload["inference_count"], 1);
 }

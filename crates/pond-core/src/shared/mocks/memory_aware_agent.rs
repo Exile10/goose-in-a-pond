@@ -75,7 +75,7 @@ impl Agent for MemoryAwareAgent {
         let model_role = request.model_role.clone();
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Text { content: text });
-            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None });
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None, stats: None });
         };
         Ok(stream.boxed())
     }
