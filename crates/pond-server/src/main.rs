@@ -1806,6 +1806,11 @@ async fn run_server(
     // Device actuation backend (#195): the Matter controller when configured
     // and reachable, else the logging stub. The bridge halves (event stream +
     // node cache) are spawned further down where the EventBus exists.
+    // Holds the controller GIAP started, if any. It must outlive this block:
+    // the child is kill_on_drop, so dropping the handle stops matter-server.
+    #[cfg(feature = "goose-agent")]
+    let _matter_server_child: Option<tokio::process::Child>;
+
     // Matter commissioning, available only once a controller is connected.
     // `None` means "Matter is off", which the API turns into a clear 503 rather
     // than a confusing failure when someone submits a setup code.
@@ -1854,6 +1859,10 @@ async fn run_server(
                 let cache: pond_adapters_matter::NodeCache =
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
+                // Same connection commissions new devices onto the fabric.
+                matter_commissioner = Some(Arc::new(
+                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
+                ));
                 let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
                     client.clone(),
                     cache.clone(),
@@ -1862,17 +1871,6 @@ async fn run_server(
                 // keeps working across a matter-server restart (#195).
                 let client_handle = control.client_handle();
                 (control, Some((client, events, cache, client_handle)))
-                // Same connection commissions new devices onto the fabric.
-                matter_commissioner = Some(Arc::new(
-                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
-                ));
-                (
-                    Arc::new(pond_adapters_matter::MatterDeviceControl::new(
-                        client.clone(),
-                        cache.clone(),
-                    )),
-                    Some((client, events, cache)),
-                )
             }
             Err(e) => {
                 tracing::warn!(
