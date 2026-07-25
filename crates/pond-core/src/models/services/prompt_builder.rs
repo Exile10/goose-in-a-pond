@@ -22,6 +22,13 @@
 //! // Always update the dynamic portions
 //! agent.extend_system_prompt("temporal", partition.dynamic_suffix);
 //! ```
+//!
+//! ## Prompt extras are outside `prefix_hash` — by design
+//!
+//! Prompt extras and skills (injected by the agent via `extend_system_prompt`
+//! as `<extension-notes>` blocks) are NOT part of the partition and are not
+//! covered by `prefix_hash`: they are appended after the partitioned prompt is
+//! applied, and changing them must not invalidate the static-prefix KV cache.
 
 use crate::prompts::{
     render_jinja_template, sanitize_field, ProfileContext, PromptState, PROMPT_BALANCED,
@@ -102,6 +109,7 @@ pub fn build_prompt_partition(
         available_tools: state.available_tools.clone(),
         thinking_enabled: state.thinking_enabled,
         compact_prompt: state.compact_prompt,
+        native_tools_json: state.native_tools_json,
         prefix_hash: None,
     };
 
@@ -222,6 +230,8 @@ pub fn compute_prefix_hash_fast(
     state.voice_mode.hash(&mut hasher);
     state.canvas_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
+    // Gates the "Available tools:" listing inside <tool-usage>
+    state.native_tools_json.hash(&mut hasher);
     // Tool descriptions are static, but hash their count as a sanity check
     state.available_tools.len().hash(&mut hasher);
     hasher.finish()
@@ -263,6 +273,7 @@ mod tests {
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
             thinking_enabled: false,
             compact_prompt: false,
+            native_tools_json: false,
             prefix_hash: None,
         }
     }
