@@ -1806,6 +1806,13 @@ async fn run_server(
     // Device actuation backend (#195): the Matter controller when configured
     // and reachable, else the logging stub. The bridge halves (event stream +
     // node cache) are spawned further down where the EventBus exists.
+    // Holds the controller GIAP started, if any. Kept until shutdown, where it
+    // is killed explicitly: kill_on_drop alone is not enough because a signal
+    // (Ctrl-C / SIGTERM) terminates the process without unwinding, so the
+    // destructor never runs and the controller would orphan.
+    #[cfg(feature = "goose-agent")]
+    let mut matter_server_child: Option<tokio::process::Child>;
+
     // Matter commissioning, available only once a controller is connected.
     // `None` means "Matter is off", which the API turns into a clear 503 rather
     // than a confusing failure when someone submits a setup code.
@@ -1829,7 +1836,7 @@ async fn run_server(
         // Auto-setup: install + start a controller when the URL is loopback and
         // nothing is serving it yet. A remote URL is someone else's server, and
         // an already-live port is reused as-is.
-        _matter_server_child =
+        matter_server_child =
             match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
                 Some(port) => {
                     match pond_adapters_matter::ensure_matter_server(
@@ -1854,6 +1861,10 @@ async fn run_server(
                 let cache: pond_adapters_matter::NodeCache =
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
+                // Same connection commissions new devices onto the fabric.
+                matter_commissioner = Some(Arc::new(
+                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
+                ));
                 let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
                     client.clone(),
                     cache.clone(),
@@ -1862,17 +1873,6 @@ async fn run_server(
                 // keeps working across a matter-server restart (#195).
                 let client_handle = control.client_handle();
                 (control, Some((client, events, cache, client_handle)))
-                // Same connection commissions new devices onto the fabric.
-                matter_commissioner = Some(Arc::new(
-                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
-                ));
-                (
-                    Arc::new(pond_adapters_matter::MatterDeviceControl::new(
-                        client.clone(),
-                        cache.clone(),
-                    )),
-                    Some((client, events, cache)),
-                )
             }
             Err(e) => {
                 tracing::warn!(
@@ -1887,7 +1887,7 @@ async fn run_server(
         }
     } else {
         // Matter disabled: nothing to install, nothing to start.
-        _matter_server_child = None;
+        matter_server_child = None;
         (
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             None,
@@ -2702,13 +2702,60 @@ async fn run_server(
         spawn_desktop_app(api_port);
     }
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    // Serve until a shutdown signal. We race the server against the signal
+    // rather than using graceful shutdown so long-lived SSE streams (chat,
+    // notifications) can't hold shutdown open indefinitely.
+    tokio::select! {
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ) => {
+            result?;
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received — stopping");
+        }
+    }
+
+    // Stop the matter-server GIAP started, if any. kill_on_drop does not fire on
+    // the signal path (the process exits without unwinding), so kill it here —
+    // otherwise the controller orphans and survives the Pond, including under
+    // `systemctl stop`.
+    #[cfg(feature = "goose-agent")]
+    if let Some(mut child) = matter_server_child.take() {
+        tracing::info!("stopping matter-server controller");
+        let _ = child.start_kill();
+    }
 
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C on any platform, plus
+/// SIGTERM on Unix (what `systemctl stop` and `docker stop` send). Used to end
+/// serving so shutdown cleanup — notably killing the matter-server child — runs
+/// instead of the process being torn down mid-flight.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // If we can't install the handler, never resolve on this arm.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 /// Print a Unicode QR code for `url` to stdout, indented to match the startup banner.

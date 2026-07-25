@@ -142,6 +142,17 @@ impl DeviceRegistry for SqliteDeviceRegistry {
         Ok(())
     }
 
+    async fn rename(&self, device_id: &str, name: &str) -> Result<()> {
+        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query("UPDATE devices SET name = ?, updated_at = ? WHERE id = ?")
+            .bind(name)
+            .bind(&now_str)
+            .bind(device_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn heartbeat(&self, device_id: &str) -> Result<()> {
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         sqlx::query("UPDATE devices SET last_seen = ?, is_online = 1, updated_at = ? WHERE id = ?")

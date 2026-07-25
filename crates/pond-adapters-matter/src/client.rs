@@ -162,7 +162,7 @@ impl MatterClient {
             return Err(anyhow!("matter-server connection lost"));
         }
 
-        match tokio::time::timeout(COMMAND_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow!("matter-server dropped the response channel")),
             Err(_) => {
