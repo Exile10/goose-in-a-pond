@@ -1258,8 +1258,6 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
-        let session_mgr = self.session_manager.clone();
-        let goose_sid_for_usage = goose_sid.clone();
 
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
@@ -1300,6 +1298,8 @@ impl GooseAdapter {
                 }
             };
 
+            let mut turn_stats = pond_core::shared::domain::turn_stats::TurnStats::default();
+            let mut saw_usage = false;
             while let Some(event_result) = goose_stream.next().await {
                 match event_result {
                     Ok(event) => match event {
@@ -1391,6 +1391,44 @@ impl GooseAdapter {
                         goose::agents::AgentEvent::HistoryReplaced(_) => {
                             yield Ok(AgentStreamEvent::Status { content: "Compacting context...".to_string() });
                         }
+                        // Per-inference usage from the provider. A turn can hold
+                        // several inferences (tool round-trips): the FINAL one's
+                        // input is the turn's real context load; outputs sum.
+                        goose::agents::AgentEvent::Usage(pu) => {
+                            saw_usage = true;
+                            turn_stats.inference_count += 1;
+                            if let Some(input) = pu.usage.input_tokens {
+                                turn_stats.prompt_tokens = input.max(0) as u32;
+                            }
+                            if let Some(output) = pu.usage.output_tokens {
+                                turn_stats.completion_tokens += output.max(0) as u32;
+                            }
+                            if let Some(stats) = &pu.stats {
+                                if turn_stats.ttft_ms.is_none() {
+                                    turn_stats.ttft_ms = stats.time_to_first_token_ms;
+                                }
+                                if let Some(load) = stats.model_load_ms {
+                                    turn_stats.model_load_ms =
+                                        Some(turn_stats.model_load_ms.unwrap_or(0) + load);
+                                }
+                                if let Some(prefill) = stats.prefill_ms {
+                                    turn_stats.prefill_ms =
+                                        Some(turn_stats.prefill_ms.unwrap_or(0) + prefill);
+                                }
+                                if let Some(elapsed) = stats.elapsed_ms {
+                                    let decode =
+                                        elapsed.saturating_sub(stats.prefill_ms.unwrap_or(0));
+                                    turn_stats.decode_ms =
+                                        Some(turn_stats.decode_ms.unwrap_or(0) + decode);
+                                }
+                                if let Some(n_ctx) = stats.effective_context_tokens {
+                                    turn_stats.context_limit_tokens = Some(n_ctx as u32);
+                                }
+                                if let Some(draft) = &stats.draft {
+                                    turn_stats.draft_accept_rate = Some(draft.accept_rate as f32);
+                                }
+                            }
+                        }
                         _ => {}
                     },
                     Err(e) => {
@@ -1398,27 +1436,22 @@ impl GooseAdapter {
                     }
                 }
             }
-            // Read real token usage from Goose's session metrics (tracked by
-            // the provider during inference). Fall back to chars/4 heuristic
-            // if the session isn't available or counts are missing.
-            let usage = match session_mgr.get_session(&goose_sid_for_usage, false).await {
-                Ok(goose_session) => {
-                    let input = goose_session.accumulated_usage.input_tokens
-                        .map(|t| t.max(0) as u32)
-                        .unwrap_or((user_msg_len / 4).max(1) as u32);
-                    let output = goose_session.accumulated_usage.output_tokens
-                        .map(|t| t.max(0) as u32)
-                        .unwrap_or((total_output_chars / 4).max(1) as u32);
-                    pond_core::models::ports::provider::UsageStats {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                    }
+            // Per-turn usage from the provider's per-inference Usage events.
+            // Fall back to the chars/4 heuristic only when the provider emitted
+            // no Usage events at all (some HTTP providers).
+            let usage = if saw_usage {
+                turn_stats.context_used_tokens = Some(turn_stats.prompt_tokens);
+                pond_core::models::ports::provider::UsageStats {
+                    prompt_tokens: turn_stats.prompt_tokens,
+                    completion_tokens: turn_stats.completion_tokens,
                 }
-                Err(_) => pond_core::models::ports::provider::UsageStats {
+            } else {
+                pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: (user_msg_len / 4).max(1) as u32,
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
-                },
+                }
             };
+            turn_stats.finalize_rates();
             let total_latency_ms = turn_start.elapsed().as_millis() as u64;
             tracing::info!(
                 target: "giap::trace",
@@ -1427,8 +1460,15 @@ impl GooseAdapter {
                 prompt_tokens = usage.prompt_tokens,
                 completion_tokens = usage.completion_tokens,
                 total_latency_ms,
+                ttft_ms = turn_stats.ttft_ms,
+                prefill_ms = turn_stats.prefill_ms,
+                decode_tok_per_sec = turn_stats.decode_tok_per_sec,
+                context_used_tokens = turn_stats.context_used_tokens,
+                context_limit_tokens = turn_stats.context_limit_tokens,
+                inference_count = turn_stats.inference_count,
             );
-            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage) });
+            let stats = saw_usage.then_some(turn_stats);
+            yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: Some(usage), stats });
         };
 
         Ok(Box::pin(stream))

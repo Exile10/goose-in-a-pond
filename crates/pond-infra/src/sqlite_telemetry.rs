@@ -34,7 +34,9 @@ impl SqliteTelemetry {
         let rows = sqlx::query(
             "SELECT session_id, turn_number, prompt_tokens, completion_tokens, ttft_ms, \
              total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
-             context_utilization_pct, model_name, timestamp \
+             context_utilization_pct, model_name, timestamp, \
+             prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
+             context_limit_tokens, inference_count \
              FROM turn_metrics ORDER BY id ASC",
         )
         .fetch_all(pool)
@@ -60,6 +62,20 @@ fn row_to_turn_metrics(row: &sqlx::sqlite::SqliteRow) -> TurnMetrics {
         context_utilization_pct: row.get::<f64, _>("context_utilization_pct") as f32,
         model_name: row.get("model_name"),
         timestamp: row.get("timestamp"),
+        prefill_ms: row.get::<Option<i64>, _>("prefill_ms").map(|v| v as u64),
+        model_load_ms: row.get::<Option<i64>, _>("model_load_ms").map(|v| v as u64),
+        decode_tok_per_sec: row
+            .get::<Option<f64>, _>("decode_tok_per_sec")
+            .map(|v| v as f32),
+        prefill_tok_per_sec: row
+            .get::<Option<f64>, _>("prefill_tok_per_sec")
+            .map(|v| v as f32),
+        context_limit_tokens: row
+            .get::<Option<i64>, _>("context_limit_tokens")
+            .map(|v| v as u32),
+        inference_count: row
+            .get::<Option<i64>, _>("inference_count")
+            .map(|v| v as u32),
     }
 }
 
@@ -70,8 +86,10 @@ impl TelemetryPort for SqliteTelemetry {
             "INSERT INTO turn_metrics \
              (session_id, turn_number, prompt_tokens, completion_tokens, ttft_ms, \
               total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
-              context_utilization_pct, model_name, timestamp) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              context_utilization_pct, model_name, timestamp, \
+              prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
+              context_limit_tokens, inference_count) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&metrics.session_id)
         .bind(metrics.turn_number as i64)
@@ -85,6 +103,12 @@ impl TelemetryPort for SqliteTelemetry {
         .bind(metrics.context_utilization_pct as f64)
         .bind(&metrics.model_name)
         .bind(&metrics.timestamp)
+        .bind(metrics.prefill_ms.map(|v| v as i64))
+        .bind(metrics.model_load_ms.map(|v| v as i64))
+        .bind(metrics.decode_tok_per_sec.map(|v| v as f64))
+        .bind(metrics.prefill_tok_per_sec.map(|v| v as f64))
+        .bind(metrics.context_limit_tokens.map(|v| v as i64))
+        .bind(metrics.inference_count.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -157,6 +181,12 @@ mod tests {
             context_utilization_pct: 30.0 + turn_number as f32,
             model_name: "test-model".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            prefill_ms: Some(1500 + turn_number as u64),
+            model_load_ms: None,
+            decode_tok_per_sec: Some(22.5),
+            prefill_tok_per_sec: Some(600.0),
+            context_limit_tokens: Some(3072),
+            inference_count: Some(1),
         }
     }
 

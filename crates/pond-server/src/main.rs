@@ -3103,6 +3103,15 @@ async fn run_chat(
 
     let mut chat_service =
         ChatService::new(agent, session_id.clone(), storage).with_system_prompt(system_prompt);
+    if let Some(model_name) = model {
+        chat_service = chat_service.with_model_name(model_name);
+    }
+    // Durable per-turn telemetry (TTFT, tok/s, context) for voice turns —
+    // same turn_metrics table the REST path writes.
+    match SqliteTelemetry::new(db.logs.clone()).await {
+        Ok(telemetry) => chat_service = chat_service.with_telemetry(Arc::new(telemetry)),
+        Err(e) => tracing::warn!("voice telemetry disabled (init failed): {e}"),
+    }
 
     // ── NDJSON event sink (--json-events) ──────────────────────────────────────
     // Writes one serialized WorkflowEvent per line to stdout with immediate

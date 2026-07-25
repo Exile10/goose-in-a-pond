@@ -34,6 +34,25 @@ pub struct TurnMetrics {
     pub model_name: String,
     /// ISO 8601 timestamp when the turn completed.
     pub timestamp: String,
+    /// Prefill time (template + tokenize + prompt decode), summed across the
+    /// turn's inferences. Engine-reported; None for providers without stats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<u64>,
+    /// Cold model-load time when a load happened during this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_load_ms: Option<u64>,
+    /// Generation speed in tokens/second (decode phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tok_per_sec: Option<f32>,
+    /// Prompt-processing speed in tokens/second (prefill phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_tok_per_sec: Option<f32>,
+    /// Engine-reported context window (n_ctx) for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit_tokens: Option<u32>,
+    /// Number of inferences the agentic loop ran (1 + tool round-trips).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_count: Option<u32>,
 }
 
 /// Aggregated telemetry summary for a session.

@@ -66,6 +66,10 @@ pub enum AgentStreamEvent {
         model_role: String,
         /// Token usage for this response (estimated if real counts unavailable).
         usage: Option<crate::models::ports::provider::UsageStats>,
+        /// Per-turn inference performance stats (TTFT, prefill/decode tok/s,
+        /// context utilization). None when the engine reports nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<super::turn_stats::TurnStats>,
     },
     Error {
         content: String,

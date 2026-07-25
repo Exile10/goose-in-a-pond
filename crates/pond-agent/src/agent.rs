@@ -643,6 +643,7 @@ impl Agent for PondAgent {
                     session_id,
                     model_role,
                     usage: Some(total_usage),
+                    stats: None,
                 }))
                 .await;
         });

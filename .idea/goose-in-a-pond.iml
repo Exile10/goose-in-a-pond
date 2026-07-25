@@ -45,6 +45,16 @@
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-sdk/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-agent/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-inference/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-vision-onnx/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-vision/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-hf-cache/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-hf-cache/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-download-manager/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-local-inference/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-provider-types/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-providers/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-providers/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-sdk-types/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/target" />
