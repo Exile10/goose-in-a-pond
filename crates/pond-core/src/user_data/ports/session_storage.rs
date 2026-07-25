@@ -103,4 +103,24 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<Option<String>, SessionStorageError> {
         Ok(None) // default no-op for backward compat
     }
+
+    /// Read the session's rolling conversation summary and the id of the last
+    /// message it covers. `(None, None)` when no summary exists yet.
+    async fn get_rolling_summary(
+        &self,
+        _session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        Ok((None, None)) // default no-op for backward compat
+    }
+
+    /// Store a refreshed rolling summary. `through_message_id` is the id of
+    /// the newest message the summary covers.
+    async fn set_rolling_summary(
+        &self,
+        _session_id: &str,
+        _summary: &str,
+        _through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
 }

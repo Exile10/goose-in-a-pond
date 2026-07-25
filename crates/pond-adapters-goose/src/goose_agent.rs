@@ -104,6 +104,15 @@ pub struct GooseAdapter {
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
     /// local inference providers to reuse their KV-cache for the stable portion.
     last_prefix_hash: Mutex<u64>,
+    /// GIAP session storage — read-only source of the rolling conversation
+    /// summary for the deterministic turn trimmer. Optional: without it the
+    /// trimmer still runs, just without a summary splice.
+    giap_session_storage:
+        Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
+    /// Last engine-reported prompt token count per GIAP session — feedback
+    /// for the trimmer's chars/4 estimate. OnceLock<Arc<..>> so the 'static
+    /// stream closure can hold a handle.
+    last_prompt_tokens_arc: std::sync::OnceLock<Arc<Mutex<HashMap<String, u32>>>>,
     /// Cached tool set from the last list_tools() call. Invalidated when
     /// extensions are added/removed. Avoids re-querying all MCP servers every turn.
     cached_tools: tokio::sync::RwLock<Option<std::collections::HashSet<String>>>,
@@ -209,6 +218,8 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
+            giap_session_storage: None,
+            last_prompt_tokens_arc: std::sync::OnceLock::new(),
             cached_tools: tokio::sync::RwLock::new(None),
             defaults_stripped: Mutex::new(HashSet::new()),
         })
@@ -438,6 +449,15 @@ impl GooseAdapter {
         #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("GOOSE_CONTEXT_LIMIT", effective_ctx.to_string());
+            // Hybrid compaction: GIAP owns trimming (deterministic, in-turn)
+            // and summarization (idle). A threshold >= 1.0 disables goose's
+            // own auto-compaction, which would stall the turn with an LLM
+            // summarization pass mid-conversation on-device.
+            if settings.hybrid_compaction_enabled {
+                std::env::set_var("GOOSE_AUTO_COMPACT_THRESHOLD", "1.0");
+            } else {
+                std::env::remove_var("GOOSE_AUTO_COMPACT_THRESHOLD");
+            }
         }
         tracing::info!(
             provider = %settings.chat_provider,
@@ -626,6 +646,159 @@ impl GooseAdapter {
             );
         }
         Ok(())
+    }
+
+    /// Arc-clone handle for the per-session last-prompt-token feedback map,
+    /// usable inside the 'static stream closure.
+    fn last_prompt_tokens_handle(&self) -> Arc<Mutex<HashMap<String, u32>>> {
+        // The map lives behind the adapter's Arc; expose a shared handle by
+        // storing it in an Arc on first use. (Field is Mutex<HashMap>; wrap
+        // the read/write through a dedicated Arc kept in self via OnceLock.)
+        self.last_prompt_tokens_arc
+            .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    /// Deterministically trim goose's stored conversation for this session:
+    /// strip stale <system-context> blocks from prior user turns, splice the
+    /// rolling <conversation-summary>, and drop the oldest complete turns
+    /// beyond the profile's history budget. Never calls a model; errors are
+    /// logged and skipped — a failed trim must never block the turn.
+    async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
+        use pond_core::models::services::context::context_budget::CompactionProfile;
+        use pond_core::models::services::context::turn_trimmer::{
+            trim_history, TrimMessage, TrimRole,
+        };
+
+        let conversation = match self.session_manager.get_session(goose_sid, true).await {
+            Ok(s) => match s.conversation {
+                Some(c) => c,
+                None => return,
+            },
+            Err(e) => {
+                tracing::debug!("trim: goose session unavailable: {e}");
+                return;
+            }
+        };
+        let source = conversation.messages().clone();
+        if source.is_empty() {
+            return;
+        }
+
+        // Rolling summary from GIAP storage (idle-refreshed).
+        let rolling_summary = match &self.giap_session_storage {
+            Some(storage) => storage
+                .get_rolling_summary(giap_session_id)
+                .await
+                .ok()
+                .and_then(|(s, _)| s),
+            None => None,
+        };
+
+        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let last_real = self
+            .last_prompt_tokens_handle()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(giap_session_id)
+            .copied();
+
+        let trim_input: Vec<TrimMessage> = source
+            .iter()
+            .enumerate()
+            .map(|(index, m)| {
+                let has_tool_response = m.content.iter().any(|c| {
+                    matches!(
+                        c,
+                        goose::conversation::message::MessageContent::ToolResponse(_)
+                    )
+                });
+                let text = m.as_concat_text();
+                let role = if has_tool_response {
+                    TrimRole::ToolResult
+                } else {
+                    match m.role {
+                        rmcp::model::Role::User => TrimRole::User,
+                        rmcp::model::Role::Assistant => TrimRole::Assistant,
+                    }
+                };
+                let is_summary = text.trim_start().starts_with("<conversation-summary>");
+                TrimMessage {
+                    index,
+                    role,
+                    text,
+                    is_summary,
+                }
+            })
+            .collect();
+
+        let outcome = trim_history(trim_input, &profile, rolling_summary.as_deref(), last_real);
+        if !outcome.changed {
+            return;
+        }
+
+        // Rebuild: original messages survive untouched unless (a) they are the
+        // spliced summary (fresh user message) or (b) their text changed AND
+        // they are plain-text messages — structured messages (tool requests /
+        // responses, thinking) are never rewritten, only kept or dropped.
+        let mut rebuilt: Vec<goose::conversation::message::Message> = Vec::new();
+        for tm in &outcome.messages {
+            if tm.is_summary || tm.index == usize::MAX {
+                rebuilt.push(goose::conversation::message::Message::user().with_text(&tm.text));
+                continue;
+            }
+            let original = &source[tm.index];
+            let text_only = original
+                .content
+                .iter()
+                .all(|c| matches!(c, goose::conversation::message::MessageContent::Text(_)));
+            if text_only && original.as_concat_text() != tm.text {
+                let mut m = match original.role {
+                    rmcp::model::Role::User => {
+                        goose::conversation::message::Message::user().with_text(&tm.text)
+                    }
+                    rmcp::model::Role::Assistant => {
+                        goose::conversation::message::Message::assistant().with_text(&tm.text)
+                    }
+                };
+                m.id = original.id.clone();
+                m.created = original.created;
+                rebuilt.push(m);
+            } else {
+                rebuilt.push(original.clone());
+            }
+        }
+
+        let rebuilt_conversation = goose::conversation::Conversation::new_unvalidated(rebuilt);
+        match self
+            .session_manager
+            .replace_conversation(goose_sid, &rebuilt_conversation)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "giap::trace",
+                kind = "history_trim",
+                session_id = %giap_session_id,
+                dropped_turns = outcome.dropped_turns,
+                estimated_tokens = outcome.estimated_tokens,
+                summary_spliced = rolling_summary.is_some(),
+            ),
+            Err(e) => tracing::warn!("trim: replace_conversation failed: {e}"),
+        }
+    }
+
+    /// Attach GIAP session storage so the deterministic turn trimmer can
+    /// splice the rolling `<conversation-summary>` into the model's history.
+    pub fn with_giap_session_storage(
+        mut self,
+        storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    ) -> Self {
+        self.giap_session_storage = Some(storage);
+        self
     }
 
     /// Register a GGUF model in Goose's global `local_model_registry` so that
@@ -1273,6 +1446,12 @@ impl GooseAdapter {
         };
 
         let agent_clone = self.agent.clone();
+        let last_prompt_tokens_map = self.last_prompt_tokens_handle();
+
+        // ── Deterministic in-turn trim (hybrid compaction, GIAP-owned) ──
+        if settings.hybrid_compaction_enabled {
+            self.trim_goose_history(&goose_sid, &session_id).await;
+        }
 
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
@@ -1467,6 +1646,12 @@ impl GooseAdapter {
                 }
             };
             turn_stats.finalize_rates();
+            if saw_usage {
+                last_prompt_tokens_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_id.clone(), turn_stats.prompt_tokens);
+            }
             let total_latency_ms = turn_start.elapsed().as_millis() as u64;
             tracing::info!(
                 target: "giap::trace",
