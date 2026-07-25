@@ -816,14 +816,11 @@ impl GooseAdapter {
 
         let gguf_dir = data_dir.join("models").join("gguf");
 
-        // Derive filename and registry key from the model name
-        let (stem, filename) = if model_name.ends_with(".gguf") {
-            let s = model_name.trim_end_matches(".gguf").to_string();
-            (s, model_name.to_string())
-        } else {
-            (model_name.to_string(), format!("{}.gguf", model_name))
-        };
-
+        // The registry key stays the requested name — callers look the model up
+        // by exactly the string in settings (`chat_model`). Only the file we
+        // point at is resolved, so a display name still resolves to its file.
+        let stem = model_name.trim_end_matches(".gguf").to_string();
+        let filename = resolve_gguf_filename(model_name, &gguf_dir);
         let local_path = gguf_dir.join(&filename);
         if !local_path.exists() {
             tracing::warn!(
@@ -835,7 +832,20 @@ impl GooseAdapter {
         match get_registry().lock() {
             Ok(mut registry) => {
                 let registry: &mut goose::providers::local_inference::local_model_registry::LocalModelRegistry = &mut registry;
-                if !registry.has_model(&stem) {
+                // Register when the model is absent, OR when a stale entry points
+                // at a file that no longer exists. The stale case is what older
+                // builds left behind: they stored the display name and derived
+                // `{name}.gguf`, so the persisted registry (models/registry.json)
+                // holds an entry whose `local_path` never existed. Skipping it —
+                // as a plain `has_model` check would — leaves the bad path in
+                // place and inference keeps failing with "Model not downloaded".
+                // `add_model` upserts, so re-registering repairs it in place.
+                let needs_register = registry
+                    .get_model(&stem)
+                    .map(|entry| !entry.local_path.exists())
+                    .unwrap_or(true);
+
+                if needs_register {
                     let mut settings = ModelSettings::default();
                     // GIAP's local GGUFs (gemma family) support llama.cpp native
                     // tool calling; force it rather than relying on Auto detection.
@@ -1794,9 +1804,180 @@ impl AgentPort for GooseAdapter {
     }
 }
 
+/// The `.gguf` filename to register for a model name, tolerating a missing
+/// quantization suffix.
+///
+/// Model names stored in settings and role assignments are frequently the
+/// catalog *display* name (e.g. `gemma-4-E2B-it`), while the file on disk keeps
+/// its quant suffix (`gemma-4-E2B-it-Q4_K_M.gguf`). Naively appending `.gguf`
+/// therefore points at a file that does not exist, and inference fails with
+/// "Model not downloaded" even though the model is present. This resolves the
+/// name to a real file so a display name still loads.
+///
+/// Resolution order:
+/// 1. an explicit `.gguf` name is taken verbatim;
+/// 2. an exact `{name}.gguf` on disk wins;
+/// 3. otherwise a quant variant `{name}-*.gguf` (or `{name}.*.gguf`) — only
+///    files that actually exist are considered, and the choice is
+///    deterministic (lexicographically first) so repeated runs agree;
+/// 4. failing all that, the naive `{name}.gguf`, so the caller's
+///    file-not-found warning still fires.
+fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String {
+    if model_name.ends_with(".gguf") {
+        return model_name.to_string();
+    }
+
+    let exact = format!("{model_name}.gguf");
+    if gguf_dir.join(&exact).exists() {
+        return exact;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(gguf_dir) {
+        let mut variants: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|f| f.ends_with(".gguf"))
+            .filter(|f| {
+                let base = f.trim_end_matches(".gguf");
+                // A quant variant is the model name, a separator, then a
+                // quantization tag. Requiring the tag matters: model names
+                // contain hyphens too, so "gemma-4-E2B" is a prefix of the
+                // *different* model "gemma-4-E2B-it-Q4_K_M" — and must not
+                // match it. Only a real quant suffix counts.
+                base.strip_prefix(model_name)
+                    .and_then(|rest| rest.strip_prefix(['-', '.']))
+                    .is_some_and(looks_like_quant_tag)
+            })
+            .collect();
+        variants.sort();
+        if let Some(filename) = variants.into_iter().next() {
+            return filename;
+        }
+    }
+
+    exact
+}
+
+/// Whether `tag` begins with a GGUF quantization marker (`Q4_K_M`, `Q6_K`,
+/// `Q8_0`, `IQ4_XS`, `F16`, `F32`, `BF16`, …). Deliberately conservative: it
+/// only needs to tell a quant suffix apart from a continuation of the model
+/// name (`it`, `instruct`), not to validate every possible tag.
+fn looks_like_quant_tag(tag: &str) -> bool {
+    let digit_after = |prefix: &str| {
+        tag.strip_prefix(prefix)
+            .and_then(|r| r.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    };
+    tag.starts_with("F16")
+        || tag.starts_with("F32")
+        || tag.starts_with("BF16")
+        || digit_after("IQ")
+        || digit_after("Q")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"gguf").unwrap();
+    }
+
+    #[test]
+    fn exact_match_is_preferred() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E2B-it.gguf");
+        touch(tmp.path(), "gemma-4-E2B-it-Q4_K_M.gguf");
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E2B-it", tmp.path()),
+            "gemma-4-E2B-it.gguf"
+        );
+    }
+
+    /// The bug this fixes: a display name resolves to its quant-suffixed file.
+    #[test]
+    fn display_name_resolves_to_its_quant_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E2B-it-Q4_K_M.gguf");
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E2B-it", tmp.path()),
+            "gemma-4-E2B-it-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn an_explicit_gguf_name_is_taken_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_gguf_filename("whatever-Q8_0.gguf", tmp.path()),
+            "whatever-Q8_0.gguf"
+        );
+    }
+
+    /// A shorter name must not swallow a longer sibling: `gemma-4-E2B` is not
+    /// a prefix-with-separator of `gemma-4-E2B-it`, so it must not match it.
+    #[test]
+    fn a_bare_prefix_does_not_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E2B-it-Q4_K_M.gguf");
+        // No file for "gemma-4-E2B" exists, and the -it- file is a different
+        // model, so we fall back to the naive name rather than mis-resolving.
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E2B", tmp.path()),
+            "gemma-4-E2B.gguf"
+        );
+    }
+
+    #[test]
+    fn missing_file_falls_back_to_the_naive_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_gguf_filename("not-installed", tmp.path()),
+            "not-installed.gguf"
+        );
+    }
+
+    /// Among several quant variants the choice is deterministic.
+    #[test]
+    fn variant_choice_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E4B-it-Q4_K_S.gguf");
+        touch(tmp.path(), "gemma-4-E4B-it-Q4_K_M.gguf");
+        // Lexicographically first: ...Q4_K_M before ...Q4_K_S.
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E4B-it", tmp.path()),
+            "gemma-4-E4B-it-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn quant_tags_are_told_apart_from_name_continuations() {
+        for q in [
+            "Q4_K_M", "Q6_K", "Q8_0", "Q4_0", "IQ4_XS", "F16", "F32", "BF16",
+        ] {
+            assert!(looks_like_quant_tag(q), "{q} should read as a quant tag");
+        }
+        for not in ["it", "instruct", "it-Q4_K_M", "chat", ""] {
+            assert!(!looks_like_quant_tag(not), "{not} is not a quant tag");
+        }
+    }
+
+    /// The exact production shape: two sibling models where one name is a
+    /// prefix of the other. Each must resolve to its own file.
+    #[test]
+    fn sibling_models_do_not_cross_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E2B-it-Q4_K_M.gguf");
+        touch(tmp.path(), "gemma-4-E4B-it-Q4_K_M.gguf");
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E2B-it", tmp.path()),
+            "gemma-4-E2B-it-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E4B-it", tmp.path()),
+            "gemma-4-E4B-it-Q4_K_M.gguf"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires llamafile at http://127.0.0.1:8080"]
