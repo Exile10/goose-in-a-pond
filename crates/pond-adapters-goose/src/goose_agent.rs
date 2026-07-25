@@ -898,6 +898,11 @@ impl GooseAdapter {
                 available_tools,
                 thinking_enabled,
                 compact_prompt,
+                // Local llama.cpp providers inject the full tools JSON via the
+                // model's chat template (native tool calling) — the prompt
+                // template must not render its own "Available tools:" listing
+                // on top of that, or every schema is fed to the model twice.
+                native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
@@ -968,19 +973,29 @@ impl GooseAdapter {
             self.agent.override_system_prompt(system_prompt).await;
         }
 
+        // Extras and skills are appended AFTER the partitioned prompt and sit
+        // OUTSIDE prefix_hash by design (see models/services/prompt_builder.rs).
+        // Each body is wrapped in an <extension-notes> envelope so small models
+        // can tell injected extension guidance apart from the core prompt
+        // sections of the v2 tag skeleton.
         if let Ok(extras) = extras_result {
             for extra in extras {
-                self.agent
-                    .extend_system_prompt(extra.key, extra.instruction)
-                    .await;
+                let body = format!(
+                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
+                    extra.key, extra.instruction
+                );
+                self.agent.extend_system_prompt(extra.key, body).await;
             }
         }
 
         if let Ok(skills) = skills_result {
             for skill in skills {
-                self.agent
-                    .extend_system_prompt(format!("skill:{}", skill.name), skill.content)
-                    .await;
+                let key = format!("skill:{}", skill.name);
+                let body = format!(
+                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
+                    key, skill.content
+                );
+                self.agent.extend_system_prompt(key, body).await;
             }
         }
 
