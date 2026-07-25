@@ -225,7 +225,8 @@ impl DeviceControlPort for MatterDeviceControl {
         let pct = percent.min(100);
         let (node, ep) = self.resolve(device_id, CLUSTER_FAN_CONTROL).await?;
         // Fan speed is the `PercentSetting` attribute (0–100), not a command.
-        self.client
+        self.client()
+            .await
             .send_command(
                 "write_attribute",
                 json!({

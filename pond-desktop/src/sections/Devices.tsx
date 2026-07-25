@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Button, Separator } from "@heroui/react";
 import {
-  Monitor, Cpu, Activity, Power, Settings, Plus, X,
+  Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio,
   Lightbulb, Lock, Thermometer, Fan, Blinds,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
