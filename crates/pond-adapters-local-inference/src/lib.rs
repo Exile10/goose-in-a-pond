@@ -8,7 +8,7 @@
 //! - **Jetson Orin Nano (NVIDIA)**: Requires `--features cuda` at build time.
 //!   CUDA settings are applied to the model registry at init time:
 //!   - `n_gpu_layers = 99` — full offload into unified 8 GB DRAM (no separate VRAM)
-//!   - `context_size = 3072` — safe headroom for GIAP's chat workflow on 8 GB
+//!   - `context_size = 4096` — fits the schema-v2 turn-1 prompt (~3.2K tokens) on 8 GB
 //!   - `n_batch = 512` — maximise GPU throughput on Ampere (sm_87)
 //!   - `n_threads = 4` — 6-core A78AE; leave headroom for OS + voice pipeline
 //!   - `flash_attention = true` — reduces KV-cache memory by ~40 % on Ampere
@@ -356,9 +356,11 @@ impl LocalInferenceLlmAdapter {
             // Full GPU offload: Jetson unified memory means all layers fit in
             // the same 8 GB pool — no split between CPU and GPU DRAM.
             n_gpu_layers: Some(99),
-            // 3072-token context fits the GIAP chat workflow with room for the
-            // system prompt + history, while keeping KV-cache pressure manageable.
-            context_size: Some(3072),
+            // 4096-token context: the schema-v2 turn-1 prompt (system prefix +
+            // native tools JSON for all giap extensions) measures ~3.2K tokens,
+            // so 3072 could not hold even a fresh session. With flash attention
+            // the extra 1K tokens of KV cache is a modest cost on the 8 GB pool.
+            context_size: Some(4096),
             // Batch size 512 keeps Ampere SMs saturated during prefill without
             // exceeding the available memory bandwidth (68 GB/s).
             n_batch: Some(512),
