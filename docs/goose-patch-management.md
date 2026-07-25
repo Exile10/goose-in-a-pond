@@ -11,11 +11,11 @@ how to rebase against a new upstream goose release.
 
 ## GIAP Patch Set
 
-### Branch: `giap-patches-2026-07` (current)
+### Branch: `main` (current pin)
 
-`jarida-io/Goose:giap-patches-2026-07` = upstream goose `main` (synced 2026-07-25,
-675 commits, upstream tip `192b5db8b`) merged into the previous
-`giap-patches-rmcp-1.5` history, carrying:
+`jarida-io/Goose:main` = upstream goose `main` (synced 2026-07-25, 675 commits,
+upstream tip `192b5db8b`) merged into the previous `giap-patches-rmcp-1.5`
+history, carrying:
 
 | Patch | Description | Files |
 |--------|-------------|-------|
@@ -45,21 +45,22 @@ The GIAP parent workspace still forces `rmcp = "=1.5.0"` so the goose crates and
 
 ```
 jarida-io/Goose
-├── main                   ← historical fork main (pre-quadrant GIAP work)
+├── main                   ← CURRENT PIN: upstream 2026-07 sync + patch set above
 ├── giap-patches           ← legacy patch branch (pre-rmcp-1.5)
-├── giap-patches-rmcp-1.5  ← previous pin; still referenced by parent `main`'s CI
-└── giap-patches-2026-07   ← CURRENT: upstream 2026-07 sync + patch set above
+└── giap-patches-rmcp-1.5  ← previous pin; still referenced by parent `main`'s CI
 ```
 
-The parent repo (`goose-in-a-pond`) pins the submodule to the tip of the current
-patch branch. `.gitmodules` names the branch, and `.github/workflows/ci.yml`
-clones that branch's HEAD directly (bypassing the stored submodule SHA).
+The parent repo (`goose-in-a-pond`) pins the submodule to the tip of
+`jarida-io/Goose:main`. `.gitmodules` names the branch, and
+`.github/workflows/ci.yml` clones that branch's HEAD directly (bypassing the
+stored submodule SHA).
 
-**A new sync gets a NEW branch name.** CI clones the branch tip by name, so
-pushing a breaking sync to the branch that `main`'s ci.yml references would break
-CI for `main` and every open PR. Instead: push the sync to a fresh branch, then
-flip `.gitmodules` + `ci.yml` + the submodule SHA in one parent commit on the
-branch that carries the matching parent-side API changes.
+**Stage breaking syncs on a side branch.** CI clones the fork branch tip by
+name, so moving `main` underneath parent branches whose code still targets the
+old goose API fails their fresh CI runs. Prepare and verify a sync on a
+temporary fork branch, then fast-forward it into fork `main` together with the
+one parent commit that carries the matching API port (`.gitmodules` + `ci.yml`
++ submodule SHA + docs). Delete the temporary branch afterwards.
 
 ### Parent workspace dependency mirror
 
@@ -92,7 +93,7 @@ the current patch branch — verify with:
 
 ```bash
 git -C goose branch -r --contains $(git ls-tree HEAD goose | awk '{print $3}')
-# expected output:  origin/giap-patches-2026-07
+# expected output:  origin/main
 ```
 
 ---
@@ -108,7 +109,7 @@ cd goose
 git remote add upstream https://github.com/aaif-goose/goose
 
 git fetch upstream main
-git checkout -B <new-branch> origin/<current-branch>
+git checkout -B sync-staging origin/main
 
 # MERGE (not rebase) upstream — the branch history contains merge commits, and
 # a merge needs no force-push. Resolve conflicts, re-porting the patch set
@@ -119,9 +120,9 @@ git merge upstream/main
 # mirror section above — the parent Cargo.toml usually needs updates too):
 cd .. && SQLX_OFFLINE=true cargo check -p pond-server -p pond-adapters-goose
 
-# Push the NEW branch, then flip .gitmodules + ci.yml + submodule SHA + this
-# document in ONE parent commit.
-git -C goose push origin <new-branch>
+# Fast-forward fork main, then flip .gitmodules + ci.yml + submodule SHA +
+# this document in ONE parent commit.
+git -C goose push origin sync-staging:main
 git add goose .gitmodules .github/workflows/ci.yml docs/goose-patch-management.md
 git commit -m "chore: sync goose fork with upstream (<date>)"
 ```
@@ -136,9 +137,9 @@ git submodule update --init --recursive
 
 ## Adding a New GIAP Patch
 
-1. Checkout the current patch branch in the submodule: `git -C goose checkout giap-patches-2026-07`
+1. Checkout `main` in the submodule: `git -C goose checkout main`
 2. Make and commit your change in the submodule
-3. Push: `git -C goose push origin giap-patches-2026-07`
+3. Push: `git -C goose push origin main`
 4. In the parent repo, stage and commit the updated pointer:
    ```bash
    git add goose

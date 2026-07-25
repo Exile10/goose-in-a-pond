@@ -152,17 +152,17 @@ Do not remove either guard without a dedicated stabilisation milestone. The code
 
 See `docs/goose-patch-management.md` for the patch set carried on top of upstream (`aaif-goose/goose`) and the upstream-rebase procedure.
 
-The submodule is pinned to `jarida-io/Goose:giap-patches-2026-07` (upstream main
-synced 2026-07-25 + the GIAP patch set: ollama tool-less retry, extra featured
-Gemma 4 models; the old native_tool_calling/use_jinja patches are subsumed by
-upstream's `ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`;
-the workspace still forces `rmcp = "=1.5.0"`. CI clones this branch's tip
-directly, bypassing the stored submodule SHA — a breaking sync therefore goes to
-a NEW branch, flipped together with `.gitmodules` + `ci.yml` in one commit
-(`main` still references `giap-patches-rmcp-1.5` until this lands there). The
-goose crates' `workspace = true` deps resolve against the PARENT `Cargo.toml`
-(mirror rules in `docs/goose-patch-management.md`). After a sync lands,
-teammates must run:
+The submodule is pinned to `jarida-io/Goose:main` (upstream main synced
+2026-07-25 + the GIAP patch set: ollama tool-less retry, extra featured Gemma 4
+models; the old native_tool_calling/use_jinja patches are subsumed by upstream's
+`ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the
+workspace still forces `rmcp = "=1.5.0"`. CI clones the fork branch tip
+directly, bypassing the stored submodule SHA — a BREAKING sync must be staged on
+a side branch and fast-forwarded into fork `main` together with the parent-side
+API port in one commit (parent `main`'s ci.yml still references
+`giap-patches-rmcp-1.5` until this branch lands there). The goose crates'
+`workspace = true` deps resolve against the PARENT `Cargo.toml` (mirror rules in
+`docs/goose-patch-management.md`). After a sync lands, teammates must run:
 
 ```bash
 git submodule update --init --recursive
