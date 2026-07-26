@@ -50,6 +50,63 @@ impl PipelineActive {
     }
 }
 
+/// `rodio::OutputStream` is `!Send` due to cpal's CoreAudio property-listener
+/// callbacks. We move it to a dedicated keeper thread that lives for the whole
+/// app lifetime and never touch it from any other thread, so the transfer is
+/// safe. Mirrors `pond_adapters_piper::AudioKeeper`.
+#[allow(dead_code)] // kept alive for its Drop (closes the audio device); never read
+struct SendableStream(rodio::OutputStream);
+// SAFETY: moved into the keeper thread exactly once at app startup and never
+// accessed from any other thread afterward.
+unsafe impl Send for SendableStream {}
+
+/// One persistent CoreAudio output opened at app startup and reused by every
+/// TTS/ping/thinking-tone playback call. Reopening `OutputStream::try_default()`
+/// on every sentence (the previous behaviour) causes the repeated CoreAudio
+/// AudioUnit open/close cycle that produces fragmented, progressively
+/// degrading playback across a multi-sentence response — the same class of
+/// bug `pond_adapters_piper::AudioKeeper` fixes for the in-process CLI path.
+pub struct SharedAudioOutput(Option<rodio::OutputStreamHandle>);
+
+impl SharedAudioOutput {
+    pub fn new() -> Self {
+        let (stream, handle) = match rodio::OutputStream::try_default() {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    "audio output device unavailable at startup ({e}) — \
+                     falling back to per-call streams, playback may be choppy"
+                );
+                return Self(None);
+            }
+        };
+        let sendable = SendableStream(stream);
+        let spawned = std::thread::Builder::new()
+            .name("desktop-audio-keeper".into())
+            .spawn(move || {
+                let _stream = sendable; // keep OutputStream alive for the app's lifetime
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            });
+        match spawned {
+            Ok(_) => Self(Some(handle)),
+            Err(e) => {
+                tracing::warn!(
+                    "audio keeper thread spawn failed ({e}) — falling back to per-call streams"
+                );
+                Self(None)
+            }
+        }
+    }
+
+    /// A cheap clone of the shared handle, or `None` if no persistent output
+    /// device was available at startup (callers fall back to opening their own).
+    pub fn handle(&self) -> Option<rodio::OutputStreamHandle> {
+        self.0.clone()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptResult {
     pub text: String,
@@ -258,12 +315,19 @@ pub async fn record_with_vad(
 /// Play a short confirmation ping — used to signal wake-word detection.
 /// Synthesises a brief two-tone chime (~200ms) using pure math, no assets needed.
 #[tauri::command]
-pub async fn play_ping() -> Result<(), String> {
-    tokio::task::spawn_blocking(|| {
+pub async fn play_ping(audio_output: State<'_, SharedAudioOutput>) -> Result<(), String> {
+    let shared_handle = audio_output.handle();
+    tokio::task::spawn_blocking(move || {
         use rodio::{OutputStream, Sink, Source};
         use std::time::Duration;
 
-        let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+        let (_owned_stream, handle) = match shared_handle {
+            Some(h) => (None, h),
+            None => {
+                let (stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+                (Some(stream), handle)
+            }
+        };
         let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
         sink.set_volume(0.35);
 
@@ -378,8 +442,10 @@ pub async fn run_voice_pipeline(
     pipeline_flag: State<'_, PipelineActive>,
     speculative_llm: State<'_, SpeculativeLlmSlot>,
     voice: State<'_, crate::chat_process::VoiceChatProcess>,
+    audio_output: State<'_, SharedAudioOutput>,
 ) -> Result<(), String> {
     use crate::tts_text;
+    let audio_handle = audio_output.handle();
 
     // A terminal-voice child owns the mic and speaker exclusively while active —
     // do not run the HTTP transcribe → chat → TTS pipeline in parallel with it.
@@ -387,14 +453,22 @@ pub async fn run_voice_pipeline(
         return Err("voice session active".to_string());
     }
 
-    // Reset kill switch at the start of each pipeline run.
-    kill_switch.0.store(false, Ordering::Relaxed);
-    let kill_flag = kill_switch.0.clone();
+    // Atomically claim exclusive pipeline ownership. If another invocation of
+    // this command is already running (e.g. from JS listener fan-out when the
+    // wake word fires multiple registered Tauri listeners), return immediately
+    // so we never run two concurrent pipelines on the same wake event.
+    if pipeline_flag
+        .0
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        tracing::debug!(
+            "run_voice_pipeline: duplicate invocation dropped (pipeline already active)"
+        );
+        return Ok(());
+    }
 
-    // Mark pipeline as active so the always-on wake listener uses
-    // barge-in mode (kill switch only, no one-breath capture).
-    pipeline_flag.0.store(true, Ordering::Relaxed);
-    // RAII guard — clears the flag on all exit paths (Ok, Err, panic).
+    // We now own the pipeline — guard releases the flag on all exit paths.
     struct PipelineGuard(Arc<AtomicBool>);
     impl Drop for PipelineGuard {
         fn drop(&mut self) {
@@ -402,6 +476,10 @@ pub async fn run_voice_pipeline(
         }
     }
     let _pipeline_guard = PipelineGuard(pipeline_flag.0.clone());
+
+    // Reset kill switch after claiming ownership.
+    kill_switch.0.store(false, Ordering::Relaxed);
+    let kill_flag = kill_switch.0.clone();
 
     let base_url = server.get_url();
     let client = reqwest::Client::new();
@@ -477,7 +555,9 @@ pub async fn run_voice_pipeline(
         // Speak the farewell via TTS (interruptible — wake word can still barge in)
         match fetch_tts_bytes(&client, &base_url, farewell).await {
             Ok(bytes) => {
-                let _ = play_wav_bytes_interruptible(bytes, kill_flag.clone()).await;
+                let _ =
+                    play_wav_bytes_interruptible(bytes, kill_flag.clone(), audio_handle.clone())
+                        .await;
             }
             Err(e) => {
                 tracing::debug!("Farewell TTS skipped: {e}");
@@ -490,6 +570,13 @@ pub async fn run_voice_pipeline(
     }
 
     // ── 2. Quip — fills silence during LLM inference (after transcription) ──
+    // Deliberately does NOT use the shared audio_handle: the quip plays
+    // concurrently with the thinking tone, and both can still be draining
+    // when the first real sentence starts — three sinks briefly competing for
+    // one shared mixer produced audible choppiness. Each gets its own
+    // independent stream instead; only the sequential per-sentence TTS
+    // playback below reuses the shared handle (that's what the persistent
+    // stream was meant to fix: churn *between sentences* of one response).
     let quip_text = pick_quip();
     let quip_client = client.clone();
     let quip_url = base_url.clone();
@@ -497,7 +584,7 @@ pub async fn run_voice_pipeline(
     let quip_handle = tokio::spawn(async move {
         match fetch_tts_bytes(&quip_client, &quip_url, quip_text).await {
             Ok(bytes) => {
-                let _ = play_wav_bytes_interruptible(bytes, quip_kill).await;
+                let _ = play_wav_bytes_interruptible(bytes, quip_kill, None).await;
             }
             Err(e) => {
                 tracing::debug!("Quip TTS skipped: {e}");
@@ -553,10 +640,11 @@ pub async fn run_voice_pipeline(
     let thinking_active = std::sync::Arc::new(AtomicBool::new(true));
     let thinking_flag = thinking_active.clone();
     let tone_kill = kill_flag.clone();
+    // Own stream, not the shared handle — see the quip comment above for why.
     let thinking_tone = tokio::task::spawn_blocking(move || {
         use rodio::{OutputStream, Sink};
 
-        let Ok((_stream, handle)) = OutputStream::try_default() else {
+        let Ok((_owned_stream, handle)) = OutputStream::try_default() else {
             return;
         };
         let Ok(sink) = Sink::try_new(&handle) else {
@@ -597,6 +685,7 @@ pub async fn run_voice_pipeline(
     let tts_url = base_url.clone();
     let tts_app = app.clone();
     let tts_kill = kill_flag.clone();
+    let tts_audio = audio_handle.clone();
     let tts_task = tokio::spawn(async move {
         let mut quip_done = false;
         let mut quip = Some(quip_handle);
@@ -622,7 +711,9 @@ pub async fn run_voice_pipeline(
             }
             match fetch_tts_bytes(&tts_client, &tts_url, &text).await {
                 Ok(bytes) => {
-                    let _ = play_wav_bytes_interruptible(bytes, tts_kill.clone()).await;
+                    let _ =
+                        play_wav_bytes_interruptible(bytes, tts_kill.clone(), tts_audio.clone())
+                            .await;
                 }
                 Err(e) => {
                     tracing::warn!("Sentence TTS failed: {e}");
@@ -820,12 +911,28 @@ async fn fetch_tts_bytes(
 /// Play WAV bytes through the system audio output via rodio.
 /// Play WAV bytes with an interruptible loop. Checks `kill` every 50 ms;
 /// if set, stops playback immediately (wake word barge-in).
-async fn play_wav_bytes_interruptible(bytes: Vec<u8>, kill: Arc<AtomicBool>) -> Result<(), String> {
+///
+/// `shared_handle` should be the app-lifetime `SharedAudioOutput` handle —
+/// reusing it avoids reopening the CoreAudio device on every call, which
+/// fragments playback across a multi-sentence response. Falls back to
+/// opening a fresh, one-off stream only if no shared handle is available.
+async fn play_wav_bytes_interruptible(
+    bytes: Vec<u8>,
+    kill: Arc<AtomicBool>,
+    shared_handle: Option<rodio::OutputStreamHandle>,
+) -> Result<(), String> {
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
             use rodio::{Decoder, OutputStream, Sink};
-            let (_stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+            let (_owned_stream, handle) = match shared_handle {
+                Some(h) => (None, h),
+                None => {
+                    let (stream, handle) =
+                        OutputStream::try_default().map_err(|e| e.to_string())?;
+                    (Some(stream), handle)
+                }
+            };
             let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
             let cursor = std::io::Cursor::new(bytes);
             let source = Decoder::new(cursor).map_err(|e| e.to_string())?;
@@ -848,8 +955,9 @@ async fn play_wav_bytes_interruptible(bytes: Vec<u8>, kill: Arc<AtomicBool>) -> 
 }
 
 /// Non-interruptible playback — used for short pings where barge-in is unwanted.
+#[allow(dead_code)]
 async fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), String> {
-    play_wav_bytes_interruptible(bytes, Arc::new(AtomicBool::new(false))).await
+    play_wav_bytes_interruptible(bytes, Arc::new(AtomicBool::new(false)), None).await
 }
 
 /// Synthesise `text` and play it — convenience wrapper.

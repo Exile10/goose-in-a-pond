@@ -183,6 +183,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
         session_storage: session_storage.clone(),
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),

@@ -101,6 +101,7 @@ async fn make_app_with_real_memory(
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
         session_storage,
         http_client: ReqwestClient::new(),
         agent: Arc::new(MockAgent::new()),

@@ -36,8 +36,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use crate::{
-    f32_samples_to_pcm_le_bytes, pcm_to_wav, pick_quip, play_wav_interruptible,
-    start_barge_in_thread, start_thinking_tone_thread,
+    f32_samples_to_pcm_le_bytes, pcm_to_wav, pick_quip, play_wav_on_handle, start_barge_in_thread,
+    start_thinking_tone_thread, AudioKeeper,
 };
 
 /// Env var that espeak-rs consults to find the bundled `espeak-ng-data` dir.
@@ -63,13 +63,18 @@ pub struct PiperRsOutput {
     /// Thinking-tone stop flag — shared with the background tone thread.
     thinking_active: Arc<AtomicBool>,
     /// Speech interrupt flag — set true to immediately stop TTS playback.
-    /// Checked by `play_wav_interruptible()` every 50 ms during playback.
+    /// Checked by `play_wav_on_handle()` every 50 ms during playback.
     speech_interrupted: Arc<AtomicBool>,
     /// Barge-in listener active flag — shared with the mic monitoring thread.
     barge_in_active: Arc<AtomicBool>,
     /// True while audio is actively playing. Shared with the barge-in thread so
     /// it applies an elevated RMS threshold during playback (AEC gating).
     is_speaking: Arc<AtomicBool>,
+    /// Persistent audio output. One CoreAudio AudioUnit opened at construction
+    /// time and kept alive for the lifetime of this adapter. All TTS playback
+    /// calls reuse `audio_handle` to create sinks — no repeated open/close churn.
+    _audio_keeper: AudioKeeper,
+    audio_handle: rodio::OutputStreamHandle,
 }
 
 impl PiperRsOutput {
@@ -91,6 +96,8 @@ impl PiperRsOutput {
             ));
         }
         let piper = load_voice(&model_path, &config_path)?;
+        let audio_keeper = AudioKeeper::try_new()?;
+        let audio_handle = audio_keeper.handle.clone();
         tracing::info!(
             "PiperRsOutput loaded voice: {} (in-process piper-rs / ort)",
             model_path.display()
@@ -104,6 +111,8 @@ impl PiperRsOutput {
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             barge_in_active: Arc::new(AtomicBool::new(false)),
             is_speaking: Arc::new(AtomicBool::new(false)),
+            _audio_keeper: audio_keeper,
+            audio_handle,
         })
     }
 
@@ -255,48 +264,67 @@ impl VoiceOutput for PiperRsOutput {
 
     async fn speak(&self, text: &str) -> Result<()> {
         self.speech_interrupted.store(false, Ordering::SeqCst);
-        let clauses = split_clauses(text);
-        if clauses.is_empty() {
+        if text.trim().is_empty() {
             return Ok(());
         }
-        // Synthesize first clause, then overlap playback of clause N with
-        // synthesis of clause N+1 to cut first-audio latency on long sentences
-        // (#162). Thread `is_speaking` through every play call so the barge-in
-        // monitor applies the elevated AEC-gating threshold during playback (#161).
-        let mut pending = self.synth_to_wav(&clauses[0]).await?;
 
-        for i in 1..clauses.len() {
-            if self.speech_interrupted.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            if pending.is_empty() {
-                pending = self.synth_to_wav(&clauses[i]).await?;
-                continue;
-            }
-            let flag = self.speech_interrupted.clone();
-            let is_speaking = self.is_speaking.clone();
-            let wav = std::mem::take(&mut pending);
-            let (play_result, next_wav) = tokio::join!(
-                tokio::task::spawn_blocking(move || play_wav_interruptible(
-                    wav,
-                    &flag,
-                    &is_speaking
-                )),
-                self.synth_to_wav(&clauses[i]),
-            );
-            play_result.context("playback task panicked")??;
-            pending = next_wav?;
+        // Single piper.create() call for the full text — espeak-ng phonemizes
+        // the whole utterance with full sentence context and no cross-call state
+        // accumulation (the repeated-fragment stammer on turn 2+).
+        let wav = self.synth_to_wav(text).await?;
+        if wav.is_empty() || self.speech_interrupted.load(Ordering::Relaxed) {
+            return Ok(());
         }
 
-        if !pending.is_empty() && !self.speech_interrupted.load(Ordering::Relaxed) {
+        const WAV_HEADER_LEN: usize = 44;
+        if wav.len() <= WAV_HEADER_LEN {
+            return Ok(());
+        }
+        let sample_rate = u32::from_le_bytes(wav[24..28].try_into().unwrap_or([0x56, 0x22, 0, 0]));
+        let pcm = &wav[WAV_HEADER_LEN..];
+
+        // Q2-27: scan for the first silence window after 20% of the audio and
+        // split there (capped at 80% so we never split near the very end).
+        // Both parts come from the same synthesis so prosody is intact; the split
+        // lands inside an existing pause so there is no audible click, and the
+        // barge-in listener can fire cleanly at the clause boundary.
+        let split_at = find_first_silence(pcm, sample_rate, pcm.len() / 5)
+            .filter(|&off| off < pcm.len() * 4 / 5);
+
+        if let Some(offset) = split_at {
+            let part1 = pcm_to_wav(&pcm[..offset], sample_rate);
+            let part2 = pcm_to_wav(&pcm[offset..], sample_rate);
+
             let flag = self.speech_interrupted.clone();
             let is_speaking = self.is_speaking.clone();
+            let handle = self.audio_handle.clone();
             tokio::task::spawn_blocking(move || {
-                play_wav_interruptible(pending, &flag, &is_speaking)
+                play_wav_on_handle(part1, &handle, &flag, &is_speaking)
+            })
+            .await
+            .context("playback task panicked")??;
+
+            if !self.speech_interrupted.load(Ordering::Relaxed) {
+                let flag = self.speech_interrupted.clone();
+                let is_speaking = self.is_speaking.clone();
+                let handle = self.audio_handle.clone();
+                tokio::task::spawn_blocking(move || {
+                    play_wav_on_handle(part2, &handle, &flag, &is_speaking)
+                })
+                .await
+                .context("playback task panicked")??;
+            }
+        } else {
+            let flag = self.speech_interrupted.clone();
+            let is_speaking = self.is_speaking.clone();
+            let handle = self.audio_handle.clone();
+            tokio::task::spawn_blocking(move || {
+                play_wav_on_handle(wav, &handle, &flag, &is_speaking)
             })
             .await
             .context("playback task panicked")??;
         }
+
         Ok(())
     }
 
@@ -313,7 +341,8 @@ impl VoiceOutput for PiperRsOutput {
         self.speech_interrupted.store(false, Ordering::SeqCst);
         let flag = self.speech_interrupted.clone();
         let is_speaking = self.is_speaking.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag, &is_speaking))
+        let handle = self.audio_handle.clone();
+        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag, &is_speaking))
             .await
             .context("playback task panicked")?
     }
@@ -376,36 +405,40 @@ fn synth_blocking(voice: Arc<Mutex<Piper>>, text: &str) -> Result<(Vec<u8>, u32)
 
 /// Split text into clause-sized chunks for pipelined synthesis.
 ///
-/// Splits on `,`, `;`, `:` so the first clause can be synthesized and played
-/// while the remainder is still being processed. Keeps the delimiter attached
-/// to the preceding clause for natural prosody. A delimiter flanked by digits on
-/// both sides (e.g. `10,000` or `12:30`) is treated as part of the number/time
-/// and does NOT start a new clause.
-fn split_clauses(text: &str) -> Vec<String> {
-    let mut clauses: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let mut prev: Option<char> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        buf.push(ch);
-        if matches!(ch, ',' | ';' | ':') {
-            let between_digits = prev.is_some_and(|p| p.is_ascii_digit())
-                && chars.peek().is_some_and(|n| n.is_ascii_digit());
-            if !between_digits {
-                let clause = buf.trim().to_string();
-                if !clause.is_empty() {
-                    clauses.push(clause);
-                }
-                buf.clear();
-            }
+/// Scan `pcm` (16-bit signed LE) for the first 40 ms window whose RMS energy
+/// falls below a silence threshold, starting the search at `min_offset` bytes.
+///
+/// Returns the byte offset of the first silent window (aligned to a 2-byte
+/// sample boundary), or `None` if no silence is found before the end of the
+/// buffer. Uses 50% window overlap so a silence boundary as narrow as 20 ms
+/// is detectable.
+fn find_first_silence(pcm: &[u8], sample_rate: u32, min_offset: usize) -> Option<usize> {
+    const RMS_SILENCE: f32 = 0.015;
+    // Window and step in bytes, both aligned to 2 (one 16-bit sample = 2 bytes).
+    let window_bytes = ((sample_rate as usize * 40 / 1000) * 2 + 1) & !1;
+    let step_bytes = ((sample_rate as usize * 20 / 1000) * 2 + 1) & !1;
+
+    if pcm.len() < window_bytes {
+        return None;
+    }
+
+    let start = (min_offset + 1) & !1; // align to sample boundary
+    let mut i = start;
+    while i + window_bytes <= pcm.len() {
+        let n = window_bytes / 2;
+        let sum_sq: f32 = pcm[i..i + window_bytes]
+            .chunks_exact(2)
+            .map(|b| {
+                let s = i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0;
+                s * s
+            })
+            .sum();
+        if (sum_sq / n as f32).sqrt() < RMS_SILENCE {
+            return Some(i);
         }
-        prev = Some(ch);
+        i += step_bytes;
     }
-    let tail = buf.trim().to_string();
-    if !tail.is_empty() {
-        clauses.push(tail);
-    }
-    clauses
+    None
 }
 
 /// Best-effort message extraction from a `catch_unwind` payload.
@@ -499,50 +532,5 @@ mod tests {
         // Build a dummy function so we exercise the trait bound at compile time
         // without needing to construct a valid PiperRsOutput.
         fn _assert_object_safe(_: Arc<dyn VoiceOutput>) {}
-    }
-
-    #[test]
-    fn split_clauses_no_delimiters() {
-        let clauses = split_clauses("Hello there");
-        assert_eq!(clauses, vec!["Hello there"]);
-    }
-
-    #[test]
-    fn split_clauses_comma() {
-        let clauses = split_clauses("The model predicts tokens, then verifies them.");
-        assert_eq!(
-            clauses,
-            vec!["The model predicts tokens,", "then verifies them."]
-        );
-    }
-
-    #[test]
-    fn split_clauses_multiple_delimiters() {
-        let clauses = split_clauses("One, two; three: four");
-        assert_eq!(clauses, vec!["One,", "two;", "three:", "four"]);
-    }
-
-    #[test]
-    fn split_clauses_keeps_numbers_and_times() {
-        // A delimiter between digits belongs to a number/time and must not split.
-        assert_eq!(
-            split_clauses("It costs 10,000 dollars"),
-            vec!["It costs 10,000 dollars"]
-        );
-        assert_eq!(
-            split_clauses("Meet at 12:30 sharp"),
-            vec!["Meet at 12:30 sharp"]
-        );
-        // But a real clause boundary after a number still splits.
-        assert_eq!(
-            split_clauses("We have 10,000 tokens, then we stop"),
-            vec!["We have 10,000 tokens,", "then we stop"]
-        );
-    }
-
-    #[test]
-    fn split_clauses_empty() {
-        assert!(split_clauses("").is_empty());
-        assert!(split_clauses("   ").is_empty());
     }
 }

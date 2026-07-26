@@ -147,6 +147,17 @@ impl WhisperRsInput {
         self.model_path.read().await.clone()
     }
 
+    /// Decode WAV bytes, resample to 16 kHz mono, and transcribe in-process.
+    ///
+    /// Intended for the HTTP `POST /api/v1/transcribe` handler so the serve
+    /// path can transcribe without spawning an external whisper-server binary.
+    pub fn transcribe_wav_bytes(&self, wav_bytes: &[u8]) -> Result<String> {
+        let (samples, rate) = crate::decode_wav_mono_f32(wav_bytes)?;
+        let samples_16k = crate::resample_to_16k(&samples, rate);
+        let ctx = self.context.blocking_read().clone();
+        Self::transcribe_samples(ctx, samples_16k)
+    }
+
     /// Run inference on raw 16 kHz mono f32 PCM. Returns the joined transcript,
     /// already passed through `strip_whisper_artifacts`.
     ///
