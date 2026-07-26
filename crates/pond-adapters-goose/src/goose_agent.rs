@@ -83,6 +83,17 @@ pub struct GooseAdapter {
     extension_manager: Arc<GiapGooseExtensionManager>,
     /// Tracks the last "chat_provider:chat_model" key we wired into Goose.
     last_provider_key: Mutex<String>,
+    /// The provider + model config last wired into Goose, retained so NEW
+    /// Goose sessions can be configured without rebuilding the provider.
+    /// Goose resolves the model PER-SESSION: `update_provider` persists the
+    /// model_config onto exactly one session row, and a session created
+    /// afterwards has none — its reply path then falls back to the GLOBAL
+    /// goose config (`~/.config/goose/config.yaml` / GOOSE_MODEL), which on a
+    /// dev machine can name a long-gone model (seen live: "gemma4:latest").
+    current_provider: Mutex<Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)>>,
+    /// Goose sessions already configured (via `update_provider`) with the
+    /// `last_provider_key` pair. Cleared on every provider/model change.
+    provider_configured_sessions: Mutex<HashSet<String>>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
     /// Goose sessions that have already had GIAP builtin extensions loaded.
@@ -209,6 +220,8 @@ impl GooseAdapter {
             data_dir,
             extension_manager,
             last_provider_key: Mutex::new(String::new()),
+            current_provider: Mutex::new(None),
+            provider_configured_sessions: Mutex::new(HashSet::new()),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
             tool_registry,
@@ -414,21 +427,50 @@ impl GooseAdapter {
         session_id: &str,
     ) -> Result<()> {
         let key = format!("{}:{}", settings.chat_provider, settings.chat_model);
-        {
+        let key_unchanged = {
             let last = self
                 .last_provider_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if *last == key {
+            *last == key
+        };
+        if key_unchanged {
+            // The provider object is current, but Goose resolves the MODEL
+            // per session: a Goose session created after the last swap has no
+            // model_config row, and its reply path (and session naming) falls
+            // back to the GLOBAL goose config — on a dev machine that can be a
+            // stale ~/.config/goose/config.yaml naming a long-gone model, which
+            // surfaces as "Model not found: <old model>" on every new session.
+            // Configure this session with the retained pair exactly once.
+            let session_configured = self
+                .provider_configured_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(session_id);
+            if session_configured {
                 tracing::debug!("[model-switch] provider already current: {}", key);
                 return Ok(());
             }
-            tracing::debug!(
-                "[model-switch] provider change detected: {:?} -> {}",
-                *last,
-                key
-            );
+            let cached = self
+                .current_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some((p, cfg)) = cached {
+                self.agent.update_provider(p, cfg, session_id).await?;
+                self.provider_configured_sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_id.to_string());
+                tracing::debug!(
+                    "[model-switch] session {} configured with current provider {}",
+                    session_id,
+                    key
+                );
+            }
+            return Ok(());
         }
+        tracing::debug!("[model-switch] provider change detected -> {}", key);
 
         // ── Sync GOOSE_CONTEXT_LIMIT with the actual KV-cache / provider limit ─
         //
@@ -607,11 +649,32 @@ impl GooseAdapter {
                 model = %settings.chat_model,
                 "Switching Goose provider"
             );
-            self.agent.update_provider(p, model_cfg, session_id).await?;
+            self.agent
+                .update_provider(p.clone(), model_cfg.clone(), session_id)
+                .await?;
             *self
                 .last_provider_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = key.clone();
+            {
+                let mut configured = self
+                    .provider_configured_sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                configured.clear();
+                configured.insert(session_id.to_string());
+            }
+            *self
+                .current_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((p, model_cfg));
+            // Align goose's global model fallback with the active pair. Goose
+            // reads Config::global() (env first, then ~/.config/goose/
+            // config.yaml) for any session without a model_config — session
+            // naming among them — and a developer machine's config.yaml can
+            // name a model that no longer exists. The env override makes that
+            // fallback resolve the model GIAP is actually serving.
+            std::env::set_var("GOOSE_MODEL", &settings.chat_model);
 
             // Update model capabilities from the new model name
             let caps =
