@@ -534,6 +534,58 @@ pub(crate) fn f32_samples_to_pcm_le_bytes(samples: &[f32]) -> Vec<u8> {
     out
 }
 
+// ── Persistent audio output ───────────────────────────────────────────────────
+
+/// Keeps a `rodio::OutputStream` alive on a dedicated background thread.
+///
+/// `rodio::OutputStream` is `!Send`, so it cannot be stored in a `Send` struct
+/// directly. We park it on a named thread that sleeps until the keeper is
+/// dropped, then expose the `Send + Clone` `OutputStreamHandle` for creating
+/// sinks from any thread.
+///
+/// Reusing one `OutputStreamHandle` across all TTS calls avoids the repeated
+/// CoreAudio AudioUnit open/close cycle that causes progressive audio
+/// degradation after several voice turns on macOS.
+/// `rodio::OutputStream` is `!Send` due to cpal's CoreAudio property-listener
+/// callbacks. We move it to a dedicated keeper thread and never access it from
+/// any other thread, so the transfer is safe.
+#[allow(dead_code)] // kept alive for its Drop (closes the audio device); never read
+struct SendableStream(rodio::OutputStream);
+// SAFETY: the stream is moved into the keeper thread exactly once and lives
+// there until the keeper is dropped. No other thread touches it.
+unsafe impl Send for SendableStream {}
+
+pub(crate) struct AudioKeeper {
+    pub(crate) handle: rodio::OutputStreamHandle,
+    stop: Arc<AtomicBool>,
+}
+
+impl AudioKeeper {
+    pub(crate) fn try_new() -> Result<Self> {
+        let (stream, handle) =
+            rodio::OutputStream::try_default().context("audio output device unavailable")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let sendable = SendableStream(stream);
+        std::thread::Builder::new()
+            .name("piper-audio-keeper".into())
+            .spawn(move || {
+                let _stream = sendable; // keep OutputStream alive on this thread
+                while !stop_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            })
+            .context("audio keeper thread spawn failed")?;
+        Ok(Self { handle, stop })
+    }
+}
+
+impl Drop for AudioKeeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 // ── Audio playback (shared) ───────────────────────────────────────────────────
 
 /// Play WAV audio without interrupt support.
@@ -545,9 +597,10 @@ fn play_wav(wav: Vec<u8>) -> Result<()> {
 
 /// Play WAV audio with interrupt support and AEC gating.
 ///
-/// Sets `is_speaking` to `true` for the duration of playback so the barge-in
-/// thread uses an elevated RMS threshold (suppressing speaker echo). Clears the
-/// flag on exit whether playback finishes or is interrupted.
+/// Opens a fresh `OutputStream` on each call. Used only by the legacy
+/// subprocess backend (`PiperOutput`) — the in-process backend's TTS playback
+/// uses `play_wav_on_handle` with a persistent `OutputStreamHandle` instead.
+#[cfg(feature = "legacy-subprocess")]
 pub(crate) fn play_wav_interruptible(
     wav: Vec<u8>,
     interrupted: &AtomicBool,
@@ -563,6 +616,40 @@ pub(crate) fn play_wav_interruptible(
         OutputStream::try_default().context("No audio output device found")?;
     let sink = Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
 
+    sink.append(decoder);
+    is_speaking.store(true, Ordering::SeqCst);
+
+    while !sink.empty() {
+        if interrupted.load(Ordering::Relaxed) {
+            sink.stop();
+            is_speaking.store(false, Ordering::SeqCst);
+            tracing::debug!("TTS playback interrupted by barge-in");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    is_speaking.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Play WAV audio on an already-open `OutputStreamHandle` with interrupt support.
+///
+/// Same semantics as `play_wav_interruptible` but reuses the caller's stream
+/// instead of opening a new `OutputStream`. Used by `PiperRsOutput` to avoid
+/// repeated CoreAudio AudioUnit churn across voice turns.
+pub(crate) fn play_wav_on_handle(
+    wav: Vec<u8>,
+    handle: &rodio::OutputStreamHandle,
+    interrupted: &AtomicBool,
+    is_speaking: &AtomicBool,
+) -> Result<()> {
+    use rodio::{Decoder, Sink};
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(wav);
+    let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
+    let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
     sink.append(decoder);
     is_speaking.store(true, Ordering::SeqCst);
 

@@ -75,6 +75,9 @@ export class WebVoiceBackend implements VoiceBackend {
   private stopThinkingFn: (() => void) | null = null;
   private recording: RecordingContext | null = null;
   private wakeActive = false;
+  private wakeDetecting = false;
+  private _wakeWord = '';          // stored so runPipeline can restart the listener after finish
+  private _wakeNorm: string[] = [];
   private wakeStream: MediaStream | null = null;
   private wakeInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -100,6 +103,12 @@ export class WebVoiceBackend implements VoiceBackend {
   // ════════════════════════════════════════════════════════════════
 
   async recordWithVad(authToken?: string, sessionId?: string): Promise<Blob | null> {
+    // Only one mic listener may own the microphone at a time. The wake
+    // listener may have just been restarted by a prior runPipeline() call's
+    // finally block — stop it before opening the conversational-follow-up
+    // stream, or both loops independently detect the same utterance and
+    // each call runPipeline(), producing overlapping/garbled responses.
+    this.stopWakeInternal();
     this.closeMic();
     this.cancelled = false;
 
@@ -178,6 +187,11 @@ export class WebVoiceBackend implements VoiceBackend {
   }
 
   async runPipeline(wav: Blob, opts: PipelineOpts): Promise<void> {
+    // Guard against concurrent invocation (e.g. the wake listener and the
+    // conversational follow-up recording both grabbing the mic and both
+    // detecting the same utterance) — mirrors the Tauri-native
+    // compare_exchange guard in audio_cmd.rs::run_voice_pipeline.
+    if (this.pipelineActive) return;
     this.cancelled = false;
     this.pipelineActive = true;
     resetTtsInterrupt();
@@ -252,14 +266,22 @@ export class WebVoiceBackend implements VoiceBackend {
       this.onStateChange?.("error");
     } finally {
       this.pipelineActive = false;
+      this.wakeDetecting = false;
       this.abortController = null;
       if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
+      // Restart the wake listener (it was killed when detection fired).
+      if (this._wakeWord && !this.cancelled) {
+        this.startWakeListener(this._wakeWord, this._wakeNorm.slice(1));
+      }
     }
   }
 
   cancelPipeline(): void {
     this.cancelled = true;
     this.pipelineActive = false;
+    this.wakeDetecting = false;
+    // Don't restart wake listener here — the barge-in path calls runPostTrigger next,
+    // which fires onWakeDetected → runPipeline, and finally restarts the listener.
     this.abortController?.abort(); this.abortController = null;
     if (this.speculativeLlm) { this.speculativeLlm.abort.abort(); this.speculativeLlm = null; }
     if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
@@ -272,6 +294,8 @@ export class WebVoiceBackend implements VoiceBackend {
   }
 
   startWakeListener(word: string, variants: string[]): void {
+    this._wakeWord = word;
+    this._wakeNorm = [word.toLowerCase().trim(), ...variants.map((v) => v.toLowerCase().trim()).filter(Boolean)];
     this.stopWakeInternal();
     this.wakeActive = true;
     const norm = [word.toLowerCase().trim()];
@@ -569,18 +593,26 @@ export class WebVoiceBackend implements VoiceBackend {
       chunks = [];
 
       const ds = downsampleTo16k(merged, actx.sampleRate);
+      // Prevent re-entrance: if a prior detection is still resolving (transcribing or
+      // in post-trigger) skip this burst. pipelineActive covers the running-pipeline case.
+      if (this.wakeDetecting || this.pipelineActive) { chunks = []; return; }
+      this.wakeDetecting = true;
       try {
         const transcript = await this.transcribe(encodeWav(ds, 16000));
-        if (!transcript || !this.wakeActive) return;
-        if (!normalised.some((w) => transcript.toLowerCase().includes(w))) return;
+        if (!transcript || !this.wakeActive) { this.wakeDetecting = false; return; }
+        if (!normalised.some((w) => transcript.toLowerCase().includes(w))) { this.wakeDetecting = false; return; }
 
-        // Barge-in
-        if (this.pipelineActive) { this.cancelPipeline(); this.onWakeInterrupt?.(); return; }
+        // Barge-in: cancel running pipeline, leave wakeDetecting=false so listener re-arms.
+        if (this.pipelineActive) { this.wakeDetecting = false; this.cancelPipeline(); this.onWakeInterrupt?.(); return; }
 
-        // Initial activation: ping + post-trigger continuation
+        // Kill the detection interval NOW — clearInterval is the only guarantee against
+        // concurrent async ticks that may have already passed the wakeDetecting guard.
+        // runPipeline's finally restarts the listener when the pipeline finishes.
+        if (this.wakeInterval) { clearInterval(this.wakeInterval); this.wakeInterval = null; }
+
         playPingTone();
         this.runPostTrigger(analyser, td, ds, (c) => { capturing = c; }, (c) => { chunks = c; });
-      } catch { /* transcription failed, ignore in wake mode */ }
+      } catch { this.wakeDetecting = false; /* transcription failed, ignore in wake mode */ }
     }, 30);
   }
 
@@ -625,6 +657,7 @@ export class WebVoiceBackend implements VoiceBackend {
 
   private stopWakeInternal(): void {
     this.wakeActive = false;
+    this.wakeDetecting = false;
     if (this.wakeInterval) { clearInterval(this.wakeInterval); this.wakeInterval = null; }
     if (this.wakeStream) { this.wakeStream.getTracks().forEach((t) => t.stop()); this.wakeStream = null; }
   }

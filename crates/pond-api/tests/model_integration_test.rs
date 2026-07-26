@@ -117,6 +117,7 @@ async fn make_app_with_settings_repo() -> (
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
         session_storage,
         http_client: reqwest::Client::new(),
         agent: Arc::new(MockAgent::new()),
