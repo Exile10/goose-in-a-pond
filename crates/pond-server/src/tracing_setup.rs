@@ -200,11 +200,19 @@ pub fn init_tracing_with_console(
     // targets down to WARN so only genuine errors survive; inference is surfaced
     // as a clean one-line summary instead (see ChatService turn completion).
     // `RUST_LOG` still overrides everything for a full-verbosity debug session.
+    // The goose crates log the whole agent loop (extension init, session
+    // writes, reply spans) at INFO/WARN on every turn. GIAP owns its own
+    // telemetry (giap::trace events, the [turn] summary line, turn_metrics),
+    // so goose's narration is pure per-turn formatting and I/O cost — carve
+    // it down to ERROR. Real goose failures still surface, and `RUST_LOG`
+    // restores full goose verbosity for a debug session.
     let filter_str = if debug {
         "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn,\
-         llama-cpp-2=warn,ggml=warn,whisper=warn"
+         llama-cpp-2=warn,ggml=warn,whisper=warn,\
+         goose=error,goose_providers=error,goose_local_inference=error,rmcp=error"
     } else {
-        "info,llama-cpp-2=warn,ggml=warn,whisper=warn"
+        "info,llama-cpp-2=error,ggml=error,whisper=error,\
+         goose=error,goose_providers=error,goose_local_inference=error,rmcp=error"
     };
     let rust_log_set = std::env::var("RUST_LOG").is_ok();
 

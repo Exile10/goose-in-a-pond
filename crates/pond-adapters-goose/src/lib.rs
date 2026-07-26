@@ -4,6 +4,7 @@ pub mod giap_registration;
 pub mod goose_agent;
 pub mod logging;
 pub mod provider_adapter;
+pub mod provider_shim;
 pub mod session_adapter;
 
 pub use extension_manager::GiapGooseExtensionManager;
