@@ -94,6 +94,10 @@ pub struct GooseAdapter {
     /// Goose sessions already configured (via `update_provider`) with the
     /// `last_provider_key` pair. Cleared on every provider/model change.
     provider_configured_sessions: Mutex<HashSet<String>>,
+    /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
+    /// provider handed to Goose — GIAP's last-mile veto over the system
+    /// prompt, Goose's `<turn-context>` message injection, and the tools list.
+    shim_controls: Arc<crate::provider_shim::ShimControls>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
     /// Goose sessions that have already had GIAP builtin extensions loaded.
@@ -153,7 +157,10 @@ impl GooseAdapter {
             permission_manager,
             None,
             GooseMode::Auto,
-            false,
+            // Goose's background session-naming is a full LLM call per session;
+            // GIAP derives titles itself (ChatService::ensure_session_title),
+            // so that call is pure wasted compute on-device.
+            true,
             GoosePlatform::GooseCli,
         );
 
@@ -222,6 +229,7 @@ impl GooseAdapter {
             last_provider_key: Mutex::new(String::new()),
             current_provider: Mutex::new(None),
             provider_configured_sessions: Mutex::new(HashSet::new()),
+            shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
             tool_registry,
@@ -635,6 +643,13 @@ impl GooseAdapter {
             };
 
         if let Some((p, model_cfg)) = provider {
+            // Every provider Goose sees is wrapped in the GIAP shim — the
+            // last-mile veto over system prompt, message injections, and the
+            // tools list (see provider_shim.rs).
+            let p: Arc<dyn Provider> = Arc::new(crate::provider_shim::GiapProviderShim::new(
+                p,
+                self.shim_controls.clone(),
+            ));
             tracing::debug!(
                 "[model-switch] swapping Goose provider to {}:{} for session {}",
                 settings.chat_provider,
@@ -1175,6 +1190,11 @@ impl GooseAdapter {
                 &template_content,
             );
 
+            // Publish the authoritative prefix to the provider shim — the
+            // last-mile veto rebuilds any Goose-mutated system prompt from it.
+            self.shim_controls
+                .set_system_prefix(partition.static_prefix.clone());
+
             // Check whether the static prefix changed. Drop the MutexGuard
             // before any `.await` to keep the future `Send`.
             let prefix_changed = {
@@ -1216,8 +1236,14 @@ impl GooseAdapter {
                 Some(&prompt_state),
                 &template_content,
             );
+            self.shim_controls.set_system_prefix(system_prompt.clone());
             self.agent.override_system_prompt(system_prompt).await;
         }
+
+        // GIAP-owned system-prompt appendix, re-attached by the provider shim
+        // after it vetoes Goose's own appendages. Everything GIAP delivers via
+        // goose extras below is mirrored here so the veto never loses it.
+        let mut shim_appendix: Vec<String> = Vec::new();
 
         // Extras and skills are appended AFTER the partitioned prompt and sit
         // OUTSIDE prefix_hash by design (see models/services/prompt_builder.rs).
@@ -1230,6 +1256,7 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     extra.key, extra.instruction
                 );
+                shim_appendix.push(body.clone());
                 self.agent.extend_system_prompt(extra.key, body).await;
             }
         }
@@ -1241,9 +1268,17 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     key, skill.content
                 );
+                shim_appendix.push(body.clone());
                 self.agent.extend_system_prompt(key, body).await;
             }
         }
+
+        self.shim_controls
+            .set_turn_appendix(if shim_appendix.is_empty() {
+                None
+            } else {
+                Some(shim_appendix.join("\n\n"))
+            });
 
         // ── Token-budgeted memory injection ──────────────────────────────
         // Memories go into <system-context> in the user message (not the system
@@ -1463,9 +1498,13 @@ impl GooseAdapter {
                         external_extensions.len(),
                     );
 
+                    self.shim_controls
+                        .set_extension_appendix(Some(ext_description.clone()));
                     self.agent
                         .extend_system_prompt("extensions".to_string(), ext_description)
                         .await;
+                } else {
+                    self.shim_controls.set_extension_appendix(None);
                 }
 
                 *self.cached_tools.write().await = Some(tools_set.clone());
@@ -1474,6 +1513,10 @@ impl GooseAdapter {
         };
 
         tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
+
+        // Publish the allow-set to the provider shim — anything Goose adds on
+        // its own (platform tools, final_output) is vetoed at the last mile.
+        self.shim_controls.set_allowed_tools(allowed_tools.clone());
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;
