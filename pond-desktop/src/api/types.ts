@@ -40,6 +40,14 @@ export interface NowPlayingApiResponse {
   album_art?: string | null;
   progress_ms?: number;
   duration_ms?: number;
+  /**
+   * Set when Spotify answered but refused the request — `"unauthorized"`,
+   * `"forbidden"`, `"rate_limited"` or `"unavailable"`. Absent on a healthy
+   * response, including the genuine "connected but nothing playing" case.
+   */
+  error?: string;
+  /** Human-readable explanation for `error`, safe to show as-is. */
+  message?: string;
 }
 
 export type MusicControlAction = "play" | "pause" | "next" | "previous";

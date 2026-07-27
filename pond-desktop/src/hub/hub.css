@@ -1052,6 +1052,24 @@
   box-shadow: 0 4px 10px rgba(140, 75, 255, 0.3);
 }
 
+/* Spotify answered but refused the request: the transport controls would fail
+   the same way, so they read as unavailable rather than merely idle. The
+   explanation sits in .np__artist, which may wrap to two lines here. */
+.np--error .np__artist {
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.np--error .np__ctrls button {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.np--error .np__play {
+  background: var(--mut) !important;
+  box-shadow: none;
+}
+
 /* ─── Hub greeting ─── */
 .hub-greet { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
 .hub-greet span { color: var(--pp); }

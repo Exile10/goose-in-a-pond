@@ -73,6 +73,13 @@ export interface NowPlayingData {
   /** Whether Spotify is connected — gates real playback controls vs. the cosmetic demo toggle. */
   connected: boolean;
   playing: boolean;
+  /**
+   * Set when Spotify answered but refused the request. Distinct from "nothing
+   * playing": the account is linked, so playback controls would fail too.
+   */
+  error?: string;
+  /** Human-readable explanation for `error`. */
+  message?: string;
 }
 
 export interface TodoItem {
