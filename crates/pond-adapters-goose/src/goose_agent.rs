@@ -10,8 +10,10 @@ use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
 use pond_core::models::ports::agent::{
     Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
 };
+use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
+use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
@@ -73,6 +75,11 @@ pub struct GooseAdapter {
     extras_repo: Arc<dyn PromptExtraRepository>,
     skill_repo: Arc<dyn UserSkillRepository>,
     memory_repo: Arc<dyn MemoryRepository>,
+    /// Embedder for the per-turn memory search. When present the injection path
+    /// embeds the user message and ranks by cosine similarity; when absent it
+    /// falls back to the keyword LIKE search. Optional because the fastembed
+    /// adapter can fail to initialise (ONNX Runtime mismatch) or be disabled.
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Device registry — queried per turn to populate PromptState for Jinja2 rendering.
     device_repo: Arc<dyn DeviceRegistry>,
     llamafile_url: String,
@@ -222,6 +229,7 @@ impl GooseAdapter {
             extras_repo,
             skill_repo,
             memory_repo,
+            embedding_provider: None,
             device_repo,
             llamafile_url,
             data_dir,
@@ -893,6 +901,80 @@ impl GooseAdapter {
         }
     }
 
+    /// Memories topically relevant to `message`, each paired with its cosine
+    /// similarity when one is known.
+    ///
+    /// Semantic path when an embedding provider is wired: embed the message and
+    /// rank by cosine over stored vectors. The similarity is recomputed here
+    /// from each hit's own embedding — `search_similar` returns fragments, not
+    /// scores, and the blend in `rank_by_relevance` needs the score.
+    ///
+    /// Keyword LIKE path otherwise (no provider, or embedding this message
+    /// failed): stopword-filtered terms, and no similarity to report.
+    ///
+    /// Never fails — retrieval trouble degrades the prompt, it must not fail the
+    /// turn.
+    async fn topical_memories(
+        &self,
+        message: &str,
+        limit: usize,
+    ) -> Vec<(MemoryFragment, Option<f32>)> {
+        if let Some(provider) = &self.embedding_provider {
+            match provider.embed(message).await {
+                Ok(query_vector) => {
+                    match self
+                        .memory_repo
+                        .search_similar(&query_vector, None, limit)
+                        .await
+                    {
+                        Ok(hits) => {
+                            return hits
+                                .into_iter()
+                                .map(|fragment| {
+                                    // `search_similar` degrades to search_recent when
+                                    // NOTHING in the store is embedded; those hits have
+                                    // no vector and so carry no similarity.
+                                    let similarity = fragment
+                                        .embedding
+                                        .as_deref()
+                                        .map(|e| cosine_similarity(&query_vector, e));
+                                    (fragment, similarity)
+                                })
+                                .collect();
+                        }
+                        Err(e) => tracing::warn!("memory: semantic search failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("memory: embedding the turn failed, using keywords: {e}"),
+            }
+        }
+
+        let keywords = pond_core::user_data::services::memory_relevance::keyword_terms(message);
+        if keywords.is_empty() {
+            return vec![];
+        }
+        match self
+            .memory_repo
+            .search_by_content(&keywords, None, limit)
+            .await
+        {
+            Ok(hits) => hits.into_iter().map(|m| (m, None)).collect(),
+            Err(e) => {
+                tracing::warn!("memory: keyword search failed: {e}");
+                vec![]
+            }
+        }
+    }
+
+    /// Attach the embedding provider used by per-turn memory retrieval.
+    ///
+    /// Without it the injection path keeps working, just on the keyword LIKE
+    /// fallback — which is why this is a builder rather than a `new()` argument.
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding_provider = Some(provider);
+        self
+    }
+
     /// Attach GIAP session storage so the deterministic turn trimmer can
     /// splice the rolling `<conversation-summary>` into the model's history.
     pub fn with_giap_session_storage(
@@ -1059,18 +1141,6 @@ impl GooseAdapter {
             None
         };
 
-        // Extract keywords from user message for relevance-based memory search.
-        // Simple approach: split on whitespace, keep words ≥3 chars, lowercase.
-        let memory_keywords: Vec<String> = request
-            .message
-            .split_whitespace()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase()
-            })
-            .filter(|w| w.len() >= 3)
-            .collect();
-
         let (
             template_result,
             devices_result,
@@ -1090,32 +1160,34 @@ impl GooseAdapter {
                     None => Ok(vec![]),
                 }
             },
-            // Relevant memories (content keyword match — surfaces old but topical memories)
+            // Topical memories — semantic when an embedder is wired, keyword
+            // LIKE otherwise. Embedding one short message is a few ms on CPU,
+            // and it happens inside this join! so it overlaps the other fetches.
             async {
                 match memory_limit {
-                    Some(limit) if !memory_keywords.is_empty() => {
-                        self.memory_repo
-                            .search_by_content(&memory_keywords, None, limit)
-                            .await
-                    }
-                    _ => Ok(vec![]),
+                    Some(limit) => self.topical_memories(&request.message, limit).await,
+                    None => vec![],
                 }
             },
         );
 
-        // Merge recent + relevant, deduplicate by ID
-        let memories_result: Result<Vec<pond_core::user_data::domain::memory::MemoryFragment>> = {
-            let mut merged = recent_memories.unwrap_or_default();
-            let relevant = relevant_memories.unwrap_or_default();
-            let seen: std::collections::HashSet<String> =
-                merged.iter().map(|m| m.id.clone()).collect();
-            for m in relevant {
-                if !seen.contains(&m.id) {
-                    merged.push(m);
-                }
+        // Merge recency + topical, keeping the similarity score of anything that
+        // came back from the semantic search. `None` means "recency-only hit",
+        // which the ranking blend scores as zero similarity.
+        let mut memory_candidates: Vec<(MemoryFragment, Option<f32>)> = recent_memories
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| (m, None))
+            .collect();
+        for (fragment, similarity) in relevant_memories {
+            match memory_candidates
+                .iter_mut()
+                .find(|(existing, _)| existing.id == fragment.id)
+            {
+                Some(entry) => entry.1 = similarity,
+                None => memory_candidates.push((fragment, similarity)),
             }
-            Ok(merged)
-        };
+        }
 
         let template_content = template_result
             .ok()
@@ -1332,73 +1404,71 @@ impl GooseAdapter {
                 Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
             );
 
-        if let Ok(mut memories) = memories_result {
-            if !memories.is_empty() {
-                // Sort by importance (highest first) so the most valuable
-                // memories survive the budget cut.
-                memories.sort_by(|a, b| {
-                    b.importance
-                        .partial_cmp(&a.importance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+        if !memory_candidates.is_empty() {
+            // Blended relevance (similarity + importance + recency decay) so a
+            // topical memory can displace the standing high-importance identity
+            // block instead of always losing to it.
+            pond_core::user_data::services::memory_relevance::rank_by_relevance(
+                &mut memory_candidates,
+                chrono::Utc::now(),
+            );
 
-                // Apply fragment count limit from the compaction profile.
-                memories.truncate(compaction_profile.max_memory_fragments);
+            // Apply fragment count limit from the compaction profile.
+            memory_candidates.truncate(compaction_profile.max_memory_fragments);
 
-                // Apply token budget: estimate tokens per fragment using the
-                // chars/4 heuristic, keep fragments until the budget is spent.
-                let token_budget = compaction_profile.memory_token_budget;
-                let mut tokens_used: usize = 0;
-                let mut budgeted: Vec<&pond_core::user_data::domain::memory::MemoryFragment> =
-                    Vec::new();
-                for m in &memories {
-                    let estimated_tokens = m.content.len() / 4 + 1;
-                    if tokens_used + estimated_tokens > token_budget && !budgeted.is_empty() {
-                        break;
-                    }
-                    tokens_used += estimated_tokens;
-                    budgeted.push(m);
+            // Apply token budget: estimate tokens per fragment using the
+            // chars/4 heuristic, keep fragments until the budget is spent.
+            let token_budget = compaction_profile.memory_token_budget;
+            let mut tokens_used: usize = 0;
+            let mut budgeted: Vec<&MemoryFragment> = Vec::new();
+            for (m, _) in &memory_candidates {
+                let estimated_tokens = m.content.len() / 4 + 1;
+                if tokens_used + estimated_tokens > token_budget && !budgeted.is_empty() {
+                    break;
                 }
+                tokens_used += estimated_tokens;
+                budgeted.push(m);
+            }
 
-                if !budgeted.is_empty() {
-                    let block = budgeted
-                        .iter()
-                        .map(|m| {
-                            let seg = m
-                                .segment
-                                .as_ref()
-                                .map(|s| format!("{:?}", s).to_lowercase())
-                                .unwrap_or_default();
-                            if seg.is_empty() {
-                                format!("- {}", m.content)
-                            } else {
-                                format!("- [{}] {}", seg, m.content)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    tracing::debug!(
-                        fragments_injected = budgeted.len(),
-                        fragments_available = memories.len(),
-                        tokens_used,
-                        token_budget,
-                        "Memory injection (budget from CompactionProfile ctx={})",
-                        effective_ctx,
-                    );
-
-                    memory_block_for_user_msg = block;
-
-                    // Record access for decay tracking — fire-and-forget in background
-                    // to avoid blocking the inference hot path with sequential DB writes.
-                    let ids: Vec<String> = budgeted.iter().map(|m| m.id.clone()).collect();
-                    let repo = self.memory_repo.clone();
-                    tokio::spawn(async move {
-                        for id in ids {
-                            let _ = repo.record_access(&id).await;
+            if !budgeted.is_empty() {
+                let block = budgeted
+                    .iter()
+                    .map(|m| {
+                        let seg = m
+                            .segment
+                            .as_ref()
+                            .map(|s| format!("{:?}", s).to_lowercase())
+                            .unwrap_or_default();
+                        if seg.is_empty() {
+                            format!("- {}", m.content)
+                        } else {
+                            format!("- [{}] {}", seg, m.content)
                         }
-                    });
-                }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                tracing::debug!(
+                    fragments_injected = budgeted.len(),
+                    fragments_available = memory_candidates.len(),
+                    tokens_used,
+                    token_budget,
+                    semantic = self.embedding_provider.is_some(),
+                    "Memory injection (budget from CompactionProfile ctx={})",
+                    effective_ctx,
+                );
+
+                memory_block_for_user_msg = block;
+
+                // Record access for decay tracking — fire-and-forget in background
+                // to avoid blocking the inference hot path with sequential DB writes.
+                let ids: Vec<String> = budgeted.iter().map(|m| m.id.clone()).collect();
+                let repo = self.memory_repo.clone();
+                tokio::spawn(async move {
+                    for id in ids {
+                        let _ = repo.record_access(&id).await;
+                    }
+                });
             }
         }
 

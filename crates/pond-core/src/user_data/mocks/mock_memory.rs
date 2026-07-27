@@ -1,7 +1,7 @@
 //! In-memory mock implementations of `EmbeddingProvider` and `MemoryRepository`.
 
 use crate::models::ports::embedding::EmbeddingProvider;
-use crate::user_data::domain::memory::MemoryFragment;
+use crate::user_data::domain::memory::{cosine_similarity, MemoryFragment, MemoryLifecycle};
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,7 +38,8 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 
 /// Mock memory repository — stores fragments in-memory.
 ///
-/// `search_similar` falls back to `search_recent` (zero vectors have undefined cosine similarity).
+/// `search_similar` mirrors the SQLite adapter: cosine over rows that actually
+/// carry an embedding, falling back to `search_recent` when none do.
 pub struct MockMemoryRepository {
     fragments: Arc<RwLock<Vec<MemoryFragment>>>,
 }
@@ -86,18 +87,68 @@ impl MemoryRepository for MockMemoryRepository {
 
     async fn search_similar(
         &self,
-        _query_embedding: &[f32],
+        query_embedding: &[f32],
         profile_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        // No real embeddings in mock — fall back to recency
-        self.search_recent(profile_id, limit).await
+        let scored: Vec<(f32, MemoryFragment)> = {
+            let fragments = self.fragments.read().await;
+            fragments
+                .iter()
+                .filter(|f| is_active(f))
+                .filter(|f| match profile_id {
+                    Some(pid) => f.profile_id.as_deref() == Some(pid),
+                    None => true,
+                })
+                .filter_map(|f| {
+                    let emb = f.embedding.as_ref()?;
+                    Some((cosine_similarity(query_embedding, emb), f.clone()))
+                })
+                .collect()
+        };
+
+        // Same contract as the SQLite adapter: with nothing embedded at all,
+        // degrade to recency rather than returning an empty result.
+        if scored.is_empty() {
+            return self.search_recent(profile_id, limit).await;
+        }
+
+        let mut scored = scored;
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, f)| f).collect())
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
         self.fragments.write().await.retain(|f| f.id != id);
         Ok(())
     }
+
+    async fn search_unembedded(&self, limit: usize) -> Result<Vec<MemoryFragment>> {
+        let fragments = self.fragments.read().await;
+        Ok(fragments
+            .iter()
+            .filter(|f| f.embedding.is_none() && is_active(f))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
+        let mut fragments = self.fragments.write().await;
+        if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
+            f.embedding = Some(embedding.to_vec());
+        }
+        Ok(())
+    }
+}
+
+/// Pre-lifecycle rows carry `None`, which the SQLite adapter treats as active.
+fn is_active(fragment: &MemoryFragment) -> bool {
+    !matches!(
+        fragment.lifecycle,
+        Some(MemoryLifecycle::Archived) | Some(MemoryLifecycle::Merged)
+    )
 }
 
 #[cfg(test)]

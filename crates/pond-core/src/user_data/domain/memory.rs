@@ -220,6 +220,25 @@ impl MemoryFragment {
     }
 }
 
+/// Cosine similarity between two embedding vectors.
+///
+/// Returns `0.0` for mismatched dimensions, empty inputs, or a zero vector —
+/// callers treat "no usable embedding" and "unrelated" identically, and the
+/// mock embedding provider legitimately returns all-zero vectors.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
+}
+
 // ── Memory graph (causal DAG) ───────────────────────────────────────────────
 
 /// The kind of causal or structural relationship between two memories.
@@ -301,6 +320,21 @@ pub struct MemoryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosine_similarity_is_one_for_parallel_and_zero_for_orthogonal() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_degrades_to_zero_instead_of_nan() {
+        // Dimension mismatch, empty input, and the mock provider's zero vector
+        // must all be "unrelated", never NaN — NaN would poison every sort.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
 
     #[test]
     fn segment_serde_round_trip() {
