@@ -57,9 +57,9 @@ log "$C_BE" "backend " "cargo run -p pond-server ${FEATURE_ARGS[*]}"
 pids+=($!)
 
 # ── frontend ─────────────────────────────────────────────────────────────────
-log "$C_FE" "frontend" "npm run dev (in ./web)"
+log "$C_FE" "frontend" "npm run dev:vite (in ./pond-desktop)"
 (
-  cd web && npm run dev 2>&1 |
+  cd pond-desktop && npm run dev:vite 2>&1 |
     while IFS= read -r line; do
       printf "%b[frontend]%b %s\n" "$C_FE" "$C_RST" "$line"
     done
