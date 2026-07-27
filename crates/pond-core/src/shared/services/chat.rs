@@ -1968,7 +1968,11 @@ impl ChatService {
                 AgentStreamEvent::Status { .. }
                 | AgentStreamEvent::Thinking { .. }
                 | AgentStreamEvent::ReviewStatus { .. }
-                | AgentStreamEvent::ReviewRevision { .. } => {
+                | AgentStreamEvent::ReviewRevision { .. }
+                // The engine's cap message itself arrives as Text and IS spoken;
+                // this structured marker is for clients that can offer a
+                // continue affordance, which a voice turn cannot.
+                | AgentStreamEvent::TurnLimitReached { .. } => {
                     // Not spoken during streaming — informational only
                 }
             }

@@ -140,7 +140,7 @@ Flat key-value store for GIAP configuration.
 | | `custom_system_prompt` | `""` |
 | | `prompt_addendum` | `""` |
 | Agent behaviour | `agent_goose_mode` | `"auto"` |
-| | `agent_max_turns` | `"20"` |
+| | `agent_max_turns` | `"50"` (0 = uncapped) |
 | | `agent_memory_inject` | `"false"` |
 | | `agent_memory_limit` | `"5"` |
 | Voice pipeline | `voice_wake_word` | `"goose"` |

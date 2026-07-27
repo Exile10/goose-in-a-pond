@@ -123,4 +123,33 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
     }
+
+    /// The agent engine's own session id paired with this GIAP session, if one
+    /// has been recorded.
+    ///
+    /// Engines keep their own conversation store under ids they generate
+    /// themselves. Without a persisted pairing, a server restart makes an
+    /// existing GIAP chat resolve to a brand-new empty engine session and the
+    /// model loses the whole conversation even though every message is still in
+    /// `pond_system.db`. The id is engine-generated and opaque here — callers
+    /// must re-validate it against the engine before use, because the engine's
+    /// store can be wiped independently of ours.
+    async fn get_engine_session_id(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(None) // default no-op for backward compat
+    }
+
+    /// Record the engine session paired with this GIAP session (idempotent
+    /// upsert). Deliberately not keyed to a `sessions` row: the pairing is also
+    /// established on paths (direct tool calls, the voice child) that can run
+    /// before a GIAP session row exists.
+    async fn set_engine_session_id(
+        &self,
+        _session_id: &str,
+        _engine_session_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
 }

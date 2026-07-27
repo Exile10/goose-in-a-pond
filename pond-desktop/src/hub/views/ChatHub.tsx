@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { filterThinking } from "../../lib/thinkFilter";
+import { CONTINUE_TURN_MESSAGE } from "../../api/types";
 import type { ChatEvent, TurnStats } from "../../api/types";
 import { HubIco, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
@@ -21,6 +22,8 @@ interface ChatMessage {
   card?: CardKind;
   streaming?: boolean;
   turnStats?: TurnStats;
+  /** Set when the agent stopped on its turn budget — renders a Continue action. */
+  turnLimit?: number;
 }
 
 // ── Constants ─────────────────────────────────────────────────
@@ -201,6 +204,14 @@ export function ChatHubView() {
             setMsgs((prev) =>
               prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
             );
+          } else if (ev.type === "turn_limit_reached") {
+            // The agent ran out of turns rather than finishing — mark the
+            // message (by id, same reasoning as turn_stats) so it offers a
+            // Continue action.
+            const limit = ev.max_turns ?? 0;
+            setMsgs((prev) =>
+              prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
+            );
           } else if (ev.done && ev.session_id) {
             sessionIdRef.current = ev.session_id;
             dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
@@ -287,6 +298,20 @@ export function ChatHubView() {
               {m.card && !m.streaming && (
                 <div className="ch-card">
                   <ResultCard kind={m.card} />
+                </div>
+              )}
+              {m.who === "goose" && !m.streaming && m.turnLimit !== undefined && (
+                <div className="turn-limit">
+                  <span className="turn-limit__note">
+                    Stopped after {m.turnLimit} steps.
+                  </span>
+                  <button
+                    className="turn-limit__btn"
+                    onClick={() => sendMessage(CONTINUE_TURN_MESSAGE)}
+                    disabled={busy}
+                  >
+                    <HubIco d={HP_PATHS.play} size={12} color="currentColor" /> Continue
+                  </button>
                 </div>
               )}
               {m.who === "goose" && !m.streaming && showTurnStats && m.turnStats && (

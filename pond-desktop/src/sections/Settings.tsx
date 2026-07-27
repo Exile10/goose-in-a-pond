@@ -399,7 +399,7 @@ function AgentTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       {devMode && (
         <Section title="Performance">
           <Row label="Fast path" hint="Skip redundant processing steps for simple queries"><Switch isSelected={s.fast_path_enabled ?? true} onChange={(v) => patch("fast_path_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-          <Row label="Max turns"><input type="number" role="spinbutton" className="native-input" min={1} max={50} value={s.agent_max_turns ?? 20} onChange={(e) => patch("agent_max_turns", Number(e.target.value))} /></Row>
+          <Row label="Max turns" hint="Tool-calling steps allowed per request (0 = unlimited; the idle timeout still applies)"><input type="number" role="spinbutton" className="native-input" min={0} max={500} value={s.agent_max_turns ?? 50} onChange={(e) => patch("agent_max_turns", Number(e.target.value))} /></Row>
           <Row label="Idle timeout" hint="Abort a turn only after this many seconds with no output (0 disables)"><div className="settings-inline-row"><input type="number" role="spinbutton" className="native-input native-input--w100" min={0} max={3600} value={s.agent_timeout_secs ?? 300} onChange={(e) => patch("agent_timeout_secs", Number(e.target.value))} /><span className="muted-12">seconds</span></div></Row>
           <Row label="Tool output compaction"><Switch isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
           <Row label="Prompt cache reuse"><Switch isSelected={s.prefix_cache_prompt ?? true} onChange={(v) => patch("prefix_cache_prompt", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>

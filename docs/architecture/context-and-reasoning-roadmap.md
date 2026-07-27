@@ -176,35 +176,52 @@ then consolidation hardening, then multimodality.
 - Invariants: memories stay in `<system-context>` in the user message (KV
   prefix stability); Jetson tier budgets unchanged until measured.
 
-### Phase B — Reasoning length (turns)
+### Phase B — Reasoning length (turns) — LANDED (B5 deferred)
 
-- B1 Raise `default_agent_max_turns` 20 → 50 and support `0 = uncapped`
-  (cancellation, idle timeout, and context-overflow abort remain the rails);
-  voice keeps its own cap.
-- B2 GIAP-owned budget awareness: when ≥ 50% of the cap is used, append a
-  one-line budget note into the per-turn `<system-context>` (shim strips
-  goose's version; ours is KV-safe because it rides the user message).
-- B3 Continue wiring: when the cap message fires, emit a structured SSE event
-  so the UI can offer one-click "continue" (a resume turn), instead of a dead
-  sentence. Persist the cap message consistently.
-- B4 Thinking coherence: pass `enable_thinking` to the engine per
-  ModelConfig request_param, aligned with GIAP's `thinking_mode`/voice, so
-  suppression is template-level, not prompt-hope + leak filter.
-- B5 Exclude goal/grind nudges from the turn count (they are bookkeeping, not
-  model actions).
+- B1 DONE `default_agent_max_turns` 20 → 50, and `0 = uncapped` (expressed to
+  goose as `UNCAPPED_MAX_TURNS = 100_000`, safe to do arithmetic on unlike
+  `u32::MAX`). Cancellation, idle timeout, and context-overflow abort remain the
+  rails. Voice keeps its own cap: a non-zero `voice_max_turns` still binds even
+  when the text budget is uncapped.
+- B2 DONE, PER-REQUEST rather than per-turn. A `<turn-budget>` note goes into
+  the user message's `<system-context>` (`turn_budget_note` in pond-core). The
+  ≥ 50%-of-cap trigger from the original plan needs `turns_taken` mid-loop,
+  which GooseAdapter cannot see — it builds the user message once, before
+  `agent.reply`. A mid-loop injection would need a fork-side seam (see below).
+- B3 DONE `AgentStreamEvent::TurnLimitReached { max_turns }`, detected by
+  matching goose's private `MAX_TURNS_MESSAGE` verbatim (canary test
+  `goose_cap_message_is_still_verbatim` reads the fork source so a reword
+  fails). Surfaced as a `turn_limit_reached` SSE event from both stream routes;
+  both desktop chat surfaces render a Continue action. The cap text is still
+  emitted as Text so persistence and voice are unchanged.
+- B4 DONE `enable_thinking` is passed as a ModelConfig request_param for
+  `local`/`gguf` (the only provider that reads it), resolved from
+  `thinking_mode` + voice + capabilities. A thinking-mode change re-stamps the
+  config on the retained provider instead of rebuilding it.
+- B5 NOT DONE — excluding goal/grind nudges from the turn count is inside
+  `goose/crates/goose/src/agents/agent.rs`, i.e. a fork change. Deferred to a
+  goose-side patch.
 
-### Phase C — History durability & budgets
+### Phase C — History durability & budgets — LANDED
 
-- C1 Persist the GIAP→goose session mapping and, on a mapping miss with
-  existing pond history, hydrate the goose session (replay recent turns +
-  rolling summary) so a server restart no longer amnesia-wipes live chats.
-- C2 Re-apply env-derived knobs (`GOOSE_CONTEXT_LIMIT`,
-  `GOOSE_AUTO_COMPACT_THRESHOLD`) on settings change, not only on model swap.
-- C3 Make tool-result truncation real (head+tail truncate the structured
-  ToolResponse content at rebuild) and disable goose's background tool-pair
-  summarization for the local provider (the deterministic trimmer owns it).
-- C4 Flip `hybrid_compaction_enabled` default → true once C1-C3 land
-  (completes the existing burn-in item).
+- C1 DONE The pairing is persisted in `pond_system.db` (`engine_session_map`,
+  migration 0032) behind two engine-neutral `SessionStorage` methods, and
+  re-validated against goose on read (its store can be wiped independently). On
+  a miss with existing pond history the new goose session is hydrated via
+  pond-core's `plan_replay` (recent turns + rolling summary, budgeted by the
+  same trimmer, trailing user message dropped because the handler persists it
+  before the stream). Text-only: pond rows cannot rebuild a valid tool
+  request/response pair.
+- C2 DONE `GOOSE_CONTEXT_LIMIT` / `GOOSE_AUTO_COMPACT_THRESHOLD` (plus C3's
+  knob) moved into `apply_goose_env_knobs`, called on the settings path every
+  turn and `set_var`-ing only when the signature changes.
+- C3 DONE `truncate_head_tail` (pond-core) is applied to the retained structured
+  `ToolResponse` at rebuild — cloning the message and rewriting only text bodies,
+  so ids, annotations, error flags and pairing are preserved — and to the
+  trimmer's estimate, so estimate and reality agree.
+  `GOOSE_TOOL_PAIR_SUMMARIZATION=false` for local/gguf + hybrid: the
+  deterministic trimmer owns tool-result pruning on-device.
+- C4 DONE `hybrid_compaction_enabled` now defaults to true.
 
 ### Phase D — Tool relevance (KV-aware)
 

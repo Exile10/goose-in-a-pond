@@ -126,6 +126,66 @@ pub fn available_history_chars(
 /// Maximum assistant tool-output size kept verbatim in history.
 pub const TOOL_RESULT_MAX_CHARS: usize = 1_500;
 
+/// Shrink an oversized tool result to `max_chars`-ish, keeping BOTH ends.
+///
+/// Returns `None` when `text` already fits, so callers can skip rewriting.
+///
+/// Head-only truncation loses exactly the part that usually carries the answer:
+/// a tool result's tail holds totals, the last log lines, the closing summary,
+/// the "N more results" count. Keeping ~60% head and ~40% tail preserves the
+/// shape of the payload (so the model can still tell what it is looking at) and
+/// the conclusion, and the marker states how much is missing so the model can
+/// call the tool again with a narrower query instead of assuming it saw
+/// everything.
+///
+/// Always splits on char boundaries; the result can exceed `max_chars` by the
+/// length of the marker, which is the honest trade for saying how much was cut.
+pub fn truncate_head_tail(text: &str, max_chars: usize) -> Option<String> {
+    if text.len() <= max_chars {
+        return None;
+    }
+    // Degenerate budgets: a head-only cut is all that fits.
+    if max_chars < 64 {
+        let mut end = max_chars.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Some(format!(
+            "{}\n[... truncated {} chars ...]",
+            &text[..end],
+            text.len() - end
+        ));
+    }
+
+    let head_len = max_chars * 3 / 5;
+    let tail_len = max_chars - head_len;
+
+    let mut head_end = head_len;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(tail_len);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // A pathological multi-byte boundary walk could cross the head — then there
+    // is nothing left to keep from the tail.
+    if tail_start <= head_end {
+        return Some(format!(
+            "{}\n[... truncated {} chars ...]",
+            &text[..head_end],
+            text.len() - head_end
+        ));
+    }
+
+    let dropped = tail_start - head_end;
+    Some(format!(
+        "{}\n[... truncated {dropped} chars ...]\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    ))
+}
+
 /// Approximate total context window in characters (8K tokens × 4 chars/token).
 pub const MAX_CONTEXT_CHARS: usize = 12_000;
 
@@ -284,6 +344,57 @@ mod tests {
     #[test]
     fn empty_input_returns_empty() {
         assert!(trim_to_budget(vec![]).is_empty());
+    }
+
+    // ── truncate_head_tail (C3) ──────────────────────────────────────────
+
+    #[test]
+    fn text_within_budget_is_left_alone() {
+        assert!(truncate_head_tail("short", TOOL_RESULT_MAX_CHARS).is_none());
+        let exact = "x".repeat(TOOL_RESULT_MAX_CHARS);
+        assert!(truncate_head_tail(&exact, TOOL_RESULT_MAX_CHARS).is_none());
+    }
+
+    /// The point of head+tail: the CONCLUSION at the end survives, which a
+    /// head-only truncation would have thrown away.
+    #[test]
+    fn both_ends_survive_and_the_marker_states_the_loss() {
+        let text = format!("HEAD-MARKER{}TAIL-MARKER", "x".repeat(50_000));
+        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_CHARS).unwrap();
+        assert!(out.starts_with("HEAD-MARKER"), "{}", &out[..40]);
+        assert!(out.ends_with("TAIL-MARKER"), "{}", &out[out.len() - 40..]);
+        assert!(out.contains("[... truncated "));
+        // Far smaller than the original, and close to the budget.
+        assert!(out.len() < TOOL_RESULT_MAX_CHARS + 64, "len {}", out.len());
+        // The stated loss is accurate.
+        let dropped: usize = out
+            .split("[... truncated ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        assert_eq!(
+            dropped,
+            text.len() - (out.len() - format!("\n[... truncated {dropped} chars ...]\n").len())
+        );
+    }
+
+    #[test]
+    fn multibyte_text_is_never_split_mid_char() {
+        // Every char is 4 bytes, so naive byte slicing would panic.
+        let text = "\u{1F600}".repeat(2_000);
+        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_CHARS).unwrap();
+        assert!(out.contains("[... truncated "));
+        // Round-trips as valid UTF-8 with no replacement chars introduced.
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn a_tiny_budget_degrades_to_a_head_cut() {
+        let text = "y".repeat(500);
+        let out = truncate_head_tail(&text, 10).unwrap();
+        assert!(out.starts_with("yyyyyyyyyy"));
+        assert!(out.contains("[... truncated 490 chars ...]"));
     }
 
     #[test]

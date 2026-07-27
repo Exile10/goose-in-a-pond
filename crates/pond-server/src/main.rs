@@ -6126,6 +6126,14 @@ async fn stream_agent_response(
                 println!("{content}");
                 printed_newline = content.ends_with('\n');
             }
+            AgentStreamEvent::TurnLimitReached { max_turns } => {
+                // The cap sentence itself already printed as Text. In a REPL the
+                // continuation is just the next prompt, so say how to give it.
+                eprintln!(
+                    "\r\x1b[K\x1b[2m  (turn budget of {max_turns} reached — \
+                     send \"continue\" to resume)\x1b[0m"
+                );
+            }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");
                 std::process::exit(1);

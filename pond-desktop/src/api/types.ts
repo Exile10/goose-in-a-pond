@@ -396,7 +396,12 @@ export interface ChatStreamRequest {
   voice_mode?: boolean;
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached";
+
+// Sent as a fresh user turn when the agent stopped on its turn budget. The
+// backend has no dedicated resume endpoint — a continuation IS just the next
+// message — so this lives in one place to keep both chat surfaces identical.
+export const CONTINUE_TURN_MESSAGE = "Continue where you left off.";
 
 // Per-turn inference performance stats emitted by the backend after each assistant turn.
 // All timing/throughput fields may be null when the provider does not report them.
@@ -429,6 +434,8 @@ export interface ChatEvent {
     card_type?: string;
     data?: Record<string, unknown>;
   };
+  /** Turn budget that was exhausted — present on "turn_limit_reached" events. */
+  max_turns?: number;
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)

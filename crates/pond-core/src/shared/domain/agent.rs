@@ -61,6 +61,14 @@ pub enum AgentStreamEvent {
         score: u8,
         rounds: u32,
     },
+    /// The agent loop stopped because the request's turn budget was exhausted,
+    /// not because the task was finished. Carries the budget that was hit so a
+    /// client can say so and offer a one-click continuation turn — without this
+    /// the user just gets the engine's "would you like me to continue?" as
+    /// plain text with nothing wired to answer it.
+    TurnLimitReached {
+        max_turns: u32,
+    },
     Done {
         session_id: String,
         model_role: String,

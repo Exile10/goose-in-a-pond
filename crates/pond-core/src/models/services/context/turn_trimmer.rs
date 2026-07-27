@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 
-use super::context_budget::{CompactionProfile, TOOL_RESULT_MAX_CHARS};
+use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrimRole {
@@ -120,12 +120,17 @@ pub fn trim_history(
         }
     }
 
-    // 2. Truncate oversized tool results.
+    // 2. Truncate oversized tool results, head+tail. The adapter applies the
+    //    SAME helper to the structured tool response it rebuilds, so this
+    //    estimate matches what the model actually receives — for a long time it
+    //    did not, and a 50K-char result was re-prefilled verbatim every turn
+    //    while the estimate believed it was 1.5K.
     for m in msgs.iter_mut() {
-        if m.role == TrimRole::ToolResult && m.text.len() > TOOL_RESULT_MAX_CHARS {
-            m.text.truncate(TOOL_RESULT_MAX_CHARS);
-            m.text.push_str("\n[tool output truncated]");
-            changed = true;
+        if m.role == TrimRole::ToolResult {
+            if let Some(truncated) = truncate_head_tail(&m.text, TOOL_RESULT_MAX_CHARS) {
+                m.text = truncated;
+                changed = true;
+            }
         }
     }
 
@@ -190,6 +195,57 @@ pub fn trim_history(
     }
 }
 
+/// Shape a conversation read back from durable storage for replay into a FRESH
+/// engine session, budgeted exactly like a live conversation would have been.
+///
+/// This is the hydration half of history durability: engines keep their own
+/// conversation store, so a restart (or a wiped engine store) can leave an
+/// existing chat pointing at an empty engine session while the durable store
+/// still holds every message. [`trim_history`] alone cannot cover it — it runs
+/// against the engine's conversation and returns early when that is empty.
+///
+/// Two rules beyond plain trimming:
+///
+/// 1. Empty-text messages are dropped: providers reject empty turns.
+/// 2. TRAILING user messages are dropped. The caller persists the incoming user
+///    message BEFORE starting the turn, so the tail of durable history is the
+///    very message the engine is about to append — replaying it would duplicate
+///    it. Dropping the trailing run also leaves the replay ending on an
+///    assistant turn, the correct shape to append a user message to.
+///
+/// Tool results are the caller's problem: a durable store generally cannot
+/// reconstruct a provider-valid tool request/response pair, and an orphaned tool
+/// response breaks the provider, so callers should filter them out before
+/// calling this.
+pub fn plan_replay(
+    messages: Vec<(TrimRole, String)>,
+    profile: &CompactionProfile,
+    rolling_summary: Option<&str>,
+) -> Vec<TrimMessage> {
+    let mut rows: Vec<(TrimRole, String)> = messages
+        .into_iter()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+    while matches!(rows.last(), Some((TrimRole::User, _))) {
+        rows.pop();
+    }
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let trim_input: Vec<TrimMessage> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, text))| TrimMessage {
+            index,
+            role,
+            text,
+            is_summary: false,
+        })
+        .collect();
+    trim_history(trim_input, profile, rolling_summary, None).messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,12 +303,15 @@ mod tests {
 
     #[test]
     fn truncates_oversized_tool_results() {
-        let big = "x".repeat(TOOL_RESULT_MAX_CHARS + 500);
+        let big = format!("START{}END", "x".repeat(TOOL_RESULT_MAX_CHARS + 500));
         let msgs = vec![user(0, "check"), tool(1, &big), assistant(2, "done")];
         let out = trim_history(msgs, &profile(10_000), None, None);
         assert!(out.changed);
-        assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 40);
-        assert!(out.messages[1].text.ends_with("[tool output truncated]"));
+        assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 64);
+        // Head+tail: the conclusion at the end of a tool result survives.
+        assert!(out.messages[1].text.starts_with("START"));
+        assert!(out.messages[1].text.ends_with("END"));
+        assert!(out.messages[1].text.contains("[... truncated "));
     }
 
     #[test]
@@ -341,5 +400,95 @@ mod tests {
         assert_eq!(relaxed.dropped_turns, 0);
         let tightened = trim_history(msgs, &profile(300), None, Some(6144));
         assert!(tightened.dropped_turns > 0);
+    }
+
+    // ── plan_replay (C1 hydration) ───────────────────────────────────────
+
+    fn rows(pairs: &[(TrimRole, &str)]) -> Vec<(TrimRole, String)> {
+        pairs.iter().map(|(r, t)| (*r, (*t).to_string())).collect()
+    }
+
+    /// The duplication bug this guards: the caller persists the incoming user
+    /// message before the turn starts, so the tail of durable history IS the
+    /// message the engine is about to append.
+    #[test]
+    fn replay_drops_the_trailing_user_message() {
+        let out = plan_replay(
+            rows(&[
+                (TrimRole::User, "first"),
+                (TrimRole::Assistant, "answer"),
+                (TrimRole::User, "the message about to be sent"),
+            ]),
+            &profile(10_000),
+            None,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].role, TrimRole::Assistant);
+        assert!(!out.iter().any(|m| m.text.contains("about to be sent")));
+    }
+
+    /// A conversation that is nothing but pending user messages replays as
+    /// nothing at all — hydrating it would only duplicate the current turn.
+    #[test]
+    fn replay_of_only_user_messages_is_empty() {
+        assert!(plan_replay(rows(&[(TrimRole::User, "hello")]), &profile(10_000), None).is_empty());
+        assert!(plan_replay(vec![], &profile(10_000), None).is_empty());
+    }
+
+    #[test]
+    fn replay_skips_blank_messages() {
+        let out = plan_replay(
+            rows(&[
+                (TrimRole::User, "q"),
+                (TrimRole::Assistant, "   "),
+                (TrimRole::Assistant, "real"),
+            ]),
+            &profile(10_000),
+            None,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].text, "real");
+    }
+
+    #[test]
+    fn replay_splices_the_rolling_summary_and_respects_the_budget() {
+        let filler = "z".repeat(2_000);
+        let out = plan_replay(
+            rows(&[
+                (TrimRole::User, "oldest"),
+                (TrimRole::Assistant, &filler),
+                (TrimRole::User, "newer"),
+                (TrimRole::Assistant, "kept"),
+            ]),
+            &profile(200),
+            Some("earlier: the user set up two lamps"),
+        );
+        assert!(out[0].is_summary);
+        assert!(out[0].text.contains("<conversation-summary>"));
+        // The oversized oldest turn was dropped to fit the budget.
+        assert!(!out.iter().any(|m| m.text == filler));
+        assert!(out.iter().any(|m| m.text == "kept"));
+    }
+
+    /// Replay is stable: hydrating a session twice yields the same plan.
+    #[test]
+    fn replay_is_idempotent() {
+        let input = rows(&[
+            (TrimRole::User, "q1"),
+            (TrimRole::Assistant, "a1"),
+            (TrimRole::User, "q2"),
+            (TrimRole::Assistant, "a2"),
+        ]);
+        let first = plan_replay(input.clone(), &profile(10_000), Some("s"));
+        let again: Vec<(TrimRole, String)> = first
+            .iter()
+            .filter(|m| !m.is_summary)
+            .map(|m| (m.role, m.text.clone()))
+            .collect();
+        let second = plan_replay(again, &profile(10_000), Some("s"));
+        assert_eq!(
+            first.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+            second.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+        );
     }
 }

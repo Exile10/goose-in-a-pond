@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Brain, Check, ChevronDown, Cpu, History, Loader2, PenSquare, Wrench } from "lucide-react";
+import { Brain, Check, ChevronDown, Cpu, History, Loader2, PenSquare, PlayCircle, Wrench } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -11,6 +11,7 @@ import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
 import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
+import { CONTINUE_TURN_MESSAGE } from "../api/types";
 import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { filterThinking } from "../lib/thinkFilter";
@@ -55,6 +56,8 @@ interface Message {
   turnStats?: TurnStats;
   error?: boolean;
   historyToolNames?: string[];
+  /** Set when the agent stopped on its turn budget — renders a Continue action. */
+  turnLimit?: number;
 }
 
 function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
@@ -375,6 +378,15 @@ export function Chat() {
           setMessages((prev) =>
             prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
           );
+        } else if (ev.type === "turn_limit_reached") {
+          // The agent ran out of turns rather than finishing. Mark the message
+          // (by id, same reasoning as turn_stats) so it offers a Continue action
+          // instead of leaving the backend's "would you like me to continue?"
+          // as a question nothing can answer.
+          const limit = ev.max_turns ?? 0;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
+          );
         }
       }
     } catch (e) {
@@ -540,6 +552,21 @@ export function Chat() {
                       <> · {msg.tokenUsage.completion_tokens} tokens</>
                     )}
                   </span>
+                )}
+                {/* Turn budget exhausted — offer a continuation turn */}
+                {msg.role === "agent" && !msg.streaming && msg.turnLimit !== undefined && (
+                  <div className="turn-limit">
+                    <span className="turn-limit__note">
+                      Stopped after {msg.turnLimit} steps.
+                    </span>
+                    <button
+                      className="turn-limit__btn"
+                      onClick={() => sendMessage(CONTINUE_TURN_MESSAGE)}
+                      disabled={busy}
+                    >
+                      <PlayCircle size={12} aria-hidden /> Continue
+                    </button>
+                  </div>
                 )}
                 {/* Inference stats footer */}
                 {msg.role === "agent" && !msg.streaming && showTurnStats && msg.turnStats && (

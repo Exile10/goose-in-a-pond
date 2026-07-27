@@ -55,6 +55,60 @@ const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local
      User messages use XML tags: <system-context> has date/time and <memories>. \
      <user-message> has the actual request. Only respond to <user-message>.";
 
+/// Verbatim copy of Goose's PRIVATE `MAX_TURNS_MESSAGE`
+/// (`goose/crates/goose/src/agents/agent.rs:72`) — the plain assistant text
+/// Goose streams when `turns_taken > max_turns`.
+///
+/// Matching it exactly is the only signal GIAP gets that the loop stopped on its
+/// budget rather than on the task being done, and it is what turns that dead
+/// sentence into an [`AgentStreamEvent::TurnLimitReached`] with a real continue
+/// affordance. The constant is not `pub` upstream, so this copy is the coupling
+/// — `goose_cap_message_is_still_verbatim` reads the fork source and fails if a
+/// Goose sync rewords it.
+const GOOSE_MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
+
+/// Goose environment knobs GIAP owns, as `(key, Some(value) | None)` where
+/// `None` means "unset this key".
+///
+/// Split out as a pure function for two reasons: it is the decision table worth
+/// unit-testing, and its result doubles as the change signature that stops
+/// `set_var` from firing on every turn (`set_var` is documented-unsound in a
+/// multi-threaded process, so it runs only when something actually changed).
+fn goose_env_knobs(
+    provider: &str,
+    effective_ctx: usize,
+    hybrid_compaction: bool,
+) -> [(&'static str, Option<String>); 3] {
+    let local = matches!(provider, "local" | "gguf");
+    [
+        // Without this Goose's ModelConfig defaults context_limit to 128K and
+        // its compaction targets ~102K, while the real KV cache is 8K (macOS) or
+        // 4K (Jetson) — the model hits ContextLengthExceeded long before the
+        // threshold and falls into the expensive emergency-compaction path.
+        ("GOOSE_CONTEXT_LIMIT", Some(effective_ctx.to_string())),
+        // Hybrid compaction: GIAP owns trimming (deterministic, in-turn) and
+        // summarization (idle). A threshold >= 1.0 disables Goose's own
+        // auto-compaction, which would stall the turn with an LLM summarization
+        // pass mid-conversation on-device.
+        (
+            "GOOSE_AUTO_COMPACT_THRESHOLD",
+            hybrid_compaction.then(|| "1.0".to_string()),
+        ),
+        // Ownership rule: tool-result pruning has exactly one owner. In hybrid
+        // mode that owner is GIAP's deterministic trimmer, which truncates tool
+        // results head+tail with no model call at all. Goose's tool-pair
+        // summarization (default ON) spawns background LLM calls to summarize
+        // old tool pairs — on-device that spends the tok/s budget the user is
+        // waiting on, to redo work the trimmer already did. Only disabled for
+        // the local engine: an HTTP provider's spare capacity is not ours to
+        // save, and there the summaries are close to free.
+        (
+            "GOOSE_TOOL_PAIR_SUMMARIZATION",
+            (local && hybrid_compaction).then(|| "false".to_string()),
+        ),
+    ]
+}
+
 /// Adapter: GooseAdapter
 ///
 /// Full-capability implementation of the `Agent` port using the Goose framework.
@@ -101,6 +155,13 @@ pub struct GooseAdapter {
     /// Goose sessions already configured (via `update_provider`) with the
     /// `last_provider_key` pair. Cleared on every provider/model change.
     provider_configured_sessions: Mutex<HashSet<String>>,
+    /// The `enable_thinking` request-param last stamped onto the ModelConfig.
+    /// Tracked separately from `last_provider_key` so a thinking-mode change
+    /// re-stamps the config on the RETAINED provider instead of rebuilding it.
+    last_thinking_param: Mutex<Option<bool>>,
+    /// Signature of the Goose env knobs currently exported, so `set_var` runs
+    /// only when a setting actually changed rather than on every turn.
+    last_env_signature: Mutex<String>,
     /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
@@ -237,6 +298,8 @@ impl GooseAdapter {
             last_provider_key: Mutex::new(String::new()),
             current_provider: Mutex::new(None),
             provider_configured_sessions: Mutex::new(HashSet::new()),
+            last_thinking_param: Mutex::new(None),
+            last_env_signature: Mutex::new(String::new()),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
@@ -337,8 +400,16 @@ impl GooseAdapter {
     /// Goose uses its own SQLite sessions.db with auto-generated IDs (`YYYYMMDD_N`).
     /// A GIAP session ID (UUID or arbitrary string) won't exist there unless we create it.
     /// Returns the Goose session ID to use for all subsequent `agent.*` calls.
+    ///
+    /// Resolution order — process cache, then the PERSISTED pairing, then the
+    /// GIAP id used verbatim, then a fresh session. The persisted step is what
+    /// stops a pond-server restart from amnesia-wiping a live chat: without it
+    /// the map was process-local, every restart landed on the fresh-session
+    /// branch, and the model lost the conversation that `pond_system.db` still
+    /// held in full. A fresh session created for a GIAP session that HAS pond
+    /// history is hydrated from that history before it is used.
     async fn resolve_goose_session(&self, giap_sid: &str) -> String {
-        // Fast path: already mapped this session.
+        // Fast path: already mapped this session in this process.
         if let Some(gid) = self
             .goose_session_map
             .lock()
@@ -348,6 +419,24 @@ impl GooseAdapter {
         {
             return gid;
         }
+        // Persisted pairing from a previous run. Re-validated against Goose:
+        // its store can be wiped independently of ours, and a dangling id would
+        // fail every agent call for the session.
+        if let Some(storage) = &self.giap_session_storage {
+            if let Ok(Some(gid)) = storage.get_engine_session_id(giap_sid).await {
+                if self.session_manager.get_session(&gid, false).await.is_ok() {
+                    self.goose_session_map
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(giap_sid.to_string(), gid.clone());
+                    tracing::debug!("Restored persisted goose session pairing {giap_sid} -> {gid}");
+                    return gid;
+                }
+                tracing::info!(
+                    "Persisted goose session '{gid}' for '{giap_sid}' is gone — re-creating"
+                );
+            }
+        }
         // Try using the GIAP session_id as-is (e.g. if Goose already stored it).
         if self
             .session_manager
@@ -355,10 +444,7 @@ impl GooseAdapter {
             .await
             .is_ok()
         {
-            self.goose_session_map
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(giap_sid.to_string(), giap_sid.to_string());
+            self.remember_goose_session(giap_sid, giap_sid).await;
             return giap_sid.to_string();
         }
         // Create a brand-new Goose session; use the GIAP id as the human name.
@@ -374,10 +460,11 @@ impl GooseAdapter {
         {
             Ok(session) => {
                 let gid = session.id.clone();
-                self.goose_session_map
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(giap_sid.to_string(), gid.clone());
+                self.remember_goose_session(giap_sid, &gid).await;
+                // A brand-new engine session for an EXISTING conversation must
+                // not start empty. The trimmer cannot cover this: it returns
+                // early on an empty conversation, so nothing would ever replay.
+                self.hydrate_goose_session(&gid, giap_sid).await;
                 gid
             }
             Err(e) => {
@@ -385,6 +472,169 @@ impl GooseAdapter {
                 giap_sid.to_string()
             }
         }
+    }
+
+    /// Record a GIAP -> Goose session pairing in the process cache and, when
+    /// session storage is wired, durably.
+    async fn remember_goose_session(&self, giap_sid: &str, goose_sid: &str) {
+        self.goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(giap_sid.to_string(), goose_sid.to_string());
+        if let Some(storage) = &self.giap_session_storage {
+            if let Err(e) = storage.set_engine_session_id(giap_sid, goose_sid).await {
+                // Non-fatal: the process cache still works for this run, the
+                // next restart just repeats the hydration path.
+                tracing::warn!("Failed to persist goose session pairing: {e}");
+            }
+        }
+    }
+
+    /// Replay a GIAP conversation into a freshly created Goose session.
+    ///
+    /// Text-only on purpose: `pond_system.db` stores tool calls and results as
+    /// separate rows and cannot reconstruct a provider-valid request/response
+    /// pair, and an orphaned tool response breaks the provider outright. The
+    /// user/assistant turns plus the rolling summary are what the model needs to
+    /// stay coherent about the conversation.
+    ///
+    /// Budgeting reuses the same `trim_history` the in-turn trimmer uses, so a
+    /// long history is cut to the profile's budget exactly the way a live
+    /// conversation would have been. Any failure is logged and skipped — losing
+    /// the replay degrades the turn, it must never fail it.
+    async fn hydrate_goose_session(&self, goose_sid: &str, giap_session_id: &str) {
+        use pond_core::models::domain::message::Role as GiapRole;
+        use pond_core::models::services::context::context_budget::CompactionProfile;
+        use pond_core::models::services::context::turn_trimmer::{plan_replay, TrimRole};
+
+        let Some(storage) = &self.giap_session_storage else {
+            return;
+        };
+        // Cap the read before budgeting: a 500-message session would otherwise
+        // be loaded in full only to have most of it dropped.
+        let history = match storage.get_recent_messages(giap_session_id, 200).await {
+            Ok(rows) => rows,
+            // A brand-new conversation has no row yet — the common case.
+            Err(e) => {
+                tracing::debug!("hydrate: no pond history for {giap_session_id}: {e}");
+                return;
+            }
+        };
+
+        let rows: Vec<(TrimRole, String)> = history
+            .into_iter()
+            .filter_map(|m| match m.message.role {
+                GiapRole::User => Some((TrimRole::User, m.message.content)),
+                GiapRole::Assistant => Some((TrimRole::Assistant, m.message.content)),
+                // Tool rows are dropped (see above); System never reaches history.
+                GiapRole::Tool | GiapRole::System => None,
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+
+        let rolling_summary = storage
+            .get_rolling_summary(giap_session_id)
+            .await
+            .ok()
+            .and_then(|(s, _)| s);
+
+        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let profile = CompactionProfile::from_context_window(effective_ctx);
+
+        // Trailing-user drop, blank filtering, budget cut and summary splice all
+        // live in pond-core's `plan_replay` so they are unit-tested there.
+        let planned = plan_replay(rows, &profile, rolling_summary.as_deref());
+        if planned.is_empty() {
+            return;
+        }
+
+        let replayed: Vec<Message> = planned
+            .iter()
+            .map(|tm| match tm.role {
+                TrimRole::Assistant => Message::assistant().with_text(&tm.text),
+                // The spliced summary rides a user message, like the trimmer's.
+                _ => Message::user().with_text(&tm.text),
+            })
+            .collect();
+        let replayed_len = replayed.len();
+
+        let conversation = goose::conversation::Conversation::new_unvalidated(replayed);
+        match self
+            .session_manager
+            .replace_conversation(goose_sid, &conversation)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "giap::trace",
+                kind = "history_hydrate",
+                session_id = %giap_session_id,
+                goose_session_id = %goose_sid,
+                messages = replayed_len,
+                summary_spliced = rolling_summary.is_some(),
+            ),
+            Err(e) => tracing::warn!("hydrate: replace_conversation failed: {e}"),
+        }
+    }
+
+    /// Export the Goose env knobs GIAP owns, but only when they changed.
+    ///
+    /// These used to be written inside `ensure_provider_current` AFTER its
+    /// provider:model fast-path return, so toggling `hybrid_compaction_enabled`
+    /// or `context_window_override` did nothing until a model switch or a
+    /// restart. They are settings-derived, not provider-derived, so they belong
+    /// on the settings path.
+    fn apply_goose_env_knobs(&self, settings: &pond_core::user_data::domain::settings::Settings) {
+        let effective_ctx = Self::effective_context_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        );
+        let knobs = goose_env_knobs(
+            &settings.chat_provider,
+            effective_ctx,
+            settings.hybrid_compaction_enabled,
+        );
+        let signature = knobs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(";");
+        {
+            let mut last = self
+                .last_env_signature
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == signature {
+                return;
+            }
+            *last = signature.clone();
+        }
+
+        // SAFETY: set_var is unsafe in multi-threaded programs per Rust 1.66+,
+        // but Goose already calls set_var for OLLAMA_HOST/OLLAMA_TIMEOUT in the
+        // same code path, so we follow the existing pattern. The signature guard
+        // above keeps this to actual changes rather than every turn.
+        #[allow(unused_unsafe)]
+        unsafe {
+            for (key, value) in &knobs {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        tracing::info!(
+            provider = %settings.chat_provider,
+            model = %settings.chat_model,
+            effective_ctx,
+            knobs = %signature,
+            "Applied Goose context/compaction env knobs"
+        );
     }
 
     /// Determine the context limit for Goose's compaction logic.
@@ -455,11 +705,42 @@ impl GooseAdapter {
         }
     }
 
-    /// Hot-swap the Goose provider when `chat_provider` / `chat_model` in settings changes.
+    /// Stamp the engine-level `enable_thinking` request-param onto a ModelConfig.
+    ///
+    /// Only for the in-process GGUF engine: it is the one provider that reads
+    /// this param (`goose-local-inference/src/lib.rs`, where only `Some(false)`
+    /// acts — `true` leaves the model registry's own default alone), and HTTP
+    /// providers can serialize `request_params` straight into request bodies,
+    /// where an unknown key is a liability.
+    ///
+    /// Why it matters: GIAP's `thinking_mode` (and voice mode) only ever shaped
+    /// the PROMPT, so with thinking "off" the engine still applied its registry
+    /// default of `true` — the template opened a reasoning channel and GIAP
+    /// relied on the ThoughtFilter to catch the leakage. Passing the param makes
+    /// suppression template-level, which is where it belongs.
+    fn with_thinking_param(
+        provider: &str,
+        cfg: goose_providers::model::ModelConfig,
+        enable_thinking: bool,
+    ) -> goose_providers::model::ModelConfig {
+        if !matches!(provider, "local" | "gguf") {
+            return cfg;
+        }
+        cfg.with_merged_request_params(HashMap::from([(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(enable_thinking),
+        )]))
+    }
+
+    /// Hot-swap the Goose provider when `chat_provider` / `chat_model` in
+    /// settings changes, or re-stamp its ModelConfig when only the engine-level
+    /// thinking flag changed (`enable_thinking`, resolved per request from
+    /// `thinking_mode` + voice + model capabilities).
     async fn ensure_provider_current(
         &self,
         settings: &pond_core::user_data::domain::settings::Settings,
         session_id: &str,
+        enable_thinking: bool,
     ) -> Result<()> {
         let key = format!("{}:{}", settings.chat_provider, settings.chat_model);
         let key_unchanged = {
@@ -469,6 +750,61 @@ impl GooseAdapter {
                 .unwrap_or_else(|e| e.into_inner());
             *last == key
         };
+        let thinking_unchanged = {
+            let last = self
+                .last_thinking_param
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last == Some(enable_thinking)
+        };
+        // HTTP providers never carry the param (see with_thinking_param), so a
+        // thinking change is a no-op for them — record it and skip the re-stamp.
+        if key_unchanged
+            && !thinking_unchanged
+            && !matches!(settings.chat_provider.as_str(), "local" | "gguf")
+        {
+            *self
+                .last_thinking_param
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(enable_thinking);
+        } else if key_unchanged && !thinking_unchanged {
+            // Same model, different thinking flag: re-stamp the ModelConfig on
+            // the RETAINED provider rather than rebuilding it. The static prompt
+            // prefix changes too (thinking_enabled feeds PromptState), so the
+            // KV prefix is being rebuilt this turn regardless.
+            let cached = self
+                .current_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some((p, cfg)) = cached {
+                let cfg = Self::with_thinking_param(&settings.chat_provider, cfg, enable_thinking);
+                self.agent
+                    .update_provider(p.clone(), cfg.clone(), session_id)
+                    .await?;
+                *self
+                    .current_provider
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((p, cfg));
+                *self
+                    .last_thinking_param
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(enable_thinking);
+                {
+                    let mut configured = self
+                        .provider_configured_sessions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    configured.clear();
+                    configured.insert(session_id.to_string());
+                }
+                tracing::info!(
+                    enable_thinking,
+                    "Re-stamped engine thinking flag on the current provider"
+                );
+                return Ok(());
+            }
+        }
         if key_unchanged {
             // The provider object is current, but Goose resolves the MODEL
             // per session: a Goose session created after the last swap has no
@@ -507,41 +843,11 @@ impl GooseAdapter {
         }
         tracing::debug!("[model-switch] provider change detected -> {}", key);
 
-        // ── Sync GOOSE_CONTEXT_LIMIT with the actual KV-cache / provider limit ─
-        //
-        // Critical fix: without this, Goose's ModelConfig defaults context_limit
-        // to 128K. Its auto-compaction triggers at ~80% of that (102K tokens),
-        // but the local llama-cpp KV cache is only 8K (macOS) or 3K (Jetson).
-        // The model hits ContextLengthExceeded long before 102K and falls into
-        // the expensive emergency compaction path. Setting this env var BEFORE
-        // ModelConfig::new_or_fail() ensures Goose sees the real limit.
-        let effective_ctx = Self::effective_context_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
-        );
-        // SAFETY: set_var is unsafe in multi-threaded programs per Rust 1.66+,
-        // but Goose already calls set_var for OLLAMA_HOST/OLLAMA_TIMEOUT in the
-        // same code path, so we follow the existing pattern.
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::set_var("GOOSE_CONTEXT_LIMIT", effective_ctx.to_string());
-            // Hybrid compaction: GIAP owns trimming (deterministic, in-turn)
-            // and summarization (idle). A threshold >= 1.0 disables goose's
-            // own auto-compaction, which would stall the turn with an LLM
-            // summarization pass mid-conversation on-device.
-            if settings.hybrid_compaction_enabled {
-                std::env::set_var("GOOSE_AUTO_COMPACT_THRESHOLD", "1.0");
-            } else {
-                std::env::remove_var("GOOSE_AUTO_COMPACT_THRESHOLD");
-            }
-        }
-        tracing::info!(
-            provider = %settings.chat_provider,
-            model = %settings.chat_model,
-            effective_ctx,
-            "Set GOOSE_CONTEXT_LIMIT to match actual KV-cache / provider limit"
-        );
+        // GOOSE_CONTEXT_LIMIT / GOOSE_AUTO_COMPACT_THRESHOLD /
+        // GOOSE_TOOL_PAIR_SUMMARIZATION are exported by `apply_goose_env_knobs`,
+        // which the caller runs BEFORE this function (they must be set before
+        // ModelConfig construction reads the context limit) and on every turn, so
+        // a settings toggle takes effect without a model switch or restart.
 
         let provider: Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)> =
             match settings.chat_provider.as_str() {
@@ -675,6 +981,8 @@ impl GooseAdapter {
             };
 
         if let Some((p, model_cfg)) = provider {
+            let model_cfg =
+                Self::with_thinking_param(&settings.chat_provider, model_cfg, enable_thinking);
             // Every provider Goose sees is wrapped in the GIAP shim — the
             // last-mile veto over system prompt, message injections, and the
             // tools list (see provider_shim.rs).
@@ -703,6 +1011,10 @@ impl GooseAdapter {
                 .last_provider_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = key.clone();
+            *self
+                .last_thinking_param
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(enable_thinking);
             {
                 let mut configured = self
                     .provider_configured_sessions
@@ -852,9 +1164,15 @@ impl GooseAdapter {
         }
 
         // Rebuild: original messages survive untouched unless (a) they are the
-        // spliced summary (fresh user message) or (b) their text changed AND
-        // they are plain-text messages — structured messages (tool requests /
-        // responses, thinking) are never rewritten, only kept or dropped.
+        // spliced summary (fresh user message), (b) their text changed AND they
+        // are plain-text messages, or (c) they carry an oversized structured
+        // tool response, whose TEXT bodies are truncated in place.
+        //
+        // (c) is the only case that rewrites a structured message, and it does
+        // so by cloning the original and replacing text inside it — ids,
+        // annotations, error flags and the tool-request/response pairing are
+        // preserved byte-for-byte. That pairing is load-bearing: an orphaned or
+        // re-keyed tool response is rejected by the provider.
         let mut rebuilt: Vec<goose::conversation::message::Message> = Vec::new();
         for tm in &outcome.messages {
             if tm.is_summary || tm.index == usize::MAX {
@@ -862,6 +1180,13 @@ impl GooseAdapter {
                 continue;
             }
             let original = &source[tm.index];
+            if let Some(truncated) = truncate_tool_response_text(
+                original,
+                pond_core::models::services::context_budget::TOOL_RESULT_MAX_CHARS,
+            ) {
+                rebuilt.push(truncated);
+                continue;
+            }
             let text_only = original
                 .content
                 .iter()
@@ -1092,6 +1417,12 @@ impl GooseAdapter {
         pond_mcp_server::set_last_user_message(&request.message);
         pond_mcp_server::set_current_session_id(&session_id);
 
+        // Settings-derived Goose knobs, re-applied every turn (cheaply — see
+        // apply_goose_env_knobs) so toggling hybrid compaction or the context
+        // override takes effect immediately. Must run BEFORE anything that reads
+        // GOOSE_CONTEXT_LIMIT: session hydration and ModelConfig construction do.
+        self.apply_goose_env_knobs(&settings);
+
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
 
@@ -1202,6 +1533,30 @@ impl GooseAdapter {
         let is_voice =
             self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) || request.voice_mode;
 
+        // Resolve thinking mode from settings + capabilities.
+        // Voice mode always disables thinking — reasoning tokens waste TTS time
+        // and leak as spoken text if any filter layer misses them.
+        //
+        // Hoisted out of the PromptState block below because it now drives two
+        // things that must agree: the prompt's <thinking> section AND the
+        // engine-level `enable_thinking` request-param (B4). Previously only the
+        // prompt knew, so the engine kept its registry default of `true` and the
+        // ThoughtFilter had to mop up the leakage.
+        let thinking_enabled = if is_voice {
+            false
+        } else {
+            let caps = self
+                .model_capabilities
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match settings.thinking_mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => caps.thinking, // "auto" — enable when model supports it
+            }
+        };
+
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
@@ -1214,24 +1569,6 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Resolve thinking mode from settings + capabilities.
-            // Voice mode always disables thinking — reasoning tokens waste TTS
-            // time and leak as spoken text if any filter layer misses them.
-            let caps = self
-                .model_capabilities
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let thinking_enabled = if is_voice {
-                false
-            } else {
-                match settings.thinking_mode.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    _ => caps.thinking, // "auto" — enable when model supports it
-                }
-            };
-
             // Derive compact_prompt from the PROMPT-side context budget: for
             // local inference the profile is clamped so a huge KV cache never
             // selects the verbose tier (see prompt_budget_ctx).
@@ -1477,7 +1814,10 @@ impl GooseAdapter {
         // The old global-state path (registry.rs) has been removed.
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
-        if let Err(e) = self.ensure_provider_current(&settings, &goose_sid).await {
+        if let Err(e) = self
+            .ensure_provider_current(&settings, &goose_sid, thinking_enabled)
+            .await
+        {
             tracing::warn!("Provider update failed (continuing with current provider): {e}");
         }
 
@@ -1630,26 +1970,42 @@ impl GooseAdapter {
             .ok();
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
-        // Build <system-context> block with per-turn dynamic data (date/time,
-        // memories). This keeps the system prompt + tool tokens stable across
-        // turns, enabling KV cache prefix reuse in the local inference engine.
-        let has_context =
-            !dynamic_suffix_for_user_msg.is_empty() || !memory_block_for_user_msg.is_empty();
+        // Build the <system-context> block with per-turn dynamic data (date/time,
+        // memories, turn budget). Everything variable lives HERE, in the user
+        // message, so the system prompt + tool tokens stay byte-stable across
+        // turns and the local engine can reuse its KV prefix.
+        //
+        // Reasoning-budget note (B2): the model is otherwise blind to its turn
+        // budget — Goose carries "N/M turns used" in its own <turn-context>, and
+        // the GIAP shim strips that precisely because it is NOT byte-stable and
+        // would break prefix reuse if it rode the system prompt.
+        //
+        // PER-REQUEST, not per-turn: this user message is built ONCE before
+        // `agent.reply`, so a live turn counter is not available here. What the
+        // model can act on either way is the size of the budget — and, when
+        // uncapped, that it should keep going rather than stop to ask.
+        let max_turns = settings.effective_max_turns(is_voice);
+        let turn_budget_block = pond_core::models::services::turn_budget::turn_budget_note(
+            (!settings.turns_are_uncapped(is_voice)).then_some(max_turns),
+        );
+
         let user_text = {
             let mut msg = String::with_capacity(512 + request.message.len());
-            if has_context {
-                msg.push_str("<system-context>\n");
-                if !dynamic_suffix_for_user_msg.is_empty() {
-                    msg.push_str(&dynamic_suffix_for_user_msg);
-                    msg.push('\n');
-                }
-                if !memory_block_for_user_msg.is_empty() {
-                    msg.push_str("<memories>\n");
-                    msg.push_str(&memory_block_for_user_msg);
-                    msg.push_str("\n</memories>\n");
-                }
-                msg.push_str("</system-context>\n");
+            // Always present now (the budget note is unconditional), so the
+            // <system-context> envelope is too.
+            msg.push_str("<system-context>\n");
+            if !dynamic_suffix_for_user_msg.is_empty() {
+                msg.push_str(&dynamic_suffix_for_user_msg);
+                msg.push('\n');
             }
+            if !memory_block_for_user_msg.is_empty() {
+                msg.push_str("<memories>\n");
+                msg.push_str(&memory_block_for_user_msg);
+                msg.push_str("\n</memories>\n");
+            }
+            msg.push_str(&turn_budget_block);
+            msg.push('\n');
+            msg.push_str("</system-context>\n");
             msg.push_str("<user-message>\n");
             msg.push_str(&request.message);
             msg.push_str("\n</user-message>");
@@ -1661,7 +2017,8 @@ impl GooseAdapter {
             schedule_id: None,
             // Voice requests get the tighter #105 cap so a runaway loop can't
             // keep the speaker silent for the full text-chat turn budget.
-            max_turns: Some(settings.effective_max_turns(is_voice)),
+            // `agent_max_turns = 0` resolves to the uncapped sentinel here.
+            max_turns: Some(max_turns),
             retry_config: None,
         };
 
@@ -1798,8 +2155,24 @@ impl GooseAdapter {
                             // is waiting for, causing answer text to be swallowed).
                             let raw_text = msg.as_concat_text();
                             if !raw_text.is_empty() {
+                                // Goose signals "budget exhausted" by streaming a
+                                // fixed sentence as ordinary assistant text (see
+                                // GOOSE_MAX_TURNS_MESSAGE). Re-emit it as a
+                                // structured event so a client can offer a real
+                                // continue action; the text still goes through so
+                                // history, persistence, and voice stay consistent.
+                                let hit_turn_limit = raw_text.trim() == GOOSE_MAX_TURNS_MESSAGE;
                                 total_output_chars += raw_text.len();
                                 yield Ok(AgentStreamEvent::Text { content: raw_text });
+                                if hit_turn_limit {
+                                    tracing::info!(
+                                        target: "giap::trace",
+                                        kind = "turn_limit_reached",
+                                        session_id = %session_id,
+                                        max_turns,
+                                    );
+                                    yield Ok(AgentStreamEvent::TurnLimitReached { max_turns });
+                                }
                             }
                         }
                         goose::agents::AgentEvent::HistoryReplaced(_) => {
@@ -2014,6 +2387,61 @@ impl AgentPort for GooseAdapter {
     }
 }
 
+/// Shrink the text bodies of an oversized structured tool response, or `None`
+/// when the message carries no tool response over `max_chars`.
+///
+/// GIAP's `TOOL_RESULT_MAX_CHARS` used to reach only the trimmer's token
+/// ESTIMATE: the rebuild kept structured `ToolResponse` messages whole, so a
+/// 50K-char tool result was re-prefilled verbatim on every single turn until its
+/// entire turn aged out — the estimate said 1.5K, the engine paid for 50K.
+///
+/// The rewrite is deliberately surgical: the message is cloned and only
+/// `RawContent::Text` bodies inside the response are replaced. The response id,
+/// its annotations, `is_error`, and the tool-request/response pairing all survive
+/// untouched, because a re-keyed or orphaned tool response is rejected by the
+/// provider outright.
+///
+/// `structured_content` is left alone: it is arbitrary tool-defined JSON that
+/// cannot be truncated without risking invalid data, and the text bodies are
+/// what the chat template renders.
+fn truncate_tool_response_text(
+    message: &goose::conversation::message::Message,
+    max_chars: usize,
+) -> Option<goose::conversation::message::Message> {
+    use goose::conversation::message::MessageContent;
+    use pond_core::models::services::context_budget::truncate_head_tail;
+
+    let oversized = message.content.iter().any(|c| match c {
+        MessageContent::ToolResponse(tr) => tr.tool_result.as_ref().is_ok_and(|r| {
+            r.content.iter().any(
+                |c| matches!(&c.raw, rmcp::model::RawContent::Text(t) if t.text.len() > max_chars),
+            )
+        }),
+        _ => false,
+    });
+    if !oversized {
+        return None;
+    }
+
+    let mut rewritten = message.clone();
+    for content in rewritten.content.iter_mut() {
+        let MessageContent::ToolResponse(tr) = content else {
+            continue;
+        };
+        let Ok(result) = tr.tool_result.as_mut() else {
+            continue;
+        };
+        for part in result.content.iter_mut() {
+            if let rmcp::model::RawContent::Text(text) = &mut part.raw {
+                if let Some(truncated) = truncate_head_tail(&text.text, max_chars) {
+                    text.text = truncated;
+                }
+            }
+        }
+    }
+    Some(rewritten)
+}
+
 /// The `.gguf` filename to register for a model name, tolerating a missing
 /// quantization suffix.
 ///
@@ -2114,6 +2542,235 @@ fn canonical_model_stem(model_name: &str, gguf_dir: &std::path::Path) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── B3: the Goose cap-message coupling ───────────────────────────────
+
+    /// Canary for the copied `GOOSE_MAX_TURNS_MESSAGE`. The upstream constant is
+    /// private, so GIAP matches on a duplicate string; if a Goose sync rewords
+    /// it, cap detection silently stops working and the Continue affordance
+    /// never appears. This test reads the fork source so that failure is loud.
+    #[test]
+    fn goose_cap_message_is_still_verbatim() {
+        let agent_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../goose/crates/goose/src/agents/agent.rs");
+        let Ok(source) = std::fs::read_to_string(&agent_rs) else {
+            // Submodule not initialised (`git submodule update --init`).
+            // Skipping beats failing on a checkout that cannot see the fork.
+            eprintln!("skipping: {} unavailable", agent_rs.display());
+            return;
+        };
+        assert!(
+            source.contains(&format!(
+                "MAX_TURNS_MESSAGE: &str = \"{GOOSE_MAX_TURNS_MESSAGE}\""
+            )),
+            "Goose's MAX_TURNS_MESSAGE no longer matches GOOSE_MAX_TURNS_MESSAGE — \
+             update the constant in goose_agent.rs or turn-limit detection is dead"
+        );
+    }
+
+    /// The detection itself: exact match (with surrounding whitespace tolerated),
+    /// and nothing else.
+    #[test]
+    fn only_the_cap_sentence_counts_as_a_turn_limit() {
+        let hit = |t: &str| t.trim() == GOOSE_MAX_TURNS_MESSAGE;
+        assert!(hit(GOOSE_MAX_TURNS_MESSAGE));
+        assert!(hit(&format!("\n{GOOSE_MAX_TURNS_MESSAGE}\n")));
+        assert!(!hit("I've reached the maximum number of actions."));
+        assert!(!hit(&format!(
+            "{GOOSE_MAX_TURNS_MESSAGE} Also here is more."
+        )));
+        assert!(!hit("Would you like me to continue?"));
+        assert!(!hit(""));
+    }
+
+    // ── C2: env-knob decision table ──────────────────────────────────────
+
+    fn knob(knobs: &[(&'static str, Option<String>)], key: &str) -> Option<String> {
+        knobs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn hybrid_compaction_disables_goose_compaction_and_tool_pair_summaries() {
+        let knobs = goose_env_knobs("local", 4096, true);
+        assert_eq!(knob(&knobs, "GOOSE_CONTEXT_LIMIT").as_deref(), Some("4096"));
+        assert_eq!(
+            knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").as_deref(),
+            Some("false"),
+            "the deterministic trimmer owns tool-result pruning on-device"
+        );
+    }
+
+    #[test]
+    fn without_hybrid_compaction_goose_keeps_its_own_defaults() {
+        let knobs = goose_env_knobs("local", 8192, false);
+        assert_eq!(knob(&knobs, "GOOSE_CONTEXT_LIMIT").as_deref(), Some("8192"));
+        // Unset, not "0.8" — absence restores Goose's own default.
+        assert!(knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").is_none());
+        assert!(knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none());
+    }
+
+    /// Tool-pair summarization is only disabled for the in-process engine: an
+    /// HTTP provider's spare capacity is not ours to conserve.
+    #[test]
+    fn http_providers_keep_goose_tool_pair_summarization() {
+        for provider in ["ollama", "llamafile"] {
+            let knobs = goose_env_knobs(provider, 32768, true);
+            assert!(
+                knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none(),
+                "{provider}"
+            );
+            assert_eq!(
+                knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").as_deref(),
+                Some("1.0"),
+                "{provider}"
+            );
+        }
+    }
+
+    /// The knob set doubles as the change signature that gates `set_var`, so a
+    /// settings change MUST alter it and an unchanged setting must not.
+    #[test]
+    fn knob_signature_changes_only_when_a_setting_changes() {
+        let sig = |p, ctx, hybrid| {
+            goose_env_knobs(p, ctx, hybrid)
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        assert_eq!(sig("local", 4096, true), sig("local", 4096, true));
+        assert_ne!(sig("local", 4096, true), sig("local", 4096, false));
+        assert_ne!(sig("local", 4096, true), sig("local", 8192, true));
+        assert_ne!(sig("local", 4096, true), sig("ollama", 4096, true));
+    }
+
+    // ── C3: structured tool-response truncation ──────────────────────────
+
+    fn tool_response_message(id: &str, body: &str) -> goose::conversation::message::Message {
+        goose::conversation::message::Message::user().with_tool_response(
+            id,
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(body.to_string()),
+            ])),
+        )
+    }
+
+    fn tool_response_text(message: &goose::conversation::message::Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                    tr.tool_result.as_ref().ok()
+                }
+                _ => None,
+            })
+            .flat_map(|r| r.content.iter())
+            .filter_map(|c| match &c.raw {
+                rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn a_small_tool_response_is_not_rewritten() {
+        let msg = tool_response_message("call-1", "sunny, 21C");
+        assert!(truncate_tool_response_text(&msg, 1_500).is_none());
+    }
+
+    #[test]
+    fn plain_text_messages_are_never_rewritten() {
+        let msg = goose::conversation::message::Message::assistant()
+            .with_text("x".repeat(10_000).as_str());
+        assert!(truncate_tool_response_text(&msg, 1_500).is_none());
+    }
+
+    /// The bug this closes: an oversized structured tool result used to be
+    /// re-prefilled verbatim every turn because the rebuild kept it whole.
+    #[test]
+    fn an_oversized_tool_response_is_truncated_head_and_tail() {
+        let body = format!("FIRST-LINE{}LAST-LINE", "x".repeat(50_000));
+        let msg = tool_response_message("call-1", &body);
+        let out = truncate_tool_response_text(&msg, 1_500).expect("should truncate");
+        let text = tool_response_text(&out);
+        assert!(text.len() < 1_600, "len {}", text.len());
+        assert!(text.starts_with("FIRST-LINE"));
+        assert!(text.ends_with("LAST-LINE"));
+        assert!(text.contains("[... truncated "));
+    }
+
+    /// Pairing preservation — the property that matters most here: an orphaned
+    /// or re-keyed tool response is rejected outright by the provider, so the
+    /// rewrite must preserve the response id, the content-part count, the role,
+    /// and the error flag. Only the text shrinks.
+    #[test]
+    fn truncation_preserves_the_tool_call_pairing_structure() {
+        let body = "y".repeat(40_000);
+        let original = tool_response_message("call-abc", &body);
+        let rewritten = truncate_tool_response_text(&original, 1_500).expect("should truncate");
+
+        assert_eq!(rewritten.role, original.role);
+        assert_eq!(rewritten.content.len(), original.content.len());
+
+        let ids = |m: &goose::conversation::message::Message| {
+            m.content
+                .iter()
+                .filter_map(|c| match c {
+                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                        Some((tr.id.clone(), tr.tool_result.is_ok()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&rewritten), ids(&original));
+        assert_eq!(ids(&rewritten), vec![("call-abc".to_string(), true)]);
+
+        let parts = |m: &goose::conversation::message::Message| {
+            m.content
+                .iter()
+                .filter_map(|c| match c {
+                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                        tr.tool_result.as_ref().ok()
+                    }
+                    _ => None,
+                })
+                .map(|r| (r.content.len(), r.is_error))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(parts(&rewritten), parts(&original));
+        assert!(tool_response_text(&rewritten).len() < tool_response_text(&original).len());
+    }
+
+    /// An error tool result is truncated too, and stays an error.
+    #[test]
+    fn an_error_tool_response_keeps_its_error_flag() {
+        let msg = goose::conversation::message::Message::user().with_tool_response(
+            "call-err",
+            Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::Content::text("z".repeat(20_000)),
+            ])),
+        );
+        let out = truncate_tool_response_text(&msg, 1_500).expect("should truncate");
+        let is_error = out.content.iter().any(|c| match c {
+            goose::conversation::message::MessageContent::ToolResponse(tr) => tr
+                .tool_result
+                .as_ref()
+                .is_ok_and(|r| r.is_error == Some(true)),
+            _ => false,
+        });
+        assert!(is_error);
+        assert!(tool_response_text(&out).contains("[... truncated "));
+    }
 
     #[test]
     fn quant_spelling_collapses_to_display_stem() {

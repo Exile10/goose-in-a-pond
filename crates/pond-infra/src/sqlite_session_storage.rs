@@ -192,6 +192,41 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn get_engine_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        let row =
+            sqlx::query("SELECT engine_session_id FROM engine_session_map WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row.map(|r| r.get("engine_session_id")))
+    }
+
+    async fn set_engine_session_id(
+        &self,
+        session_id: &str,
+        engine_session_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        // No `sessions` existence guard on purpose — see the port doc-comment:
+        // the pairing can be established before a GIAP session row exists.
+        sqlx::query(
+            "INSERT INTO engine_session_map (session_id, engine_session_id, updated_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               engine_session_id = excluded.engine_session_id, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(engine_session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
     async fn add_message(
         &self,
         session_id: String,
@@ -432,6 +467,46 @@ mod tests {
         assert_eq!(session.id, "sess-1");
         let fetched = s.get_session("sess-1").await.unwrap();
         assert_eq!(fetched.id, "sess-1");
+    }
+
+    /// C1: the engine-session pairing must survive a process restart, which is
+    /// what a fresh storage handle over the same file simulates.
+    #[tokio::test]
+    async fn engine_session_pairing_persists_and_upserts() {
+        let tmp = tempdir().unwrap();
+        {
+            let db = Database::init(tmp.path()).await.unwrap();
+            let s = SqliteSessionStorage::new(db.system);
+            assert_eq!(s.get_engine_session_id("sess-1").await.unwrap(), None);
+            // No sessions row on purpose — the pairing must not require one.
+            s.set_engine_session_id("sess-1", "20260728_1")
+                .await
+                .unwrap();
+            assert_eq!(
+                s.get_engine_session_id("sess-1").await.unwrap().as_deref(),
+                Some("20260728_1")
+            );
+            // Re-pairing (engine store wiped) overwrites rather than erroring.
+            s.set_engine_session_id("sess-1", "20260728_9")
+                .await
+                .unwrap();
+            assert_eq!(
+                s.get_engine_session_id("sess-1").await.unwrap().as_deref(),
+                Some("20260728_9")
+            );
+        }
+        let db = Database::init(tmp.path()).await.unwrap();
+        let reopened = SqliteSessionStorage::new(db.system);
+        assert_eq!(
+            reopened
+                .get_engine_session_id("sess-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("20260728_9"),
+            "pairing must survive a restart"
+        );
+        assert_eq!(reopened.get_engine_session_id("other").await.unwrap(), None);
     }
 
     #[tokio::test]
