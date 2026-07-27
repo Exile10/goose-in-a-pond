@@ -269,6 +269,21 @@ function weatherFromApi(w: WeatherApiResponse | null): WeatherData {
 
 function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
   if (!np || !np.connected) return { ...MOCK_HOME.nowPlaying, connected: false };
+  // Spotify answered but refused the request. This is NOT "nothing playing" —
+  // the account is linked, so silently showing an idle player hides a problem
+  // the user has to act on (and the transport controls would fail too).
+  if (np.error) {
+    return {
+      track: np.error === "forbidden" ? "Spotify not authorised" : "Spotify unavailable",
+      artist: np.message || "",
+      elapsed: 0,
+      hue: MOCK_HOME.nowPlaying.hue,
+      connected: true,
+      playing: false,
+      error: np.error,
+      message: np.message,
+    };
+  }
   // Connected but nothing actively playing (Spotify's 204 case) — show an
   // honest idle state instead of the mock/demo track, so a real connection
   // never gets mistaken for the decorative filler.

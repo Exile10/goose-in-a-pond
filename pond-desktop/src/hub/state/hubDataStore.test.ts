@@ -158,6 +158,72 @@ describe("hubDataStore", () => {
     expect(sunset?.does).toEqual(["Run tub", "dim lights", "play jazz"]);
   });
 
+  // ── Now Playing ──────────────────────────────────────────────
+  // Spotify refusing a call must never look like a paused player: a
+  // development-mode app serves only allowlisted accounts, and everyone else
+  // completes the whole OAuth flow before every API call 403s.
+
+  async function loadWithNowPlaying(np: unknown) {
+    apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
+    apiMock.listDevices.mockResolvedValue([]);
+    apiMock.listSchedules.mockResolvedValue([]);
+    apiMock.getNowPlaying.mockResolvedValue(np);
+    await refreshHomeData();
+    return getHomeData().nowPlaying;
+  }
+
+  it("surfaces a Spotify authorisation failure instead of an idle player", async () => {
+    const np = await loadWithNowPlaying({
+      connected: true,
+      playing: false,
+      error: "forbidden",
+      message: "This Spotify account is not authorised for the app GIAP signs in with.",
+    });
+
+    expect(np.error).toBe("forbidden");
+    expect(np.track).toBe("Spotify not authorised");
+    expect(np.artist).toContain("not authorised");
+    expect(np.track).not.toBe("Nothing playing");
+    expect(np.playing).toBe(false);
+  });
+
+  it("labels non-403 Spotify failures without claiming an authorisation problem", async () => {
+    const np = await loadWithNowPlaying({
+      connected: true,
+      playing: false,
+      error: "rate_limited",
+      message: "Spotify is rate-limiting requests.",
+    });
+
+    expect(np.error).toBe("rate_limited");
+    expect(np.track).toBe("Spotify unavailable");
+  });
+
+  it("still shows an honest idle state when nothing is playing", async () => {
+    const np = await loadWithNowPlaying({ connected: true, playing: false });
+
+    expect(np.error).toBeUndefined();
+    expect(np.track).toBe("Nothing playing");
+    expect(np.connected).toBe(true);
+  });
+
+  it("keeps real playback untouched", async () => {
+    const np = await loadWithNowPlaying({
+      connected: true,
+      playing: true,
+      track: "Blinding Lights",
+      artist: "The Weeknd",
+      progress_ms: 60_000,
+      duration_ms: 200_000,
+    });
+
+    expect(np.error).toBeUndefined();
+    expect(np.track).toBe("Blinding Lights");
+    expect(np.artist).toBe("The Weeknd");
+    expect(np.playing).toBe(true);
+    expect(np.elapsed).toBeCloseTo(0.3);
+  });
+
   it("derives scenes from schedules", async () => {
     apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
     apiMock.listDevices.mockResolvedValue([
