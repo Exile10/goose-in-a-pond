@@ -106,7 +106,7 @@
       "description": "Control music playback, search tracks, and manage playlists via Spotify",
       "kind": "stdio",
       "command": "npx",
-      "args": ["tsx", "extensions/music/src/server.ts"],
+      "args": ["-y", "tsx", "extensions/music/src/server.ts"],
       "category": "entertainment",
       "author": "GIAP",
       "tools": ["play", "status", "control"],

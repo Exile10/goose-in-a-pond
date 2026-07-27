@@ -71,6 +71,18 @@ pub fn internal_extension_token() -> &'static str {
     INTERNAL_EXTENSION_TOKEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// Env var naming the local API base URL, read by extension subprocesses that
+/// call back into GIAP (e.g. the music extension refreshing its Spotify token).
+///
+/// Extensions cannot assume a port: `serve` binds the first free one of
+/// 80 / 8080 / 4000 / 5000, so the value has to be handed down at spawn time.
+pub const GIAP_SERVER_URL_ENV_KEY: &str = "GIAP_SERVER_URL";
+
+/// The loopback base URL for this server, for [`GIAP_SERVER_URL_ENV_KEY`].
+pub fn local_server_url(api_port: u16) -> String {
+    format!("http://127.0.0.1:{api_port}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

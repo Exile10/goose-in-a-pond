@@ -17,6 +17,7 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
+mod asset_root;
 mod composite_model_catalog_provider;
 mod filesystem_model_storage;
 mod http_model_downloader;
@@ -2468,8 +2469,14 @@ async fn run_server(
 
     // Marketplace — curated registry of installable extensions.
     // Initialized before MCP auto-connect so startup can look up required_secrets.
+    // The asset root anchors entries that launch a bundled script, so they no
+    // longer depend on which directory pond-server happened to be started from.
+    let asset_root = asset_root::resolve();
+    tracing::info!(asset_root = %asset_root.display(), "resolved extension asset root");
     let marketplace: Arc<dyn pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace> =
-        Arc::new(pond_core::mcp::services::marketplace::BundledMarketplace::new());
+        Arc::new(
+            pond_core::mcp::services::marketplace::BundledMarketplace::with_asset_root(&asset_root),
+        );
 
     // MCP client — load persisted server configs and auto-connect enabled ones.
     let mcp_server_repo: Option<Arc<dyn pond_core::mcp::ports::mcp_server::McpServerRepository>> = {
@@ -2501,12 +2508,36 @@ async fn run_server(
                             }
                         }
 
+                        // A config persisted before extension paths were anchored
+                        // still carries a cwd-relative arg, which only resolves
+                        // when the server is launched from the repo root. Re-anchor
+                        // it here so an existing install heals on restart instead
+                        // of needing a manual remove-and-reinstall.
+                        let mut args = srv.args.clone();
+                        if pond_core::mcp::services::marketplace::anchor_asset_args(
+                            &mut args,
+                            &asset_root,
+                        ) {
+                            tracing::info!(
+                                extension = %srv.name,
+                                "re-anchored persisted extension args to the asset root"
+                            );
+                            let mut migrated = srv.clone();
+                            migrated.args = args.clone();
+                            if let Err(e) = repo.save(&migrated).await {
+                                tracing::warn!(
+                                    "failed to persist re-anchored args for '{}': {e}",
+                                    srv.name
+                                );
+                            }
+                        }
+
                         let req = AddExtensionRequest {
                             name: srv.name.clone(),
                             kind: srv.kind.clone(),
                             description: srv.description.clone(),
                             command: srv.command.clone(),
-                            args: srv.args.clone(),
+                            args,
                             env,
                             uri: srv.uri.clone(),
                         };

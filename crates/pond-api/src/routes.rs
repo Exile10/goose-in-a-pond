@@ -7620,6 +7620,10 @@ async fn install_marketplace_handler(
         crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
         crate::oauth_callback::internal_extension_token().to_string(),
     );
+    env.insert(
+        crate::oauth_callback::GIAP_SERVER_URL_ENV_KEY.to_string(),
+        crate::oauth_callback::local_server_url(state.api_port),
+    );
 
     let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
         name: ext.id.clone(),
@@ -7993,6 +7997,26 @@ async fn oauth_authorize_handler(
 /// `GET /api/v1/oauth/callback` — Handle the OAuth provider's redirect.
 ///
 /// Query: `?code=...&state=...`
+/// Escapes text that is interpolated into the OAuth result pages.
+///
+/// Those pages embed strings GIAP does not control — a subprocess's stderr, or
+/// an error body returned by the OAuth provider — so they must not be able to
+/// close a tag and inject markup into a page rendered on 127.0.0.1.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 ///
 /// Exchanges the authorization code for tokens using the stored PKCE
 /// verifier, persists access/refresh tokens in the secret store, and
@@ -8080,6 +8104,7 @@ async fn oauth_callback_handler(
 
             // If this OAuth flow was triggered by an extension install, restart
             // the extension so the child process picks up the new tokens.
+            let mut restart_error: Option<String> = None;
             if let Some(ext_id) = &session.extension_id {
                 if let (Some(mgr), Some(mp), Some(secret_repo)) = (
                     &state.extension_manager,
@@ -8097,6 +8122,10 @@ async fn oauth_callback_handler(
                         env.insert(
                             crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
                             crate::oauth_callback::internal_extension_token().to_string(),
+                        );
+                        env.insert(
+                            crate::oauth_callback::GIAP_SERVER_URL_ENV_KEY.to_string(),
+                            crate::oauth_callback::local_server_url(state.api_port),
                         );
 
                         // Remove the running extension and re-add with new env
@@ -8117,14 +8146,38 @@ async fn oauth_callback_handler(
                                 extension = %ext_id,
                                 "restarted extension with OAuth tokens"
                             ),
-                            Err(e) => tracing::warn!(
-                                extension = %ext_id,
-                                error = %e,
-                                "failed to restart extension after OAuth"
-                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    extension = %ext_id,
+                                    error = %e,
+                                    "failed to restart extension after OAuth"
+                                );
+                                restart_error = Some(e.to_string());
+                            }
                         }
                     }
                 }
+            }
+
+            // The tokens are stored either way, but if the extension could not be
+            // started there is nothing working on the other side — say so rather
+            // than showing a green "Connected" card over a dead extension.
+            if let Some(err) = restart_error {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html><head><title>Authorization Incomplete</title>
+<style>body{{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8f9fa}}
+.card{{max-width:40rem;padding:2rem;border-radius:12px;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.1)}}
+h1{{color:#f59e0b;margin:0 0 .5rem}}p{{color:#6b7280}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#f3f4f6;padding:1rem;border-radius:8px;color:#374151;font-size:.8rem}}</style></head>
+<body><div class="card"><h1>Signed in to {}, but the extension did not start</h1>
+<p>Your credentials were saved. The <code>{}</code> extension failed to launch, so it will not work yet.</p>
+<pre>{}</pre></div></body></html>"#,
+                    html_escape(&provider.display_name),
+                    html_escape(session.extension_id.as_deref().unwrap_or("unknown")),
+                    html_escape(&err),
+                ))
+                .into_response();
             }
 
             Html(format!(
@@ -8145,7 +8198,7 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
                 "<h1>Authorization failed</h1>\
                  <p>Token exchange error. Please try again.</p>\
                  <pre>{}</pre>",
-                error_body
+                html_escape(&error_body)
             ))
             .into_response()
         }
