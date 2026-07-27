@@ -346,7 +346,7 @@ be validated on real Jetson hardware, enforce fail-closed at load:
    (`ResourceAwareModelScheduler::memory_status`), reserving ~1 GB headroom.
 2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) first to
    free the page cache — otherwise the `-ngl` allocation hits the NvMap OOM wall
-   (error 12). See `scripts/jetson-llama-optimization`.
+   (error 12). See `scripts/jetson/llama-optimization`.
 3. Re-check; if it STILL will not fit, refuse the full-GPU load (fail closed) and
    surface the spill to the UI rather than silently degrading to a CPU/GPU split.
 

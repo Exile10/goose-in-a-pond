@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# build-jetson-docker.sh — Build the GIAP single-executable server for the
+# build-docker.sh — Build the GIAP single-executable server for the
 # Jetson Orin Nano (aarch64 Linux) from an ARM64 host (e.g. an Apple Silicon Mac).
 #
 # WHY DOCKER, NOT `cross`:  on Apple Silicon, `cross` defaults to an x86_64
@@ -13,12 +13,12 @@
 # crates/pond-api/build.rs), so the built binary needs no external files.
 #
 # Usage:
-#   bash scripts/build-jetson-docker.sh          # lean: goose backend, ollama/llamafile providers
-#   bash scripts/build-jetson-docker.sh --full   # + local-inference (in-process GGUF; heavy llama-cpp-2/candle build)
+#   bash scripts/jetson.sh docker-build          # lean: goose backend, ollama/llamafile providers
+#   bash scripts/jetson.sh docker-build --full   # + local-inference (in-process GGUF; heavy llama-cpp-2/candle build)
 #
 # NOTE — CUDA/GPU: not available here. A generic arm64 container has no CUDA
 # toolkit or Jetson driver, and a CUDA binary must match JetPack exactly. For GPU
-# inference, build ON the device: `bash scripts/build-jetson-native.sh --cuda`.
+# inference, build ON the device: `bash scripts/jetson.sh build --cuda`.
 #
 # Output: target-jetson/release/pond-server  (aarch64 Linux ELF)
 # Deploy: scp it to the Jetson and run `./pond-server serve` — models download to
@@ -75,7 +75,7 @@ docker run --rm --platform linux/arm64 \
   -e CARGO_TARGET_DIR=/src/target-jetson \
   -e RUSTFLAGS="-C target-cpu=cortex-a78" \
   -e CFLAGS="-march=armv8.2-a+fp16+dotprod" -e CXXFLAGS="-march=armv8.2-a+fp16+dotprod" \
-  -e CMAKE_TOOLCHAIN_FILE=/src/scripts/jetson-ggml-toolchain.cmake \
+  -e CMAKE_TOOLCHAIN_FILE=/src/scripts/jetson/ggml-toolchain.cmake \
   -e SQLX_OFFLINE=true -e CARGO_TERM_COLOR=never \
   rust:bookworm bash -c '
     set -e

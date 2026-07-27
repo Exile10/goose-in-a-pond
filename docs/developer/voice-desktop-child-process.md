@@ -97,7 +97,7 @@ macOS:
 7. Run a UI text chat during a voice turn; check both logs for SQLITE_BUSY.
 
 Jetson (nano@nano.local):
-1. Build on-device with `scripts/build-jetson-native.sh --cuda`; keep the
+1. Build on-device with `bash scripts/jetson.sh build --cuda`; keep the
    child's Whisper tier at tiny/base (it duplicates serve's CUDA context).
 2. `drop_caches` before load (NvMap ~586MiB wall), watch `tegrastats` during a
    session for GPU/NvMap headroom.

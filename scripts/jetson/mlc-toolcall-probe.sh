@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# jetson-mlc-toolcall-probe.sh — Experiment A: is MLC-LLM "fast AND well" for GIAP?
+# mlc-toolcall-probe.sh — Experiment A: is MLC-LLM "fast AND well" for GIAP?
 #
 # Run this ON the Jetson Orin Nano. It stands up MLC-LLM's OpenAI server with the
 # prebuilt Llama-3.2-3B q4f16 weights and runs mlc_toolcall_probe.py — the
@@ -12,9 +12,9 @@
 #   FAIL -> stay on Ollama; MLC's speed is a mirage for our tool loop.
 #
 # Usage (on the Nano):
-#   bash scripts/jetson-mlc-toolcall-probe.sh            # serve, probe, tear down
-#   bash scripts/jetson-mlc-toolcall-probe.sh --keep     # leave the server up for
-#                                                        # the GIAP end-to-end test
+#   bash scripts/jetson.sh probe-mlc            # serve, probe, tear down
+#   bash scripts/jetson.sh probe-mlc --keep     # leave the server up for
+#                                               # the GIAP end-to-end test
 #
 # Prereqs: Docker + nvidia runtime (already on the box), JetPack 6.2, MAXN SUPER.
 # First run builds/pulls the MLC container and JIT-compiles the model lib for

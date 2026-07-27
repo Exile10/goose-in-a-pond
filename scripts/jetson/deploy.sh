@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# jetson-deploy.sh — one-command deploy of GIAP to the Jetson Orin Nano
+# deploy.sh — one-command deploy of GIAP to the Jetson Orin Nano
 #
 # Run from the repo root ON THE DEV MACHINE (not the Jetson):
-#   bash scripts/jetson-deploy.sh                # deploy origin/main
-#   bash scripts/jetson-deploy.sh --branch mybr  # deploy another pushed branch
-#   JETSON_HOST=nano-ip bash scripts/jetson-deploy.sh   # alternate ssh host
+#   bash scripts/jetson.sh deploy                # deploy origin/main
+#   bash scripts/jetson.sh deploy --branch mybr  # deploy another pushed branch
+#   JETSON_HOST=nano-ip bash scripts/jetson.sh deploy   # alternate ssh host
 #
 # What it does:
 #   1. Jetson: fetch + hard-reset the checkout to origin/<branch>, sync the

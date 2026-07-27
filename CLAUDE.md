@@ -87,13 +87,14 @@ npm run tauri build    # native desktop app bundle
 ### Single-executable / Jetson build
 `pond-server` embeds `pond-desktop/dist` at compile time (`crates/pond-api/build.rs` + `routes.rs` via `include_dir`), so a release build is a **single self-contained executable** (build the UI first, or you get the `build.rs` placeholder). Build scripts:
 ```bash
-bash scripts/build-jetson-native.sh --cuda   # ON the Jetson: CUDA/GPU build (GPU build MUST be on-device)
-bash scripts/build-jetson-docker.sh          # OFF-device: aarch64 CPU binary via native linux/arm64 container
+bash scripts/jetson.sh deploy                # from the dev machine: one-command deploy to the nano
+bash scripts/jetson.sh build --cuda          # ON the Jetson: CUDA/GPU build (GPU build MUST be on-device)
+bash scripts/jetson.sh docker-build          # OFF-device: aarch64 CPU binary via native linux/arm64 container
 ```
-Cross-build gotcha: ggml's cmake must not probe the build host's CPU. `scripts/jetson-ggml-toolchain.cmake` (via `CMAKE_TOOLCHAIN_FILE`) pins `GGML_NATIVE=OFF` + `GGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod`. Use a valid `-march` ISA string for C/C++ (`-march=armv8.2-a+fp16+dotprod`) — a CPU *name* like `cortex-a78` is only valid for rustc's `target-cpu`, never gcc's `-march`.
+All Jetson scripts live in `scripts/jetson/` (see its README for the full workflow). Cross-build gotcha: ggml's cmake must not probe the build host's CPU. `scripts/jetson/ggml-toolchain.cmake` (via `CMAKE_TOOLCHAIN_FILE`) pins `GGML_NATIVE=OFF` + `GGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod`. Use a valid `-march` ISA string for C/C++ (`-march=armv8.2-a+fp16+dotprod`) — a CPU *name* like `cortex-a78` is only valid for rustc's `target-cpu`, never gcc's `-march`.
 
 ### On-device inference (Jetson Orin Nano)
-Decode is **memory-bandwidth-bound** (~102 GB/s on the 8GB Super): `tok/s ≈ 102 / model_GB`. A ~2GB 3B-Q4 model runs ~22 tok/s at 100% GPU; a 5.6GB model spills off-GPU → single-digit tok/s. Keep models ≤ the GPU budget (leave ~1GB headroom for KV cache). The Models tab + onboarding surface a fit-verdict from `GET /api/v1/models/memory-status` (note: the Ollama/llamafile NoopScheduler returns zeros → verdict "unknown"). See `docs/developer/inference_optimization.md` and `scripts/jetson-llama-optimization/` (drop_caches before `-ngl` to dodge the ~586 MiB NvMap OOM wall).
+Decode is **memory-bandwidth-bound** (~102 GB/s on the 8GB Super): `tok/s ≈ 102 / model_GB`. A ~2GB 3B-Q4 model runs ~22 tok/s at 100% GPU; a 5.6GB model spills off-GPU → single-digit tok/s. Keep models ≤ the GPU budget (leave ~1GB headroom for KV cache). The Models tab + onboarding surface a fit-verdict from `GET /api/v1/models/memory-status` (note: the Ollama/llamafile NoopScheduler returns zeros → verdict "unknown"). See `docs/developer/inference_optimization.md` and `scripts/jetson/llama-optimization/` (drop_caches before `-ngl` to dodge the ~586 MiB NvMap OOM wall).
 
 ---
 

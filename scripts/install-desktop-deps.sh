@@ -9,9 +9,9 @@
 # build dies deep inside `webkit2gtk-sys` with a cryptic pkg-config error.
 #
 # This is the single source of truth for that dependency set. It is called by
-# scripts/build-jetson-native.sh --desktop and scripts/jetson-deploy.sh
-# --desktop, and pond-desktop/src-tauri/build.rs points users here on a missing
-# lib. Safe to run standalone and idempotent.
+# `scripts/jetson.sh build --desktop` and `scripts/jetson.sh deploy --desktop`
+# (scripts/jetson/), and pond-desktop/src-tauri/build.rs points users here on a
+# missing lib. Safe to run standalone and idempotent.
 #
 # Usage:
 #   bash scripts/install-desktop-deps.sh          # check + install missing (apt, uses sudo)

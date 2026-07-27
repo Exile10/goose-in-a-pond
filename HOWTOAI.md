@@ -167,14 +167,14 @@ Three tests in `onboarding_integration_test.rs` are **pre-existing failures** (n
 
 ## 11. Jetson CUDA Build — Native Only
 
-Cross-compilation is **not possible** for the `local-inference` feature (nvcc requires the target arch). The workflow is:
+Cross-compilation is **not possible** for the `local-inference` feature (nvcc requires the target arch). All Jetson scripts live in `scripts/jetson/` behind one entry point:
 
 ```bash
-# On x86 host — deploy the non-CUDA binary
-./scripts/deploy-jetson.sh
+# From the dev machine — one-command deploy (on-device CUDA build included)
+bash scripts/jetson.sh deploy
 
-# SSH into Jetson — build CUDA variant natively
-./scripts/build-jetson-cuda.sh    # sets CMAKE_CUDA_ARCHITECTURES=87, CUDA 12.6
+# Or ON the Jetson — native build with CUDA (sm_87)
+bash scripts/jetson.sh build --cuda
 ```
 
 The `LocalInferenceLlmAdapter` automatically applies Jetson-optimised `ModelSettings` (`n_gpu_layers=99`, `flash_attention=true`, `use_mlock=false`, etc.) when compiled with `--features cuda`. These are patched into the Goose model registry at startup.
@@ -244,7 +244,7 @@ GIAP is structured across five conceptual layers. When adding features, identify
 │               (web/dist, tower-http ServeDir)          │
 ├────────────────────────────────────────────────────────┤
 │  1. OS Layer — Linux, drivers, models on disk          │
-│               (Cross.toml, deploy-jetson.sh, setup.sh) │
+│               (scripts/jetson/, setup.sh)              │
 └────────────────────────────────────────────────────────┘
 ```
 
