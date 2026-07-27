@@ -12,6 +12,7 @@ pub mod news;
 pub mod schedule;
 pub mod sensors;
 pub mod system;
+pub mod toolkit;
 pub mod vision;
 pub mod weather;
 
@@ -147,6 +148,7 @@ pub use news::NewsMcpServer;
 pub use schedule::{try_upcoming_schedules_context, ScheduleMcpServer};
 pub use sensors::SensorsMcpServer;
 pub use system::SystemMcpServer;
+pub use toolkit::ToolkitMcpServer;
 pub use vision::VisionMcpServer;
 pub use weather::WeatherMcpServer;
 
@@ -163,6 +165,7 @@ pub use news::{init_news_deps, spawn_news_server};
 pub use schedule::{init_schedule_deps, spawn_schedule_server};
 pub use sensors::{init_sensor_deps, spawn_sensor_server};
 pub use system::spawn_system_server;
+pub use toolkit::{init_toolkit_deps, spawn_toolkit_server};
 pub use vision::{init_vision_deps, spawn_vision_server};
 pub use weather::{init_weather_deps, spawn_weather_server, WEATHER_APP_URI};
 

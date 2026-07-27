@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 /// or the context limit lands first — while staying safe to do maths on.
 pub const UNCAPPED_MAX_TURNS: u32 = 100_000;
 
+/// `tool_selection_mode`: send every registered extension's tools every turn.
+pub const TOOL_SELECTION_MODE_ALL: &str = "all";
+/// `tool_selection_mode`: core groups plus the groups scored relevant to the
+/// session, chosen once at session start (Phase D2).
+pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
+
 /// All configurable settings for GIAP.
 ///
 /// Serializes to/from JSON via serde. Each field has a default via
@@ -388,6 +394,25 @@ pub struct Settings {
     #[serde(default = "Settings::default_prefix_cache_prompt")]
     pub prefix_cache_prompt: bool,
 
+    /// Which extension tool SCHEMAS reach the model: `"all"` (default) |
+    /// `"relevant"`.
+    ///
+    /// `"all"` sends every registered `giap-*` tool on every turn — 59 tools at
+    /// roughly 100 tokens each through the Gemma chat template, i.e. ~5.9K of an
+    /// 8K-class on-device prompt budget spent before the conversation starts.
+    ///
+    /// `"relevant"` keeps a small always-on core (draft, memory, system, and the
+    /// discovery escape hatch) plus the groups scored relevant to the session's
+    /// opening message, chosen ONCE per session so the KV prompt prefix stays
+    /// reusable across turns. The model can pull in any dormant group itself via
+    /// `enable_tool_group`, so nothing becomes unreachable — and this never
+    /// decides WHETHER tools are used, only which schemas are in the prompt.
+    ///
+    /// Defaults to `"all"`: existing installs see no behaviour change until the
+    /// operator opts in.
+    #[serde(default = "Settings::default_tool_selection_mode")]
+    pub tool_selection_mode: String,
+
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
     pub agent_memory_inject: bool,
@@ -678,6 +703,7 @@ impl Default for Settings {
             voice_max_turns: Self::default_voice_max_turns(),
             agent_timeout_secs: Self::default_agent_timeout_secs(),
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
+            tool_selection_mode: Self::default_tool_selection_mode(),
             agent_memory_inject: Self::default_agent_memory_inject(),
             agent_memory_limit: Self::default_agent_memory_limit(),
             tool_output_compaction: Self::default_tool_output_compaction(),
@@ -940,8 +966,20 @@ impl Settings {
     pub fn turns_are_uncapped(&self, voice: bool) -> bool {
         self.effective_max_turns(voice) == UNCAPPED_MAX_TURNS
     }
+
+    /// Whether per-session tool-relevance selection (Phase D2) is active.
+    ///
+    /// Anything other than the exact opt-in string means "all tools" — an
+    /// unrecognised value must never silently narrow the model's tool surface.
+    pub fn tool_selection_is_relevant(&self) -> bool {
+        self.tool_selection_mode == TOOL_SELECTION_MODE_RELEVANT
+    }
     fn default_agent_timeout_secs() -> u64 {
         300
+    }
+    fn default_tool_selection_mode() -> String {
+        // "all" so this first landing changes nothing for existing installs.
+        TOOL_SELECTION_MODE_ALL.to_string()
     }
     fn default_prefix_cache_prompt() -> bool {
         true
@@ -1250,6 +1288,27 @@ mod tests {
         assert!(s.turns_are_uncapped(true));
     }
 
+    /// D2: the default must not narrow anything, and only the exact opt-in
+    /// string may. A typo'd or future value silently shrinking the model's tool
+    /// surface would be the worst failure mode of this feature.
+    #[test]
+    fn tool_selection_defaults_to_all_and_only_exact_opt_in_narrows() {
+        let mut s = Settings::default();
+        assert_eq!(s.tool_selection_mode, TOOL_SELECTION_MODE_ALL);
+        assert!(!s.tool_selection_is_relevant());
+
+        s.tool_selection_mode = TOOL_SELECTION_MODE_RELEVANT.to_string();
+        assert!(s.tool_selection_is_relevant());
+
+        for bogus in ["Relevant", "relevent", "semantic", "", "true"] {
+            s.tool_selection_mode = bogus.to_string();
+            assert!(
+                !s.tool_selection_is_relevant(),
+                "'{bogus}' must not enable narrowing"
+            );
+        }
+    }
+
     /// A real cap is never reported as uncapped.
     #[test]
     fn a_real_cap_is_not_uncapped() {
@@ -1398,6 +1457,7 @@ mod tests {
             "tool_call_validation",
             "tool_model",
             "tool_output_compaction",
+            "tool_selection_mode",
             "tool_request_detection",
             "user_name",
             "vision_camera_id",

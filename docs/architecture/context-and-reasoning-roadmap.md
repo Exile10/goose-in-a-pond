@@ -42,6 +42,8 @@ quarantined PondAgent loop (Q2-05) is out of scope.
 
 ### Tools
 
+> Superseded by Phase D below (landed). Kept as the measured baseline.
+
 - **No relevance selection anywhere.** 14 `giap-*` extensions (57 tools when
   all enabled; CLAUDE.md's "12" is stale) are registered at startup from
   settings toggles; every session loads all of them; `allowed_tools` per turn
@@ -49,7 +51,8 @@ quarantined PondAgent loop (Q2-05) is out of scope.
   `prepare_tools_and_prompt` sends `list_tools(None)` wholesale. The shim's
   allow-set is a veto (drops goose self-injected tools), never a narrower.
   Cost: ~100 tok/tool through the Gemma template ≈ 5.7K prompt tokens every
-  turn on an 8K-class budget.
+  turn on an 8K-class budget. (Measured after D1/D2 landed, with `giap-toolkit`
+  added: 59 tools = 24,032 tools-JSON chars = 6,539 real prompt tokens.)
 - `giap-schedule` alone is 12 of 57 tools.
 - **ShimControls is one global slot per adapter** (`provider_shim.rs:66`) —
   fine while every session gets the same set; a data race the moment per-turn
@@ -223,18 +226,63 @@ then consolidation hardening, then multimodality.
   deterministic trimmer owns tool-result pruning on-device.
 - C4 DONE `hybrid_compaction_enabled` now defaults to true.
 
-### Phase D — Tool relevance (KV-aware)
+### Phase D — Tool relevance (KV-aware) — LANDED (D3 deferred)
 
-- D1 Key ShimControls per session (prerequisite; the global slot becomes a
-  race the moment tool sets differ).
-- D2 Per-SESSION tool selection: a stable core set + semantically relevant
-  extensions chosen at session start (first message + memories), sticky for
-  the session so the KV prefix stays reusable; a discovery escape hatch lets
-  the model pull in more (accepting a one-time prefix rebuild). Never a
-  keyword classifier deciding IF tools are used — the model still calls tools
-  natively (working agreement).
-- D3 Compress `giap-schedule` (12 tools → dispatch-style with an action enum)
-  to shrink the baseline surface.
+- D1 DONE Per-turn shim control state is keyed by GOOSE session id
+  (`SessionControls` inside `ShimControls`, bounded LRU). The shim resolves the
+  key from `goose::session_context::current_session_id()` — the `tokio::task_local`
+  goose already wraps every provider call in (`reply_parts.rs`, the same one that
+  stamps its `agent-session-id` header), so no fork change. A shim INSTANCE per
+  session was rejected: `Agent` holds ONE `provider: Mutex<Option<Arc<dyn Provider>>>`,
+  so per-session instances relocate the race into goose's provider slot instead of
+  removing it. `system_prefix` and `extension_appendix` stay GLOBAL by design —
+  the prefix IS the KV prefix and `override_system_prompt`/`last_prefix_hash` are
+  agent-wide, so anything session-specific rides the user message's
+  `<system-context>` instead.
+- D2 DONE `tool_selection_mode` = `"all"` (default) | `"relevant"`. In
+  `"relevant"`, a session's groups are chosen ONCE from its first message plus
+  the injected memories: cosine (fastembed MiniLM, the Phase A embedder) against
+  one natural-language description per EXTENSION (`pond-core`
+  `mcp/domain/tool_group.rs`), core groups always in, everything at or above 0.28
+  in, plus the top non-core scorer rescued below threshold. Sticky, cached
+  in-process and persisted (`session_tool_groups`, migration 0033), so the tools
+  JSON — and the KV prefix — does not churn between turns. Every failure path
+  widens to ALL groups (no embedder, embed error, empty registry, unrecognised
+  mode string). Narrowing is enforced at the SHIM, not by loading/unloading
+  extensions: goose keeps offering all 59 tools and the veto drops the dormant
+  ones, so a widen lands on the next provider call of the same reply loop.
+  Core set: `giap-draft` (safety, unconditionally registered), `giap-memory`
+  (cross-cutting), `giap-system` (holds `get_current_time`), `giap-toolkit`.
+  Escape hatch: `giap-toolkit`'s `list_tool_groups` + `enable_tool_group`, plus a
+  `<tool-groups>` listing of dormant groups in `<system-context>` so the model
+  usually skips the discovery round trip. This is NOT a keyword classifier and
+  never decides IF tools are used — it decides which schemas are in the prompt,
+  for cost, and the model can reverse it itself.
+  Measured (Mac, Gemma E2B Q4_K_M, same question, fresh sessions):
+  59 tools / 24,032 tools-JSON chars / **6,539 prompt tokens** / 11.4s TTFT →
+  17 tools / 6,671 chars / **2,386 prompt tokens** / 4.0s TTFT. A 64% prompt-token
+  cut. Verified live: the weather tool still fires identically in `"relevant"`
+  mode, and `enable_tool_group("giap-schedule")` followed by
+  `giap-schedule__list_schedules` succeeds inside a SINGLE turn (payload observed
+  growing 17 → 29 tools mid-turn).
+- D3 DEFERRED, deliberately. Compressing `giap-schedule` (12 tools) into one
+  action-enum dispatcher is a semantic change to the tool surface, and explicit
+  single-purpose tools are more reliable than one overloaded enum on the 2-4B
+  models GIAP actually runs on-device — a small model picks the right tool from a
+  list far more consistently than it fills a discriminated-union argument. D2
+  already removes `giap-schedule` from the prompt entirely for sessions that do
+  not need it, which captures most of D3's saving without the reliability risk.
+  Revisit only with a measured tool-call accuracy comparison on E2B/E4B.
+- Known cost, accepted: with per-session tool sets, two sessions alternating on
+  one model diverge in the KV prefix at the tools block rather than at the
+  history, so alternating chats re-prefill more. Single-active-session use (the
+  on-device norm) is unaffected, and each session's own turn-to-turn reuse is
+  preserved, which is what the stickiness protects.
+- Not done: the prompt template's textual `available_tools` listing (rendered
+  only for HTTP providers — `native_tools_json` suppresses it for local/gguf) is
+  still the full list. It lives inside the static prefix, so narrowing it
+  per-session would thrash `last_prefix_hash`; it costs nothing on the on-device
+  path this phase targets.
 
 ### Phase E — Consolidation hardening (bonus)
 

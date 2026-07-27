@@ -14,6 +14,8 @@ pub struct InMemorySessionStorage {
     rolling_summaries: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// GIAP session id -> agent-engine session id.
     engine_sessions: Arc<RwLock<HashMap<String, String>>>,
+    /// GIAP session id -> selected tool groups (Phase D2).
+    tool_groups: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl InMemorySessionStorage {
@@ -23,6 +25,7 @@ impl InMemorySessionStorage {
             messages: Arc::new(RwLock::new(HashMap::new())),
             rolling_summaries: Arc::new(RwLock::new(HashMap::new())),
             engine_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tool_groups: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -213,6 +216,27 @@ impl SessionStorage for InMemorySessionStorage {
             .insert(session_id.to_string(), engine_session_id.to_string());
         Ok(())
     }
+
+    async fn get_session_tool_groups(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<String>>, SessionStorageError> {
+        Ok(self.tool_groups.read().await.get(session_id).cloned())
+    }
+
+    async fn set_session_tool_groups(
+        &self,
+        session_id: &str,
+        groups: &[String],
+    ) -> Result<(), SessionStorageError> {
+        // Replaces the list wholesale and skips the session-existence guard,
+        // matching the SQLite impl and the port contract.
+        self.tool_groups
+            .write()
+            .await
+            .insert(session_id.to_string(), groups.to_vec());
+        Ok(())
+    }
 }
 
 impl InMemorySessionStorage {
@@ -258,6 +282,38 @@ mod tests {
         let storage = InMemorySessionStorage::new();
         let result = storage.get_session("nonexistent").await;
         assert!(result.is_err());
+    }
+
+    /// D2: tool groups round-trip, replace wholesale, and — matching the port
+    /// contract and the SQLite impl — do NOT require a `sessions` row.
+    #[tokio::test]
+    async fn tool_groups_round_trip_without_a_session_row() {
+        let storage = InMemorySessionStorage::new();
+        assert_eq!(storage.get_session_tool_groups("s1").await.unwrap(), None);
+
+        let first = vec!["giap-draft".to_string(), "giap-weather".to_string()];
+        storage.set_session_tool_groups("s1", &first).await.unwrap();
+        assert_eq!(
+            storage.get_session_tool_groups("s1").await.unwrap(),
+            Some(first)
+        );
+
+        // A widen (escape hatch) replaces the list rather than appending twice.
+        let widened = vec![
+            "giap-draft".to_string(),
+            "giap-schedule".to_string(),
+            "giap-weather".to_string(),
+        ];
+        storage
+            .set_session_tool_groups("s1", &widened)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_session_tool_groups("s1").await.unwrap(),
+            Some(widened)
+        );
+        // Sessions do not leak into each other.
+        assert_eq!(storage.get_session_tool_groups("s2").await.unwrap(), None);
     }
 
     #[tokio::test]

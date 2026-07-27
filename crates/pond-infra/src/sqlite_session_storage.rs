@@ -227,6 +227,46 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn get_session_tool_groups(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<String>>, SessionStorageError> {
+        let row = sqlx::query("SELECT groups FROM session_tool_groups WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row.map(|r| {
+            let raw: String = r.get("groups");
+            raw.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        }))
+    }
+
+    async fn set_session_tool_groups(
+        &self,
+        session_id: &str,
+        groups: &[String],
+    ) -> Result<(), SessionStorageError> {
+        // No `sessions` existence guard on purpose — see the port doc-comment.
+        sqlx::query(
+            "INSERT INTO session_tool_groups (session_id, groups, updated_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               groups = excluded.groups, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(groups.join("\n"))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
     async fn add_message(
         &self,
         session_id: String,

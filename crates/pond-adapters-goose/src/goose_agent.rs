@@ -202,6 +202,18 @@ pub struct GooseAdapter {
     /// Whether the Goose default extensions have been stripped for this session.
     /// Only needs to happen once, not every turn.
     defaults_stripped: Mutex<HashSet<String>>,
+    /// Phase D2 tool selection: GIAP session id -> chosen extension groups.
+    ///
+    /// Resolved ONCE per session (from its opening message + injected memories)
+    /// and then held stable, so the tools JSON — and therefore the local engine's
+    /// KV prompt prefix — does not churn between turns. Backed by
+    /// `session_tool_groups` in `pond_system.db` so a restart mid-conversation
+    /// does not silently drop a group the model enabled for itself.
+    session_tool_groups: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// Embeddings of the scorable group descriptions, computed on first use.
+    /// The descriptions are `&'static str` constants, so one pass is enough for
+    /// the process lifetime.
+    group_embeddings: tokio::sync::OnceCell<Option<Vec<(String, Vec<f32>)>>>,
 }
 
 impl GooseAdapter {
@@ -314,6 +326,8 @@ impl GooseAdapter {
             last_prompt_tokens_arc: std::sync::OnceLock::new(),
             cached_tools: tokio::sync::RwLock::new(None),
             defaults_stripped: Mutex::new(HashSet::new()),
+            session_tool_groups: tokio::sync::RwLock::new(HashMap::new()),
+            group_embeddings: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -1291,6 +1305,150 @@ impl GooseAdapter {
         }
     }
 
+    // ── Phase D2: per-session tool selection ────────────────────────────────
+
+    /// Embeddings of the scorable (non-core, registered) group descriptions.
+    ///
+    /// Computed once per process. `None` means the work could not be done at all
+    /// (no embedder, or every embed failed) — which callers must treat as "do not
+    /// narrow", never as "no groups matched".
+    async fn group_description_embeddings(&self) -> Option<&Vec<(String, Vec<f32>)>> {
+        self.group_embeddings
+            .get_or_init(|| async {
+                let provider = self.embedding_provider.as_ref()?;
+                let available: Vec<String> = registered_extensions().to_vec();
+                let scorable =
+                    pond_core::mcp::services::tool_selection::scorable_groups(&available);
+                let mut out = Vec::with_capacity(scorable.len());
+                for (extension, description) in scorable {
+                    match provider.embed(description).await {
+                        Ok(v) => out.push((extension.to_string(), v)),
+                        // One bad description should not disable the feature, but
+                        // it does mean that group can never be scored — so it is
+                        // simply absent from the scores, and `select_groups`'
+                        // "unavailable groups are never selected" rule keeps it
+                        // dormant until the escape hatch pulls it in.
+                        Err(e) => {
+                            tracing::warn!("tool selection: embedding '{extension}' failed: {e}")
+                        }
+                    }
+                }
+                (!out.is_empty()).then_some(out)
+            })
+            .await
+            .as_ref()
+    }
+
+    /// The tool groups for this session, resolving (and persisting) them on first
+    /// use.
+    ///
+    /// Resolution order: in-process cache, then the persisted row, then scoring.
+    /// Sticky by design — re-scoring per turn would rewrite the tools JSON every
+    /// turn and destroy the KV prefix reuse this feature exists to protect.
+    async fn resolve_session_tool_groups(
+        &self,
+        giap_session_id: &str,
+        first_message: &str,
+        memories: &str,
+    ) -> Vec<String> {
+        use pond_core::mcp::services::tool_selection as sel;
+
+        if let Some(cached) = self
+            .session_tool_groups
+            .read()
+            .await
+            .get(giap_session_id)
+            .cloned()
+        {
+            return cached;
+        }
+
+        if let Some(storage) = &self.giap_session_storage {
+            if let Ok(Some(groups)) = storage.get_session_tool_groups(giap_session_id).await {
+                if !groups.is_empty() {
+                    self.session_tool_groups
+                        .write()
+                        .await
+                        .insert(giap_session_id.to_string(), groups.clone());
+                    tracing::debug!(
+                        session_id = %giap_session_id,
+                        groups = ?groups,
+                        "tool selection: restored persisted groups"
+                    );
+                    return groups;
+                }
+            }
+        }
+
+        let available: Vec<String> = registered_extensions().to_vec();
+        let signal = sel::selection_signal(first_message, memories);
+
+        // Score, or fall back to every group. Both the "no group embeddings" and
+        // the "embedding this signal failed" paths widen — the asymmetry is
+        // deliberate (a missing tool is a wrong answer, a surplus one is tokens).
+        let scores: Option<Vec<sel::GroupScore>> = match (
+            self.group_description_embeddings().await,
+            self.embedding_provider.as_ref(),
+        ) {
+            (Some(group_vectors), Some(provider)) => match provider.embed(&signal).await {
+                Ok(query) => Some(
+                    group_vectors
+                        .iter()
+                        .map(|(extension, v)| sel::GroupScore {
+                            extension: extension.clone(),
+                            score: cosine_similarity(&query, v),
+                        })
+                        .collect(),
+                ),
+                Err(e) => {
+                    tracing::warn!("tool selection: embedding the opening message failed: {e}");
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        let selection = sel::select_groups(
+            &available,
+            scores.as_deref(),
+            sel::DEFAULT_RELEVANCE_THRESHOLD,
+        );
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Some(scores) = scores.as_deref() {
+                let mut ranked: Vec<&sel::GroupScore> = scores.iter().collect();
+                ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+                let top: Vec<String> = ranked
+                    .iter()
+                    .take(5)
+                    .map(|s| format!("{}={:.3}", s.extension, s.score))
+                    .collect();
+                tracing::debug!(
+                    session_id = %giap_session_id,
+                    threshold = sel::DEFAULT_RELEVANCE_THRESHOLD,
+                    top_scores = %top.join(" "),
+                    "tool selection: group scores"
+                );
+            }
+        }
+
+        self.session_tool_groups
+            .write()
+            .await
+            .insert(giap_session_id.to_string(), selection.groups.clone());
+        if let Some(storage) = &self.giap_session_storage {
+            if let Err(e) = storage
+                .set_session_tool_groups(giap_session_id, &selection.groups)
+                .await
+            {
+                // Non-fatal: the in-process cache still keeps the session stable
+                // for this run; only cross-restart stickiness is lost.
+                tracing::warn!("tool selection: persisting groups failed: {e}");
+            }
+        }
+        selection.groups
+    }
+
     /// Attach the embedding provider used by per-turn memory retrieval.
     ///
     /// Without it the injection path keeps working, just on the keyword LIKE
@@ -1715,6 +1873,7 @@ impl GooseAdapter {
         }
 
         self.shim_controls
+            .session(&goose_sid)
             .set_turn_appendix(if shim_appendix.is_empty() {
                 None
             } else {
@@ -1956,11 +2115,76 @@ impl GooseAdapter {
             }
         };
 
-        tracing::info!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
+        // ── 6c. Phase D2: per-session tool relevance ─────────────────────────
+        // `allowed_tools` above is the full registered union. Goose keeps sending
+        // all of it (`prepare_tools_and_prompt` -> `list_tools(None)`), so the
+        // narrowing happens HERE and is enforced by the shim on every provider
+        // call — no extension add/remove churn, and a mid-turn widen through the
+        // escape hatch lands on the very next call of the same reply loop.
+        //
+        // This does NOT decide whether the model uses tools (working agreement:
+        // trust the model, no keyword pre-classification). It decides which
+        // extension SCHEMAS are physically in the prompt, for cost — 59 tools at
+        // ~100 tokens each through the Gemma template is ~5.9K of an 8K-class
+        // on-device budget. The model still chooses natively, and can pull in any
+        // dormant group itself via giap-toolkit.
+        let mut dormant_groups_note = String::new();
+        let allowed_tools = if settings.tool_selection_is_relevant() {
+            let groups = self
+                .resolve_session_tool_groups(
+                    &session_id,
+                    &request.message,
+                    &memory_block_for_user_msg,
+                )
+                .await;
+            let selected: HashSet<String> =
+                pond_core::mcp::services::tool_selection::filter_tools_by_groups(
+                    allowed_tools.iter(),
+                    &groups,
+                )
+                .into_iter()
+                .collect();
 
-        // Publish the allow-set to the provider shim — anything Goose adds on
-        // its own (platform tools, final_output) is vetoed at the last mile.
-        self.shim_controls.set_allowed_tools(allowed_tools.clone());
+            dormant_groups_note = pond_core::mcp::services::tool_selection::dormant_groups_note(
+                registered_extensions(),
+                &groups,
+            );
+
+            tracing::info!(
+                target: "giap::trace",
+                kind = "tool_selection",
+                session_id = %session_id,
+                mode = "relevant",
+                groups = ?groups,
+                groups_total = registered_extensions().len(),
+                tools = selected.len(),
+                tools_total = allowed_tools.len(),
+            );
+            selected
+        } else {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "tool_selection",
+                session_id = %session_id,
+                mode = "all",
+                groups_total = registered_extensions().len(),
+                tools = allowed_tools.len(),
+                tools_total = allowed_tools.len(),
+            );
+            allowed_tools
+        };
+
+        tracing::debug!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
+
+        // Publish the allow-set to this SESSION's shim controls — anything Goose
+        // adds on its own (platform tools, final_output) is vetoed at the last
+        // mile, and anything Phase D left dormant never reaches the model.
+        //
+        // The handle is retained: the tool-call guard below reads it LIVE so a
+        // group the model enables mid-turn is admitted immediately, and the
+        // escape hatch widens the same entry.
+        let session_controls = self.shim_controls.session(&goose_sid);
+        session_controls.set_allowed_tools(allowed_tools.clone());
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;
@@ -2003,6 +2227,15 @@ impl GooseAdapter {
                 msg.push_str(&memory_block_for_user_msg);
                 msg.push_str("\n</memories>\n");
             }
+            // D2: what the model could load but currently cannot see. Rides the
+            // user message, never the system prompt — it is session-specific and
+            // the prefix must stay byte-identical across sessions for KV reuse.
+            // Empty (zero tokens) whenever nothing is dormant, so the default
+            // "all" mode is unaffected.
+            if !dormant_groups_note.is_empty() {
+                msg.push_str(&dormant_groups_note);
+                msg.push('\n');
+            }
             msg.push_str(&turn_budget_block);
             msg.push('\n');
             msg.push_str("</system-context>\n");
@@ -2024,6 +2257,8 @@ impl GooseAdapter {
 
         let agent_clone = self.agent.clone();
         let last_prompt_tokens_map = self.last_prompt_tokens_handle();
+        // Live handle for the tool-call guard inside the 'static stream closure.
+        let guard_controls = session_controls.clone();
 
         // ── Deterministic in-turn trim (hybrid compaction, GIAP-owned) ──
         if settings.hybrid_compaction_enabled {
@@ -2082,12 +2317,16 @@ impl GooseAdapter {
                                         if let Ok(tool_call) = &tr.tool_call {
                                             let tool_name = tool_call.name.to_string();
                                             // Guard: suppress tool calls not in the validated schema.
-                                            // An empty allowed_tools set means no extensions loaded —
+                                            // An empty allowed set means no extensions loaded —
                                             // every call is a hallucination and must be blocked.
-                                            if !allowed_tools.contains(&tool_name) {
+                                            //
+                                            // Read LIVE from the session's shim controls rather than
+                                            // a snapshot: `enable_tool_group` widens the set mid-turn
+                                            // and the very next call must be admitted, or the escape
+                                            // hatch would enable a group and then block its use.
+                                            if !guard_controls.is_tool_allowed(&tool_name) {
                                                 tracing::warn!(
                                                     tool = %tool_name,
-                                                    allowed = ?allowed_tools,
                                                     "Blocked unauthorized tool call (not in schema or no tools loaded)",
                                                 );
                                                 continue;
@@ -2536,6 +2775,134 @@ fn canonical_model_stem(model_name: &str, gguf_dir: &std::path::Path) -> String 
         base.to_string()
     } else {
         stem.to_string()
+    }
+}
+
+/// Phase D2 escape hatch. Driven by the `giap-toolkit` MCP extension, which is
+/// in the always-on core set, so the model can always reach this even in a
+/// heavily narrowed session.
+#[async_trait]
+impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl for GooseAdapter {
+    async fn group_status(
+        &self,
+        session_id: &str,
+    ) -> Vec<pond_core::mcp::ports::tools::tool_selection_control::ToolGroupStatus> {
+        use pond_core::mcp::domain::tool_group::{find_group, group_of_tool};
+        use pond_core::mcp::ports::tools::tool_selection_control::ToolGroupStatus;
+
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        // Not narrowing? Then every registered group is loaded, and saying so
+        // truthfully is better than implying there is something to enable.
+        let loaded: Option<Vec<String>> = if settings.tool_selection_is_relevant() {
+            self.session_tool_groups
+                .read()
+                .await
+                .get(session_id)
+                .cloned()
+        } else {
+            None
+        };
+
+        // Tool counts come from the live cache when warm — the honest number for
+        // "what will this cost me" — and are omitted rather than guessed if cold.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        if let Some(cache) = self.cached_tools.read().await.as_ref() {
+            for tool in cache {
+                if let Some(ext) = group_of_tool(tool) {
+                    *counts.entry(ext.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        registered_extensions()
+            .iter()
+            .filter_map(|extension| {
+                let group = find_group(extension)?;
+                Some(ToolGroupStatus {
+                    extension: extension.clone(),
+                    description: group.description.to_string(),
+                    loaded: match &loaded {
+                        Some(groups) => groups.iter().any(|g| g == extension),
+                        None => true,
+                    },
+                    core: group.core,
+                    tool_count: counts.get(extension).copied().unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    async fn enable_group(
+        &self,
+        session_id: &str,
+        group: &str,
+    ) -> Result<Vec<String>, pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionError>
+    {
+        use pond_core::mcp::domain::tool_group::is_catalog_extension;
+        use pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionError;
+
+        let group = group.trim();
+        if !is_catalog_extension(group) {
+            return Err(ToolSelectionError::UnknownGroup(group.to_string()));
+        }
+        if !registered_extensions().iter().any(|e| e == group) {
+            return Err(ToolSelectionError::GroupNotRegistered(group.to_string()));
+        }
+
+        let groups = {
+            let mut map = self.session_tool_groups.write().await;
+            // No entry means selection never ran for this session (mode is
+            // "all", or the tool was reached from a non-chat path). Nothing is
+            // being narrowed, so there is nothing to widen.
+            let Some(entry) = map.get_mut(session_id) else {
+                return Err(ToolSelectionError::NotActive);
+            };
+            if !entry.iter().any(|g| g == group) {
+                entry.push(group.to_string());
+                entry.sort();
+            }
+            entry.clone()
+        };
+
+        if let Some(storage) = &self.giap_session_storage {
+            if let Err(e) = storage.set_session_tool_groups(session_id, &groups).await {
+                // Non-fatal: the widen holds for this run either way.
+                tracing::warn!("tool selection: persisting the widened groups failed: {e}");
+            }
+        }
+
+        // Admit the group's tools on the NEXT provider call — including the next
+        // call of the turn that just invoked this, which is what makes
+        // enable-then-use work in one turn. Both the shim's veto and the
+        // stream's tool-call guard read this entry live.
+        let goose_sid = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned();
+        if let Some(goose_sid) = goose_sid {
+            let newly_allowed: Vec<String> = match self.cached_tools.read().await.as_ref() {
+                Some(cache) => cache
+                    .iter()
+                    .filter(|t| pond_core::mcp::domain::tool_group::group_of_tool(t) == Some(group))
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            if newly_allowed.is_empty() {
+                tracing::warn!(
+                    group,
+                    "tool selection: enabled a group but the tool cache is cold — \
+                     its tools land on the next turn"
+                );
+            }
+            self.shim_controls
+                .session(&goose_sid)
+                .extend_allowed_tools(newly_allowed);
+        }
+
+        Ok(groups)
     }
 }
 
