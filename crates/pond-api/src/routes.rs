@@ -1394,6 +1394,13 @@ fn chat_stream_inner(
                                 AgentStreamEvent::ReviewRevision { content, score, rounds } => {
                                     Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
                                 }
+                                // Its own event type so the UI can offer a
+                                // one-click continue instead of leaving the
+                                // engine's "would you like me to continue?" as
+                                // an unanswerable sentence.
+                                AgentStreamEvent::TurnLimitReached { max_turns } => {
+                                    Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
+                                }
                                 AgentStreamEvent::Done { usage, stats, .. } => {
                                     if let Some(u) = usage {
                                         usage_prompt_tokens = u.prompt_tokens;
@@ -6895,6 +6902,10 @@ async fn agent_chat_stream(
                         }
                         AgentStreamEvent::ReviewRevision { content, score, rounds } => {
                             Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
+                        }
+                        // Parity with /chat/stream — see the note there.
+                        AgentStreamEvent::TurnLimitReached { max_turns } => {
+                            Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
                         }
                         AgentStreamEvent::Done { .. } => {
                             Some(json!({"done": true, "session_id": session_id.clone()}).to_string())

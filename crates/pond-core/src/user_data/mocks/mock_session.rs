@@ -12,6 +12,8 @@ pub struct InMemorySessionStorage {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     messages: Arc<RwLock<HashMap<String, Vec<SessionMessage>>>>,
     rolling_summaries: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// GIAP session id -> agent-engine session id.
+    engine_sessions: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl InMemorySessionStorage {
@@ -20,6 +22,7 @@ impl InMemorySessionStorage {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             messages: Arc::new(RwLock::new(HashMap::new())),
             rolling_summaries: Arc::new(RwLock::new(HashMap::new())),
+            engine_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -187,6 +190,27 @@ impl SessionStorage for InMemorySessionStorage {
             session_id.to_string(),
             (summary.to_string(), through_message_id.to_string()),
         );
+        Ok(())
+    }
+
+    async fn get_engine_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(self.engine_sessions.read().await.get(session_id).cloned())
+    }
+
+    async fn set_engine_session_id(
+        &self,
+        session_id: &str,
+        engine_session_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        // Upsert, like the SQLite impl — and deliberately WITHOUT a session
+        // existence guard, matching the port contract.
+        self.engine_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), engine_session_id.to_string());
         Ok(())
     }
 }

@@ -161,7 +161,7 @@ Four settings fields control GooseAdapter's agentic loop behaviour:
 | Field | Default | Description |
 |---|---|---|
 | `agent_goose_mode` | `"auto"` | GooseMode: `"auto"`, `"chat"`, or `"smart"` |
-| `agent_max_turns` | `20` | Max loop turns per request |
+| `agent_max_turns` | `50` | Max loop turns per request; `0` = uncapped |
 | `agent_memory_inject` | `false` | Whether to inject recent memories into the system prompt |
 | `agent_memory_limit` | `5` | How many memory fragments to inject (most recent) |
 

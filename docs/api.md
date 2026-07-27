@@ -323,7 +323,7 @@ Returns the full settings object.
   "custom_system_prompt": null,
   "prompt_addendum": "",
   "agent_goose_mode": "auto",
-  "agent_max_turns": 20,
+  "agent_max_turns": 50,
   "agent_memory_inject": false,
   "agent_memory_limit": 5,
   "voice_wake_word": "goose",

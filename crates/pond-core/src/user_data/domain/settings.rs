@@ -5,6 +5,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The turn budget handed to the agent engine when `agent_max_turns == 0`
+/// ("uncapped").
+///
+/// The engine enforces its budget as a bare `turns_taken > max_turns` compare on
+/// a `u32` and also renders the number into its per-turn context block, so
+/// "uncapped" has to be a number rather than an absence. `u32::MAX` is the
+/// obvious choice and the wrong one: any arithmetic on it (a percentage, a
+/// remaining-turns subtraction, a `+ 1`) overflows or formats absurdly.
+/// 100_000 provider calls is unreachable for a real request — the idle timeout
+/// or the context limit lands first — while staying safe to do maths on.
+pub const UNCAPPED_MAX_TURNS: u32 = 100_000;
+
 /// All configurable settings for GIAP.
 ///
 /// Serializes to/from JSON via serde. Each field has a default via
@@ -315,9 +327,17 @@ pub struct Settings {
     pub show_turn_stats: bool,
 
     /// GIAP-owned hybrid compaction (deterministic in-turn trim + idle rolling
-    /// summary). When true, Goose's own auto-compaction is disabled for the
-    /// live path. Default false until burn-in on-device.
-    #[serde(default)]
+    /// summary). When true, Goose's own auto-compaction and its background
+    /// tool-pair summarization are disabled for the live path — GIAP owns
+    /// history pruning end to end.
+    ///
+    /// Default TRUE. Off, the only defences against a full context on-device are
+    /// Goose's reactive LLM auto-compaction (a mid-conversation stall the user
+    /// waits through) and the 200K file-spill threshold. On, pruning is
+    /// deterministic and costs no inference: whole oldest turns are dropped,
+    /// oversized tool results are truncated head+tail, and the idle-refreshed
+    /// rolling summary is spliced in.
+    #[serde(default = "Settings::default_hybrid_compaction_enabled")]
     pub hybrid_compaction_enabled: bool,
 
     /// Idle seconds before the rolling-summary refresh may run (never at
@@ -336,7 +356,10 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_goose_mode")]
     pub agent_goose_mode: String,
 
-    /// Maximum agentic loop turns per request (safety cap)
+    /// Maximum agentic loop turns per request (a turn = one provider call).
+    /// `0` means UNCAPPED: the model reasons and calls tools for as long as the
+    /// task needs, bounded only by cancellation, the idle timeout
+    /// (`agent_timeout_secs`), and context-overflow abort.
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
@@ -647,7 +670,7 @@ impl Default for Settings {
             review_pass_threshold: Self::default_review_pass_threshold(),
             context_window_override: 0,
             show_turn_stats: false,
-            hybrid_compaction_enabled: false,
+            hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
@@ -854,14 +877,28 @@ impl Settings {
         120
     }
 
+    /// True since the C1-C3 work landed: the engine session is now hydrated
+    /// after a restart, the env knobs follow settings changes, and tool-result
+    /// truncation actually reaches the model — so the deterministic trimmer is
+    /// the better default than Goose's reactive LLM compaction, which stalls a
+    /// turn mid-conversation on-device.
+    fn default_hybrid_compaction_enabled() -> bool {
+        true
+    }
+
     fn default_agent_backend() -> String {
         "goose".to_string()
     }
     fn default_agent_goose_mode() -> String {
         "auto".to_string()
     }
+    /// 50 rather than 20: a multi-step research or home-automation request
+    /// routinely needs more than 20 provider calls, and hitting the cap
+    /// mid-task strands the user. The rails that actually protect the device
+    /// are cancellation, `agent_timeout_secs`, and context-overflow abort — not
+    /// a low turn count. `0` opts out of the cap entirely.
     fn default_agent_max_turns() -> u32 {
-        20
+        50
     }
     // 8 turns ≈ 2-3 chained tool rounds + the spoken summary. Chosen against
     // the #105 harness (command_chaining_live_test.rs): chained two-action
@@ -874,14 +911,34 @@ impl Settings {
     /// The agent-loop turn cap for a request, honouring the voice-specific
     /// tuning (#105): voice requests use the tighter `voice_max_turns` so a
     /// chained command still completes but a runaway loop can't keep the
-    /// speaker silent for the full text-chat budget. `voice_max_turns` never
-    /// raises the cap above `agent_max_turns`, and 0 disables the voice cap.
+    /// speaker silent for the full text-chat budget. `voice_max_turns == 0`
+    /// disables the voice-specific cap; `agent_max_turns == 0` means uncapped
+    /// text reasoning (rendered as [`UNCAPPED_MAX_TURNS`]).
+    ///
+    /// An uncapped text budget does NOT lift a voice cap: voice latency is a
+    /// separate concern, so a non-zero `voice_max_turns` still binds.
     pub fn effective_max_turns(&self, voice: bool) -> u32 {
         if voice && self.voice_max_turns > 0 {
-            self.voice_max_turns.min(self.agent_max_turns)
+            if self.agent_max_turns == 0 {
+                self.voice_max_turns
+            } else {
+                self.voice_max_turns.min(self.agent_max_turns)
+            }
+        } else if self.agent_max_turns == 0 {
+            UNCAPPED_MAX_TURNS
         } else {
             self.agent_max_turns
         }
+    }
+
+    /// Whether this request's reasoning length is effectively unbounded — i.e.
+    /// [`effective_max_turns`] returned the sentinel rather than a real budget.
+    /// Callers use it to tell the model "keep going until the task is done"
+    /// instead of quoting a meaningless step count.
+    ///
+    /// [`effective_max_turns`]: Settings::effective_max_turns
+    pub fn turns_are_uncapped(&self, voice: bool) -> bool {
+        self.effective_max_turns(voice) == UNCAPPED_MAX_TURNS
     }
     fn default_agent_timeout_secs() -> u64 {
         300
@@ -1160,10 +1217,45 @@ mod tests {
         let s = Settings::default();
         assert_eq!(
             s.effective_max_turns(false),
-            20,
+            50,
             "text uses agent_max_turns"
         );
         assert_eq!(s.effective_max_turns(true), 8, "voice uses voice_max_turns");
+    }
+
+    /// B1: `agent_max_turns = 0` means uncapped reasoning — the engine gets the
+    /// sentinel, not 0 (which would stop the loop before its first turn).
+    #[test]
+    fn zero_agent_max_turns_means_uncapped() {
+        let mut s = Settings::default();
+        s.agent_max_turns = 0;
+        assert_eq!(s.effective_max_turns(false), UNCAPPED_MAX_TURNS);
+        assert!(s.turns_are_uncapped(false));
+        // Sanity: the sentinel is safe to do arithmetic on.
+        assert!(UNCAPPED_MAX_TURNS.checked_mul(2).is_some());
+    }
+
+    /// B1: an uncapped TEXT budget must not lift the voice cap — voice latency
+    /// is a separate concern and `voice_max_turns` keeps its own meaning.
+    #[test]
+    fn uncapped_text_budget_still_honours_the_voice_cap() {
+        let mut s = Settings::default();
+        s.agent_max_turns = 0;
+        s.voice_max_turns = 8;
+        assert_eq!(s.effective_max_turns(true), 8);
+        assert!(!s.turns_are_uncapped(true));
+        // Both zero: voice inherits the uncapped text budget.
+        s.voice_max_turns = 0;
+        assert_eq!(s.effective_max_turns(true), UNCAPPED_MAX_TURNS);
+        assert!(s.turns_are_uncapped(true));
+    }
+
+    /// A real cap is never reported as uncapped.
+    #[test]
+    fn a_real_cap_is_not_uncapped() {
+        let s = Settings::default();
+        assert!(!s.turns_are_uncapped(false));
+        assert!(!s.turns_are_uncapped(true));
     }
 
     /// #105: the voice cap can only tighten the budget, never extend it.
