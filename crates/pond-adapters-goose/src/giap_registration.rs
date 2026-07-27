@@ -64,6 +64,20 @@ pub fn register_giap_extensions(
     register_builtin_extension("giap-draft", pond_mcp_server::spawn_draft_server);
     registered.push("giap-draft".into());
 
+    // ── Always-on: toolkit server (Phase D2 escape hatch) ───────────────────
+    // Not toggleable, for the same reason giap-draft is not: it is what makes
+    // tool-relevance narrowing safe. With `tool_selection_mode = "relevant"` the
+    // model sees a reduced set of extension schemas; these two tools are how it
+    // discovers and loads a group nobody predicted. Its `ToolSelectionControl`
+    // handle is installed separately (`init_toolkit_deps` in pond-server) because
+    // the implementor is the agent adapter, which is built after this call — and
+    // without the handle both tools truthfully report "everything is loaded".
+    register_builtin_extension(
+        pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION,
+        pond_mcp_server::spawn_toolkit_server,
+    );
+    registered.push(pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION.into());
+
     // ── Toggleable extensions ───────────────────────────────────────────────
 
     if settings.ext_memory_enabled {

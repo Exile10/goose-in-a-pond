@@ -152,4 +152,36 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
     }
+
+    /// The tool GROUPS (MCP extension names) selected for this session, if any.
+    ///
+    /// Phase D2 chooses a session's tool surface once, from its opening message,
+    /// and keeps it stable so the local engine's KV prompt prefix stays reusable
+    /// across turns. Persisting it matters for one specific reason: the model can
+    /// widen its own surface mid-session via `enable_tool_group`, and a
+    /// process-local record would silently drop that capability on the next
+    /// restart, mid-conversation, with no way for the user to tell why.
+    ///
+    /// `None` means "not chosen yet" — the caller selects and stores.
+    async fn get_session_tool_groups(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<Vec<String>>, SessionStorageError> {
+        Ok(None) // default no-op for backward compat
+    }
+
+    /// Record this session's tool groups (idempotent upsert, replaces the list).
+    ///
+    /// Deliberately not keyed to a `sessions` row, for the same reason as
+    /// [`set_engine_session_id`]: selection also happens on paths that run before
+    /// a GIAP `sessions` row exists.
+    ///
+    /// [`set_engine_session_id`]: SessionStorage::set_engine_session_id
+    async fn set_session_tool_groups(
+        &self,
+        _session_id: &str,
+        _groups: &[String],
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
 }

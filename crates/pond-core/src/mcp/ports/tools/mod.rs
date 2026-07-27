@@ -17,6 +17,10 @@
 //! - [`tool_cache`] — **memoizes.** Caches deterministic tool results so a
 //!   repeated call within a session skips the round-trip. Cache identity is the
 //!   tool name + canonicalised arguments.
+//! - [`tool_selection_control`] — **narrows.** Which extension groups have
+//!   their schemas in the prompt for a session, and the escape hatch that lets
+//!   the model pull a dormant group in. It shapes the tool SURFACE, never
+//!   whether a tool is used.
 //! - [`tool_agent`] — **the pre-LLM tool pass.** A coarse agent stage that may
 //!   run tools *before* the main chat stream begins, seeding context. It sits
 //!   ahead of the LLM rather than inside its agentic loop.
@@ -28,3 +32,4 @@ pub mod tool_cache;
 pub mod tool_caller;
 pub mod tool_dispatcher;
 pub mod tool_registry;
+pub mod tool_selection_control;

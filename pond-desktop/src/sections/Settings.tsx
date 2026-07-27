@@ -323,6 +323,7 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
             </Row>
             <Row label="Embedding provider"><select className="native-select" value={s.embedding_provider ?? "fastembed"} onChange={(e) => patch("embedding_provider", e.target.value)}><option value="fastembed">FastEmbed (local ONNX)</option><option value="none">None</option></select></Row>
             <Row label="Embedding model"><input className="native-input" disabled={(s.embedding_provider ?? "fastembed") === "none"} value={s.active_embedding_model ?? ""} onChange={(e) => patch("active_embedding_model", e.target.value)} placeholder="all-MiniLM-L6-v2" /></Row>
+            <Row label="Tool loading" hint="Relevant keeps the prompt small on-device by loading only the tool groups a conversation needs. The assistant can load more itself at any time."><select className="native-select" value={s.tool_selection_mode ?? "all"} onChange={(e) => patch("tool_selection_mode", e.target.value)}><option value="all">All tools, every turn</option><option value="relevant">Only relevant groups</option></select></Row>
           </Section>
         </>
       )}

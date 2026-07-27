@@ -112,6 +112,8 @@ export interface Settings {
   agent_memory_inject: boolean;
   agent_memory_limit?: number;
   tool_output_compaction?: boolean;
+  /** "all" (default) | "relevant" — which extension tool schemas reach the model. */
+  tool_selection_mode?: string;
 
   // Memory lifecycle
   memory_extraction_enabled?: boolean;

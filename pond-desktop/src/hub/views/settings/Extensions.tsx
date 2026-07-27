@@ -2,9 +2,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Plus, RefreshCw, Loader2, Download, Check, X, Store, AlertCircle } from "lucide-react";
 import { HubIco } from "../../primitives/HubIco";
 import { DetailShell } from "./DetailShell";
-import { Card } from "./controls";
+import { Card, Segment } from "./controls";
 import { api } from "../../../api/PondApiClient";
-import type { Extension, MarketplaceExtension, AddExtensionRequest } from "../../../api/types";
+import type { Extension, MarketplaceExtension, AddExtensionRequest, Settings } from "../../../api/types";
 
 // ─── Icon path strings ────────────────────────────────────────
 const WRENCH_PATH =
@@ -469,6 +469,66 @@ function AddServerModal({ onClose, onAdded }: AddServerModalProps) {
   );
 }
 
+
+// ─── Tool loading mode (Phase D) ──────────────────────────────
+// On-device the tool SCHEMAS are the single largest fixed cost in the prompt:
+// every tool is roughly 100 tokens through the chat template, re-sent on every
+// fresh turn. "Relevant" loads a small always-on core plus the groups a
+// conversation actually needs, chosen once when the conversation starts so the
+// prompt stays cacheable. Goose can still load any other group itself mid-chat,
+// so nothing becomes unreachable.
+const TOOL_MODE_LABELS: Record<string, string> = { all: "All tools", relevant: "Only relevant" };
+const TOOL_MODE_VALUES: Record<string, string> = { "All tools": "all", "Only relevant": "relevant" };
+
+function ToolLoadingCard({ onFlash }: { onFlash: (text: string, ok?: boolean) => void }) {
+  const [mode, setMode] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getSettings()
+      .then((s: Partial<Settings>) => { if (!cancelled) setMode(s.tool_selection_mode ?? "all"); })
+      .catch(() => { if (!cancelled) setMode("all"); });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function pick(label: string) {
+    const next = TOOL_MODE_VALUES[label] ?? "all";
+    const prev = mode;
+    setMode(next);
+    try {
+      await api.updateSettings({ tool_selection_mode: next } as Partial<Settings>);
+      onFlash(next === "relevant"
+        ? "New conversations will load only the tool groups they need."
+        : "All tools will be sent every turn.");
+    } catch (e) {
+      setMode(prev);
+      onFlash(`Could not save tool loading mode: ${String(e)}`, false);
+    }
+  }
+
+  return (
+    <Card title="Tool loading">
+      <div className="mrow">
+        <div className="mrow__info">
+          <span className="mrow__name">Which tools go to the model</span>
+          <span className="mrow__meta">
+            Sending every tool costs a large slice of the prompt on small local models.
+            &ldquo;Only relevant&rdquo; picks the groups a conversation needs when it starts;
+            Goose can load any other group itself if it needs one.
+          </span>
+        </div>
+        {mode !== null && (
+          <Segment
+            options={["All tools", "Only relevant"]}
+            value={TOOL_MODE_LABELS[mode] ?? "All tools"}
+            onChange={pick}
+          />
+        )}
+      </div>
+    </Card>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────
 interface ExtensionsDetailProps {
   go: (route: string) => void;
@@ -632,6 +692,8 @@ export function ExtensionsDetail({ go }: ExtensionsDetailProps) {
             {error}
           </div>
         )}
+
+        <ToolLoadingCard onFlash={showFlash} />
 
         <Card>
           <div className="ext2list">

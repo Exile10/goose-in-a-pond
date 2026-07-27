@@ -28,8 +28,8 @@
 //! The shim is pure pass-through when no controls are set, so auxiliary
 //! provider users (model listing, compaction) see no behaviour change.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use goose::conversation::message::Message;
@@ -44,35 +44,111 @@ use rmcp::model::Tool;
 /// GIAP's prompt was lost and must be restored.
 const GOOSE_DEFAULT_MARKER: &str = "general-purpose AI agent called goose";
 
-/// Mutable per-turn controls shared between [`GooseAdapter`] and the shim.
+/// How many Goose sessions keep live per-turn control state.
+///
+/// Goose exposes no session-end hook, so entries are evicted in insertion order
+/// once the map exceeds this. Evicting a live session's entry only costs the
+/// veto for that turn (the adapter republishes on every turn), so a generous
+/// bound is enough — this exists to stop a long-lived server accumulating an
+/// entry per session forever, not to be a tight cache.
+const MAX_TRACKED_SESSIONS: usize = 64;
+
+/// Per-turn control state for ONE Goose session.
+///
+/// Split out of [`ShimControls`] because tool selection (Phase D2) makes these
+/// values differ between sessions. While every session got an identical set the
+/// single global slot was benign; the moment sets diverge, a shared slot means
+/// session A's provider call reads session B's allow-set.
+#[derive(Default)]
+pub struct SessionControls {
+    /// Per-turn GIAP-owned appendix (prompt extras + skills), rebuilt fresh
+    /// each turn. Kept separate from the prefix so the veto can truncate
+    /// Goose's extras without losing GIAP's own.
+    turn_appendix: Mutex<Option<String>>,
+    /// Exact (prefixed) tool names allowed for this session. `None` disables
+    /// tool filtering entirely.
+    allowed_tools: Mutex<Option<HashSet<String>>>,
+}
+
+impl SessionControls {
+    pub fn set_turn_appendix(&self, appendix: Option<String>) {
+        *self.turn_appendix.lock().unwrap_or_else(|e| e.into_inner()) = appendix;
+    }
+
+    pub fn set_allowed_tools(&self, tools: HashSet<String>) {
+        *self.allowed_tools.lock().unwrap_or_else(|e| e.into_inner()) = Some(tools);
+    }
+
+    /// Widen the allow-set in place (the `enable_tool_group` escape hatch).
+    ///
+    /// Takes effect on the next provider call — including the next call of the
+    /// turn that triggered it, because Goose re-reads the provider each
+    /// iteration and the shim filters on every call. A no-op when no allow-set
+    /// is published (nothing is being filtered, so nothing needs widening).
+    pub fn extend_allowed_tools<I: IntoIterator<Item = String>>(&self, tools: I) {
+        let mut guard = self.allowed_tools.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = guard.as_mut() {
+            set.extend(tools);
+        }
+    }
+
+    pub fn allowed_tools_snapshot(&self) -> Option<HashSet<String>> {
+        self.allowed_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether a tool call may proceed. `true` when no allow-set is published,
+    /// matching the shim's pass-through semantics.
+    pub fn is_tool_allowed(&self, tool: &str) -> bool {
+        self.allowed_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|set| set.contains(tool))
+    }
+}
+
+/// Mutable controls shared between [`GooseAdapter`] and the shim.
 ///
 /// The adapter writes these while assembling a chat turn; the shim reads them
-/// inside `Provider::stream`. All `None` means "no enforcement" (pass-through).
+/// inside `Provider::stream`, resolving the session via
+/// [`goose::session_context::current_session_id`]. All `None` means "no
+/// enforcement" (pass-through).
+///
+/// ## Global vs per-session
+///
+/// `system_prefix` and `extension_appendix` are deliberately GLOBAL. The prefix
+/// IS the KV prompt prefix: it must be byte-identical across turns AND across
+/// sessions, because `override_system_prompt` is agent-wide and
+/// `last_prefix_hash` is a single slot — a per-session prefix would re-issue the
+/// override on every session switch and destroy prefix reuse. The corollary is
+/// that anything session-specific must ride the user message's
+/// `<system-context>`, which is where the dormant-tool-group listing goes.
 #[derive(Default)]
 pub struct ShimControls {
     /// GIAP's authoritative static system prefix for the current chat model —
     /// the exact string passed to `override_system_prompt`.
     system_prefix: Mutex<Option<String>>,
-    /// Per-turn GIAP-owned appendix (prompt extras + skills), rebuilt fresh
-    /// each turn. Kept separate from the prefix so the veto can truncate
-    /// Goose's extras without losing GIAP's own.
-    turn_appendix: Mutex<Option<String>>,
     /// External MCP extension listing — recomputed only when the tool cache
     /// refreshes, so it persists across turns (same lifetime as the goose
     /// extra it mirrors).
     extension_appendix: Mutex<Option<String>>,
-    /// Exact (prefixed) tool names allowed this turn. `None` disables tool
-    /// filtering entirely.
-    allowed_tools: Mutex<Option<HashSet<String>>>,
+    /// Per-turn state keyed by GOOSE session id.
+    sessions: RwLock<SessionMap>,
+}
+
+/// Session entries plus their insertion order, for bounded eviction.
+#[derive(Default)]
+struct SessionMap {
+    entries: std::collections::HashMap<String, Arc<SessionControls>>,
+    order: VecDeque<String>,
 }
 
 impl ShimControls {
     pub fn set_system_prefix(&self, prefix: String) {
         *self.system_prefix.lock().unwrap_or_else(|e| e.into_inner()) = Some(prefix);
-    }
-
-    pub fn set_turn_appendix(&self, appendix: Option<String>) {
-        *self.turn_appendix.lock().unwrap_or_else(|e| e.into_inner()) = appendix;
     }
 
     pub fn set_extension_appendix(&self, appendix: Option<String>) {
@@ -82,8 +158,57 @@ impl ShimControls {
             .unwrap_or_else(|e| e.into_inner()) = appendix;
     }
 
-    pub fn set_allowed_tools(&self, tools: HashSet<String>) {
-        *self.allowed_tools.lock().unwrap_or_else(|e| e.into_inner()) = Some(tools);
+    /// The control entry for a Goose session, created on first use.
+    ///
+    /// Returned as an `Arc` so a caller (the chat stream's tool-call guard, the
+    /// escape hatch) can hold it and observe live updates without re-locking the
+    /// map.
+    pub fn session(&self, goose_session_id: &str) -> Arc<SessionControls> {
+        if let Some(existing) = self
+            .sessions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(goose_session_id)
+        {
+            return existing.clone();
+        }
+        let mut map = self.sessions.write().unwrap_or_else(|e| e.into_inner());
+        // Re-check: another writer may have raced us between the two locks.
+        if let Some(existing) = map.entries.get(goose_session_id) {
+            return existing.clone();
+        }
+        let entry = Arc::new(SessionControls::default());
+        map.entries
+            .insert(goose_session_id.to_string(), entry.clone());
+        map.order.push_back(goose_session_id.to_string());
+        while map.order.len() > MAX_TRACKED_SESSIONS {
+            if let Some(oldest) = map.order.pop_front() {
+                map.entries.remove(&oldest);
+            }
+        }
+        entry
+    }
+
+    /// The entry for a session, WITHOUT creating one. Used by the shim: an
+    /// auxiliary provider call for a session GIAP never chatted in must stay
+    /// pass-through rather than mint an empty entry.
+    fn existing_session(&self, goose_session_id: &str) -> Option<Arc<SessionControls>> {
+        self.sessions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(goose_session_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn tracked_sessions(&self) -> usize {
+        self.sessions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
     }
 }
 
@@ -259,15 +384,24 @@ impl Provider for GiapProviderShim {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let (prefix, turn_apx, ext_apx, allowed) = {
+        // Which session is this call for? Goose wraps every provider call in
+        // `session_context::with_session_id` (reply_parts.rs) — the task-local it
+        // already uses to stamp the `agent-session-id` header on provider HTTP
+        // requests. That is the only session identity reaching `stream()`:
+        // `Provider::stream` takes no session argument, and Goose holds ONE
+        // agent-wide provider slot, so a shim INSTANCE per session would not
+        // work either (session B's `update_provider` would hijack session A's
+        // in-flight reply).
+        //
+        // `None` — an auxiliary call made outside the scope — stays pure
+        // pass-through for the per-session controls, which is exactly right.
+        let session = goose::session_context::current_session_id()
+            .and_then(|sid| self.controls.existing_session(&sid));
+
+        let (prefix, ext_apx) = {
             (
                 self.controls
                     .system_prefix
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                self.controls
-                    .turn_appendix
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
@@ -276,12 +410,17 @@ impl Provider for GiapProviderShim {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
-                self.controls
-                    .allowed_tools
+            )
+        };
+        let (turn_apx, allowed) = match &session {
+            Some(s) => (
+                s.turn_appendix
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
-            )
+                s.allowed_tools_snapshot(),
+            ),
+            None => (None, None),
         };
 
         let enforced_system = enforce_system(system, &prefix, &[&turn_apx, &ext_apx]);
@@ -313,8 +452,13 @@ impl Provider for GiapProviderShim {
                 .unwrap_or(0);
             tracing::debug!(
                 system_chars = final_system.len(),
+                // `tools_offered` is what Goose handed us (always the full
+                // union); `tools_count` is what the model actually sees after
+                // Phase D selection. The gap is the saving.
+                tools_offered = tools.len(),
                 tools_count = final_tools.len(),
                 tools_json_chars = tools_chars,
+                session_scoped = session.is_some(),
                 "provider payload size"
             );
         }
@@ -525,5 +669,127 @@ mod tests {
     fn minify_tools_returns_none_when_already_clean() {
         let clean = tool("giap-weather__get_current_weather");
         assert!(minify_tools(&[clean]).is_none());
+    }
+
+    // ── D1: session-keyed controls ─────────────────────────────────────────
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The reason D1 exists. Before keying, two sessions shared one allow-set
+    /// slot; with different tool selections that is a cross-session data race
+    /// where one session's provider call filters by another's set.
+    #[test]
+    fn two_sessions_do_not_see_each_others_allow_sets() {
+        let controls = ShimControls::default();
+        let a = controls.session("goose-a");
+        let b = controls.session("goose-b");
+
+        a.set_allowed_tools(set(&["giap-weather__get_forecast"]));
+        b.set_allowed_tools(set(&["giap-schedule__create_schedule"]));
+
+        assert!(a.is_tool_allowed("giap-weather__get_forecast"));
+        assert!(!a.is_tool_allowed("giap-schedule__create_schedule"));
+        assert!(b.is_tool_allowed("giap-schedule__create_schedule"));
+        assert!(!b.is_tool_allowed("giap-weather__get_forecast"));
+
+        // And the veto itself filters per session, not globally.
+        let tools = [
+            tool("giap-weather__get_forecast"),
+            tool("giap-schedule__create_schedule"),
+        ];
+        let for_a = enforce_tools(&tools, &a.allowed_tools_snapshot()).expect("veto fired");
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].name.as_ref(), "giap-weather__get_forecast");
+        let for_b = enforce_tools(&tools, &b.allowed_tools_snapshot()).expect("veto fired");
+        assert_eq!(for_b[0].name.as_ref(), "giap-schedule__create_schedule");
+    }
+
+    #[test]
+    fn turn_appendices_are_also_per_session() {
+        let controls = ShimControls::default();
+        let a = controls.session("goose-a");
+        let b = controls.session("goose-b");
+        a.set_turn_appendix(some("A's skills"));
+        b.set_turn_appendix(some("B's skills"));
+        assert_eq!(
+            *a.turn_appendix.lock().unwrap(),
+            Some("A's skills".to_string())
+        );
+        assert_eq!(
+            *b.turn_appendix.lock().unwrap(),
+            Some("B's skills".to_string())
+        );
+    }
+
+    #[test]
+    fn the_same_session_id_returns_the_same_live_entry() {
+        let controls = ShimControls::default();
+        let first = controls.session("goose-a");
+        first.set_allowed_tools(set(&["giap-memory__recall_memories"]));
+        let second = controls.session("goose-a");
+        assert!(Arc::ptr_eq(&first, &second));
+        // A widen through one handle is visible through the other — this is what
+        // lets the escape hatch affect the in-flight turn.
+        second.extend_allowed_tools(["giap-vision__list_camera_events".to_string()]);
+        assert!(first.is_tool_allowed("giap-vision__list_camera_events"));
+    }
+
+    /// D2 escape hatch: enabling a group widens the live allow-set.
+    #[test]
+    fn extending_the_allow_set_admits_newly_enabled_tools() {
+        let controls = ShimControls::default();
+        let s = controls.session("goose-a");
+        s.set_allowed_tools(set(&["giap-toolkit__enable_tool_group"]));
+        assert!(!s.is_tool_allowed("giap-schedule__create_schedule"));
+
+        s.extend_allowed_tools([
+            "giap-schedule__create_schedule".to_string(),
+            "giap-schedule__list_schedules".to_string(),
+        ]);
+
+        assert!(s.is_tool_allowed("giap-schedule__create_schedule"));
+        assert!(s.is_tool_allowed("giap-schedule__list_schedules"));
+        // The original core tool is not lost in the widen.
+        assert!(s.is_tool_allowed("giap-toolkit__enable_tool_group"));
+    }
+
+    /// Widening when nothing is being filtered must not accidentally START
+    /// filtering — that would narrow the surface, the opposite of the intent.
+    #[test]
+    fn extending_without_an_allow_set_stays_pass_through() {
+        let controls = ShimControls::default();
+        let s = controls.session("goose-a");
+        s.extend_allowed_tools(["giap-schedule__create_schedule".to_string()]);
+        assert!(s.allowed_tools_snapshot().is_none());
+        assert!(s.is_tool_allowed("literally-anything"));
+    }
+
+    /// An auxiliary provider call for a session GIAP never chatted in must not
+    /// mint an entry — otherwise the map grows on compaction traffic.
+    #[test]
+    fn lookup_without_creation_does_not_track_the_session() {
+        let controls = ShimControls::default();
+        assert!(controls.existing_session("never-seen").is_none());
+        assert_eq!(controls.tracked_sessions(), 0);
+        controls.session("real");
+        assert!(controls.existing_session("real").is_some());
+        assert_eq!(controls.tracked_sessions(), 1);
+    }
+
+    /// Goose gives us no session-end hook, so the map is bounded.
+    #[test]
+    fn session_tracking_is_bounded() {
+        let controls = ShimControls::default();
+        for i in 0..(MAX_TRACKED_SESSIONS + 25) {
+            controls.session(&format!("goose-{i}"));
+        }
+        assert_eq!(controls.tracked_sessions(), MAX_TRACKED_SESSIONS);
+        // Oldest evicted, newest retained.
+        assert!(controls.existing_session("goose-0").is_none());
+        assert!(controls
+            .existing_session(&format!("goose-{}", MAX_TRACKED_SESSIONS + 24))
+            .is_some());
     }
 }

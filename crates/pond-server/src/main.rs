@@ -5729,7 +5729,16 @@ async fn build_goose_backend(
             }
             let ext_mgr: Arc<dyn ExtensionManagerPort> = adapter.extension_manager();
             tracing::info!("Goose agent active — GIAP MCP extension registered");
-            let agent: Arc<dyn Agent> = Arc::new(adapter);
+            let adapter = Arc::new(adapter);
+            // Phase D2 escape hatch: giap-toolkit's tools reach back into the
+            // adapter that owns the per-session tool selection. Installed here
+            // rather than in register_giap_extensions because the adapter is the
+            // implementor and did not exist at registration time.
+            pond_mcp_server::init_toolkit_deps(Some(adapter.clone()
+                as Arc<
+                    dyn pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl,
+                >));
+            let agent: Arc<dyn Agent> = adapter;
             (agent, Some(ext_mgr), tool_caller, default_registry)
         }
         Err(e) => {
