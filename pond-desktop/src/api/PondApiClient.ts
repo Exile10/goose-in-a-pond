@@ -1327,6 +1327,17 @@ export class PondApiClient {
     return this.post("/api/v1/oauth/authorize", { provider, extension_id: extensionId });
   }
 
+  /**
+   * How the flow with this `state` nonce ended.
+   *
+   * `pending` while the browser hand-off is in flight, then `completed` /
+   * `failed`. `unknown` means the nonce was never issued by the running server
+   * (it restarted) or its outcome aged out.
+   */
+  async getOAuthStatus(state: string): Promise<import("./types").OAuthFlowStatus> {
+    return this.get(`/api/v1/oauth/status/${encodeURIComponent(state)}`);
+  }
+
   /** Refresh an expired OAuth access token. */
   async refreshOAuth(provider: string): Promise<void> {
     await this.post("/api/v1/oauth/refresh", { provider });

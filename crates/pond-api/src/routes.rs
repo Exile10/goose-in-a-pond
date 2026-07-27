@@ -213,6 +213,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth/callback", get(oauth_callback_handler))
         .route("/oauth/refresh", post(oauth_refresh_handler))
         .route("/oauth/providers", get(oauth_providers_handler))
+        .route("/oauth/status/{state}", get(oauth_status_handler))
         // ── Music (Spotify) ────────────────────────────────────────────────────
         .route("/music/now-playing", get(music_now_playing_handler))
         .route("/music/control", post(music_control_handler))
@@ -8036,15 +8037,33 @@ async fn oauth_callback_handler(
         sessions.remove(&state_nonce)
     };
 
+    // Every terminal branch below records how the flow ended, so the UI that
+    // started it can poll for the real answer instead of guessing from whether
+    // a token key happens to exist.
+    let fail = |reason: &str| {
+        let outcomes = state.oauth_outcomes.clone();
+        let nonce = state_nonce.clone();
+        let reason = reason.to_string();
+        async move {
+            crate::oauth_callback::record_outcome(
+                &outcomes,
+                &nonce,
+                crate::oauth_callback::FlowOutcome::Failed(reason),
+            )
+            .await;
+        }
+    };
+
     let session = match session {
         Some(s) => s,
         None => {
+            fail("Invalid or expired authorization state. Start the sign-in again.").await;
             return Html(
                 "<h1>Authorization failed</h1>\
                  <p>Invalid or expired state. Please try again.</p>"
                     .to_string(),
             )
-            .into_response()
+            .into_response();
         }
     };
 
@@ -8053,8 +8072,9 @@ async fn oauth_callback_handler(
     let provider = match providers.iter().find(|p| p.id == session.provider_id) {
         Some(p) => p,
         None => {
+            fail("Unknown OAuth provider.").await;
             return Html("<h1>Authorization failed</h1><p>Unknown provider.</p>".to_string())
-                .into_response()
+                .into_response();
         }
     };
 
@@ -8163,6 +8183,12 @@ async fn oauth_callback_handler(
             // started there is nothing working on the other side — say so rather
             // than showing a green "Connected" card over a dead extension.
             if let Some(err) = restart_error {
+                fail(&format!(
+                    "Signed in, but the {} extension did not start: {}",
+                    session.extension_id.as_deref().unwrap_or("linked"),
+                    err
+                ))
+                .await;
                 return Html(format!(
                     r#"<!DOCTYPE html>
 <html><head><title>Authorization Incomplete</title>
@@ -8180,6 +8206,13 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f3f4f6;padding:1rem;
                 .into_response();
             }
 
+            crate::oauth_callback::record_outcome(
+                &state.oauth_outcomes,
+                &state_nonce,
+                crate::oauth_callback::FlowOutcome::Completed,
+            )
+            .await;
+
             Html(format!(
                 r#"<!DOCTYPE html>
 <html><head><title>Authorization Successful</title>
@@ -8194,6 +8227,7 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
         Ok(resp) => {
             let error_body = resp.text().await.unwrap_or_default();
             tracing::warn!(provider = %provider.id, error = %error_body, "OAuth token exchange failed");
+            fail(&format!("Token exchange failed: {error_body}")).await;
             Html(format!(
                 "<h1>Authorization failed</h1>\
                  <p>Token exchange error. Please try again.</p>\
@@ -8204,12 +8238,44 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
         }
         Err(e) => {
             tracing::error!(provider = %provider.id, error = %e, "OAuth token exchange network error");
+            fail(&format!("Could not reach the provider: {e}")).await;
             Html(format!(
                 "<h1>Authorization failed</h1><p>Network error: {}</p>",
-                e
+                html_escape(&e.to_string())
             ))
             .into_response()
         }
+    }
+}
+
+/// `GET /api/v1/oauth/status/{state}` — How the flow with this `state` nonce ended.
+///
+/// Returns `pending` while the browser hand-off is still in flight, then
+/// `completed` or `failed` once the callback has run. `unknown` means the
+/// nonce was never issued by this process, or its outcome has aged out.
+///
+/// This exists so the sign-in UI can wait for the flow it actually started.
+/// Watching the secret store instead reports success the moment a token key is
+/// present — which, when re-authorising, is true before the user has done
+/// anything at all.
+async fn oauth_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(state_nonce): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if state.oauth_state.read().await.contains_key(&state_nonce) {
+        return Json(json!({"status": "pending"})).into_response();
+    }
+
+    match crate::oauth_callback::peek_outcome(&state.oauth_outcomes, &state_nonce).await {
+        Some(crate::oauth_callback::FlowOutcome::Completed) => {
+            Json(json!({"status": "completed"})).into_response()
+        }
+        Some(crate::oauth_callback::FlowOutcome::Failed(error)) => {
+            Json(json!({"status": "failed", "error": error})).into_response()
+        }
+        None => Json(json!({"status": "unknown"})).into_response(),
     }
 }
 

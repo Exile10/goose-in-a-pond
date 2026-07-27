@@ -3008,6 +3008,7 @@ async fn run_server(
             .map(|(uri, html)| (uri.to_string(), html))
             .collect(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
         security_policy,
         api_port,
         weather_provider: weather.clone(),

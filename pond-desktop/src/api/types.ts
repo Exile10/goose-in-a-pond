@@ -52,6 +52,19 @@ export interface NowPlayingApiResponse {
 
 export type MusicControlAction = "play" | "pause" | "next" | "previous";
 
+// ── OAuth ────────────────────────────────────────────────────
+/**
+ * Outcome of a single OAuth flow, keyed server-side by its `state` nonce.
+ *
+ * `unknown` is not a failure on its own — a flow whose nonce the server never
+ * issued (it restarted mid-flow) reports it too, so callers should keep waiting
+ * until their own timeout rather than treating it as terminal.
+ */
+export interface OAuthFlowStatus {
+  status: "pending" | "completed" | "failed" | "unknown";
+  error?: string;
+}
+
 // ── Settings ─────────────────────────────────────────────────
 export interface Settings {
   // Identity
