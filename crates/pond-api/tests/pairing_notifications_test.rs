@@ -173,9 +173,9 @@ async fn make_app(handshake: Arc<dyn Handshake>) -> Harness {
 
     // `/handshake/verify` extracts `ConnectInfo` (per-IP rate limiting); the
     // oneshot test path has no real socket, so inject one.
-    let router = build_router(state, std::path::PathBuf::from("web/dist")).layer(MockConnectInfo(
-        std::net::SocketAddr::from(([127, 0, 0, 1], 40000)),
-    ));
+    let router = build_router(state, std::path::PathBuf::from("pond-desktop/dist")).layer(
+        MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 40000))),
+    );
     Harness {
         router,
         notifications,

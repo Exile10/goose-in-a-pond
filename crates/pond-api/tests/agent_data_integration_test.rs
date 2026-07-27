@@ -201,7 +201,7 @@ async fn make_app_with_dispatcher(
     });
 
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         tmp,
     )
 }
@@ -422,7 +422,7 @@ async fn prompt_template_delete_system_returns_403() {
         weather_provider: None,
     });
 
-    let app = build_router(state, std::path::PathBuf::from("web/dist"));
+    let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
     let resp = app
         .oneshot(delete("/api/v1/prompts/balanced"))
         .await
@@ -896,7 +896,7 @@ async fn returns_501_when_repos_not_configured() {
         api_port: 4000,
         weather_provider: None,
     });
-    let app = build_router(state, std::path::PathBuf::from("web/dist"));
+    let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
     for (method, uri) in &[
         (Method::GET, "/api/v1/prompts"),

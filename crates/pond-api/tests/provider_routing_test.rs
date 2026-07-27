@@ -274,7 +274,7 @@ async fn make_app_with_provider(
         weather_provider: None,
     });
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         tmp,
     )
 }
@@ -603,7 +603,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         api_port: 4000,
         weather_provider: None,
     });
-    let app = build_router(state, std::path::PathBuf::from("web/dist"));
+    let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
     let resp = app
         .oneshot(stream_request(serde_json::json!({"message": "echo test"})))
@@ -706,7 +706,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         api_port: 4000,
         weather_provider: None,
     });
-    let app = build_router(state, std::path::PathBuf::from("web/dist"));
+    let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
     let resp = app
         .oneshot(stream_request(

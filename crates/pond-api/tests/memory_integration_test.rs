@@ -169,7 +169,7 @@ async fn make_app_with_real_memory(
         weather_provider: None,
     });
 
-    let router = build_router(state, std::path::PathBuf::from("web/dist"));
+    let router = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
     (router, memory_repo, tmp)
 }
 
