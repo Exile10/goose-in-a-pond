@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# build-jetson-native.sh — Build GIAP natively on a Jetson Orin Nano
+# build-native.sh — Build GIAP natively on a Jetson Orin Nano
 #
 # Run this script ON the Jetson after cloning the repo.
 #
 # Usage:
-#   bash scripts/build-jetson-native.sh           # CPU-only server
-#   bash scripts/build-jetson-native.sh --cuda    # server with CUDA GPU accel
-#   bash scripts/build-jetson-native.sh --desktop # server + Tauri desktop app
-#   bash scripts/build-jetson-native.sh --cuda --desktop
+#   bash scripts/jetson.sh build                  # CPU-only server
+#   bash scripts/jetson.sh build --cuda           # server with CUDA GPU accel
+#   bash scripts/jetson.sh build --desktop        # server + Tauri desktop app
+#   bash scripts/jetson.sh build --cuda --desktop
 #
 # Requirements:
 #   - JetPack 5.x (CUDA 11.4) or JetPack 6.x (CUDA 12.2) — pre-installed
@@ -60,7 +60,7 @@ if [ "$DESKTOP" = true ]; then
   # full WebKitGTK set: webkit2gtk-4.1, gtk-3, libsoup-3.0, javascriptcoregtk,
   # plus rsvg/patchelf/appindicator). Also enforced at compile time by
   # pond-desktop/src-tauri/build.rs.
-  bash "$(dirname "${BASH_SOURCE[0]}")/install-desktop-deps.sh"
+  bash "$(dirname "${BASH_SOURCE[0]}")/../install-desktop-deps.sh"
 fi
 
 # ── 2b. Build the web UI (embedded into the single-executable server) ────────

@@ -339,7 +339,7 @@ impl LocalInferenceLlmAdapter {
     ///      reserving ~1 GB headroom for KV cache + system.
     ///   2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) to
     ///      free the page cache first — otherwise the `-ngl` allocation hits the
-    ///      NvMap OOM wall (error 12). See `scripts/jetson-llama-optimization`.
+    ///      NvMap OOM wall (error 12). See `scripts/jetson/llama-optimization`.
     ///   3. Re-check after dropping caches; if it STILL won't fit, refuse the
     ///      full-GPU load (fail closed) and surface the spill to the UI rather
     ///      than silently degrading to a CPU/GPU split.

@@ -35,8 +35,8 @@ ssh nano journalctl --user -u goose-in-a-pond -f    # follow logs
 ## Deploying
 
 ```bash
-bash scripts/jetson-deploy.sh                 # deploy origin/main
-bash scripts/jetson-deploy.sh --branch mybr   # any branch pushed to the Jetson's origin
+bash scripts/jetson.sh deploy                 # deploy origin/main
+bash scripts/jetson.sh deploy --branch mybr   # any branch pushed to the Jetson's origin
 ```
 
 The script: hard-resets the Jetson checkout to the pushed branch (submodule

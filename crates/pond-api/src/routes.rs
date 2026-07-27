@@ -3560,7 +3560,7 @@ async fn activate_model(
         // This is cross-platform-safe: it only *logs*. On Jetson the recommended
         // fail-closed behavior (drop_caches + -ngl residency check, and refusing
         // a spilling full-GPU load) belongs in the local-inference loader and is
-        // NOT done here — see scripts/jetson-llama-optimization and the note in
+        // NOT done here — see scripts/jetson/llama-optimization and the note in
         // .ai/scratchpad.md. We do not touch the loader from the Mac build.
         warn_if_model_spills(&state, &record).await;
 
@@ -3627,7 +3627,7 @@ async fn warn_if_model_spills(state: &Arc<AppState>, record: &ModelRecord) {
             "model exceeds device LLM memory budget — it will spill to CPU and \
              run slowly. On Jetson, enable the fail-closed loader path \
              (drop_caches + -ngl residency check) or pick a model that fits the \
-             GPU budget. See scripts/jetson-llama-optimization."
+             GPU budget. See scripts/jetson/llama-optimization."
         );
     }
 }
