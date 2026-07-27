@@ -398,6 +398,25 @@ impl GooseAdapter {
     /// heuristic and forces a compaction loop. The value flows into
     /// GOOSE_CONTEXT_LIMIT and thus into Ollama's `options.num_ctx`, so the
     /// reported limit, the request's num_ctx, and the KV cache all agree.
+    /// Context size used for PROMPT-side budgets (template tier, memory
+    /// injection) — as opposed to history budgets.
+    ///
+    /// For local in-process inference every preamble token is re-prefilled on
+    /// every turn (no KV prompt-session cache yet) at roughly 0.5–1K tok/s,
+    /// so a large context window must buy HISTORY room, not a more verbose
+    /// preamble: an unclamped 32K profile on the Mac selected the full
+    /// template tier + a 1.5K-token memory budget and produced a 9.4K-token
+    /// prompt (~17s TTFT) for a one-line question. Clamping to the 8K-class
+    /// profile keeps the compact tier + bounded memories regardless of how
+    /// big the KV cache is. HTTP providers keep the raw window — their
+    /// preamble is not paid for in local prefill.
+    fn prompt_budget_ctx(provider: &str, effective_ctx: usize) -> usize {
+        match provider {
+            "local" | "gguf" => effective_ctx.min(8192),
+            _ => effective_ctx,
+        }
+    }
+
     fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
         if override_tokens > 0 {
             return override_tokens as usize;
@@ -528,12 +547,17 @@ impl GooseAdapter {
                         settings.chat_model.clone()
                     };
                     // Register the GGUF model path in Goose's global registry
-                    if let Some(ref dd) = self.data_dir {
-                        Self::register_gguf_model(&model_name, dd);
-                    }
-                    // Registry key is the stem (no ".gguf") — ModelConfig must match.
-                    let registry_key = model_name.trim_end_matches(".gguf");
-                    let cfg = goose_providers::model::ModelConfig::new(registry_key);
+                    // Register the model and get back its CANONICAL registry
+                    // key: "gemma-4-E2B-it" and "gemma-4-E2B-it-Q4_K_M" both
+                    // name the same GGUF file, and letting them fork into two
+                    // registry ids splits sessions across identities and can
+                    // keep two multi-GB copies of one model resident in the
+                    // engine's per-id model cache.
+                    let registry_key = match self.data_dir {
+                        Some(ref dd) => Self::register_gguf_model(&model_name, dd),
+                        None => model_name.trim_end_matches(".gguf").to_string(),
+                    };
+                    let cfg = goose_providers::model::ModelConfig::new(&registry_key);
                     tracing::debug!(
                         "[model-switch] building LocalInferenceProvider for '{}'...",
                         model_name
@@ -886,18 +910,25 @@ impl GooseAdapter {
     /// - Bare stem: `"qwen2.5-3b-instruct-q4_k_m"` → looks for `{stem}.gguf`
     /// - Raw filename: `"model.gguf"` → uses as-is
     ///
-    /// Idempotent: skips registration if the model is already known.
-    fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) {
+    /// Returns the CANONICAL registry key: a quant-suffixed spelling
+    /// ("gemma-4-E2B-it-Q4_K_M") collapses to the display stem
+    /// ("gemma-4-E2B-it") whenever both unambiguously name the same file, so
+    /// the two spellings can never fork into separate registry ids — which
+    /// would split sessions and keep two copies of one model in the engine's
+    /// per-id cache. Callers MUST build their `ModelConfig` from the returned
+    /// key. Idempotent: skips registration if the model is already known.
+    fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, LocalModelEntry, LocalModelStorage, ModelSettings, ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
 
-        // The registry key stays the requested name — callers look the model up
-        // by exactly the string in settings (`chat_model`). Only the file we
-        // point at is resolved, so a display name still resolves to its file.
-        let stem = model_name.trim_end_matches(".gguf").to_string();
+        // Canonical registry key: collapse a redundant quant suffix, then keep
+        // the requested spelling for everything else. Only the file we point
+        // at is resolved from the ORIGINAL name, so an explicit quant choice
+        // still pins its exact file.
+        let stem = canonical_model_stem(model_name, &gguf_dir);
         let filename = resolve_gguf_filename(model_name, &gguf_dir);
         let local_path = gguf_dir.join(&filename);
         if !local_path.exists() {
@@ -963,6 +994,7 @@ impl GooseAdapter {
             }
             Err(e) => tracing::warn!("GGUF registry lock poisoned: {}", e),
         }
+        stem
     }
 
     pub async fn chat_stream(
@@ -1128,9 +1160,9 @@ impl GooseAdapter {
                 }
             };
 
-            // Derive compact_prompt from the effective context window.
-            // On small-context platforms (Jetson 3K, macOS Metal 8K), verbose
-            // tool descriptions and detailed instructions waste precious tokens.
+            // Derive compact_prompt from the PROMPT-side context budget: for
+            // local inference the profile is clamped so a huge KV cache never
+            // selects the verbose tier (see prompt_budget_ctx).
             let effective_ctx = Self::effective_context_window(
                 &settings.chat_provider,
                 &settings.chat_model,
@@ -1138,7 +1170,7 @@ impl GooseAdapter {
             );
             let compact_prompt =
                 pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                    effective_ctx,
+                    Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
                 )
                 .use_compact_prompt();
 
@@ -1285,9 +1317,11 @@ impl GooseAdapter {
         // prompt) to keep the prefix token-stable for KV cache reuse.
         let mut memory_block_for_user_msg = String::new();
         //
-        // Derive a CompactionProfile from the effective context window so
-        // memory injection doesn't eat into the already-tight KV cache on
-        // small-context platforms (Jetson 3K, macOS Metal 8K).
+        // Derive a CompactionProfile for MEMORY INJECTION from the
+        // prompt-side context budget: local inference re-prefills every
+        // injected memory token each turn, so the budget stays bounded even
+        // on a 32K context (see prompt_budget_ctx). History budgets elsewhere
+        // keep the real window.
         let effective_ctx = Self::effective_context_window(
             &settings.chat_provider,
             &settings.chat_model,
@@ -1295,7 +1329,7 @@ impl GooseAdapter {
         );
         let compaction_profile =
             pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                effective_ctx,
+                Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
             );
 
         if let Ok(mut memories) = memories_result {
@@ -1981,9 +2015,82 @@ fn looks_like_quant_tag(tag: &str) -> bool {
         || digit_after("Q")
 }
 
+/// Collapse a redundant quantization suffix in a model name to its display
+/// stem — "gemma-4-E2B-it-Q4_K_M" → "gemma-4-E2B-it" — but ONLY when both
+/// spellings unambiguously resolve to the same file on disk. Without this,
+/// the two spellings fork into separate registry ids: sessions split across
+/// model identities, the static-prefix hash churns, and the engine's per-id
+/// model cache can hold two multi-GB copies of one GGUF.
+///
+/// An explicit quant choice that differs from what the display stem would
+/// resolve to (two quant files present, the user pinned the one the stem
+/// would not pick) keeps its own identity — pinning stays honoured. A name
+/// whose file is missing is left untouched (no evidence to collapse on).
+fn canonical_model_stem(model_name: &str, gguf_dir: &std::path::Path) -> String {
+    let stem = model_name.trim_end_matches(".gguf");
+    let Some((base, tag)) = stem.rsplit_once(['-', '.']) else {
+        return stem.to_string();
+    };
+    if base.is_empty() || !looks_like_quant_tag(tag) {
+        return stem.to_string();
+    }
+    if resolve_gguf_filename(base, gguf_dir) == resolve_gguf_filename(stem, gguf_dir) {
+        base.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_spelling_collapses_to_display_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gemma-4-E2B-it-Q4_K_M.gguf"), b"gguf").unwrap();
+        assert_eq!(
+            canonical_model_stem("gemma-4-E2B-it-Q4_K_M", tmp.path()),
+            "gemma-4-E2B-it"
+        );
+        // The display spelling is already canonical.
+        assert_eq!(
+            canonical_model_stem("gemma-4-E2B-it", tmp.path()),
+            "gemma-4-E2B-it"
+        );
+        // Both spellings now share one registry id.
+    }
+
+    #[test]
+    fn explicit_quant_pin_keeps_its_identity_when_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gemma-4-E4B-it-Q4_K_M.gguf"), b"gguf").unwrap();
+        std::fs::write(tmp.path().join("gemma-4-E4B-it-Q4_K_S.gguf"), b"gguf").unwrap();
+        // The display stem would resolve Q4_K_M (lexicographic); a pin on
+        // Q4_K_S therefore stays its own id.
+        assert_eq!(
+            canonical_model_stem("gemma-4-E4B-it-Q4_K_S", tmp.path()),
+            "gemma-4-E4B-it-Q4_K_S"
+        );
+        // The matching pin collapses.
+        assert_eq!(
+            canonical_model_stem("gemma-4-E4B-it-Q4_K_M", tmp.path()),
+            "gemma-4-E4B-it"
+        );
+    }
+
+    #[test]
+    fn missing_file_and_non_quant_tails_are_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            canonical_model_stem("gemma-4-E2B-it-Q4_K_M", tmp.path()),
+            "gemma-4-E2B-it-Q4_K_M"
+        );
+        assert_eq!(
+            canonical_model_stem("llama-3.2-3b-instruct", tmp.path()),
+            "llama-3.2-3b-instruct"
+        );
+    }
 
     fn touch(dir: &std::path::Path, name: &str) {
         std::fs::write(dir.join(name), b"gguf").unwrap();

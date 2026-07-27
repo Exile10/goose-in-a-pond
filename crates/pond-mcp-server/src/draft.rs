@@ -26,13 +26,13 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SaveDraftParams {
-    /// Action type tag: "shell_command", "file_write", "schedule_create", etc.
+    /// Tag, e.g. "shell_command", "file_write".
     pub kind: Option<String>,
-    /// One-line description the user will see.
+    /// One-line summary shown to the user.
     pub summary: Option<String>,
-    /// JSON string with everything needed to execute the action later.
+    /// JSON string needed to execute later.
     pub payload: Option<String>,
-    /// Session ID (auto-populated if omitted).
+    /// Auto-filled if omitted.
     pub session_id: Option<String>,
     /// Catch-all for unexpected fields.
     #[serde(flatten)]
@@ -42,7 +42,7 @@ pub struct SaveDraftParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListDraftsParams {
-    /// Session ID to list drafts for. If omitted, returns all pending drafts.
+    /// Omit for all pending drafts.
     pub session_id: Option<String>,
     /// Catch-all for unexpected fields.
     #[serde(flatten)]
@@ -52,9 +52,8 @@ pub struct ListDraftsParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ApproveDraftParams {
-    /// The draft ID to approve.
     pub draft_id: Option<String>,
-    /// Alternate field name models sometimes use.
+    /// Alias for draft_id.
     pub id: Option<String>,
     /// Catch-all for unexpected fields.
     #[serde(flatten)]
@@ -64,9 +63,8 @@ pub struct ApproveDraftParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RejectDraftParams {
-    /// The draft ID to reject.
     pub draft_id: Option<String>,
-    /// Alternate field name models sometimes use.
+    /// Alias for draft_id.
     pub id: Option<String>,
     /// Catch-all for unexpected fields.
     #[serde(flatten)]
@@ -93,9 +91,8 @@ impl DraftMcpServer {
     }
 
     #[tool(
-        description = "Stage a destructive action for user confirmation instead of executing it. \
-        Use this for shell commands, file writes, schedule creation, or any action with side effects. \
-        DO NOT execute destructive actions directly — always save a draft first."
+        description = "Stage any side-effect action (shell, file write, schedule) as a draft for \
+        user confirmation. Never execute destructive actions directly."
     )]
     async fn save_draft(
         &self,
@@ -166,10 +163,7 @@ impl DraftMcpServer {
         }
     }
 
-    #[tool(
-        description = "List pending drafts awaiting user confirmation. Call when the user says \
-        'what\'s pending', 'show drafts', or 'what are you waiting on'."
-    )]
+    #[tool(description = "List pending drafts awaiting user confirmation.")]
     async fn list_drafts(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -202,10 +196,7 @@ impl DraftMcpServer {
         }
     }
 
-    #[tool(
-        description = "Approve a pending draft for execution. Call when the user says 'yes', \
-        'go ahead', 'approve', or 'do it'."
-    )]
+    #[tool(description = "Approve a pending draft for execution after the user confirms.")]
     async fn approve_draft(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -253,10 +244,7 @@ impl DraftMcpServer {
         }
     }
 
-    #[tool(
-        description = "Reject a pending draft. Call when the user says 'no', 'cancel', 'reject', \
-        or 'don't do that'."
-    )]
+    #[tool(description = "Reject a pending draft after the user declines.")]
     async fn reject_draft(
         &self,
         _ctx: RequestContext<RoleServer>,

@@ -32,17 +32,15 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CreateScheduleParams {
-    /// Human-readable name for the scheduled task.
     #[serde(default)]
     pub name: String,
-    /// 6-field cron expression: sec min hr dom mon dow.
-    /// Example: "0 0 8 * * *" = daily at 8:00 AM.
+    /// 6-field cron: sec min hr dom mon dow.
     #[serde(default)]
     pub cron: String,
-    /// The prompt to send to the agent on each fire.
+    /// Prompt sent to the agent on each fire.
     #[serde(default)]
     pub prompt: String,
-    /// IANA timezone (e.g. "Africa/Nairobi"). If omitted, uses the user's configured timezone.
+    /// IANA timezone; default: user's setting.
     pub timezone: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -52,40 +50,37 @@ pub struct CreateScheduleParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ScheduleIdParam {
-    /// The schedule ID to operate on.
     #[serde(default)]
     pub id: String,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CreateSensorRuleParams {
-    /// Short human-readable rule name (e.g. "Backyard motion lights").
     pub name: Option<String>,
-    /// Event family to listen to: "sensor" (default) | "camera" | "device".
+    /// "sensor" (default) | "camera" | "device".
     pub source: Option<String>,
-    /// Only match events from this device/camera ID. Omit for any.
+    /// Match this device/camera ID only; omit for any.
     pub device_id: Option<String>,
-    /// Only match this sensor type / camera event type / device state key
-    /// (e.g. "motion", "person", "temperature"). Omit for any.
+    /// Event type, e.g. "motion", "person", "temperature"; omit for any.
     pub signal: Option<String>,
-    /// Numeric comparison on the event value: gt | gte | lt | lte | eq.
+    /// Compare event value: gt | gte | lt | lte | eq.
     pub op: Option<String>,
-    /// Threshold for `op` (e.g. 1 for motion, 30 for temperature).
+    /// Threshold for `op`.
     pub value: Option<f64>,
-    /// Only fire after this local time, 24h "HH:MM" (e.g. "18:30" ≈ sunset).
+    /// Fire only after this local time, 24h "HH:MM".
     pub after: Option<String>,
-    /// Only fire before this local time, 24h "HH:MM" (e.g. "06:00").
+    /// Fire only before this local time, 24h "HH:MM".
     pub before: Option<String>,
-    /// Action: send this prompt to the agent when the rule fires.
+    /// Action: send this prompt to the agent.
     pub prompt: Option<String>,
-    /// Action: switch this device when the rule fires (with power_on).
+    /// Action: switch this device (with power_on).
     pub power_device_id: Option<String>,
-    /// true = turn on (default), false = turn off.
+    /// true = on (default), false = off.
     pub power_on: Option<bool>,
-    /// Action: push a notification with this title (requires notify_body).
+    /// Action: notification title (requires notify_body).
     pub notify_title: Option<String>,
     pub notify_body: Option<String>,
-    /// Minimum seconds between fires (debounce). Default 60.
+    /// Debounce seconds between fires. Default 60.
     pub cooldown_secs: Option<u64>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -95,7 +90,7 @@ pub struct CreateSensorRuleParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct DeleteSensorRuleParams {
-    /// The rule ID to delete (see list_sensor_rules).
+    /// Rule ID (see list_sensor_rules).
     pub rule_id: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -105,25 +100,22 @@ pub struct DeleteSensorRuleParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetScheduleRunsParams {
-    /// The schedule ID.
     #[serde(default)]
     pub id: String,
-    /// Maximum number of runs to return (default 10).
+    /// Max runs to return (default 10).
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct UpdateScheduleParams {
-    /// The schedule ID to update (required).
+    /// Schedule ID to update (required).
     #[serde(default)]
     pub id: String,
-    /// New name (optional — only provided fields are updated).
     pub name: Option<String>,
-    /// New 6-field cron expression (optional). You can also use natural language like "every morning at 9am".
+    /// 6-field cron or natural language ("every morning at 9am").
     pub cron: Option<String>,
-    /// New prompt/action (optional).
     pub prompt: Option<String>,
-    /// New IANA timezone (optional).
+    /// IANA timezone.
     pub timezone: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -133,7 +125,7 @@ pub struct UpdateScheduleParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WorldClockParams {
-    /// One or more IANA timezone names (e.g. "America/New_York", "Asia/Tokyo", "Africa/Nairobi"). If omitted, returns the user's configured timezone.
+    /// IANA names, e.g. "Asia/Tokyo". Default: user's timezone.
     pub timezones: Option<Vec<String>>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -164,9 +156,7 @@ impl ScheduleMcpServer {
         }
     }
 
-    #[tool(
-        description = "List all scheduled tasks on this GIAP instance, including their cron schedule, timezone, type, and status."
-    )]
+    #[tool(description = "List all scheduled tasks with cron, timezone, type, and status.")]
     async fn list_schedules(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -245,8 +235,7 @@ impl ScheduleMcpServer {
     }
 
     #[tool(
-        description = "Create a new scheduled task. Accepts natural language like 'every morning at 8am' \
-        or 6-field cron: sec min hr dom mon dow. Example: '0 0 8 * * *' = daily at 8 AM."
+        description = "Create a scheduled task. Accepts natural language ('every morning at 8am') or 6-field cron: sec min hr dom mon dow."
     )]
     async fn create_schedule(
         &self,
@@ -383,7 +372,7 @@ impl ScheduleMcpServer {
         }
     }
 
-    #[tool(description = "Delete a scheduled task by its ID.")]
+    #[tool(description = "Delete a scheduled task by ID.")]
     async fn delete_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -402,11 +391,9 @@ impl ScheduleMcpServer {
         }
     }
 
-    #[tool(description = "\
-Create a sensor/event-triggered automation rule (#92), e.g. 'if motion in the backyard \
-after sunset, turn on the lights and notify me'. The rule fires when a matching \
-sensor/camera/device event arrives — not on a timer. At least one action \
-(prompt, device power, or notification) is required.")]
+    #[tool(
+        description = "Create a rule fired by sensor/camera/device events, not a timer. Needs at least one action: prompt, device power, or notify."
+    )]
     async fn create_sensor_rule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -534,9 +521,9 @@ sensor/camera/device event arrives — not on a timer. At least one action \
         }
     }
 
-    #[tool(description = "\
-List the sensor/event-triggered automation rules (motion rules, threshold alerts, …). \
-Time-based schedules are listed by list_schedules instead.")]
+    #[tool(
+        description = "List sensor/event-triggered rules. Time-based schedules: use list_schedules."
+    )]
     async fn list_sensor_rules(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -570,7 +557,7 @@ Time-based schedules are listed by list_schedules instead.")]
         }
     }
 
-    #[tool(description = "Delete a sensor/event-triggered rule by its ID (see list_sensor_rules).")]
+    #[tool(description = "Delete a sensor rule by ID (see list_sensor_rules).")]
     async fn delete_sensor_rule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -591,7 +578,7 @@ Time-based schedules are listed by list_schedules instead.")]
         }
     }
 
-    #[tool(description = "Pause a scheduled task so it stops firing until resumed.")]
+    #[tool(description = "Pause a scheduled task until resumed.")]
     async fn pause_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -610,7 +597,7 @@ Time-based schedules are listed by list_schedules instead.")]
         }
     }
 
-    #[tool(description = "Resume a paused scheduled task so it starts firing again.")]
+    #[tool(description = "Resume a paused scheduled task.")]
     async fn resume_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -629,9 +616,7 @@ Time-based schedules are listed by list_schedules instead.")]
         }
     }
 
-    #[tool(
-        description = "Trigger a scheduled task to run immediately, regardless of its cron schedule."
-    )]
+    #[tool(description = "Run a scheduled task immediately, ignoring its cron.")]
     async fn run_schedule_now(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -650,9 +635,7 @@ Time-based schedules are listed by list_schedules instead.")]
         }
     }
 
-    #[tool(
-        description = "Get the execution history for a scheduled task — shows recent runs with status, result, and duration."
-    )]
+    #[tool(description = "Get recent run history for a schedule: status, result, duration.")]
     async fn get_schedule_runs(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -729,8 +712,7 @@ Time-based schedules are listed by list_schedules instead.")]
     }
 
     #[tool(
-        description = "Update an existing scheduled task. You can change the name, cron schedule, \
-        prompt, or timezone. Only the fields you provide will be updated."
+        description = "Update a schedule's name, cron, prompt, or timezone. Only provided fields change."
     )]
     async fn update_schedule(
         &self,
@@ -843,9 +825,7 @@ Time-based schedules are listed by list_schedules instead.")]
     }
 
     #[tool(
-        description = "Get the current time in one or more timezones. Use this before scheduling \
-        tasks to confirm the right time across zones. Pass IANA timezone names like \
-        'America/New_York', 'Asia/Tokyo', 'Africa/Nairobi'."
+        description = "Get current time in one or more IANA timezones (e.g. 'Asia/Tokyo'); default: user's timezone."
     )]
     async fn world_clock(
         &self,

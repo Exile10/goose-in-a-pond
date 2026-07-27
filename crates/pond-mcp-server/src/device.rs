@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetRecipeParams {
-    /// The recipe name (slug).
+    /// Recipe name (slug).
     pub name: String,
 }
 
@@ -59,7 +59,7 @@ impl DeviceMcpServer {
         }
     }
 
-    #[tool(description = "List all registered devices on this GIAP instance.")]
+    #[tool(description = "List registered devices with online status.")]
     async fn list_registered_devices(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -111,9 +111,7 @@ impl DeviceMcpServer {
         }
     }
 
-    #[tool(
-        description = "Get the current user profile: name, assistant name, timezone, and location."
-    )]
+    #[tool(description = "Get user profile: name, assistant name, timezone, location.")]
     async fn get_user_profile(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -137,9 +135,7 @@ impl DeviceMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        description = "Get the current model configuration: which LLM and tool-calling model are active."
-    )]
+    #[tool(description = "Get active model config: main LLM and tool-calling model.")]
     async fn get_model_assignments(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -159,7 +155,7 @@ impl DeviceMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "List all active user skills injected into the assistant's context.")]
+    #[tool(description = "List active user skills.")]
     async fn list_skills(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -183,7 +179,7 @@ impl DeviceMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Get the YAML definition of a named agent recipe.")]
+    #[tool(description = "Get a named agent recipe's YAML.")]
     async fn get_recipe(
         &self,
         _ctx: RequestContext<RoleServer>,

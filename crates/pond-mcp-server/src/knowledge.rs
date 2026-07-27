@@ -20,9 +20,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WikipediaQueryParams {
-    /// The topic to look up — a name, phrase, or question (e.g. "black holes", "Nairobi", "how do volcanoes work").
+    /// Name, phrase, or question to look up.
     pub topic: Option<String>,
-    /// Maximum number of search results (default 5, max 10). Only used by search_wikipedia.
+    /// Max results, default 5, max 10 (search_wikipedia only).
     pub limit: Option<u32>,
     /// Catch-all for any extra fields the model sends (e.g. "query", "title", "search").
     /// Not part of the advertised schema — exists purely to absorb unexpected keys.
@@ -33,7 +33,6 @@ pub struct WikipediaQueryParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct DefineWordParams {
-    /// The English word to define (e.g. "serendipity", "ephemeral").
     pub word: Option<String>,
     /// Catch-all for any extra fields the model sends (e.g. "term", "query").
     #[serde(flatten)]
@@ -43,11 +42,11 @@ pub struct DefineWordParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct BookSearchParams {
-    /// Search query — a book title, topic, or keyword (e.g. "Dune", "machine learning").
+    /// Book title, topic, or keyword.
     pub query: Option<String>,
-    /// Filter by author name (e.g. "Frank Herbert").
+    /// Filter by author name.
     pub author: Option<String>,
-    /// Maximum results to return (default 5, max 10).
+    /// Max results, default 5, max 10.
     pub limit: Option<u32>,
     /// Catch-all for any extra fields the model sends.
     #[serde(flatten)]
@@ -83,10 +82,8 @@ impl KnowledgeMcpServer {
     }
 
     #[tool(description = "\
-Search Wikipedia for articles matching a topic. Returns a ranked list of article \
-titles with short descriptions. Only use this when you need to disambiguate \
-between multiple topics or show the user a list of options. For direct factual \
-questions, prefer get_wikipedia_article instead — it auto-searches on your behalf.")]
+Search Wikipedia; returns ranked titles with snippets. Only for disambiguating \
+or listing options; for factual questions prefer get_wikipedia_article.")]
     async fn search_wikipedia(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -192,12 +189,9 @@ questions, prefer get_wikipedia_article instead — it auto-searches on your beh
     }
 
     #[tool(description = "\
-Look up a topic on Wikipedia. Pass a topic name or natural-language query — the \
-tool auto-searches if the exact title is not found. Use this as your first \
-choice for ANY factual question (people, places, events, science, history, etc.).\n\
-After receiving the result: extract only the facts relevant to the user's \
-question and answer concisely in your own words. Do NOT repeat the extract \
-verbatim. In voice mode keep it to 1-3 sentences.")]
+Look up a topic on Wikipedia (auto-searches if the title is not exact). First \
+choice for any factual question. Answer concisely in your own words; never \
+repeat the extract verbatim.")]
     async fn get_wikipedia_article(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -250,8 +244,8 @@ verbatim. In voice mode keep it to 1-3 sentences.")]
     }
 
     #[tool(description = "\
-Get a quick factual answer or summary for simple questions. Try this first for \
-definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
+Quick factual answer or summary. Try first for simple 'what is X' questions \
+before Wikipedia.")]
     async fn instant_answer(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -342,9 +336,7 @@ definitions, quick facts, or 'what is X' questions before using Wikipedia.")]
         Ok(CallToolResult::success(vec![Content::text(truncated)]))
     }
 
-    #[tool(description = "\
-Define an English word. Returns meanings, pronunciation, and examples. Use \
-when asked 'what does X mean' or 'define X'.")]
+    #[tool(description = "Define an English word: meanings, pronunciation, examples.")]
     async fn define_word(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -416,8 +408,8 @@ when asked 'what does X mean' or 'define X'.")]
     }
 
     #[tool(description = "\
-Search for books by title, author, or subject. Use when asked about books, \
-reading recommendations, or 'who wrote X'.")]
+Search books by title, author, or subject. Use for book questions, reading \
+recommendations, or 'who wrote X'.")]
     async fn search_books(
         &self,
         _ctx: RequestContext<RoleServer>,

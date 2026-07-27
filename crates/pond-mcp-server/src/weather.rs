@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WeatherParams {
-    /// City or place name (e.g. "Kisumu", "London", "Tokyo"). If omitted, uses the configured default location.
     pub location: Option<String>,
     /// Catch-all for unexpected fields the model might send.
     #[serde(flatten)]
@@ -31,9 +30,8 @@ pub struct WeatherParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ForecastParams {
-    /// City or place name (e.g. "Kisumu", "London", "Tokyo"). If omitted, uses the configured default location.
     pub location: Option<String>,
-    /// Number of days to forecast (1-7, default 3).
+    /// 1-7, default 3.
     pub days: Option<u8>,
     /// Catch-all for unexpected fields the model might send.
     #[serde(flatten)]
@@ -60,9 +58,8 @@ impl WeatherMcpServer {
     }
 
     #[tool(description = "\
-Get current weather conditions. Pass a location name for any city \
-(e.g. 'Kisumu', 'London'). Omit location to use the pond's configured \
-home location. DO NOT guess weather data or use shell commands for weather.")]
+Get current weather for a city; omit location for the configured home. \
+Never guess weather data or use shell commands for it.")]
     async fn get_current_weather(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -125,10 +122,8 @@ home location. DO NOT guess weather data or use shell commands for weather.")]
     }
 
     #[tool(description = "\
-Get a multi-day weather forecast with highs, lows, rain chance, UV index, \
-and sunrise/sunset. Pass 'location' for any city, 'days' for how many days \
-(1-7, default 3). Omit location to use the pond's configured home location. \
-DO NOT guess forecast data.")]
+Multi-day forecast: highs/lows, rain chance, UV, sunrise/sunset. \
+days 1-7 (default 3); omit location for the configured home. Never guess data.")]
     async fn get_weather_forecast(
         &self,
         _ctx: RequestContext<RoleServer>,

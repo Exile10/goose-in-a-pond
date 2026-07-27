@@ -28,34 +28,31 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SetDeviceStateParams {
-    /// The device to control — its id or name (e.g. "living-room-lamp").
+    /// Device id or name.
     #[serde(default)]
     pub device_id: String,
-    /// Turn the device on (true) or off (false).
     #[serde(default)]
     pub power: Option<bool>,
-    /// Brightness as a 0–100 percentage.
+    /// 0-100 percent.
     #[serde(default)]
     pub brightness: Option<u8>,
-    /// Thermostat target temperature in degrees Celsius.
+    /// Degrees Celsius.
     #[serde(default)]
     pub target_temp: Option<f32>,
-    /// Lock (true) or unlock (false).
     #[serde(default)]
     pub locked: Option<bool>,
-    /// Colour hue in degrees (0–360). Pair with `saturation`.
+    /// Hue degrees 0-360.
     #[serde(default)]
     pub hue: Option<u16>,
-    /// Colour saturation as a 0–100 percentage. Pair with `hue`.
+    /// 0-100 percent.
     #[serde(default)]
     pub saturation: Option<u8>,
-    /// Fan speed as a 0–100 percentage.
+    /// 0-100 percent.
     #[serde(default)]
     pub fan_speed: Option<u8>,
-    /// Covering position as a 0–100 percentage OPEN (100 = fully open).
+    /// 0-100 percent open (100=fully open).
     #[serde(default)]
     pub position: Option<u8>,
-    /// Absorbs any unexpected fields a small model might emit.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -87,7 +84,7 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "Control a smart device: turn power on/off, set brightness (0-100), set thermostat target temperature (°C), lock/unlock, set colour (hue 0-360 + saturation 0-100), set fan speed (0-100), or set a covering/blind position (0-100 percent open). Use when the user asks to change a device's state. device_id accepts the registered id, the device's name, or a natural reference like \"the light\" when it is unambiguous."
+        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position. device_id: id, name, or natural ref like \"the light\"."
     )]
     async fn set_device_state(
         &self,

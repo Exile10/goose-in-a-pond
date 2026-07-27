@@ -169,6 +169,83 @@ fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Ve
     )
 }
 
+/// Strip mechanical schemars/serde boilerplate from a tool's input schema.
+/// Every char here is re-prefilled by the local model on every turn:
+/// - `"$schema"` draft URI and struct-name `"title"` — zero instruction value;
+/// - integer-width artifacts: `"format": "uintN"/"intN"` plus the
+///   `minimum: 0` / power-of-two `maximum` bounds pairs serde derives from
+///   Rust integer types (a real, hand-written bound is kept).
+///
+/// Walks nested schema objects (`properties` values, `items`, `$defs`,
+/// `anyOf`/`oneOf`/`allOf`) without ever touching `properties` KEYS, so a
+/// parameter genuinely named "title" survives.
+fn minify_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.remove("$schema");
+    obj.remove("title");
+
+    let int_width_artifact = obj
+        .get("format")
+        .and_then(|f| f.as_str())
+        .is_some_and(|f| f.starts_with("uint") || f.starts_with("int"));
+    if int_width_artifact {
+        obj.remove("format");
+        let min_is_zero = obj.get("minimum").and_then(|v| v.as_u64()) == Some(0);
+        let max_is_width = matches!(
+            obj.get("maximum").and_then(|v| v.as_u64()),
+            Some(255) | Some(65535) | Some(4294967295)
+        );
+        if min_is_zero && max_is_width {
+            obj.remove("minimum");
+            obj.remove("maximum");
+        }
+    }
+
+    for key in ["items", "additionalProperties"] {
+        if let Some(serde_json::Value::Object(child)) = obj.get_mut(key) {
+            minify_schema_object(child);
+        }
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(children)) = obj.get_mut(key) {
+            for child in children.values_mut() {
+                if let serde_json::Value::Object(child) = child {
+                    minify_schema_object(child);
+                }
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(serde_json::Value::Array(variants)) = obj.get_mut(key) {
+            for v in variants.iter_mut() {
+                if let serde_json::Value::Object(child) = v {
+                    minify_schema_object(child);
+                }
+            }
+        }
+    }
+}
+
+/// Minified copies of `tools`. Returns `None` when nothing changed.
+fn minify_tools(tools: &[Tool]) -> Option<Vec<Tool>> {
+    let mut changed = false;
+    let minified: Vec<Tool> = tools
+        .iter()
+        .map(|t| {
+            let mut schema = (*t.input_schema).clone();
+            minify_schema_object(&mut schema);
+            if schema != *t.input_schema {
+                changed = true;
+                let mut t = t.clone();
+                t.input_schema = Arc::new(schema);
+                t
+            } else {
+                t.clone()
+            }
+        })
+        .collect();
+    changed.then_some(minified)
+}
+
 #[async_trait]
 impl Provider for GiapProviderShim {
     fn get_name(&self) -> &str {
@@ -210,6 +287,12 @@ impl Provider for GiapProviderShim {
         let enforced_system = enforce_system(system, &prefix, &[&turn_apx, &ext_apx]);
         let stripped_messages = strip_turn_context(messages);
         let vetoed_tools = enforce_tools(tools, &allowed);
+        // Minify AFTER the veto so we never pay for tools about to be dropped.
+        let minified_tools = minify_tools(vetoed_tools.as_deref().unwrap_or(tools));
+        let final_tools: &[Tool] = minified_tools
+            .as_deref()
+            .or(vetoed_tools.as_deref())
+            .unwrap_or(tools);
 
         if enforced_system.is_some() || stripped_messages.is_some() || vetoed_tools.is_some() {
             tracing::debug!(
@@ -220,12 +303,28 @@ impl Provider for GiapProviderShim {
             );
         }
 
+        // Prompt-cost accounting (debug only — serialization is skipped when
+        // the level is off): chars/4 approximates tokens, making the split
+        // between system prompt and tools JSON visible per call.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let final_system = enforced_system.as_deref().unwrap_or(system);
+            let tools_chars = serde_json::to_string(final_tools)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            tracing::debug!(
+                system_chars = final_system.len(),
+                tools_count = final_tools.len(),
+                tools_json_chars = tools_chars,
+                "provider payload size"
+            );
+        }
+
         self.inner
             .stream(
                 model_config,
                 enforced_system.as_deref().unwrap_or(system),
                 stripped_messages.as_deref().unwrap_or(messages),
-                vetoed_tools.as_deref().unwrap_or(tools),
+                final_tools,
             )
             .await
     }
@@ -369,5 +468,62 @@ mod tests {
     #[test]
     fn no_allowlist_means_no_tool_filtering() {
         assert!(enforce_tools(&[tool("platform__manage_schedule")], &None).is_none());
+    }
+
+    #[test]
+    fn minifier_strips_boilerplate_and_int_width_noise() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ForecastParams",
+            "type": "object",
+            "properties": {
+                "days": {
+                    "description": "1-7, default 3.",
+                    "type": ["integer", "null"],
+                    "format": "uint8",
+                    "maximum": 255,
+                    "minimum": 0
+                },
+                "location": { "type": ["string", "null"] }
+            }
+        });
+        let mut obj = schema.as_object().unwrap().clone();
+        minify_schema_object(&mut obj);
+        let out = serde_json::Value::Object(obj);
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("title").is_none());
+        let days = &out["properties"]["days"];
+        assert!(days.get("format").is_none());
+        assert!(days.get("maximum").is_none());
+        assert!(days.get("minimum").is_none());
+        assert_eq!(days["description"], "1-7, default 3.");
+        assert_eq!(out["properties"]["location"]["type"][0], "string");
+    }
+
+    #[test]
+    fn minifier_keeps_real_bounds_and_title_named_params() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                // A parameter genuinely named "title" must survive.
+                "title": { "type": "string" },
+                // Hand-written bounds (not an integer-width artifact pair).
+                "limit": { "type": "integer", "format": "uint8", "minimum": 1, "maximum": 10 }
+            }
+        });
+        let mut obj = schema.as_object().unwrap().clone();
+        minify_schema_object(&mut obj);
+        let out = serde_json::Value::Object(obj);
+        assert!(out["properties"].get("title").is_some());
+        assert_eq!(out["properties"]["limit"]["minimum"], 1);
+        assert_eq!(out["properties"]["limit"]["maximum"], 10);
+        // The width-format marker itself still goes — it carries no meaning.
+        assert!(out["properties"]["limit"].get("format").is_none());
+    }
+
+    #[test]
+    fn minify_tools_returns_none_when_already_clean() {
+        let clean = tool("giap-weather__get_current_weather");
+        assert!(minify_tools(&[clean]).is_none());
     }
 }
