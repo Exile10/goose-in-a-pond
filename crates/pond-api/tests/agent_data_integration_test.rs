@@ -340,6 +340,7 @@ async fn prompt_template_delete_system_returns_403() {
         content: "You are balanced.".into(),
         description: "Built-in".into(),
         is_system: true,
+        is_customized: false,
         updated_at: String::new(),
     })
     .await

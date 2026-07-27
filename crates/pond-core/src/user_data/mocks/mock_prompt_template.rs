@@ -53,6 +53,24 @@ impl PromptTemplateRepository for MockPromptTemplateRepository {
         Ok(())
     }
 
+    async fn seed_system_template(&self, template: &PromptTemplate) -> Result<()> {
+        let mut store = self.templates.write().await;
+        match store.iter_mut().find(|t| t.name == template.name) {
+            Some(existing) if existing.is_customized => {}
+            Some(existing) => {
+                *existing = PromptTemplate {
+                    is_customized: false,
+                    ..template.clone()
+                };
+            }
+            None => store.push(PromptTemplate {
+                is_customized: false,
+                ..template.clone()
+            }),
+        }
+        Ok(())
+    }
+
     async fn insert_if_absent(&self, template: &PromptTemplate) -> Result<bool> {
         let mut store = self.templates.write().await;
         if store.iter().any(|t| t.name == template.name) {
