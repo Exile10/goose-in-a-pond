@@ -31,11 +31,11 @@ Segment-based memory with importance scoring, exponential decay, automatic extra
   │  Cleanup    │    < 0.05 → prune  |  < 0.15 → archive
   │  Service    │    permanent tier exempt
   └─────────────┘
-         │ every 24 hours
+         │ after 15 min of user inactivity (opt-in, cancelled by activity)
          ▼
-  ┌─────────────┐    single-pass LLM merge/prune
-  │  Consolidat.│    "merge duplicates, remove redundancies"
-  │  Service    │    max 20 memories per batch
+  ┌─────────────┐    three-stage adversarial pipeline:
+  │  Consolidat.│    Proposer -> Adversary -> Judge (3 LLM calls)
+  │  Service    │    merge / prune / split / recategorize
   └─────────────┘
 ```
 
@@ -110,18 +110,40 @@ When saving via MCP tool without explicit segment, `auto_classify_segment()` use
 
 ## Consolidation
 
-Periodic single-pass LLM merge/prune (simplified from boop-agent's 3-phase proposer/adversary/judge):
+Opt-in (`memory_consolidation_enabled`, default false — it needs a meaningful
+number of memories to be useful). The shipped pipeline is three-stage and
+adversarial (`crates/pond-server/src/three_stage_consolidator.rs`), not the
+single-pass merge this document originally described:
 
-1. Fetch up to `memory_consolidation_batch_size` (default 20) active memories with segment data
-2. LLM proposes: merge duplicates, prune redundancies
-3. Apply approved actions: create merged memory, mark sources as `lifecycle=Merged`
+1. **Proposer** reads the scoreable memories and proposes actions
+   (`Merge` / `Prune` / `Split` / `Recategorize`).
+2. **Adversary** challenges each proposal, arguing against destructive or
+   lossy changes.
+3. **Judge** rules on each exchange; only accepted actions are applied.
+
+Correction-safety guards are unconditional: a `Correction` memory is never
+pruned, a merge involving one is forced to `segment=Correction`, and `corrects`
+metadata propagates to the merged fragment. Every lifecycle change is written
+to `memory_events`, and each run is recorded in `consolidation_runs`.
+
+**Trigger and control**: a background loop starts a run after 15 minutes of
+user inactivity; any chat turn cancels an in-flight run (checked between
+stages — a stage already inside an LLM call finishes first).
+`POST /api/v1/memory/consolidate` streams a run's events over SSE for the
+desktop's consolidation banner, and `.../consolidate/stop` cancels it.
+
+Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`,
+Phase E): the trigger fires ~15 min after a boot with no user activity;
+`memory_consolidation_mode`, `_interval_hours`, and `_batch_size` are persisted
+and UI-exposed but not read by the runtime (mode is always adversarial, and
+there is no batch cap); toggling the enable flag needs a server restart.
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
 | `save_memory` | Save with optional segment, importance, tier. Auto-classifies if segment omitted. |
-| `recall_memories` | Search with keyword filter. Returns segment + importance metadata. Records access. |
+| `recall_memories` | Vector search when a query is given and an embedding provider is available (keyword fallback otherwise); recency-ordered without a query. Returns segment + importance metadata. Records access. |
 | `forget_memory` | Delete by ID or exact content match. |
 
 ## REST API

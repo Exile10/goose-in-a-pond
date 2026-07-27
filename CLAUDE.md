@@ -132,7 +132,7 @@ All chat history is written to and read from `pond_system.db`. Goose maintains i
 
 ### MCP dispatch
 
-`GooseAdapter` dispatches the 12 `giap-*` builtin MCP extensions via Goose's own extension manager (`giap_registration.rs`). `crates/pond-mcp-server/src/dispatcher.rs` (`McpToolDispatcher`, the `PREFIX_*` consts) is the **PondAgent** direct-dispatch path, which is quarantined (Q2-05) — so audit/vision tools that need deps installed by pond-server (`init_audit_deps`) are dispatched by Goose, not this dispatcher.
+`GooseAdapter` dispatches the 14 `giap-*` builtin MCP extensions (57 tools when every toggle is on; `giap-draft` is always-on and `giap-device-control` rides the `ext_device_enabled` toggle) via Goose's own extension manager (`giap_registration.rs`). `crates/pond-mcp-server/src/dispatcher.rs` (`McpToolDispatcher`, the `PREFIX_*` consts) is the **PondAgent** direct-dispatch path, which is quarantined (Q2-05) — so audit/vision tools that need deps installed by pond-server (`init_audit_deps`) are dispatched by Goose, not this dispatcher.
 
 ---
 
