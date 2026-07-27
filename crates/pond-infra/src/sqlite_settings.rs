@@ -6,6 +6,12 @@
 //!
 //! IMPORTANT: `update()` issues one `INSERT OR REPLACE` per field — never batched into
 //! a single query (sqlx only executes the first statement when multiple are batched).
+//! The whole sequence runs inside one transaction so concurrent writers cannot
+//! interleave per-key and leave a torn hybrid of two snapshots.
+//!
+//! Every field MUST have both an upsert in `update_fields` and an arm in
+//! `apply_key`; a field with only one of the two is silently unsaved or silently
+//! unread. `roundtrip_persists_every_field` guards the whole class.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +19,7 @@ use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
+use std::collections::HashSet;
 
 pub struct SqliteSettingsRepository {
     pool: Pool<Sqlite>,
@@ -39,16 +46,31 @@ impl SettingsRepository for SqliteSettingsRepository {
     }
 
     async fn update(&self, settings: &Settings) -> Result<()> {
+        self.update_fields(settings, None).await
+    }
+
+    async fn update_fields(
+        &self,
+        settings: &Settings,
+        only: Option<&HashSet<String>>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // `only` = write just these keys (the caller's patch), so a save of one
+        // field cannot revert a field another writer changed since the caller
+        // read its snapshot. `None` = write every field.
         macro_rules! upsert {
             ($key:expr, $val:expr) => {
-                sqlx::query(
-                    "INSERT OR REPLACE INTO settings (key, value, updated_at) \
-                     VALUES (?, ?, datetime('now'))",
-                )
-                .bind($key)
-                .bind($val)
-                .execute(&self.pool)
-                .await?;
+                if only.is_none_or(|keys| keys.contains($key)) {
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO settings (key, value, updated_at) \
+                         VALUES (?, ?, datetime('now'))",
+                    )
+                    .bind($key)
+                    .bind($val)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             };
         }
 
@@ -541,7 +563,16 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_sensor_enabled",
+            if settings.ext_sensor_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -903,6 +934,8 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_finance_enabled" => s.ext_finance_enabled = value == "true",
         "ext_discovery_enabled" => s.ext_discovery_enabled = value == "true",
         "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
+        "ext_vision_enabled" => s.ext_vision_enabled = value == "true",
+        "ext_sensor_enabled" => s.ext_sensor_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }
@@ -945,6 +978,89 @@ mod tests {
         assert!(!got.cameras_enabled);
         assert!(got.cloud_fallback_enabled);
         assert_eq!(got.home_name, "The Anyumba Home");
+    }
+
+    /// Perturb every scalar field of a serialised `Settings` to a value that
+    /// differs from the input, so a field that fails to persist shows up as a
+    /// mismatch after a round-trip.
+    fn perturb(value: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::Bool(b) => Value::Bool(!b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::from(i + 7)
+                } else if let Some(u) = n.as_u64() {
+                    Value::from(u + 7)
+                } else {
+                    Value::from(n.as_f64().unwrap_or(0.0) + 1.5)
+                }
+            }
+            Value::String(s) => Value::String(format!("{s}-probe")),
+            Value::Null => Value::String("probe".to_string()),
+            Value::Array(_) => serde_json::json!(["probe-a", "probe-b"]),
+            Value::Object(_) => serde_json::json!({ "probe-key": 11 }),
+        }
+    }
+
+    /// Every field must survive `update()` -> `get()`. A field with an upsert but
+    /// no `apply_key` arm (write-only), or an `apply_key` arm but no upsert
+    /// (never written), fails here — the class of bug that made
+    /// `ext_vision_enabled` a privacy toggle that could not be turned off and
+    /// `ext_sensor_enabled` inert.
+    #[tokio::test]
+    async fn roundtrip_persists_every_field() {
+        let repo = fresh_repo().await;
+        let base = serde_json::to_value(repo.get().await.unwrap()).unwrap();
+
+        let mut probe = base.clone();
+        for (_k, v) in probe.as_object_mut().unwrap().iter_mut() {
+            *v = perturb(v);
+        }
+        let probe_settings: Settings = serde_json::from_value(probe.clone())
+            .expect("perturbed settings must still deserialize");
+        // Serialize back so comparison uses the same normalisation as the read side.
+        let expected = serde_json::to_value(&probe_settings).unwrap();
+
+        repo.update(&probe_settings).await.unwrap();
+        let got = serde_json::to_value(repo.get().await.unwrap()).unwrap();
+
+        let mut unsaved = Vec::new();
+        for (key, want) in expected.as_object().unwrap() {
+            let have = got.get(key);
+            if have != Some(want) {
+                unsaved.push(format!("{key}: wrote {want}, read back {have:?}"));
+            }
+        }
+        assert!(
+            unsaved.is_empty(),
+            "settings fields did not survive a write/read round-trip (missing an \
+             upsert in update_fields or an arm in apply_key):\n  {}",
+            unsaved.join("\n  ")
+        );
+    }
+
+    /// A targeted write must not revert fields it does not name — the lost-update
+    /// path when two clients each save one field.
+    #[tokio::test]
+    async fn update_fields_writes_only_the_named_keys() {
+        let repo = fresh_repo().await;
+
+        let mut first = repo.get().await.unwrap();
+        first.mic_enabled = false;
+        repo.update(&first).await.unwrap();
+
+        // A second writer holding a STALE snapshot (mic_enabled still true)
+        // saves only telemetry_enabled.
+        let mut stale = repo.get().await.unwrap();
+        stale.mic_enabled = true;
+        stale.telemetry_enabled = false;
+        let only: HashSet<String> = ["telemetry_enabled".to_string()].into_iter().collect();
+        repo.update_fields(&stale, Some(&only)).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert!(!got.telemetry_enabled, "named key must be written");
+        assert!(!got.mic_enabled, "unnamed key must not be reverted");
     }
 
     #[tokio::test]
