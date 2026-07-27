@@ -2431,7 +2431,15 @@ async fn update_settings(
             base_obj.insert(k.clone(), v.clone());
         }
     }
-    let mut merged: Settings = serde_json::from_value(base).unwrap_or_else(|_| current.clone());
+    // A type-invalid field must fail loudly: silently keeping `current` here
+    // returned 200 with the OLD settings, so the UI flashed "Saved" while every
+    // edit in the form was discarded.
+    let mut merged: Settings = serde_json::from_value(base).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": format!("Invalid settings value: {}", e)})),
+        )
+    })?;
 
     // Geocode-on-save: turn the location name into coordinates so the Settings
     // page shows real lat/lon and the weather gate is satisfied without the user
@@ -2439,6 +2447,14 @@ async fn update_settings(
     // an onboarded install ends up with real coordinates and no user action.
     // Best-effort — a failure keeps whatever coordinates were provided, since the
     // adapter resolves the name on demand anyway.
+    // Write only the keys this request actually carries. Writing the whole
+    // merged snapshot reverted any field another writer (the phone, the other
+    // desktop UI, a model activation) changed after `current` was read.
+    let mut write_keys: std::collections::HashSet<String> = patch
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+
     let patch_lat = patch.get("weather_latitude").and_then(|v| v.as_f64());
     let patch_lon = patch.get("weather_longitude").and_then(|v| v.as_f64());
     if let Some(name) = geocode_target(
@@ -2456,6 +2472,10 @@ async fn update_settings(
             Ok(geo) => {
                 merged.weather_latitude = geo.latitude;
                 merged.weather_longitude = geo.longitude;
+                // Geocoding derived these, so they must be written even though
+                // the caller did not send them.
+                write_keys.insert("weather_latitude".to_string());
+                write_keys.insert("weather_longitude".to_string());
             }
             Err(e) => tracing::warn!(
                 error = %e,
@@ -2465,12 +2485,16 @@ async fn update_settings(
         }
     }
 
-    state.settings_repo.update(&merged).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to save settings: {}", e)})),
-        )
-    })?;
+    state
+        .settings_repo
+        .update_fields(&merged, Some(&write_keys))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to save settings: {}", e)})),
+            )
+        })?;
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
