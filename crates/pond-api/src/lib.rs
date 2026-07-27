@@ -328,6 +328,10 @@ pub struct AppState {
     pub mcp_app_resources: std::collections::HashMap<String, &'static str>,
     /// In-memory OAuth PKCE sessions (state nonce -> verifier + provider).
     pub oauth_state: crate::oauth_callback::OAuthState,
+    /// Outcomes of finished OAuth flows (state nonce -> completed / failed),
+    /// so the UI that started a flow can tell whether it actually succeeded
+    /// rather than inferring it from the token key's existence.
+    pub oauth_outcomes: crate::oauth_callback::OAuthOutcomes,
     /// Authorization + audit hook at the privacy/security boundary.
     ///
     /// A hook, not a gate: the default implementation allows everything and

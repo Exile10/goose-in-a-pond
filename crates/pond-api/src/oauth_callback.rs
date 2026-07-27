@@ -38,6 +38,64 @@ pub fn new_oauth_state() -> OAuthState {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// How a finished OAuth flow ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowOutcome {
+    /// Tokens were stored, and any extension tied to the flow came back up.
+    Completed,
+    /// The flow reached a terminal state without delivering a usable result.
+    Failed(String),
+}
+
+/// A finished flow's outcome, retained briefly so the UI that started it can
+/// ask how it ended.
+pub struct FlowRecord {
+    pub outcome: FlowOutcome,
+    recorded_at: std::time::Instant,
+}
+
+/// Outcomes of finished OAuth flows, keyed by the same `state` nonce the
+/// in-flight session used.
+///
+/// The callback consumes the [`PkceSession`] when it runs, so presence in the
+/// session map cannot answer "did my sign-in work?" — an absent nonce is
+/// indistinguishable from one that never existed. Without this, the only
+/// signal available to the UI is whether the token key exists in the secret
+/// store, which is already true whenever the user is *re*-authorising: the
+/// poll then reports success ~2 seconds in, regardless of what the user did in
+/// the browser.
+pub type OAuthOutcomes = Arc<RwLock<HashMap<String, FlowRecord>>>;
+
+/// Create a fresh (empty) OAuth outcome store.
+pub fn new_oauth_outcomes() -> OAuthOutcomes {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// How long a finished flow's outcome stays queryable. Long enough for a slow
+/// browser hand-off, short enough that abandoned flows do not accumulate.
+pub const OUTCOME_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Record how a flow ended, evicting anything past [`OUTCOME_TTL`] on the way.
+pub async fn record_outcome(outcomes: &OAuthOutcomes, state_nonce: &str, outcome: FlowOutcome) {
+    let mut map = outcomes.write().await;
+    map.retain(|_, r| r.recorded_at.elapsed() < OUTCOME_TTL);
+    map.insert(
+        state_nonce.to_string(),
+        FlowRecord {
+            outcome,
+            recorded_at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// Look up how a flow ended, treating an expired record as absent.
+pub async fn peek_outcome(outcomes: &OAuthOutcomes, state_nonce: &str) -> Option<FlowOutcome> {
+    let map = outcomes.read().await;
+    map.get(state_nonce)
+        .filter(|r| r.recorded_at.elapsed() < OUTCOME_TTL)
+        .map(|r| r.outcome.clone())
+}
+
 /// Generate a PKCE code verifier and its S256 challenge.
 ///
 /// Returns `(code_verifier, code_challenge)`.
@@ -137,6 +195,92 @@ mod tests {
         rt.block_on(async {
             let state = new_oauth_state();
             assert!(state.read().await.is_empty());
+        });
+    }
+
+    // ── Flow outcomes ────────────────────────────────────────
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_unstarted_flow_has_no_outcome() {
+        rt().block_on(async {
+            let outcomes = new_oauth_outcomes();
+            // The whole point: absence must be reported as absence. If this
+            // ever answered "completed", the UI would report a sign-in that
+            // never happened — the bug this store exists to prevent.
+            assert_eq!(peek_outcome(&outcomes, "never-issued").await, None);
+        });
+    }
+
+    #[test]
+    fn outcomes_are_recorded_and_read_back_per_nonce() {
+        rt().block_on(async {
+            let outcomes = new_oauth_outcomes();
+            record_outcome(&outcomes, "nonce-a", FlowOutcome::Completed).await;
+            record_outcome(
+                &outcomes,
+                "nonce-b",
+                FlowOutcome::Failed("token exchange failed".into()),
+            )
+            .await;
+
+            assert_eq!(
+                peek_outcome(&outcomes, "nonce-a").await,
+                Some(FlowOutcome::Completed)
+            );
+            assert_eq!(
+                peek_outcome(&outcomes, "nonce-b").await,
+                Some(FlowOutcome::Failed("token exchange failed".into()))
+            );
+            // One flow's result must never answer for another's.
+            assert_eq!(peek_outcome(&outcomes, "nonce-c").await, None);
+        });
+    }
+
+    #[test]
+    fn a_later_flow_supersedes_an_earlier_one_on_the_same_nonce() {
+        rt().block_on(async {
+            let outcomes = new_oauth_outcomes();
+            record_outcome(&outcomes, "n", FlowOutcome::Failed("first".into())).await;
+            record_outcome(&outcomes, "n", FlowOutcome::Completed).await;
+            assert_eq!(
+                peek_outcome(&outcomes, "n").await,
+                Some(FlowOutcome::Completed)
+            );
+        });
+    }
+
+    #[test]
+    fn expired_outcomes_read_as_absent_and_get_evicted() {
+        rt().block_on(async {
+            let outcomes = new_oauth_outcomes();
+            {
+                // Backdate past the TTL without waiting five minutes.
+                let mut map = outcomes.write().await;
+                map.insert(
+                    "stale".to_string(),
+                    FlowRecord {
+                        outcome: FlowOutcome::Completed,
+                        recorded_at: std::time::Instant::now()
+                            - OUTCOME_TTL
+                            - std::time::Duration::from_secs(1),
+                    },
+                );
+            }
+
+            assert_eq!(peek_outcome(&outcomes, "stale").await, None);
+
+            // Recording anything sweeps expired entries rather than letting
+            // abandoned flows accumulate for the life of the process.
+            record_outcome(&outcomes, "fresh", FlowOutcome::Completed).await;
+            let map = outcomes.read().await;
+            assert!(!map.contains_key("stale"));
+            assert!(map.contains_key("fresh"));
         });
     }
 }

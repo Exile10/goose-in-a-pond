@@ -108,6 +108,7 @@ async fn make_app_with_bus() -> (axum::Router, Arc<InProcessEventBus>, tempfile:
         ),
         mcp_app_resources: std::collections::HashMap::new(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
         security_policy: None,
         tool_dispatcher: None,
         api_port: 4000,
