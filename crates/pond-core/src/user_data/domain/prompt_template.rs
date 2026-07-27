@@ -18,6 +18,10 @@ pub struct PromptTemplate {
     pub description: String,
     /// `true` = built-in template seeded at setup; cannot be deleted.
     pub is_system: bool,
+    /// `true` = the user edited this template; the startup factory reseed
+    /// skips it so the edit survives restarts. Cleared by an explicit reset.
+    #[serde(default)]
+    pub is_customized: bool,
     /// ISO datetime of the last update (SQLite `datetime('now')` format).
     pub updated_at: String,
 }

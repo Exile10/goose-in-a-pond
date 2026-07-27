@@ -25,6 +25,12 @@ pub trait PromptTemplateRepository: Send + Sync {
     /// Returns `true` if the row was inserted, `false` if it already existed.
     async fn insert_if_absent(&self, template: &PromptTemplate) -> Result<bool>;
 
+    /// Seed factory content for a system template WITHOUT clobbering a user
+    /// edit: inserts the row if absent, updates it only while
+    /// `is_customized = 0`. The startup reseed must use this — a plain
+    /// `upsert` here would revert user edits on every boot.
+    async fn seed_system_template(&self, template: &PromptTemplate) -> Result<()>;
+
     /// Delete a template by name.
     ///
     /// Callers should check `is_system` before calling — system templates

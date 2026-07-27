@@ -8348,11 +8348,19 @@ async fn upsert_prompt_template(
                 .into_response()
         }
     };
+    // Preserve the built-in flag of an existing row — editing "balanced" must
+    // not strip its system status (deletion protection) — and mark the row
+    // customized so the startup factory reseed leaves the edit alone.
+    let existing_is_system = match repo.get(&name).await {
+        Ok(Some(t)) => t.is_system,
+        _ => false,
+    };
     let template = PromptTemplate {
         name: name.clone(),
         content: req.content,
         description: req.description,
-        is_system: false,
+        is_system: existing_is_system,
+        is_customized: true,
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     match repo.upsert(&template).await {
@@ -8431,6 +8439,7 @@ async fn reset_prompt_template(
         content: content.to_string(),
         description: description.to_string(),
         is_system: true,
+        is_customized: false,
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     match repo.upsert(&template).await {

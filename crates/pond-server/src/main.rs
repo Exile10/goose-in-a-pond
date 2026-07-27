@@ -615,6 +615,7 @@ async fn run_setup(model: &str) -> Result<()> {
                 content: content.to_string(),
                 description: description.to_string(),
                 is_system: true,
+                is_customized: false,
                 updated_at: String::new(),
             };
             if let Err(e) = template_repo.insert_if_absent(&t).await {
@@ -1500,9 +1501,10 @@ async fn run_server(
                 content: content.to_string(),
                 description: description.to_string(),
                 is_system: true,
+                is_customized: false,
                 updated_at: String::new(),
             };
-            if let Err(e) = prompt_template_repo.upsert(&t).await {
+            if let Err(e) = prompt_template_repo.seed_system_template(&t).await {
                 tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
             }
         }
@@ -3350,9 +3352,10 @@ async fn run_chat(
                 content: content.to_string(),
                 description: description.to_string(),
                 is_system: true,
+                is_customized: false,
                 updated_at: String::new(),
             };
-            if let Err(e) = template_repo.upsert(&t).await {
+            if let Err(e) = template_repo.seed_system_template(&t).await {
                 tracing::warn!("Failed to reseed built-in prompt template '{name}': {e}");
             }
         }
@@ -6415,6 +6418,8 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
                 content: content.to_string(),
                 description: description.to_string(),
                 is_system: true,
+                // An explicit reset returns the row to factory ownership.
+                is_customized: false,
                 updated_at: String::new(),
             };
             repo.upsert(&t).await?;

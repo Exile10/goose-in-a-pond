@@ -368,6 +368,8 @@ export interface PromptTemplate {
   name: string;
   content: string;
   is_system: boolean;
+  /** User-edited: the startup factory reseed leaves this template alone. */
+  is_customized?: boolean;
   updated_at?: string;
 }
 
