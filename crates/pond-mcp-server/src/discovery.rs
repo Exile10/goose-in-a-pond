@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CountryInfoParams {
-    /// Country name, code, or partial match (e.g. "Kenya", "US", "GBR", "japan").
+    /// Country name or uppercase 2-3 letter code.
     pub country: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -33,11 +33,10 @@ pub struct CountryInfoParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ProductLookupParams {
-    /// EAN/UPC barcode number (e.g. "3017620422003" for Nutella).
+    /// EAN/UPC barcode digits.
     pub barcode: Option<String>,
-    /// Product name to search for (e.g. "nutella", "coca cola").
     pub name: Option<String>,
-    /// Maximum results for name search (default 3, max 5).
+    /// Default 3, max 5.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -47,9 +46,8 @@ pub struct ProductLookupParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ProductPriceParams {
-    /// Product name or barcode to look up prices for.
+    /// Product barcode (names are rejected).
     pub product: Option<String>,
-    /// Optional location filter (e.g. "Paris", "Germany").
     pub location: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -59,9 +57,8 @@ pub struct ProductPriceParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WebSearchParams {
-    /// Search query (e.g. "Rust programming language", "best coffee in Nairobi").
     pub query: Option<String>,
-    /// Maximum results to return (default 5, max 10).
+    /// Default 5, max 10.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -107,9 +104,7 @@ impl DiscoveryMcpServer {
         }
     }
 
-    #[tool(description = "\
-Look up country data: population, capital, currency, languages. Use for \
-'tell me about Kenya', 'what currency does Japan use', or country comparisons.")]
+    #[tool(description = "Look up country data: population, capital, currency, languages, region.")]
     async fn get_country_info(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -205,8 +200,7 @@ Look up country data: population, capital, currency, languages. Use for \
     }
 
     #[tool(description = "\
-Look up a food product by barcode or name. Returns nutrition, ingredients, and \
-Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
+Look up a food product by barcode or name: nutrition, ingredients, allergens, Nutri-Score.")]
     async fn lookup_product(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -369,8 +363,7 @@ Nutri-Score. Use for 'what's in Nutella' or dietary questions.")]
     }
 
     #[tool(description = "\
-Find recent prices for a food product by barcode. Use for 'how much does X cost' \
-or price comparisons. European coverage is strongest.")]
+Recent crowdsourced prices for a product barcode (find it via lookup_product). Coverage strongest in Europe.")]
     async fn get_product_price(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -477,8 +470,7 @@ or price comparisons. European coverage is strongest.")]
     }
 
     #[tool(description = "\
-Search the web for information not covered by other tools. Use as a LAST RESORT \
-— prefer specific tools (news, finance, knowledge) first.")]
+General web search. LAST RESORT — prefer specific tools (news, finance, knowledge) first.")]
     async fn search_web(
         &self,
         _ctx: RequestContext<RoleServer>,

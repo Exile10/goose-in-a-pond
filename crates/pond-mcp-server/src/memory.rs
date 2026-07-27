@@ -25,40 +25,34 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RecallMemoriesParams {
-    /// Optional keyword to search for in memory content.
     pub query: Option<String>,
-    /// Maximum number of memories to return (default 10).
+    /// Max results, default 10.
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SaveMemoryParams {
-    /// The content to remember.
     #[serde(default)]
     pub content: String,
-    /// Optional comma-separated tags (e.g. "preferences,home").
+    /// Comma-separated tags.
     pub tags: Option<String>,
-    /// Memory segment: identity, preference, correction, relationship, project, knowledge, or context.
-    /// If omitted, auto-classified from content.
+    /// identity|preference|correction|relationship|project|knowledge|context; auto if omitted.
     pub segment: Option<String>,
-    /// Importance score 0.0-1.0. If omitted, defaults by segment.
+    /// 0.0-1.0; defaults by segment.
     pub importance: Option<f32>,
-    /// Tier: short, long, or permanent. If omitted, defaults by segment.
+    /// short|long|permanent; defaults by segment.
     pub tier: Option<String>,
-    /// Memory IDs that this new memory replaces. Those memories will be
-    /// immediately archived with lifecycle=merged and superseded_by set.
+    /// IDs of memories this replaces (archived).
     #[serde(default)]
     pub supersedes: Option<Vec<String>>,
-    /// For correction segment: describes what wrong claim this corrects.
-    /// Prevents consolidation from reverting the fix.
+    /// Wrong claim this corrects (correction segment).
     pub corrects: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ForgetMemoryParams {
-    /// The memory ID to delete.
     pub id: Option<String>,
-    /// Exact content to search for and delete (if id not provided).
+    /// Exact content match, used when id is absent.
     pub content: Option<String>,
 }
 
@@ -86,9 +80,8 @@ impl MemoryMcpServer {
     }
 
     #[tool(
-        description = "Recall memories, optionally filtered by a keyword. Uses semantic search \
-        when embeddings are available, falling back to keyword matching. Returns memories \
-        with their segment (identity, preference, etc.) and importance score."
+        description = "Recall memories, optionally filtered by keyword (semantic when available). \
+        Returns segment, importance, and IDs."
     )]
     async fn recall_memories(
         &self,
@@ -210,8 +203,7 @@ impl MemoryMcpServer {
     }
 
     #[tool(
-        description = "Save a new memory. Optionally specify 'supersedes' with IDs of memories \
-        this replaces (they'll be archived). Supports segment, importance, and tier."
+        description = "Save a memory. Pass supersedes=[ids] to replace and archive old memories."
     )]
     async fn save_memory(
         &self,

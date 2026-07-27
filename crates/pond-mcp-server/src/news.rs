@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct TopStoriesParams {
-    /// Category of stories: top, best, new, ask, show, job (default "top").
+    /// top|best|new|ask|show|job (default top).
     pub category: Option<String>,
-    /// Number of stories to return (default 5, max 15).
+    /// Default 5, max 15.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -34,11 +34,11 @@ pub struct TopStoriesParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SearchNewsParams {
-    /// Search keywords (e.g. "climate change", "Kenya elections", "AI regulation").
+    /// Search keywords.
     pub query: Option<String>,
-    /// Optional section filter (world, politics, technology, sport, etc.).
+    /// Section filter: world, politics, technology, sport, etc.
     pub section: Option<String>,
-    /// Maximum results to return (default 5, max 10).
+    /// Default 5, max 10.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -48,13 +48,13 @@ pub struct SearchNewsParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct HeadlinesParams {
-    /// Topic: general, world, nation, business, technology, entertainment, sports, science, health.
+    /// general|world|nation|business|technology|entertainment|sports|science|health.
     pub topic: Option<String>,
-    /// 2-letter country code (e.g. "us", "ke", "gb"). Omit for global headlines.
+    /// 2-letter country code (us, ke, gb). Omit for global.
     pub country: Option<String>,
-    /// Language code (default "en").
+    /// Language code (default en).
     pub language: Option<String>,
-    /// Maximum headlines to return (default 5, max 10).
+    /// Default 5, max 10.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -97,8 +97,8 @@ impl NewsMcpServer {
     }
 
     #[tool(description = "\
-Get trending tech stories from Hacker News. Use for 'what's new in tech', \
-'trending on HN', or tech industry news.")]
+Trending Hacker News tech stories. Tech only; for world news use \
+search_news/get_headlines.")]
     async fn get_top_stories(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -215,8 +215,8 @@ Get trending tech stories from Hacker News. Use for 'what's new in tech', \
     }
 
     #[tool(description = "\
-Search for news or get today's world events. Use for 'what's happening with X', \
-current events, or news about a topic.")]
+Search news by keyword, or today's world events. Use for news about a \
+specific topic.")]
     async fn search_news(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -255,8 +255,7 @@ current events, or news about a topic.")]
     }
 
     #[tool(description = "\
-Get today's top news headlines and trending topics. Use for 'what's in the news', \
-'today's headlines', or 'breaking news'.")]
+Today's top general/breaking news headlines when no specific topic is asked.")]
     async fn get_headlines(
         &self,
         _ctx: RequestContext<RoleServer>,

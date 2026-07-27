@@ -32,7 +32,7 @@ const MAX_LIMIT: usize = 50;
 pub struct RecentCameraEventsParams {
     /// Camera to read (default "camera-1").
     pub camera_id: Option<String>,
-    /// Maximum events to return (default 10, max 50).
+    /// Default 10, max 50.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -42,7 +42,7 @@ pub struct RecentCameraEventsParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct AcknowledgeCameraEventParams {
-    /// The event ID to acknowledge (see get_recent_camera_events).
+    /// Event ID from get_recent_camera_events.
     pub event_id: Option<i64>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -69,9 +69,8 @@ impl VisionMcpServer {
     }
 
     #[tool(description = "\
-List recent camera/vision events (motion, pet, package, person …) detected on-device or \
-posted by cameras. Use for \"did the camera see anything?\", \"any motion in the backyard?\", \
-or \"what happened outside?\". Newest first.")]
+List recent camera/vision events (motion, pet, package, person), newest first. Never guess \
+what a camera saw.")]
     async fn get_recent_camera_events(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -128,8 +127,7 @@ or \"what happened outside?\". Newest first.")]
     }
 
     #[tool(description = "\
-Acknowledge a camera event by ID so it stops re-alerting. Use after the user has \
-seen/handled an event (\"dismiss that motion alert\").")]
+Acknowledge a camera event by ID to stop re-alerts once the user has seen it.")]
     async fn acknowledge_camera_event(
         &self,
         _ctx: RequestContext<RoleServer>,

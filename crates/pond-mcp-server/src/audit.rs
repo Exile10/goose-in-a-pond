@@ -42,11 +42,11 @@ const MAX_SURFACEABLE: PrivacySensitivity = PrivacySensitivity::Sensitive;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RecentActivityParams {
-    /// Time window: "hour" | "day" (default) | "week".
+    /// "hour" | "day" (default) | "week".
     pub window: Option<String>,
-    /// Optional category filter, snake_case (e.g. "network", "sensor", "device", "tool").
+    /// snake_case, e.g. "network", "sensor", "device", "tool".
     pub category: Option<String>,
-    /// Maximum events to list (default 50, max 200).
+    /// Default 50, max 200.
     pub limit: Option<u32>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -56,7 +56,7 @@ pub struct RecentActivityParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WindowParams {
-    /// Time window: "hour" | "day" (default) | "week".
+    /// "hour" | "day" (default) | "week".
     pub window: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -83,10 +83,8 @@ impl AuditMcpServer {
     }
 
     #[tool(description = "\
-List the assistant's own recent activity — sensor readings, device actions, tool calls, and \
-outbound network requests — from the local on-device event log. Use this to answer \
-\"what did you do?\", \"what happened today?\", or \"show recent activity\". \
-Optional window (hour|day|week, default day) and category filter.")]
+List the assistant's own recent activity (sensor/device/tool/network events) from the local \
+event log. Answers \"what did you do?\". Never guess.")]
     async fn get_recent_activity(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -126,9 +124,8 @@ Optional window (hour|day|week, default day) and category filter.")]
     }
 
     #[tool(description = "\
-Summarize the assistant's recent activity as counts per category over a time window \
-(hour|day|week, default day). Use for \"what have you been doing?\" or \"give me an overview \
-of today\". Flags how many outbound network calls were made.")]
+Summarize recent activity as counts per category (overview, not a full list). Flags outbound \
+network call count.")]
     async fn summarize_activity(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -156,10 +153,8 @@ of today\". Flags how many outbound network calls were made.")]
     }
 
     #[tool(description = "\
-Report privacy-relevant activity over a window (hour|day|week, default day): which external \
-hosts the assistant contacted (and via which tool), plus how many events handled personal/\
-sensitive data. Use for \"what data did you send out?\", \"did you contact any servers?\", or \
-\"give me a privacy report\".")]
+Privacy report: external hosts contacted (and via which tool) plus count of events touching \
+personal/sensitive data.")]
     async fn list_privacy_risks(
         &self,
         _ctx: RequestContext<RoleServer>,

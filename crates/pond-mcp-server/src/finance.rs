@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ExchangeRateParams {
-    /// Base currency code (e.g. "USD", "EUR"). Default: "USD".
+    /// Base currency code, default USD.
     pub from: Option<String>,
-    /// Target currency/currencies, comma-separated (e.g. "EUR,GBP,JPY"). Omit for major currencies.
+    /// Comma-separated target codes; omit for majors.
     pub to: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -34,11 +34,10 @@ pub struct ExchangeRateParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ConvertCurrencyParams {
-    /// Amount to convert (default 1.0).
     pub amount: Option<f64>,
-    /// Source currency code (e.g. "USD", "EUR"). Default: "USD".
+    /// Source currency code, default USD.
     pub from: Option<String>,
-    /// Target currency code (e.g. "EUR", "GBP"). Required for meaningful result.
+    /// Target currency code; required.
     pub to: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -48,7 +47,7 @@ pub struct ConvertCurrencyParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct StockQuoteParams {
-    /// Stock ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
+    /// Ticker symbol, e.g. AAPL.
     pub symbol: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -58,7 +57,7 @@ pub struct StockQuoteParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CryptoPriceParams {
-    /// Cryptocurrency name or symbol (e.g. "bitcoin", "BTC", "ethereum", "ETH").
+    /// Name or symbol, e.g. bitcoin or BTC.
     pub asset: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -104,9 +103,9 @@ impl FinanceMcpServer {
         }
     }
 
-    #[tool(description = "\
-Get current currency exchange rates. Use for 'USD to EUR rate', \
-'forex rates', or 'how strong is the dollar'.")]
+    #[tool(
+        description = "Get current forex rates. To convert a specific amount, use convert_currency instead."
+    )]
     async fn get_exchange_rate(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -219,9 +218,9 @@ Get current currency exchange rates. Use for 'USD to EUR rate', \
         Ok(CallToolResult::success(vec![Content::text(truncated)]))
     }
 
-    #[tool(description = "\
-Convert a specific amount between currencies. Use for 'convert 100 USD to EUR' \
-or 'how much is 50 pounds in shillings'.")]
+    #[tool(
+        description = "Convert an amount between currencies. amount default 1, from default USD; to required."
+    )]
     async fn convert_currency(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -317,9 +316,7 @@ or 'how much is 50 pounds in shillings'.")]
         Ok(CallToolResult::success(vec![Content::text(truncated)]))
     }
 
-    #[tool(description = "\
-Get a stock's current price and daily change. Use for 'AAPL stock price', \
-'how is Tesla doing', or market questions. Pass a ticker symbol.")]
+    #[tool(description = "Get a stock's current price and daily change by ticker symbol.")]
     async fn get_stock_quote(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -373,9 +370,7 @@ Get a stock's current price and daily change. Use for 'AAPL stock price', \
         self.get_stock_quote_yahoo(&symbol).await
     }
 
-    #[tool(description = "\
-Get cryptocurrency price and market data. Use for 'Bitcoin price', \
-'how much is ETH worth', or any crypto question.")]
+    #[tool(description = "Get cryptocurrency price and 24h market data by name or symbol.")]
     async fn get_crypto_price(
         &self,
         _ctx: RequestContext<RoleServer>,

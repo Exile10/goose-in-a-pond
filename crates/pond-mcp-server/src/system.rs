@@ -20,42 +20,37 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SystemInfoParams {
-    /// What info to get: "all", "memory", "disk", or "os" (default: "all")
+    /// "all" | "memory" | "disk" | "os"; default "all"
     pub category: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct NotifyParams {
-    /// Notification title
     pub title: String,
-    /// Notification body text
     pub body: String,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ShellCommandParams {
-    /// The command to execute. Only safe commands are allowed: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv
+    /// Allow-listed command name only, no args
     pub command: String,
-    /// Arguments to pass to the command
     #[serde(default)]
     pub args: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ReadFileParams {
-    /// Absolute path to the file to read
+    /// Absolute path
     pub path: String,
-    /// Maximum number of lines to read (default: 100)
     pub max_lines: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct WriteFileParams {
-    /// Absolute path to the file to write
+    /// Absolute path
     pub path: String,
-    /// Content to write
     pub content: String,
-    /// If true, append to file instead of overwriting (default: false)
+    /// true = append, default overwrite
     #[serde(default)]
     pub append: bool,
 }
@@ -82,9 +77,7 @@ impl SystemMcpServer {
         }
     }
 
-    #[tool(
-        description = "Get the current date, time, and timezone. Use when asked about the current time or date."
-    )]
+    #[tool(description = "Get current date, time, and timezone.")]
     async fn get_current_time(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -107,10 +100,7 @@ impl SystemMcpServer {
         Ok(CallToolResult::success(vec![Content::text(full_result)]))
     }
 
-    #[tool(
-        description = "Get system information: OS, hostname, memory usage, and disk usage. \
-        Use when the user asks about their system, available memory, disk space, or hardware."
-    )]
+    #[tool(description = "Get system info: OS, hostname, memory, and disk usage.")]
     async fn get_system_info(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -189,10 +179,7 @@ impl SystemMcpServer {
         Ok(CallToolResult::success(vec![Content::text(full_result)]))
     }
 
-    #[tool(
-        description = "Send a desktop notification to the user. Use when the user asks to be \
-        notified, alerted, or reminded with a popup message."
-    )]
+    #[tool(description = "Send a desktop popup notification to the user.")]
     async fn send_notification(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -243,9 +230,8 @@ impl SystemMcpServer {
     }
 
     #[tool(
-        description = "Execute a safe shell command. Only allow-listed commands are permitted: \
-        ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, \
-        grep, find, which, env, printenv. Times out after 10 seconds."
+        description = "Run an allow-listed shell command only: ls, cat, echo, date, uptime, df, free, \
+        whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. 10s timeout."
     )]
     async fn run_shell_command(
         &self,
@@ -309,10 +295,7 @@ impl SystemMcpServer {
         }
     }
 
-    #[tool(
-        description = "Read the contents of a local file. Returns up to max_lines lines (default 100). \
-        Use when the user asks to read, view, or inspect a file on their system."
-    )]
+    #[tool(description = "Read a local file. Returns up to max_lines lines (default 100).")]
     async fn read_file(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -359,10 +342,7 @@ impl SystemMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(
-        description = "Write content to a local file. Can overwrite or append. Creates parent \
-        directories if needed. Use when the user asks to write, save, or create a file."
-    )]
+    #[tool(description = "Write or append content to a local file; creates parent dirs.")]
     async fn write_file(
         &self,
         _ctx: RequestContext<RoleServer>,

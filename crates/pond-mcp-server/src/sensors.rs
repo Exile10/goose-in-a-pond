@@ -21,9 +21,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetSensorReadingParams {
-    /// The device ID (e.g. "bedroom", "kitchen", "sensor-01").
+    /// Room/device name, e.g. "bedroom".
     pub device_id: Option<String>,
-    /// The sensor type (e.g. "temperature", "humidity", "pressure").
+    /// e.g. "temperature", "humidity".
     pub sensor_type: Option<String>,
     #[serde(flatten)]
     #[schemars(skip)]
@@ -32,15 +32,15 @@ pub struct GetSensorReadingParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetSensorHistoryParams {
-    /// The device ID (e.g. "bedroom").
+    /// Room/device name, e.g. "bedroom".
     pub device_id: Option<String>,
-    /// The sensor type (e.g. "temperature").
+    /// e.g. "temperature".
     pub sensor_type: Option<String>,
-    /// ISO 8601 start time, inclusive (e.g. "2024-01-01T00:00:00Z"). Omit for all history.
+    /// ISO 8601 start, inclusive. Omit for all history.
     pub since: Option<String>,
-    /// ISO 8601 end time, exclusive. Omit for up to now.
+    /// ISO 8601 end, exclusive. Omit for up to now.
     pub until: Option<String>,
-    /// Aggregation: "min", "max", "avg", or omit for raw readings.
+    /// "min", "max", or "avg"; omit for raw readings.
     pub agg: Option<String>,
     #[serde(flatten)]
     #[schemars(skip)]
@@ -72,10 +72,9 @@ impl SensorsMcpServer {
         }
     }
 
-    #[tool(description = "\
-Get the latest sensor reading for a device. Use for questions like \
-'What is the temperature in the bedroom?' or 'What is the humidity in the kitchen?'. \
-Pass device_id (the room/device name) and sensor_type ('temperature', 'humidity', etc.).")]
+    #[tool(
+        description = "Get the latest reading for a device. Requires device_id and sensor_type. Never guess values."
+    )]
     async fn get_sensor_reading(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -126,11 +125,9 @@ Pass device_id (the room/device name) and sensor_type ('temperature', 'humidity'
         }
     }
 
-    #[tool(description = "\
-Get sensor reading history for a device within an optional time range. \
-Supports aggregation: pass agg='min', 'max', or 'avg' for a single aggregate value, \
-or omit for the raw time series. Use for 'What was the temperature trend today?' or \
-'What was the peak humidity this week?'.")]
+    #[tool(
+        description = "Get sensor history for a device, optional time range. agg='min'|'max'|'avg' for one value; omit for raw series."
+    )]
     async fn get_sensor_history(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -235,9 +232,9 @@ or omit for the raw time series. Use for 'What was the temperature trend today?'
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "\
-List all sensors (device + type pairs) that have stored readings. Use to discover \
-what sensor data is available (e.g. 'what sensors do you have?', 'which rooms have temperature sensors?').")]
+    #[tool(
+        description = "List all device + sensor_type pairs with stored readings. Use to discover available sensor data."
+    )]
     async fn list_sensors(
         &self,
         _ctx: RequestContext<RoleServer>,
