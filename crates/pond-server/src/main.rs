@@ -1631,18 +1631,19 @@ async fn run_server(
         >);
 
     // Memory extractor — background extraction of durable facts from conversations.
-    let (memory_extractor_for_http, memory_extraction_service_for_http) =
+    // The service is built here but wrapped in an Arc further down, once the
+    // embedding provider exists, so extracted facts can be embedded at write.
+    let (memory_extractor_for_http, memory_extraction_service_unwired) =
         if settings.memory_extraction_enabled {
             let extractor: Arc<dyn pond_core::user_data::ports::memory_extractor::MemoryExtractor> =
                 Arc::new(llm_memory_extractor::LlmMemoryExtractor::new(
                     llm_provider.clone(),
                     settings.memory_extraction_max_facts,
                 ));
-            let service = Arc::new(
+            let service =
                 pond_core::user_data::services::memory_extraction::MemoryExtractionService::new(
                     settings.memory_extraction_interval_secs,
-                ),
-            );
+                );
             tracing::info!(
                 "memory extraction enabled — facts will be auto-extracted from conversations"
             );
@@ -2033,6 +2034,36 @@ async fn run_server(
             }
         }
     };
+
+    // Finish the extraction service now that the embedder is known — every fact
+    // it stores is embedded at write, so it is searchable on the next turn
+    // instead of waiting for a backfill.
+    let memory_extraction_service_for_http = memory_extraction_service_unwired.map(|service| {
+        Arc::new(match &embedding_provider {
+            Some(provider) => service.with_embedding_provider(provider.clone()),
+            None => service,
+        })
+    });
+
+    // ── Embedding backfill ───────────────────────────────────────────────────
+    // Extraction stored `embedding: None` before Phase A, and `search_similar`
+    // ignores unembedded rows entirely — so without this pass the semantic
+    // injection path would see only the handful of rows written by the
+    // `save_memory` MCP tool. Batched with a pause between batches: on a Jetson
+    // this competes with inference for CPU.
+    if let Some(provider) = embedding_provider.clone() {
+        let backfill_repo = memory_repo.clone();
+        tokio::spawn(async move {
+            use pond_core::user_data::services::memory_relevance as relevance;
+            relevance::run_backfill(
+                backfill_repo.as_ref(),
+                provider.as_ref(),
+                relevance::BACKFILL_BATCH_SIZE,
+                relevance::BACKFILL_BATCH_PAUSE_MS,
+            )
+            .await;
+        });
+    }
 
     // ── Agent backend ────────────────────────────────────────────────────────────
     // pond_agent_active is always false while the backend is quarantined (Q2-05).
@@ -5646,7 +5677,7 @@ async fn build_goose_backend(
     match pond_adapters_goose::register_giap_extensions(
         &settings,
         memory_repo.clone(),
-        embedding_provider,
+        embedding_provider.clone(),
         scheduler,
         weather,
         settings_repo.clone(),
@@ -5685,6 +5716,12 @@ async fn build_goose_backend(
             // rolling-summary splice (hybrid compaction).
             let adapter = match session_storage {
                 Some(storage) => adapter.with_giap_session_storage(storage),
+                None => adapter,
+            };
+            // Semantic memory injection: without this the per-turn retrieval
+            // falls back to the keyword LIKE search.
+            let adapter = match embedding_provider {
+                Some(provider) => adapter.with_embedding_provider(provider),
                 None => adapter,
             };
             if voice_mode {

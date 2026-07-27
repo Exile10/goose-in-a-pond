@@ -37,6 +37,22 @@ pub trait MemoryRepository: Send + Sync {
     /// Delete a memory fragment by ID.
     async fn delete(&self, id: &str) -> Result<()>;
 
+    /// Return up to `limit` active fragments that have no stored embedding.
+    ///
+    /// Drives the startup embedding backfill
+    /// (`services::memory_relevance::run_backfill`): extraction historically
+    /// stored `embedding: None`, which makes those rows invisible to
+    /// `search_similar`. Adapters that cannot report this return nothing, and
+    /// the backfill simply finds no work.
+    async fn search_unembedded(&self, _limit: usize) -> Result<Vec<MemoryFragment>> {
+        Ok(vec![])
+    }
+
+    /// Attach (or replace) the embedding vector of an existing fragment.
+    async fn update_embedding(&self, _id: &str, _embedding: &[f32]) -> Result<()> {
+        Ok(())
+    }
+
     /// Search active memories whose content matches any of the given keywords.
     ///
     /// Used for relevance-based retrieval: extract keywords from the user's

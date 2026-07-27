@@ -8,7 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use pond_core::user_data::domain::memory::{
-    MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
+    cosine_similarity, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle,
+    MemorySegment, MemoryTier,
 };
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use serde_json;
@@ -34,20 +35,6 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        0.0
-    } else {
-        dot / (norm_a * norm_b)
-    }
 }
 
 // ── Row helper ────────────────────────────────────────────────────────────────
@@ -286,6 +273,31 @@ impl MemoryRepository for SqliteMemoryRepository {
 
     async fn delete(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM memory_fragments WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn search_unembedded(&self, limit: usize) -> Result<Vec<MemoryFragment>> {
+        // Oldest first: the backfill then walks the store in insertion order,
+        // so an interrupted run resumes where it stopped instead of re-reading
+        // the newest rows every restart.
+        let sql = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE embedding IS NULL AND (lifecycle IS NULL OR lifecycle = 'active') \
+             ORDER BY created_at ASC LIMIT ?"
+        );
+        let rows: Vec<FragmentRow> = sqlx::query_as(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_fragment).collect())
+    }
+
+    async fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
+        sqlx::query("UPDATE memory_fragments SET embedding = ? WHERE id = ?")
+            .bind(vec_to_blob(embedding))
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -755,6 +767,78 @@ mod tests {
         // Empty keywords — no results
         let results = repo.search_by_content(&[], None, 10).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_unembedded_returns_only_rows_without_a_vector() {
+        let (repo, _tmp) = make_repo().await;
+
+        let plain =
+            MemoryFragment::from_chat("plain".to_string(), None, None, "no vec".to_string());
+        let mut embedded =
+            MemoryFragment::from_chat("embedded".to_string(), None, None, "has vec".to_string());
+        embedded.embedding = Some(vec![0.1, 0.2, 0.3, 0.4]);
+        let mut archived = MemoryFragment::from_extraction(
+            "archived".to_string(),
+            None,
+            "archived, no vec".to_string(),
+            MemorySegment::Context,
+            0.2,
+            None,
+        );
+        archived.lifecycle = Some(MemoryLifecycle::Archived);
+
+        repo.add(plain).await.unwrap();
+        repo.add(embedded).await.unwrap();
+        repo.add(archived).await.unwrap();
+
+        let pending = repo.search_unembedded(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "plain");
+    }
+
+    #[tokio::test]
+    async fn update_embedding_makes_a_row_visible_to_similarity_search() {
+        let (repo, _tmp) = make_repo().await;
+        repo.add(MemoryFragment::from_chat(
+            "backfilled".to_string(),
+            None,
+            None,
+            "was unembedded".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        repo.update_embedding("backfilled", &[1.0, 0.0, 0.0, 0.0])
+            .await
+            .unwrap();
+
+        assert!(repo.search_unembedded(10).await.unwrap().is_empty());
+        let stored = repo.search_recent(None, 10).await.unwrap();
+        assert_eq!(stored[0].embedding, Some(vec![1.0, 0.0, 0.0, 0.0]));
+
+        // Now it participates in cosine ranking rather than being ignored.
+        let hits = repo
+            .search_similar(&[1.0, 0.0, 0.0, 0.0], None, 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "backfilled");
+    }
+
+    #[tokio::test]
+    async fn search_unembedded_respects_the_batch_limit_oldest_first() {
+        let (repo, _tmp) = make_repo().await;
+        for i in 0..5 {
+            let mut frag =
+                MemoryFragment::from_chat(format!("m{i}"), None, None, format!("fragment {i}"));
+            frag.created_at = Utc::now() - chrono::Duration::days(10 - i as i64);
+            repo.add(frag).await.unwrap();
+        }
+        let batch = repo.search_unembedded(2).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].id, "m0");
+        assert_eq!(batch[1].id, "m1");
     }
 
     #[tokio::test]
