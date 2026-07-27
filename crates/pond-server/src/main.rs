@@ -1009,12 +1009,22 @@ async fn run_server(
     };
 
     // Q2-05: pond-agent is quarantined — experimental backend not ready for production.
-    // Force goose even if the setting was written as "pond".
+    // Force goose even if the setting was written as "pond", and PERSIST the
+    // correction: a stored "pond" row bricks the desktop Settings page —
+    // the UI saves the full settings object, so every PUT echoes the stored
+    // value back and trips the 422 quarantine guard regardless of what the
+    // user actually edited. Healing the row at startup keeps the guard's job
+    // to its intent (rejecting a genuine switch TO "pond").
     let agent_backend: &str = if agent_backend == "pond" {
         tracing::warn!(
             "pond-agent backend is quarantined (not production-ready); \
-             falling back to goose. Set agent_backend to \"goose\" in Settings to suppress this warning."
+             falling back to goose and repairing the stored setting."
         );
+        let mut healed = settings.clone();
+        healed.agent_backend = "goose".to_string();
+        if let Err(e) = settings_repo_early.update(&healed).await {
+            tracing::warn!("could not persist agent_backend repair: {e}");
+        }
         "goose"
     } else {
         agent_backend
