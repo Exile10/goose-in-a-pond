@@ -26,16 +26,16 @@ function SkeletonLogRow() {
   return (
     <div className="logrow" style={{ opacity: 0.45 }}>
       <code className="logrow__ts">
-        <span style={{ display: "inline-block", width: 56, height: 10, background: "#e2e8f0", borderRadius: 4, verticalAlign: "middle" }} />
+        <span style={{ display: "inline-block", width: 56, height: 10, background: "var(--grey-200)", borderRadius: 4, verticalAlign: "middle" }} />
       </code>
       <span className="logrow__lvl logrow__lvl--info">
-        <span style={{ display: "inline-block", width: 36, height: 10, background: "#bfdbfe", borderRadius: 4, verticalAlign: "middle" }} />
+        <span style={{ display: "inline-block", width: 36, height: 10, background: "var(--grey-200)", borderRadius: 4, verticalAlign: "middle" }} />
       </span>
       <code className="logrow__src">
-        <span style={{ display: "inline-block", width: 48, height: 10, background: "#e2e8f0", borderRadius: 4, verticalAlign: "middle" }} />
+        <span style={{ display: "inline-block", width: 48, height: 10, background: "var(--grey-200)", borderRadius: 4, verticalAlign: "middle" }} />
       </code>
       <span className="logrow__msg">
-        <span style={{ display: "inline-block", width: "60%", height: 10, background: "#f1f5f9", borderRadius: 4, verticalAlign: "middle" }} />
+        <span style={{ display: "inline-block", width: "60%", height: 10, background: "var(--grey-200)", borderRadius: 4, verticalAlign: "middle" }} />
       </span>
     </div>
   );
@@ -152,9 +152,9 @@ export function LogsDetail({ go }: LogsDetailProps) {
             padding: "8px 12px",
             borderRadius: 6,
             fontSize: 13,
-            background: "#fffbeb",
-            color: "#92400e",
-            border: "1px solid #fde68a",
+            background: "var(--color-warning-soft)",
+            color: "var(--color-warning-fg)",
+            border: "1px solid var(--color-warning)",
           }}
           role="status"
           aria-live="polite"
@@ -193,13 +193,13 @@ export function LogsDetail({ go }: LogsDetailProps) {
             gap: 6,
             fontSize: 13,
             fontWeight: 700,
-            color: "#7C3AED",
+            color: "var(--pp)",
             cursor: "pointer",
             fontFamily: "inherit",
           }}
           aria-label="Export logs as CSV"
         >
-          <Download size={13} color="#7C3AED" strokeWidth={2} /> Export
+          <Download size={13} color="var(--pp)" strokeWidth={2} /> Export
         </button>
       </div>
 
