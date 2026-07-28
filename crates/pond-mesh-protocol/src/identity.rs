@@ -32,6 +32,13 @@ impl MeshKeypair {
         PeerId::from(self.0.verifying_key().to_bytes())
     }
 
+    /// The raw 32-byte secret seed, for adapters that need to reconstruct an
+    /// equivalent keypair in a different library's type (e.g. libp2p's own
+    /// `identity::Keypair`) so both speak as the same [`PeerId`].
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.0.sign(message).to_bytes()
     }
