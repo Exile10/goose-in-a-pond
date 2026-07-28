@@ -4,6 +4,27 @@ Welcome to the GIAP documentation. This index covers architecture, development g
 
 ---
 
+## Start here
+
+```bash
+bash scripts/giap.sh          # install, build, service, logs, doctor
+bash scripts/giap.sh doctor   # health check; exits 1 on any FAIL
+```
+
+`scripts/giap.sh` is the primary interface for installing, building, running and
+maintaining GIAP on any host. It detects the platform (Jetson / Linux / macOS)
+and whether CUDA is usable, and its doctor is the first step for any "why is
+this broken" question.
+
+| Document | Description |
+|---|---|
+| [Installation Guide](./developer/installation.md) | What `giap.sh install` does, and the underlying `install.sh` flags |
+| [Jetson build & run](./jetson-build-and-run.txt) | Operational guide for the Orin Nano — the traps, the measured numbers, the verification commands |
+| [Jetson dev routine](./developer/jetson-dev-routine.md) | Day-to-day loop against the device: ssh alias, service, deploy |
+| [scripts/jetson/README.md](../scripts/jetson/README.md) | The Jetson-specific verbs `giap.sh` delegates to |
+
+---
+
 ## Architecture
 
 | Document | Description |

@@ -47,6 +47,13 @@ Detailed design docs live under `docs/architecture/` and `docs/creating-ports-an
 
 ## Commands
 
+**`bash scripts/giap.sh` is the primary interface** — a menu-driven front door for
+install, build, service control, logs and diagnostics that auto-detects the host
+(Jetson / Linux / macOS) and whether CUDA is usable. Non-interactive:
+`giap.sh install|build|doctor|status|deploy|logs`, plus `--dry-run` and `-y`.
+`giap.sh doctor` exits 1 on any FAIL and is the fastest way to find a broken
+install. The raw commands below are what it runs, and remain the escape hatch.
+
 CI is the source of truth for canonical invocations: `.github/workflows/ci.yml`.
 
 ### Rust workspace
@@ -70,10 +77,6 @@ cargo run -p pond-server -- setup [--model tiny|base|small]
 cargo run -p pond-server -- chat  [--provider mock|llamafile|ollama] [--model M]
 cargo run -p pond-server -- status
 ```
-
-`bash scripts/giap.sh` is the menu-driven front door for all of the above plus
-build/install/service/GUI and a `doctor` that checks the known traps
-(`scripts/giap.sh doctor` is non-interactive and exits 1 on any FAIL).
 
 The server writes the port it actually bound to `<data_dir>/.runtime_api_port` —
 read that rather than assuming, since `--port` is optional and the fallback walks

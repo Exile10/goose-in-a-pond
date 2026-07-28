@@ -1,64 +1,69 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# GIAP — Jetson Orin Nano Build Targets
+# GIAP — convenience targets.
 #
-# Cross-compilation (from macOS or x86 Linux):
-#   Prerequisites: cargo install cross --locked  +  Docker running
+# The primary interface is the menu-driven control script:
 #
-# Native build (on the Jetson itself):
-#   Run:  bash scripts/build-jetson-native.sh [--cuda]
+#     bash scripts/giap.sh            # install, build, service, logs, doctor
+#     bash scripts/giap.sh doctor     # non-interactive health check, exit 1 on FAIL
+#
+# It detects the host (Jetson / Linux / macOS) and whether CUDA is usable, and
+# picks the right feature flags. This Makefile only forwards to it.
+#
+# Jetson-specific verbs live in scripts/jetson.sh (deploy | build | docker-build
+# | optimize | probe-mlc).
+#
+# The old cross-compilation targets were removed. They did not work for the path
+# that matters: nvcc has to target the device architecture, so a CUDA build must
+# happen ON the Jetson. They also referenced scripts/build-jetson-native.sh,
+# which does not exist, and deployed to a host and directory that no longer do
+# either. Use `make deploy` below, which routes through the real deploy script.
 # ─────────────────────────────────────────────────────────────────────────────
 
-JETSON_TARGET := aarch64-unknown-linux-gnu
-JETSON_HOST   ?= jetson@192.168.1.100
-DEPLOY_DIR    ?= /opt/giap
+.PHONY: install build ui server desktop doctor status deploy docker-build test fmt help
 
-SERVER_BIN    := target/$(JETSON_TARGET)/release/pond-server
+## install       Install GIAP on this host (guardrailed; delegates to install.sh)
+install:
+	bash scripts/giap.sh install
 
-.PHONY: server server-cuda desktop deploy help
+## build         Build the web UI + pond-server with this host's correct features
+build:
+	bash scripts/giap.sh build
 
-## server        Cross-compile pond-server for Jetson (CPU only, no CUDA)
+## ui            Build only the web UI (embedded into the server at compile time)
+ui:
+	bash scripts/giap.sh build-ui
+
+## server        Build only pond-server (release, host-appropriate features)
 server:
-	SQLX_OFFLINE=true cross build -p pond-server \
-	  --target $(JETSON_TARGET) \
-	  --release
-	@echo ""
-	@echo "Binary: $(SERVER_BIN)"
+	bash scripts/giap.sh build
 
-## server-cuda   Show native CUDA build command (run on the Jetson, not here)
-server-cuda:
-	@echo ""
-	@echo "CUDA cross-compilation requires the CUDA ARM64 sysroot and is not"
-	@echo "supported via the cross tool. Build natively on the Jetson instead:"
-	@echo ""
-	@echo "  ssh $(JETSON_HOST)"
-	@echo "  cd /path/to/giap"
-	@echo "  SQLX_OFFLINE=true cargo build -p pond-server \\"
-	@echo "    --features pond-adapters-local-inference/cuda \\"
-	@echo "    --release"
-	@echo ""
-	@echo "Or run the helper script:"
-	@echo "  bash scripts/build-jetson-native.sh --cuda"
-	@echo ""
-
-## desktop       Cross-compile Tauri desktop for ARM64 Linux (deb bundle)
+## desktop       Build the Tauri desktop app (with the custom-protocol feature)
 desktop:
-	@echo "Building frontend..."
-	cd pond-desktop && npm run build
-	@echo "Building Tauri app for $(JETSON_TARGET)..."
-	cd pond-desktop && cargo tauri build \
-	  --target $(JETSON_TARGET) \
-	  --bundles deb
-	@echo ""
-	@echo "Bundle: pond-desktop/src-tauri/target/$(JETSON_TARGET)/release/bundle/"
+	bash scripts/giap.sh build-desktop
 
-## deploy        Cross-compile + scp server binary to Jetson
-##               Override host: make deploy JETSON_HOST=user@ip
-deploy: server
-	@echo "Deploying to $(JETSON_HOST):$(DEPLOY_DIR)..."
-	ssh $(JETSON_HOST) "mkdir -p $(DEPLOY_DIR)"
-	scp $(SERVER_BIN) $(JETSON_HOST):$(DEPLOY_DIR)/pond-server
-	@echo "Done. Run on device:"
-	@echo "  ssh $(JETSON_HOST) '$(DEPLOY_DIR)/pond-server'"
+## doctor        Health check — submodule drift, CUDA build, service scope, disk
+doctor:
+	bash scripts/giap.sh doctor
+
+## status        Print the detection banner for this host
+status:
+	bash scripts/giap.sh status
+
+## deploy        Build the UI here, sync it, and build on the Jetson over ssh
+deploy:
+	bash scripts/jetson.sh deploy
+
+## docker-build  aarch64 CPU-only binary via a linux/arm64 container (no CUDA)
+docker-build:
+	bash scripts/jetson.sh docker-build
+
+## test          Run the fast-crate test suite (mirrors ci.yml)
+test:
+	SQLX_OFFLINE=true cargo test -p pond-core -p pond-api -p pond-infra
+
+## fmt           Format the workspace
+fmt:
+	cargo fmt
 
 ## help          Show this help
 help:

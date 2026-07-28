@@ -25,6 +25,28 @@ Without both, you will repeat decisions that have already been made — or unmad
 
 ---
 
+## 1b. Front Door — `scripts/giap.sh`
+
+Before proposing any build command on a real host, run:
+
+```bash
+bash scripts/giap.sh status     # detection banner
+bash scripts/giap.sh doctor     # read-only checks; exits 1 on any FAIL
+```
+
+`giap.sh` is the menu-driven entry point for install, build, service control,
+logs and diagnostics. It detects the host (Jetson / Linux / macOS) and whether
+CUDA is *actually* usable, and it emits the correct feature string for the
+machine — prefer `bash scripts/giap.sh build` over hardcoding one.
+
+Its doctor is the only thing that catches the failures this repo has shipped
+silently: goose submodule drift, a build with no CUDA feature that runs on the
+CPU while logging what looks like success, a placeholder dashboard the server
+cannot self-detect, two service units at different scopes, duplicate
+`pond-server` processes each loading a model, and a stray `target/debug` binary
+that `--native` prefers over release.
+
+
 ## 2. Build Strategy — Fast vs. Full
 
 There are two compile paths with radically different costs:
@@ -39,24 +61,30 @@ There are two compile paths with radically different costs:
 
 ---
 
-## 3. The Workspace Exclusion Constraint — Read This First
+## 3. The rmcp Pin — Read This First
 
-Several crates are intentionally **excluded from `[workspace.members]`** and listed in `[workspace.exclude]` instead:
+**Corrected 2026-07-28.** This section used to claim that the Goose-dependent
+crates were excluded from `[workspace.members]` and listed in
+`[workspace.exclude]`. That is false and was actively dangerous: there is no
+`[workspace.exclude]` section in `Cargo.toml` at all, and every crate it named —
+`pond-adapters-goose`, `pond-mcp-server`, `pond-adapters-mcp-memory`,
+`pond-adapters-local-inference`, `pond-adapters-weather`,
+`pond-infra-scheduler` — **is** a workspace member. An agent obeying the old
+instruction would have "fixed" a working manifest by deleting them.
 
-- `pond-adapters-goose`
-- `pond-mcp-server`
-- `pond-adapters-mcp-memory`
-- `pond-adapters-local-inference`
-- `pond-adapters-weather`
-- `pond-infra-scheduler`
-
-**Why:** Goose's `code-mode` feature requires `rmcp ^0.14`; another feature requires `rmcp 1.2`. These are irreconcilable in a single workspace resolution.
+The real constraint is a single pinned dependency. Goose declares `rmcp ^1.4`;
+the workspace forces `rmcp = "=1.5.0"` in `[workspace.dependencies]` so the
+submodule and `pond-mcp-server` resolve to one rmcp with the union of features.
 
 **What this means for you:**
-- Never add a Goose-dependent crate to `[workspace.members]` — the build will fail.
 - Always use `default-features = false` on any `goose` dependency.
 - Never enable the `code-mode` feature.
-- Use `-p <crate>` directly to build/test these crates.
+- Do not change the `rmcp` pin without checking both the submodule and
+  `pond-mcp-server` still resolve.
+- The crates that pull Goose or heavy native libs are excluded from the *CI
+  fast-crate lint/test pass* (see `.github/workflows/ci.yml`), not from the
+  workspace. They are covered by the `cargo check -p pond-server
+  -p pond-adapters-goose` gate.
 
 ---
 
@@ -138,14 +166,27 @@ These cost significant debugging time and are documented so you don't repeat the
 
 ---
 
-## 9. Port Management — Compile-Time Only
+## 9. Port Management
 
-All network port constants live in **`crates/pond-server/src/ports.rs`**. There are no `--port` or `--whisper-url` CLI flags. If a port is blocked, the server tries the next port in arithmetic sequence automatically.
+Port **defaults** live in `crates/pond-server/src/ports.rs`:
+`API_SERVER = 4000`, `WHISPER = 9000`, `LLAMAFILE = 8080`, `PIPER_TTS = 8282`,
+`MAX_TRIES = 10`.
+
+`serve --port PORT` **does** exist (this section previously said it did not).
+When it is omitted the server starts at `API_SERVER` and walks upward through
+`MAX_TRIES` — so the real fallback is `4000..4009`, not the
+`80 -> 8080 -> 4000 -> 5000` order some older docs claim.
+
+**Never guess the live port.** The server writes the port it actually bound to
+`<data_dir>/.runtime_api_port`. Read that file — `scripts/giap.sh` does, and it
+is why its banner can report the real port when two servers are running.
 
 - GIAP-owned sockets: `bind_with_fallback(host, start)` — holds the socket, no TOCTOU.
 - External child processes (whisper, llamafile, qwen-tts): `find_free_port(start)` — bind-test-release.
 
-To change a port: edit `ports.rs` and recompile. Do not add runtime config for this.
+To change a *default*: edit `ports.rs` and recompile. To change the port for one
+run: pass `--port`, and always pass it explicitly when a service already holds
+one, or you will silently start a second server.
 
 ---
 
@@ -244,7 +285,7 @@ GIAP is structured across five conceptual layers. When adding features, identify
 │               (web/dist, tower-http ServeDir)          │
 ├────────────────────────────────────────────────────────┤
 │  1. OS Layer — Linux, drivers, models on disk          │
-│               (scripts/jetson/, setup.sh)              │
+│               (scripts/giap.sh, install.sh)              │
 └────────────────────────────────────────────────────────┘
 ```
 

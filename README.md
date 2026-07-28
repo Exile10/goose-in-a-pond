@@ -75,31 +75,82 @@ pond-desktop                (Tauri 2 desktop app — React + Rust)
 
 ## Getting Started
 
-### Prerequisites
-
-- **Rust** stable (install via [rustup](https://rustup.rs))
-- **Git** with submodule support
-- For voice: [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server + [Piper](https://github.com/rhasspy/piper) binary
-
-## Fork the repository.  
-
-### 1. Clone
-
 ```bash
 git clone --recursive https://github.com/your-username/goose-in-a-pond.git
 cd goose-in-a-pond
+bash scripts/giap.sh
 ```
-[Click here](https://github.com/settings/tokens/new) to generate a new access token when asked for password, copy token generated and paste it in the password field.
 
-### 2. Build
+**`scripts/giap.sh` is the front door.** It is a menu-driven control script for
+install, build, service management, logs and diagnostics. It detects the host
+(Jetson / generic Linux / macOS), whether CUDA is actually usable, and the known
+bad states *before* you hit them — then offers only the actions that make sense
+on that machine.
 
 ```bash
-# Fast build — skips Goose compilation (~2s)
-cargo build -p pond-core -p pond-infra -p pond-api -p pond-server
-
-# Full workspace — compiles Goose from the submodule (~10 min first time)
-cargo build --workspace
+bash scripts/giap.sh install     # first-time install on this host (-y to skip prompts)
+bash scripts/giap.sh build       # web UI + pond-server, correct features for this host
+bash scripts/giap.sh doctor      # health report; exits 1 on any FAIL
+bash scripts/giap.sh status      # detection banner only
+bash scripts/giap.sh --dry-run … # print every command instead of running it
 ```
+
+Run `doctor` after any install or deploy. It is the only thing that catches the
+failures this project has historically shipped silently: a goose submodule the
+parent commit did not move, a build without the CUDA feature that runs on the CPU
+while looking fine, a placeholder dashboard the server itself cannot detect, two
+service units competing for one port, and a stray `target/debug` binary that
+`--native` prefers over your release build.
+
+### Prerequisites
+
+- **Rust** stable (install via [rustup](https://rustup.rs)) — `giap.sh install` will fetch it if missing
+- **Git** with submodule support
+- **Node ≥ 20** to build the web UI (older Node can still run the server; the UI must then be built elsewhere and copied in)
+- Voice models are downloaded for you by `pond-server setup`
+
+### Building by hand
+
+`giap.sh` exists so you don't have to, but the underlying commands are:
+
+```bash
+# The genuinely fast set — no Goose, no llama-cpp-2
+SQLX_OFFLINE=true cargo build -p pond-core -p pond-infra -p pond-api
+
+# pond-server pulls Goose AND llama-cpp-2 through its default features,
+# so this is a 10-35 minute cold build, not a fast one
+SQLX_OFFLINE=true cargo build -p pond-server --release
+```
+
+Build the web UI **before** the server, or the binary embeds a placeholder
+dashboard: `cd pond-desktop && npm run build`. The server cannot warn you about
+this — `giap.sh doctor` is the only detector.
+
+### Jetson Orin Nano
+
+Deploy from your dev machine (the Jetson's Node is too old to build the UI, so
+the UI is built locally and synced):
+
+```bash
+bash scripts/giap.sh deploy      # wraps scripts/jetson.sh deploy with a safety check
+```
+
+Two things that bite: the deploy **hard-resets the device** to `origin/<branch>`,
+and the device's `origin` is your personal fork — pushing only to the org remote
+deploys stale code and reports success. `giap.sh deploy` refuses unless HEAD is on
+both. See **[scripts/jetson/README.md](./scripts/jetson/README.md)** and
+**[docs/jetson-build-and-run.txt](./docs/jetson-build-and-run.txt)**.
+
+### Running as a service
+
+```bash
+bash scripts/giap.sh             # menu 20 installs a user systemd unit
+```
+
+It installs a **user** unit and enables `loginctl enable-linger` so it survives
+logout and starts at boot. Note `scripts/install.sh` writes a *system* unit of the
+same name — having both means two servers, each loading its own model into the
+same memory. `giap.sh` refuses to create a second one.
 
 ### 3. First-time setup
 
