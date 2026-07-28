@@ -941,6 +941,40 @@ impl GooseAdapter {
         !voice && Self::model_supports_vision(provider, model)
     }
 
+    /// Whether THIS turn's system prompt should carry the `<thinking>` section
+    /// (and, in step with it, the engine's `enable_thinking` request-param).
+    ///
+    /// Voice mode always says no: reasoning tokens waste TTS time and leak as
+    /// spoken text if any filter layer misses them.
+    ///
+    /// In `"auto"` the answer comes from the model NAME, deliberately, and not
+    /// from the `model_capabilities` cache. That cache is only refreshed inside
+    /// the provider-SWAP branch of `ensure_provider_current`, which runs LATER
+    /// in the same turn that builds the prompt. On the first turn of a process
+    /// it therefore still holds `ModelCapabilities::default()`, whose `thinking`
+    /// is false — so turn 1 rendered a prompt without the section and turn 2
+    /// rendered one with it, 78 characters appearing at the top of the static
+    /// prefix. That moved `prefix_hash`, and with it the engine's KV
+    /// prompt-session prefix, so every session paid one full re-prefill on its
+    /// second turn: 3.7 s on the Orin, for the turn the cache exists to make
+    /// nearly free. `from_model_name` is pure and cheap, and agrees with the
+    /// cache the moment the cache is right.
+    fn thinking_section_applies(mode: &str, model: &str, voice: bool) -> bool {
+        if voice {
+            return false;
+        }
+        match mode {
+            "on" => true,
+            "off" => false,
+            _ => {
+                pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
+                    model,
+                )
+                .thinking
+            }
+        }
+    }
+
     /// Append the `<vision>` section to a prompt template when the model can see.
     ///
     /// Appended to the TEMPLATE, before Tera runs, rather than to the rendered
@@ -2027,20 +2061,8 @@ impl GooseAdapter {
         // engine-level `enable_thinking` request-param (B4). Previously only the
         // prompt knew, so the engine kept its registry default of `true` and the
         // ThoughtFilter had to mop up the leakage.
-        let thinking_enabled = if is_voice {
-            false
-        } else {
-            let caps = self
-                .model_capabilities
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            match settings.thinking_mode.as_str() {
-                "on" => true,
-                "off" => false,
-                _ => caps.thinking, // "auto" — enable when model supports it
-            }
-        };
+        let thinking_enabled =
+            Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
 
         let prompt_state = {
             use chrono::Local;
@@ -3427,6 +3449,45 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── thinking section stability ────────────────────────────────────────
+
+    /// The regression that cost a full re-prefill on every session's second
+    /// turn: in "auto", turn 1 and turn 2 must agree, which they only do if the
+    /// answer comes from the model name rather than a cache filled in later.
+    #[test]
+    fn auto_thinking_is_decided_by_the_model_name_alone() {
+        assert!(GooseAdapter::thinking_section_applies(
+            "auto",
+            "gemma-4-E2B-it",
+            false
+        ));
+        assert!(!GooseAdapter::thinking_section_applies(
+            "auto",
+            "llama-3.2-3b",
+            false
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_modes_ignore_the_model_and_voice_always_wins() {
+        assert!(GooseAdapter::thinking_section_applies(
+            "on",
+            "llama-3.2-3b",
+            false
+        ));
+        assert!(!GooseAdapter::thinking_section_applies(
+            "off",
+            "gemma-4-E2B-it",
+            false
+        ));
+        for mode in ["on", "off", "auto"] {
+            assert!(
+                !GooseAdapter::thinking_section_applies(mode, "gemma-4-E2B-it", true),
+                "voice mode must suppress <thinking> regardless of mode ({mode})"
+            );
+        }
+    }
 
     // ── context window precedence ─────────────────────────────────────────
 
