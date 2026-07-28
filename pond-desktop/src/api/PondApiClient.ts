@@ -17,6 +17,7 @@ import {
   type HealthResponse,
   type HfModel,
   type HfModelFile,
+  type ImageAttachment,
   type LlamafileRelease,
   type LogEntry,
   type MarketplaceExtension,
@@ -803,6 +804,7 @@ export class PondApiClient {
         created_at: m.created_at as string,
         tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
         tool_call_id: m.tool_call_id as string | undefined,
+        images: m.images as SessionMessage["images"],
       }));
     });
   }
@@ -872,13 +874,21 @@ export class PondApiClient {
     sessionId?: string,
     token?: string,
     canvasMode?: boolean,
+    images?: ImageAttachment[],
   ): AsyncGenerator<ChatEvent> {
     const reqBody: ChatStreamRequest = {
       message,
       session_id: sessionId,
       canvas_mode: canvasMode ?? false,
+      // Only set when non-empty so text-only turns keep today's exact body.
+      ...(images && images.length > 0 ? { images } : {}),
     };
     yield* this.streamSse("/api/v1/chat/stream", reqBody, token);
+  }
+
+  /** Absolute URL for a persisted chat-image attachment (see SessionMessageImage.url). */
+  sessionAttachmentUrl(sessionId: string, attachmentId: string): string {
+    return `${this.base}/api/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`;
   }
 
   /**

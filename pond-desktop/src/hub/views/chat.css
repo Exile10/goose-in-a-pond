@@ -404,6 +404,105 @@
   color: var(--color-destructive);
 }
 
+/* Image(s) inside a chat bubble — sent live or replayed from history */
+.ch-bubble__images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.ch-bubble__image {
+  max-height: 160px;
+  max-width: 200px;
+  object-fit: cover;
+  border-radius: 12px;
+  display: block;
+}
+
+/* Attach-image button — ghost icon button, sits next to the mic button */
+.ch-attach {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--color-surface);
+  color: var(--mut);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.ch-attach:hover:not(:disabled) {
+  border-color: var(--pp-100);
+  background: var(--pp-50);
+  color: var(--pp);
+}
+
+.ch-attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Pending attachment tray — shown above the input row while images are queued */
+.attachment-tray {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 24px 10px;
+}
+
+.attachment-tray__item {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.attachment-tray__thumb {
+  width: 56px;
+  height: 56px;
+  border-radius: 10px;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  display: block;
+}
+
+.attachment-tray__remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: var(--color-destructive, #FF3B30);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.attachment-tray__count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--mut);
+  margin-left: 4px;
+}
+
+/* Attach/paste validation error, shown above the input row */
+.attach-error {
+  padding: 0 24px 8px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-destructive, #FF3B30);
+}
+
 /* Turn budget exhausted — resume affordance below the agent bubble */
 .turn-limit {
   display: flex;

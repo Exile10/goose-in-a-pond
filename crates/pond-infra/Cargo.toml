@@ -25,6 +25,10 @@ sha2 = "0.10"
 hmac = { workspace = true }
 rand = "0.8"
 base64 = { workspace = true }
+# Phase F2: image attachments are stored as files under the OS data dir; the
+# adapter resolves that dir itself (POND_DATA_DIR override first) rather than
+# having it threaded down from pond-server, mirroring model_download.rs.
+dirs = { workspace = true }
 subtle = { workspace = true }
 once_cell = { workspace = true }
 

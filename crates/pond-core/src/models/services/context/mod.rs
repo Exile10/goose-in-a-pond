@@ -11,9 +11,12 @@
 //!   compaction can be triggered proactively.
 //! - [`compact_encoding`] — compact wire encoding for compacted history blocks.
 //! - [`turn_budget`] — the per-request reasoning-budget note shown to the model.
+//! - [`image_history`] — how many historical image attachments are replayed as
+//!   real pixels rather than a text placeholder.
 pub mod compact_encoding;
 pub mod context_budget;
 pub mod context_compactor;
 pub mod context_monitor;
+pub mod image_history;
 pub mod turn_budget;
 pub mod turn_trimmer;

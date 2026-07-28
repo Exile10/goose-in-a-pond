@@ -38,6 +38,26 @@ impl SessionMessage {
     }
 }
 
+/// Metadata for one persisted image attachment (phase F2).
+///
+/// The bytes themselves live outside the database — `pond_system.db` is read on
+/// every turn and every session listing, and a megabyte-per-row BLOB would bloat
+/// its page cache for data that is only ever fetched whole and rarely. The
+/// storage adapter owns the file layout; nothing above it should parse
+/// `file_path`, which exists for operators debugging a session by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAttachment {
+    pub id: String,
+    pub message_id: String,
+    pub session_id: String,
+    /// Position within its message, 0-based. Preserves "the first picture".
+    pub ordinal: u32,
+    pub mime_type: String,
+    /// Decoded size on disk. Lets a client render a size without a fetch.
+    pub byte_size: u64,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Represents a conversation session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {

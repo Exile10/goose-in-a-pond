@@ -279,6 +279,86 @@ fn strip_turn_context(messages: &[Message]) -> Option<Vec<Message>> {
     )
 }
 
+/// Provider names whose format layer already relocates tool-result images
+/// correctly, so promotion must NOT run for them.
+///
+/// `formats/openai.rs`, `formats/google.rs` and `formats/databricks.rs` each
+/// pull an image out of a tool response and re-host it as a following user
+/// message. Promoting on top of that would send every camera frame twice.
+fn provider_relocates_tool_images(provider_name: &str) -> bool {
+    !matches!(provider_name, "local" | "gguf")
+}
+
+/// Lift images out of tool responses into a top-level user message (phase F3).
+///
+/// # Why this is here and not in the engine
+///
+/// A GIAP MCP tool CAN return `rmcp` image content — that part of the protocol
+/// works. Two things in the goose local-inference engine stop it reaching the
+/// model, and both are fork-side:
+///
+/// 1. `goose-local-inference/src/multimodal.rs` matches only a TOP-LEVEL
+///    `MessageContent::Image`. `MessageContent::ToolResponse(_)` falls into its
+///    catch-all arm, so images nested in a tool result are never extracted for
+///    mtmd.
+/// 2. `goose-local-inference/src/lib.rs` calls `strip_image_parts_from_messages`
+///    unconditionally — with no vision guard — replacing the `image_url` part
+///    that `formats/openai.rs` helpfully relocates with an apology string.
+///
+/// The shim is the one boundary that sees the final `(system, messages, tools)`
+/// before the provider does, so promoting here puts the image exactly where the
+/// engine's extractor looks, without touching the submodule. When the fork gains
+/// a proper tool-result image path this function becomes a no-op and can go.
+///
+/// Returns `None` when there is nothing to promote, so the common case does not
+/// clone the conversation.
+fn promote_tool_result_images(messages: &[Message], max_images: usize) -> Option<Vec<Message>> {
+    use goose::conversation::message::MessageContent;
+    use rmcp::model::RawContent;
+
+    // Newest-first: when a session has accumulated several looks at a camera,
+    // the most recent frame is the one being asked about.
+    let mut promoted: Vec<(String, String)> = Vec::new();
+    'outer: for msg in messages.iter().rev() {
+        for content in msg.content.iter().rev() {
+            let MessageContent::ToolResponse(tr) = content else {
+                continue;
+            };
+            let Ok(result) = &tr.tool_result else {
+                continue;
+            };
+            for part in result.content.iter().rev() {
+                if let RawContent::Image(img) = &part.raw {
+                    promoted.push((img.data.clone(), img.mime_type.clone()));
+                    if promoted.len() >= max_images {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    if promoted.is_empty() {
+        return None;
+    }
+    // Restore chronological order for the model.
+    promoted.reverse();
+
+    let mut out = messages.to_vec();
+    // A dedicated trailing user message rather than editing an existing one:
+    // rewriting a tool-response message would break the call/response pairing
+    // every provider validates, and appending to the last user message would
+    // reorder it after its own assistant reply.
+    let mut carrier = Message::user().with_text(
+        "The images below are the frames returned by the tool call above. Describe only what \
+         you can actually see in them.",
+    );
+    for (data, mime) in &promoted {
+        carrier = carrier.with_image(data, mime);
+    }
+    out.push(carrier);
+    Some(out)
+}
+
 /// Retain only allow-listed tools. Returns `None` when nothing was vetoed.
 fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Vec<Tool>> {
     let allowed = allowed.as_ref()?;
@@ -425,6 +505,20 @@ impl Provider for GiapProviderShim {
 
         let enforced_system = enforce_system(system, &prefix, &[&turn_apx, &ext_apx]);
         let stripped_messages = strip_turn_context(messages);
+        // Phase F3: run AFTER the turn-context strip so the promoted carrier is
+        // built from the messages the provider will actually receive.
+        let promoted_messages = if provider_relocates_tool_images(self.inner.get_name()) {
+            None
+        } else {
+            promote_tool_result_images(
+                stripped_messages.as_deref().unwrap_or(messages),
+                pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN,
+            )
+        };
+        let final_messages: &[Message] = promoted_messages
+            .as_deref()
+            .or(stripped_messages.as_deref())
+            .unwrap_or(messages);
         let vetoed_tools = enforce_tools(tools, &allowed);
         // Minify AFTER the veto so we never pay for tools about to be dropped.
         let minified_tools = minify_tools(vetoed_tools.as_deref().unwrap_or(tools));
@@ -433,11 +527,16 @@ impl Provider for GiapProviderShim {
             .or(vetoed_tools.as_deref())
             .unwrap_or(tools);
 
-        if enforced_system.is_some() || stripped_messages.is_some() || vetoed_tools.is_some() {
+        if enforced_system.is_some()
+            || stripped_messages.is_some()
+            || vetoed_tools.is_some()
+            || promoted_messages.is_some()
+        {
             tracing::debug!(
                 system_rebuilt = enforced_system.is_some(),
                 turn_context_stripped = stripped_messages.is_some(),
                 tools_vetoed = vetoed_tools.is_some(),
+                tool_images_promoted = promoted_messages.is_some(),
                 "GIAP provider shim enforced ownership"
             );
         }
@@ -467,7 +566,7 @@ impl Provider for GiapProviderShim {
             .stream(
                 model_config,
                 enforced_system.as_deref().unwrap_or(system),
-                stripped_messages.as_deref().unwrap_or(messages),
+                final_messages,
                 final_tools,
             )
             .await
@@ -580,6 +679,118 @@ mod tests {
     fn clean_messages_are_not_cloned() {
         let msg = Message::user().with_text("hello");
         assert!(strip_turn_context(&[msg]).is_none());
+    }
+
+    // ── F3: tool-result image promotion ──────────────────────────────────
+
+    fn image_tool_response(id: &str, note: &str, images: &[(&str, &str)]) -> Message {
+        let mut parts = vec![rmcp::model::Content::text(note.to_string())];
+        for (data, mime) in images {
+            parts.push(rmcp::model::Content::image(
+                data.to_string(),
+                mime.to_string(),
+            ));
+        }
+        Message::user().with_tool_response(id, Ok(rmcp::model::CallToolResult::success(parts)))
+    }
+
+    fn top_level_images(msg: &Message) -> Vec<(String, String)> {
+        msg.content
+            .iter()
+            .filter_map(|c| match c {
+                goose::conversation::message::MessageContent::Image(i) => {
+                    Some((i.data.clone(), i.mime_type.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_only_conversation_is_not_cloned() {
+        let msgs = vec![
+            Message::user().with_text("hi"),
+            tool_text_response("call-1", "the door is locked"),
+        ];
+        assert!(promote_tool_result_images(&msgs, 4).is_none());
+    }
+
+    fn tool_text_response(id: &str, body: &str) -> Message {
+        Message::user().with_tool_response(
+            id,
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(body.to_string()),
+            ])),
+        )
+    }
+
+    #[test]
+    fn a_tool_result_image_is_promoted_to_a_trailing_user_message() {
+        let msgs = vec![
+            Message::user().with_text("what is at the door?"),
+            image_tool_response("call-1", "front-door frame", &[("AAAA", "image/jpeg")]),
+        ];
+        let out = promote_tool_result_images(&msgs, 4).expect("an image was returned");
+        assert_eq!(out.len(), 3, "the original messages are kept intact");
+        // The tool response itself is untouched — rewriting it would break the
+        // call/response pairing providers validate.
+        assert_eq!(out[1].content.len(), msgs[1].content.len());
+        let carrier = out.last().unwrap();
+        assert_eq!(
+            top_level_images(carrier),
+            vec![("AAAA".to_string(), "image/jpeg".to_string())]
+        );
+    }
+
+    #[test]
+    fn several_frames_keep_chronological_order() {
+        let msgs = vec![
+            image_tool_response("call-1", "older", &[("AAAA", "image/jpeg")]),
+            image_tool_response("call-2", "newer", &[("BBBB", "image/jpeg")]),
+        ];
+        let out = promote_tool_result_images(&msgs, 4).unwrap();
+        assert_eq!(
+            top_level_images(out.last().unwrap())
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect::<Vec<_>>(),
+            vec!["AAAA".to_string(), "BBBB".to_string()]
+        );
+    }
+
+    /// The cap is the same one a manual attachment obeys — a camera window that
+    /// returned six frames must not become a six-image prefill.
+    #[test]
+    fn promotion_is_capped_and_keeps_the_newest_frames() {
+        let msgs = vec![image_tool_response(
+            "call-1",
+            "window",
+            &[
+                ("F1", "image/jpeg"),
+                ("F2", "image/jpeg"),
+                ("F3", "image/jpeg"),
+                ("F4", "image/jpeg"),
+                ("F5", "image/jpeg"),
+                ("F6", "image/jpeg"),
+            ],
+        )];
+        let out = promote_tool_result_images(&msgs, 2).unwrap();
+        let kept: Vec<String> = top_level_images(out.last().unwrap())
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(kept, vec!["F5".to_string(), "F6".to_string()]);
+    }
+
+    /// HTTP formats already relocate tool-result images; promoting on top of
+    /// that would send every frame twice.
+    #[test]
+    fn only_the_local_engine_needs_promotion() {
+        assert!(!provider_relocates_tool_images("local"));
+        assert!(!provider_relocates_tool_images("gguf"));
+        for http in ["openai", "anthropic", "google", "databricks", "ollama"] {
+            assert!(provider_relocates_tool_images(http), "{http}");
+        }
     }
 
     fn tool(name: &str) -> Tool {

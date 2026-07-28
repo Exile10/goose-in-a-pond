@@ -126,4 +126,18 @@ impl ChatMessage {
         self.images.push(ImageAttachment { data, mime_type });
         self
     }
+
+    /// Create a user message carrying image attachments (phase F1).
+    ///
+    /// Order is preserved: attachment ordinal 0 is the first image the user
+    /// picked, which is what "the first picture" refers to in a follow-up.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
 }

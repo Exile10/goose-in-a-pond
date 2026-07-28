@@ -4,10 +4,14 @@
 //! Tables are created by `migrations/system/0001_initial.sql`.
 
 use async_trait::async_trait;
-use pond_core::models::domain::message::{ChatMessage, Role, ToolCallRecord};
-use pond_core::user_data::domain::session::{Session, SessionMessage};
+use base64::Engine as _;
+use pond_core::models::domain::image_limits::extension_for_mime;
+use pond_core::models::domain::message::{ChatMessage, ImageAttachment, Role, ToolCallRecord};
+use pond_core::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
 use pond_core::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use sqlx::{Pool, Row, Sqlite};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 // ── Raw DB row types ──────────────────────────────────────────────────────────
 
@@ -112,13 +116,226 @@ impl TryFrom<MessageRow> for SessionMessage {
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
+#[derive(sqlx::FromRow)]
+struct AttachmentRow {
+    id: String,
+    message_id: String,
+    session_id: String,
+    ordinal: i64,
+    mime_type: String,
+    byte_size: i64,
+    created_at: String,
+}
+
+impl From<AttachmentRow> for MessageAttachment {
+    fn from(r: AttachmentRow) -> Self {
+        MessageAttachment {
+            id: r.id,
+            message_id: r.message_id,
+            session_id: r.session_id,
+            ordinal: r.ordinal.max(0) as u32,
+            mime_type: r.mime_type,
+            byte_size: r.byte_size.max(0) as u64,
+            created_at: parse_dt(&r.created_at),
+        }
+    }
+}
+
+/// Directory holding image attachment bytes.
+///
+/// Resolved here rather than threaded down from `pond-server` for the same
+/// reason `model_download.rs` duplicates `default_data_dir()`: the storage
+/// adapter is constructed from a pool alone in several places, and an extra
+/// constructor argument would have to be plumbed through all of them. Honours
+/// `POND_DATA_DIR` so an isolated test/measurement run never writes into the
+/// real profile.
+fn default_attachment_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("POND_DATA_DIR") {
+        return PathBuf::from(dir).join("attachments");
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("goose-in-a-pond")
+        .join("attachments")
+}
+
+/// Reduce an untrusted id to something that cannot escape its parent directory.
+///
+/// Session and message ids are UUIDs today, but they arrive from the network on
+/// several paths (`session_id` is caller-supplied on `/chat/stream`), so a
+/// `../../` in one must not become a path. Mirrors `sanitize_camera_id` in
+/// `pond-adapters-vision`.
+fn sanitize_path_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(128)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub struct SqliteSessionStorage {
     pool: Pool<Sqlite>,
+    /// Where attachment bytes are written. Overridable for tests.
+    attachment_dir: PathBuf,
 }
 
 impl SqliteSessionStorage {
     pub fn new(pool: Pool<Sqlite>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            attachment_dir: default_attachment_dir(),
+        }
+    }
+
+    /// Point attachment storage at a specific directory (tests, and any future
+    /// caller that already knows the data dir).
+    #[must_use]
+    pub fn with_attachment_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.attachment_dir = dir.into();
+        self
+    }
+
+    /// Persist one message's images: bytes to disk, one index row each.
+    ///
+    /// Best-effort per attachment. A full disk or an undecodable payload must
+    /// not fail the turn — the message itself is already committed by the time
+    /// this runs, and losing a picture is strictly better than losing the
+    /// conversation. Every failure is logged with the message id so it is
+    /// diagnosable.
+    async fn persist_attachments(&self, message: &SessionMessage) {
+        if message.message.images.is_empty() {
+            return;
+        }
+        let dir = self
+            .attachment_dir
+            .join(sanitize_path_component(&message.session_id));
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::warn!(
+                message_id = %message.id,
+                dir = %dir.display(),
+                error = %e,
+                "could not create attachment directory; images for this message are not persisted"
+            );
+            return;
+        }
+
+        for (ordinal, img) in message.message.images.iter().enumerate() {
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(
+                // Tolerate a data-URL prefix from a client that sent one.
+                img.data
+                    .rsplit_once("base64,")
+                    .map(|(_, b)| b)
+                    .unwrap_or(&img.data)
+                    .trim(),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        message_id = %message.id,
+                        ordinal,
+                        error = %e,
+                        "attachment is not valid base64; skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let attachment_id = uuid::Uuid::new_v4().to_string();
+            let path = dir.join(format!(
+                "{}.{}",
+                attachment_id,
+                extension_for_mime(&img.mime_type)
+            ));
+            let byte_size = bytes.len() as i64;
+            if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                tracing::warn!(
+                    message_id = %message.id,
+                    ordinal,
+                    path = %path.display(),
+                    error = %e,
+                    "could not write attachment bytes; skipping"
+                );
+                continue;
+            }
+
+            if let Err(e) = sqlx::query(
+                "INSERT INTO message_attachments \
+                     (id, message_id, session_id, ordinal, mime_type, byte_size, file_path, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            )
+            .bind(&attachment_id)
+            .bind(&message.id)
+            .bind(&message.session_id)
+            .bind(ordinal as i64)
+            .bind(&img.mime_type)
+            .bind(byte_size)
+            .bind(path.to_string_lossy().as_ref())
+            .execute(&self.pool)
+            .await
+            {
+                // The row is the index; without it the file is unreachable, so
+                // do not leave it behind.
+                let _ = tokio::fs::remove_file(&path).await;
+                tracing::warn!(
+                    message_id = %message.id,
+                    ordinal,
+                    error = %e,
+                    "could not index attachment; bytes removed"
+                );
+            }
+        }
+    }
+
+    /// Remove a session's attachment directory. Called on session delete, where
+    /// the rows disappear via `ON DELETE CASCADE` and would otherwise orphan
+    /// their files.
+    async fn remove_session_attachment_files(&self, session_id: &str) {
+        let dir = self
+            .attachment_dir
+            .join(sanitize_path_component(session_id));
+        if !dir.exists() {
+            return;
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(
+                session_id = %session_id,
+                dir = %dir.display(),
+                error = %e,
+                "could not remove attachment files for deleted session"
+            );
+        }
+    }
+
+    /// Read one attachment file, refusing anything that resolved outside the
+    /// attachment root.
+    ///
+    /// `file_path` comes from our own DB, but a stored row is still a value that
+    /// travels (backup restores, hand edits), and this function is reachable from
+    /// an HTTP handler — so the containment check is cheap insurance rather than
+    /// paranoia.
+    async fn read_attachment_file(&self, file_path: &str) -> Option<Vec<u8>> {
+        let path = Path::new(file_path);
+        let root = self.attachment_dir.canonicalize().ok()?;
+        let real = path.canonicalize().ok()?;
+        if !real.starts_with(&root) {
+            tracing::warn!(
+                path = %file_path,
+                "attachment path resolved outside the attachment root; refusing to read"
+            );
+            return None;
+        }
+        tokio::fs::read(&real).await.ok()
     }
 }
 
@@ -306,6 +523,10 @@ impl SessionStorage for SqliteSessionStorage {
             .await
             .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
 
+        // Phase F2. After the message row commits, so an attachment can never
+        // reference a message that does not exist.
+        self.persist_attachments(&message).await;
+
         Ok(message)
     }
 
@@ -348,6 +569,9 @@ impl SessionStorage for SqliteSessionStorage {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {
+        // Files first: the CASCADE below erases the index rows, and without them
+        // the bytes on disk are unreachable garbage.
+        self.remove_session_attachment_files(session_id).await;
         // ON DELETE CASCADE handles session_messages automatically
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
@@ -483,6 +707,96 @@ impl SessionStorage for SqliteSessionStorage {
 
         Ok(content)
     }
+
+    // ── Image attachments (phase F2) ────────────────────────────────────────
+
+    async fn list_session_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MessageAttachment>, SessionStorageError> {
+        let rows = sqlx::query_as::<_, AttachmentRow>(
+            "SELECT id, message_id, session_id, ordinal, mime_type, byte_size, created_at \
+             FROM message_attachments \
+             WHERE session_id = ? \
+             ORDER BY created_at ASC, ordinal ASC, rowid ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(rows.into_iter().map(MessageAttachment::from).collect())
+    }
+
+    async fn load_message_images(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ImageAttachment>>, SessionStorageError> {
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Runtime sqlx has no array binding for SQLite, so the IN list is built
+        // from placeholders — never from the ids themselves.
+        let placeholders = std::iter::repeat_n("?", message_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT message_id, mime_type, file_path FROM message_attachments \
+             WHERE message_id IN ({placeholders}) \
+             ORDER BY message_id, ordinal ASC"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in message_ids {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let mut out: HashMap<String, Vec<ImageAttachment>> = HashMap::new();
+        for row in rows {
+            let message_id: String = row.get("message_id");
+            let mime_type: String = row.get("mime_type");
+            let file_path: String = row.get("file_path");
+            // A missing file degrades to "this image is gone" rather than an
+            // error: the caller's fallback is a text placeholder, which is a
+            // better outcome than failing the whole turn.
+            let Some(bytes) = self.read_attachment_file(&file_path).await else {
+                tracing::debug!(
+                    message_id = %message_id,
+                    path = %file_path,
+                    "attachment bytes unavailable; will fall back to a text placeholder"
+                );
+                continue;
+            };
+            out.entry(message_id).or_default().push(ImageAttachment {
+                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn read_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, SessionStorageError> {
+        let row = sqlx::query("SELECT mime_type, file_path FROM message_attachments WHERE id = ?")
+            .bind(attachment_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let Some(row) = row else { return Ok(None) };
+        let mime_type: String = row.get("mime_type");
+        let file_path: String = row.get("file_path");
+        Ok(self
+            .read_attachment_file(&file_path)
+            .await
+            .map(|bytes| (mime_type, bytes)))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -497,7 +811,11 @@ mod tests {
     async fn make_storage() -> (SqliteSessionStorage, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        (SqliteSessionStorage::new(db.system), tmp)
+        // Attachment bytes must land in the temp dir, never in the developer's
+        // real profile (the production default resolves the OS data dir).
+        let storage = SqliteSessionStorage::new(db.system)
+            .with_attachment_dir(tmp.path().join("attachments"));
+        (storage, tmp)
     }
 
     #[tokio::test]
@@ -907,6 +1225,255 @@ mod tests {
             assert_eq!(msgs.len(), 1);
             assert_eq!(msgs[0].message.content, "Remember me");
         }
+    }
+
+    // ── Image attachments (phase F2) ────────────────────────────────────────
+
+    /// A 1x1 red PNG, base64. Small enough to inline, real enough that a decode
+    /// failure would show up.
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+
+    async fn seed_image_message(
+        s: &SqliteSessionStorage,
+        session: &str,
+        message_id: &str,
+        images: Vec<ImageAttachment>,
+    ) {
+        s.add_message(
+            session.to_string(),
+            SessionMessage::new(
+                message_id.to_string(),
+                session.to_string(),
+                ChatMessage::user_with_images("what is this?", images),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn png(data: &str) -> ImageAttachment {
+        ImageAttachment {
+            data: data.to_string(),
+            mime_type: "image/png".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn attachments_round_trip_bytes_and_metadata() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-img".to_string()).await.unwrap();
+        seed_image_message(&s, "sess-img", "m1", vec![png(TINY_PNG)]).await;
+
+        let meta = s.list_session_attachments("sess-img").await.unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].message_id, "m1");
+        assert_eq!(meta[0].session_id, "sess-img");
+        assert_eq!(meta[0].ordinal, 0);
+        assert_eq!(meta[0].mime_type, "image/png");
+        // 1x1 PNG is 70 bytes; assert it is the decoded length, not the base64.
+        assert!(meta[0].byte_size > 0 && meta[0].byte_size < TINY_PNG.len() as u64);
+
+        let loaded = s.load_message_images(&["m1".to_string()]).await.unwrap();
+        let images = loaded.get("m1").expect("m1 has images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, TINY_PNG, "base64 must round-trip exactly");
+
+        let (mime, bytes) = s.read_attachment(&meta[0].id).await.unwrap().unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes.len() as u64, meta[0].byte_size);
+    }
+
+    /// Ordinal order is the user's pick order, and must survive the round trip —
+    /// "the first picture" has to mean the same thing on a follow-up turn.
+    #[tokio::test]
+    async fn attachment_order_is_preserved() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-order".to_string()).await.unwrap();
+        // Three distinguishable payloads (differing base64 lengths).
+        let a = png(TINY_PNG);
+        let b = ImageAttachment {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        };
+        let c = ImageAttachment {
+            data: "aGVsbG8gd29ybGQ=".to_string(),
+            mime_type: "image/webp".to_string(),
+        };
+        seed_image_message(&s, "sess-order", "m1", vec![a, b, c]).await;
+
+        let meta = s.list_session_attachments("sess-order").await.unwrap();
+        assert_eq!(
+            meta.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            meta.iter()
+                .map(|m| m.mime_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image/png", "image/jpeg", "image/webp"]
+        );
+        let loaded = s.load_message_images(&["m1".to_string()]).await.unwrap();
+        assert_eq!(
+            loaded["m1"]
+                .iter()
+                .map(|i| i.mime_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image/png", "image/jpeg", "image/webp"]
+        );
+    }
+
+    #[tokio::test]
+    async fn attachments_survive_restart() {
+        let tmp = tempdir().unwrap();
+        let attach_dir = tmp.path().join("attachments");
+        {
+            let db = Database::init(tmp.path()).await.unwrap();
+            let s = SqliteSessionStorage::new(db.system).with_attachment_dir(attach_dir.clone());
+            s.create_session("sess-restart".to_string()).await.unwrap();
+            seed_image_message(&s, "sess-restart", "m1", vec![png(TINY_PNG)]).await;
+        }
+        {
+            let db = Database::init(tmp.path()).await.unwrap();
+            let s = SqliteSessionStorage::new(db.system).with_attachment_dir(attach_dir);
+            let loaded = s.load_message_images(&["m1".to_string()]).await.unwrap();
+            assert_eq!(loaded["m1"][0].data, TINY_PNG);
+        }
+    }
+
+    /// Loading images must never fail a turn just because a file went missing —
+    /// the caller's fallback is a text placeholder, which is strictly better than
+    /// erroring out the whole conversation.
+    #[tokio::test]
+    async fn a_missing_attachment_file_degrades_instead_of_erroring() {
+        let (s, tmp) = make_storage().await;
+        s.create_session("sess-gone".to_string()).await.unwrap();
+        seed_image_message(&s, "sess-gone", "m1", vec![png(TINY_PNG)]).await;
+
+        // Simulate the bytes disappearing under us (disk cleanup, restore).
+        let dir = tmp.path().join("attachments").join("sess-gone");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        let loaded = s.load_message_images(&["m1".to_string()]).await.unwrap();
+        assert!(!loaded.contains_key("m1"), "no pixels, no entry");
+        // The index row is still there, so the UI can still say an image existed.
+        assert_eq!(
+            s.list_session_attachments("sess-gone").await.unwrap().len(),
+            1
+        );
+        let meta = s.list_session_attachments("sess-gone").await.unwrap();
+        assert!(s.read_attachment(&meta[0].id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn undecodable_base64_is_skipped_without_failing_the_message() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-bad".to_string()).await.unwrap();
+        seed_image_message(
+            &s,
+            "sess-bad",
+            "m1",
+            vec![
+                ImageAttachment {
+                    data: "!!!not base64!!!".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+                png(TINY_PNG),
+            ],
+        )
+        .await;
+
+        // The message itself persisted.
+        assert_eq!(s.get_messages("sess-bad").await.unwrap().len(), 1);
+        // Only the decodable image was stored, and it kept its ordinal.
+        let meta = s.list_session_attachments("sess-bad").await.unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].ordinal, 1);
+    }
+
+    #[tokio::test]
+    async fn a_data_url_prefix_is_tolerated() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-dataurl".to_string()).await.unwrap();
+        seed_image_message(
+            &s,
+            "sess-dataurl",
+            "m1",
+            vec![ImageAttachment {
+                data: format!("data:image/png;base64,{TINY_PNG}"),
+                mime_type: "image/png".to_string(),
+            }],
+        )
+        .await;
+        let loaded = s.load_message_images(&["m1".to_string()]).await.unwrap();
+        assert_eq!(loaded["m1"][0].data, TINY_PNG);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_removes_its_attachment_files() {
+        let (s, tmp) = make_storage().await;
+        s.create_session("sess-del".to_string()).await.unwrap();
+        seed_image_message(&s, "sess-del", "m1", vec![png(TINY_PNG)]).await;
+        let dir = tmp.path().join("attachments").join("sess-del");
+        assert!(dir.exists());
+
+        s.delete_session("sess-del").await.unwrap();
+        assert!(!dir.exists(), "orphaned bytes must not survive the session");
+    }
+
+    /// A caller-supplied session id must never become a path.
+    #[tokio::test]
+    async fn a_traversal_session_id_cannot_escape_the_attachment_root() {
+        let (s, tmp) = make_storage().await;
+        let nasty = "../../escaped";
+        s.create_session(nasty.to_string()).await.unwrap();
+        seed_image_message(&s, nasty, "m1", vec![png(TINY_PNG)]).await;
+
+        let root = tmp.path().join("attachments");
+        let meta = s.list_session_attachments(nasty).await.unwrap();
+        assert_eq!(meta.len(), 1);
+        // Whatever path was chosen, it is inside the root.
+        let stored: String =
+            sqlx::query_scalar("SELECT file_path FROM message_attachments WHERE id = ?")
+                .bind(&meta[0].id)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert!(
+            Path::new(&stored).starts_with(&root),
+            "attachment escaped the root: {stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_only_message_writes_no_attachment_rows_or_files() {
+        let (s, tmp) = make_storage().await;
+        s.create_session("sess-text".to_string()).await.unwrap();
+        s.add_message(
+            "sess-text".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-text".to_string(),
+                ChatMessage::user("no pictures here"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(s
+            .list_session_attachments("sess-text")
+            .await
+            .unwrap()
+            .is_empty());
+        // Not even the per-session directory is created.
+        assert!(!tmp.path().join("attachments").join("sess-text").exists());
+    }
+
+    #[tokio::test]
+    async fn loading_images_for_no_messages_is_a_no_op() {
+        let (s, _tmp) = make_storage().await;
+        assert!(s.load_message_images(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
-use crate::user_data::domain::session::{Session, SessionMessage};
+use crate::models::domain::message::ImageAttachment;
+use crate::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -183,5 +184,51 @@ pub trait SessionStorage: Send + Sync {
         _groups: &[String],
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
+    }
+
+    // ── Image attachments (phase F2) ────────────────────────────────────────
+    //
+    // Attachments are written implicitly: `add_message` persists whatever is on
+    // `SessionMessage.message.images`. They are read back EXPLICITLY, through
+    // the three methods below, and never inflated into `get_messages` — a
+    // session-history read happens on every turn and on every UI load, and
+    // silently base64-inflating every image a conversation ever contained would
+    // turn a cheap read into a multi-megabyte one.
+
+    /// Metadata for every attachment in a session, chronological then by
+    /// ordinal. Cheap: no bytes are read.
+    ///
+    /// Callers use this to decide WHICH images are worth loading (see
+    /// `models::services::context::image_history::plan_image_replay`) before
+    /// paying for any of them.
+    async fn list_session_attachments(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<MessageAttachment>, SessionStorageError> {
+        Ok(Vec::new()) // default no-op for backward compat
+    }
+
+    /// Load the base64 image payloads for specific messages, keyed by message
+    /// id, with each message's images in ordinal order.
+    ///
+    /// Batched deliberately: history replay needs a handful of images chosen
+    /// across a whole conversation, and one call per image would be one file
+    /// read plus one query per image.
+    async fn load_message_images(
+        &self,
+        _message_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<ImageAttachment>>, SessionStorageError> {
+        Ok(std::collections::HashMap::new()) // default no-op for backward compat
+    }
+
+    /// Read one attachment's raw (decoded) bytes and MIME type.
+    ///
+    /// Serves the desktop's `<img>` requests, so it returns bytes rather than
+    /// base64 — re-encoding only to have the browser decode again is pure waste.
+    async fn read_attachment(
+        &self,
+        _attachment_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, SessionStorageError> {
+        Ok(None) // default no-op for backward compat
     }
 }
