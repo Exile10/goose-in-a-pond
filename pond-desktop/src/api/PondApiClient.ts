@@ -22,6 +22,8 @@ import {
   type LogEntry,
   type MarketplaceExtension,
   type MemoryFragment,
+  type MeshPeer,
+  type MeshSelf,
   type ModelActiveRoles,
   type ModelEntry,
   type ModelMemoryStatus,
@@ -304,6 +306,30 @@ export class PondApiClient {
 
   unregisterDevice(id: string): Promise<void> {
     return this.del(`/api/v1/devices/${encodeURIComponent(id)}`);
+  }
+
+  // ── Mesh (#132) ─────────────────────────────────────────────
+
+  listMeshPeers(): Promise<MeshPeer[]> {
+    return this.get<{ peers: MeshPeer[] }>("/api/v1/mesh/peers").then(
+      (r) => r.peers ?? [],
+    );
+  }
+
+  addMeshPeer(req: {
+    peer_id: string;
+    trust_scope: "self_owned" | "circle";
+    address?: string;
+  }): Promise<{ peer_id: string; trust_scope: string }> {
+    return this.post("/api/v1/mesh/peers", req);
+  }
+
+  removeMeshPeer(peerId: string): Promise<void> {
+    return this.del(`/api/v1/mesh/peers/${encodeURIComponent(peerId)}`);
+  }
+
+  getMeshSelf(): Promise<MeshSelf> {
+    return this.get("/api/v1/mesh/self");
   }
 
   // ── Schedules ─────────────────────────────────────────────

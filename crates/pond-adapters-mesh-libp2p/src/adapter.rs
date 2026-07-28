@@ -44,30 +44,6 @@ impl Libp2pMeshTransport {
         })
     }
 
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
-    }
-
-    /// Every address this node is confirmed listening on — bare multiaddrs,
-    /// without a `/p2p/<id>` suffix (`connect()` adds that from its own
-    /// `peer` argument). Test/setup helper, not part of the `MeshTransport`
-    /// port — `Multiaddr` is libp2p-specific.
-    pub async fn listen_addresses(&self) -> Vec<String> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self
-            .send_command(Command::ListenAddrs { reply: reply_tx })
-            .is_err()
-        {
-            return Vec::new();
-        }
-        reply_rx
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|addr| addr.to_string())
-            .collect()
-    }
-
     /// Reserve a relay slot through an already-reachable peer, so this node
     /// becomes dialable via `.../p2p/<relay_peer>/p2p-circuit/p2p/<self>`
     /// even without a direct inbound path. Test/setup helper, not part of
@@ -136,5 +112,21 @@ impl MeshTransport for Libp2pMeshTransport {
             .recv()
             .await
             .ok_or_else(|| MeshTransportError::Transport("mesh swarm task has stopped".to_string()))
+    }
+
+    fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
+    async fn listen_addresses(&self) -> Result<Vec<String>, MeshTransportError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(Command::ListenAddrs { reply: reply_tx })?;
+        let addrs = reply_rx
+            .await
+            .map_err(|_| MeshTransportError::Transport("mesh swarm task has stopped".to_string()))?
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect();
+        Ok(addrs)
     }
 }

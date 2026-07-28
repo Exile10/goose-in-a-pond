@@ -134,6 +134,26 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { devices: [] } }),
   );
 
+  // Mesh (#132) — no peers, mesh disabled by default in tests.
+  await page.route("**/api/v1/mesh/peers", (route) => {
+    if (route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as {
+        peer_id?: string;
+        trust_scope?: string;
+      };
+      return route.fulfill({
+        json: { peer_id: body.peer_id ?? "", trust_scope: body.trust_scope ?? "circle" },
+      });
+    }
+    return route.fulfill({ json: { peers: [] } });
+  });
+  await page.route("**/api/v1/mesh/peers/*", (route) =>
+    route.fulfill({ status: 204, body: "" }),
+  );
+  await page.route("**/api/v1/mesh/self", (route) =>
+    route.fulfill({ json: { mesh_enabled: false } }),
+  );
+
   // Weather — no location configured in tests, dashboard falls back to mock data.
   await page.route("**/api/v1/weather", (route) =>
     route.fulfill({ json: { enabled: false } }),

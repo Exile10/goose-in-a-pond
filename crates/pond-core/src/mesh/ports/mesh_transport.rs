@@ -33,4 +33,13 @@ pub trait MeshTransport: Send + Sync {
     /// one arrives. Pull-based so a mock can back it with a simple queue and
     /// a real transport can back it with an mpsc fed by its event loop.
     async fn recv(&self) -> Result<(PeerId, Vec<u8>), MeshTransportError>;
+
+    /// This Pond's own identity. Pure lookup, no I/O — sync.
+    fn local_peer_id(&self) -> PeerId;
+
+    /// Every address this node is confirmed listening on — opaque dial
+    /// hints in the same `String` shape `connect()` takes, so a caller (e.g.
+    /// an invite-generation route) can hand one back to another Pond without
+    /// pond-core ever knowing the transport-specific address type.
+    async fn listen_addresses(&self) -> Result<Vec<String>, MeshTransportError>;
 }

@@ -25,6 +25,7 @@ import {
   ScanFace,
   Layers,
   QrCode,
+  Share2,
 } from "lucide-react";
 
 // ── Icon map — standard lucide icons matching each section's intent ──────────
@@ -34,6 +35,7 @@ const NAV_ICONS: Record<string, React.ElementType> = {
   home:          LayoutDashboard,
   chat:          MessageCircle,
   devices:       Monitor,
+  mesh:          Share2,
   pairing:       QrCode,
   clock:         CalendarClock,
   memory:        Brain,

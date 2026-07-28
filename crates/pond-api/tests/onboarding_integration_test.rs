@@ -166,6 +166,14 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
     (
         build_router(state, std::path::PathBuf::from("web/dist")),

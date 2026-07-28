@@ -1384,6 +1384,23 @@ async fn run_server(
         dyn pond_core::user_data::ports::camera_storage::CameraStorage + Send + Sync,
     > = Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
+    // Private mesh (#132) — PeerDirectory/CreditLedger/UsageTally are plain
+    // SQLite, no extra dependency, so unlike mesh_transport (below, behind
+    // the `mesh` feature + settings.mesh_enabled) they're always available.
+    let peer_directory: Arc<
+        dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync,
+    > = Arc::new(pond_infra::sqlite_peer_directory::SqlitePeerDirectory::new(
+        db.system.clone(),
+    ));
+    let credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync> =
+        Arc::new(pond_infra::sqlite_credit_ledger::SqliteCreditLedger::new(
+            db.system.clone(),
+        ));
+    let usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync> =
+        Arc::new(pond_infra::sqlite_usage_tally::SqliteUsageTally::new(
+            db.system.clone(),
+        ));
+
     // ── Face recognition (Phase 2) ──────────────────────────────────────────
     // Built only when the --features face-onnx build flag is enabled AND an
     // ONNX embedding model is present on disk.  Missing model file → None
@@ -1788,10 +1805,9 @@ async fn run_server(
     };
 
     // Private mesh (#132 Milestone 2) — real libp2p MeshTransport, gated on
-    // settings.mesh_enabled. No route/MCP tool consumes it yet (that lands
-    // with the mesh-inference milestone); kept alive for the server's
-    // lifetime purely by this binding.
-    let _mesh_transport = build_mesh_transport(&settings, &settings_repo).await;
+    // settings.mesh_enabled. Wired into AppState below (Milestone 6) so the
+    // /api/v1/mesh/* routes can use it.
+    let mesh_transport = build_mesh_transport(&settings, &settings_repo).await;
 
     // Scheduler — persist task list next to the databases.
     // Uses a DeferredExecutor so the scheduler can be created before the agent
@@ -2518,6 +2534,10 @@ async fn run_server(
         security_policy,
         api_port,
         weather_provider: weather.clone(),
+        peer_directory,
+        credit_ledger,
+        usage_tally,
+        mesh_transport,
     });
 
     // Spawn OAuth token auto-refresh worker.
