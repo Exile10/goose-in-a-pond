@@ -3,6 +3,8 @@
 # giap.sh — one entry point for building, installing, running and repairing GIAP.
 #
 #   bash scripts/giap.sh              # interactive menu
+#   bash scripts/giap.sh install      # first-time install on this host
+#   bash scripts/giap.sh install -y   # ... without the confirmation prompts
 #   bash scripts/giap.sh doctor       # non-interactive: health report, exit 1 on FAIL
 #   bash scripts/giap.sh status       # non-interactive: detection banner only
 #   bash scripts/giap.sh build        # non-interactive: build UI + server for THIS host
@@ -35,6 +37,7 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 DRY_RUN=false
+ASSUME_YES=false
 SERVICE_NAME="goose-in-a-pond.service"
 
 # ── output ───────────────────────────────────────────────────────────────────
@@ -69,7 +72,12 @@ run_sh() {
 }
 
 confirm() {
-  # $1 = prompt. Returns 0 on yes. Refuses (returns 1) when not a TTY.
+  # $1 = prompt. Returns 0 on yes. Refuses (returns 1) when not a TTY, unless
+  # --yes was passed — the explicit opt-out for scripted installs.
+  if [ "$ASSUME_YES" = true ]; then
+    printf '%s%s [y/N]%s y (--yes)\n' "$C_YLW" "$1" "$C_RST"
+    return 0
+  fi
   if [ ! -t 0 ]; then
     warn "not a terminal — refusing to run an action that needs confirmation"
     return 1
@@ -572,6 +580,88 @@ write_build_stamp() {
   } > target/release/.giap-build-stamp 2>/dev/null || true
 }
 
+# ── install ──────────────────────────────────────────────────────────────────
+# Delegates to scripts/install.sh, which is the only place that knows the full
+# 9-step sequence (preflight, submodule, system deps, build, pond-server setup,
+# LLM + Piper download, systemd, mDNS, desktop, verify). This wrapper exists to
+# put the guardrails in front of it, because install.sh cannot see the state
+# that makes those steps dangerous on an already-configured device.
+action_install() {
+  head1 "Install GIAP on this host"
+
+  local args="" why_no_service=""
+
+  info "Host:  $D_OS/$D_ARCH${D_IS_JETSON:+ }$( [ "$D_IS_JETSON" = true ] && echo '(Jetson)' )"
+  info "Accel: $D_ACCEL"
+
+  # Guardrail 1: never let install.sh add a SECOND service unit.
+  #
+  # setup_systemd in scripts/lib/install-systemd.sh writes a root-owned unit to
+  # /etc/systemd/system/goose-in-a-pond.service. The Jetson runs a hand-written
+  # USER unit of the same name. Both installed means two servers, each loading
+  # its own ~3 GB model into one 7.4 GB pool.
+  if [ "$D_SVC_SCOPE" = "user" ] || [ "$D_SVC_SCOPE" = "system" ] || [ "$D_SVC_SCOPE" = "BOTH" ]; then
+    args="$args --no-service"
+    why_no_service="a $D_SVC_SCOPE-scope unit already exists"
+  fi
+
+  # Guardrail 2: this host cannot build the web UI, so a model/UI-heavy install
+  # would embed the placeholder dashboard.
+  if [ "$D_NODE_OK" != true ]; then
+    warn "node ${D_NODE:-absent} cannot build the web UI (Vite needs >= 20)."
+    note "the server will embed whatever is already in pond-desktop/dist"
+    note "build dist on a dev machine and rsync it, or use 'jetson.sh deploy'"
+  fi
+
+  # Guardrail 3: a Jetson release build with a model resident gets its linker
+  # OOM-killed.
+  if [ "$D_IS_JETSON" = true ] && [ "$D_SVC_ACTIVE" = "active" ]; then
+    warn "the service is running and holding a model; the release link may be OOM-killed."
+    if confirm "Stop it for the install and restart afterwards?"; then
+      run systemctl --user stop "$SERVICE_NAME"
+      RESTART_SVC_AFTER=true
+    fi
+  fi
+
+  if [ -t 0 ]; then
+    say ""
+    say "  1) Full install         — deps, build, models, service (default)"
+    say "  2) Minimal              — server + DB only, no model downloads"
+    say "  3) Full + desktop app   — also builds the Tauri app"
+    printf '  choose [1]: '
+    local c=""; read -r c
+    case "$c" in
+      2) args="$args --minimal" ;;
+      3) args="$args --desktop" ;;
+      *) ;;
+    esac
+  fi
+
+  say ""
+  info "This installs system packages, may download several GB of models, and uses sudo."
+  [ -n "$why_no_service" ] && info "Passing --no-service because $why_no_service."
+  info "install.sh auto-detects its own mode (dev / production / jetson)."
+  if ! confirm "Run: bash scripts/install.sh$args ?"; then
+    [ "${RESTART_SVC_AFTER:-false}" = true ] && { run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false; }
+    return 1
+  fi
+
+  # shellcheck disable=SC2086
+  run_sh "bash scripts/install.sh$args"
+  local rc=$?
+
+  if [ "${RESTART_SVC_AFTER:-false}" = true ]; then
+    run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false
+  fi
+  detect_all
+  if [ $rc -eq 0 ]; then
+    ok "install finished — run the doctor (menu 1) to confirm the result"
+  else
+    bad "install exited $rc"
+  fi
+  return $rc
+}
+
 action_build_ui() {
   head1 "Build the web UI"
   if [ "$D_NODE_OK" != true ]; then
@@ -844,7 +934,8 @@ show_menu() {
   say "   4) Reclaim disk (target/debug only)"
   say "   5) Stop stray pond-server / pond-desktop processes"
   say ""
-  say "  ${C_B}Build${C_RST}"
+  say "  ${C_B}Install & build${C_RST}"
+  say "  10) Install GIAP on this host (first-time setup)"
   say "  11) Build the web UI"
   say "  12) Build pond-server (release, correct features for this host)"
   say "  13) Build both (UI then server)"
@@ -879,6 +970,7 @@ menu_loop() {
       3)  action_repair_submodule; pause ;;
       4)  action_reclaim_disk; pause ;;
       5)  action_kill_strays; pause ;;
+      10) action_install; pause ;;
       11) action_build_ui; pause ;;
       12) action_build_server; pause ;;
       13) action_build_ui && action_build_server; pause ;;
@@ -912,6 +1004,7 @@ CMD=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
+    -y|--yes)  ASSUME_YES=true; shift ;;
     -h|--help|help) usage; exit 0 ;;
     *) CMD="$1"; shift ;;
   esac
@@ -923,6 +1016,7 @@ case "$CMD" in
   "")        menu_loop ;;
   status)    banner ;;
   doctor)    banner; doctor; [ "$DOC_FAIL" -gt 0 ] && exit 1 || exit 0 ;;
+  install)   action_install ;;
   build)     action_build_ui; action_build_server ;;
   build-ui)  action_build_ui ;;
   build-desktop) action_build_desktop ;;
