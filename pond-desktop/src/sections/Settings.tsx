@@ -23,6 +23,101 @@ import type { GuiSection } from "../desktopState";
 import { AppearanceView } from "../hub/views/settings/Appearance";
 const WakeWordCalibration = lazy(() => import("../components/WakeWordCalibration").then(m => ({ default: m.WakeWordCalibration })));
 
+// ── Patch diffing ─────────────────────────────────────────────
+//
+// `PUT /api/v1/settings` is a PATCH endpoint, and its key set is the server's
+// only record of user INTENT: those keys are marked `is_user_set`, which
+// permanently exempts them from future default-adoption migrations (see
+// docs/developer/settings-defaults-and-user-intent.md).
+//
+// This panel batches edits behind one Save button, so it has to reconstruct
+// that key set itself. Sending the whole loaded object instead — which is what
+// it used to do — marked every setting as deliberately chosen on the first
+// Save, from a click that changed nothing, and clobbered any field another
+// surface (the Models tab, the phone, a calibration run) had changed since the
+// panel loaded.
+
+/**
+ * Deep value equality for settings values.
+ *
+ * Compare by VALUE, not identity: several fields are arrays or maps
+ * (`voice_wake_word_transcriptions`, `retention_events_by_category`) that the
+ * UI replaces wholesale, so a reference check would report every one of them
+ * as edited on every Save. Object key order is not significant (the server
+ * serialises a `HashMap`); array order is. Settings are plain JSON, so no
+ * cycle handling is needed.
+ */
+export function settingsValueEquals(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  const aIsArray = Array.isArray(a);
+  if (aIsArray !== Array.isArray(b)) return false;
+  if (aIsArray) {
+    const av = a as unknown[];
+    const bv = b as unknown[];
+    return av.length === bv.length && av.every((v, i) => settingsValueEquals(v, bv[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const aKeys = Object.keys(ao);
+  if (aKeys.length !== Object.keys(bo).length) return false;
+  return aKeys.every(
+    (k) => Object.prototype.hasOwnProperty.call(bo, k) && settingsValueEquals(ao[k], bo[k]),
+  );
+}
+
+/**
+ * The keys of `current` whose value differs from `baseline` — the last state
+ * the server told us about. Keys the panel never touched are omitted, so an
+ * untouched field is neither re-sent nor marked as chosen.
+ *
+ * A key present in `baseline` but not in `current` is NOT reported: the
+ * endpoint is a patch and has no way to express a deletion.
+ */
+export function diffSettings(
+  baseline: Partial<SettingsType>,
+  current: Partial<SettingsType>,
+): Partial<SettingsType> {
+  const out: Record<string, unknown> = {};
+  const base = baseline as Record<string, unknown>;
+  for (const [key, value] of Object.entries(current)) {
+    if (!settingsValueEquals(value, base[key])) out[key] = value;
+  }
+  return out as Partial<SettingsType>;
+}
+
+/**
+ * Fold a fresh server snapshot into local state without discarding edits the
+ * user has made but not yet saved: a key they have not touched (local still
+ * equals baseline) takes the server's value, a key they have touched keeps
+ * theirs. Without this, a background refresh would silently revert in-progress
+ * typing, and — worse — would leave the baseline disagreeing with the values on
+ * screen, so the next Save would re-send fields nobody edited.
+ */
+export function foldServerState(
+  prev: Partial<SettingsType>,
+  baseline: Partial<SettingsType>,
+  server: Partial<SettingsType>,
+): Partial<SettingsType> {
+  const next = { ...prev } as Record<string, unknown>;
+  const prevRec = prev as Record<string, unknown>;
+  const baseRec = baseline as Record<string, unknown>;
+  for (const [key, value] of Object.entries(server)) {
+    if (settingsValueEquals(prevRec[key], baseRec[key])) next[key] = value;
+  }
+  return next as Partial<SettingsType>;
+}
+
+/**
+ * Detached copy of a server snapshot, so the baseline can never alias a nested
+ * object that some later edit mutates in place (which would hide that edit
+ * from the diff).
+ */
+function snapshot(s: Partial<SettingsType>): Partial<SettingsType> {
+  if (typeof structuredClone === "function") return structuredClone(s);
+  return JSON.parse(JSON.stringify(s)) as Partial<SettingsType>;
+}
+
 // ── Types ─────────────────────────────────────────────────────
 
 // Rows that navigate to another section rather than opening a detail panel
@@ -155,7 +250,7 @@ function IdentityTab({
 }
 
 function VoiceTab({
-  s, patch, hotkey, setHotkey, applyHotkey, refreshSettings, devMode,
+  s, patch, hotkey, setHotkey, applyHotkey, refreshSettings, commitField, devMode,
 }: {
   s: Partial<SettingsType>;
   patch: (k: keyof SettingsType, v: unknown) => void;
@@ -163,6 +258,7 @@ function VoiceTab({
   setHotkey: (v: string) => void;
   applyHotkey: () => void;
   refreshSettings: () => Promise<void>;
+  commitField: (k: keyof SettingsType, v: unknown) => Promise<void>;
   devMode: boolean;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -173,9 +269,15 @@ function VoiceTab({
   const transcriptions = s.voice_wake_word_transcriptions ?? [];
   const isCalibrated   = transcriptions.length > 0;
 
+  // Calibration records against the STORED wake phrase, so an unsaved edit has
+  // to be persisted first. `commitField` sends it only when it actually differs
+  // from the server's copy and adopts the echo — calibrating without having
+  // touched the phrase used to PUT it anyway, marking `voice_wake_word` as
+  // deliberately chosen from a click that changed nothing, and left the panel
+  // baseline behind so the next Save re-sent it.
   async function startCalibration() {
     if (wakePhrase) {
-      try { await api.updateSettings({ voice_wake_word: wakePhrase }); await api.resetWakeWordCalibration(); } catch { /* ignore */ }
+      try { await commitField("voice_wake_word", wakePhrase); await api.resetWakeWordCalibration(); } catch { /* ignore */ }
     }
     setCalibrating(true);
   }
@@ -199,7 +301,11 @@ function VoiceTab({
               {isCalibrated ? `Calibrated (${transcriptions.length} variant${transcriptions.length !== 1 ? "s" : ""})` : "Not calibrated"}
             </span>
             <div className="calibration-row__actions">
-              {isCalibrated && <Button variant="outline" size="sm" onPress={async () => { try { await api.resetWakeWordCalibration(); patch("voice_wake_word_transcriptions", []); } catch { /* ignore */ } }}>Clear</Button>}
+              {/* `voice_wake_word_transcriptions` is SERVER-owned: the calibrate
+                  endpoints append to it and DELETE clears it. Re-read rather
+                  than patching a local copy, so the panel's baseline tracks the
+                  server and Save never sends this field back. */}
+              {isCalibrated && <Button variant="outline" size="sm" onPress={async () => { try { await api.resetWakeWordCalibration(); await refreshSettings(); } catch { /* ignore */ } }}>Clear</Button>}
               <Button variant="outline" size="sm" onPress={startCalibration}>{isCalibrated ? "Re-calibrate" : "Calibrate"}</Button>
             </div>
           </div>
@@ -660,6 +766,9 @@ export function Settings() {
 
   const [detail, setDetail]     = useState<SettingsRowId | null>(null);
   const [settings, setSettings] = useState<Partial<SettingsType>>({});
+  // Last state the server told us about. Save PATCHes the difference against
+  // this, never the whole object — see the diffing block at the top of the file.
+  const [baseline, setBaseline] = useState<Partial<SettingsType>>({});
   const [loading, setLoading]   = useState(true);
   const [saving, setSaving]     = useState(false);
   const [saved, setSaved]       = useState(false);
@@ -676,13 +785,50 @@ export function Settings() {
     });
   }
 
+  function adoptServerState(s: SettingsType) {
+    setSettings(s);
+    setBaseline(snapshot(s));
+  }
+
   useEffect(() => {
-    api.getSettings().then((s) => setSettings(s)).catch((e) => setError(String(e))).finally(() => setLoading(false));
+    api.getSettings().then(adoptServerState).catch((e) => setError(String(e))).finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function flashSaved() {
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  }
+
   async function save() {
+    const patchBody = diffSettings(baseline, settings);
+    if (Object.keys(patchBody).length === 0) {
+      // Nothing to send. Do NOT fall back to PUTting the whole object: that is
+      // what marked every key as deliberately chosen and reverted fields
+      // changed elsewhere.
+      setError(null);
+      flashSaved();
+      return;
+    }
     setSaving(true); setSaved(false); setError(null);
-    try { const updated = await api.updateSettings(settings); setSettings(updated); setSaved(true); setTimeout(() => setSaved(false), 2000); }
+    try {
+      const updated = await api.updateSettings(patchBody);
+      // Fold against the PATCH WE SENT, not the pre-save baseline. The request
+      // succeeded, so those keys are what the server now holds; anything still
+      // differing from them was typed while the request was in flight and must
+      // be kept.
+      //
+      // This is also the only thing that lets a float field ever converge. The
+      // API serialises `f32` through serde_json, which widens to `f64`, so the
+      // echo of `0.8` comes back as 0.800000011920929 — see
+      // docs/developer/settings-defaults-and-user-intent.md. Folded against the
+      // OLD baseline the key looked locally edited, kept the client's 0.8, and
+      // then disagreed with the new baseline forever: every later Save re-sent
+      // it and re-marked it user-set, quietly ending default adoption for it.
+      setSettings((prev) => foldServerState(prev, { ...baseline, ...patchBody }, updated));
+      setBaseline(snapshot(updated));
+      flashSaved();
+    }
     catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   }
@@ -692,8 +838,36 @@ export function Settings() {
     try { await invoke("set_hotkey", { hotkey }); } catch (e) { setError(String(e)); }
   }
 
+  /**
+   * Re-read the server after something OTHER than this panel wrote settings
+   * (wake-word calibration appends `voice_wake_word_transcriptions` server
+   * side). The baseline must move with it, or the refreshed values would look
+   * like local edits and be re-sent on the next Save.
+   */
   async function refreshSettings() {
-    try { const u = await api.getSettings(); setSettings(u); } catch { /* ignore */ }
+    try {
+      const u = await api.getSettings();
+      setSettings((prev) => foldServerState(prev, baseline, u));
+      setBaseline(snapshot(u));
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * PUT a single field from outside the Save button, keeping the panel in step.
+   *
+   * A value that already equals the baseline is NOT sent. `PUT
+   * /api/v1/settings` marks every key the request carries as deliberately
+   * chosen, so an unconditional write would end default adoption for that key
+   * on a click that changed nothing. And because it does write, the response
+   * has to be adopted the same way `save()` adopts one, or the panel's baseline
+   * stays behind and the next Save re-sends the field.
+   */
+  async function commitField(key: keyof SettingsType, value: unknown) {
+    if (settingsValueEquals(value, (baseline as Record<string, unknown>)[key])) return;
+    const patchBody = { [key]: value } as Partial<SettingsType>;
+    const updated = await api.updateSettings(patchBody);
+    setSettings((prev) => foldServerState(prev, { ...baseline, ...patchBody }, updated));
+    setBaseline(snapshot(updated));
   }
 
   function patch(key: keyof SettingsType, value: unknown) {
@@ -711,7 +885,7 @@ export function Settings() {
       case "account":       return <IdentityTab s={settings} patch={patch} onRestartOnboarding={() => dispatch({ type: "SET_NEEDS_ONBOARDING", payload: true })} />;
       case "models":        return <ModelsTab   s={settings} patch={patch} devMode={devMode} />;
       case "prompts":       return <PromptsTab  s={settings} patch={patch} />;
-      case "voice":         return <VoiceTab    s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} refreshSettings={refreshSettings} devMode={devMode} />;
+      case "voice":         return <VoiceTab    s={settings} patch={patch} hotkey={hotkey} setHotkey={setHotkey} applyHotkey={applyHotkey} refreshSettings={refreshSettings} commitField={commitField} devMode={devMode} />;
       case "memory":        return <AgentTab    s={settings} patch={patch} devMode={devMode} />;
       case "extensions":    return <ToolsTab    s={settings} patch={patch} devMode={devMode} />;
       case "privacy":       return <DataTab     s={settings} patch={patch} serverUrl={state.serverUrl} onServerUrlChange={(v) => dispatch({ type: "SET_SERVER_URL", payload: v })} devMode={devMode} />;
@@ -742,7 +916,7 @@ export function Settings() {
             )}
           </div>
         </header>
-        {error && <ErrorBanner error={error} onRetry={() => { setError(null); setLoading(true); api.getSettings().then(setSettings).catch((e) => setError(String(e))).finally(() => setLoading(false)); }} />}
+        {error && <ErrorBanner error={error} onRetry={() => { setError(null); setLoading(true); api.getSettings().then(adoptServerState).catch((e) => setError(String(e))).finally(() => setLoading(false)); }} />}
         <div className="settings-body">
           {loading ? <SkeletonList rows={5} /> : renderDetail(detail)}
         </div>

@@ -23,6 +23,84 @@ pub const TOOL_SELECTION_MODE_ALL: &str = "all";
 /// session, chosen once at session start (Phase D2).
 pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
 
+/// One factory default that CHANGED after installs already existed.
+///
+/// Settings are a flat key-value table and a default only applies when the key
+/// is ABSENT. Any install that ever saved a settings snapshot has every key
+/// pinned to whatever the default was on that day, so a later default change is
+/// invisible there forever. Each entry here records one such change and is
+/// adopted, once, by the named migration.
+///
+/// The adoption rule is deliberately narrow: adopt only where the stored value
+/// is still byte-equal to `old_default`, which means the user never chose
+/// anything different. The one accepted false positive is a user who
+/// deliberately picked exactly the old value — nothing in the store
+/// distinguishes them from a user who never chose, so they are moved to the new
+/// default once (and their next explicit save marks the key user-set, which
+/// exempts it from every future adoption).
+///
+/// What does NOT belong here: a key whose default never actually moved. The
+/// entry only fires where the stored value equals `old_default`, so if the
+/// factory default is unchanged there is nothing to adopt and the entry would
+/// be a no-op (`tool_selection_mode` is still `"all"`, and stored `"all"` rows
+/// exist — the exclusion is "the default did not move", not "the key is new").
+/// A stored value that never was any default is likewise out of reach:
+/// `embedding_provider` has defaulted to `"fastembed"` since it was
+/// introduced, so a stored `"none"` matches no `old_default` and can only be
+/// changed by hand or by a UI prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultAdoption {
+    /// The `settings` table key.
+    pub key: &'static str,
+    /// How the OLD default was rendered into the store.
+    pub old_default: &'static str,
+    /// How the CURRENT default is rendered into the store.
+    pub new_default: &'static str,
+    /// Numeric prefix of the migration that performs the adoption.
+    pub migration: &'static str,
+}
+
+/// Every shipped default change that needs to reach existing installs, oldest
+/// first.
+///
+/// A default may move more than once: entries for the same key CHAIN, each
+/// one's `old_default` picking up where the previous one's `new_default` left
+/// off, and only the last entry for a key states the value
+/// `Settings::default()` produces today. `default_adoptions_are_structurally_sound`
+/// (below) enforces the chaining, so changing a registered default again forces
+/// a new entry plus a new migration rather than an edit to a migration that
+/// already ran.
+///
+/// The other half — that `new_default` is the exact literal the store holds for
+/// today's default — is enforced in **pond-infra**
+/// (`every_adoption_entry_states_the_literal_the_adapter_writes`), not here.
+/// It cannot be checked in this crate: the domain has no way to render a field
+/// the way the adapter does, and the obvious stand-in disagrees. The adapter
+/// writes numbers with `Display`, while a `serde_json` round-trip widens every
+/// `f32` to `f64` (`0.05f32` renders as `0.05`, but as `0.05000000074505806`
+/// through JSON). A checker built on the second would demand a literal the
+/// migration could never match.
+pub const DEFAULT_ADOPTIONS: &[DefaultAdoption] = &[
+    // The 20-turn cap stranded multi-step research and home-automation
+    // requests mid-task; the rails that actually protect the device are
+    // cancellation, `agent_timeout_secs`, and context-overflow abort.
+    DefaultAdoption {
+        key: "agent_max_turns",
+        old_default: "20",
+        new_default: "50",
+        migration: "0035",
+    },
+    // Deterministic trimming replaced Goose's reactive LLM auto-compaction
+    // once C1-C3 landed; off, an on-device conversation still stalls
+    // mid-turn to summarise itself.
+    DefaultAdoption {
+        key: "hybrid_compaction_enabled",
+        old_default: "false",
+        new_default: "true",
+        migration: "0035",
+    },
+];
+
 /// All configurable settings for GIAP.
 ///
 /// Serializes to/from JSON via serde. Each field has a default via
@@ -1070,6 +1148,195 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Validate the STRUCTURE of an adoption registry against the field set
+    /// `Settings` has today. Returns every problem found, so the synthetic
+    /// tests below can prove each rule actually fires.
+    ///
+    /// The rules, and why each one exists:
+    ///
+    /// - The key must be a real `Settings` field, or the migration UPDATEs a
+    ///   row nothing ever reads.
+    /// - `old_default != new_default`, or the entry is a no-op.
+    /// - Entries for the same key CHAIN in ascending migration order, each
+    ///   `old_default` picking up where the previous `new_default` left off.
+    ///   Without that, an install that already adopted the first change is
+    ///   skipped by the second.
+    ///
+    /// Deliberately NOT here: "the newest entry states today's default". That
+    /// needs the literal the STORE holds, and this crate can only guess at it —
+    /// a `serde_json` render disagrees with the adapter's `Display` render for
+    /// every float, so the rule would reject correct float entries and demand
+    /// a widened literal no migration could ever match. pond-infra's
+    /// `every_adoption_entry_states_the_literal_the_adapter_writes` asserts it
+    /// against the real write instead.
+    fn validate_adoptions(entries: &[DefaultAdoption], defaults: &Settings) -> Vec<String> {
+        let value = serde_json::to_value(defaults).expect("serialize Settings");
+        let obj = value.as_object().expect("Settings is a JSON object");
+        let mut problems = Vec::new();
+        // Last entry seen for each key.
+        let mut previous: std::collections::BTreeMap<&str, &DefaultAdoption> =
+            std::collections::BTreeMap::new();
+
+        for entry in entries {
+            if !obj.contains_key(entry.key) {
+                problems.push(format!(
+                    "DEFAULT_ADOPTIONS names `{}`, which is not a Settings field",
+                    entry.key
+                ));
+                continue;
+            }
+            if entry.old_default == entry.new_default {
+                problems.push(format!(
+                    "`{}` adoption ({}) is a no-op — old and new defaults are identical. \
+                     A default that did not move needs no entry.",
+                    entry.key, entry.migration
+                ));
+            }
+            if let Some(prev) = previous.get(entry.key) {
+                if prev.migration >= entry.migration {
+                    problems.push(format!(
+                        "`{}` adoptions are out of order: migration {} is listed before {}. \
+                         DEFAULT_ADOPTIONS is oldest-first.",
+                        entry.key, prev.migration, entry.migration
+                    ));
+                }
+                if prev.new_default != entry.old_default {
+                    problems.push(format!(
+                        "`{}` adoptions do not chain: migration {} leaves the stored value \
+                         at `{}`, but migration {} only fires on `{}`, so every install that \
+                         already ran {} is skipped. Set old_default to `{}`.",
+                        entry.key,
+                        prev.migration,
+                        prev.new_default,
+                        entry.migration,
+                        entry.old_default,
+                        prev.migration,
+                        prev.new_default
+                    ));
+                }
+            }
+            previous.insert(entry.key, entry);
+        }
+
+        problems
+    }
+
+    #[test]
+    fn default_adoptions_are_structurally_sound() {
+        let problems = validate_adoptions(DEFAULT_ADOPTIONS, &Settings::default());
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// A default is allowed to move twice: two entries for one key chain. No
+    /// live example exists yet, so prove the checker accepts the shape the docs
+    /// tell people to write.
+    #[test]
+    fn a_chained_adoption_is_accepted() {
+        let defaults = Settings::default();
+        let chained = [
+            DefaultAdoption {
+                key: "agent_max_turns",
+                old_default: "20",
+                new_default: "50",
+                migration: "0035",
+            },
+            DefaultAdoption {
+                key: "agent_max_turns",
+                old_default: "50",
+                new_default: "80",
+                migration: "0041",
+            },
+        ];
+        assert!(
+            validate_adoptions(&chained, &defaults).is_empty(),
+            "chaining a second change to the same key must be expressible"
+        );
+    }
+
+    /// Each rule must actually fire — a checker that accepts everything is
+    /// worse than none, because the docs promise it catches these.
+    #[test]
+    fn adoption_defects_are_rejected() {
+        let defaults = Settings::default();
+
+        // A second entry that restates the ORIGINAL old value skips every
+        // install that already ran the first migration.
+        let problems = validate_adoptions(
+            &[
+                DefaultAdoption {
+                    key: "agent_max_turns",
+                    old_default: "20",
+                    new_default: "50",
+                    migration: "0035",
+                },
+                DefaultAdoption {
+                    key: "agent_max_turns",
+                    old_default: "20",
+                    new_default: "80",
+                    migration: "0041",
+                },
+            ],
+            &defaults,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("do not chain")),
+            "a broken chain must be reported, got {problems:?}"
+        );
+
+        // Not a Settings field at all.
+        let problems = validate_adoptions(
+            &[DefaultAdoption {
+                key: "not_a_setting",
+                old_default: "a",
+                new_default: "b",
+                migration: "0035",
+            }],
+            &defaults,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("not a Settings field")),
+            "an unknown key must be reported, got {problems:?}"
+        );
+
+        // No-op entry.
+        let problems = validate_adoptions(
+            &[DefaultAdoption {
+                key: "tool_selection_mode",
+                old_default: TOOL_SELECTION_MODE_ALL,
+                new_default: TOOL_SELECTION_MODE_ALL,
+                migration: "0035",
+            }],
+            &defaults,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("no-op")),
+            "an entry whose default never moved must be reported, got {problems:?}"
+        );
+
+        // Descending migration order.
+        let problems = validate_adoptions(
+            &[
+                DefaultAdoption {
+                    key: "agent_max_turns",
+                    old_default: "20",
+                    new_default: "50",
+                    migration: "0041",
+                },
+                DefaultAdoption {
+                    key: "agent_max_turns",
+                    old_default: "50",
+                    new_default: "50",
+                    migration: "0035",
+                },
+            ],
+            &defaults,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("out of order")),
+            "descending migration order must be reported, got {problems:?}"
+        );
+    }
 
     #[test]
     fn default_settings_have_expected_values() {

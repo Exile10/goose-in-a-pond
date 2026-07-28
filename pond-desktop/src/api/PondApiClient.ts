@@ -303,6 +303,31 @@ export class PondApiClient {
     return this.get("/api/v1/settings");
   }
 
+  /**
+   * PATCH the settings the caller actually changed, and return the full merged
+   * result.
+   *
+   * Send ONLY changed keys. The server writes exactly the keys the request
+   * carries and treats that key set as a record of user intent: each one is
+   * marked `is_user_set`, which permanently exempts it from future
+   * default-adoption migrations. A caller that PUTs a whole settings object
+   * therefore marks every setting as deliberately chosen — even on a Save that
+   * changed nothing — and reverts any field another surface (the Models tab,
+   * the phone, wake-word calibration) has written since it loaded.
+   *
+   * See docs/developer/settings-defaults-and-user-intent.md. Callers that
+   * batch edits behind a Save button should diff against the last loaded
+   * snapshot; `diffSettings` in `sections/Settings.tsx` does exactly that.
+   *
+   * The returned object is NOT byte-identical to the patch for a float field.
+   * `Settings` holds these as `f32` and the API serialises through `f64`, so a
+   * sent `0.7` comes back as 0.699999988079071. A caller that keeps a baseline
+   * must fold in the patch it sent alongside this response, or the float looks
+   * permanently edited and every later save re-sends it — which re-marks it and
+   * defeats default adoption for that key. Do not paper over it by comparing
+   * numbers with an epsilon or `Math.fround`: that also collapses distinct
+   * integers above 2^24 and would drop real edits to the count fields.
+   */
   updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return this.put("/api/v1/settings", patch);
   }
