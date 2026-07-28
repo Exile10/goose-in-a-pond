@@ -844,6 +844,9 @@ async fn chat(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Resets the inactivity clock and interrupts any background consolidation.
+    state.note_user_activity().await;
+
     let Json(req) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -1068,12 +1071,8 @@ async fn chat_stream(
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
-    // Update activity timestamp — resets the consolidation inactivity timer
-    *state.last_user_activity.write().await = std::time::Instant::now();
-    // Cancel any in-progress consolidation
-    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
-        cancel.cancel();
-    }
+    // Resets the inactivity clock and interrupts any background consolidation.
+    state.note_user_activity().await;
 
     let permit = state
         .sse_semaphore
@@ -4782,6 +4781,12 @@ async fn transcribe(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The GUI voice path enters here, one step ahead of the chat turn it will
+    // produce. Interrupting consolidation now (rather than waiting for
+    // `/chat/stream`) gives the pipeline time to unwind before the user's turn
+    // needs the inference slot.
+    state.note_user_activity().await;
+
     // Read the "audio" field from the multipart body
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut filename = "audio.bin".to_string();
@@ -6771,12 +6776,8 @@ async fn agent_chat_stream(
     use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::shared::domain::agent::AgentRequest;
 
-    // Update activity timestamp — resets the consolidation inactivity timer
-    *state.last_user_activity.write().await = std::time::Instant::now();
-    // Cancel any in-progress consolidation
-    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
-        cancel.cancel();
-    }
+    // Resets the inactivity clock and interrupts any background consolidation.
+    state.note_user_activity().await;
 
     let permit = match state.sse_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -8709,11 +8710,27 @@ async fn start_consolidation(State(state): State<Arc<AppState>>) -> axum::respon
         None => {
             return (
                 StatusCode::NOT_IMPLEMENTED,
-                Json(json!({"error": "Memory consolidation is not enabled"})),
+                Json(json!({"error": "Memory consolidation is not available in this build"})),
             )
                 .into_response();
         }
     };
+
+    // Read the CURRENT setting, not a startup snapshot — flipping the toggle in
+    // Settings must take effect without restarting the server.
+    let enabled = state
+        .settings_repo
+        .get()
+        .await
+        .map(|s| s.memory_consolidation_enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "Memory consolidation is not enabled"})),
+        )
+            .into_response();
+    }
 
     let cancel = tokio_util::sync::CancellationToken::new();
     *state.consolidation_cancel.write().await = Some(cancel.clone());
@@ -9132,11 +9149,8 @@ async fn run_recipe(
         }
     };
 
-    // Update activity timestamp — resets the consolidation inactivity timer
-    *state.last_user_activity.write().await = std::time::Instant::now();
-    if let Some(cancel) = state.consolidation_cancel.read().await.as_ref() {
-        cancel.cancel();
-    }
+    // Resets the inactivity clock and interrupts any background consolidation.
+    state.note_user_activity().await;
 
     let permit = state
         .sse_semaphore

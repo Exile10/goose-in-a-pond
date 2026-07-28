@@ -111,32 +111,76 @@ When saving via MCP tool without explicit segment, `auto_classify_segment()` use
 ## Consolidation
 
 Opt-in (`memory_consolidation_enabled`, default false — it needs a meaningful
-number of memories to be useful). The shipped pipeline is three-stage and
-adversarial (`crates/pond-server/src/three_stage_consolidator.rs`), not the
-single-pass merge this document originally described:
+number of memories to be useful). Two modes, selected by
+`memory_consolidation_mode`:
 
-1. **Proposer** reads the scoreable memories and proposes actions
-   (`Merge` / `Prune` / `Split` / `Recategorize`).
-2. **Adversary** challenges each proposal, arguing against destructive or
-   lossy changes.
-3. **Judge** rules on each exchange; only accepted actions are applied.
+- **`single`** (default) — one LLM call
+  (`crates/pond-server/src/llm_memory_consolidator.rs`). Every proposal is
+  applied. On a 3B on-device model this is the sane choice for a background
+  chore; the audit trail records each action as accepted *without* review so it
+  never implies a scrutiny that did not happen.
+- **`adversarial`** — three sequential LLM calls
+  (`crates/pond-server/src/three_stage_consolidator.rs`), cancellable between
+  stages:
+  1. **Proposer** reads the batch and proposes actions
+     (`Merge` / `Prune` / `Split` / `Recategorize`).
+  2. **Adversary** challenges each proposal, arguing against destructive or
+     lossy changes.
+  3. **Judge** rules on each exchange; only accepted actions are applied.
 
-Correction-safety guards are unconditional: a `Correction` memory is never
-pruned, a merge involving one is forced to `segment=Correction`, and `corrects`
-metadata propagates to the merged fragment. Every lifecycle change is written
-to `memory_events`, and each run is recorded in `consolidation_runs`.
+Both modes share one apply path,
+`pond_core::user_data::services::memory_consolidation::apply_actions`, so the
+correction-safety guards cannot drift between them. Those guards are
+unconditional: a `Correction` memory is never pruned, a merge involving one is
+forced to `segment=Correction`, `corrects` metadata propagates to the merged
+fragment (and, on a split, to the first `Correction`-segment entry), and a
+replacement that fails to insert aborts before its sources are marked
+superseded. Every lifecycle change is written to `memory_events`, and each run
+is recorded in `consolidation_runs` tagged with the mode that produced it.
 
-**Trigger and control**: a background loop starts a run after 15 minutes of
-user inactivity; any chat turn cancels an in-flight run (checked between
-stages — a stage already inside an LLM call finishes first).
+**Batch cap**: `select_batch` bounds each run at
+`memory_consolidation_batch_size` eligible (segmented) memories, **oldest
+first** — duplicates cluster in time, so a contiguous window is the ordering
+most likely to hold both halves of a duplicate pair. Whatever does not fit is
+logged as `deferred`, never silently dropped. Known limitation: the window does
+not rotate, so on a store larger than the batch, newer memories are not reached
+until the oldest ones are acted on. Advancing a persisted cursor would need a
+schema column and is deliberately future work.
+
+**Trigger and control**: the scheduler policy lives in
+`pond_core::user_data::services::consolidation_schedule` and is *at most one run
+per `memory_consolidation_interval_hours`, and only after 15 minutes of
+inactivity following real user activity in this process lifetime*. A freshly
+booted server that nobody has talked to never consolidates, however long it
+idles. The enable toggle, mode, interval, and batch size are all re-read from
+the settings DB on every tick, so changing them in Settings takes effect without
+a restart.
+
+Activity is a **two-source** signal, because the terminal voice loop runs in a
+separate OS process (`pond-server chat --json-events`) and cannot reach the
+server's in-memory state: the in-process `last_user_activity` clock (reset by
+every route through `AppState::note_user_activity`) *and* the newest
+`sessions.updated_at` in `pond_system.db`, which the voice child bumps through
+`ChatService` on every turn it persists. Either source going active both holds a
+run off and cancels one already in flight (adversarial stages check the token
+between calls; a stage already inside an LLM call finishes first).
+
 `POST /api/v1/memory/consolidate` streams a run's events over SSE for the
 desktop's consolidation banner, and `.../consolidate/stop` cancels it.
 
-Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`,
-Phase E): the trigger fires ~15 min after a boot with no user activity;
-`memory_consolidation_mode`, `_interval_hours`, and `_batch_size` are persisted
-and UI-exposed but not read by the runtime (mode is always adversarial, and
-there is no batch cap); toggling the enable flag needs a server restart.
+Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`):
+
+- The batch window does not rotate (above).
+- The 15-minute inactivity threshold is a compile-time constant
+  (`INACTIVITY_THRESHOLD_SECS`) rather than a setting.
+- Cross-process cancellation is poll-based, not pushed: the in-process clock is
+  sampled every 500 ms and the DB every 2 s, so an out-of-process voice turn can
+  wait up to about two seconds behind an in-flight LLM call.
+- An attempt consumes the interval budget even when cancelled or skipped for too
+  few memories. On a device the user touches every evening this can starve
+  consolidation for long stretches. The tradeoff is deliberate — retrying at the
+  next idle window is what made the old loop churn — but it is the part of the
+  policy most likely to want revisiting after Jetson soak time.
 
 ## MCP Tools
 
