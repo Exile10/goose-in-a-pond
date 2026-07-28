@@ -35,7 +35,8 @@ for arg in "$@"; do
   esac
 done
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# This script lives at scripts/jetson/build-docker.sh — the repo root is two levels up.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 echo "═══════════════════════════════════════════════════"
