@@ -33,9 +33,6 @@ export interface MusicProvider {
   searchTracks(query: string, limit?: number): Promise<TrackInfo[]>;
   searchAlbums(query: string, limit?: number): Promise<AlbumInfo[]>;
   getPlaylists(limit?: number): Promise<PlaylistInfo[]>;
-  getPlaylistTracks(playlistId: string): Promise<TrackInfo[]>;
-  createPlaylist(name: string, description?: string): Promise<PlaylistInfo>;
-  addToPlaylist(playlistId: string, trackUris: string[]): Promise<string>;
 }
 
 export interface AlbumInfo {
