@@ -253,20 +253,58 @@ export class SpotifyProvider implements MusicProvider {
     return tracks;
   }
 
+  /**
+   * Turns "Nairobi by Bensoul" into `track:"Nairobi" artist:"Bensoul"`.
+   *
+   * Spotify's search has no notion of natural language: every word in `q` is
+   * matched as a term, so "by" and a featured artist are scored as if the user
+   * had asked for them. "nairobi by bensoul" returns Extravaganza by Sauti Sol;
+   * "Intro by quality control ft gucci mane" returns Easy by Nicki Minaj. The
+   * field-filtered form returns the right track first in both cases.
+   *
+   * Returns `null` when the query has no "by", leaving it to be sent as-is.
+   */
+  private fieldFilteredQuery(query: string): string | null {
+    const split = query.match(/^(.*?)\s+by\s+(.*)$/i);
+    if (!split) return null;
+
+    const title = split[1].trim();
+    // Drop a featured-artist tail: the primary artist is what Spotify indexes
+    // under artist:, and the guest usually appears in the track title anyway.
+    const artist = split[2]
+      .replace(/\s+(feat\.?|ft\.?|featuring|with)\s+.*$/i, '')
+      .trim();
+
+    if (!title || !artist) return null;
+    // Quote both so multi-word values stay one term.
+    return `track:"${title}" artist:"${artist}"`;
+  }
+
   async searchTracks(query: string, limit: number = 10): Promise<TrackInfo[]> {
     const clamped = Math.max(1, Math.min(50, limit));
-    const encoded = encodeURIComponent(query);
 
     interface SearchResponse {
       tracks: { items: SpotifyTrack[] };
     }
 
-    const data = await this.api<SearchResponse>(
-      'GET',
-      `/search?type=track&q=${encoded}&limit=${clamped}`
-    );
+    const run = async (q: string) => {
+      const data = await this.api<SearchResponse>(
+        'GET',
+        `/search?type=track&q=${encodeURIComponent(q)}&limit=${clamped}`
+      );
+      return (data.tracks?.items || []).map(t => this.parseTrack(t));
+    };
 
-    return (data.tracks?.items || []).map(t => this.parseTrack(t));
+    // Try the precise form first, but never let it lose results: a strict
+    // filter finds nothing when the user misremembers a title, and the loose
+    // query still would.
+    const filtered = this.fieldFilteredQuery(query);
+    if (filtered) {
+      const hits = await run(filtered);
+      if (hits.length > 0) return hits;
+    }
+
+    return run(query);
   }
 
   async searchAlbums(query: string, limit: number = 10): Promise<AlbumInfo[]> {
