@@ -40,8 +40,31 @@ pub struct CompactionProfile {
     pub system_prompt_budget: usize,
     /// Max tokens to allocate for conversation history injection (per request).
     pub history_token_budget: usize,
+    /// Tokens held back for the model's OWN output — reasoning plus answer.
+    ///
+    /// Nothing else reserves this, and on a small window that omission is what
+    /// ends conversations. Measured on the Orin (n_ctx 4096): the preamble is
+    /// ~3,250 tokens, a couple of turns push the prompt to ~3,800, and then a
+    /// `thinking` block of up to 306 tokens overruns the window MID-generation.
+    /// llama.cpp returns ContextLengthExceeded ("Generation exhausted context
+    /// window"), and goose answers that by compacting the conversation
+    /// reactively — a path that does NOT consult GOOSE_AUTO_COMPACT_THRESHOLD,
+    /// so GIAP's "we own compaction" setting cannot prevent it. The user sees
+    /// their history replaced by a summary and an answer cut to one character.
+    ///
+    /// So the prompt must be budgeted against `context_window - this`, never
+    /// against the raw window.
+    pub output_reserve_tokens: usize,
     /// The effective context window this profile was derived from.
     pub context_window_tokens: usize,
+}
+
+impl CompactionProfile {
+    /// Tokens the prompt may occupy: the window minus the output reserve.
+    pub fn usable_prompt_tokens(&self) -> usize {
+        self.context_window_tokens
+            .saturating_sub(self.output_reserve_tokens)
+    }
 }
 
 impl CompactionProfile {
@@ -61,6 +84,9 @@ impl CompactionProfile {
                 max_memory_fragments: 3,
                 system_prompt_budget: 1500,
                 history_token_budget: 1200,
+                // A thinking block alone measured 306 tokens on this class of
+                // device; 768 covers reasoning plus a real answer.
+                output_reserve_tokens: 768,
                 context_window_tokens: context_tokens,
             }
         } else if context_tokens <= 12288 {
@@ -71,6 +97,7 @@ impl CompactionProfile {
                 max_memory_fragments: 5,
                 system_prompt_budget: 3000,
                 history_token_budget: 4000,
+                output_reserve_tokens: 1024,
                 context_window_tokens: context_tokens,
             }
         } else if context_tokens <= 65536 {
@@ -81,6 +108,7 @@ impl CompactionProfile {
                 max_memory_fragments: 10,
                 system_prompt_budget: 6000,
                 history_token_budget: 20000,
+                output_reserve_tokens: 2048,
                 context_window_tokens: context_tokens,
             }
         } else {
@@ -91,6 +119,7 @@ impl CompactionProfile {
                 max_memory_fragments: 15,
                 system_prompt_budget: 10000,
                 history_token_budget: 80000,
+                output_reserve_tokens: 4096,
                 context_window_tokens: context_tokens,
             }
         }

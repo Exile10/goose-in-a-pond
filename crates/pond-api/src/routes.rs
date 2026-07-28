@@ -320,8 +320,12 @@ pub(crate) fn embedded_ui_present() -> bool {
     WEB_DIST
         .get_file("index.html")
         .map(|f| {
+            // 21, the length of the marker. With 20 the windows could never
+            // equal it, `any` was always false, and this function always
+            // returned true — so the "UI not embedded" startup warning could
+            // not fire and the --static-dir fallback it guards was unreachable.
             !f.contents()
-                .windows(20)
+                .windows(b"data-giap-placeholder".len())
                 .any(|w| w == b"data-giap-placeholder")
         })
         .unwrap_or(false)
