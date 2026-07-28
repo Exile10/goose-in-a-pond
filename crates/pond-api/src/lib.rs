@@ -343,6 +343,33 @@ pub struct AppState {
     pub weather_provider: Option<Arc<dyn WeatherProvider>>,
 }
 
+impl AppState {
+    /// Record that the user just did something, and get out of the way.
+    ///
+    /// Every route that starts real work on the user's behalf must call this
+    /// **first**. It does two things that must always happen together:
+    ///
+    /// 1. Resets the inactivity clock the consolidation scheduler reads, so a
+    ///    background pass is not started while the user is mid-interaction.
+    /// 2. Cancels any consolidation already in flight. On the Jetson there is a
+    ///    single inference slot; a running three-stage pass would otherwise sit
+    ///    in front of the user's turn.
+    ///
+    /// Exists as one helper precisely so a new route cannot half-remember the
+    /// pair — the two blocks used to be copy-pasted into each handler, and the
+    /// voice and plain-`/chat` paths were missing them.
+    ///
+    /// Note: the terminal voice loop runs in a *separate process* and never
+    /// reaches this. It is covered instead by the scheduler's second activity
+    /// source, the newest `sessions.updated_at` in `pond_system.db`.
+    pub async fn note_user_activity(&self) {
+        *self.last_user_activity.write().await = std::time::Instant::now();
+        if let Some(cancel) = self.consolidation_cancel.read().await.as_ref() {
+            cancel.cancel();
+        }
+    }
+}
+
 /// State of a single in-progress (or recently completed) model download.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadEntry {

@@ -1,3 +1,4 @@
+pub mod consolidation_schedule;
 pub mod memory_cleanup;
 pub mod memory_consolidation;
 pub mod memory_extraction;

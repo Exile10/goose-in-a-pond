@@ -8,9 +8,14 @@ use async_trait::async_trait;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
 use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment};
-use pond_core::user_data::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
+use pond_core::user_data::ports::memory_consolidator::{
+    ChallengeSeverity, ChallengeVerdict, ConsolidationAction, ConsolidationEvent,
+    ConsolidationProposal, ConsolidationRunResult, JudgeDecision, MemoryConsolidator,
+    TrialExchange,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 const CONSOLIDATION_PROMPT: &str = "\
 Review these memories and find problems. Output a JSON array of actions:
@@ -64,6 +69,113 @@ impl MemoryConsolidator for LlmMemoryConsolidator {
 
         parse_consolidation_response(&response.content)
     }
+}
+
+/// Run a single-pass consolidation and shape the outcome like a three-stage run.
+///
+/// This is the `"single"` value of `memory_consolidation_mode`: one LLM call
+/// instead of three. On a 3B on-device model, paying for a Proposer, an
+/// Adversary and a Judge for a background chore is a real cost, so single-pass
+/// is the default and adversarial is the opt-in thorough mode.
+///
+/// The returned [`ConsolidationRunResult`] uses the same shape as the
+/// three-stage run so the SSE modal, the caller's apply step, and the
+/// `consolidation_runs` audit row are identical across modes. Because there is
+/// no adversary or judge here, every proposal is recorded as agreed-and-accepted
+/// with a rationale that says so — the audit trail must not imply a review that
+/// did not happen.
+pub async fn run_single_pass(
+    provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
+    memories: &[MemoryFragment],
+    cancel: CancellationToken,
+    event_tx: Option<tokio::sync::mpsc::Sender<ConsolidationEvent>>,
+) -> Result<ConsolidationRunResult> {
+    let start = std::time::Instant::now();
+
+    async fn emit(
+        tx: &Option<tokio::sync::mpsc::Sender<ConsolidationEvent>>,
+        e: ConsolidationEvent,
+    ) {
+        if let Some(tx) = tx {
+            let _ = tx.send(e).await;
+        }
+    }
+
+    let empty = |start: std::time::Instant| ConsolidationRunResult {
+        exchanges: vec![],
+        accepted_count: 0,
+        rejected_count: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+    };
+
+    if cancel.is_cancelled() {
+        emit(&event_tx, ConsolidationEvent::Cancelled).await;
+        return Ok(empty(start));
+    }
+
+    emit(
+        &event_tx,
+        ConsolidationEvent::Started {
+            memory_count: memories.len(),
+        },
+    )
+    .await;
+
+    let actions = LlmMemoryConsolidator::new(provider)
+        .consolidate(memories)
+        .await?;
+
+    // A cancel that landed while the single call was in flight: drop the
+    // proposals rather than applying work the user interrupted.
+    if cancel.is_cancelled() {
+        emit(&event_tx, ConsolidationEvent::Cancelled).await;
+        return Ok(empty(start));
+    }
+
+    let exchanges: Vec<TrialExchange> = actions
+        .into_iter()
+        .map(|action| TrialExchange {
+            proposal: ConsolidationProposal {
+                action,
+                rationale: "single-pass proposal".to_string(),
+            },
+            challenge: ChallengeVerdict {
+                agreed: true,
+                rationale: "single-pass mode: no adversarial review was run".to_string(),
+                severity: ChallengeSeverity::Low,
+            },
+            judgment: JudgeDecision {
+                accepted: true,
+                rationale: "accepted without review (single-pass mode)".to_string(),
+            },
+        })
+        .collect();
+
+    emit(
+        &event_tx,
+        ConsolidationEvent::ProposerDone {
+            proposals: exchanges.iter().map(|e| e.proposal.clone()).collect(),
+        },
+    )
+    .await;
+
+    let accepted_count = exchanges.len();
+    let result = ConsolidationRunResult {
+        exchanges,
+        accepted_count,
+        rejected_count: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+    };
+
+    emit(
+        &event_tx,
+        ConsolidationEvent::Completed {
+            result: result.clone(),
+        },
+    )
+    .await;
+
+    Ok(result)
 }
 
 fn parse_consolidation_response(raw: &str) -> Result<Vec<ConsolidationAction>> {

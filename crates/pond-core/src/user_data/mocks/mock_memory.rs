@@ -1,7 +1,9 @@
 //! In-memory mock implementations of `EmbeddingProvider` and `MemoryRepository`.
 
 use crate::models::ports::embedding::EmbeddingProvider;
-use crate::user_data::domain::memory::{cosine_similarity, MemoryFragment, MemoryLifecycle};
+use crate::user_data::domain::memory::{
+    cosine_similarity, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
+};
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -36,19 +38,61 @@ impl EmbeddingProvider for MockEmbeddingProvider {
     }
 }
 
+/// One row of the mock's `consolidation_runs` table:
+/// (mode, memory_count, accepted, rejected).
+pub type RecordedConsolidationRun = (String, usize, usize, usize);
+
 /// Mock memory repository — stores fragments in-memory.
 ///
 /// `search_similar` mirrors the SQLite adapter: cosine over rows that actually
 /// carry an embedding, falling back to `search_recent` when none do.
+///
+/// The lifecycle / supersede / segment / event writes are recorded rather than
+/// dropped so consolidation's correction-safety guards can be asserted on.
 pub struct MockMemoryRepository {
     fragments: Arc<RwLock<Vec<MemoryFragment>>>,
+    lifecycle_updates: Arc<RwLock<Vec<(String, MemoryLifecycle)>>>,
+    superseded: Arc<RwLock<Vec<(String, String)>>>,
+    segment_updates: Arc<RwLock<Vec<(String, MemorySegment, f32)>>>,
+    events: Arc<RwLock<Vec<(MemoryEventKind, String, Option<String>)>>>,
+    consolidation_runs: Arc<RwLock<Vec<RecordedConsolidationRun>>>,
 }
 
 impl MockMemoryRepository {
     pub fn new() -> Self {
         Self {
             fragments: Arc::new(RwLock::new(Vec::new())),
+            lifecycle_updates: Arc::new(RwLock::new(Vec::new())),
+            superseded: Arc::new(RwLock::new(Vec::new())),
+            segment_updates: Arc::new(RwLock::new(Vec::new())),
+            events: Arc::new(RwLock::new(Vec::new())),
+            consolidation_runs: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Lifecycle transitions recorded, in order: (memory id, new lifecycle).
+    pub async fn lifecycle_updates(&self) -> Vec<(String, MemoryLifecycle)> {
+        self.lifecycle_updates.read().await.clone()
+    }
+
+    /// Supersede links recorded, in order: (superseded id, superseding id).
+    pub async fn superseded(&self) -> Vec<(String, String)> {
+        self.superseded.read().await.clone()
+    }
+
+    /// Recategorizations recorded, in order: (id, new segment, new importance).
+    pub async fn segment_updates(&self) -> Vec<(String, MemorySegment, f32)> {
+        self.segment_updates.read().await.clone()
+    }
+
+    /// Audit events recorded, in order: (kind, memory id, data).
+    pub async fn events(&self) -> Vec<(MemoryEventKind, String, Option<String>)> {
+        self.events.read().await.clone()
+    }
+
+    /// Consolidation audit rows recorded, in order.
+    pub async fn consolidation_runs(&self) -> Vec<RecordedConsolidationRun> {
+        self.consolidation_runs.read().await.clone()
     }
 }
 
@@ -140,6 +184,80 @@ impl MemoryRepository for MockMemoryRepository {
             f.embedding = Some(embedding.to_vec());
         }
         Ok(())
+    }
+
+    // ── Consolidation-observable writes ────────────────────────────────────
+    // Recorded (not no-op'd) so the correction-safety guards are assertable.
+
+    async fn update_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<()> {
+        self.lifecycle_updates
+            .write()
+            .await
+            .push((id.to_string(), lifecycle.clone()));
+        let mut fragments = self.fragments.write().await;
+        if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
+            f.lifecycle = Some(lifecycle);
+        }
+        Ok(())
+    }
+
+    async fn mark_superseded(&self, id: &str, superseded_by: &str) -> Result<()> {
+        self.superseded
+            .write()
+            .await
+            .push((id.to_string(), superseded_by.to_string()));
+        let mut fragments = self.fragments.write().await;
+        if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
+            f.superseded_by = Some(superseded_by.to_string());
+            f.lifecycle = Some(MemoryLifecycle::Merged);
+        }
+        Ok(())
+    }
+
+    async fn update_segment(
+        &self,
+        id: &str,
+        segment: MemorySegment,
+        importance: f32,
+    ) -> Result<()> {
+        self.segment_updates
+            .write()
+            .await
+            .push((id.to_string(), segment.clone(), importance));
+        let mut fragments = self.fragments.write().await;
+        if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
+            f.segment = Some(segment);
+            f.importance = Some(importance);
+        }
+        Ok(())
+    }
+
+    async fn log_event(
+        &self,
+        kind: MemoryEventKind,
+        memory_id: &str,
+        _session_id: Option<&str>,
+        data: Option<&str>,
+    ) -> Result<()> {
+        self.events
+            .write()
+            .await
+            .push((kind, memory_id.to_string(), data.map(str::to_string)));
+        Ok(())
+    }
+
+    async fn log_consolidation_run(
+        &self,
+        mode: &str,
+        memory_count: usize,
+        accepted: usize,
+        rejected: usize,
+        _duration_ms: u64,
+        _details: Option<&str>,
+    ) -> Result<i64> {
+        let mut runs = self.consolidation_runs.write().await;
+        runs.push((mode.to_string(), memory_count, accepted, rejected));
+        Ok(runs.len() as i64)
     }
 }
 

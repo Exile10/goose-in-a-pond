@@ -1716,10 +1716,10 @@ async fn run_server(
         tracing::info!("memory cleanup enabled — runs every 6 hours");
     }
 
-    // ── Adversarial memory consolidation (inactivity-based) ──────────────
+    // ── Memory consolidation (inactivity-based) ──────────────────────────
     //
     // Three shared pieces of state:
-    //   - last_user_activity: reset on every chat request
+    //   - last_user_activity: reset by every route via AppState::note_user_activity
     //   - consolidation_cancel: abort mid-run when the user comes back
     //   - consolidation_event_tx: broadcast channel for SSE + background logs
     let last_user_activity = Arc::new(tokio::sync::RwLock::new(std::time::Instant::now()));
@@ -1733,64 +1733,223 @@ async fn run_server(
     // Build the ConsolidationRunner closure that pond-api will call from the
     // POST /api/v1/memory/consolidate endpoint. Captures repo, provider, and
     // the broadcast channel so pond-api never imports the consolidator crate.
-    let consolidation_runner: Option<pond_api::ConsolidationRunner> =
-        if settings.memory_consolidation_enabled {
-            let cr_repo = memory_repo.clone();
-            let cr_provider = llm_provider.clone();
-            let cr_broadcast_tx = consolidation_event_tx.clone();
-            Some(Arc::new(
-                move |cancel: tokio_util::sync::CancellationToken| {
-                    let repo = cr_repo.clone();
-                    let provider = cr_provider.clone();
-                    let broadcast_tx = cr_broadcast_tx.clone();
-                    Box::pin(async move {
-                        run_consolidation_pipeline(repo, provider, broadcast_tx, cancel).await;
-                    })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-                },
-            ))
-        } else {
-            None
-        };
+    //
+    // Built UNCONDITIONALLY: the enable toggle is a *runtime* decision, read
+    // fresh from the settings DB by the caller and by the loop below. Gating
+    // construction on a startup snapshot meant flipping the switch in Settings
+    // did nothing until the next restart.
+    let consolidation_runner: Option<pond_api::ConsolidationRunner> = {
+        let cr_repo = memory_repo.clone();
+        let cr_provider = llm_provider.clone();
+        let cr_broadcast_tx = consolidation_event_tx.clone();
+        let cr_settings_repo = settings_repo.clone();
+        Some(Arc::new(
+            move |cancel: tokio_util::sync::CancellationToken| {
+                let repo = cr_repo.clone();
+                let provider = cr_provider.clone();
+                let broadcast_tx = cr_broadcast_tx.clone();
+                let settings_repo = cr_settings_repo.clone();
+                Box::pin(async move {
+                    // Mode + batch size come from the CURRENT settings, so a
+                    // manual run honours whatever the user last chose.
+                    let (mode, batch_size) = match settings_repo.get().await {
+                        Ok(s) => (
+                            s.memory_consolidation_mode,
+                            s.memory_consolidation_batch_size as usize,
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "consolidation: settings read failed ({e}) — using defaults"
+                            );
+                            let d = pond_core::user_data::domain::settings::Settings::default();
+                            (
+                                d.memory_consolidation_mode,
+                                d.memory_consolidation_batch_size as usize,
+                            )
+                        }
+                    };
+                    run_consolidation_pipeline(
+                        repo,
+                        provider,
+                        broadcast_tx,
+                        cancel,
+                        &mode,
+                        batch_size,
+                    )
+                    .await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        ))
+    };
 
-    // Spawn inactivity-based consolidation scheduler
-    if settings.memory_consolidation_enabled {
+    // ── Inactivity-based consolidation scheduler ─────────────────────────
+    //
+    // Contract, enforced by `pond_core::user_data::services::consolidation_schedule`:
+    // at most one run per `memory_consolidation_interval_hours`, and only after
+    // INACTIVITY_THRESHOLD_SECS of quiet **following real user activity in this
+    // process lifetime**. A freshly booted server nobody has spoken to never
+    // consolidates, however long it idles.
+    //
+    // Activity is a two-source signal, because the terminal voice loop is a
+    // separate OS process that never touches this AppState:
+    //   1. in-process `last_user_activity` (HTTP routes), and
+    //   2. the newest `sessions.updated_at` in pond_system.db, which the voice
+    //      child bumps through ChatService on every turn it persists.
+    {
+        use pond_core::user_data::services::consolidation_schedule as sched;
+
         let inact_repo = memory_repo.clone();
         let inact_provider = llm_provider.clone();
         let inact_activity = last_user_activity.clone();
         let inact_cancel = consolidation_cancel.clone();
         let inact_event_tx = consolidation_event_tx.clone();
-        let inactivity_secs = 15 * 60u64; // 15 minutes
+        let inact_settings_repo = settings_repo.clone();
+        let inact_storage = session_storage.clone();
+
+        // Baselines for the "never on startup" guard. Captured before the
+        // server binds, so no request can have been served yet.
+        let started_at = std::time::Instant::now();
+        let started_at_utc = chrono::Utc::now();
 
         tokio::spawn(async move {
-            loop {
-                // Poll every 60 seconds
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            const POLL_SECS: u64 = 60;
+            let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+            let mut last_run: Option<std::time::Instant> = None;
 
-                // Check if 15 minutes of inactivity have passed
-                let elapsed = inact_activity.read().await.elapsed();
-                if elapsed < std::time::Duration::from_secs(inactivity_secs) {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+                let settings = match inact_settings_repo.get().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("consolidation scheduler: settings read failed: {e}");
+                        continue;
+                    }
+                };
+
+                // Out-of-process activity (voice child, GOTG on another
+                // process, anything else writing turns).
+                let db_activity = newest_session_activity(inact_storage.as_ref()).await;
+                let in_process_at = *inact_activity.read().await;
+
+                let saw_activity_since_start = sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                );
+
+                let idle_for =
+                    sched::combined_idle_for(in_process_at, db_activity, chrono::Utc::now());
+
+                let decision = sched::should_run(sched::GateInputs {
+                    enabled: settings.memory_consolidation_enabled,
+                    saw_activity_since_start,
+                    idle_for,
+                    idle_threshold,
+                    since_last_run: last_run.map(|t| t.elapsed()),
+                    interval_floor: sched::interval_floor_from_hours(
+                        settings.memory_consolidation_interval_hours,
+                    ),
+                });
+
+                if let sched::GateDecision::Skip(reason) = decision {
+                    tracing::trace!(
+                        reason = reason.as_str(),
+                        idle_secs = idle_for.as_secs(),
+                        "consolidation scheduler: skipping tick"
+                    );
                     continue;
                 }
 
-                tracing::info!("15 minutes of inactivity — starting memory consolidation");
+                tracing::info!(
+                    mode = %settings.memory_consolidation_mode,
+                    idle_secs = idle_for.as_secs(),
+                    "idle after user activity — starting memory consolidation"
+                );
 
                 let cancel = tokio_util::sync::CancellationToken::new();
                 *inact_cancel.write().await = Some(cancel.clone());
+
+                // Watcher: abort the moment activity resumes from EITHER source.
+                // Routes cancel this token directly; the DB poll is what lets an
+                // out-of-process voice turn interrupt a run.
+                let watcher_activity = inact_activity.clone();
+                let watcher_storage = inact_storage.clone();
+                let watcher_cancel = cancel.clone();
+                let watcher_baseline_in_process = in_process_at;
+                let watcher_baseline_db = db_activity;
+                let watcher = tokio::spawn(async move {
+                    // The in-process clock is a lock read, so poll it fast. The
+                    // DB check is a query, so sample it every Nth tick instead
+                    // of hammering SQLite for the whole length of a run.
+                    const TICK_MS: u64 = 500;
+                    const DB_EVERY_N_TICKS: u32 = 4;
+                    let mut tick: u32 = 0;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+                        if watcher_cancel.is_cancelled() {
+                            break;
+                        }
+                        tick = tick.wrapping_add(1);
+
+                        let resumed_in_process =
+                            *watcher_activity.read().await > watcher_baseline_in_process;
+
+                        let resumed_in_db = if tick % DB_EVERY_N_TICKS == 0 {
+                            match newest_session_activity(watcher_storage.as_ref()).await {
+                                // A transient read failure reads as None, which
+                                // must not be mistaken for activity.
+                                Some(latest) => match watcher_baseline_db {
+                                    Some(baseline) => latest > baseline,
+                                    None => true,
+                                },
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+
+                        if resumed_in_process || resumed_in_db {
+                            tracing::info!(
+                                "user activity resumed — cancelling memory consolidation"
+                            );
+                            watcher_cancel.cancel();
+                            break;
+                        }
+                    }
+                });
 
                 run_consolidation_pipeline(
                     inact_repo.clone(),
                     inact_provider.clone(),
                     inact_event_tx.clone(),
                     cancel,
+                    &settings.memory_consolidation_mode,
+                    settings.memory_consolidation_batch_size as usize,
                 )
                 .await;
+                watcher.abort();
 
-                // Reset the activity timer so we don't immediately re-run
-                *inact_activity.write().await = std::time::Instant::now();
+                // The interval floor (not the activity clock) is what prevents a
+                // re-fire. Rewriting last_user_activity here would have faked
+                // user activity and confused the summary loop that shares it.
+                //
+                // Deliberate: an attempt consumes the interval budget even when
+                // it was cancelled or skipped for too few memories. The
+                // alternative — retry after the next 15-minute idle window —
+                // reintroduces exactly the repeated-expensive-attempt churn
+                // this phase set out to remove. Consolidation is a best-effort
+                // background chore, so on a contended device it is better to
+                // miss a pass than to keep trying.
+                last_run = Some(std::time::Instant::now());
             }
         });
-        tracing::info!("memory consolidation enabled — triggers after 15 min inactivity");
+        tracing::info!(
+            "memory consolidation scheduler active — runs after {} min idle, at most once per interval (enable toggle is live)",
+            sched::INACTIVITY_THRESHOLD_SECS / 60
+        );
     }
 
     // ── Idle rolling-summary refresh (hybrid compaction, soft half) ──────
@@ -4141,15 +4300,49 @@ fn has_display() -> bool {
     }
 }
 
-/// Background task that tails the `event_log` table in `pond_logs.db`.
+/// Newest `sessions.updated_at` across every session in `pond_system.db`.
 ///
-/// On startup, it records the current maximum row ID so that pre-existing log
-/// history is not replayed. It then polls every second and prints any new rows
-/// to stdout. This is intentionally a plain `println!` rather than a tracing
-/// event so the output is always visible alongside the tracing output, making
-/// Run the three-stage adversarial consolidation pipeline, apply accepted
-/// actions, and broadcast events. Shared by the inactivity scheduler and the
-/// manual `POST /api/v1/memory/consolidate` endpoint (via `ConsolidationRunner`).
+/// This is the second of the consolidation scheduler's two activity sources.
+/// The terminal voice loop runs in a **separate OS process** (`pond-server chat
+/// --json-events`, spawned by the desktop shell) and so can never touch this
+/// process's `AppState.last_user_activity` — but it does persist every turn
+/// through `ChatService`, which bumps `sessions.updated_at` in the shared
+/// system DB. Watching that column is therefore what lets a voice interaction
+/// both hold consolidation off and interrupt a run already in flight.
+///
+/// Returns `None` when there are no sessions or the read fails; callers treat
+/// that as "no observable out-of-process activity".
+async fn newest_session_activity(
+    storage: &dyn pond_core::user_data::ports::session_storage::SessionStorage,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    storage
+        .list_sessions()
+        .await
+        .ok()?
+        .into_iter()
+        .map(|s| s.updated_at)
+        .max()
+}
+
+/// Run one consolidation pass in the configured mode, apply the accepted
+/// actions, and broadcast progress events.
+///
+/// Shared by the inactivity scheduler and the manual
+/// `POST /api/v1/memory/consolidate` endpoint (via `ConsolidationRunner`).
+///
+/// `mode` picks the cost/thoroughness tradeoff:
+/// - `"single"` — one LLM call. The default, and the sane choice on a 3B
+///   on-device model.
+/// - anything else (`"adversarial"`) — the three-stage Proposer -> Adversary ->
+///   Judge pipeline, cancellable between stages.
+///
+/// `batch_size` bounds how many memories reach the prompt, so a growing store
+/// cannot blow the context window. Whatever does not fit is logged, not
+/// silently dropped.
+///
+/// Both modes funnel their accepted actions through pond-core's
+/// `apply_actions`, so the correction-safety guards live in exactly one place
+/// and cannot drift between modes.
 async fn run_consolidation_pipeline(
     repo: Arc<dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync>,
     provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -4157,11 +4350,12 @@ async fn run_consolidation_pipeline(
         pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
     >,
     cancel: tokio_util::sync::CancellationToken,
+    mode: &str,
+    batch_size: usize,
 ) {
-    use pond_core::user_data::domain::memory::MemoryLifecycle;
-    use pond_core::user_data::ports::memory_consolidator::{
-        ConsolidationAction, ConsolidationEvent,
-    };
+    use pond_core::user_data::ports::memory_consolidator::ConsolidationEvent;
+    use pond_core::user_data::services::consolidation_schedule::MIN_MEMORIES_TO_CONSOLIDATE;
+    use pond_core::user_data::services::memory_consolidation as consolidation;
 
     let memories = match repo.search_scoreable(None).await {
         Ok(m) => m,
@@ -4174,18 +4368,35 @@ async fn run_consolidation_pipeline(
         }
     };
 
-    if memories.len() < 6 {
+    // Bound the prompt. Oldest-first, because duplicates cluster in time and a
+    // contiguous window is the ordering most likely to contain both halves of a
+    // duplicate pair (see `select_batch`).
+    let selection = consolidation::select_batch(memories, batch_size);
+
+    if selection.below_minimum() {
         tracing::debug!(
-            "consolidation: skipped — only {} memories (need >= 6)",
-            memories.len()
+            "consolidation: skipped — only {} eligible memories (need >= {})",
+            selection.batch.len(),
+            MIN_MEMORIES_TO_CONSOLIDATE
         );
         let _ = broadcast_tx.send(ConsolidationEvent::Error {
             message: format!(
-                "Need at least 6 memories to consolidate, found {}",
-                memories.len()
+                "Need at least {} memories to consolidate, found {}",
+                MIN_MEMORIES_TO_CONSOLIDATE,
+                selection.batch.len()
             ),
         });
         return;
+    }
+
+    if selection.deferred > 0 {
+        tracing::info!(
+            mode = %mode,
+            considered = selection.considered,
+            batch = selection.batch.len(),
+            deferred = selection.deferred,
+            "consolidation: batch cap applied — remaining memories deferred to the next run"
+        );
     }
 
     // Bridge: mpsc -> broadcast so the consolidator writes to mpsc and the
@@ -4198,196 +4409,65 @@ async fn run_consolidation_pipeline(
         }
     });
 
-    let memory_count = memories.len();
-    let consolidator = three_stage_consolidator::ThreeStageConsolidator::new(provider);
-    let result = consolidator.run(&memories, cancel, Some(mpsc_tx)).await;
+    let batch_len = selection.batch.len();
+    let resolved_mode = consolidation::mode_from_setting(mode);
+    let mode_label = resolved_mode.as_str();
+
+    let result = if resolved_mode.is_adversarial() {
+        three_stage_consolidator::ThreeStageConsolidator::new(provider)
+            .run(&selection.batch, cancel, Some(mpsc_tx))
+            .await
+    } else {
+        llm_memory_consolidator::run_single_pass(provider, &selection.batch, cancel, Some(mpsc_tx))
+            .await
+    };
 
     match result {
         Ok(ref result) => {
-            // Build lookup for source memory metadata (corrects, segment)
-            let memory_map: std::collections::HashMap<
-                &str,
-                &pond_core::user_data::domain::memory::MemoryFragment,
-            > = memories.iter().map(|m| (m.id.as_str(), m)).collect();
+            // Collected, not lazy: a borrowing iterator held across the
+            // `apply_actions` await defeats the compiler's higher-ranked
+            // lifetime inference for the whole spawned future.
+            let accepted: Vec<
+                pond_core::user_data::ports::memory_consolidator::ConsolidationAction,
+            > = result
+                .exchanges
+                .iter()
+                .filter(|e| e.judgment.accepted)
+                .map(|e| e.proposal.action.clone())
+                .collect();
 
-            for exchange in &result.exchanges {
-                if !exchange.judgment.accepted {
-                    continue;
-                }
-                match &exchange.proposal.action {
-                    ConsolidationAction::Merge {
-                        source_ids,
-                        merged_content,
-                        segment,
-                        importance,
-                    } => {
-                        // Guard: if any source is a correction, preserve its metadata
-                        let any_correction = source_ids
-                            .iter()
-                            .filter_map(|id| memory_map.get(id.as_str()))
-                            .any(|m| m.is_correction());
-
-                        let effective_segment = if any_correction {
-                            pond_core::user_data::domain::memory::MemorySegment::Correction
-                        } else {
-                            segment.clone()
-                        };
-
-                        let corrects = source_ids
-                            .iter()
-                            .filter_map(|id| memory_map.get(id.as_str()))
-                            .filter_map(|m| m.corrects.clone())
-                            .next();
-
-                        if any_correction {
-                            tracing::info!(
-                                "[consolidation] merge includes correction source — forcing segment=Correction"
-                            );
-                        }
-
-                        let new_frag =
-                            pond_core::user_data::domain::memory::MemoryFragment::from_extraction(
-                                uuid::Uuid::new_v4().to_string(),
-                                None,
-                                merged_content.clone(),
-                                effective_segment,
-                                *importance,
-                                corrects,
-                            );
-                        let new_id = new_frag.id.clone();
-                        let _ = repo.add(new_frag).await;
-                        for src_id in source_ids {
-                            let _ = repo.mark_superseded(src_id, &new_id).await;
-                            let _ = repo
-                                .log_event(
-                                    pond_core::user_data::domain::memory::MemoryEventKind::Superseded,
-                                    src_id,
-                                    None,
-                                    Some(&new_id),
-                                )
-                                .await;
-                        }
-                        let _ = repo
-                            .log_event(
-                                pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
-                                &new_id,
-                                None,
-                                None,
-                            )
-                            .await;
+            let outcome =
+                match consolidation::apply_actions(repo.as_ref(), &selection.batch, accepted).await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!("consolidation: applying actions failed: {e}");
+                        let _ = broadcast_tx.send(ConsolidationEvent::Error {
+                            message: e.to_string(),
+                        });
+                        return;
                     }
-                    ConsolidationAction::Prune { id } => {
-                        // Guard: never prune correction memories
-                        if let Some(mem) = memory_map.get(id.as_str()) {
-                            if mem.is_correction() {
-                                tracing::warn!(
-                                    "[consolidation] blocked prune of correction memory {id}"
-                                );
-                                continue;
-                            }
-                        }
+                };
 
-                        let _ = repo.update_lifecycle(id, MemoryLifecycle::Archived).await;
-                        let _ = repo
-                            .log_event(
-                                pond_core::user_data::domain::memory::MemoryEventKind::Pruned,
-                                id,
-                                None,
-                                None,
-                            )
-                            .await;
-                    }
-                    ConsolidationAction::Recategorize {
-                        id,
-                        new_segment,
-                        new_importance,
-                    } => {
-                        let _ = repo
-                            .update_segment(id, new_segment.clone(), *new_importance)
-                            .await;
-                        let _ = repo
-                            .log_event(
-                                pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
-                                id,
-                                None,
-                                Some("recategorized"),
-                            )
-                            .await;
-                    }
-                    ConsolidationAction::Split {
-                        source_id,
-                        new_memories,
-                    } => {
-                        // If source is a correction, propagate corrects to split entries
-                        let source_corrects = memory_map
-                            .get(source_id.as_str())
-                            .and_then(|m| m.corrects.clone());
-
-                        let mut first_new_id = String::new();
-                        let mut corrects_assigned = false;
-
-                        for entry in new_memories {
-                            let entry_corrects = if !corrects_assigned
-                                && source_corrects.is_some()
-                                && entry.segment
-                                    == pond_core::user_data::domain::memory::MemorySegment::Correction
-                            {
-                                corrects_assigned = true;
-                                source_corrects.clone()
-                            } else {
-                                None
-                            };
-
-                            let new_frag =
-                                pond_core::user_data::domain::memory::MemoryFragment::from_extraction(
-                                    uuid::Uuid::new_v4().to_string(),
-                                    None,
-                                    entry.content.clone(),
-                                    entry.segment.clone(),
-                                    entry.importance,
-                                    entry_corrects,
-                                );
-                            let nid = new_frag.id.clone();
-                            if first_new_id.is_empty() {
-                                first_new_id = nid.clone();
-                            }
-                            let _ = repo.add(new_frag).await;
-                            let _ = repo
-                                .log_event(
-                                    pond_core::user_data::domain::memory::MemoryEventKind::Consolidated,
-                                    &nid,
-                                    None,
-                                    None,
-                                )
-                                .await;
-                        }
-                        if !first_new_id.is_empty() {
-                            let _ = repo.mark_superseded(source_id, &first_new_id).await;
-                            let _ = repo
-                                .log_event(
-                                    pond_core::user_data::domain::memory::MemoryEventKind::Superseded,
-                                    source_id,
-                                    None,
-                                    Some(&first_new_id),
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
             if result.accepted_count > 0 || result.rejected_count > 0 {
                 tracing::info!(
+                    mode = %mode_label,
                     accepted = result.accepted_count,
                     rejected = result.rejected_count,
+                    merged = outcome.merged,
+                    pruned = outcome.pruned,
+                    split = outcome.split,
+                    recategorized = outcome.recategorized,
+                    blocked = outcome.blocked,
                     duration_ms = result.duration_ms,
-                    "adversarial consolidation complete"
+                    "memory consolidation complete"
                 );
                 // Persist audit trail
                 let details_json = serde_json::to_string(&result).ok();
                 let _ = repo
                     .log_consolidation_run(
-                        "adversarial",
-                        memory_count,
+                        mode_label,
+                        batch_len,
                         result.accepted_count,
                         result.rejected_count,
                         result.duration_ms,
@@ -4405,6 +4485,12 @@ async fn run_consolidation_pipeline(
     }
 }
 
+/// Background task that tails the `event_log` table in `pond_logs.db`.
+///
+/// On startup, it records the current maximum row ID so that pre-existing log
+/// history is not replayed. It then polls every second and prints any new rows
+/// to stdout. This is intentionally a plain `println!` rather than a tracing
+/// event so the output is always visible alongside the tracing output, making
 /// it easy to correlate API activity with DB-level events in a single terminal.
 ///
 /// Output format:

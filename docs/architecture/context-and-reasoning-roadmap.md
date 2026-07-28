@@ -284,30 +284,158 @@ then consolidation hardening, then multimodality.
   per-session would thrash `last_prefix_hash`; it costs nothing on the on-device
   path this phase targets.
 
-### Phase E — Consolidation hardening (bonus)
+### Phase E — Consolidation hardening (bonus) — DONE
 
-- E1 Startup guard (mirror the summary loop) + honor
-  `memory_consolidation_interval_hours` as the idle re-fire floor.
-- E2 Wire or remove the dead settings; wire the enable toggle without restart
-  (re-read settings in the loop).
-- E3 Batch cap from `memory_consolidation_batch_size` (top-N scoreable by
-  age/score) so prompts fit a 3B model.
-- E4 Replace the inline apply loop in main.rs with pond-core's
-  `run_consolidation`; delete the orphaned port + dead single-pass
-  consolidator (or wire it as the "single" mode if kept).
-- E5 Refresh `docs/architecture/memory_system.md`.
+- E1 DONE. Scheduling policy extracted to pond-core
+  (`user_data/services/consolidation_schedule.rs`) as a pure `should_run` gate:
+  *at most one run per `memory_consolidation_interval_hours`, and only after
+  `INACTIVITY_THRESHOLD_SECS` of quiet following real user activity in this
+  process lifetime*. The startup guard compares `last_user_activity` against an
+  `Instant` captured before the server binds (the in-process analogue of the
+  summary loop's `started_at`), so a booted-but-untouched server never runs. The
+  post-run reset of the activity clock is gone — the interval floor is what
+  prevents a re-fire, and faking activity confused the summary loop that shares
+  the clock.
+- E2 DONE. All three settings wired; nothing removed, so the UI and
+  `types.ts` are untouched and `every_settings_field_is_dispositioned` is
+  unaffected. `mode` dispatches: `"single"` (the existing
+  `LlmMemoryConsolidator`, one LLM call, and already the *default* the code was
+  ignoring) vs `"adversarial"` (three calls). Single-pass synthesises
+  `TrialExchange`es so the SSE modal renders unchanged, with rationales that say
+  no review was run.
+- E3 DONE. `select_batch` caps at `memory_consolidation_batch_size`,
+  **oldest-first** (duplicates cluster in time, so a contiguous window is most
+  likely to hold both halves of a pair) and reports `deferred` in the run log.
+  Not done: the window does not rotate, so a store larger than the batch never
+  reaches its newer half until the oldest are acted on — a persisted cursor
+  needs a schema column and was deliberately left out.
+- E4 DONE. The 165-line inline apply loop in `main.rs` is replaced by pond-core
+  `apply_actions`, now shared by both modes. Comparing the two first: they were
+  behaviourally identical arm for arm, so nothing needed porting *into*
+  pond-core except the `consolidation_runs` audit insert. pond-core's `?` on
+  `repo.add` was kept over main.rs's `let _ =` — a failed insert must not go on
+  to supersede its sources.
+- E5 DONE. Orphaned `ports/adversarial_consolidator.rs` deleted.
+- E6 DONE. Runner and loop both built unconditionally; `enabled` is re-read per
+  tick and in `start_consolidation`, so the toggle is live.
+- E7 DONE, with a caveat. `AppState::note_user_activity` replaces four
+  copy-pasted blocks and now also covers `/chat` and `/transcribe`. The voice
+  child is a **separate OS process** and can never reach `AppState`, so activity
+  became a two-source signal: the in-process clock *plus* the newest
+  `sessions.updated_at` in `pond_system.db`, which the voice child bumps via
+  `ChatService`. A watcher polls both during a run, so a voice turn cancels one
+  in flight within ~500 ms.
+- E8 DONE. `docs/architecture/memory_system.md` refreshed.
 
-### Phase F — Multimodality (after the above)
+### Phase F — Multimodality — F1/F2/F3/F5 LANDED (F4 deferred)
 
-- F1 Image v1: attach `request.images` in GooseAdapter (`with_image` loop) +
-  `/agent/chat/stream` parity + desktop attachment UI (`ChatStreamRequest.images`,
-  picker/paste, per-model gating via a surfaced `vision_capable`).
-- F2 Image history: persist attachments (pond_system.db + replay decision)
-  so follow-ups about an earlier image keep working after trims/restarts.
-- F3 Camera bridge: vision MCP tool variant that returns the snapshot as
-  image content ("what's at the door?" feeds the frame to the model).
-- F4 Audio-to-model (fork work): MessageContent variant + mtmd audio extract
-  path; until then Whisper transcription remains the audio route.
-- F5 Video v1: frame sampling into the image path (bounded frames/turn).
-- Perf note: vision turns bypass KV retention (full prefill) — measure on
-  Jetson with E2B + mmproj before enabling by default.
+**A second blocking gap the scouting missed.** `with_image` was necessary but
+not sufficient. `GooseAdapter::register_gguf_model` hard-coded
+`mmproj_path: None` for every GIAP-registered GGUF, and the engine's vision gate
+is exactly that field (`has_vision = resolved_model.mmproj_path.is_some()`,
+`goose-local-inference/src/llamacpp/mod.rs`). Goose's own
+`enrich_with_featured_mmproj` could never help, because it matches
+`featured_mmproj_spec(&self.id)` against the featured HF repo id
+(`unsloth/gemma-4-E2B-it-GGUF`) while GIAP registers the bare stem
+(`gemma-4-E2B-it`, `repo_id = "local/<stem>"`). Nothing in GIAP downloaded an
+mmproj either. So before this phase, an image on the `local` provider could only
+ever produce the engine's "[Image attached - image input is not supported...]".
+
+- **F1 DONE.** `crates/pond-adapters-goose/src/vision_encoder.rs` maps a stem to
+  its featured encoder, fetches it in the background to
+  `<data_dir>/models/mmproj/<normalised-name>/` (NOT `models/gguf/`, which
+  `resolve_gguf_filename` scans), and stamps `mmproj_path` /
+  `mmproj_size_bytes` / `vision_capable` onto the registry entry.
+  `resolve_model_path` runs on every `Provider::stream`, so the stamp takes
+  effect on the next turn without a provider rebuild or a restart. The download
+  is deliberately NOT blocking (the E2B encoder is 941 MB); a turn that needs
+  bytes that have not landed gets a specific error saying so, rather than a
+  silently rewritten prompt.
+  Also: `attach_images` folds `request.images` onto the user message;
+  `/agent/chat/stream` hand-parses `images` for parity; both chat surfaces got
+  picker + paste + thumbnail + remove, with client-side downscale to 1024 px.
+- **F1 gating**: no new endpoint. `GET /api/v1/models/capabilities` already
+  returned `vision` and the desktop already read it — it was just untruthful,
+  coming from a name regex that calls every `gemma-4*` vision-capable including
+  `gemma-4-E1B-it`, which ships no encoder. For `local`/`gguf` it now comes from
+  the registry. It reports DECLARED vision, not downloaded, so a user who has
+  just picked a vision model is not told the model cannot see.
+- **F1 limits**: `pond_core::models::domain::image_limits` — 4 images/turn,
+  4 MiB each, 8 MiB total, MIME allowlist; size computed from base64 length
+  WITHOUT decoding, so an oversized payload is a 413 before any decode buffer
+  exists. Note Axum's `DefaultBodyLimit` is 2 MiB, *smaller than one legal
+  image*: both chat routes carry an explicit `MAX_CHAT_BODY_BYTES` layer, sized
+  so every domain rejection stays reachable with its actionable message.
+- **F2 DONE — persisted, with a bounded replay.** `message_attachments`
+  (migration 0034) indexes bytes stored under `<data_dir>/attachments/<sid>/`;
+  bytes on disk rather than a SQLite BLOB because pond_system.db is read on
+  every turn and every session listing. `add_message` writes them, best-effort
+  (a full disk loses a picture, never the conversation).
+  Replay is capped at `MAX_HISTORY_REPLAY_IMAGES = 1`, newest-first, with
+  `[an image was attached here but is no longer available in this context]`
+  for the rest. The cap is not timidity: ANY conversation containing an image
+  makes that turn multimodal, and multimodal turns bypass KV retention — so
+  replaying everything would make every later turn in the session pay a full
+  prefill forever. `hydrate_goose_session` joins planned messages back to their
+  stored attachments by message id (it pre-applies `plan_replay`'s own blank and
+  trailing-user filters so the returned `index` is a valid subscript).
+  Verified end to end: after a restart with a fresh goose session,
+  `history_hydrate` logged `images_replayed=1` and the model answered a question
+  about an image the engine session had never seen.
+- **F3 DONE, via the shim — the MCP path alone cannot work here.** `rmcp 1.5.0`
+  has `Content::image` and `CallToolResult` carries it fine, but two fork-side
+  facts kill it on the on-device path: `multimodal.rs` matches only a TOP-LEVEL
+  `MessageContent::Image` (a `ToolResponse` falls into its catch-all), and
+  `strip_image_parts_from_messages` runs UNCONDITIONALLY, overwriting the
+  `image_url` part that `formats/openai.rs` relocates. Both are submodule edits,
+  out of scope this phase. So `GiapProviderShim::promote_tool_result_images`
+  lifts tool-result images into a trailing user message — the one place the
+  engine's extractor looks — gated to the `local`/`gguf` inner provider because
+  the HTTP formats already relocate correctly and would otherwise double up.
+  New tools: `look_at_camera_snapshot`, `look_at_camera_window`.
+- **F5 DONE as camera-event window sampling**, `look_at_camera_window`: up to 4
+  evenly-spaced frames (`pick_evenly_spaced` always includes both ends, so three
+  frames show a change rather than one moment three times). Deliberately NOT
+  ffmpeg: `pond-adapters-vision` already decodes the stream and writes one JPEG
+  per event, indexed by `camera_events.snapshot_path`. Those frames are decoded
+  and on disk, so sampling them is strictly cheaper than re-spawning ffmpeg —
+  and there is no recorded clip to sample anyway (the pipeline stores frames,
+  not video). If clip recording ever lands, `FfmpegFrameSource::build_args` is
+  the place to extend.
+- **F4 still deferred (fork work).** What the patch involves, concretely:
+  `RawContent::Audio` is flattened to the literal text
+  `"[Audio content: not supported]"` in `From<Content> for MessageContent`
+  (`goose-provider-types/src/conversation/message.rs`). The patch needs (a) a
+  `MessageContent::Audio` variant plus a `with_audio` builder, (b) that `From`
+  arm preserving it, (c) an `extract_audio_from_messages` beside
+  `extract_images_from_messages` in `goose-local-inference/src/multimodal.rs`
+  feeding mtmd's audio bitmaps (mtmd already reports audio support), (d) the
+  HTTP format layers deciding to drop or relocate it, and (e) the same
+  unconditional `strip_image_parts_from_messages` problem for audio parts.
+  That is five touch points across two fork crates — a milestone, not a phase
+  tail. Whisper ASR remains the audio route.
+
+**Measured (Mac M-series, gemma-4-E2B-it Q4_K_M, 60 tools, same question, fresh
+session each, model already resident):**
+
+| | prompt_tokens | ttft_ms | prefill_ms | prefill tok/s |
+|---|---|---|---|---|
+| text turn | 6,791 | 12,467 | 12,142 | 559 |
+| image turn (256x256 PNG) | 7,079 | 14,985 | 14,913 | 475 |
+
++288 prompt tokens and +2.8 s prefill for one image. The image itself is 256
+mtmd tokens (`image_tokens->nx = 256`); the engine logs `encoding image slice
+882 ms` + `image decoded 50 ms`, so roughly a third of the delta is the vision
+encoder and the rest is the larger prefill at a lower effective rate. The model
+described a synthetic red square with a black circle correctly ("The background
+color is red. The shape in the middle is a black circle."). Not yet measured on
+the Jetson — E2B weights (~1.8 GB) plus a 941 MB encoder is a real bite out of
+the 8 GB budget and needs its own burn-in before vision is recommended there.
+
+**Field note worth keeping:** the first version of `look_at_camera_snapshot`
+said "use this whenever the user asks what something LOOKS like". With an image
+ATTACHED to the message, gemma-4-E2B called the camera tool instead of looking
+at the picture it had already been given, got "No frame available", and answered
+"I cannot see the image". Tool descriptions that overlap an intrinsic capability
+need the boundary spelled out; both `look_at_*` descriptions now end with "not
+for an image attached to the message".
