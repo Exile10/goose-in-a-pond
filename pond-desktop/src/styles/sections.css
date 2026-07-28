@@ -1069,7 +1069,7 @@
   transition: background 100ms;
 }
 .session-dropdown__item:hover { background: var(--grey-50, #fafafa); }
-.session-dropdown__item.is-active { background: var(--purple-50, #f5f0ff); }
+.session-dropdown__item.is-active { background: var(--color-selected); }
 /* The clickable "open conversation" region — everything except the actions. */
 .session-dropdown__open {
   display: flex; align-items: center; gap: 8px;
@@ -1108,7 +1108,7 @@
 }
 .session-dropdown__action:hover { background: var(--grey-100, #eee); color: var(--color-text); }
 .session-dropdown__action--danger:hover {
-  background: var(--red-50, #fef3f2); color: var(--color-danger, #d92d20);
+  background: var(--color-destructive-soft); color: var(--color-destructive);
 }
 .session-dropdown__edit-input {
   flex: 1; min-width: 0; font-size: 13px;
