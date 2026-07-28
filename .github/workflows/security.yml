@@ -46,17 +46,30 @@ jobs:
         with:
           tool: cargo-audit
 
-      # Fails the job on any vulnerability advisory affecting Cargo.lock.
+      # Fails the job on any vulnerability advisory affecting a lockfile.
       # (Unmaintained/unsound advisories surface as warnings, not failures.)
-      - name: cargo audit
+      #
+      # Both lockfiles must be named explicitly. Bare `cargo audit` reads the
+      # workspace lockfile only, and pond-desktop/src-tauri is a separate cargo
+      # project — four advisories accumulated there unnoticed because of that.
+      - name: cargo audit (workspace)
         run: cargo audit
+
+      - name: cargo audit (desktop shell)
+        run: cargo audit --file pond-desktop/src-tauri/Cargo.lock
 
   npm-audit:
     name: Frontend — npm audit (high+)
     runs-on: ubuntu-latest
+    strategy:
+      # Do not stop at the first failing tree — report every one in a single run.
+      fail-fast: false
+      matrix:
+        # Every npm lockfile in the repo. Add new ones here.
+        project: [pond-desktop, extensions/music]
     defaults:
       run:
-        working-directory: pond-desktop
+        working-directory: ${{ matrix.project }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,11 +77,54 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: pond-desktop/package-lock.json
+          cache-dependency-path: ${{ matrix.project }}/package-lock.json
 
       # `npm audit` needs only the lockfile; fail on high/critical advisories.
       - name: npm audit
         run: npm audit --audit-level=high
+
+  osv:
+    name: All lockfiles — OSV (GitHub Advisory ranges)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      # Why this exists alongside cargo audit.
+      #
+      # cargo-audit resolves against the RustSec advisory database. Dependabot
+      # resolves against the GitHub Advisory Database. The two disagree on
+      # affected ranges, and the GitHub ranges are sometimes wider — openssl,
+      # tar, serde_with and jsonwebtoken were all open Dependabot alerts
+      # against the workspace lockfile while `cargo audit` reported it clean.
+      # A green cargo-audit run is not evidence that a lockfile is clean.
+      #
+      # osv-scanner queries OSV.dev, which aggregates BOTH databases, so it sees
+      # what Dependabot sees across Cargo and npm alike. cargo-deny would NOT
+      # close this gap: its advisories check reads the same RustSec database
+      # cargo-audit already does.
+      #
+      # Lockfiles are listed explicitly rather than scanned recursively. A bare
+      # recursive scan also picks up vendor/temporal_rs and
+      # templates/extensions/rust — a vendored [patch] source and a standalone
+      # user-extension template — whose advisories are not ours to action, and
+      # that noise is what lets real findings sit unread. The cost is that a new
+      # lockfile must be added here; the npm-audit matrix above has the same
+      # requirement.
+      #
+      # The goose submodule is not checked out here, and does not need to be:
+      # its dependencies reach us through the workspace lockfile, which is
+      # scanned.
+      - name: osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --lockfile=Cargo.lock
+            --lockfile=pond-desktop/src-tauri/Cargo.lock
+            --lockfile=pond-desktop/package-lock.json
+            --lockfile=extensions/music/package-lock.json
 
   secrets:
     name: Secrets — gitleaks (full history)
