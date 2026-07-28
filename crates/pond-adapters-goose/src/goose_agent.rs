@@ -513,11 +513,14 @@ impl GooseAdapter {
     /// model needs to stay coherent about the conversation.
     ///
     /// Image attachments (phase F2) ARE replayed, but only up to
-    /// `MAX_HISTORY_REPLAY_IMAGES`, newest-first; anything beyond that becomes a
-    /// text placeholder. See `pond_core::models::services::context::image_history`
-    /// for why the budget is small (every replayed image makes every subsequent
-    /// turn in the session a multimodal turn, and multimodal turns forfeit the
-    /// engine's KV prefix cache).
+    /// `MAX_HISTORY_REPLAY_IMAGES`, newest-first; anything beyond that — or
+    /// anything whose bytes could not be loaded — becomes a text placeholder,
+    /// whose wording is derived from what was actually attached rather than from
+    /// what the budget planned. See
+    /// `pond_core::models::services::context::image_history` for why the budget
+    /// is small (every replayed image makes every subsequent turn in the session
+    /// a multimodal turn, and multimodal turns forfeit the engine's KV prefix
+    /// cache).
     ///
     /// Budgeting reuses the same `trim_history` the in-turn trimmer uses, so a
     /// long history is cut to the profile's budget exactly the way a live
@@ -616,10 +619,24 @@ impl GooseAdapter {
                     *slot = attachment_counts.get(id).copied().unwrap_or(0);
                 }
             }
-            replay_images = pond_core::models::services::context::image_history::plan_image_replay(
-                &had_images,
-                pond_core::models::services::context::image_history::MAX_HISTORY_REPLAY_IMAGES,
-            );
+            // Only the user arm of the rebuild below attaches pixels, so an
+            // assistant row must not spend a budget it could never use. Its own
+            // `had_images` entry is left alone: the index row is still evidence
+            // an image was there, and it still earns a placeholder.
+            let plannable: Vec<usize> = had_images
+                .iter()
+                .zip(planned.iter())
+                .map(|(n, tm)| match tm.role {
+                    TrimRole::Assistant => 0,
+                    _ => *n,
+                })
+                .collect();
+            // Shared with the live trimmer's cap so a session that survives a
+            // restart neither gains nor loses images.
+            replay_images =
+                pond_core::models::services::context::image_history::plan_history_images(
+                    &plannable,
+                );
         }
 
         let wanted_ids: Vec<String> = planned
@@ -639,45 +656,65 @@ impl GooseAdapter {
 
         let mut replayed_images_total = 0usize;
         let mut placeholders_total = 0usize;
-        let replayed: Vec<Message> = planned
-            .iter()
-            .enumerate()
-            .map(|(i, tm)| {
-                let keep = replay_images[i];
-                let had = had_images[i];
-                // The model must know an image WAS there. Without the
-                // placeholder, a turn reading "what colour is this?" with nothing
-                // attached invites a confident invention.
-                let text = if had > keep {
-                    placeholders_total += had - keep;
-                    format!(
-                        "{}\n{}",
-                        tm.text,
-                        pond_core::models::services::context::image_history::HISTORY_IMAGE_PLACEHOLDER
-                    )
-                } else {
-                    tm.text.clone()
-                };
+        let mut replayed: Vec<Message> = Vec::with_capacity(planned.len());
+        for (i, tm) in planned.iter().enumerate() {
+            // ATTACHMENT REALITY — not the plan — decides the wording and both
+            // counters. `replay_images[i]` is only a request, and three things
+            // routinely make it larger than what this message can actually
+            // carry: `load_message_images` deliberately skips an attachment
+            // whose file has gone missing, a storage error collapses the whole
+            // load to an empty map, and only the user arm below attaches
+            // anything at all. Reading the plan instead let a message announce
+            // "the image still shown in this message" while carrying zero
+            // images — the exact text-contradicts-reality failure the
+            // placeholder exists to prevent.
+            let images = match tm.role {
+                TrimRole::Assistant => None,
+                _ => ids.get(tm.index).and_then(|id| loaded_images.get(id)),
+            };
+            let attached = replay_images[i].min(images.map_or(0, Vec::len));
+            let dropped = had_images[i].saturating_sub(attached);
 
-                match tm.role {
-                    TrimRole::Assistant => Message::assistant().with_text(&text),
-                    // The spliced summary rides a user message, like the trimmer's.
-                    _ => {
-                        let mut msg = Message::user().with_text(&text);
-                        if keep > 0 {
-                            if let Some(imgs) = ids.get(tm.index).and_then(|id| loaded_images.get(id))
-                            {
-                                for img in imgs.iter().take(keep) {
-                                    msg = msg.with_image(&img.data, &img.mime_type);
-                                    replayed_images_total += 1;
-                                }
-                            }
-                        }
-                        msg
+            // The model must know an image WAS there. Without the placeholder, a
+            // turn reading "what colour is this?" with nothing attached invites a
+            // confident invention.
+            //
+            // Which wording depends on whether an image SURVIVED this message:
+            // the replay writes the text before the images, so a
+            // partially-replayed turn would otherwise read "an image is no
+            // longer available" immediately above the image that still is.
+            // (`tm.text` comes from durable GIAP history, which stores real
+            // attachments and never a placeholder, so there is none to strip
+            // here — unlike the live cap, which re-reads its own output.)
+            let text = if dropped > 0 {
+                placeholders_total += dropped;
+                format!(
+                    "{}\n{}",
+                    tm.text,
+                    pond_core::models::services::context::image_history::history_image_placeholder(
+                        attached
+                    )
+                )
+            } else {
+                tm.text.clone()
+            };
+
+            replayed.push(match tm.role {
+                TrimRole::Assistant => Message::assistant().with_text(&text),
+                // The spliced summary rides a user message, like the trimmer's.
+                _ => {
+                    let mut msg = Message::user().with_text(&text);
+                    // `attached` is already clamped to `images.len()`, so this
+                    // yields exactly `attached` images and the counter cannot
+                    // drift from what the message holds.
+                    for img in images.into_iter().flatten().take(attached) {
+                        msg = msg.with_image(&img.data, &img.mime_type);
+                        replayed_images_total += 1;
                     }
+                    msg
                 }
-            })
-            .collect();
+            });
+        }
         let replayed_len = replayed.len();
 
         let conversation = goose::conversation::Conversation::new_unvalidated(replayed);
@@ -822,6 +859,70 @@ impl GooseAdapter {
                 caps.context_window_tokens as usize
             }
         }
+    }
+
+    /// Whether the ACTIVE model can accept image content.
+    ///
+    /// For the in-process engine this is the model registry's answer — does
+    /// this GGUF declare an mmproj — because the registry is the same thing the
+    /// engine gates its multimodal path on. HTTP providers have no registry to
+    /// ask, so they get `ModelCapabilities::name_implies_vision`, which mirrors
+    /// the registry's own verdicts (E1B excluded) and recognises the vision
+    /// models an Ollama install actually serves.
+    ///
+    /// DECLARED, not downloaded. The encoder is ~941 MB and lands in the
+    /// background, so "the bytes exist" flips mid-session; this does not. Two
+    /// things depend on that stability: `ModelCapabilities.vision`, and the
+    /// `<vision>` section of the system prompt, which sits inside the KV-cached
+    /// static prefix. A turn that actually needs the encoder before it has
+    /// landed is refused up front in `chat_stream`, with a message that says so.
+    fn model_supports_vision(provider: &str, model: &str) -> bool {
+        match provider {
+            "local" | "gguf" => crate::vision_encoder::declares_vision(model),
+            _ => pond_core::models::domain::model_capabilities::ModelCapabilities::name_implies_vision(
+                model,
+            ),
+        }
+    }
+
+    /// Whether THIS turn's system prompt should carry the `<vision>` section.
+    ///
+    /// Model capability is necessary but not sufficient: `capabilities()`
+    /// reports `vision = false` in voice mode, and a prompt that asserts a
+    /// capability the adapter simultaneously denies is a contradiction the model
+    /// pays for. Voice turns are transcribed speech with no attachment path, so
+    /// the section is pure prompt cost there — the same trade `thinking` already
+    /// makes in voice mode.
+    ///
+    /// `voice` is the INSTANCE-level flag (CLI `--input whisper`), not the
+    /// per-request one, for two reasons. It is the only signal `capabilities()`
+    /// can see, so keying off it is what makes the two agree on every input. And
+    /// it is fixed for the life of the process, so it cannot flip the static
+    /// prefix between turns of one session and forfeit the KV cache — which a
+    /// per-request flag, alternating text and voice turns, would.
+    fn vision_section_applies(provider: &str, model: &str, voice: bool) -> bool {
+        !voice && Self::model_supports_vision(provider, model)
+    }
+
+    /// Append the `<vision>` section to a prompt template when the model can see.
+    ///
+    /// Appended to the TEMPLATE, before Tera runs, rather than to the rendered
+    /// prefix: that way it lands inside `static_prefix` and `prefix_hash` covers
+    /// it for free, so a model switch that changes vision capability rebuilds
+    /// the prefix and a switch that does not leaves the KV cache alone. The
+    /// section itself is Jinja-free and renders verbatim.
+    ///
+    /// Not applied when `Settings.custom_system_prompt` is set: that is a full
+    /// override which `build_prompt_partition` uses INSTEAD of the template, so
+    /// its author owns the whole prompt including this section.
+    fn apply_vision_section(template: String, vision: bool, compact: bool) -> String {
+        if !vision {
+            return template;
+        }
+        format!(
+            "{template}\n{}",
+            pond_core::prompts::vision_capability_section(compact)
+        )
     }
 
     /// Stamp the engine-level `enable_thinking` request-param onto a ModelConfig.
@@ -1170,19 +1271,8 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
-            // Phase F1: for the in-process engine, `vision` comes from the model
-            // registry (does this model declare an mmproj?) rather than the name
-            // heuristic, which reports every `gemma-4*` as vision-capable and is
-            // therefore wrong for gemma-4-E1B-it. HTTP providers keep the
-            // heuristic — there is no registry to ask.
-            //
-            // Declared, not downloaded: a user who just picked a vision model
-            // must not be told it cannot read images while a ~1 GB encoder is
-            // still transferring. A turn that actually needs the bytes and does
-            // not have them says so precisely.
-            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
-                caps.vision = crate::vision_encoder::declares_vision(&settings.chat_model);
-            }
+            caps.vision =
+                Self::model_supports_vision(&settings.chat_provider, &settings.chat_model);
             tracing::debug!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
@@ -1226,9 +1316,13 @@ impl GooseAdapter {
 
     /// Deterministically trim goose's stored conversation for this session:
     /// strip stale <system-context> blocks from prior user turns, splice the
-    /// rolling <conversation-summary>, and drop the oldest complete turns
-    /// beyond the profile's history budget. Never calls a model; errors are
-    /// logged and skipped — a failed trim must never block the turn.
+    /// rolling <conversation-summary>, drop the oldest complete turns beyond the
+    /// profile's history budget, and cap how many historical images keep real
+    /// pixels. Never calls a model; errors are logged and skipped — a failed
+    /// trim must never block the turn.
+    ///
+    /// Runs only when `hybrid_compaction_enabled` (the default), which is also
+    /// what gates the image cap.
     async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{
@@ -1302,22 +1396,45 @@ impl GooseAdapter {
             .collect();
 
         let outcome = trim_history(trim_input, &profile, rolling_summary.as_deref(), last_real);
-        if !outcome.changed {
+
+        // ── Live-history image cap (phase F2, live half) ──────────────────
+        //
+        // Same policy the hydration replay uses, applied to the conversation
+        // the engine already holds: only the most recent image-bearing turn
+        // keeps real pixels, everything older degrades to a text placeholder.
+        //
+        // Without it every image in the transcript is re-encoded on every
+        // later turn. Measured on a four-turn production conversation: 1, then
+        // 2, then 3 encodes per turn at 0.7-2.7s each, prefill 28s -> 37s. The
+        // cost is unbounded in the length of the conversation.
+        //
+        // The image on the turn about to be sent is NOT counted — it has not
+        // been appended to Goose's conversation yet, so it is not history, and
+        // this session still gets one fresh image plus one from before.
+        let (had_images, keep_images, images_dropped) =
+            plan_live_image_cap(&source, &outcome.messages);
+
+        // A conversation with no images (or one already inside the budget) must
+        // come out byte-identical: the trimmer's own `changed` flag is still the
+        // only thing that can trigger a rewrite.
+        if !outcome.changed && images_dropped == 0 {
             return;
         }
 
         // Rebuild: original messages survive untouched unless (a) they are the
         // spliced summary (fresh user message), (b) their text changed AND they
-        // are plain-text messages, or (c) they carry an oversized structured
-        // tool response, whose TEXT bodies are truncated in place.
+        // are plain-text messages, (c) they carry an oversized structured tool
+        // response, whose TEXT bodies are truncated in place, or (d) they carry
+        // images over the history budget.
         //
-        // (c) is the only case that rewrites a structured message, and it does
-        // so by cloning the original and replacing text inside it — ids,
-        // annotations, error flags and the tool-request/response pairing are
-        // preserved byte-for-byte. That pairing is load-bearing: an orphaned or
-        // re-keyed tool response is rejected by the provider.
+        // (c) and (d) are the only cases that rewrite a structured message, and
+        // both do so by cloning the original and editing its content in place —
+        // ids, annotations, error flags and the tool-request/response pairing
+        // are preserved byte-for-byte. That pairing is load-bearing: an orphaned
+        // or re-keyed tool response is rejected by the provider, which is why
+        // (d) refuses to touch any message carrying tool parts at all.
         let mut rebuilt: Vec<goose::conversation::message::Message> = Vec::new();
-        for tm in &outcome.messages {
+        for (i, tm) in outcome.messages.iter().enumerate() {
             if tm.is_summary || tm.index == usize::MAX {
                 rebuilt.push(goose::conversation::message::Message::user().with_text(&tm.text));
                 continue;
@@ -1328,6 +1445,15 @@ impl GooseAdapter {
                 pond_core::models::services::context_budget::TOOL_RESULT_MAX_CHARS,
             ) {
                 rebuilt.push(truncated);
+                continue;
+            }
+            // (d) an image-bearing message over the history budget, or one whose
+            // text was rewritten — the text-only branch below cannot reach it,
+            // so before this its stale <system-context> also survived forever.
+            if had_images[i] > 0
+                && (keep_images[i] < had_images[i] || original.as_concat_text() != tm.text)
+            {
+                rebuilt.push(cap_message_images(original, keep_images[i], &tm.text));
                 continue;
             }
             let text_only = original
@@ -1364,6 +1490,7 @@ impl GooseAdapter {
                 dropped_turns = outcome.dropped_turns,
                 estimated_tokens = outcome.estimated_tokens,
                 summary_spliced = rolling_summary.is_some(),
+                images_dropped,
             ),
             Err(e) => tracing::warn!("trim: replace_conversation failed: {e}"),
         }
@@ -1851,8 +1978,8 @@ impl GooseAdapter {
         // and the session turn cap (#105 — voice_max_turns). Check both the
         // instance-level flag (CLI --input whisper) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
-        let is_voice =
-            self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) || request.voice_mode;
+        let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
+        let is_voice = voice_instance || request.voice_mode;
 
         // Resolve thinking mode from settings + capabilities.
         // Voice mode always disables thinking — reasoning tokens waste TTS time
@@ -1929,6 +2056,30 @@ impl GooseAdapter {
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
+
+        // Phase F3: tell a multimodal model that it IS multimodal.
+        //
+        // Nothing else in the prompt says so, and the omission is not theoretical:
+        // asked "what is in the image above?" with a fully encoded 252-token image
+        // in context, Gemma-4-E4B answered "I cannot directly describe the content
+        // of an image you provide. I am a text-based assistant." The section also
+        // draws the line between an image ATTACHED to the message and a live
+        // CAMERA frame, because the same model answered "what do you see?" by
+        // offering camera frames while an attachment sat in front of it.
+        //
+        // Gated on the model, never rendered for a text-only one — telling a
+        // blind model it can see manufactures a hallucination from nothing —
+        // and off in voice mode, where `capabilities()` already reports
+        // vision = false and no attachment can reach the turn.
+        let template_content = Self::apply_vision_section(
+            template_content,
+            Self::vision_section_applies(
+                &settings.chat_provider,
+                &settings.chat_model,
+                voice_instance,
+            ),
+            prompt_state.compact_prompt,
+        );
 
         // Per-turn dynamic context (date/time, profile). Moved from system
         // prompt to user message to keep system+tools prefix token-stable.
@@ -2680,6 +2831,10 @@ impl AgentPort for GooseAdapter {
             .clone();
         // Voice mode disables expensive/leaky capabilities: thinking tokens
         // waste TTS time, vision/audio inputs aren't used in voice flow.
+        //
+        // `vision = false` here is load-bearing for the prompt too:
+        // `vision_section_applies` reads the SAME instance-level flag, so the
+        // `<vision>` section cannot assert a capability this method denies.
         if self.voice_mode.load(std::sync::atomic::Ordering::Relaxed) {
             caps.thinking = false;
             caps.vision = false;
@@ -2898,10 +3053,6 @@ fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String
     exact
 }
 
-/// Whether `tag` begins with a GGUF quantization marker (`Q4_K_M`, `Q6_K`,
-/// `Q8_0`, `IQ4_XS`, `F16`, `F32`, `BF16`, …). Deliberately conservative: it
-/// only needs to tell a quant suffix apart from a continuation of the model
-/// name (`it`, `instruct`), not to validate every possible tag.
 /// Attach a turn's image attachments to a message (phase F1).
 ///
 /// Images ride the USER message, never the system prefix: the prefix must stay
@@ -2921,6 +3072,154 @@ fn attach_images(
         .fold(msg, |m, img| m.with_image(&img.data, &img.mime_type))
 }
 
+/// Number of image parts carried by a Goose message.
+fn image_part_count(msg: &Message) -> usize {
+    msg.content
+        .iter()
+        .filter(|c| matches!(c, goose::conversation::message::MessageContent::Image(_)))
+        .count()
+}
+
+/// True when the message carries a tool request or response part.
+///
+/// The image cap never rewrites these. Tool request/response pairing is
+/// load-bearing — an orphaned or re-keyed response is rejected outright by the
+/// provider — and the one path allowed to rebuild such a message is
+/// `truncate_tool_response_text`, which preserves ids and error flags
+/// byte-for-byte. Camera tools DO return images inside a tool response; those
+/// ride the tool-result truncation path, not this one.
+fn has_tool_parts(msg: &Message) -> bool {
+    use goose::conversation::message::MessageContent as C;
+    msg.content.iter().any(|c| {
+        matches!(
+            c,
+            C::ToolRequest(_)
+                | C::ToolResponse(_)
+                | C::ToolConfirmationRequest(_)
+                // An elicitation or a tool confirmation awaiting an answer: part
+                // of the same request/response bookkeeping, and just as unsafe
+                // to rewrite.
+                | C::ActionRequired(_)
+                | C::FrontendToolRequest(_)
+        )
+    })
+}
+
+/// Rebuild `original` with at most `keep` of its image parts, its text replaced
+/// by `text`, and ONE placeholder describing whatever images were dropped.
+///
+/// The message is CLONED and only its `content` replaced, so id, timestamp,
+/// role and metadata survive exactly. The LEADING images are the ones kept, so
+/// ordinal 0 stays ordinal 0 — the same rule the hydration replay uses.
+///
+/// Text parts collapse into the position of the first one. That keeps the text
+/// on the same side of the images as the model originally saw it, which is the
+/// only ordering property a multimodal template cares about.
+///
+/// # Exactly one placeholder, whatever the state
+///
+/// Capping is STAGED: with a budget of one, a two-image message is capped 2 to 1
+/// when it becomes history, then 1 to 0 when a newer image turn arrives. By the
+/// second pass the first pass's placeholder is already part of the message — and
+/// part of `as_concat_text()`, so `text` carries it too and the text does not
+/// even register as changed. Appending unconditionally would leave the model
+/// reading two stand-ins for the same attachment, one of them stale. So every
+/// existing placeholder is stripped first and exactly one is re-emitted for the
+/// state the message ends up in: the partial wording while an image survives,
+/// the all-dropped wording once none do.
+fn cap_message_images(original: &Message, keep: usize, text: &str) -> Message {
+    use goose::conversation::message::MessageContent as C;
+    use pond_core::models::services::context::image_history::{
+        contains_history_image_placeholder, history_image_placeholder,
+        strip_history_image_placeholders,
+    };
+
+    // A placeholder already in the transcript means images were dropped on an
+    // earlier pass, so one is still owed even if this pass drops nothing.
+    let placeholder_owed = contains_history_image_placeholder(text)
+        || original.content.iter().any(|c| match c {
+            C::Text(t) => contains_history_image_placeholder(&t.text),
+            _ => false,
+        });
+    let wanted_text = strip_history_image_placeholders(text);
+    // `placeholder_owed` forces the text collapse below, which is what actually
+    // removes the earlier pass's placeholder. Today the comparison alone would
+    // do it — a placeholder in the message is in `as_concat_text()`, and
+    // `wanted_text` has none, so the two always differ — but that reasoning
+    // leans on Goose's concatenation including every text part. If a submodule
+    // sync ever changed that, the stale placeholder would survive next to the
+    // fresh one, which is the exact bug this is here to prevent.
+    let text_changed = placeholder_owed || original.as_concat_text() != wanted_text;
+    let mut kept = 0usize;
+    let mut dropped = 0usize;
+    let mut text_emitted = false;
+    let mut content: Vec<C> = Vec::with_capacity(original.content.len() + 1);
+
+    for part in &original.content {
+        match part {
+            C::Image(_) => {
+                if kept < keep {
+                    kept += 1;
+                    content.push(part.clone());
+                } else {
+                    dropped += 1;
+                }
+            }
+            C::Text(_) if text_changed => {
+                if !text_emitted {
+                    text_emitted = true;
+                    // An empty part is dropped rather than emitted: some
+                    // providers reject empty text content outright.
+                    if !wanted_text.is_empty() {
+                        content.push(C::text(wanted_text.as_ref()));
+                    }
+                }
+            }
+            other => content.push(other.clone()),
+        }
+    }
+
+    if dropped > 0 || placeholder_owed {
+        content.push(C::text(history_image_placeholder(kept)));
+    }
+
+    let mut capped = original.clone();
+    capped.content = content;
+    capped
+}
+
+/// Per-message image counts and the cap plan for a trimmed conversation.
+///
+/// Returns `(had, keep, dropped_total)`, all aligned with `trimmed`. A message
+/// that carries tool parts, or that has no source row (the spliced summary,
+/// `index == usize::MAX`), counts as zero and is therefore never rewritten.
+///
+/// `dropped_total == 0` means the conversation already fits the policy and must
+/// be left byte-identical.
+fn plan_live_image_cap(
+    source: &[Message],
+    trimmed: &[pond_core::models::services::context::turn_trimmer::TrimMessage],
+) -> (Vec<usize>, Vec<usize>, usize) {
+    use pond_core::models::services::context::image_history::{
+        dropped_image_count, plan_history_images,
+    };
+
+    let had: Vec<usize> = trimmed
+        .iter()
+        .map(|tm| match source.get(tm.index) {
+            Some(m) if !has_tool_parts(m) => image_part_count(m),
+            _ => 0,
+        })
+        .collect();
+    let keep = plan_history_images(&had);
+    let dropped = dropped_image_count(&had, &keep);
+    (had, keep, dropped)
+}
+
+/// Whether `tag` begins with a GGUF quantization marker (`Q4_K_M`, `Q6_K`,
+/// `Q8_0`, `IQ4_XS`, `F16`, `F32`, `BF16`, …). Deliberately conservative: it
+/// only needs to tell a quant suffix apart from a continuation of the model
+/// name (`it`, `instruct`), not to validate every possible tag.
 pub(crate) fn looks_like_quant_tag(tag: &str) -> bool {
     let digit_after = |prefix: &str| {
         tag.strip_prefix(prefix)
@@ -3158,6 +3457,398 @@ mod tests {
             Some(goose::conversation::message::MessageContent::Text(_))
         ));
         assert_eq!(image_parts(&msg).len(), 1);
+    }
+
+    // ── F3: the vision-capability prompt section ─────────────────────────
+
+    /// The failure this guards is the whole point of the section: a text-only
+    /// model told it can see will describe an image that was never there.
+    #[test]
+    fn a_text_only_model_never_gets_the_vision_section() {
+        for compact in [false, true] {
+            let out =
+                GooseAdapter::apply_vision_section("<identity>x</identity>".into(), false, compact);
+            assert_eq!(out, "<identity>x</identity>");
+            assert!(!out.contains("<vision>"));
+        }
+    }
+
+    #[test]
+    fn a_vision_model_gets_exactly_one_vision_section_at_the_tier_it_pays_for() {
+        for compact in [false, true] {
+            let out =
+                GooseAdapter::apply_vision_section("<identity>x</identity>".into(), true, compact);
+            assert!(out.starts_with("<identity>x</identity>"));
+            assert_eq!(out.matches("<vision>").count(), 1);
+            assert!(out.contains(pond_core::prompts::vision_capability_section(compact)));
+        }
+        // The compact tier must not pay for the verbose wording.
+        let verbose = GooseAdapter::apply_vision_section(String::new(), true, false);
+        let compact = GooseAdapter::apply_vision_section(String::new(), true, true);
+        assert!(compact.len() < verbose.len());
+    }
+
+    /// The registry (mmproj presence), not the `gemma-4*` name heuristic, is the
+    /// truth for the in-process engine: E1B is a gemma-4 with no vision encoder.
+    #[test]
+    fn local_vision_capability_comes_from_the_mmproj_registry() {
+        for provider in ["local", "gguf"] {
+            assert!(GooseAdapter::model_supports_vision(
+                provider,
+                "gemma-4-E2B-it"
+            ));
+            assert!(GooseAdapter::model_supports_vision(
+                provider,
+                "gemma-4-E4B-it-Q4_K_M"
+            ));
+            assert!(
+                !GooseAdapter::model_supports_vision(provider, "gemma-4-E1B-it"),
+                "E1B declares no mmproj — the name heuristic would wrongly say yes"
+            );
+            assert!(!GooseAdapter::model_supports_vision(
+                provider,
+                "Llama-3.2-3B-Instruct"
+            ));
+        }
+    }
+
+    /// HTTP providers have no registry to ask, so they fall back to the name
+    /// rule — which has to reach the SAME verdict the registry would, including
+    /// the E1B exclusion, and has to recognise the vision models an Ollama
+    /// install actually serves. Both directions were wrong before: E1B was told
+    /// it could see, and every `*-vision` / `*-vl` model was told it could not.
+    #[test]
+    fn http_vision_capability_matches_the_registry_and_covers_real_ollama_tags() {
+        for provider in ["ollama", "llamafile", "openai"] {
+            assert!(
+                !GooseAdapter::model_supports_vision(provider, "gemma-4-E1B-it"),
+                "{provider}: E1B has no vision encoder on ANY provider"
+            );
+            assert!(
+                !GooseAdapter::model_supports_vision(provider, "gemma3n:e1b"),
+                "{provider}: same model, Ollama's spelling"
+            );
+            for model in [
+                "gemma-4-E4B-it",
+                "gemma3n:e4b",
+                "llama3.2-vision:11b",
+                "qwen2.5-vl:7b",
+                "minicpm-v:8b",
+                "pixtral-12b",
+            ] {
+                assert!(
+                    GooseAdapter::model_supports_vision(provider, model),
+                    "{provider}/{model} accepts images"
+                );
+            }
+            assert!(!GooseAdapter::model_supports_vision(
+                provider,
+                "Llama-3.2-3B-Instruct"
+            ));
+            assert!(!GooseAdapter::model_supports_vision(
+                provider,
+                "llama3.2:3b"
+            ));
+        }
+    }
+
+    /// D4: the prompt must not assert a capability `capabilities()` denies.
+    /// Voice mode forces `caps.vision = false`, so the section is off there too
+    /// — driven by the same instance-level flag, so the two cannot disagree.
+    #[test]
+    fn voice_mode_suppresses_the_vision_section_just_as_capabilities_does() {
+        let vision_model = ("ollama", "gemma-4-E4B-it");
+        assert!(GooseAdapter::vision_section_applies(
+            vision_model.0,
+            vision_model.1,
+            false
+        ));
+        assert!(
+            !GooseAdapter::vision_section_applies(vision_model.0, vision_model.1, true),
+            "voice mode reports vision=false; the prompt must not claim otherwise"
+        );
+        // A text-only model stays off in both modes.
+        for voice in [false, true] {
+            assert!(!GooseAdapter::vision_section_applies(
+                "ollama",
+                "Llama-3.2-3B-Instruct",
+                voice
+            ));
+        }
+    }
+
+    // ── F2 live half: the image cap on the in-turn trimmer ───────────────
+
+    fn trim_msg(
+        index: usize,
+        text: &str,
+    ) -> pond_core::models::services::context::turn_trimmer::TrimMessage {
+        pond_core::models::services::context::turn_trimmer::TrimMessage {
+            index,
+            role: pond_core::models::services::context::turn_trimmer::TrimRole::User,
+            text: text.to_string(),
+            is_summary: false,
+        }
+    }
+
+    fn user_with_images(text: &str, images: &[&str]) -> Message {
+        images.iter().fold(Message::user().with_text(text), |m, d| {
+            m.with_image(*d, "image/png")
+        })
+    }
+
+    /// The KV invariant guard: a conversation that never had an image must come
+    /// out of the cap with nothing to do, so the trimmer's own `changed` flag
+    /// stays the only thing that can rewrite it.
+    #[test]
+    fn a_text_only_conversation_plans_no_image_change() {
+        let source = vec![
+            Message::user().with_text("hi"),
+            Message::assistant().with_text("hello"),
+            Message::user().with_text("bye"),
+        ];
+        let trimmed = vec![trim_msg(0, "hi"), trim_msg(1, "hello"), trim_msg(2, "bye")];
+        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        assert_eq!(had, vec![0, 0, 0]);
+        assert_eq!(keep, vec![0, 0, 0]);
+        assert_eq!(dropped, 0);
+    }
+
+    /// One image is inside the budget: still nothing to rewrite.
+    #[test]
+    fn a_single_historical_image_is_left_alone() {
+        let source = vec![user_with_images("look", &["AAAA"])];
+        let (_, _, dropped) = plan_live_image_cap(&source, &[trim_msg(0, "look")]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn only_the_newest_image_bearing_turn_keeps_pixels() {
+        let source = vec![
+            user_with_images("first", &["AAAA"]),
+            Message::assistant().with_text("ok"),
+            user_with_images("second", &["BBBB", "CCCC"]),
+        ];
+        let trimmed = vec![
+            trim_msg(0, "first"),
+            trim_msg(1, "ok"),
+            trim_msg(2, "second"),
+        ];
+        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        assert_eq!(had, vec![1, 0, 2]);
+        assert_eq!(keep, vec![0, 0, 1], "newest-first, leading image kept");
+        assert_eq!(dropped, 2);
+    }
+
+    /// A spliced `<conversation-summary>` has no source row (`usize::MAX`) and
+    /// must not index out of bounds or steal budget.
+    #[test]
+    fn the_spliced_summary_row_counts_as_no_images() {
+        let source = vec![user_with_images("look", &["AAAA", "BBBB"])];
+        let mut summary = trim_msg(usize::MAX, "<conversation-summary>x</conversation-summary>");
+        summary.is_summary = true;
+        let (had, keep, dropped) = plan_live_image_cap(&source, &[summary, trim_msg(0, "look")]);
+        assert_eq!(had, vec![0, 2]);
+        assert_eq!(keep, vec![0, 1]);
+        assert_eq!(dropped, 1);
+    }
+
+    /// Tool request/response pairing is load-bearing — the cap must not so much
+    /// as count those messages, let alone rebuild them.
+    #[test]
+    fn messages_carrying_tool_parts_are_never_capped() {
+        let request = Message::assistant().with_tool_request(
+            "call-1",
+            Ok(rmcp::model::CallToolRequestParams::new(
+                "look_at_camera_snapshot".to_string(),
+            )),
+        );
+        // A camera tool DOES return frames inside its response — the cap must
+        // still keep its hands off, or the request/response pair breaks.
+        let response = tool_response_message("call-1", "front-door, person");
+        assert!(has_tool_parts(&request));
+        assert!(has_tool_parts(&response));
+
+        let source = vec![
+            user_with_images("first", &["AAAA"]),
+            request,
+            response,
+            user_with_images("second", &["BBBB"]),
+        ];
+        let trimmed = vec![
+            trim_msg(0, "first"),
+            trim_msg(1, ""),
+            trim_msg(2, "front-door, person"),
+            trim_msg(3, "second"),
+        ];
+        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        assert_eq!(
+            &had[1..3],
+            &[0, 0],
+            "tool messages contribute nothing to the plan"
+        );
+        assert_eq!(&keep[1..3], &[0, 0]);
+        // The two plain image turns are still capped normally around them.
+        assert_eq!(dropped, 1);
+    }
+
+    /// A partially-capped message keeps its leading image AND gets a stand-in
+    /// for the ones that went — but the stand-in must describe the DROPPED
+    /// images. The all-dropped wording here would assert "an image attached
+    /// here is no longer available" with an image sitting in the same message,
+    /// which is precisely the contradiction the `<vision>` section exists to
+    /// prevent.
+    #[test]
+    fn a_partially_capped_message_does_not_deny_the_image_it_still_shows() {
+        use pond_core::models::services::context::image_history::{
+            HISTORY_IMAGE_PLACEHOLDER, HISTORY_IMAGE_PLACEHOLDER_MARKER,
+            HISTORY_IMAGE_PLACEHOLDER_PARTIAL,
+        };
+        let original = user_with_images("look at these", &["AAAA", "BBBB", "CCCC"]);
+        let capped = cap_message_images(&original, 1, "look at these");
+        assert_eq!(
+            image_parts(&capped),
+            vec![("AAAA".into(), "image/png".into())]
+        );
+        let text = capped.as_concat_text();
+        assert!(text.contains("look at these"));
+        assert!(text.contains(HISTORY_IMAGE_PLACEHOLDER_PARTIAL));
+        assert!(
+            !text.contains(HISTORY_IMAGE_PLACEHOLDER),
+            "the all-dropped wording contradicts the surviving image: {text}"
+        );
+        assert_eq!(text.matches(HISTORY_IMAGE_PLACEHOLDER_MARKER).count(), 1);
+    }
+
+    /// Dropping every image still leaves the model told that something visual
+    /// was there — otherwise "what colour is this?" invites an invention.
+    #[test]
+    fn a_fully_stripped_image_turn_still_says_an_image_was_there() {
+        let original = user_with_images("what colour is this?", &["AAAA"]);
+        let capped = cap_message_images(&original, 0, "what colour is this?");
+        assert!(image_parts(&capped).is_empty());
+        assert!(capped.as_concat_text().contains(
+            pond_core::models::services::context::image_history::HISTORY_IMAGE_PLACEHOLDER
+        ));
+    }
+
+    #[test]
+    fn capping_preserves_message_identity() {
+        let mut original = user_with_images("look", &["AAAA", "BBBB"]);
+        original.id = Some("msg-7".into());
+        original.created = 1_234_567;
+        let capped = cap_message_images(&original, 1, "look");
+        assert_eq!(capped.id.as_deref(), Some("msg-7"));
+        assert_eq!(capped.created, 1_234_567);
+        assert_eq!(capped.role, original.role);
+    }
+
+    /// An image-bearing user turn also carries the `<system-context>` envelope,
+    /// and the text-only rewrite branch can never reach it — so before the cap
+    /// existed, its stale block was re-prefilled for the life of the session.
+    #[test]
+    fn capping_applies_the_trimmed_text_to_an_image_turn() {
+        let stale = "<system-context>\nToday is Tuesday\n</system-context>\n<user-message>look</user-message>";
+        let original = user_with_images(stale, &["AAAA"]);
+        let trimmed_text =
+            pond_core::models::services::context::turn_trimmer::strip_system_context(stale)
+                .into_owned();
+        let capped = cap_message_images(&original, 0, &trimmed_text);
+        assert!(!capped.as_concat_text().contains("<system-context>"));
+        assert!(capped
+            .as_concat_text()
+            .contains("<user-message>look</user-message>"));
+    }
+
+    /// Second pass over a FULLY capped conversation must be a no-op: the
+    /// message has no image parts left, so it cannot collect a second
+    /// placeholder or churn the prefix.
+    #[test]
+    fn capping_is_idempotent() {
+        let original = user_with_images("look", &["AAAA", "BBBB"]);
+        let once = cap_message_images(&original, 0, "look");
+        let text = once.as_concat_text();
+        let (had, keep, dropped) =
+            plan_live_image_cap(std::slice::from_ref(&once), &[trim_msg(0, &text)]);
+        assert_eq!(had, vec![0]);
+        assert_eq!(keep, vec![0]);
+        assert_eq!(dropped, 0, "nothing left to drop on a second pass");
+    }
+
+    /// The path the idempotence test above CANNOT reach, and the one that
+    /// actually happens: a 2-image message is capped in two stages — 2 to 1 when
+    /// it becomes history, 1 to 0 when a newer image turn arrives. On the second
+    /// stage the message still has an image, so the cap runs again; the text has
+    /// not changed (the pass-1 placeholder is already inside `as_concat_text()`),
+    /// so nothing stops a second placeholder from being appended.
+    ///
+    /// Drives it through the real plan/cap pair rather than calling
+    /// `cap_message_images` twice by hand, so the trimmer's text-feedback loop
+    /// is part of the test.
+    #[test]
+    fn staged_capping_converges_to_exactly_one_placeholder() {
+        use pond_core::models::services::context::image_history::{
+            HISTORY_IMAGE_PLACEHOLDER, HISTORY_IMAGE_PLACEHOLDER_MARKER,
+            HISTORY_IMAGE_PLACEHOLDER_PARTIAL,
+        };
+
+        // Stage 1: the 2-image turn is the newest, budget 1 -> keep the leading
+        // image, one placeholder for the dropped one.
+        let original = user_with_images("look at these", &["AAAA", "BBBB"]);
+        let (had, keep, dropped) = plan_live_image_cap(
+            std::slice::from_ref(&original),
+            &[trim_msg(0, &original.as_concat_text())],
+        );
+        assert_eq!((had[0], keep[0], dropped), (2, 1, 1));
+        let stage1 = cap_message_images(&original, keep[0], &original.as_concat_text());
+        assert_eq!(image_parts(&stage1).len(), 1);
+        assert_eq!(
+            stage1
+                .as_concat_text()
+                .matches(HISTORY_IMAGE_PLACEHOLDER_MARKER)
+                .count(),
+            1
+        );
+
+        // Stage 2: a newer image turn arrives, so the budget moves on and the
+        // older message loses its last image. Its trimmer text is whatever the
+        // message now concatenates to — placeholder included, which is exactly
+        // why `text_changed` cannot be the guard.
+        let newer = user_with_images("and this one", &["CCCC"]);
+        let source = vec![stage1.clone(), newer];
+        let trimmed = vec![
+            trim_msg(0, &source[0].as_concat_text()),
+            trim_msg(1, &source[1].as_concat_text()),
+        ];
+        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        assert_eq!((had[0], keep[0]), (1, 0), "the older turn loses its image");
+        assert_eq!((had[1], keep[1]), (1, 1), "the newest turn keeps its own");
+        assert_eq!(dropped, 1);
+
+        let stage2 = cap_message_images(&source[0], keep[0], &trimmed[0].text);
+        let text = stage2.as_concat_text();
+        assert!(image_parts(&stage2).is_empty());
+        assert_eq!(
+            text.matches(HISTORY_IMAGE_PLACEHOLDER_MARKER).count(),
+            1,
+            "one placeholder for the message's state, not one per pass: {text}"
+        );
+        assert!(
+            text.contains(HISTORY_IMAGE_PLACEHOLDER),
+            "no image survives now, so the all-dropped wording is the true one: {text}"
+        );
+        assert!(
+            !text.contains(HISTORY_IMAGE_PLACEHOLDER_PARTIAL),
+            "the stale partial wording claims an image is still shown: {text}"
+        );
+        assert!(
+            text.contains("look at these"),
+            "the user's own text survives"
+        );
+
+        // Stage 3: a third pass changes nothing further.
+        let stage3 = cap_message_images(&stage2, 0, &text);
+        assert_eq!(stage3.as_concat_text(), text);
     }
 
     // ── B3: the Goose cap-message coupling ───────────────────────────────

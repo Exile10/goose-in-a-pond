@@ -14,6 +14,20 @@
 //! previous turn's REAL prompt token count (from `TurnStats`) exceeded the
 //! budget, the effective budget shrinks proportionally so the estimate error
 //! self-corrects without a tokenizer dependency in pond-core.
+//!
+//! # Images are deliberately NOT handled here
+//!
+//! [`TrimMessage`] is text-only, and the image cap runs in the adapter AFTER
+//! [`trim_history`] returns, over the messages that survived: capping an image
+//! on a turn that is about to be dropped is wasted work, and the policy itself
+//! belongs to `super::image_history`, shared with the hydration replay. Do not
+//! add a second image rule inside this module — the two would drift, and the
+//! adapter's is the one the engine actually sees.
+//!
+//! Consequence for the estimate: an image contributes only the length of its
+//! surrounding text here, not the ~250 prompt tokens it really costs. The
+//! `last_real_prompt_tokens` feedback path is what absorbs that, and the cap
+//! bounds the error at one image.
 
 use std::borrow::Cow;
 

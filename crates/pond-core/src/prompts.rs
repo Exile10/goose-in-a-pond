@@ -733,6 +733,71 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 </canvas-mode>
 {% endif %}";
 
+// ── Vision capability section ────────────────────────────────────────────
+
+/// Vision section for the verbose prompt tier.
+///
+/// See [`vision_capability_section`] for why this exists and how it is applied.
+pub const VISION_SECTION: &str = "\
+<vision>
+You can see images. An image attached to a user message is directly visible to you — \
+look at it and describe or reason about what is actually there. Never say you are a \
+text-based assistant or that you cannot view images.
+Camera frames are a different thing. Live views from the household cameras are NOT \
+attached to the message and require a camera tool. Reach for a camera tool only when the \
+user asks about a camera, a room, or what is happening somewhere right now — never to \
+answer a question about an image that is already attached.
+</vision>";
+
+/// Vision section for the compact prompt tier (small-context, on-device).
+///
+/// Same two rules as [`VISION_SECTION`], roughly half the tokens: the compact
+/// tier targets a ~600-token static prefix and every line competes with the
+/// tool schemas.
+pub const VISION_SECTION_COMPACT: &str = "\
+<vision>
+You can see images. An image attached to a user message is directly visible to you — \
+describe what is actually in it, and never claim to be text-only. Camera frames are \
+separate: they are not attached to the message and need a camera tool, which you must \
+never call to answer a question about an attached image.
+</vision>";
+
+/// The `<vision>` section to append to a rendered template, or `None` when the
+/// active model cannot see.
+///
+/// # Why this is needed at all
+///
+/// Nothing else in the prompt tells the model it is multimodal. Measured on a
+/// production turn with Gemma-4-E4B and a fully encoded 252-token image in
+/// context, the reply was "I cannot directly describe the content of an image
+/// you provide. I am a text-based assistant." The pixels were there; the
+/// self-model was not.
+///
+/// # Why it must be conditional
+///
+/// Telling a text-only model that it can see manufactures a confident
+/// hallucination out of nothing. The caller decides, from the model registry
+/// (does this GGUF declare an mmproj?) rather than a name heuristic.
+///
+/// # Capability is DECLARED, not downloaded
+///
+/// The vision encoder is fetched in the background (~941 MB), so "the bytes are
+/// on disk" flips mid-session. This section deliberately keys off the model's
+/// *declaration* instead, which is fixed for the life of a model selection:
+/// keying off the download would rewrite the system prefix mid-session and
+/// throw away the engine's KV prompt-session cache for every turn after it. A
+/// turn that actually needs the encoder and does not have it is refused up
+/// front, with a precise "still downloading" message, so the model is never
+/// handed an image it cannot decode.
+#[must_use]
+pub fn vision_capability_section(compact: bool) -> &'static str {
+    if compact {
+        VISION_SECTION_COMPACT
+    } else {
+        VISION_SECTION
+    }
+}
+
 // ── Built-in template lookup ─────────────────────────────────────────────
 
 /// Return the original (factory-default) content and description for a built-in
@@ -1740,6 +1805,91 @@ mod tests {
                 !off.contains("<thinking>"),
                 "style '{name}': <thinking> must be hidden when thinking_enabled=false"
             );
+        }
+    }
+
+    // ── Vision capability section ─────────────────────────────────────────
+
+    /// Both rules have to be present or the section only solves half the
+    /// problem: the model either still believes it is text-only, or it believes
+    /// it can see and answers an attached-image question with camera frames.
+    #[test]
+    fn vision_section_states_both_rules_in_both_tiers() {
+        for compact in [false, true] {
+            let section = vision_capability_section(compact);
+            let lower = section.to_lowercase();
+            assert!(section.starts_with("<vision>"), "compact={compact}");
+            assert!(section.ends_with("</vision>"), "compact={compact}");
+            assert!(
+                lower.contains("you can see images"),
+                "compact={compact}: must assert the capability outright"
+            );
+            assert!(
+                lower.contains("attached"),
+                "compact={compact}: must name attached images"
+            );
+            assert!(
+                lower.contains("camera"),
+                "compact={compact}: must contrast camera frames against attachments"
+            );
+        }
+    }
+
+    /// The compact tier budgets ~600 tokens for the whole static prefix, so the
+    /// section it gets must be the cheap one.
+    #[test]
+    fn compact_vision_section_is_the_shorter_one() {
+        assert!(
+            vision_capability_section(true).len() < vision_capability_section(false).len(),
+            "the compact tier must not pay for the verbose section"
+        );
+        // chars/4 — the estimator the context budget uses everywhere else.
+        assert!(
+            vision_capability_section(true).len() / 4 < 100,
+            "compact vision section must stay under ~100 tokens"
+        );
+    }
+
+    /// The section is appended to a template BEFORE Tera renders it, so any
+    /// stray `{{` or `{%` would either be eaten or fail the whole render and
+    /// silently fall back to plain substitution.
+    #[test]
+    fn vision_section_survives_jinja_rendering_verbatim() {
+        let s = Settings::default();
+        for compact in [false, true] {
+            let section = vision_capability_section(compact);
+            assert!(!section.contains("{{"), "compact={compact}");
+            assert!(!section.contains("{%"), "compact={compact}");
+            for (name, raw) in ALL_STYLES {
+                let template = format!("{raw}\n{section}");
+                let out = render_jinja_template(
+                    &template,
+                    &s,
+                    Some(&v2_state(compact, false, false)),
+                    None,
+                );
+                assert!(
+                    out.contains(section),
+                    "style '{name}' (compact={compact}): vision section must render verbatim"
+                );
+            }
+        }
+    }
+
+    /// Nothing renders the section unless a caller appends it — a text-only
+    /// model must never be told it can see.
+    #[test]
+    fn no_builtin_style_carries_a_vision_section_on_its_own() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                assert!(
+                    !out.contains("<vision>"),
+                    "style '{name}' (compact={compact}): the vision section is opt-in"
+                );
+            }
         }
     }
 }

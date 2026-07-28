@@ -47,7 +47,106 @@ impl Default for ModelCapabilities {
     }
 }
 
+/// Substrings that identify a multimodal (image-input) model family outright.
+///
+/// Each entry is distinctive enough that a plain `contains` cannot collide with
+/// an unrelated model name. `llava` also covers `bakllava`.
+const VISION_NAME_FRAGMENTS: &[&str] = &[
+    "llava",
+    "moondream",
+    "pixtral",
+    "minicpm-v",
+    "minicpm_v",
+    "minicpm-o",
+    "internvl",
+    "cogvlm",
+    "smolvlm",
+    "idefics",
+    "multimodal",
+    // Ollama publishes this one unseparated, so the `vl` SEGMENT rule below
+    // cannot see it: `qwen2.5vl` splits into `qwen2` / `5vl`, never a bare `vl`.
+    // The hyphenated `qwen2.5-vl` and `qwen3-vl` spellings are already covered
+    // by that rule.
+    "qwen2.5vl",
+];
+
+/// Whole name segments (split on any non-alphanumeric character) that identify
+/// a multimodal model.
+///
+/// Segment matching rather than `contains`: `vl` as a bare substring appears
+/// inside plenty of unrelated words, and a false positive here is the expensive
+/// direction (see [`ModelCapabilities::name_implies_vision`]).
+const VISION_NAME_SEGMENTS: &[&str] = &["vision", "vl", "vlm"];
+
+/// Spellings of the Gemma 4 family, including the `gemma3n` name Ollama and
+/// Hugging Face use for the same weights (`gemma3n:e4b`).
+///
+/// Consulted by the vision rule only. The other axes in
+/// [`ModelCapabilities::from_model_name`] still match `gemma-4*` literally:
+/// widening them would silently change thinking, tool-calling and context-window
+/// behaviour — and with it the prompt tier — for models beyond the vision bug
+/// this list was added for.
+const GEMMA4_NAME_FRAGMENTS: &[&str] = &[
+    "gemma-4", "gemma4", "gemma_4", "gemma-3n", "gemma3n", "gemma_3n",
+];
+
 impl ModelCapabilities {
+    /// Whether a model NAME is evidence that the model accepts image input.
+    ///
+    /// # Why this is deliberately asymmetric
+    ///
+    /// The two error directions do not cost the same. A false POSITIVE reaches
+    /// the system prompt (`<vision>`: "you can see images"), so a text-only
+    /// model is told it has an ability it does not have and answers an
+    /// image question by inventing an image. A false NEGATIVE only withholds
+    /// that section — the model stays as it was, which is the status quo the
+    /// section exists to improve. So the bias is heavily towards `false`:
+    /// anything unrecognised stays `false`, and there is one explicit exclusion
+    /// (below) for a family member that breaks its family's rule.
+    ///
+    /// # What the rules are NOT
+    ///
+    /// Two of the three rules name a known family outright
+    /// (`VISION_NAME_FRAGMENTS`, `GEMMA4_NAME_FRAGMENTS`). The third —
+    /// `VISION_NAME_SEGMENTS` — is a *marker* rule, not a family
+    /// identification: it credits any name carrying `vision` / `vl` / `vlm` as a
+    /// whole segment. That is what makes it cover the long tail of vendors and
+    /// quantisers who label a multimodal build that way without appearing in any
+    /// list here, and it is why `qwen2.5-vl`, `qwen3-vl` and `llama3.2-vision`
+    /// need no entry of their own. The cost is that a name which merely contains
+    /// the segment for an unrelated reason — `vision-labs/text-only-7b` — is
+    /// credited too. Segment matching (rather than `contains`) keeps that to
+    /// contrived names; it is accepted, not solved.
+    ///
+    /// # The exclusion
+    ///
+    /// Every featured Gemma 4 declares a vision encoder EXCEPT `E1B`
+    /// (`FEATURED_MODELS` in `goose-local-inference`, where `E1B` is the one
+    /// entry with `mmproj: None`). On the in-process engine that registry IS
+    /// the answer and this function is not consulted; on an HTTP provider
+    /// serving the same weights the name is all there is, so the exclusion has
+    /// to be repeated here or `gemma-4-E1B-it` on Ollama is told it can see.
+    ///
+    /// # Scope
+    ///
+    /// Ollama/llamafile-class open models only. Cloud models are not listed:
+    /// they are vision-capable, but they also do not exhibit the failure this
+    /// signal drives (a 4B model insisting it is "a text-based assistant"),
+    /// and every added entry is a claim this file has to keep true.
+    #[must_use]
+    pub fn name_implies_vision(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+
+        if GEMMA4_NAME_FRAGMENTS.iter().any(|f| lower.contains(f)) {
+            return !lower.contains("e1b");
+        }
+
+        VISION_NAME_FRAGMENTS.iter().any(|f| lower.contains(f))
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|segment| VISION_NAME_SEGMENTS.contains(&segment))
+    }
+
     /// Detect capabilities from a model name string.
     ///
     /// This is a heuristic based on known model families. Adapters can
@@ -68,16 +167,10 @@ impl ModelCapabilities {
             caps.thinking = true;
         }
 
-        // Vision-capable model families
-        if lower.contains("gemma-4")
-            || lower.contains("gemma4")
-            || lower.contains("gemma_4")
-            || lower.contains("llava")
-            || lower.contains("bakllava")
-            || lower.contains("moondream")
-        {
-            caps.vision = true;
-        }
+        // Vision-capable model families. Kept in one place (and deliberately
+        // narrower than the other axes below) because this flag is the only one
+        // that can put a claim about the model's own senses into its prompt.
+        caps.vision = Self::name_implies_vision(name);
 
         // Audio-capable (Gemma 4 E2B/E4B only)
         if (lower.contains("gemma-4") || lower.contains("gemma4") || lower.contains("gemma_4"))
@@ -173,6 +266,102 @@ mod tests {
         assert!(!caps.thinking);
         assert!(!caps.vision);
         assert_eq!(caps.context_window_tokens, 4096);
+    }
+
+    // ── Vision detection ──────────────────────────────────────────────────
+
+    /// The headline false positive. E1B is the one Gemma 4 with no vision
+    /// encoder — it is literally the entry the local registry excludes via
+    /// `mmproj: None` — so a name rule that says "gemma-4 means vision" tells a
+    /// blind model it can see.
+    #[test]
+    fn gemma4_e1b_has_no_vision_in_any_spelling() {
+        for name in [
+            "gemma-4-E1B-it",
+            "gemma-4-E1B-it-Q4_K_M.gguf",
+            "gemma4-e1b",
+            "gemma3n:e1b",
+        ] {
+            assert!(
+                !ModelCapabilities::from_model_name(name).vision,
+                "{name} declares no mmproj encoder"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gemma4_variants_that_do_carry_an_encoder_are_recognised() {
+        for name in [
+            "gemma-4-E2B-it",
+            "gemma-4-E4B-it-Q4_K_M",
+            "gemma-4-12B-A4B-it",
+            "gemma-4-27B-it",
+            // The spelling Ollama serves the same weights under.
+            "gemma3n:e4b",
+            "gemma3n:e2b",
+            "gemma-3n-E4B-it",
+        ] {
+            assert!(
+                ModelCapabilities::from_model_name(name).vision,
+                "{name} is multimodal"
+            );
+        }
+    }
+
+    /// The false negatives that left the production bug ("I cannot describe
+    /// images, I am a text-based assistant") unfixed on every HTTP provider.
+    #[test]
+    fn common_http_vision_models_are_recognised() {
+        for name in [
+            "llama3.2-vision",
+            "llama3.2-vision:11b",
+            "llama-3.2-90b-vision-instruct",
+            "qwen2.5-vl",
+            "qwen2.5-vl:7b",
+            // Ollama's real published tag has no hyphen, so the `vl` segment
+            // rule cannot see it and it needs its own fragment.
+            "qwen2.5vl",
+            "qwen2.5vl:7b",
+            "Qwen2-VL-7B-Instruct",
+            "qwen3-vl:8b",
+            "minicpm-v",
+            "minicpm-v:8b",
+            "pixtral-12b",
+            "llava:13b",
+            "bakllava",
+            "moondream",
+            "internvl2-8b",
+            "phi-4-multimodal-instruct",
+        ] {
+            assert!(
+                ModelCapabilities::from_model_name(name).vision,
+                "{name} accepts images"
+            );
+        }
+    }
+
+    /// Silence is the safe answer, so text-only models must stay false — and a
+    /// bare `vl`/`vision` SUBSTRING must not be what decides it.
+    #[test]
+    fn text_only_models_are_not_credited_with_vision() {
+        for name in [
+            "llama3.2",
+            "llama3.2:3b",
+            "Llama-3.2-3B-Instruct",
+            "qwen3-8b-instruct-q4_k_m",
+            "mistral-small-24b",
+            "Hermes-2-Pro-Mistral-7B",
+            "gpt-oss:20b",
+            "my-custom-model",
+            // "vl" inside a word is not a vision marker.
+            "vlad-tuned-7b",
+            "nvlink-test-model",
+        ] {
+            assert!(
+                !ModelCapabilities::from_model_name(name).vision,
+                "{name} has no image input"
+            );
+        }
     }
 
     #[test]
