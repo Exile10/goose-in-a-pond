@@ -2491,22 +2491,41 @@ async fn run_server(
                     {
                         use pond_core::mcp::ports::extension_manager::AddExtensionRequest;
 
-                        // Start with persisted env, then resolve any secrets
-                        // from the secret repo that aren't already present.
-                        // This ensures OAuth tokens (stored in secrets.json,
-                        // not in mcp_servers.env) are injected at startup.
+                        // Start with the persisted env, then overwrite every
+                        // secret from the secret repository.
+                        //
+                        // The repository is authoritative for credentials; the
+                        // env stored on the row is a snapshot taken when the
+                        // extension was installed. Preferring the snapshot
+                        // handed the child an access token that had since been
+                        // rotated, on every restart, for as long as the row
+                        // survived — so overwrite rather than fill the gaps.
                         let mut env = srv.env.clone();
                         if let Some(sr) = &secret_repo {
                             if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
                                 for secret_req in &ext.required_secrets {
-                                    if !env.contains_key(&secret_req.key) {
-                                        if let Ok(Some(val)) = sr.get(&secret_req.key).await {
-                                            env.insert(secret_req.key.clone(), val);
-                                        }
+                                    if let Ok(Some(val)) = sr.get(&secret_req.key).await {
+                                        env.insert(secret_req.key.clone(), val);
                                     }
                                 }
                             }
                         }
+
+                        // The internal token is a fresh UUID per process run, so
+                        // the persisted copy is always from a dead process. Left
+                        // alone, the child authenticates to /oauth/refresh with
+                        // it, gets a 401, and can never recover from an expired
+                        // access token — the extension simply stops working an
+                        // hour after every restart.
+                        //
+                        // GIAP_SERVER_URL is deliberately left as persisted:
+                        // auto-connect runs before the listener binds, so the
+                        // port is not known here. Install and the OAuth callback
+                        // both run after binding and write the correct value.
+                        env.insert(
+                            pond_api::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                            pond_api::oauth_callback::internal_extension_token().to_string(),
+                        );
 
                         // A config persisted before extension paths were anchored
                         // still carries a cwd-relative arg, which only resolves

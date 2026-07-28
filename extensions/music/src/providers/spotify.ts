@@ -215,18 +215,20 @@ export class SpotifyProvider implements MusicProvider {
       device?: { volume_percent: number };
     }
 
-    try {
-      const data = await this.api<PlayerState>('GET', '/me/player');
-      if (!data || !data.item) return null;
+    // Errors deliberately propagate. `null` here means one thing only —
+    // Spotify answered, and nothing is playing — because that is exactly how
+    // the caller reports it ("Nothing is currently playing on Spotify"). A
+    // `catch` returning null made an expired token, a failed refresh and an
+    // unreachable Spotify all indistinguishable from an idle player, which is
+    // the most misleading answer available.
+    const data = await this.api<PlayerState>('GET', '/me/player');
+    if (!data || !data.item) return null;
 
-      const track = this.parseTrack(data.item);
-      track.is_playing = data.is_playing;
-      track.progress_ms = data.progress_ms;
-      track.volume_percent = data.device?.volume_percent;
-      return track;
-    } catch {
-      return null;
-    }
+    const track = this.parseTrack(data.item);
+    track.is_playing = data.is_playing;
+    track.progress_ms = data.progress_ms;
+    track.volume_percent = data.device?.volume_percent;
+    return track;
   }
 
   async getQueue(): Promise<TrackInfo[]> {
