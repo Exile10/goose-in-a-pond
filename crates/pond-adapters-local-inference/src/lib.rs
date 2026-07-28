@@ -8,7 +8,8 @@
 //! - **Jetson Orin Nano (NVIDIA)**: Requires `--features cuda` at build time.
 //!   CUDA settings are applied to the model registry at init time:
 //!   - `n_gpu_layers = 99` — full offload into unified 8 GB DRAM (no separate VRAM)
-//!   - `context_size = 4096` — fits the schema-v2 turn-1 prompt (~3.2K tokens) on 8 GB
+//!   - `context_size = 16384` — the ~3.2K-token turn-1 prompt plus real history
+//!     room; measured KV cost is ~18 KiB/token, so this is ~288 MiB
 //!   - `n_batch = 512` — maximise GPU throughput on Ampere (sm_87)
 //!   - `n_threads = 4` — 6-core A78AE; leave headroom for OS + voice pipeline
 //!   - `flash_attention = true` — reduces KV-cache memory by ~40 % on Ampere
@@ -302,7 +303,17 @@ impl LocalInferenceLlmAdapter {
                     );
                 } else {
                     tracing::info!(
-                        "Applied Metal/platform settings to model '{}' (n_gpu_layers=99, ctx=dynamic, flash_attn=true)",
+                        "{} settings applied to model '{}' (n_gpu_layers=99, ctx=dynamic, flash_attn=true)",
+                        // On aarch64 Linux this branch means the `cuda` feature
+                        // was NOT compiled in, so the n_gpu_layers=99 below is a
+                        // request no backend will honour — inference runs on the
+                        // CPU. Saying "Metal" there sent me hunting a settings
+                        // bug for an hour when the binary was simply built wrong.
+                        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                            "CPU-ONLY (built without the cuda feature) —"
+                        } else {
+                            "Metal/platform"
+                        },
                         model_id
                     );
                 }
@@ -356,11 +367,26 @@ impl LocalInferenceLlmAdapter {
             // Full GPU offload: Jetson unified memory means all layers fit in
             // the same 8 GB pool — no split between CPU and GPU DRAM.
             n_gpu_layers: Some(99),
-            // 4096-token context: the schema-v2 turn-1 prompt (system prefix +
-            // native tools JSON for all giap extensions) measures ~3.2K tokens,
-            // so 3072 could not hold even a fresh session. With flash attention
-            // the extra 1K tokens of KV cache is a modest cost on the 8 GB pool.
-            context_size: Some(4096),
+            // 16384-token context.
+            //
+            // 4096 was chosen when the KV cost was assumed rather than measured,
+            // and it left a fresh turn at 80% before the user had said anything:
+            // the turn-1 prompt (system prefix + native tools JSON for every
+            // giap extension) measures ~3,250 tokens. Two turns in, a `thinking`
+            // block would overrun the window mid-generation and goose would
+            // compact the conversation away to recover.
+            //
+            // The real cost, read from llama.cpp's own allocation on this board:
+            // 24 MiB non-SWA + 48 MiB SWA = 72 MiB for 4096 cells, i.e. ~18 KiB
+            // per token, because Gemma 4 E2B has n_head_kv = 1. 16384 therefore
+            // costs ~288 MiB against ~5.5 GiB free with the model resident, and
+            // the two buffers (96 + 192 MiB) stay clear of the ~586 MiB NvMap
+            // single-allocation wall.
+            //
+            // This is affordable now in a way it was not before: the prompt-
+            // session KV cache means a longer window buys history that is
+            // re-used rather than re-prefilled every turn.
+            context_size: Some(16384),
             // Batch size 512 keeps Ampere SMs saturated during prefill without
             // exceeding the available memory bandwidth (68 GB/s).
             n_batch: Some(512),

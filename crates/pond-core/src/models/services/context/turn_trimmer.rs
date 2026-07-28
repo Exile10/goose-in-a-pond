@@ -33,6 +33,11 @@ use std::borrow::Cow;
 
 use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
 
+/// Floor for the history budget after the overshoot correction. Below roughly
+/// this, a turn carries no usable context at all, and dropping to zero would
+/// make the assistant forget the message it is answering.
+const MIN_HISTORY_TOKENS: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrimRole {
     User,
@@ -106,14 +111,32 @@ pub fn trim_history(
 ) -> TrimOutcome {
     let mut changed = false;
 
-    // Effective budget: shrink proportionally when the engine told us our
-    // last estimate under-counted (real prompt exceeded the budget).
-    let mut budget = profile.history_token_budget;
+    // Effective budget.
+    //
+    // Two corrections to the declared history budget, both aimed at the same
+    // failure: a prompt that fills the window leaves the model no room to
+    // answer, the engine raises ContextLengthExceeded mid-generation, and goose
+    // reacts by compacting the conversation out from under us (a path that
+    // ignores GOOSE_AUTO_COMPACT_THRESHOLD, so it cannot be turned off).
+    //
+    // 1. Never promise more history than fits alongside the output reserve.
+    //    The tier constants are flat — 1,200 tokens at the 4K tier — and were
+    //    blind to a preamble that measures ~3,250 tokens on the Orin, i.e. the
+    //    declared budget alone already exceeded the window.
+    // 2. When the engine's real prompt count for the LAST turn overshot the
+    //    usable ceiling, subtract that overshoot. This is measured, not
+    //    estimated, so it corrects the chars/4 approximation in the direction
+    //    that matters and converges within one turn.
+    let usable = profile.usable_prompt_tokens();
+    let mut budget = if usable > 0 {
+        profile.history_token_budget.min(usable)
+    } else {
+        profile.history_token_budget
+    };
     if let Some(real) = last_real_prompt_tokens {
         let real = real as usize;
-        if real > profile.context_window_tokens && profile.context_window_tokens > 0 {
-            let ratio = profile.context_window_tokens as f32 / real as f32;
-            budget = ((budget as f32) * ratio).max(64.0) as usize;
+        if usable > 0 && real > usable {
+            budget = budget.saturating_sub(real - usable).max(MIN_HISTORY_TOKENS);
             changed = true;
         }
     }
@@ -271,8 +294,82 @@ mod tests {
             max_memory_fragments: 3,
             system_prompt_budget: 1500,
             history_token_budget: history_budget,
+            // Zero here so the existing cases keep exercising exactly the
+            // budget they pass in; the reserve has its own tests below.
+            output_reserve_tokens: 0,
             context_window_tokens: 3072,
         }
+    }
+
+    /// Same shape, but with a reserve — for the ceiling/overshoot cases.
+    fn profile_reserved(history_budget: usize, ctx: usize, reserve: usize) -> CompactionProfile {
+        CompactionProfile {
+            compaction_threshold: 0.6,
+            memory_token_budget: 200,
+            max_memory_fragments: 3,
+            system_prompt_budget: 1500,
+            history_token_budget: history_budget,
+            output_reserve_tokens: reserve,
+            context_window_tokens: ctx,
+        }
+    }
+
+    /// The Orin case. A flat 1,200-token history budget against a 4,096 window
+    /// promised more than the window could hold once the ~3,250-token preamble
+    /// and the model's own output are accounted for. The budget must never
+    /// exceed context minus the output reserve.
+    #[test]
+    fn history_budget_never_exceeds_the_window_minus_the_output_reserve() {
+        let p = profile_reserved(1200, 4096, 768);
+        assert_eq!(p.usable_prompt_tokens(), 3328);
+
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
+        let out = trim_history(msgs, &p, None, None);
+        // 1200 <= 3328, so the declared budget still applies here.
+        assert!(out.estimated_tokens <= 1200, "got {}", out.estimated_tokens);
+    }
+
+    /// A tiny window where the reserve is the binding constraint: the declared
+    /// budget is larger than what is left after reserving output room, so the
+    /// smaller of the two must win.
+    #[test]
+    fn the_reserve_wins_when_it_is_tighter_than_the_declared_budget() {
+        let p = profile_reserved(4000, 2048, 768); // usable = 1280
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
+        let out = trim_history(msgs, &p, None, None);
+        assert!(
+            out.estimated_tokens <= 1280,
+            "history must fit the usable window, got {}",
+            out.estimated_tokens
+        );
+    }
+
+    /// Measured feedback: when the engine reports a real prompt that overshot
+    /// the usable ceiling, the next turn's budget drops by exactly that
+    /// overshoot — this is what stops the runaway that ended conversations.
+    #[test]
+    fn a_real_prompt_over_the_ceiling_shrinks_the_next_budget_by_the_overshoot() {
+        let p = profile_reserved(1200, 4096, 768); // usable = 3328
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
+
+        let baseline = trim_history(msgs.clone(), &p, None, None).estimated_tokens;
+        // Engine said the last prompt was 3,786 tokens — 458 over the ceiling.
+        let corrected = trim_history(msgs, &p, None, Some(3786)).estimated_tokens;
+        assert!(
+            corrected < baseline,
+            "overshoot must tighten the budget: {corrected} vs {baseline}"
+        );
+        assert!(corrected <= 1200 - 458 + 40, "got {corrected}");
+    }
+
+    /// The floor: a catastrophic overshoot must still leave enough room to
+    /// carry the turn being answered, not collapse to nothing.
+    #[test]
+    fn the_budget_never_collapses_below_the_floor() {
+        let p = profile_reserved(1200, 4096, 768);
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
+        let out = trim_history(msgs, &p, None, Some(100_000));
+        assert!(out.estimated_tokens > 0, "must keep the current turn");
     }
 
     fn user(index: usize, text: &str) -> TrimMessage {
