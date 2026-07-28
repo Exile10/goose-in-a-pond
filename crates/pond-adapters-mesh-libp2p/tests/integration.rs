@@ -37,7 +37,7 @@ async fn spawn_node(model_hash: ModelHash) -> Libp2pMeshTransport {
 /// binding to `tcp/0` resolves the actual port asynchronously.
 async fn wait_for_listen_address(node: &Libp2pMeshTransport) -> String {
     for _ in 0..200 {
-        let addrs = node.listen_addresses().await;
+        let addrs = node.listen_addresses().await.unwrap();
         if let Some(addr) = addrs.into_iter().find(|a| !a.contains("p2p-circuit")) {
             return addr;
         }
@@ -129,6 +129,7 @@ async fn relay_mediated_connect() {
         let _ = b.reserve_relay(c.local_peer_id(), c_addr.clone()).await;
         if b.listen_addresses()
             .await
+            .unwrap()
             .iter()
             .any(|a| a.contains("p2p-circuit"))
         {
