@@ -35,7 +35,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This script lives at scripts/jetson/deploy.sh — the repo root is two levels up.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REMOTE_REPO="goose-in-a-pond"
 
 echo "==> [1/4] Updating Jetson checkout to origin/${BRANCH}"

@@ -805,7 +805,9 @@ impl GooseAdapter {
     /// window from capabilities (model name heuristics).
     ///
     /// `override_tokens` (Settings.context_window_override, 0 = unset) wins over
-    /// every heuristic when > 0. This is the escape hatch for deployments whose
+    /// every heuristic when > 0 — except a registry-pinned local context size,
+    /// which the engine itself ranks higher (see `registry_context_size`). This
+    /// is the escape hatch for deployments whose
     /// real limit is neither the model's max nor the cuda ceiling — e.g. a
     /// Jetson running Ollama with a hand-tuned KV cache, or a tool-heavy GIAP
     /// prompt (~12K tokens for the 57 giap-* tools) that overflows the default
@@ -831,24 +833,59 @@ impl GooseAdapter {
         }
     }
 
+    /// The context size the engine will ACTUALLY allocate for a local model,
+    /// when the registry pins one.
+    ///
+    /// `context_cap` in goose-local-inference ranks `settings.context_size`
+    /// above GOOSE_CONTEXT_LIMIT and above its own memory estimate, so a
+    /// stamped value is not a hint — it is the real `n_ctx`. On Jetson,
+    /// `apply_jetson_settings` stamps 4096 at every provider init. A larger
+    /// GIAP-side number (heuristic or `context_window_override`) therefore
+    /// cannot widen the window; it only makes GIAP budget history the engine
+    /// has no room for, and the engine responds by logging "Prompt exceeds
+    /// context limit" and truncating. Platforms that leave `context_size`
+    /// unset — macOS/Metal via `apply_platform_settings` — return `None` and
+    /// keep the override/heuristic path below.
+    fn registry_context_size(model: &str) -> Option<usize> {
+        use goose::providers::local_inference::local_model_registry::get_registry;
+
+        let registry = get_registry().lock().ok()?;
+        let entry = registry.get_model(model)?;
+        entry.settings.context_size.map(|c| c as usize)
+    }
+
     fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+        let pinned = match provider {
+            "local" | "gguf" => Self::registry_context_size(model),
+            _ => None,
+        };
+        Self::resolve_context_window(provider, model, override_tokens, pinned)
+    }
+
+    /// Precedence, extracted so it can be tested without the process-global
+    /// model registry: pinned local context > user override > per-provider
+    /// heuristic.
+    fn resolve_context_window(
+        provider: &str,
+        model: &str,
+        override_tokens: u32,
+        pinned: Option<usize>,
+    ) -> usize {
+        // A pinned registry context_size outranks the user override here for
+        // the same reason it outranks it in the engine: it IS the allocation.
+        if let Some(ctx) = pinned {
+            return ctx;
+        }
         if override_tokens > 0 {
             return override_tokens as usize;
         }
         match provider {
             "local" | "gguf" => {
-                // Generous ceiling — the actual allocation is constrained by
-                // available memory at inference time, not this value.
-                // Jetson (8GB): memory estimation yields ~3-6K depending on model.
+                // Generous ceiling for an UNPINNED local model — the actual
+                // allocation is then constrained by the engine's memory
+                // estimate at inference time, not by this value.
                 // macOS M4 (18GB): yields ~16-40K depending on model.
-                #[cfg(feature = "cuda")]
-                {
-                    8192 // conservative ceiling for 8GB Jetson
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    32768 // generous ceiling — memory estimation constrains further
-                }
+                32768
             }
             _ => {
                 // HTTP providers — use model-reported context window.
@@ -3390,6 +3427,45 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── context window precedence ─────────────────────────────────────────
+
+    /// The Jetson case that motivated `registry_context_size`: the device
+    /// stamps 4096 into the registry at every provider init, so a bigger
+    /// `context_window_override` must NOT be believed — GIAP would budget
+    /// history the engine cannot hold, and llama.cpp truncates the prompt.
+    #[test]
+    fn a_pinned_local_context_outranks_a_larger_override() {
+        assert_eq!(
+            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, Some(4096)),
+            4096
+        );
+    }
+
+    /// Unpinned local (macOS/Metal leaves context_size unset) keeps the
+    /// override as the escape hatch, then the generous ceiling.
+    #[test]
+    fn an_unpinned_local_model_falls_back_to_override_then_ceiling() {
+        assert_eq!(
+            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, None),
+            16384
+        );
+        assert_eq!(
+            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 0, None),
+            32768
+        );
+    }
+
+    /// HTTP providers have no registry to pin them; the model's own reported
+    /// window still answers when no override is set.
+    #[test]
+    fn http_providers_are_unaffected_by_the_registry_rule() {
+        assert_eq!(
+            GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 8192, None),
+            8192
+        );
+        assert!(GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 0, None) > 0);
+    }
 
     // ── F1: image attachment onto the user message ───────────────────────
 
