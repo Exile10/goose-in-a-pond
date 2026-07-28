@@ -498,6 +498,30 @@ fn singular(word: &str) -> &str {
 /// The rule is calibrated to under-demote. Missing a captured request leaves a
 /// stale `Project` row that consolidation can retire; demoting a real project
 /// drops it to `Short` tier and it decays away in about a week.
+/// Whether a fact actually names the user.
+///
+/// The write gate tests the FORM of a sentence — length, no first person, no
+/// dangling anaphor — and never its subject, so a well-formed sentence about
+/// somebody else passes cleanly. On the device that let five William Ruto
+/// biography facts land in the `identity` segment, where identity means "the
+/// user's own name, role, home city", and one in `relationship`. 14 of 24
+/// stored rows contained no reference to the user at all.
+///
+/// Deliberately a cheap token test rather than anything clever: the extraction
+/// prompt teaches the wording ("The user's mother Florence lives in Kisumu"),
+/// so facts written the way the prompt asks for them pass. Callers should use
+/// this to DEMOTE rather than reject — a demotion is reversible by
+/// consolidation, a rejection loses the fact forever.
+pub fn names_user(content: &str) -> bool {
+    split_tokens(content).iter().any(|(_, normalised)| {
+        // "user's" survives split_tokens as one token (internal apostrophes
+        // are kept on purpose), and the prompt's own canonical example is
+        // "The user's mother Florence lives in Kisumu." — so the possessive
+        // has to match or the example the model is taught would fail.
+        matches!(normalised.as_str(), "user" | "users" | "user's" | "users'")
+    })
+}
+
 pub fn is_captured_request(content: &str) -> bool {
     let tokens = split_tokens(content);
     if tokens.len() < 3 || !TASK_VERBS.contains(&tokens[0].1.as_str()) {
@@ -703,6 +727,32 @@ pub struct MemoryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The subject test that the write gate never had. Every one of these
+    /// strings was in the device store, filed in a segment that means "about
+    /// the user".
+    #[test]
+    fn names_user_separates_facts_about_the_user_from_everything_else() {
+        // Real user facts — the wording the extraction prompt teaches.
+        assert!(names_user("The user's location is Nairobi."));
+        assert!(names_user("User prefers concise greetings"));
+        assert!(names_user("The user's mother Florence lives in Kisumu."));
+        assert!(names_user("The users' shared calendar is on Google."));
+
+        // What was landing in `identity` and `relationship` instead.
+        assert!(!names_user("William Ruto is a Kenyan politician."));
+        assert!(!names_user("William Ruto is the leader of Kenya."));
+        assert!(!names_user("AI assistant"));
+        assert!(!names_user("I am a computer program designed to assist"));
+        assert!(!names_user("Kirk Lazarus is an Armenian Australian artist"));
+    }
+
+    /// "user's" must match: split_tokens keeps internal apostrophes on purpose,
+    /// and the prompt's own canonical example is possessive.
+    #[test]
+    fn names_user_matches_the_possessive() {
+        assert!(names_user("The user's home city is Nairobi."));
+    }
 
     #[test]
     fn cosine_similarity_is_one_for_parallel_and_zero_for_orthogonal() {

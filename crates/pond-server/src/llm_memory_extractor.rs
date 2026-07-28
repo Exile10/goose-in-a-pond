@@ -33,11 +33,11 @@ Each content is stored forever and shown with no conversation around it:
 {\"facts\":[{\"content\":\"The user's mother Florence lives in Kisumu.\",\"segment\":\"relationship\",\"importance\":0.7},{\"content\":\"The user moved to Kisumu in 2019.\",\"segment\":\"identity\",\"importance\":0.8}]}
 
 Segments (importance):
-- identity 0.80 name, role, home city
+- identity 0.80 the user's own name, role, home city
 - correction 0.90 the user fixes something; add \"corrects\":\"the wrong claim\".
   Save it even when it restates a fact already stored.
 - preference 0.70 style, defaults, likes and dislikes
-- relationship 0.70 named people and pets
+- relationship 0.70 people and pets the user names
 - project 0.60 ongoing work the user returns to across days. A task the user
   asked for this turn is NOT a project.
 - knowledge 0.50 facts the user taught, not common knowledge
@@ -46,7 +46,10 @@ Segments (importance):
 Max 3 facts, fewer is better. Never save a request already carried out
 (\"write a prime function\", \"set a reminder\"), anything the assistant supplied
 or the system prompt already states, guesses (\"I think\", \"maybe\"), filler, or
-vague content. If nothing is worth keeping, return {\"facts\":[]}.";
+vague content. If nothing is worth keeping, return {\"facts\":[]}.
+
+Every fact must be about the user. A fact about anyone else is knowledge,
+never identity or relationship.";
 
 pub struct LlmMemoryExtractor {
     live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -80,13 +83,25 @@ impl MemoryExtractor for LlmMemoryExtractor {
 
         // Build the user message for extraction
         // Truncate long responses to stay within small-model context
-        let asst_truncated = if assistant_response.len() > 500 {
-            format!("{}...", &assistant_response[..500])
-        } else {
-            assistant_response.to_string()
+        // Truncate by CHARACTERS, not bytes. `&s[..500]` panics when byte 500
+        // lands inside a multi-byte char, and this runs in a spawned task whose
+        // JoinHandle is dropped — so the panic was swallowed and extraction was
+        // silently lost for that turn. Typographic apostrophes and em-dashes are
+        // 3 bytes each, and GIAP's users write Swahili and English prose full of
+        // them, so this fired on exactly the longest, most fact-dense replies.
+        let asst_truncated = match assistant_response.char_indices().nth(500) {
+            Some((end, _)) => format!("{}...", &assistant_response[..end]),
+            None => assistant_response.to_string(),
         };
 
-        let input = format!("User: {user_message}\nAssistant: {asst_truncated}");
+        // Label the roles. The assistant's reply is background for resolving
+        // what the user meant, never itself a source of facts — without saying
+        // so, a 500-char answer against a 17-char question is 97% of the input
+        // and the model dutifully extracts the assistant's own prose.
+        let input = format!(
+            "User said: {user_message}\n\
+             Assistant replied (background only, never a source of facts): {asst_truncated}"
+        );
 
         let messages = vec![ChatMessage::user(input)];
         let response = provider.complete(EXTRACTION_PROMPT, messages).await?;
@@ -207,10 +222,17 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
         .and_then(parse_segment_str)
         .unwrap_or(MemorySegment::Knowledge);
 
+    // Clamp to the segment's own ceiling, not to 1.0. The model authors this
+    // number and it drifts upward: on the device the eight `knowledge` rows
+    // averaged 0.806 against a prompted 0.50, and the single highest-importance
+    // memory in the whole store was "AI assistant" at 0.9 — which asserts
+    // nothing about anybody. Clamping (rather than ignoring the field) keeps the
+    // model's ability to signal LOWER confidence while removing its ability to
+    // promote noise above a real preference.
     let importance = v
         .get("importance")
         .and_then(|i| i.as_f64())
-        .map(|i| (i as f32).clamp(0.0, 1.0))
+        .map(|i| (i as f32).clamp(0.0, segment.default_importance()))
         .unwrap_or_else(|| segment.default_importance());
 
     let tier = segment.default_tier();
@@ -289,14 +311,14 @@ mod tests {
     #[test]
     fn parse_valid_json_array() {
         let json = r#"[
-            {"fact": "User's name is Jerry", "segment": "identity", "importance": 0.85},
+            {"fact": "User's name is Jerry", "segment": "identity", "importance": 0.80},
             {"fact": "User prefers dark mode", "segment": "preference", "importance": 0.7}
         ]"#;
         let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].content, "User's name is Jerry");
         assert_eq!(facts[0].segment, MemorySegment::Identity);
-        assert!((facts[0].importance - 0.85).abs() < 0.01);
+        assert!((facts[0].importance - 0.80).abs() < 0.01);
         assert_eq!(facts[1].segment, MemorySegment::Preference);
     }
 
@@ -354,11 +376,38 @@ mod tests {
         assert_eq!(facts[0].segment, MemorySegment::Knowledge);
     }
 
+    /// Importance is clamped to the SEGMENT's ceiling, not to 1.0.
+    ///
+    /// The model authors this number and it drifts upward — on the device the
+    /// eight `knowledge` rows averaged 0.806 against a prompted 0.50, and the
+    /// highest-importance memory in the whole store was "AI assistant" at 0.9.
+    /// An over-confident label must not let noise outrank a real preference.
     #[test]
-    fn importance_clamped() {
+    fn importance_is_clamped_to_the_segment_ceiling() {
         let json = r#"[{"fact": "High importance", "segment": "identity", "importance": 1.5}]"#;
         let facts = parse_extraction_response(json, &[], 3).unwrap();
-        assert_eq!(facts[0].importance, 1.0);
+        assert_eq!(
+            facts[0].importance,
+            MemorySegment::Identity.default_importance()
+        );
+
+        // knowledge is the segment the junk lands in; 0.9 must come back to 0.50
+        let json =
+            r#"[{"fact": "Some general trivia", "segment": "knowledge", "importance": 0.9}]"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(
+            facts[0].importance,
+            MemorySegment::Knowledge.default_importance()
+        );
+    }
+
+    /// The model may still signal LOWER confidence than the segment default —
+    /// clamping is a ceiling, not a replacement.
+    #[test]
+    fn a_below_default_importance_is_preserved() {
+        let json = r#"[{"fact": "User might prefer dark mode", "segment": "preference", "importance": 0.4}]"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert!((facts[0].importance - 0.4).abs() < 0.01);
     }
 
     // ── New format tests ({"facts": [...]}) ──────────────────────────────────
@@ -366,14 +415,14 @@ mod tests {
     #[test]
     fn parse_new_format_with_content_key() {
         let json = r#"{"facts": [
-            {"content": "User's name is Jerry", "segment": "identity", "importance": 0.82},
+            {"content": "User's name is Jerry", "segment": "identity", "importance": 0.80},
             {"content": "User prefers dark mode", "segment": "preference", "importance": 0.7}
         ]}"#;
         let facts = parse_extraction_response(json, &[], 3).unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].content, "User's name is Jerry");
         assert_eq!(facts[0].segment, MemorySegment::Identity);
-        assert!((facts[0].importance - 0.82).abs() < 0.01);
+        assert!((facts[0].importance - 0.80).abs() < 0.01);
     }
 
     #[test]

@@ -65,6 +65,17 @@ const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local
 /// affordance. The constant is not `pub` upstream, so this copy is the coupling
 /// — `goose_cap_message_is_still_verbatim` reads the fork source and fails if a
 /// Goose sync rewords it.
+/// How many memory candidates to retrieve per injection slot.
+///
+/// Retrieval breadth and injection width are separate concerns: ranking can only
+/// choose well from a pool it can see. Cheap because the semantic search already
+/// scores every embedded row server-side and truncates afterwards.
+const MEMORY_CANDIDATE_FANOUT: usize = 8;
+
+/// Minimum candidate pool, so a small `agent_memory_limit` still ranks over a
+/// meaningful slice of the store rather than the handful written most recently.
+const MEMORY_CANDIDATE_FLOOR: usize = 40;
+
 const GOOSE_MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
 
 /// Goose environment knobs GIAP owns, as `(key, Some(value) | None)` where
@@ -1847,7 +1858,22 @@ impl GooseAdapter {
                     .unwrap_or(true);
 
                 if needs_register {
-                    let mut settings = ModelSettings::default();
+                    // Carry the EXISTING tuning block over when we are repairing
+                    // a stale entry, rather than resetting to defaults.
+                    //
+                    // `ModelSettings::default()` has `context_size: None`, so a
+                    // re-registration dropped the platform stamp
+                    // (`apply_jetson_settings`' 16384 on the Orin). Whichever
+                    // call won the race decided the window: a turn was observed
+                    // running with a 32,768-cell KV context instead of 16,384 —
+                    // ~576 MiB of KV in two buffers against ~288 MiB, with the
+                    // SWA buffer landing within ~200 MiB of the NvMap wall.
+                    // Repairing a bad `local_path` must not also un-tune the
+                    // model.
+                    let mut settings = registry
+                        .get_model(&stem)
+                        .map(|entry| entry.settings.clone())
+                        .unwrap_or_default();
                     // GIAP's local GGUFs (gemma family) support llama.cpp native
                     // tool calling; force it rather than relying on Auto detection.
                     settings.tool_calling = ToolCallingMode::ForceNative;
@@ -1985,11 +2011,29 @@ impl GooseAdapter {
         }
 
         // ── 1-4. System prompt, extras, skills, memory — fetched in parallel ─
+        // Two different numbers, deliberately.
+        //
+        // `memory_limit` is how many memories are INJECTED. `candidate_limit` is
+        // how many are RETRIEVED for ranking. They used to be the same value,
+        // which meant the ranker only ever saw `search_recent(5)` union
+        // `search_similar(5)` — at most 10 rows. On the device that made 14 of
+        // 24 fragments invisible on every single turn, and the two genuinely
+        // useful preferences ("User prefers concise greetings", "The user
+        // prefers concise answers") had never once been candidates. The blend
+        // weights were fine; the pool they ranked was the defect.
+        //
+        // Widening is close to free: sqlite_memory's semantic search already
+        // SELECTs every embedded active row and cosines all of them, then
+        // truncates in Rust — so a bigger limit is the same query and the same
+        // arithmetic. Nothing downstream changes: the injection cap and the
+        // token budget still decide what actually reaches the prompt.
         let memory_limit = if settings.agent_memory_inject {
             Some(settings.agent_memory_limit as usize)
         } else {
             None
         };
+        let candidate_limit =
+            memory_limit.map(|limit| (limit * MEMORY_CANDIDATE_FANOUT).max(MEMORY_CANDIDATE_FLOOR));
 
         let (
             template_result,
@@ -2005,7 +2049,7 @@ impl GooseAdapter {
             self.skill_repo.list_active(),
             // Recent memories (recency-based)
             async {
-                match memory_limit {
+                match candidate_limit {
                     Some(limit) => self.memory_repo.search_recent(None, limit).await,
                     None => Ok(vec![]),
                 }
@@ -2014,7 +2058,7 @@ impl GooseAdapter {
             // LIKE otherwise. Embedding one short message is a few ms on CPU,
             // and it happens inside this join! so it overlaps the other fetches.
             async {
-                match memory_limit {
+                match candidate_limit {
                     Some(limit) => self.topical_memories(&request.message, limit).await,
                     None => vec![],
                 }
