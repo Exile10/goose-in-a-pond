@@ -16,7 +16,7 @@ const TOOLS = [
   {
     name: "play",
     description:
-      "Play music. Give a song name, artist, or album and it will search Spotify and start playing the best match. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.",
+      "Start playing music now, REPLACING whatever is currently playing and clearing the queue. Give a song name, artist, or album and it will search Spotify and play the best match. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'. To add something without interrupting the current track, use the 'queue' tool instead. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.",
     inputSchema: {
       type: "object",
       properties: {
@@ -29,6 +29,26 @@ const TOOLS = [
           type: "string",
           description:
             "Spotify URI to play directly (spotify:track:..., spotify:album:..., spotify:playlist:...). Use this only if you already have a URI. Otherwise use query.",
+        },
+      },
+    },
+  },
+  {
+    name: "queue",
+    description:
+      "Add a song to the Spotify queue WITHOUT interrupting what is playing. The current track keeps playing and the song is appended after anything already queued. Use this whenever the user says queue, add, or 'after this' — never 'play', which would cut the current song off. Spotify has no way to insert at a specific position, so this always appends to the end.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "What to queue — song name and optionally the artist (e.g. 'Bomba Train by E-Sir').",
+        },
+        uri: {
+          type: "string",
+          description:
+            "Spotify track URI to queue directly (spotify:track:...). Use this only if you already have a URI. Otherwise use query.",
         },
       },
     },
@@ -106,6 +126,39 @@ async function handlePlay(args: Record<string, unknown>): Promise<string> {
   // No query, no URI — resume
   const result = await provider.play();
   return result;
+}
+
+async function handleQueue(args: Record<string, unknown>): Promise<string> {
+  const uri = args.uri as string | undefined;
+  const query = args.query as string | undefined;
+
+  if (uri) {
+    await provider.addToQueue(uri);
+    return `Queued ${uri}`;
+  }
+
+  if (!query) {
+    return "Tell me what to queue — a song name, optionally with the artist.";
+  }
+
+  const tracks = await provider.searchTracks(query, 5);
+  if (tracks.length === 0) {
+    return `No results found for "${query}". Try a different search.`;
+  }
+
+  const top = tracks[0];
+  await provider.addToQueue(top.uri);
+
+  // Name what was queued so a wrong pick is visible and can be skipped, and
+  // list the runners-up the way handlePlay does.
+  let text = `Queued: ${top.name} by ${top.artist} (${top.album}). Current track keeps playing.`;
+  const others = tracks.slice(1, 4);
+  if (others.length > 0) {
+    text +=
+      "\n\nOther matches:\n" +
+      others.map((t, i) => `${i + 2}. ${t.name} by ${t.artist}`).join("\n");
+  }
+  return text;
 }
 
 async function handleStatus(): Promise<string> {
@@ -228,6 +281,10 @@ async function handleRequest(
           case "play":
             debug("play →", args.query || args.uri || "(resume)");
             text = await handlePlay(args);
+            break;
+          case "queue":
+            debug("queue →", args.query || args.uri || "(nothing)");
+            text = await handleQueue(args);
             break;
           case "status":
             debug("status → checking now playing");

@@ -28,6 +28,8 @@ export interface MusicProvider {
   setShuffle(enabled: boolean): Promise<string>;
   getNowPlaying(): Promise<TrackInfo | null>;
   getQueue(): Promise<TrackInfo[]>;
+  /** Appends to the queue without disturbing what is currently playing. */
+  addToQueue(uri: string): Promise<string>;
   searchTracks(query: string, limit?: number): Promise<TrackInfo[]>;
   searchAlbums(query: string, limit?: number): Promise<AlbumInfo[]>;
   getPlaylists(limit?: number): Promise<PlaylistInfo[]>;
