@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="web/src/assets/logo.png" alt="Goose In A Pond" width="120" />
+  <img src="pond-desktop/src/assets/goose-logo.png" alt="Goose In A Pond" width="120" />
 
   # Goose In A Pond
 

@@ -282,7 +282,7 @@ GIAP is structured across five conceptual layers. When adding features, identify
 │               (pond-infra-scheduler, scripts/)         │
 ├────────────────────────────────────────────────────────┤
 │  2. GUI Layer — Web dashboard, emulators (optional)    │
-│               (web/dist, tower-http ServeDir)          │
+│               (pond-desktop/dist, tower-http ServeDir) │
 ├────────────────────────────────────────────────────────┤
 │  1. OS Layer — Linux, drivers, models on disk          │
 │               (scripts/giap.sh, install.sh)              │

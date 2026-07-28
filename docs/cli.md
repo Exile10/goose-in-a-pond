@@ -67,7 +67,7 @@ pond-server serve [--port PORT] [--open] [--debug] [--agent goose|mock]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--static-dir PATH` | `web/dist` | Path to the built web dashboard assets. Run `cd web && npm run build` first. |
+| `--static-dir PATH` | `pond-desktop/dist` | Path to the built web dashboard assets. Run `cd pond-desktop && npm run build` first. |
 | `--open` | off | Open the dashboard in the default browser after startup |
 | `--debug` | off | Enable `DEBUG`-level tracing (third-party crates capped at `WARN`) |
 | `--agent` | `goose` | Agent backend. `goose` runs the full Block Goose agentic loop with MCP tool calls. `mock` returns instant echo responses (no LLM required — useful for development). |

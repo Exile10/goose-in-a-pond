@@ -170,7 +170,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         weather_provider: None,
     });
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         memory_repo,
         tmp,
     )

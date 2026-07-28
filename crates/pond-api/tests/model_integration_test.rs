@@ -186,7 +186,7 @@ async fn make_app_with_settings_repo() -> (
     });
 
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         model_repo,
         settings_repo,
         tmp,
