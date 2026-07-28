@@ -223,8 +223,9 @@ impl VisionMcpServer {
     }
 
     #[tool(description = "\
-List recent camera/vision events (motion, pet, package, person), newest first. Never guess \
-what a camera saw.")]
+Fixed home security cameras only, never an image attached to the message. Lists recent camera \
+events (motion, pet, package, person) as text, newest first - no frames. Never guess what a \
+camera saw.")]
     async fn get_recent_camera_events(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -286,9 +287,16 @@ what a camera saw.")]
     // message made the model call this tool instead of looking at the image it
     // had already been given, get "No frame available", and answer "I cannot see
     // the image". The model needs the boundary spelled out.
+    //
+    // It is spelled out FIRST, before the capability. With the guard trailing,
+    // a 4B model still answered "what do you see?" by offering camera frames
+    // while an attachment sat in its context: the opening words decided the
+    // match and the qualifier arrived too late. Scope, then guard, then what it
+    // returns.
     #[tool(description = "\
-View an actual frame from a home security camera (door, driveway, room). Newest frame unless \
-event_id is given. Not for an image attached to the message - you can already see those.")]
+Fixed home security cameras ONLY (door, driveway, room). If the user attached an image to the \
+message, do NOT call this - you can already see that image, just look at it. Returns one real \
+camera frame; newest unless event_id is given.")]
     async fn look_at_camera_snapshot(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -346,8 +354,9 @@ event_id is given. Not for an image attached to the message - you can already se
     }
 
     #[tool(description = "\
-View several home-security-camera frames spread across recent events, to see what changed or \
-which way someone moved. Up to 4 frames. Cameras only, not an image attached to the message.")]
+Fixed home security cameras ONLY. If the user attached an image to the message, do NOT call \
+this - you can already see that image. Returns up to 4 real camera frames spread across recent \
+events, to show what changed or which way someone moved.")]
     async fn look_at_camera_window(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -456,12 +465,14 @@ impl ServerHandler for VisionMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Vision MCP server — recent camera/vision events from the local, \
-                 on-device event store (never guess what a camera saw).\n\n\
+                "GIAP Vision MCP server — the FIXED HOME CAMERAS, from the local, on-device \
+                 event store (never guess what a camera saw).\n\n\
+                 None of these tools are for an image the user attached to a message: an \
+                 attachment is already visible to you, so look at it and answer directly.\n\n\
                  Tools: get_recent_camera_events (what the detector classified, newest first), \
-                 look_at_camera_snapshot (the actual frame — use for \"what does it look like\"), \
-                 look_at_camera_window (several frames across time, to see what changed), \
-                 acknowledge_camera_event (dismiss an alert by ID).",
+                 look_at_camera_snapshot (one camera frame — \"what does the driveway look \
+                 like\"), look_at_camera_window (several frames across time, to see what \
+                 changed), acknowledge_camera_event (dismiss an alert by ID).",
             )
     }
 }
@@ -652,5 +663,74 @@ mod tests {
         assert!(caption.contains("front-door"));
         assert!(caption.contains("person"));
         assert!(caption.contains("91% confidence"));
+    }
+
+    // ── The attached-image / camera-frame boundary ───────────────────────
+
+    /// Every camera tool description must still mention message attachments in
+    /// the same sentence as a negation — the shape a guard clause has.
+    ///
+    /// # What this does and does not prove
+    ///
+    /// This is a STRUCTURAL check, not a semantic one. It catches the failure
+    /// worth catching: someone reworks a description and the guard silently
+    /// disappears. It cannot tell a real guard from a sentence that happens to
+    /// contain both signals — "Attached to the roof, this camera never stops
+    /// recording." passes it with no guard at all. Do not read a pass as
+    /// confirmation that the wording guards anything; read a failure as proof
+    /// that it does not.
+    ///
+    /// It replaced a positional check ("attached" must appear in the first half
+    /// of the string), which failed a reworded guard for no reason. Placement
+    /// still matters — a 4B model matched on the opening clause and called a
+    /// camera tool with an image already in context, which is why the guard
+    /// leads each description — but placement is a wording decision no assertion
+    /// here pins down.
+    #[test]
+    fn every_camera_tool_guards_against_attached_images() {
+        /// The negations that turn a mention of attachments into a guard.
+        /// Matched as whole words so "another" cannot pass for "not".
+        const NEGATIONS: &[&str] = &["not", "never", "dont", "don"];
+
+        let router = VisionMcpServer::tool_router();
+        let tools = router.list_all();
+        assert!(!tools.is_empty());
+
+        // acknowledge_camera_event takes an ID and returns no frames — it cannot
+        // be confused for looking at an attachment.
+        let guarded = [
+            "get_recent_camera_events",
+            "look_at_camera_snapshot",
+            "look_at_camera_window",
+        ];
+        for name in guarded {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let description = tool
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} has no description"));
+            let lower = description.to_lowercase();
+            assert!(
+                lower.contains("attach"),
+                "{name} must mention images attached to the message: {description}"
+            );
+            // The guard has to be one clause: a sentence that mentions the
+            // attachment AND negates acting on it. Split on '.' so a negation
+            // three sentences away cannot stand in for a real guard.
+            let guarded_clause = lower.split('.').any(|sentence| {
+                sentence.contains("attach")
+                    && sentence
+                        .split(|c: char| !c.is_ascii_alphabetic())
+                        .any(|word| NEGATIONS.contains(&word))
+            });
+            assert!(
+                guarded_clause,
+                "{name}: mentioning attachments is not a guard - one clause must both name \
+                 the attachment and rule this tool out for it: {description}"
+            );
+        }
     }
 }

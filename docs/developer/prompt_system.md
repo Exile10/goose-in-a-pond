@@ -136,6 +136,36 @@ All templates (built-in, DB, file overrides) support these `{{placeholder}}` var
 
 ---
 
+## Conditional Sections
+
+The four built-in styles share one ordered tag skeleton. Some sections only render when their gate is true:
+
+| Section | Gate | Source |
+|---|---|---|
+| `<home-devices>` | `has_home_devices` | `DeviceRegistry` count > 0 |
+| `<thinking>` | `thinking_enabled` | `Settings.thinking_mode` + model capability, forced off in voice mode |
+| `<voice-mode>` | `voice_mode` | CLI `--input whisper` or `ChatRequest.voice_mode` |
+| `<canvas-mode>` | `canvas_mode` | `ChatRequest.canvas_mode` |
+| `<vision>` | model is vision-capable **and** not voice mode | appended by `GooseAdapter`, see below |
+
+### `<vision>` — the multimodal self-model
+
+Nothing else in the prompt tells the model it can see, and the omission is not theoretical: with a fully encoded image in context, Gemma-4-E4B answered *"I cannot directly describe the content of an image you provide. I am a text-based assistant."* The section states the capability outright and draws the line between an image **attached to the message** (directly visible — just look at it) and a **live camera frame** (needs a `giap-vision` tool). The same model, asked "what do you see?" with an attachment present, had offered camera frames instead.
+
+Mechanics, which differ from the other conditional sections:
+
+- The text is a constant in `pond-core/src/prompts.rs` (`vision_capability_section(compact)`), **not** a `{% if %}` block in the templates. `GooseAdapter::apply_vision_section()` appends it to the template string *before* Tera renders it, so it lands inside `static_prefix` and `prefix_hash` covers it automatically.
+- It is Jinja-free by contract (a test asserts no `{{` / `{%`), so it renders verbatim through any template.
+- It has a compact variant, selected by the same `compact_prompt` tier as the rest of the prompt.
+- The gate is `GooseAdapter::vision_section_applies(provider, model, voice)`. Rendering the section for a text-only model would manufacture a hallucination, so it is never on by default:
+  - **Model.** `model_supports_vision`: for `local` / `gguf` the model registry (does this GGUF declare an mmproj); for HTTP providers `ModelCapabilities::name_implies_vision`, a name rule deliberately narrower than the rest of `from_model_name`. On the Gemma 4 family it reaches the same verdict the registry would — `gemma-4-E1B` is the one Gemma 4 with no encoder and is excluded in every spelling, including Ollama's `gemma3n:e1b` — and it recognises the vision models an Ollama install actually serves (`llama3.2-vision`, `qwen2.5-vl`, Ollama's unhyphenated `qwen2.5vl`, `minicpm-v`, `pixtral`, `llava`, `moondream`, …). Unrecognised names stay `false`: a false positive tells a blind model it can see, a false negative only withholds a prompt section.
+    Two of its three rules name a known family outright; the third credits any name carrying `vision` / `vl` / `vlm` as a **whole segment**. That marker rule is what covers the long tail of vendors labelling a multimodal build without appearing in any list, and the price is that a name carrying the segment for an unrelated reason (`vision-labs/text-only-7b`) is credited too. Segment matching rather than substring matching keeps that to contrived names; it is accepted, not solved. So: not every rule is a positive identification of a known family.
+  - **Voice.** `AgentPort::capabilities()` reports `vision = false` in voice mode, so the section is suppressed there too — otherwise the prompt asserts a capability the adapter denies. Both read the same *instance-level* flag (CLI `--input whisper`), never `ChatRequest.voice_mode`: that is the only signal `capabilities()` can see, and a per-request gate would flip the static prefix between turns of one session and forfeit the KV cache.
+- **Declared, not downloaded.** The vision encoder is ~941 MB and fetched in the background, so "the bytes are on disk" flips mid-session; the model's *declaration* does not. Keying off the download would rewrite the system prefix mid-session and forfeit the engine's KV prompt-session cache for every turn after it. A turn that actually needs the encoder before it lands is refused up front in `chat_stream` with a precise "still downloading" message, so the model is never handed an image it cannot decode.
+- `Settings.custom_system_prompt` is a **full override** and is used instead of the template, so it does not receive this section. A custom prompt owns its whole contents, including any vision wording.
+
+---
+
 ## Security
 
 `sanitize_field(s, max_len)` is applied to every user-supplied value before substitution:
@@ -171,7 +201,7 @@ Four settings fields control GooseAdapter's agentic loop behaviour:
 
 | File | Role |
 |---|---|
-| `crates/pond-core/src/prompts.rs` | `pub const PROMPT_*`, `build_system_prompt(&Settings)`, `build_system_prompt_from_template`, `sanitize_field`, `render_template` |
+| `crates/pond-core/src/prompts.rs` | `pub const PROMPT_*`, `vision_capability_section`, `build_system_prompt(&Settings)`, `build_system_prompt_from_template`, `sanitize_field`, `render_template` |
 | `crates/pond-core/src/user_data/domain/settings.rs` | `prompt_style`, `custom_system_prompt`, `prompt_addendum`, `agent_*` fields |
 | `crates/pond-core/src/user_data/ports/prompt_template.rs` | `PromptTemplateRepository` trait |
 | `crates/pond-core/src/user_data/ports/prompt_extra.rs` | `PromptExtraRepository` trait |
