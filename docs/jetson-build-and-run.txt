@@ -4,7 +4,7 @@ Written 2026-07-28. Device: nano.local, user "nano", repo at ~/goose-in-a-pond
 ===============================================================================
 
 -------------------------------------------------------------------------------
-READ THIS FIRST - TWO TRAPS
+READ THIS FIRST - THREE TRAPS
 -------------------------------------------------------------------------------
 
 1. NEVER use `cargo run`, and never omit `--release`.
@@ -30,11 +30,37 @@ READ THIS FIRST - TWO TRAPS
 3. Only ONE server at a time.
 
    The systemd service holds port 8080. If you launch a second server manually
-   without stopping it, `--port` is not passed and the fallback scan runs
-   (80 -> 8080 -> 4000 -> 5000), so it silently binds 4000. You then have two
-   servers each loading a 3.1 GB model into 7.4 GB of unified memory, and the
-   device swap-thrashes.
+   without stopping it and do not pass --port, it binds 4000 and you then have
+   two servers each loading a 3.1 GB model into 7.4 GB of unified memory, and
+   the device swap-thrashes.
 
+   CORRECTION: the port fallback is 4000..4009, NOT 80 -> 8080 -> 4000 -> 5000.
+   ports::API_SERVER = 4000 and ports::MAX_TRIES = 10, so serve without --port
+   starts at 4000 and walks upward. (CLAUDE.md claimed the other order and was
+   wrong; it has been corrected.) The server writes the port it actually bound
+   to <data_dir>/.runtime_api_port - read that instead of guessing.
+
+
+-------------------------------------------------------------------------------
+THE EASY WAY: THE MENU
+-------------------------------------------------------------------------------
+
+Everything below is also available from one menu-driven script that auto-detects
+the host, whether CUDA is usable, and the known bad states:
+
+    bash scripts/giap.sh              # interactive menu
+    bash scripts/giap.sh doctor       # health report; exits 1 on any FAIL
+    bash scripts/giap.sh status       # detection banner only
+    bash scripts/giap.sh build        # web UI + server, right features for THIS host
+    bash scripts/giap.sh --dry-run .. # print every command instead of running it
+
+It prints a detected-state banner first (host, L4T, CUDA, toolchain, repo +
+submodule drift, web UI state, binaries, service scope, running server + port,
+resources, Jetson power + over-current, display, data dir), then a numbered menu.
+The doctor checks every trap in this document automatically.
+
+It delegates to the existing scripts rather than duplicating them - deploys still
+go through scripts/jetson.sh deploy.
 
 -------------------------------------------------------------------------------
 BUILD - OPTION A (RECOMMENDED): FROM THE MAC
@@ -90,7 +116,14 @@ Build the desktop app (separate cargo target, needed for --native):
 
     cd ~/goose-in-a-pond
     PATH=$HOME/.cargo/bin:$PATH SQLX_OFFLINE=true \
-    cargo build --release --manifest-path pond-desktop/src-tauri/Cargo.toml
+    cargo build --release --features custom-protocol \
+      --manifest-path pond-desktop/src-tauri/Cargo.toml
+
+  --features custom-protocol IS LOAD-BEARING. It is what `cargo tauri build`
+  passes for you. Without it Tauri stays in dev mode and the WebView loads
+  tauri.conf.json's devUrl (http://localhost:1420) instead of the embedded
+  dist, so the app opens to "Could not connect to localhost: Connection
+  refused" - and there is no build error to explain it.
 
 Timings from a full clean rebuild on 2026-07-28:
     pond-server release + CUDA ... 35m01s
