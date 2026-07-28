@@ -2,10 +2,13 @@
 /**
  * GIAP Music Extension — MCP server for Spotify playback.
  *
- * 3 focused tools (not 14):
- *   play     — search by name and play, or resume/play by URI
- *   status   — what's currently playing + queue
- *   control  — pause, resume, next, previous, volume, shuffle
+ * A small set of intent-shaped tools rather than one per endpoint (this was
+ * once 14 tools, which was worse):
+ *   play      — play a track, album, or one of the user's playlists, by name or URI
+ *   queue     — append to the queue without interrupting the current track
+ *   playlists — list the user's playlists by name
+ *   status    — what's currently playing + queue
+ *   control   — pause, resume, next, previous, volume, shuffle
  */
 import * as readline from "readline";
 import { SpotifyProvider } from "./providers/spotify.js";
@@ -30,6 +33,12 @@ const TOOLS = [
           description:
             "Spotify URI to play directly (spotify:track:..., spotify:album:..., spotify:playlist:...). Use this only if you already have a URI. Otherwise use query.",
         },
+        type: {
+          type: "string",
+          enum: ["track", "album", "playlist"],
+          description:
+            "What the query names. 'album' plays the whole record in order; 'playlist' plays one of the user's own playlists, matched by name. Defaults to 'track'.",
+        },
       },
     },
   },
@@ -52,6 +61,12 @@ const TOOLS = [
         },
       },
     },
+  },
+  {
+    name: "playlists",
+    description:
+      "List the user's own Spotify playlists by name. Use this to answer 'what playlists do I have', or to find the right name before playing one with the 'play' tool.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "status",
@@ -101,6 +116,34 @@ async function handlePlay(args: Record<string, unknown>): Promise<string> {
   if (uri) {
     const result = await provider.play(uri);
     return result;
+  }
+
+  // Playlist: match one of the user's own by name and play it. provider.play
+  // sends a non-track URI as context_uri, so playback runs through the whole
+  // playlist rather than stopping after one song.
+  if (query && (args.type as string | undefined) === "playlist") {
+    const { uri: playlistUri, name } = await resolvePlaylist(query);
+    await provider.play(playlistUri);
+    return `Now playing playlist: ${name}`;
+  }
+
+  // Album: play the whole record in order, same context_uri mechanism.
+  if (query && (args.type as string | undefined) === "album") {
+    const albums = await provider.searchAlbums(query, 5);
+    if (albums.length === 0) {
+      return `No album found for "${query}". Try a different search.`;
+    }
+    const top = albums[0];
+    await provider.play(top.uri);
+
+    let text = `Now playing album: ${top.name} by ${top.artist} (${top.total_tracks} tracks, ${top.release_date})`;
+    const others = albums.slice(1, 4);
+    if (others.length > 0) {
+      text +=
+        "\n\nOther matches:\n" +
+        others.map((a, i) => `${i + 2}. ${a.name} by ${a.artist}`).join("\n");
+    }
+    return text;
   }
 
   // Search and play
@@ -159,6 +202,32 @@ async function handleQueue(args: Record<string, unknown>): Promise<string> {
       others.map((t, i) => `${i + 2}. ${t.name} by ${t.artist}`).join("\n");
   }
   return text;
+}
+
+/**
+ * Finds one of the user's own playlists by name. The model will have a name,
+ * not an id, so requiring an id would make this unusable in practice.
+ */
+async function resolvePlaylist(name: string): Promise<{ uri: string; name: string }> {
+  const playlists = await provider.getPlaylists(50);
+  const wanted = name.trim().toLowerCase();
+
+  const hit =
+    playlists.find(p => p.name.toLowerCase() === wanted) ??
+    playlists.find(p => p.name.toLowerCase().includes(wanted));
+  if (hit) return { uri: hit.uri, name: hit.name };
+
+  throw new Error(
+    `No playlist matching "${name}". Available: ${playlists.map(p => p.name).join(", ") || "(none)"}`
+  );
+}
+
+async function handlePlaylists(): Promise<string> {
+  const playlists = await provider.getPlaylists(50);
+  if (playlists.length === 0) return "No playlists found on this Spotify account.";
+  return (
+    `${playlists.length} playlist(s):\n` + playlists.map(p => `- ${p.name}`).join("\n")
+  );
 }
 
 async function handleStatus(): Promise<string> {
@@ -285,6 +354,10 @@ async function handleRequest(
           case "queue":
             debug("queue →", args.query || args.uri || "(nothing)");
             text = await handleQueue(args);
+            break;
+          case "playlists":
+            debug("playlists → listing");
+            text = await handlePlaylists();
             break;
           case "status":
             debug("status → checking now playing");

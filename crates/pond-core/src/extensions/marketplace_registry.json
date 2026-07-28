@@ -109,7 +109,7 @@
       "args": ["-y", "tsx", "extensions/music/src/server.ts"],
       "category": "entertainment",
       "author": "GIAP",
-      "tools": ["play", "queue", "status", "control"],
+      "tools": ["play", "queue", "playlists", "status", "control"],
       "featured": true,
       "required_secrets": [
         {

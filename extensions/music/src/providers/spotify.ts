@@ -22,10 +22,30 @@ interface SpotifyPlaylist {
   id: string;
   name: string;
   description: string;
-  tracks: { total: number };
+  /** Absent on some /me/playlists entries, which carry `items` instead. */
+  tracks?: { total: number };
+  items?: unknown[];
   uri: string;
 }
 
+/**
+ * Endpoints Spotify withdrew from apps created after 2024-11-27, which includes
+ * GIAP's. Verified against a live token — these are not a scope problem and
+ * asking for more permissions will not bring them back:
+ *
+ *   GET /recommendations                     404
+ *   GET /recommendations/available-genre-seeds  404
+ *   GET /audio-features/{id}                 403
+ *   GET /audio-analysis/{id}                 403
+ *   GET /artists/{id}/related-artists        403
+ *   GET /artists/{id}/top-tracks             403
+ *   GET /browse/featured-playlists           403
+ *   GET /browse/new-releases                 403
+ *   track.preview_url                        always null
+ *
+ * So there is no "play me something like this", no mood or tempo matching, and
+ * no 30-second previews. Do not build features that depend on them.
+ */
 export class SpotifyProvider implements MusicProvider {
   name = 'Spotify';
   private baseUrl = 'https://api.spotify.com/v1';
@@ -160,7 +180,10 @@ export class SpotifyProvider implements MusicProvider {
       id: playlist.id,
       name: playlist.name,
       description: playlist.description || '',
-      track_count: playlist.tracks.total,
+      // `tracks` is not always present. /me/playlists returns some entries with
+      // an `items` array and no `tracks` object at all, so reading
+      // `playlist.tracks.total` outright throws on a perfectly ordinary account.
+      track_count: playlist.tracks?.total ?? playlist.items?.length ?? 0,
       uri: playlist.uri,
     };
   }
@@ -360,46 +383,6 @@ export class SpotifyProvider implements MusicProvider {
     return (data.items || []).map(p => this.parsePlaylist(p));
   }
 
-  async getPlaylistTracks(playlistId: string): Promise<TrackInfo[]> {
-    interface PlaylistTracksResponse {
-      items: Array<{ track: SpotifyTrack }>;
-    }
 
-    const data = await this.api<PlaylistTracksResponse>(
-      'GET',
-      `/playlists/${playlistId}/tracks?limit=50`
-    );
 
-    return (data.items || [])
-      .filter(item => item.track)
-      .map(item => this.parseTrack(item.track));
-  }
-
-  async createPlaylist(name: string, description?: string): Promise<PlaylistInfo> {
-    interface UserResponse {
-      id: string;
-    }
-
-    const user = await this.api<UserResponse>('GET', '/me');
-
-    const playlist = await this.api<SpotifyPlaylist>(
-      'POST',
-      `/users/${user.id}/playlists`,
-      {
-        name,
-        description: description || '',
-        public: false,
-      }
-    );
-
-    return this.parsePlaylist(playlist);
-  }
-
-  async addToPlaylist(playlistId: string, trackUris: string[]): Promise<string> {
-    await this.command('POST', `/playlists/${playlistId}/tracks`, {
-      uris: trackUris,
-    });
-
-    return `Added ${trackUris.length} track(s) to playlist`;
-  }
 }
