@@ -154,7 +154,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         weather_provider: None,
     });
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         tmp,
     )
 }

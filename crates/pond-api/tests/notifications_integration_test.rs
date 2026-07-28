@@ -146,7 +146,7 @@ async fn make_app() -> Harness {
     });
 
     Harness {
-        router: build_router(state, std::path::PathBuf::from("web/dist")),
+        router: build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         queue,
         sender,
         device_id,

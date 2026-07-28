@@ -137,7 +137,7 @@ async fn make_app() -> (
     });
 
     (
-        build_router(state, std::path::PathBuf::from("web/dist")),
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         push_repo,
         device_id,
         tmp,

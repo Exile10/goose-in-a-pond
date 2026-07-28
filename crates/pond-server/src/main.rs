@@ -116,8 +116,8 @@ enum Commands {
 
     /// Start the HTTP server (REST API + web dashboard)
     Serve {
-        /// Path to the built web dashboard assets (run `cd web && npm run build` first)
-        #[arg(long, default_value = "web/dist")]
+        /// Path to the built web dashboard assets (run `cd pond-desktop && npm run build` first)
+        #[arg(long, default_value = "pond-desktop/dist")]
         static_dir: std::path::PathBuf,
 
         /// Open the dashboard in the browser
@@ -5360,7 +5360,7 @@ async fn run_main_menu() -> Result<()> {
                 let data_dir = default_data_dir();
                 let drain = tracing_setup::init_tracing(false, &data_dir);
                 run_server(
-                    std::path::PathBuf::from("web/dist"),
+                    std::path::PathBuf::from("pond-desktop/dist"),
                     false,
                     false,
                     "goose",
