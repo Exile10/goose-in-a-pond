@@ -2620,10 +2620,16 @@ async fn update_settings(
     // Write only the keys this request actually carries. Writing the whole
     // merged snapshot reverted any field another writer (the phone, the other
     // desktop UI, a model activation) changed after `current` was read.
-    let mut write_keys: std::collections::HashSet<String> = patch
+    //
+    // The patch key set is also the only trustworthy record of user INTENT:
+    // these are the fields the caller deliberately sent. Keep it separate from
+    // `write_keys`, which grows to include values the server derives (the
+    // geocoded coordinates below) — derived is not chosen.
+    let user_keys: std::collections::HashSet<String> = patch
         .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
+    let mut write_keys = user_keys.clone();
 
     let patch_lat = patch.get("weather_latitude").and_then(|v| v.as_f64());
     let patch_lon = patch.get("weather_longitude").and_then(|v| v.as_f64());
@@ -2665,6 +2671,15 @@ async fn update_settings(
                 Json(json!({"error": format!("Failed to save settings: {}", e)})),
             )
         })?;
+
+    // Record that these keys were deliberately chosen, so a future
+    // default-adoption migration (see DEFAULT_ADOPTIONS / migration 0035)
+    // leaves them alone. Runs after the write because the marker only applies
+    // to rows that exist. Best-effort: the values are already saved, and
+    // losing the marker only risks a later default adoption, not this edit.
+    if let Err(e) = state.settings_repo.mark_user_set(&user_keys).await {
+        tracing::warn!(error = %e, "failed to record user intent for settings patch");
+    }
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
@@ -2709,6 +2724,15 @@ async fn update_settings(
 
     // Return the full merged Settings so the frontend can sync its local state
     // without a second GET request.
+    //
+    // The echo is NOT byte-identical to what the client sent for a float field.
+    // `Settings` stores these as `f32` and serde_json serialises through `f64`,
+    // so a sent `0.7` comes back as 0.699999988079071. A client that diffs its
+    // local state against this response must fold in the patch it sent, not
+    // just the echo, or the field never converges and every later save re-sends
+    // it — see docs/developer/settings-defaults-and-user-intent.md. Do not
+    // "fix" this by rounding here: the widening is faithful to the stored f32,
+    // and rounding on the way out would report a value the server does not hold.
     Ok(Json(
         serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
     ))

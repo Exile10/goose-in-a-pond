@@ -4,10 +4,15 @@
 //! in `pond_system.db`. Each Setting field maps to one row; missing keys fall back to
 //! `Settings::default()`.
 //!
-//! IMPORTANT: `update()` issues one `INSERT OR REPLACE` per field — never batched into
+//! IMPORTANT: `update()` issues one upsert per field — never batched into
 //! a single query (sqlx only executes the first statement when multiple are batched).
 //! The whole sequence runs inside one transaction so concurrent writers cannot
 //! interleave per-key and leave a torn hybrid of two snapshots.
+//!
+//! Every write is `INSERT … ON CONFLICT(key) DO UPDATE`, never `INSERT OR
+//! REPLACE`: replace deletes the row and re-inserts it, which resets
+//! `is_user_set` to its column default and would silently forget that the user
+//! had chosen the key (see migration 0035).
 //!
 //! Every field MUST have both an upsert in `update_fields` and an arm in
 //! `apply_key`; a field with only one of the two is silently unsaved or silently
@@ -63,8 +68,11 @@ impl SettingsRepository for SqliteSettingsRepository {
             ($key:expr, $val:expr) => {
                 if only.is_none_or(|keys| keys.contains($key)) {
                     sqlx::query(
-                        "INSERT OR REPLACE INTO settings (key, value, updated_at) \
-                         VALUES (?, ?, datetime('now'))",
+                        "INSERT INTO settings (key, value, updated_at) \
+                         VALUES (?, ?, datetime('now')) \
+                         ON CONFLICT(key) DO UPDATE SET \
+                             value = excluded.value, \
+                             updated_at = excluded.updated_at",
                     )
                     .bind($key)
                     .bind($val)
@@ -587,14 +595,43 @@ impl SettingsRepository for SqliteSettingsRepository {
 
     async fn set_key(&self, key: &str, value: String) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO settings (key, value, updated_at) \
-             VALUES (?, ?, datetime('now'))",
+            "INSERT INTO settings (key, value, updated_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(key) DO UPDATE SET \
+                 value = excluded.value, \
+                 updated_at = excluded.updated_at",
         )
         .bind(key)
         .bind(value)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn mark_user_set(&self, keys: &HashSet<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // UPDATE, not upsert: a patch may carry a key that is not a real
+        // Settings field, and an unknown key must not conjure a settings row.
+        // The caller writes the values first, so every real key has one.
+        let mut tx = self.pool.begin().await?;
+        for key in keys {
+            sqlx::query("UPDATE settings SET is_user_set = 1 WHERE key = ?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn is_user_set(&self, key: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT is_user_set FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some_and(|(flag,)| flag != 0))
     }
 }
 
@@ -946,6 +983,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use pond_core::user_data::domain::settings::{DefaultAdoption, DEFAULT_ADOPTIONS};
     use tempfile::tempdir;
 
     async fn fresh_repo() -> SqliteSettingsRepository {
@@ -1063,6 +1101,420 @@ mod tests {
         let got = repo.get().await.unwrap();
         assert!(!got.telemetry_enabled, "named key must be written");
         assert!(!got.mic_enabled, "unnamed key must not be reverted");
+    }
+
+    const MIGRATION_0035: &str = include_str!("../migrations/system/0035_settings_user_intent.sql");
+
+    /// The on-disk system migration directory. `include_str!` needs a literal
+    /// path, so it cannot reach a migration a FUTURE `DEFAULT_ADOPTIONS` entry
+    /// names; reading the directory can.
+    const SYSTEM_MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/system");
+
+    /// The SQL of the system migration whose filename starts with `number`.
+    ///
+    /// This is the FORWARD half of the tie between `DEFAULT_ADOPTIONS` and the
+    /// SQL: an entry naming a migration that was never written fails here
+    /// instead of registering an adoption that nothing performs.
+    fn migration_sql(number: &str) -> String {
+        let mut matches: Vec<std::path::PathBuf> = std::fs::read_dir(SYSTEM_MIGRATIONS_DIR)
+            .unwrap_or_else(|e| panic!("cannot read {SYSTEM_MIGRATIONS_DIR}: {e}"))
+            .map(|entry| entry.expect("read dir entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(number) && n.ends_with(".sql"))
+            })
+            .collect();
+        matches.sort();
+        assert_eq!(
+            matches.len(),
+            1,
+            "DEFAULT_ADOPTIONS names migration {number}, but {SYSTEM_MIGRATIONS_DIR} holds \
+             {} file(s) with that prefix ({matches:?}). A registered adoption with no \
+             migration file is never performed on any install.",
+            matches.len()
+        );
+        std::fs::read_to_string(&matches[0]).expect("read migration file")
+    }
+
+    /// `migration_sql` resolves against `CARGO_MANIFEST_DIR`. If that ever
+    /// stops pointing at the shipped migrations, every forward-tie assertion
+    /// below would pass vacuously — so pin it to the one file that is also
+    /// compiled in via `include_str!`.
+    #[test]
+    fn migration_lookup_resolves_to_the_shipped_files() {
+        assert_eq!(migration_sql("0035"), MIGRATION_0035);
+    }
+
+    /// The adoption UPDATE statements of a migration, whitespace-normalised.
+    ///
+    /// Full-line `--` comments are dropped first; the shipped migrations put
+    /// all prose on its own line, and a `--` inside a string literal would be
+    /// a false strip.
+    fn adoption_update_statements(sql: &str) -> Vec<String> {
+        let stripped: String = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        stripped
+            .split(';')
+            .map(|stmt| stmt.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|stmt| stmt.to_ascii_uppercase().starts_with("UPDATE "))
+            .collect()
+    }
+
+    /// Every migration `DEFAULT_ADOPTIONS` delegates to, oldest first.
+    fn adoption_migrations() -> Vec<&'static str> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for entry in DEFAULT_ADOPTIONS {
+            if !seen.contains(&entry.migration) {
+                seen.push(entry.migration);
+            }
+        }
+        seen.sort_unstable();
+        seen
+    }
+
+    /// The adoption entries one migration is responsible for.
+    fn adoptions_for(migration: &str) -> Vec<&'static DefaultAdoption> {
+        DEFAULT_ADOPTIONS
+            .iter()
+            .filter(|a| a.migration == migration)
+            .collect()
+    }
+
+    /// Replay the value-adoption half of a migration against an
+    /// already-migrated schema, and report how many statements ran.
+    ///
+    /// `fresh_repo` runs migrations on an EMPTY settings table, so the only
+    /// way to exercise an adoption is to seed the pre-migration rows and run
+    /// the UPDATEs again. It executes the SHIPPED SQL (minus the one-shot
+    /// `ALTER TABLE`) rather than a copy, so these assertions cannot drift
+    /// from what an install actually runs.
+    async fn replay_adoption_updates(pool: &Pool<Sqlite>, sql: &str) -> usize {
+        let statements = adoption_update_statements(sql);
+        for stmt in &statements {
+            sqlx::query(stmt).execute(pool).await.unwrap();
+        }
+        statements.len()
+    }
+
+    /// Replay every registered adoption in migration order, as an install that
+    /// upgrades across all of them does.
+    async fn replay_default_adoption(pool: &Pool<Sqlite>) -> usize {
+        let mut ran = 0;
+        for migration in adoption_migrations() {
+            ran += replay_adoption_updates(pool, &migration_sql(migration)).await;
+        }
+        ran
+    }
+
+    /// The tie in BOTH directions, statically:
+    ///
+    /// - forward — every `DEFAULT_ADOPTIONS` entry has an UPDATE that actually
+    ///   moves its key from `old_default` to `new_default`, guarded on
+    ///   `is_user_set`;
+    /// - backward — a migration carries no adoption UPDATE that the registry
+    ///   does not describe.
+    ///
+    /// Without this, a registry entry and its SQL can disagree (or the SQL can
+    /// be missing outright) and every runtime test still passes, because they
+    /// only ever replay the statements that do exist.
+    #[test]
+    fn every_adoption_entry_has_matching_migration_sql() {
+        for migration in adoption_migrations() {
+            let statements = adoption_update_statements(&migration_sql(migration));
+            let entries = adoptions_for(migration);
+
+            assert_eq!(
+                statements.len(),
+                entries.len(),
+                "migration {migration} carries {} adoption UPDATE(s) but DEFAULT_ADOPTIONS \
+                 lists {} key(s) for it: {statements:#?}",
+                statements.len(),
+                entries.len()
+            );
+
+            for e in entries {
+                let want_set = format!("SET value = '{}'", e.new_default);
+                let want_key = format!("key = '{}'", e.key);
+                let want_old = format!("AND value = '{}'", e.old_default);
+                // `AND is_user_set = 0`, not a bare `is_user_set = 0`: the bare
+                // substring also matches a statement that ASSIGNS the column
+                // (`SET is_user_set = 0`, which would unmark a key) instead of
+                // guarding on it. Only the conjunction proves the guard is an
+                // additional condition on the WHERE clause.
+                const WANT_GUARD: &str = "AND is_user_set = 0";
+                assert!(
+                    statements.iter().any(|s| s.contains(&want_set)
+                        && s.contains(&want_key)
+                        && s.contains(&want_old)
+                        && s.contains(WANT_GUARD)),
+                    "migration {migration} has no UPDATE matching DEFAULT_ADOPTIONS entry \
+                     `{}` ({} -> {}). Expected a statement containing `{want_key}`, \
+                     `{want_old}`, `{want_set}` and `{WANT_GUARD}`; found: {statements:#?}",
+                    e.key,
+                    e.old_default,
+                    e.new_default
+                );
+            }
+        }
+    }
+
+    /// `new_default` must be the literal the STORE actually holds for today's
+    /// default — the half of the registry check that pond-core cannot make.
+    ///
+    /// The domain has no way to render a field the way this adapter does, and
+    /// the obvious stand-in is wrong: the adapter writes numbers with
+    /// `Display`, while a `serde_json` round-trip widens every `f32` to `f64`
+    /// (`0.05f32` is `0.05` here but `0.05000000074505806` through JSON). A
+    /// registry checked against the JSON form would demand a literal that no
+    /// `WHERE value = '...'` guard could ever match, so the migration would
+    /// silently adopt nothing.
+    ///
+    /// So write `Settings::default()` through the real adapter and read the
+    /// rows back. No rendering is inferred; whatever an install stores is what
+    /// the registry must name.
+    #[tokio::test]
+    async fn every_adoption_entry_states_the_literal_the_adapter_writes() {
+        let repo = fresh_repo().await;
+        repo.update(&Settings::default()).await.unwrap();
+
+        let mut newest: std::collections::BTreeMap<&str, &DefaultAdoption> =
+            std::collections::BTreeMap::new();
+        for e in DEFAULT_ADOPTIONS {
+            newest.insert(e.key, e);
+        }
+
+        for (key, entry) in newest {
+            let stored = raw_value(&repo.pool, key).await.unwrap_or_else(|| {
+                panic!(
+                    "`{key}` is in DEFAULT_ADOPTIONS but the adapter writes no row for it, \
+                     so its migration UPDATEs a key nothing reads"
+                )
+            });
+            assert_eq!(
+                stored, entry.new_default,
+                "`{key}` is stored as `{stored}` for today's default, but the newest \
+                 DEFAULT_ADOPTIONS entry (migration {}) claims `{}`, so migration {} adopts \
+                 a value no install will ever hold. APPEND a new entry \
+                 {{ key: \"{key}\", old_default: \"{}\", new_default: \"{stored}\", \
+                 migration: \"00NN\" }} plus a new 00NN migration — never edit an entry \
+                 whose migration has already run.",
+                entry.migration, entry.new_default, entry.migration, entry.new_default
+            );
+        }
+    }
+
+    /// Write a row as it would have looked BEFORE the migration.
+    async fn seed_row(pool: &Pool<Sqlite>, key: &str, value: &str, user_set: i64) {
+        sqlx::query(
+            "INSERT INTO settings (key, value, is_user_set, updated_at) \
+             VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(user_set)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn raw_value(pool: &Pool<Sqlite>, key: &str) -> Option<String> {
+        sqlx::query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|(v,)| v)
+    }
+
+    /// An install whose row still holds the OLD default never chose it, so the
+    /// new default is adopted — the whole point of 0035.
+    ///
+    /// Driven off `DEFAULT_ADOPTIONS` rather than a fixed key list, so a later
+    /// migration is covered the day it is registered. Keys are seeded at the
+    /// value they held before their FIRST adoption and the migrations replay in
+    /// order, which is what an install upgrading across several of them does.
+    #[tokio::test]
+    async fn migration_adopts_defaults_the_user_never_chose() {
+        let repo = fresh_repo().await;
+        let migrations = adoption_migrations();
+        assert!(
+            !migrations.is_empty(),
+            "DEFAULT_ADOPTIONS must adopt at least one default"
+        );
+
+        let mut seeded: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for e in DEFAULT_ADOPTIONS {
+            if seeded.insert(e.key) {
+                seed_row(&repo.pool, e.key, e.old_default, 0).await;
+            }
+        }
+
+        for migration in &migrations {
+            let entries = adoptions_for(migration);
+            let ran = replay_adoption_updates(&repo.pool, &migration_sql(migration)).await;
+            assert_eq!(
+                ran,
+                entries.len(),
+                "migration {migration} carries {ran} UPDATE statement(s) but \
+                 DEFAULT_ADOPTIONS lists {} key(s) for it",
+                entries.len()
+            );
+        }
+
+        // Each key ends at the NEWEST registered value for it — with chained
+        // adoptions that is the last entry, not the first.
+        for key in &seeded {
+            let newest = DEFAULT_ADOPTIONS
+                .iter()
+                .rfind(|e| &e.key == key)
+                .expect("seeded from the registry");
+            assert_eq!(
+                raw_value(&repo.pool, key).await.as_deref(),
+                Some(newest.new_default),
+                "`{key}` was not adopted through to the newest registered default"
+            );
+        }
+
+        // The adopted literals must also PARSE back into what the code defaults
+        // to today — a stored '50' is worthless if `apply_key` drops it.
+        let got = repo.get().await.unwrap();
+        let want = Settings::default();
+        assert_eq!(got.agent_max_turns, want.agent_max_turns);
+        assert_eq!(
+            got.hybrid_compaction_enabled,
+            want.hybrid_compaction_enabled
+        );
+    }
+
+    /// A stored value that differs from the old default IS a choice, whether or
+    /// not it was ever marked. Adoption must leave it alone.
+    #[tokio::test]
+    async fn migration_leaves_a_deliberately_different_value_alone() {
+        let repo = fresh_repo().await;
+        seed_row(&repo.pool, "agent_max_turns", "5", 0).await;
+        seed_row(&repo.pool, "hybrid_compaction_enabled", "true", 0).await;
+
+        replay_default_adoption(&repo.pool).await;
+
+        assert_eq!(
+            raw_value(&repo.pool, "agent_max_turns").await.as_deref(),
+            Some("5")
+        );
+        assert_eq!(repo.get().await.unwrap().agent_max_turns, 5);
+    }
+
+    /// Re-running the file (a restored backup, a re-applied migration, a copy
+    /// of the guard in a later migration) must change nothing the second time.
+    ///
+    /// EVERY registered key is marked, not one of them. Marking only
+    /// `agent_max_turns` proved only that `agent_max_turns`' UPDATE carries the
+    /// `is_user_set` guard; a later entry whose UPDATE omitted it would re-adopt
+    /// a value the user had deliberately chosen, and this test would still pass.
+    #[tokio::test]
+    async fn migration_is_idempotent() {
+        let repo = fresh_repo().await;
+        // The value each key held before its FIRST adoption, and the value it
+        // should hold after all of them.
+        let mut oldest: Vec<(&str, &str)> = Vec::new();
+        let mut newest: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for e in DEFAULT_ADOPTIONS {
+            if !oldest.iter().any(|(k, _)| *k == e.key) {
+                oldest.push((e.key, e.old_default));
+            }
+            newest.insert(e.key, e.new_default);
+        }
+        assert!(!oldest.is_empty(), "DEFAULT_ADOPTIONS must not be empty");
+
+        for (key, old) in &oldest {
+            seed_row(&repo.pool, key, old, 0).await;
+        }
+
+        replay_default_adoption(&repo.pool).await;
+        let after_first = repo.get().await.unwrap();
+
+        // A second pass over already-adopted rows moves nothing.
+        replay_default_adoption(&repo.pool).await;
+        for (key, want) in &newest {
+            assert_eq!(
+                raw_value(&repo.pool, key).await.as_deref(),
+                Some(*want),
+                "a second pass moved `{key}` off its already-adopted value"
+            );
+        }
+
+        // The user then deliberately picks the OLD value back for EVERY
+        // registered key and says so. Raw SQL for the values because the keys
+        // are enumerated from the registry and have no common typed setter;
+        // `mark_user_set` is the real adapter method.
+        for (key, old) in &oldest {
+            sqlx::query("UPDATE settings SET value = ? WHERE key = ?")
+                .bind(old)
+                .bind(key)
+                .execute(&repo.pool)
+                .await
+                .unwrap();
+        }
+        let marked: HashSet<String> = oldest.iter().map(|(k, _)| k.to_string()).collect();
+        repo.mark_user_set(&marked).await.unwrap();
+
+        replay_default_adoption(&repo.pool).await;
+
+        for (key, old) in &oldest {
+            assert_eq!(
+                raw_value(&repo.pool, key).await.as_deref(),
+                Some(*old),
+                "`{key}` was re-adopted after the user marked it — its migration UPDATE is \
+                 missing the `AND is_user_set = 0` guard"
+            );
+        }
+        // And the marked values still parse back through `apply_key`.
+        let after_marked = repo.get().await.unwrap();
+        assert_ne!(
+            after_marked.agent_max_turns, after_first.agent_max_turns,
+            "the marked pass must have restored the old value, or this test is vacuous"
+        );
+    }
+
+    /// Only the keys a `PUT /api/v1/settings` patch carries count as user
+    /// intent. Snapshot writers pin every key and must claim nothing.
+    #[tokio::test]
+    async fn only_a_patch_write_records_user_intent() {
+        let repo = fresh_repo().await;
+
+        // Server-side full snapshot (onboarding, sync_assignments_to_settings).
+        repo.update(&Settings::default()).await.unwrap();
+        assert!(!repo.is_user_set("agent_max_turns").await.unwrap());
+        repo.set_key("chat_model", "gemma".to_string())
+            .await
+            .unwrap();
+        assert!(!repo.is_user_set("chat_model").await.unwrap());
+
+        // The PUT path: write the patch keys, then claim intent for exactly them.
+        let mut s = repo.get().await.unwrap();
+        s.agent_max_turns = 12;
+        let patch: HashSet<String> = ["agent_max_turns".to_string()].into_iter().collect();
+        repo.update_fields(&s, Some(&patch)).await.unwrap();
+        repo.mark_user_set(&patch).await.unwrap();
+        assert!(repo.is_user_set("agent_max_turns").await.unwrap());
+        assert!(!repo.is_user_set("hybrid_compaction_enabled").await.unwrap());
+
+        // A later value write must not forget the mark — `INSERT OR REPLACE`
+        // dropped the row and silently reset the flag.
+        repo.update(&repo.get().await.unwrap()).await.unwrap();
+        repo.set_key("agent_max_turns", "12".to_string())
+            .await
+            .unwrap();
+        assert!(repo.is_user_set("agent_max_turns").await.unwrap());
+
+        // A patch key that is not a Settings field must not conjure a row.
+        let bogus: HashSet<String> = ["not_a_setting".to_string()].into_iter().collect();
+        repo.mark_user_set(&bogus).await.unwrap();
+        assert!(!repo.is_user_set("not_a_setting").await.unwrap());
+        assert!(raw_value(&repo.pool, "not_a_setting").await.is_none());
     }
 
     #[tokio::test]

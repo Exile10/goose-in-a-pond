@@ -4,19 +4,24 @@ use crate::user_data::domain::settings::Settings;
 use crate::user_data::ports::settings::SettingsRepository;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// In-memory settings store. Starts empty (all reads return defaults).
 pub struct MockSettingsRepository {
     store: Arc<RwLock<HashMap<String, String>>>,
+    /// Keys the user deliberately chose — tracked separately from the values
+    /// exactly as the SQLite adapter tracks them in a separate column, so a
+    /// snapshot write cannot imply intent.
+    user_set: Arc<RwLock<HashSet<String>>>,
 }
 
 impl MockSettingsRepository {
     pub fn new() -> Self {
         Self {
             store: Arc::new(RwLock::new(HashMap::new())),
+            user_set: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
@@ -161,6 +166,22 @@ impl SettingsRepository for MockSettingsRepository {
         self.store.write().await.insert(key.to_string(), value);
         Ok(())
     }
+
+    async fn mark_user_set(&self, keys: &HashSet<String>) -> Result<()> {
+        // Mirrors the adapter: only keys that already have a value are marked.
+        let store = self.store.read().await;
+        let mut marked = self.user_set.write().await;
+        for key in keys {
+            if store.contains_key(key) {
+                marked.insert(key.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn is_user_set(&self, key: &str) -> Result<bool> {
+        Ok(self.user_set.read().await.contains(key))
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +221,20 @@ mod tests {
             repo.get_key("assistant_name").await.unwrap(),
             Some("Pond".to_string())
         );
+    }
+
+    /// A full snapshot write pins every key but claims no intent; only an
+    /// explicit `mark_user_set` (the PUT patch key set) does.
+    #[tokio::test]
+    async fn snapshot_write_does_not_imply_user_intent() {
+        let repo = MockSettingsRepository::new();
+        repo.update(&Settings::default()).await.unwrap();
+        assert!(!repo.is_user_set("assistant_name").await.unwrap());
+
+        let patch: HashSet<String> = ["assistant_name".to_string()].into_iter().collect();
+        repo.mark_user_set(&patch).await.unwrap();
+        assert!(repo.is_user_set("assistant_name").await.unwrap());
+        assert!(!repo.is_user_set("user_name").await.unwrap());
     }
 
     #[tokio::test]
