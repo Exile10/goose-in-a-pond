@@ -147,7 +147,19 @@ fn main() {
             // ── Main window (created here so we can attach an initialization script)
             // The init script runs before any page JS, ensuring window.__GIAP_SERVER_URL__
             // is available when api.ts executes at module load time.
-            let default_url = "http://127.0.0.1:4000";
+            // `pond-server serve --native` spawns us with GIAP_SERVER_PORT set to
+            // the port it actually bound, which is NOT always 4000: with no
+            // explicit --port the server walks 80 -> 8080 -> 4000 -> 5000, and the
+            // systemd unit pins 8080. Hard-coding 4000 here pointed the WebView's
+            // API base at a port nothing was listening on whenever the server
+            // landed anywhere else, so the app opened and then failed every call.
+            // ServerProcess::new reads the same variable to decide parent-managed
+            // mode; these two must agree.
+            let default_url = std::env::var("GIAP_SERVER_PORT")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("http://127.0.0.1:{p}"))
+                .unwrap_or_else(|| "http://127.0.0.1:4000".to_string());
             let init_script = format!(r#"window.__GIAP_SERVER_URL__ = "{default_url}";"#);
 
             // Size the window to the actual display. On a small panel — e.g. a

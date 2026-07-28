@@ -1,0 +1,240 @@
+===============================================================================
+GIAP ON THE JETSON ORIN NANO - BUILD AND RUN
+Written 2026-07-28. Device: nano.local, user "nano", repo at ~/goose-in-a-pond
+===============================================================================
+
+-------------------------------------------------------------------------------
+READ THIS FIRST - TWO TRAPS
+-------------------------------------------------------------------------------
+
+1. NEVER use `cargo run`, and never omit `--release`.
+
+   A plain `cargo run -p pond-server` builds WITHOUT the `cuda` feature. That
+   gives you a CPU-only debug binary that runs llama.cpp on the 6 A78AE cores
+   with no GPU at all. Worse, the non-CUDA code path leaves the model's
+   `context_size` unset, so the `context_window_override` setting (16384)
+   applies and the server tries to prefill a 16K-token context on CPU. Turns
+   take minutes and the agent times out.
+
+   This is not a configuration problem and `--native` is not the cause.
+
+2. The nano's Node is v12.22.9. Vite 7 needs Node 20+.
+
+   So `bash scripts/jetson.sh build --cuda` is NOT reliable on this device -
+   it dies at its "Building web UI" step because `npm ci` fails under
+   `set -e`. It also omits `pond-adapters-whisper/cuda` and
+   `CMAKE_CUDA_ARCHITECTURES=87` that the deploy path uses.
+
+   This is why deploy.sh builds the web UI on the Mac and rsyncs it over.
+
+3. Only ONE server at a time.
+
+   The systemd service holds port 8080. If you launch a second server manually
+   without stopping it, `--port` is not passed and the fallback scan runs
+   (80 -> 8080 -> 4000 -> 5000), so it silently binds 4000. You then have two
+   servers each loading a 3.1 GB model into 7.4 GB of unified memory, and the
+   device swap-thrashes.
+
+
+-------------------------------------------------------------------------------
+BUILD - OPTION A (RECOMMENDED): FROM THE MAC
+-------------------------------------------------------------------------------
+
+One command. Builds the web UI locally (Mac has Node 25), rsyncs dist to the
+device, syncs the goose submodule, builds on-device with the correct CUDA
+features, restarts the service and health-checks it.
+
+    cd ~/Documents/Jarida/goose-in-a-pond
+    bash scripts/jetson.sh deploy
+
+Deploy another branch:
+
+    bash scripts/jetson.sh deploy --branch my-branch
+
+The branch must be pushed to the JETSON's `origin`, which is the
+JERRYFROMKENYA fork - not jarida-io. Push to BOTH or the deploy builds stale
+code:
+
+    git push origin main && git push jarida-io main
+
+
+-------------------------------------------------------------------------------
+BUILD - OPTION B: ENTIRELY IN THE NANO'S TERMINAL
+-------------------------------------------------------------------------------
+
+This is what deploy.sh actually runs, minus the npm step that Node 12 breaks.
+
+    cd ~/goose-in-a-pond
+    git fetch origin && git reset --hard origin/main
+    git submodule update --init --recursive
+
+    PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH \
+    SQLX_OFFLINE=true CMAKE_CUDA_ARCHITECTURES=87 \
+    cargo build -p pond-server \
+      --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
+      --release
+
+Notes:
+  - `git submodule update` is REQUIRED. A parent-repo commit that bumps the
+    goose pin does not move the submodule on the device. The nano ran for days
+    on the right parent SHA with a stale submodule, missing the KV cache
+    entirely. Verify with:  git submodule status
+  - CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin. Without it
+    you ship compute_80 PTX that the driver JIT-compiles at first model load.
+  - The dashboard embedded in the binary is whatever sits in
+    pond-desktop/dist. Node 12 cannot refresh it, so a pure on-device build
+    ships a stale UI until you rsync dist/ from the Mac:
+        rsync -az --delete pond-desktop/dist/ nano:goose-in-a-pond/pond-desktop/dist/
+
+Build the desktop app (separate cargo target, needed for --native):
+
+    cd ~/goose-in-a-pond
+    PATH=$HOME/.cargo/bin:$PATH SQLX_OFFLINE=true \
+    cargo build --release --manifest-path pond-desktop/src-tauri/Cargo.toml
+
+Timings from a full clean rebuild on 2026-07-28:
+    pond-server release + CUDA ... 35m01s
+    pond-desktop Tauri release ...  7m05s
+An incremental build after a goose submodule bump was about 10m30s.
+
+If you need disk before a big build: `target/debug` on the device is ~10 GB of
+nothing and is safe to delete. A full `cargo clean` of both targets frees
+about 21 GB.
+
+
+-------------------------------------------------------------------------------
+RUN - OPTION A: ONE PROCESS (--native)
+-------------------------------------------------------------------------------
+
+    systemctl --user stop goose-in-a-pond
+    cd ~/goose-in-a-pond
+    DISPLAY=:0 ./target/release/pond-server serve --port 8080 --native
+
+  - Stop the service first, or you get two servers.
+  - Run from the repo ROOT. spawn_desktop_app looks for the desktop binary at
+    paths relative to the current working directory.
+  - Pass --port 8080 explicitly. Without it the fallback scan can land on 4000.
+  - DISPLAY=:0 is needed when launching over SSH. There is a local session on
+    :0; the spawned app inherits your environment and will not find a display
+    otherwise.
+
+
+-------------------------------------------------------------------------------
+RUN - OPTION B: SERVICE + DESKTOP SEPARATELY (PREFERRED)
+-------------------------------------------------------------------------------
+
+The service keeps auto-starting at boot and there is no way to accidentally
+end up with two servers.
+
+    systemctl --user start goose-in-a-pond          # server on 8080
+
+    DISPLAY=:0 GIAP_SERVER_PORT=8080 \
+      ~/goose-in-a-pond/pond-desktop/src-tauri/target/release/pond-desktop
+
+GIAP_SERVER_PORT puts the desktop app in parent-managed mode, so it attaches to
+the running server on 8080 instead of spawning its own on 4000.
+
+Service management:
+
+    systemctl --user status  goose-in-a-pond
+    systemctl --user restart goose-in-a-pond
+    systemctl --user stop    goose-in-a-pond
+    loginctl enable-linger nano      # survives SSH logout / starts at boot
+
+Dashboard over the LAN:  http://nano.local:8080
+
+
+-------------------------------------------------------------------------------
+VERIFY YOU ARE ACTUALLY ON THE GPU
+-------------------------------------------------------------------------------
+
+The single most useful check. Run it after every build:
+
+    grep -E "Applied Jetson Orin Nano CUDA|Applied Metal/platform" \
+      ~/.local/share/goose-in-a-pond/logs/pond.log.$(date +%F) | tail -1
+
+    "Applied Jetson Orin Nano CUDA settings"  -> correct, GPU build.
+    "Applied Metal/platform settings"         -> CPU-only. Stop and rebuild.
+
+Context window actually in force (should be 4096 on this device):
+
+    grep "Applied Goose context" \
+      ~/.local/share/goose-in-a-pond/logs/pond.log.$(date +%F) | tail -1
+    # want: effective_ctx=4096 knobs=GOOSE_CONTEXT_LIMIT=4096;...
+
+Health and process count:
+
+    curl -s http://127.0.0.1:8080/api/v1/health
+    ps aux | grep "[p]ond-server"        # want exactly one
+
+Per-turn performance, with the KV cache working:
+
+    grep -E "prefill plan|turn_end" ~/.local/share/goose-in-a-pond/logs/pond.log.$(date +%F) | tail
+
+Healthy pattern for one session: turn 1 CreateContext, then ReusePrefix on
+every later turn, with SacrificialContext in between for the memory-extraction
+call (that one is correct and leaves the chat cache intact). Seeing
+FullPrefillInPlace on turn 2 means something changed the system prompt between
+turns.
+
+Reference numbers measured on this device, 2026-07-28, gemma-4-E2B-it Q4_K_M:
+
+    turn 1 (fresh):  3252 prompt tokens, ttft 4639 ms, prefill 4444 ms,
+                     decode 26.0 tok/s, model load 6736 ms
+    turn 2 (reuse):  ttft 550 ms, prefill 327 ms
+    turn 3 (reuse):  ttft 901 ms, prefill 423 ms
+    turn 4 (reuse):  ttft 847 ms, prefill 469 ms
+    context: 4096, sitting at ~84% used
+
+Note: turns 2-4 generated only 4-8 tokens each, so their decode tok/s figures
+are measurement noise. Turn 1's 26 tok/s over 122 tokens is the real rate.
+
+
+-------------------------------------------------------------------------------
+OTHER GOTCHAS
+-------------------------------------------------------------------------------
+
+  - `pkill -f pond-server` over SSH kills your own shell, because the remote
+    command line contains the pattern. Use the explicit PID, or `[p]ond-server`.
+
+  - spawn_desktop_app checks src-tauri/target/DEBUG/pond-desktop BEFORE
+    release. A stray debug desktop build silently wins. Same class of trap as
+    the server.
+
+  - Do not run a chat or load a model while a release build is linking. The
+    linker gets OOM-killed.
+
+  - Three git remotes: origin = JERRYFROMKENYA fork (what the JETSON pulls),
+    jarida-io = org repo, exile10. Push both.
+
+  - Logs live at ~/.local/share/goose-in-a-pond/logs/pond.log.YYYY-MM-DD .
+    There is no journald output; the service writes to those files.
+    Timestamps in the logs are UTC. The device clock is EAT (UTC+3), so
+    11:06:59Z in the log is 14:06:59 on the device.
+
+
+-------------------------------------------------------------------------------
+KNOWN OPEN ITEMS (as of 2026-07-28)
+-------------------------------------------------------------------------------
+
+  - context_window_override is still 16384 in Settings. Harmless for local
+    inference now (the registry-pinned 4096 wins), but it is what turned the
+    CPU-only build into a 16K prefill, and it would still apply to Ollama.
+    Worth setting to 0.
+
+  - apply_platform_settings logs "Metal/platform" and promises
+    n_gpu_layers = 99 on a CPU-only aarch64 Linux build. Misleading; it reads
+    like a working GPU build. Not yet fixed.
+
+  - tool_selection_mode is "all": 61 tools, ~25K chars of schema, about 2650 of
+    the 3252 prompt tokens. Switching to "relevant" is the biggest available
+    win for context headroom on-device.
+
+  - context_size is pinned at 4096, but the measured KV cost is only ~18 KiB
+    per token (72 MiB total at 4096, from n_head_kv = 1). Raising it to 16384
+    would cost about 216 MiB against 5.5 GB free. Untested.
+
+  - TTS has only the German voice installed (de_DE-thorsten-medium).
+    home_name in Settings is empty.
+
+===============================================================================
