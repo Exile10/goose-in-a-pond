@@ -897,11 +897,15 @@ pub fn render_jinja_template(
     let user = sanitize_field(&settings.user_name, 50);
     let persona = sanitize_field(&settings.assistant_personality, 200);
     let tz = sanitize_field(&settings.timezone, 50);
+    // Stating the location is not enough: a small model reads it as trivia and
+    // still asks "which city?" when a location-aware tool needs one. Say what
+    // to DO with it. Static per install, so the prefix stays KV-stable.
     let location = if settings.weather_location_name.is_empty() {
         String::new()
     } else {
         format!(
-            "\nLocation: {}.",
+            "\nLocation: {}. This is the user's home — when a tool needs a place \
+             and none was given, use it rather than asking which city.",
             sanitize_field(&settings.weather_location_name, 100)
         )
     };
