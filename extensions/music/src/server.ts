@@ -16,7 +16,7 @@ const TOOLS = [
   {
     name: "play",
     description:
-      "Play music. Give a song name, artist, or album and it will search Spotify and start playing the best match. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'.",
+      "Play music. Give a song name, artist, or album and it will search Spotify and start playing the best match. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.",
     inputSchema: {
       type: "object",
       properties: {
