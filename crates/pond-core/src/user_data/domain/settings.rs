@@ -214,6 +214,17 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
 
+    // ── Private mesh (#132) ────────────────────────────────────────────────
+    /// Whether to start the private mesh transport (a trust-scoped P2P link
+    /// to this Pond's own other devices / trusted peers). Off by default —
+    /// no UI yet (no MCP tool or route consumes the transport this
+    /// milestone), and requires a `pond-server` build with the `mesh`
+    /// feature. The mesh identity keypair is stored separately via
+    /// `SettingsRepository::get_key`/`set_key` under `mesh_identity_secret`,
+    /// not as a `Settings` field — it's an internal secret, not a setting.
+    #[serde(default = "Settings::default_mesh_enabled")]
+    pub mesh_enabled: bool,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -602,6 +613,7 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
+            mesh_enabled: Self::default_mesh_enabled(),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -775,6 +787,9 @@ impl Settings {
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
+    }
+    fn default_mesh_enabled() -> bool {
+        false
     }
     fn default_mic_enabled() -> bool {
         true
@@ -1168,6 +1183,11 @@ mod tests {
             // that also requires a `vision-onnx` build; UI wiring comes with
             // the Models-tab vision section, not before.
             "vision_classifier_model",
+            // Private mesh (#132 Milestone 2): starts the real libp2p
+            // MeshTransport. No UI yet — nothing consumes the transport
+            // this milestone (no MCP tool, no route); also requires a
+            // `pond-server` build with the `mesh` feature.
+            "mesh_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
