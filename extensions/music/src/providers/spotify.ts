@@ -231,6 +231,28 @@ export class SpotifyProvider implements MusicProvider {
     return track;
   }
 
+  /**
+   * Appends a track to the queue, leaving current playback untouched.
+   *
+   * This is the only insert Spotify offers: the endpoint takes a `uri` and an
+   * optional `device_id` but no position, and there is no reorder endpoint, so
+   * "play next" cannot be built on it. Do not let a caller imply otherwise.
+   */
+  async addToQueue(uri: string): Promise<string> {
+    try {
+      await this.command('POST', `/me/player/queue?uri=${encodeURIComponent(uri)}`);
+    } catch (err) {
+      // Spotify answers 404 when no device is active, which reads as "not
+      // found" but means "nothing is open to queue onto" — the common case.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Spotify API 404')) {
+        throw new Error('No active Spotify device. Open Spotify on a device first.');
+      }
+      throw err;
+    }
+    return 'Added to queue';
+  }
+
   async getQueue(): Promise<TrackInfo[]> {
     interface QueueResponse {
       currently_playing: SpotifyTrack | null;
