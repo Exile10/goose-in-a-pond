@@ -105,13 +105,29 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
         .route("/chat", post(chat))
-        .route("/chat/stream", post(chat_stream))
+        // Phase F1: raise the body ceiling for the ONE route that carries image
+        // attachments. Axum's 2 MiB default is smaller than a legal attachment
+        // set, so without this the framework rejects a 3 MB photo with "length
+        // limit exceeded" and `image_limit_response` — which knows how to
+        // explain the problem — never runs. Scoped to this route rather than the
+        // router: no other endpoint has any business accepting 12 MiB.
+        .route(
+            "/chat/stream",
+            post(chat_stream).layer(axum::extract::DefaultBodyLimit::max(
+                pond_core::models::domain::image_limits::MAX_CHAT_BODY_BYTES,
+            )),
+        )
         .route("/sessions", get(list_sessions))
         .route(
             "/sessions/{session_id}",
             patch(rename_session).delete(delete_session),
         )
         .route("/sessions/{session_id}/messages", get(get_session_messages))
+        // Phase F2: raw bytes for one persisted image attachment.
+        .route(
+            "/sessions/{session_id}/attachments/{attachment_id}",
+            get(get_session_attachment),
+        )
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
@@ -218,7 +234,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // ── Agent Tools (MCP) ─────────────────────────────────────────────────
         .route("/agent/tools", get(list_agent_tools))
         // ── Agent chat stream (agentic tool-use loop) ─────────────────────────
-        .route("/agent/chat/stream", post(agent_chat_stream))
+        // Same body ceiling as /chat/stream — this route accepts `images` too.
+        .route(
+            "/agent/chat/stream",
+            post(agent_chat_stream).layer(axum::extract::DefaultBodyLimit::max(
+                pond_core::models::domain::image_limits::MAX_CHAT_BODY_BYTES,
+            )),
+        )
         // ── MCP App Resources ────────────────────────────────────────────────
         .route("/mcp/resources", get(mcp_read_resource))
         .route("/mcp/tools/call", post(mcp_call_tool))
@@ -1091,7 +1113,37 @@ async fn chat_stream(
         )
     })?;
 
+    // Phase F1: reject an oversized attachment set BEFORE the stream opens, so
+    // the client gets a real HTTP status it can show rather than an SSE error
+    // event mid-conversation. Nothing has been decoded at this point.
+    image_limit_response(&req.images)?;
+
     Ok(chat_stream_inner(state, permit, req))
+}
+
+/// Map an image-limit violation onto an HTTP status, or pass a legal set through.
+///
+/// 413 for anything about size or count, 415 for an unsupported container,
+/// 400 for a structurally broken payload. The message is the domain error's own
+/// `Display`, which carries the offending numbers so the UI can be specific.
+fn image_limit_response(
+    images: &[pond_core::models::domain::message::ImageAttachment],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use pond_core::models::domain::image_limits::{validate_turn_images, ImageLimitError};
+
+    match validate_turn_images(images) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let status = if e.is_too_large() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else if matches!(e, ImageLimitError::UnsupportedMimeType { .. }) {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err((status, Json(json!({"error": e.to_string()}))))
+        }
+    }
 }
 
 /// Shared SSE pipeline used by both `chat_stream` and `run_recipe`.
@@ -1233,7 +1285,12 @@ fn chat_stream_inner(
         }
 
         // ── Persist user message ────────────────────────────────────────────
-        if let Err(e) = chat_service.persist_user_message(&req.message).await {
+        // Phase F2: the images go in with the message so a follow-up turn can
+        // still see them after a trim, a compaction rebuild, or a restart.
+        if let Err(e) = chat_service
+            .persist_user_message_with_images(&req.message, req.images.clone())
+            .await
+        {
             let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
             yield Ok(Event::default().data(data));
             return;
@@ -1978,6 +2035,23 @@ async fn get_session_messages(
             (status, Json(json!({"error": format!("{}", e)})))
         })?;
 
+    // Phase F2. One cheap metadata query for the whole page (no bytes read),
+    // grouped by message id. Absent for sessions that never had an attachment,
+    // and a storage error here must not fail a history read.
+    let attachments_by_message: std::collections::HashMap<
+        String,
+        Vec<pond_core::user_data::domain::session::MessageAttachment>,
+    > = state
+        .session_storage
+        .list_session_attachments(&session_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .fold(std::collections::HashMap::new(), |mut acc, a| {
+            acc.entry(a.message_id.clone()).or_default().push(a);
+            acc
+        });
+
     let list: Vec<Value> = messages
         .iter()
         .map(|m| {
@@ -2009,11 +2083,101 @@ async fn get_session_messages(
                     }))
                     .collect::<Vec<_>>());
             }
+            // Phase F2: attachments are referenced, never inlined. Base64 in a
+            // history read would turn a routine page load into megabytes; the
+            // client fetches each image once from the URL below and the browser
+            // caches it.
+            if let Some(atts) = attachments_by_message.get(&m.id) {
+                obj["images"] = json!(atts
+                    .iter()
+                    .map(|a| json!({
+                        "id": a.id,
+                        "mime_type": a.mime_type,
+                        "byte_size": a.byte_size,
+                        "url": format!(
+                            "/api/v1/sessions/{}/attachments/{}",
+                            urlencoding_lite(&a.session_id),
+                            urlencoding_lite(&a.id),
+                        ),
+                    }))
+                    .collect::<Vec<_>>());
+            }
             obj
         })
         .collect();
 
     Ok(Json(json!({ "messages": list })))
+}
+
+/// Percent-encode the few characters that would break a path segment.
+///
+/// Session and attachment ids are UUIDs in practice, but `session_id` is
+/// caller-supplied on `/chat/stream`, so a returned URL must not be able to
+/// smuggle an extra path segment or a query string.
+fn urlencoding_lite(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+            other => {
+                let mut buf = [0u8; 4];
+                for b in other.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Serve one persisted image attachment's raw bytes (phase F2).
+///
+/// Bytes, not base64: the client uses this straight as an `<img src>`, and
+/// re-encoding only to have the browser decode again is pure waste. The
+/// `session_id` path segment is checked against the stored row so an attachment
+/// id from one conversation cannot be read through another's URL.
+async fn get_session_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, attachment_id)): Path<(String, String)>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    use axum::response::IntoResponse;
+
+    let owns_it = state
+        .session_storage
+        .list_session_attachments(&session_id)
+        .await
+        .map(|atts| atts.iter().any(|a| a.id == attachment_id))
+        .unwrap_or(false);
+    if !owns_it {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Attachment not found"})),
+        ));
+    }
+
+    match state.session_storage.read_attachment(&attachment_id).await {
+        Ok(Some((mime_type, bytes))) => {
+            let headers = [
+                (axum::http::header::CONTENT_TYPE, mime_type),
+                // Content-addressed by a random id and never rewritten, so it is
+                // safe to cache hard. Saves re-fetching every image on every
+                // history load.
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable".to_string(),
+                ),
+            ];
+            Ok((headers, bytes).into_response())
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Attachment bytes are no longer available"})),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{}", e)})),
+        )),
+    }
 }
 
 async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -6807,6 +6971,18 @@ async fn agent_chat_stream(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // Phase F1 parity: this route hand-parses its body (it takes a raw Value,
+    // not a typed DTO), so `images` has to be pulled out explicitly. A malformed
+    // `images` field is ignored rather than fatal, matching how every other
+    // optional field on this route behaves.
+    let images: Vec<pond_core::models::domain::message::ImageAttachment> = body
+        .get("images")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    if let Err(resp) = image_limit_response(&images) {
+        return resp.into_response();
+    }
+
     let agent = state.agent.clone();
     let storage = state.session_storage.clone();
 
@@ -6829,7 +7005,7 @@ async fn agent_chat_stream(
             }
         }
 
-        if let Err(e) = chat_service.persist_user_message(&message).await {
+        if let Err(e) = chat_service.persist_user_message_with_images(&message, images.clone()).await {
             yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
             return;
         }
@@ -6841,7 +7017,7 @@ async fn agent_chat_stream(
             message,
             session_id: session_id.clone(),
             model_role: "task".to_string(),
-            images: Vec::new(),
+            images,
             voice_mode: false,
             canvas_mode: false,
         };
@@ -10795,6 +10971,94 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── image attachment limits (phase F1) ───────────────────────
+
+    fn attachment(bytes: usize, mime: &str) -> pond_core::models::domain::message::ImageAttachment {
+        pond_core::models::domain::message::ImageAttachment {
+            data: "A".repeat(bytes.div_ceil(3) * 4),
+            mime_type: mime.to_string(),
+        }
+    }
+
+    fn limit_status(
+        images: &[pond_core::models::domain::message::ImageAttachment],
+    ) -> Option<StatusCode> {
+        image_limit_response(images).err().map(|(s, _)| s)
+    }
+
+    #[test]
+    fn a_text_only_turn_and_a_legal_attachment_set_both_pass() {
+        assert!(limit_status(&[]).is_none());
+        assert!(limit_status(&[attachment(64_000, "image/jpeg")]).is_none());
+    }
+
+    #[test]
+    fn too_many_images_is_413_not_400() {
+        use pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN;
+        let images: Vec<_> = (0..MAX_IMAGES_PER_TURN + 1)
+            .map(|_| attachment(1024, "image/jpeg"))
+            .collect();
+        assert_eq!(limit_status(&images), Some(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn an_oversized_image_is_413() {
+        use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+        assert_eq!(
+            limit_status(&[attachment(MAX_IMAGE_BYTES + 4096, "image/png")]),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    #[test]
+    fn the_aggregate_budget_is_also_413() {
+        use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+        let images: Vec<_> = (0..3)
+            .map(|_| attachment(MAX_IMAGE_BYTES - 1024, "image/jpeg"))
+            .collect();
+        assert_eq!(limit_status(&images), Some(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn an_unsupported_container_is_415() {
+        assert_eq!(
+            limit_status(&[attachment(1024, "application/pdf")]),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+    }
+
+    #[test]
+    fn an_empty_payload_is_400() {
+        assert_eq!(
+            limit_status(&[pond_core::models::domain::message::ImageAttachment {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            }]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    /// The message must be actionable, not a bare status. It carries the real
+    /// numbers so the UI can say what to do about it.
+    #[test]
+    fn the_rejection_body_names_the_offending_size() {
+        use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+        let (_, Json(body)) =
+            image_limit_response(&[attachment(MAX_IMAGE_BYTES + 4096, "image/png")]).unwrap_err();
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("MB"), "expected a size in the message: {msg}");
+        assert!(msg.contains("resize"), "expected advice: {msg}");
+    }
+
+    // ── attachment URL escaping ──────────────────────────────────
+
+    #[test]
+    fn an_attachment_url_cannot_smuggle_extra_path_segments() {
+        assert_eq!(urlencoding_lite("abc-123_x.y~"), "abc-123_x.y~");
+        assert_eq!(urlencoding_lite("../evil"), "..%2Fevil");
+        assert_eq!(urlencoding_lite("a?b=c"), "a%3Fb%3Dc");
+    }
 
     // ── geocode-on-save decision ─────────────────────────────────
 

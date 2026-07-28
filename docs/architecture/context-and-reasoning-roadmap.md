@@ -134,12 +134,19 @@ guards, audit table. Verified defects:
 
 ### Multimodality (scouted for phase F)
 
+> Superseded by the Phase F section below, which records what was actually
+> found on implementation. Two corrections in particular: the mmproj was NOT
+> auto-downloaded for GIAP-registered models, and the MCP camera bridge could
+> not be done through MCP alone.
+
 - The engine's mtmd vision path WORKS (mmproj auto-download, MtmdBitmap
   tokenize/eval, vision-capable Gemma E2B/E4B registry entries, no-vision
   fallback). The REST API already accepts `ChatRequest.images`. **The single
   blocking gap**: `goose_agent.rs:1588` builds the user message with
   `with_text` only — `request.images` is dropped on the floor.
   `Message::user().with_image(data, mime)` exists and types line up.
+  *(Correction from implementation: "mmproj auto-download" holds for goose's own
+  featured-model flow, not for GIAP's registration path — see Phase F.)*
 - Missing around it: desktop attachment UI + `images` in `ChatStreamRequest`;
   `/agent/chat/stream` hardcodes `images: vec![]`; images aren't persisted to
   history (a follow-up about an earlier image loses the pixels); vision turns

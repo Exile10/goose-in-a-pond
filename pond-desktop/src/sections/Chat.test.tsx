@@ -13,6 +13,15 @@ vi.mock("../api/PondApiClient", () => ({
     getSessionMessages: vi.fn(),
     setToken: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false }),
+    getModelCapabilities: vi.fn().mockResolvedValue({
+      thinking: false,
+      vision: true,
+      audio_input: false,
+      context_window_tokens: 8192,
+      structured_output: false,
+      tool_calling: true,
+    }),
+    sessionAttachmentUrl: vi.fn((sessionId: string, attachmentId: string) => `/api/v1/sessions/${sessionId}/attachments/${attachmentId}`),
   },
 }));
 

@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { Paperclip } from "lucide-react";
 import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { filterThinking } from "../../lib/thinkFilter";
 import { CONTINUE_TURN_MESSAGE } from "../../api/types";
-import type { ChatEvent, TurnStats } from "../../api/types";
+import type { ChatEvent, ImageAttachment, TurnStats } from "../../api/types";
 import { HubIco, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { GooseAvatar } from "./chat/GooseAvatar";
@@ -11,6 +12,9 @@ import { TypingIndicator } from "./chat/TypingIndicator";
 import { ResultCard } from "./chat/ResultCard";
 import type { CardKind } from "./chat/ResultCard";
 import { TurnStatsFooter } from "../../components/TurnStatsFooter";
+import { AttachmentTray } from "../../components/AttachmentTray";
+import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
+import type { PreparedImage } from "../../lib/imageAttach";
 import "./chat.css";
 
 // ── Types ─────────────────────────────────────────────────────
@@ -24,6 +28,8 @@ interface ChatMessage {
   turnStats?: TurnStats;
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
+  /** Local preview URLs for images attached to a live-sent message. */
+  images?: string[];
 }
 
 // ── Constants ─────────────────────────────────────────────────
@@ -99,6 +105,77 @@ export function ChatHubView() {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [showTurnStats, setShowTurnStats] = useState(false);
+  const [attachments, setAttachments] = useState<PreparedImage[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  // Fail-open: an unknown/failed capabilities fetch never disables attaching —
+  // it only disables once we've SUCCESSFULLY confirmed the model lacks vision.
+  const [visionCapable, setVisionCapable] = useState(true);
+  const [capabilitiesKnown, setCapabilitiesKnown] = useState(false);
+
+  // Load vision capability once the server is reachable.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    api.getModelCapabilities()
+      .then((caps) => { setVisionCapable(caps.vision); setCapabilitiesKnown(true); })
+      .catch(() => { setCapabilitiesKnown(false); });
+  }, [state.serverOnline]);
+
+  const attachDisabled = capabilitiesKnown && !visionCapable;
+  const attachTitle = attachDisabled
+    ? "The active model cannot read images. Switch to a vision-capable model such as gemma-4-E2B-it."
+    : "Attach image";
+
+  const removeAttachment = useCallback((index: number) => {
+    setAttachments((prev) => {
+      const target = prev[index];
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
+
+  const addFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    const prepared: PreparedImage[] = [];
+    let firstError: string | null = null;
+    for (const file of files) {
+      try {
+        prepared.push(await prepareImage(file));
+      } catch (e) {
+        firstError = e instanceof Error ? e.message : "Could not read that image.";
+      }
+    }
+    if (prepared.length === 0) {
+      if (firstError) setAttachError(firstError);
+      return;
+    }
+    const capErr = validateAttachmentSet(attachments, prepared);
+    if (capErr) {
+      prepared.forEach((p) => URL.revokeObjectURL(p.previewUrl));
+      setAttachError(capErr);
+      return;
+    }
+    setAttachError(firstError); // surface a partial-batch MIME rejection, if any
+    setAttachments((prev) => [...prev, ...prepared]);
+  }, [attachments]);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function onAttachClick() {
+    fileInputRef.current?.click();
+  }
+
+  function onFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    void addFiles(files);
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLInputElement>) {
+    const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    void addFiles(files);
+  }
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -121,18 +198,26 @@ export function ChatHubView() {
   const sendMessage = useCallback(
     async (raw?: string) => {
       const t = (raw ?? text).trim();
-      if (!t || busy) return;
+      if ((!t && attachments.length === 0) || busy) return;
 
       // Clear seed on first real send
       if (seeded) {
         setSeeded(false);
       }
 
+      const pendingAttachments = attachments;
+      const imagePayload: ImageAttachment[] = pendingAttachments.map((a) => ({ data: a.data, mime_type: a.mime_type }));
+
       setText("");
       setBusy(true);
       inThinkBlockRef.current = false;
 
-      const userMsg: ChatMessage = { id: nextMsgId(), who: "user", text: t };
+      const userMsg: ChatMessage = {
+        id: nextMsgId(),
+        who: "user",
+        text: t,
+        images: pendingAttachments.length > 0 ? pendingAttachments.map((a) => a.previewUrl) : undefined,
+      };
       const agentMsg: ChatMessage = {
         id: nextMsgId(),
         who: "goose",
@@ -144,6 +229,9 @@ export function ChatHubView() {
         const base = seeded ? [] : prev;
         return [...base, userMsg, agentMsg];
       });
+      // Bubble now holds its own copy of previewUrl — don't revoke on send.
+      setAttachments([]);
+      setAttachError(null);
 
       try {
         api.setToken(state.sessionToken);
@@ -151,6 +239,8 @@ export function ChatHubView() {
           t,
           sessionIdRef.current,
           state.sessionToken ?? undefined,
+          undefined,
+          imagePayload,
         )) {
           const ev = event as ChatEvent;
 
@@ -240,7 +330,7 @@ export function ChatHubView() {
         inputRef.current?.focus();
       }
     },
-    [text, busy, seeded, state.sessionToken], // state.sessionId intentionally via ref
+    [text, attachments, busy, seeded, state.sessionToken], // state.sessionId intentionally via ref
   );
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -254,7 +344,7 @@ export function ChatHubView() {
     dispatch({ type: "SET_MODE", payload: "voice" });
   }
 
-  const canSend = text.trim().length > 0 && !busy;
+  const canSend = (text.trim().length > 0 || attachments.length > 0) && !busy;
 
   return (
     <div className="chat2">
@@ -293,6 +383,13 @@ export function ChatHubView() {
             {m.who === "goose" && <GooseAvatar />}
             <div className="ch-bubble-wrap">
               <div className={`ch-bubble ch-bubble--${m.who}`}>
+                {m.images && m.images.length > 0 && (
+                  <div className="ch-bubble__images">
+                    {m.images.map((src, i) => (
+                      <img key={i} src={src} alt={`Attached image ${i + 1}`} className="ch-bubble__image" />
+                    ))}
+                  </div>
+                )}
                 {m.text || (m.streaming ? " " : "")}
               </div>
               {m.card && !m.streaming && (
@@ -344,6 +441,10 @@ export function ChatHubView() {
         ))}
       </div>
 
+      {/* Pending image attachments */}
+      <AttachmentTray attachments={attachments} onRemove={removeAttachment} />
+      {attachError && <p className="attach-error" role="alert">{attachError}</p>}
+
       {/* Input */}
       <div className="chat2__input">
         <button
@@ -355,11 +456,30 @@ export function ChatHubView() {
         >
           <HubIco d={micEl} size={19} color="#fff" />
         </button>
+        <button
+          className="ch-attach"
+          onClick={onAttachClick}
+          disabled={busy || attachDisabled}
+          aria-label="Attach image"
+          title={attachTitle}
+          type="button"
+        >
+          <Paperclip size={18} />
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          hidden
+          onChange={onFileInputChange}
+        />
         <input
           ref={inputRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={onPaste}
           placeholder="Message Goose or speak a command…"
           disabled={busy}
           aria-label="Message input"

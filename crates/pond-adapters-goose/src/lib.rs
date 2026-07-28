@@ -6,6 +6,7 @@ pub mod logging;
 pub mod provider_adapter;
 pub mod provider_shim;
 pub mod session_adapter;
+pub mod vision_encoder;
 
 pub use extension_manager::GiapGooseExtensionManager;
 pub use giap_prompts::GiapPrompts;

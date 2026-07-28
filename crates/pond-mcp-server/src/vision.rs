@@ -5,10 +5,26 @@
 //! vision pipeline in `pond-adapters-vision`) and externally posted events
 //! alike. Acknowledging an event suppresses re-alerts.
 //!
-//! Provides 2 tools: `get_recent_camera_events`, `acknowledge_camera_event`.
+//! Provides 4 tools: `get_recent_camera_events`, `acknowledge_camera_event`,
+//! `look_at_camera_snapshot` (phase F3), `look_at_camera_window` (phase F5).
+//!
+//! # Frames, not prose (phases F3 and F5)
+//!
+//! The two listing tools describe what the on-device detector CLASSIFIED. That
+//! is all a text-only pipeline could offer, and it is not enough for "what is at
+//! the door?" — the answer to that lives in the pixels, which have been sitting
+//! on disk as JPEGs (`camera_events.snapshot_path`, written by
+//! `pond-adapters-vision`) with no way to reach the model.
+//!
+//! The two `look_at_*` tools return those JPEGs as MCP image content. On GIAP's
+//! local engine the image is then lifted into a top-level message part by
+//! `GiapProviderShim::promote_tool_result_images` — see that function for why
+//! the engine cannot read a tool-nested image on its own.
 
 use std::sync::{Arc, OnceLock};
 
+use base64::Engine as _;
+use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -25,6 +41,20 @@ use serde::Deserialize;
 const DEFAULT_CAMERA_ID: &str = "camera-1";
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
+
+/// Frames returned by `look_at_camera_window` when the model does not say.
+///
+/// Three is a compromise: enough to show a direction of travel ("someone walked
+/// up to the door and left"), few enough that the turn is not four full image
+/// prefills. The hard cap is
+/// `pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN`, shared with
+/// manual attachments so a sampled window and a hand-picked set cost the same
+/// worst case.
+const DEFAULT_WINDOW_FRAMES: usize = 3;
+
+/// How many recent events a window samples FROM. Bounds the DB read; the frame
+/// cap bounds what the model actually sees.
+const WINDOW_EVENT_SCAN: usize = 30;
 
 // ── Parameter structs ──────────────────────────────────────────────────────--
 
@@ -48,6 +78,130 @@ pub struct AcknowledgeCameraEventParams {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct LookAtSnapshotParams {
+    /// Camera to look at (default "camera-1").
+    pub camera_id: Option<String>,
+    /// Specific event from get_recent_camera_events; omit for the newest frame.
+    pub event_id: Option<i64>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct LookAtWindowParams {
+    /// Camera to look at (default "camera-1").
+    pub camera_id: Option<String>,
+    /// Frames to sample, evenly spaced across the window. Default 3, max 4.
+    pub frames: Option<u32>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+// ── Frame helpers ────────────────────────────────────────────────────────────
+
+/// Pick `count` items spread evenly across `len`, always including the first and
+/// last when `count >= 2`.
+///
+/// This is what makes a sampled window a *window* rather than a burst: three
+/// frames taken from the start, middle, and end of a sequence show motion, three
+/// consecutive frames show one moment three times.
+///
+/// Returns indices in ascending order, never more than `len` of them.
+#[must_use]
+fn pick_evenly_spaced(len: usize, count: usize) -> Vec<usize> {
+    if len == 0 || count == 0 {
+        return Vec::new();
+    }
+    if count >= len {
+        return (0..len).collect();
+    }
+    if count == 1 {
+        // One frame from a window should be the newest, which is the last.
+        return vec![len - 1];
+    }
+    // Spread across the closed interval [0, len-1] so both ends are included.
+    (0..count)
+        .map(|i| (i * (len - 1)) / (count - 1))
+        .collect::<Vec<_>>()
+}
+
+/// Read a snapshot from disk and turn it into MCP image content.
+///
+/// Returns `None` (with a log) for anything unreadable, oversized, or not an
+/// image, so a stale row can never fail a tool call — the caller degrades to a
+/// text answer, which is what the tool did before these existed.
+async fn snapshot_content(path: &str) -> Option<Content> {
+    use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+
+    let p = std::path::Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        other => {
+            tracing::debug!(
+                path,
+                ext = other,
+                "vision: snapshot is not a readable image"
+            );
+            return None;
+        }
+    };
+
+    // Check the size before reading: an operator-swapped file could be anything,
+    // and the vision encoder budget is the same one manual attachments obey.
+    match tokio::fs::metadata(p).await {
+        Ok(m) if m.len() as usize > MAX_IMAGE_BYTES => {
+            tracing::warn!(
+                path,
+                bytes = m.len(),
+                "vision: snapshot exceeds the per-image limit; not sending it to the model"
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(path, error = %e, "vision: snapshot file is gone");
+            return None;
+        }
+    }
+
+    match tokio::fs::read(p).await {
+        Ok(bytes) => Some(Content::image(
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime.to_string(),
+        )),
+        Err(e) => {
+            tracing::warn!(path, error = %e, "vision: could not read snapshot");
+            None
+        }
+    }
+}
+
+/// One-line description of an event, used as the text that accompanies a frame
+/// so the model knows when it was taken and what the detector thought it was.
+fn frame_caption(e: &CameraEvent) -> String {
+    format!(
+        "Frame from '{}' at {} (detector said: {}{})",
+        e.camera_id,
+        e.created_at.format("%Y-%m-%d %H:%M:%S"),
+        e.event_type,
+        e.confidence
+            .map(|c| format!(", {:.0}% confidence", c * 100.0))
+            .unwrap_or_default(),
+    )
 }
 
 // ── MCP server ───────────────────────────────────────────────────────────────
@@ -126,6 +280,146 @@ what a camera saw.")]
         }
     }
 
+    // The "not for attached images" clause is not padding. Measured on
+    // gemma-4-E2B: with a description that merely said "use this when the user
+    // asks what something looks like", a turn with an image ATTACHED to the
+    // message made the model call this tool instead of looking at the image it
+    // had already been given, get "No frame available", and answer "I cannot see
+    // the image". The model needs the boundary spelled out.
+    #[tool(description = "\
+View an actual frame from a home security camera (door, driveway, room). Newest frame unless \
+event_id is given. Not for an image attached to the message - you can already see those.")]
+    async fn look_at_camera_snapshot(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<LookAtSnapshotParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        let camera_id = params
+            .0
+            .camera_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+
+        let events = match self
+            .camera_storage
+            .list_events(&camera_id, WINDOW_EVENT_SCAN)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "vision: camera event listing failed");
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Sorry, I couldn't reach the camera store right now.",
+                )]));
+            }
+        };
+
+        // `list_events` is newest-first, so the first match with a frame is the
+        // newest frame when no specific event was named.
+        let chosen = match params.0.event_id {
+            Some(id) => events.iter().find(|e| e.id == Some(id)),
+            None => events.iter().find(|e| e.snapshot_path.is_some()),
+        };
+
+        let Some(event) = chosen else {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No frame available from camera '{camera_id}'."
+            ))]));
+        };
+        let Some(path) = event.snapshot_path.as_deref() else {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Event {} has no saved frame.",
+                event.id.unwrap_or(-1)
+            ))]));
+        };
+        let Some(image) = snapshot_content(path).await else {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "The saved frame for event {} is no longer readable.",
+                event.id.unwrap_or(-1)
+            ))]));
+        };
+
+        Ok(CallToolResult::success(vec![
+            Content::text(frame_caption(event)),
+            image,
+        ]))
+    }
+
+    #[tool(description = "\
+View several home-security-camera frames spread across recent events, to see what changed or \
+which way someone moved. Up to 4 frames. Cameras only, not an image attached to the message.")]
+    async fn look_at_camera_window(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<LookAtWindowParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        use pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN;
+
+        let camera_id = params
+            .0
+            .camera_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+        let frames = params
+            .0
+            .frames
+            .map(|f| f as usize)
+            .unwrap_or(DEFAULT_WINDOW_FRAMES)
+            .clamp(1, MAX_IMAGES_PER_TURN);
+
+        let events = match self
+            .camera_storage
+            .list_events(&camera_id, WINDOW_EVENT_SCAN)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "vision: camera event listing failed");
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Sorry, I couldn't reach the camera store right now.",
+                )]));
+            }
+        };
+
+        // Oldest-first so the model reads the window in the order it happened.
+        let mut with_frames: Vec<&CameraEvent> = events
+            .iter()
+            .filter(|e| e.snapshot_path.is_some())
+            .collect();
+        with_frames.reverse();
+        if with_frames.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No frames available from camera '{camera_id}'."
+            ))]));
+        }
+
+        let picked = pick_evenly_spaced(with_frames.len(), frames);
+        let mut parts: Vec<Content> = Vec::with_capacity(picked.len() * 2 + 1);
+        parts.push(Content::text(format!(
+            "{} frame(s) from camera '{camera_id}', oldest first, sampled across the last {} \
+             events.",
+            picked.len(),
+            with_frames.len(),
+        )));
+        for idx in picked {
+            let event = with_frames[idx];
+            let Some(path) = event.snapshot_path.as_deref() else {
+                continue;
+            };
+            if let Some(image) = snapshot_content(path).await {
+                parts.push(Content::text(frame_caption(event)));
+                parts.push(image);
+            }
+        }
+
+        if parts.len() == 1 {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "The saved frames for camera '{camera_id}' are no longer readable."
+            ))]));
+        }
+        Ok(CallToolResult::success(parts))
+    }
+
     #[tool(description = "\
 Acknowledge a camera event by ID to stop re-alerts once the user has seen it.")]
     async fn acknowledge_camera_event(
@@ -164,7 +458,9 @@ impl ServerHandler for VisionMcpServer {
             .with_instructions(
                 "GIAP Vision MCP server — recent camera/vision events from the local, \
                  on-device event store (never guess what a camera saw).\n\n\
-                 Tools: get_recent_camera_events (what the camera detected, newest first), \
+                 Tools: get_recent_camera_events (what the detector classified, newest first), \
+                 look_at_camera_snapshot (the actual frame — use for \"what does it look like\"), \
+                 look_at_camera_window (several frames across time, to see what changed), \
                  acknowledge_camera_event (dismiss an alert by ID).",
             )
     }
@@ -242,5 +538,119 @@ mod tests {
     #[test]
     fn server_constructs() {
         let _server = VisionMcpServer::new(Arc::new(StubStorage(vec![])));
+    }
+
+    // ── F5: even frame sampling ──────────────────────────────────────────
+
+    #[test]
+    fn sampling_nothing_yields_nothing() {
+        assert!(pick_evenly_spaced(0, 3).is_empty());
+        assert!(pick_evenly_spaced(5, 0).is_empty());
+    }
+
+    #[test]
+    fn a_short_window_is_returned_whole() {
+        assert_eq!(pick_evenly_spaced(2, 3), vec![0, 1]);
+        assert_eq!(pick_evenly_spaced(3, 3), vec![0, 1, 2]);
+    }
+
+    /// The point of sampling: both ends of the window are always present, so
+    /// three frames show a change rather than three views of one moment.
+    #[test]
+    fn sampling_spans_the_whole_window() {
+        assert_eq!(pick_evenly_spaced(10, 3), vec![0, 4, 9]);
+        assert_eq!(pick_evenly_spaced(30, 4), vec![0, 9, 19, 29]);
+        let picked = pick_evenly_spaced(100, 4);
+        assert_eq!(picked.first(), Some(&0));
+        assert_eq!(picked.last(), Some(&99));
+    }
+
+    #[test]
+    fn one_frame_from_a_window_is_the_newest() {
+        assert_eq!(pick_evenly_spaced(10, 1), vec![9]);
+    }
+
+    #[test]
+    fn sampling_is_ascending_and_never_repeats() {
+        for len in 1..40usize {
+            for count in 1..=4usize {
+                let picked = pick_evenly_spaced(len, count);
+                assert!(picked.len() <= count.min(len), "len={len} count={count}");
+                assert!(picked.iter().all(|i| *i < len), "len={len} count={count}");
+                assert!(
+                    picked.windows(2).all(|w| w[0] < w[1]),
+                    "not strictly ascending: len={len} count={count} -> {picked:?}"
+                );
+            }
+        }
+    }
+
+    // ── F3: snapshot -> MCP image content ────────────────────────────────
+
+    #[tokio::test]
+    async fn a_real_jpeg_becomes_image_content() {
+        let dir = std::env::temp_dir().join(format!("giap-vision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("camera-1-20260728T000000000Z.jpg");
+        std::fs::write(&path, b"\xFF\xD8\xFF\xE0 pretend jpeg").unwrap();
+
+        let content = snapshot_content(path.to_str().unwrap())
+            .await
+            .expect("readable jpeg");
+        match content.raw {
+            rmcp::model::RawContent::Image(img) => {
+                assert_eq!(img.mime_type, "image/jpeg");
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&img.data)
+                        .unwrap(),
+                    b"\xFF\xD8\xFF\xE0 pretend jpeg"
+                );
+            }
+            other => panic!("expected image content, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stale row must degrade to "no frame", never fail the call.
+    #[tokio::test]
+    async fn a_missing_or_non_image_snapshot_yields_nothing() {
+        assert!(snapshot_content("/nope/does-not-exist.jpg").await.is_none());
+
+        let dir = std::env::temp_dir().join(format!("giap-vision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(snapshot_content(path.to_str().unwrap()).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_snapshot_is_refused_rather_than_sent() {
+        use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+        let dir = std::env::temp_dir().join(format!("giap-vision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.jpg");
+        std::fs::write(&path, vec![0u8; MAX_IMAGE_BYTES + 1024]).unwrap();
+        assert!(snapshot_content(path.to_str().unwrap()).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_caption_names_the_camera_time_and_detection() {
+        let e = CameraEvent {
+            id: Some(7),
+            camera_id: "front-door".into(),
+            event_type: "person".into(),
+            confidence: Some(0.91),
+            snapshot_path: Some("/tmp/x.jpg".into()),
+            metadata: None,
+            acknowledged: false,
+            created_at: chrono::Utc::now(),
+        };
+        let caption = frame_caption(&e);
+        assert!(caption.contains("front-door"));
+        assert!(caption.contains("person"));
+        assert!(caption.contains("91% confidence"));
     }
 }

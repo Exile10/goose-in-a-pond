@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Brain, Check, ChevronDown, Cpu, History, Loader2, PenSquare, PlayCircle, Wrench } from "lucide-react";
+import { Brain, Check, ChevronDown, Cpu, History, Loader2, Paperclip, PenSquare, PlayCircle, Wrench } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -7,14 +7,17 @@ import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ToolCallChip } from "../components/ToolCallChip";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
+import { AttachmentTray } from "../components/AttachmentTray";
 import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
 import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
-import type { ChatEvent, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
+import type { ChatEvent, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { filterThinking } from "../lib/thinkFilter";
+import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
+import type { PreparedImage } from "../lib/imageAttach";
 
 // Module-level counter — shared across session loads and live sends
 let _msgId = 0;
@@ -58,12 +61,18 @@ interface Message {
   historyToolNames?: string[];
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
+  /** Image preview URLs — either a live send's local previewUrl, or a
+   *  built `${apiBase}${url}` for images replayed from session history. */
+  images?: string[];
 }
 
 function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
   const out: Message[] = [];
   for (const m of raw) {
     if (m.role === "tool") continue;
+    const images = m.images?.length
+      ? m.images.map((img) => api.sessionAttachmentUrl(m.session_id, img.id))
+      : undefined;
     if (m.role === "assistant") {
       const hasContent = m.content.trim().length > 0;
       const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
@@ -74,9 +83,9 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
             return bare;
           })
         : undefined;
-      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames });
+      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images });
     } else {
-      out.push({ id: ++_msgId, role: "user", text: m.content });
+      out.push({ id: ++_msgId, role: "user", text: m.content, images });
     }
   }
   return out;
@@ -96,12 +105,91 @@ export function Chat() {
   const [availableModels, setAvailableModels]     = useState<ModelEntry[]>([]);
   const [modelSwitching, setModelSwitching]       = useState(false);
   const [showTurnStats, setShowTurnStats]         = useState(false);
+  const [attachments, setAttachments]             = useState<PreparedImage[]>([]);
+  const [attachError, setAttachError]             = useState<string | null>(null);
+  // Fail-open: an unknown/failed capabilities fetch never disables attaching —
+  // it only disables once we've SUCCESSFULLY confirmed the model lacks vision.
+  const [visionCapable, setVisionCapable]         = useState(true);
+  const [capabilitiesKnown, setCapabilitiesKnown] = useState(false);
 
   const bottomRef        = useRef<HTMLDivElement>(null);
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<HTMLDivElement>(null);
+  const fileInputRef     = useRef<HTMLInputElement>(null);
   const sessionIdRef     = useRef<string | undefined>(state.sessionId ?? undefined);
   const inThinkBlockRef  = useRef(false);
+
+  const attachDisabled = capabilitiesKnown && !visionCapable;
+  const attachTitle = attachDisabled
+    ? "The active model cannot read images. Switch to a vision-capable model such as gemma-4-E2B-it."
+    : "Attach image";
+
+  const clearAttachments = useCallback(() => {
+    setAttachments((prev) => {
+      prev.forEach((p) => URL.revokeObjectURL(p.previewUrl));
+      return [];
+    });
+    setAttachError(null);
+  }, []);
+
+  const removeAttachment = useCallback((index: number) => {
+    setAttachments((prev) => {
+      const target = prev[index];
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
+
+  const addFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    const prepared: PreparedImage[] = [];
+    let firstError: string | null = null;
+    for (const file of files) {
+      try {
+        prepared.push(await prepareImage(file));
+      } catch (e) {
+        firstError = e instanceof Error ? e.message : "Could not read that image.";
+      }
+    }
+    if (prepared.length === 0) {
+      if (firstError) setAttachError(firstError);
+      return;
+    }
+    const capErr = validateAttachmentSet(attachments, prepared);
+    if (capErr) {
+      prepared.forEach((p) => URL.revokeObjectURL(p.previewUrl));
+      setAttachError(capErr);
+      return;
+    }
+    setAttachError(firstError); // surface a partial-batch MIME rejection, if any
+    setAttachments((prev) => [...prev, ...prepared]);
+  }, [attachments]);
+
+  function onAttachClick() {
+    fileInputRef.current?.click();
+  }
+
+  function onFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    void addFiles(files);
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    void addFiles(files);
+  }
+
+  // Load vision capability once the server is reachable. Failure degrades to
+  // "let the server explain" (fail open) rather than hiding the affordance.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    api.getModelCapabilities()
+      .then((caps) => { setVisionCapable(caps.vision); setCapabilitiesKnown(true); })
+      .catch(() => { setCapabilitiesKnown(false); });
+  }, [state.serverOnline]);
 
   // Sync session ref; load history when session changes externally
   useEffect(() => {
@@ -109,11 +197,12 @@ export function Chat() {
     if (newId === sessionIdRef.current) return;
     const wasExternal = !!newId;
     sessionIdRef.current = newId;
+    clearAttachments();
     if (!wasExternal) return;
     api.getSessionMessages(newId!)
       .then((msgs) => setMessages(sessionMessagesToMessages(msgs ?? [])))
       .catch((err) => console.warn("Could not load session history (non-fatal):", err));
-  }, [state.sessionId]);
+  }, [state.sessionId, clearAttachments]);
 
   const refreshSessions = useCallback(() => {
     api.listSessions().then(setSessions).catch(() => {});
@@ -234,6 +323,7 @@ export function Chat() {
     sessionIdRef.current = undefined;
     dispatch({ type: "SET_SESSION_ID", payload: null });
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
+    clearAttachments();
     textareaRef.current?.focus();
   }
 
@@ -267,20 +357,34 @@ export function Chat() {
 
   const sendMessage = useCallback(async (directText?: string) => {
     const text = (directText ?? input).trim();
-    if (!text || busy || !state.serverOnline) return;
+    if ((!text && attachments.length === 0) || busy || !state.serverOnline) return;
+
+    const pendingAttachments = attachments;
+    const imagePayload: ImageAttachment[] = pendingAttachments.map((a) => ({ data: a.data, mime_type: a.mime_type }));
 
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     setBusy(true);
     inThinkBlockRef.current = false;
 
-    const userMsg:  Message = { id: ++_msgId, role: "user",  text };
+    const userMsg:  Message = {
+      id: ++_msgId,
+      role: "user",
+      text,
+      images: pendingAttachments.length > 0 ? pendingAttachments.map((a) => a.previewUrl) : undefined,
+    };
     const agentMsg: Message = { id: ++_msgId, role: "agent", text: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, agentMsg]);
+    // Clear the pending tray now that the images have been captured into
+    // userMsg above — the bubble keeps its own copy of the previewUrl, so we
+    // deliberately don't revoke it here (that would blank the just-sent
+    // thumbnail); only a later manual removal or new-conversation revokes it.
+    setAttachments([]);
+    setAttachError(null);
 
     try {
       api.setToken(state.sessionToken);
-      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined)) {
+      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined, undefined, imagePayload)) {
         const ev = event as ChatEvent;
 
         if (ev.type === "text" && (ev.content ?? ev.token)) {
@@ -405,7 +509,7 @@ export function Chat() {
       textareaRef.current?.focus();
       refreshSessions();
     }
-  }, [input, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
+  }, [input, attachments, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -538,6 +642,13 @@ export function Chat() {
                 )}
                 {/* Bubble */}
                 <div className={`ch-bubble ${msg.role === "user" ? "ch-bubble--user" : `ch-bubble--goose${msg.error ? " ch-bubble--error" : ""}`}`}>
+                  {msg.images && msg.images.length > 0 && (
+                    <div className="ch-bubble__images">
+                      {msg.images.map((src, i) => (
+                        <img key={i} src={src} alt={`Attached image ${i + 1}`} className="ch-bubble__image" />
+                      ))}
+                    </div>
+                  )}
                   {msg.text || (msg.streaming
                     ? msg.status
                       ? <ThinkingPlaceholder status={msg.status} />
@@ -598,6 +709,10 @@ export function Chat() {
         </div>
       )}
 
+      {/* Pending image attachments */}
+      <AttachmentTray attachments={attachments} onRemove={removeAttachment} />
+      {attachError && <p className="attach-error" role="alert">{attachError}</p>}
+
       {/* Input row */}
       <div className="chat2__input">
         <button
@@ -609,12 +724,31 @@ export function Chat() {
         >
           <HubIco d={micEl} size={19} color="#fff" />
         </button>
+        <button
+          className="ch-attach"
+          onClick={onAttachClick}
+          disabled={!state.serverOnline || busy || attachDisabled}
+          aria-label="Attach image"
+          title={attachTitle}
+          type="button"
+        >
+          <Paperclip size={18} />
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          hidden
+          onChange={onFileInputChange}
+        />
         <textarea
           ref={textareaRef}
           className="chat2__textarea"
           value={input}
           onChange={onInput}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           placeholder="Message Goose…"
           disabled={!state.serverOnline || busy}
           aria-label="Message input"
@@ -623,7 +757,7 @@ export function Chat() {
         <button
           className="ch-send"
           onClick={() => sendMessage()}
-          disabled={!input.trim() || !state.serverOnline || busy}
+          disabled={(!input.trim() && attachments.length === 0) || !state.serverOnline || busy}
           aria-label="Send message"
           type="button"
         >

@@ -363,6 +363,7 @@ export interface ModelCapabilities {
   audio_input: boolean;
   context_window_tokens: number;
   structured_output: boolean;
+  tool_calling: boolean;
 }
 
 // ── Prompt Templates ──────────────────────────────────────────
@@ -390,12 +391,19 @@ export interface AgentRecipe {
 
 // ── Chat / Streaming ──────────────────────────────────────────
 
+/** A single image sent alongside a chat turn. `data` is raw base64 — NO `data:...;base64,` prefix. */
+export interface ImageAttachment {
+  data: string;
+  mime_type: string;
+}
+
 /** Request body for POST /api/v1/chat/stream */
 export interface ChatStreamRequest {
   message: string;
   session_id?: string;
   canvas_mode?: boolean;
   voice_mode?: boolean;
+  images?: ImageAttachment[];
 }
 
 export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached";
@@ -532,6 +540,15 @@ export interface SessionMessageToolCall {
   arguments: string;
 }
 
+/** Attachment metadata for a persisted image on a session message. `url` is
+ *  relative to the API base, e.g. `/api/v1/sessions/<sid>/attachments/<aid>`. */
+export interface SessionMessageImage {
+  id: string;
+  mime_type: string;
+  byte_size: number;
+  url: string;
+}
+
 export interface SessionMessage {
   id: string;
   session_id: string;
@@ -542,6 +559,8 @@ export interface SessionMessage {
   tool_calls?: SessionMessageToolCall[];
   /** Present on role="tool" messages — links back to the tool_call id. */
   tool_call_id?: string;
+  /** Present on messages (typically role="user") that had images attached. */
+  images?: SessionMessageImage[];
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────

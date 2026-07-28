@@ -1,4 +1,5 @@
-use crate::user_data::domain::session::{Session, SessionMessage};
+use crate::models::domain::message::ImageAttachment;
+use crate::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
 use crate::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -236,6 +237,85 @@ impl SessionStorage for InMemorySessionStorage {
             .await
             .insert(session_id.to_string(), groups.to_vec());
         Ok(())
+    }
+
+    // ── Image attachments (phase F2) ────────────────────────────────────────
+    //
+    // The mock keeps whole `SessionMessage`s, so images are already in memory —
+    // but a mock that hands them back through `get_messages` while the SQLite
+    // adapter does not would make any attachment test pass vacuously. So these
+    // methods project them out of the stored messages, and `get_messages` is
+    // left alone: callers must go through the attachment methods, exactly as
+    // they must against a real database.
+
+    async fn list_session_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MessageAttachment>, SessionStorageError> {
+        let messages = self.messages.read().await;
+        let Some(msgs) = messages.get(session_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for m in msgs {
+            for (ordinal, img) in m.message.images.iter().enumerate() {
+                out.push(MessageAttachment {
+                    // Deterministic so a test can address one without a lookup.
+                    id: format!("{}#{}", m.id, ordinal),
+                    message_id: m.id.clone(),
+                    session_id: m.session_id.clone(),
+                    ordinal: ordinal as u32,
+                    mime_type: img.mime_type.clone(),
+                    byte_size: crate::models::domain::image_limits::decoded_len(&img.data) as u64,
+                    created_at: m.created_at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_message_images(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ImageAttachment>>, SessionStorageError> {
+        let wanted: std::collections::HashSet<&str> =
+            message_ids.iter().map(String::as_str).collect();
+        let messages = self.messages.read().await;
+        let mut out: HashMap<String, Vec<ImageAttachment>> = HashMap::new();
+        for msgs in messages.values() {
+            for m in msgs {
+                if wanted.contains(m.id.as_str()) && !m.message.images.is_empty() {
+                    out.insert(m.id.clone(), m.message.images.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, SessionStorageError> {
+        let Some((message_id, ordinal)) = attachment_id.rsplit_once('#') else {
+            return Ok(None);
+        };
+        let Ok(ordinal) = ordinal.parse::<usize>() else {
+            return Ok(None);
+        };
+        let messages = self.messages.read().await;
+        for msgs in messages.values() {
+            for m in msgs {
+                if m.id == message_id {
+                    if let Some(img) = m.message.images.get(ordinal) {
+                        // The mock keeps base64; decoding here keeps the port's
+                        // "raw bytes out" contract honest.
+                        let bytes = img.data.as_bytes().to_vec();
+                        return Ok(Some((img.mime_type.clone(), bytes)));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 }
 

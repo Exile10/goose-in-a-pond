@@ -31,6 +31,9 @@ schemars   = { version = "1", features = ["derive"] }
 reqwest      = { workspace = true }
 urlencoding  = { workspace = true }
 sysinfo      = "0.33"
+# Phase F3/F5: camera snapshots are handed to the model as MCP image content,
+# which the protocol carries base64-encoded.
+base64       = { workspace = true }
 notify-rust  = "4"
 
 [dev-dependencies]

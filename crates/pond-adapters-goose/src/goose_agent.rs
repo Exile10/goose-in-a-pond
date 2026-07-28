@@ -506,11 +506,18 @@ impl GooseAdapter {
 
     /// Replay a GIAP conversation into a freshly created Goose session.
     ///
-    /// Text-only on purpose: `pond_system.db` stores tool calls and results as
-    /// separate rows and cannot reconstruct a provider-valid request/response
-    /// pair, and an orphaned tool response breaks the provider outright. The
-    /// user/assistant turns plus the rolling summary are what the model needs to
-    /// stay coherent about the conversation.
+    /// Tool rows are dropped on purpose: `pond_system.db` stores tool calls and
+    /// results as separate rows and cannot reconstruct a provider-valid
+    /// request/response pair, and an orphaned tool response breaks the provider
+    /// outright. The user/assistant turns plus the rolling summary are what the
+    /// model needs to stay coherent about the conversation.
+    ///
+    /// Image attachments (phase F2) ARE replayed, but only up to
+    /// `MAX_HISTORY_REPLAY_IMAGES`, newest-first; anything beyond that becomes a
+    /// text placeholder. See `pond_core::models::services::context::image_history`
+    /// for why the budget is small (every replayed image makes every subsequent
+    /// turn in the session a multimodal turn, and multimodal turns forfeit the
+    /// engine's KV prefix cache).
     ///
     /// Budgeting reuses the same `trim_history` the in-turn trimmer uses, so a
     /// long history is cut to the profile's budget exactly the way a live
@@ -535,15 +542,34 @@ impl GooseAdapter {
             }
         };
 
-        let rows: Vec<(TrimRole, String)> = history
-            .into_iter()
-            .filter_map(|m| match m.message.role {
-                GiapRole::User => Some((TrimRole::User, m.message.content)),
-                GiapRole::Assistant => Some((TrimRole::Assistant, m.message.content)),
+        // Rows and their message ids, kept in lockstep. The ids are what lets a
+        // planned message be joined back to its stored attachments.
+        //
+        // The two filters below duplicate what `plan_replay` does internally
+        // (blank drop, trailing-user pop) ON PURPOSE: `plan_replay` assigns each
+        // TrimMessage an `index` by enumerating AFTER those filters, so applying
+        // them here first is what makes that index a valid subscript into `ids`.
+        // Having already applied them, the copies inside `plan_replay` are
+        // no-ops.
+        let mut rows: Vec<(TrimRole, String)> = Vec::with_capacity(history.len());
+        let mut ids: Vec<String> = Vec::with_capacity(history.len());
+        for m in history {
+            let role = match m.message.role {
+                GiapRole::User => TrimRole::User,
+                GiapRole::Assistant => TrimRole::Assistant,
                 // Tool rows are dropped (see above); System never reaches history.
-                GiapRole::Tool | GiapRole::System => None,
-            })
-            .collect();
+                GiapRole::Tool | GiapRole::System => continue,
+            };
+            if m.message.content.trim().is_empty() {
+                continue;
+            }
+            rows.push((role, m.message.content));
+            ids.push(m.id);
+        }
+        while matches!(rows.last(), Some((TrimRole::User, _))) {
+            rows.pop();
+            ids.pop();
+        }
         if rows.is_empty() {
             return;
         }
@@ -567,12 +593,89 @@ impl GooseAdapter {
             return;
         }
 
+        // ── Phase F2: decide which historical images get real pixels ──────────
+        //
+        // Counted only over messages that SURVIVED the budget cut: loading an
+        // image for a turn that was trimmed away is pure waste.
+        let attachment_counts: std::collections::HashMap<String, usize> = storage
+            .list_session_attachments(giap_session_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .fold(std::collections::HashMap::new(), |mut acc, a| {
+                *acc.entry(a.message_id).or_insert(0) += 1;
+                acc
+            });
+
+        let mut replay_images: Vec<usize> = vec![0; planned.len()];
+        let mut had_images: Vec<usize> = vec![0; planned.len()];
+        if !attachment_counts.is_empty() {
+            for (slot, tm) in had_images.iter_mut().zip(planned.iter()) {
+                // A spliced summary has no source row (`index == usize::MAX`).
+                if let Some(id) = ids.get(tm.index) {
+                    *slot = attachment_counts.get(id).copied().unwrap_or(0);
+                }
+            }
+            replay_images = pond_core::models::services::context::image_history::plan_image_replay(
+                &had_images,
+                pond_core::models::services::context::image_history::MAX_HISTORY_REPLAY_IMAGES,
+            );
+        }
+
+        let wanted_ids: Vec<String> = planned
+            .iter()
+            .zip(replay_images.iter())
+            .filter(|(_, n)| **n > 0)
+            .filter_map(|(tm, _)| ids.get(tm.index).cloned())
+            .collect();
+        let loaded_images = if wanted_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            storage
+                .load_message_images(&wanted_ids)
+                .await
+                .unwrap_or_default()
+        };
+
+        let mut replayed_images_total = 0usize;
+        let mut placeholders_total = 0usize;
         let replayed: Vec<Message> = planned
             .iter()
-            .map(|tm| match tm.role {
-                TrimRole::Assistant => Message::assistant().with_text(&tm.text),
-                // The spliced summary rides a user message, like the trimmer's.
-                _ => Message::user().with_text(&tm.text),
+            .enumerate()
+            .map(|(i, tm)| {
+                let keep = replay_images[i];
+                let had = had_images[i];
+                // The model must know an image WAS there. Without the
+                // placeholder, a turn reading "what colour is this?" with nothing
+                // attached invites a confident invention.
+                let text = if had > keep {
+                    placeholders_total += had - keep;
+                    format!(
+                        "{}\n{}",
+                        tm.text,
+                        pond_core::models::services::context::image_history::HISTORY_IMAGE_PLACEHOLDER
+                    )
+                } else {
+                    tm.text.clone()
+                };
+
+                match tm.role {
+                    TrimRole::Assistant => Message::assistant().with_text(&text),
+                    // The spliced summary rides a user message, like the trimmer's.
+                    _ => {
+                        let mut msg = Message::user().with_text(&text);
+                        if keep > 0 {
+                            if let Some(imgs) = ids.get(tm.index).and_then(|id| loaded_images.get(id))
+                            {
+                                for img in imgs.iter().take(keep) {
+                                    msg = msg.with_image(&img.data, &img.mime_type);
+                                    replayed_images_total += 1;
+                                }
+                            }
+                        }
+                        msg
+                    }
+                }
             })
             .collect();
         let replayed_len = replayed.len();
@@ -590,6 +693,8 @@ impl GooseAdapter {
                 goose_session_id = %goose_sid,
                 messages = replayed_len,
                 summary_spliced = rolling_summary.is_some(),
+                images_replayed = replayed_images_total,
+                images_placeheld = placeholders_total,
             ),
             Err(e) => tracing::warn!("hydrate: replace_conversation failed: {e}"),
         }
@@ -885,6 +990,17 @@ impl GooseAdapter {
                         Some(ref dd) => Self::register_gguf_model(&model_name, dd),
                         None => model_name.trim_end_matches(".gguf").to_string(),
                     };
+                    // Phase F1. `register_gguf_model` leaves `mmproj_path: None`
+                    // (GIAP registers a bare stem, which goose's featured-model
+                    // lookup cannot match), and the engine's vision gate is
+                    // exactly that field. Attach the encoder if it is on disk;
+                    // otherwise start fetching it in the background and stamp the
+                    // registry when it lands — `resolve_model_path` runs on every
+                    // generation, so no restart is needed. Non-blocking on
+                    // purpose: the encoder is ~1 GB.
+                    if let Some(ref dd) = self.data_dir {
+                        crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
+                    }
                     let cfg = goose_providers::model::ModelConfig::new(&registry_key);
                     tracing::debug!(
                         "[model-switch] building LocalInferenceProvider for '{}'...",
@@ -1050,10 +1166,23 @@ impl GooseAdapter {
             std::env::set_var("GOOSE_MODEL", &settings.chat_model);
 
             // Update model capabilities from the new model name
-            let caps =
+            let mut caps =
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
+            // Phase F1: for the in-process engine, `vision` comes from the model
+            // registry (does this model declare an mmproj?) rather than the name
+            // heuristic, which reports every `gemma-4*` as vision-capable and is
+            // therefore wrong for gemma-4-E1B-it. HTTP providers keep the
+            // heuristic — there is no registry to ask.
+            //
+            // Declared, not downloaded: a user who just picked a vision model
+            // must not be told it cannot read images while a ~1 GB encoder is
+            // still transferring. A turn that actually needs the bytes and does
+            // not have them says so precisely.
+            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+                caps.vision = crate::vision_encoder::declares_vision(&settings.chat_model);
+            }
             tracing::debug!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
@@ -1569,6 +1698,40 @@ impl GooseAdapter {
         let settings = self.settings_repo.get().await.unwrap_or_default();
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
+
+        // Phase F1: fail an image turn EARLY and specifically.
+        //
+        // Without this the engine silently rewrites each image part into
+        // "[Image attached - image input is not supported with the currently
+        // selected model]" and the model answers as if it had looked, which is
+        // the worst possible outcome. Two distinguishable causes, two messages.
+        if !request.images.is_empty() && matches!(settings.chat_provider.as_str(), "local" | "gguf")
+        {
+            let model = settings.chat_model.as_str();
+            if !crate::vision_encoder::declares_vision(model) {
+                anyhow::bail!(
+                    "The active model ({model}) cannot read images. Switch to a vision-capable \
+                     model such as gemma-4-E2B-it and try again."
+                );
+            }
+            let ready = self
+                .data_dir
+                .as_ref()
+                .is_some_and(|dd| crate::vision_encoder::mmproj_ready(dd, model));
+            if !ready {
+                if let Some(ref dd) = self.data_dir {
+                    // A turn is the strongest signal that the encoder is wanted;
+                    // make sure a fetch is running even if the provider was built
+                    // before this code existed.
+                    crate::vision_encoder::ensure_mmproj_available(dd, model);
+                }
+                anyhow::bail!(
+                    "The vision encoder for {model} is still downloading. Image input becomes \
+                     available as soon as it finishes - no restart needed. Your message was not \
+                     sent."
+                );
+            }
+        }
 
         // Stash the user message and session ID so MCP tool handlers can read
         // them for ToolCaller param generation and outbound HTTP trace events.
@@ -2244,7 +2407,7 @@ impl GooseAdapter {
             msg.push_str("\n</user-message>");
             msg
         };
-        let user_msg = Message::user().with_text(&user_text);
+        let user_msg = attach_images(Message::user().with_text(&user_text), &request.images);
         let session_cfg = goose::agents::types::SessionConfig {
             id: goose_sid.clone(),
             schedule_id: None,
@@ -2739,7 +2902,26 @@ fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String
 /// `Q8_0`, `IQ4_XS`, `F16`, `F32`, `BF16`, …). Deliberately conservative: it
 /// only needs to tell a quant suffix apart from a continuation of the model
 /// name (`it`, `instruct`), not to validate every possible tag.
-fn looks_like_quant_tag(tag: &str) -> bool {
+/// Attach a turn's image attachments to a message (phase F1).
+///
+/// Images ride the USER message, never the system prefix: the prefix must stay
+/// byte-identical across turns for the engine's KV prompt-session cache to reuse
+/// it, and a text-only turn in a session that once had an image must keep that
+/// property. Order is preserved so "the first picture" means what the user meant.
+///
+/// A model without an mmproj is NOT second-guessed here — that check happens
+/// once, up front, in `chat_stream`, where it can produce an actionable error
+/// instead of a silently rewritten prompt.
+fn attach_images(
+    msg: Message,
+    images: &[pond_core::models::domain::message::ImageAttachment],
+) -> Message {
+    images
+        .iter()
+        .fold(msg, |m, img| m.with_image(&img.data, &img.mime_type))
+}
+
+pub(crate) fn looks_like_quant_tag(tag: &str) -> bool {
     let digit_after = |prefix: &str| {
         tag.strip_prefix(prefix)
             .and_then(|r| r.chars().next())
@@ -2909,6 +3091,74 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F1: image attachment onto the user message ───────────────────────
+
+    fn img(data: &str, mime: &str) -> pond_core::models::domain::message::ImageAttachment {
+        pond_core::models::domain::message::ImageAttachment {
+            data: data.to_string(),
+            mime_type: mime.to_string(),
+        }
+    }
+
+    /// Pull out (base64, mime) for every image part, in order.
+    fn image_parts(msg: &Message) -> Vec<(String, String)> {
+        msg.content
+            .iter()
+            .filter_map(|c| match c {
+                goose::conversation::message::MessageContent::Image(i) => {
+                    Some((i.data.clone(), i.mime_type.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_only_turn_gets_no_image_parts() {
+        let msg = attach_images(Message::user().with_text("hello"), &[]);
+        assert!(image_parts(&msg).is_empty());
+        assert_eq!(msg.as_concat_text(), "hello");
+    }
+
+    /// Every image must survive, in the order the user picked them — a follow-up
+    /// that says "the second one" depends on it.
+    #[test]
+    fn every_image_is_attached_and_order_is_preserved() {
+        let images = vec![
+            img("AAAA", "image/png"),
+            img("BBBB", "image/jpeg"),
+            img("CCCC", "image/webp"),
+        ];
+        let msg = attach_images(Message::user().with_text("look"), &images);
+        assert_eq!(
+            image_parts(&msg),
+            vec![
+                ("AAAA".to_string(), "image/png".to_string()),
+                ("BBBB".to_string(), "image/jpeg".to_string()),
+                ("CCCC".to_string(), "image/webp".to_string()),
+            ]
+        );
+    }
+
+    /// The text part must stay FIRST and unmodified: it carries the
+    /// `<system-context>`/`<user-message>` envelope the rest of the pipeline
+    /// (and the trimmer's stale-context stripper) matches on.
+    #[test]
+    fn the_text_envelope_is_untouched_by_attachment() {
+        let envelope =
+            "<system-context>\n<turn-budget/>\n</system-context>\n<user-message>\nhi\n</user-message>";
+        let msg = attach_images(
+            Message::user().with_text(envelope),
+            &[img("AAAA", "image/png")],
+        );
+        assert_eq!(msg.as_concat_text(), envelope);
+        assert!(matches!(
+            msg.content.first(),
+            Some(goose::conversation::message::MessageContent::Text(_))
+        ));
+        assert_eq!(image_parts(&msg).len(), 1);
+    }
 
     // ── B3: the Goose cap-message coupling ───────────────────────────────
 

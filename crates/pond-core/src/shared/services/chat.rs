@@ -1459,10 +1459,24 @@ impl ChatService {
     /// Persist the user side of a turn. Call before starting the agent stream
     /// so the message is saved even if the stream errors out.
     pub async fn persist_user_message(&self, message: &str) -> Result<()> {
+        self.persist_user_message_with_images(message, Vec::new())
+            .await
+    }
+
+    /// Persist the user side of a turn along with its image attachments
+    /// (phase F2).
+    ///
+    /// The storage adapter decides where the bytes land; this service only has
+    /// to stop dropping them. Attachment order is the order given.
+    pub async fn persist_user_message_with_images(
+        &self,
+        message: &str,
+        images: Vec<crate::models::domain::message::ImageAttachment>,
+    ) -> Result<()> {
         let sm = SessionMessage::new(
             Uuid::new_v4().to_string(),
             self.session_id.clone(),
-            ChatMessage::user(message),
+            ChatMessage::user_with_images(message, images),
         );
         self.session_storage
             .add_message(self.session_id.clone(), sm)
