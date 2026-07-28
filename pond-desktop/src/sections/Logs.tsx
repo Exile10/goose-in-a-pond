@@ -1,19 +1,19 @@
 import { useState, useEffect, useCallback } from "react";
 import { api } from "../api/PondApiClient";
-import type { ActivityEvent, ActivitySummary, EventCategory } from "../api/types";
+import type { ActivityEvent, ActivitySummary, AttributeValue, EventCategory } from "../api/types";
 
 // ── Category metadata ─────────────────────────────────────────
 
 const CATEGORY_META: Record<EventCategory, { label: string; color: string; bg: string; icon: string }> = {
-  agent:     { label: "Agent",     color: "#7C3AED", bg: "#EDE9FE", icon: "M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zM9 9h6v6H9z" },
-  tool:      { label: "Tool",      color: "#EA580C", bg: "#FFEDD5", icon: "M14 7h2a2 2 0 0 1 2 2v2m0 0h1.5a1.5 1.5 0 0 1 0 3H18v2a2 2 0 0 1-2 2h-2m0 0v1.5a1.5 1.5 0 0 1-3 0V19H9a2 2 0 0 1-2-2v-2m0 0H5.5a1.5 1.5 0 0 1 0-3H7V9a2 2 0 0 1 2-2h2V5.5a1.5 1.5 0 0 1 3 0z" },
-  inference: { label: "Inference", color: "#2563EB", bg: "#DBEAFE", icon: "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" },
-  sensor:    { label: "Sensor",    color: "#0D9488", bg: "#CCFBF1", icon: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3" },
-  camera:    { label: "Camera",    color: "#0284C7", bg: "#E0F2FE", icon: "M15 10l4.55-2.73A1 1 0 0 1 21 8.2v7.6a1 1 0 0 1-1.45.94L15 14M3 8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" },
-  device:    { label: "Device",    color: "#16A34A", bg: "#DCFCE7", icon: "M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2v-4M9 21H5a2 2 0 0 0-2-2v-4m0 0h18" },
-  auth:      { label: "Auth",      color: "#D97706", bg: "#FEF3C7", icon: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" },
-  network:   { label: "Network",   color: "#475569", bg: "#F1F5F9", icon: "M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" },
-  system:    { label: "System",    color: "#6B7280", bg: "#F3F4F6", icon: "M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18" },
+  agent:     { label: "Agent",     color: "#7C3AED", bg: "color-mix(in srgb, #7C3AED 12%, transparent)", icon: "M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zM9 9h6v6H9z" },
+  tool:      { label: "Tool",      color: "#EA580C", bg: "color-mix(in srgb, #EA580C 12%, transparent)", icon: "M14 7h2a2 2 0 0 1 2 2v2m0 0h1.5a1.5 1.5 0 0 1 0 3H18v2a2 2 0 0 1-2 2h-2m0 0v1.5a1.5 1.5 0 0 1-3 0V19H9a2 2 0 0 1-2-2v-2m0 0H5.5a1.5 1.5 0 0 1 0-3H7V9a2 2 0 0 1 2-2h2V5.5a1.5 1.5 0 0 1 3 0z" },
+  inference: { label: "Inference", color: "#2563EB", bg: "color-mix(in srgb, #2563EB 12%, transparent)", icon: "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" },
+  sensor:    { label: "Sensor",    color: "#0D9488", bg: "color-mix(in srgb, #0D9488 12%, transparent)", icon: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3" },
+  camera:    { label: "Camera",    color: "#0284C7", bg: "color-mix(in srgb, #0284C7 12%, transparent)", icon: "M15 10l4.55-2.73A1 1 0 0 1 21 8.2v7.6a1 1 0 0 1-1.45.94L15 14M3 8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" },
+  device:    { label: "Device",    color: "#16A34A", bg: "color-mix(in srgb, #16A34A 12%, transparent)", icon: "M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2v-4M9 21H5a2 2 0 0 0-2-2v-4m0 0h18" },
+  auth:      { label: "Auth",      color: "#D97706", bg: "color-mix(in srgb, #D97706 12%, transparent)", icon: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" },
+  network:   { label: "Network",   color: "#475569", bg: "color-mix(in srgb, #475569 12%, transparent)", icon: "M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" },
+  system:    { label: "System",    color: "#6B7280", bg: "color-mix(in srgb, #6B7280 12%, transparent)", icon: "M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18" },
 };
 
 const CATEGORIES = Object.keys(CATEGORY_META) as EventCategory[];
@@ -33,6 +33,25 @@ function timeAgo(iso: string): string {
 
 function formatAction(action: string): string {
   return action.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function attrText(attrs: Record<string, AttributeValue>, key: string): string | undefined {
+  const v = attrs[key];
+  if (!v) return undefined;
+  if ("text" in v) return v.text;
+  if ("int" in v) return String(v.int);
+  if ("float" in v) return String(v.float);
+  if ("bool" in v) return String(v.bool);
+  return undefined;
+}
+
+/** Human-readable detail line for a row, e.g. "api.spotify.com · via giap-music".
+ *  Only egress.http events currently carry host/tool attributes. */
+function eventDetail(event: ActivityEvent): string | undefined {
+  const host = attrText(event.attributes, "host");
+  if (!host) return undefined;
+  const tool = attrText(event.attributes, "tool");
+  return tool ? `${host} · via ${tool}` : host;
 }
 
 // ── Sub-components ────────────────────────────────────────────
@@ -61,11 +80,13 @@ function eventKey(e: ActivityEvent, i: number): string {
 function EventRow({ event }: { event: ActivityEvent }) {
   const meta = CATEGORY_META[event.category] ?? CATEGORY_META.system;
   const isSensitive = event.privacy_sensitivity === "sensitive";
+  const detail = eventDetail(event);
   return (
     <div className={`act-row${isSensitive ? " act-row--sensitive" : ""}`}>
       <CategoryIcon category={event.category} />
       <div className="act-row__body">
         <span className="act-row__action">{formatAction(event.action)}</span>
+        {detail && <span className="act-row__detail">{detail}</span>}
         {isSensitive && <span className="act-badge act-badge--risk">sensitive</span>}
       </div>
       <div className="act-row__right">
