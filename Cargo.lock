@@ -4887,7 +4887,7 @@ dependencies = [
  "indoc",
  "insta",
  "jsonschema",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "keyring",
  "libc",
  "lru 0.18.1",
@@ -6299,21 +6299,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbd1086b01b9349fd4ef9a07433965af64c8ce8159abe633a189e4ff817bd13"
 dependencies = [
  "regex-syntax",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64 0.22.1",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]
@@ -8864,7 +8849,7 @@ dependencies = [
  "fastembed",
  "hmac 0.12.1",
  "hostname",
- "jsonwebtoken 9.3.1",
+ "jsonwebtoken",
  "once_cell",
  "pond-core",
  "rand 0.8.6",
