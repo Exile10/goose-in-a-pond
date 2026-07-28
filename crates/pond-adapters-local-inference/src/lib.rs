@@ -357,11 +357,83 @@ impl LocalInferenceLlmAdapter {
     ///
     /// This is intentionally NOT implemented in the cross-platform loader: it is
     /// unsafe to change from the macOS Metal build and cannot be tested here.
+    /// Context size that fits THIS model in the Jetson's LLM budget.
+    ///
+    /// A single hardcoded constant is wrong, and shipping one OOM-killed a
+    /// device: 16384 was derived from Gemma-4 E2B (35 layers, n_head_kv 1,
+    /// 256-wide heads) which costs ~18 KiB per token across both KV buffers.
+    /// E4B has 42 layers, n_head_kv 2 and 512-wide heads — about 4.8x that, or
+    /// ~86 KiB per token — so the same 16384 asks for ~1.4 GiB of KV on top of
+    /// 4.6 GiB of weights, exceeds the budget, and the kernel kills the server
+    /// (it took gnome-shell with it).
+    ///
+    /// `apply_jetson_settings` re-stamps the registry at every provider init,
+    /// so this cannot be worked around by editing registry.json — it has to be
+    /// right here.
+    ///
+    /// Derived rather than tabulated so a model we have never seen is still
+    /// safe: KV budget is the LLM budget minus the weights and the compute
+    /// buffers, divided by a per-token cost chosen for the widest attention
+    /// geometry we ship. Rounded down to a power of two and clamped, because
+    /// being a little conservative costs history and being wrong costs the box.
+    ///
+    /// The deeper fix belongs in the engine: `context_cap` gives a pinned
+    /// `context_size` and a host `GOOSE_CONTEXT_LIMIT` priority over its own
+    /// `estimate_max_context_for_memory`, so the one function that knows the
+    /// real geometry is the one that never gets consulted. Capping those two
+    /// branches by the memory estimate would make this helper unnecessary.
+    #[cfg(feature = "cuda")]
+    fn jetson_context_size(model_bytes: u64) -> u32 {
+        /// Per-token KV cost, both buffers, for the widest geometry we ship.
+        /// E2B measures ~18 KiB, E4B ~86 KiB; 96 keeps headroom for wider.
+        const CONSERVATIVE_KV_KIB_PER_TOKEN: u64 = 96;
+        /// llama.cpp's compute buffers, roughly flat in n_ctx (they scale with
+        /// n_batch). Measured ~515 MiB on this board.
+        const COMPUTE_BUFFER_MB: u64 = 600;
+        const MIN_CTX: u32 = 2048;
+        const MAX_CTX: u32 = 16384;
+
+        let model_mb = model_bytes / (1024 * 1024);
+        let kv_mb = crate::scheduler::LLM_BUDGET_MB
+            .saturating_sub(model_mb)
+            .saturating_sub(COMPUTE_BUFFER_MB);
+        let tokens = (kv_mb * 1024) / CONSERVATIVE_KV_KIB_PER_TOKEN;
+
+        // Largest power of two that fits, clamped.
+        let mut ctx = MIN_CTX;
+        while (ctx as u64) * 2 <= tokens && ctx < MAX_CTX {
+            ctx *= 2;
+        }
+        ctx.clamp(MIN_CTX, MAX_CTX)
+    }
+
     #[cfg(feature = "cuda")]
     fn apply_jetson_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, ModelSettings, ToolCallingMode,
         };
+
+        // Size the context to THIS model. Read the weights' size from the
+        // registry entry we are about to stamp; if the row or the file is not
+        // there yet, assume the largest model we ship so the first load is
+        // conservative rather than fatal.
+        const ASSUMED_LARGEST_MODEL_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+        let model_bytes = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| {
+                reg.get_model(model_id)
+                    .and_then(|e| std::fs::metadata(&e.local_path).ok())
+                    .map(|m| m.len())
+            })
+            .unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
+        let context_size = Self::jetson_context_size(model_bytes);
+        tracing::info!(
+            model = model_id,
+            model_mb = model_bytes / (1024 * 1024),
+            context_size,
+            "Jetson context sized to fit this model's KV cache in the LLM budget"
+        );
 
         let jetson_settings = ModelSettings {
             // Full GPU offload: Jetson unified memory means all layers fit in
@@ -386,7 +458,7 @@ impl LocalInferenceLlmAdapter {
             // This is affordable now in a way it was not before: the prompt-
             // session KV cache means a longer window buys history that is
             // re-used rather than re-prefilled every turn.
-            context_size: Some(16384),
+            context_size: Some(context_size),
             // Batch size 512 keeps Ampere SMs saturated during prefill without
             // exceeding the available memory bandwidth (68 GB/s).
             n_batch: Some(512),
@@ -536,6 +608,33 @@ impl LocalInferenceLlmAdapter {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two models GIAP actually ships on the Orin, by measured file size.
+    ///
+    /// E4B at 16384 is what OOM-killed the device: ~4.6 GiB of weights plus
+    /// ~1.4 GiB of KV against a 6,392 MB budget. It must come back smaller.
+    /// E2B is cheap enough (~18 KiB/token measured) to keep the full window.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn jetson_context_fits_each_model_in_the_budget() {
+        let e2b = LocalInferenceLlmAdapter::jetson_context_size(2_890_000_000);
+        let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000);
+        assert_eq!(e2b, 16384, "E2B should keep the full window");
+        assert!(e4b <= 8192, "E4B must shrink, got {e4b}");
+        assert!(e4b >= 2048, "E4B must stay usable, got {e4b}");
+        assert!(e4b < e2b, "a bigger model must not get a bigger context");
+    }
+
+    /// A model larger than the whole budget must still return something
+    /// loadable rather than zero or a panic.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn jetson_context_floors_for_an_oversized_model() {
+        assert_eq!(
+            LocalInferenceLlmAdapter::jetson_context_size(9_000_000_000),
+            2048
+        );
+    }
     /// Integration tests that require a real model are marked `#[ignore]` and
     /// gated on the `GIAP_TEST_MODEL_PATH` environment variable.
     ///
