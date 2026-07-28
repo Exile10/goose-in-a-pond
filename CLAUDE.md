@@ -65,11 +65,19 @@ cargo check -p pond-server -p pond-adapters-goose   # PRODUCTION-binary compile 
 
 ### Run the server
 ```bash
-cargo run -p pond-server -- serve [--port PORT] [--open]   # dashboard; port order 80 → 8080 → 4000 → 5000
+cargo run -p pond-server -- serve [--port PORT] [--open]   # dashboard; default 4000, falls back 4000..4009
 cargo run -p pond-server -- setup [--model tiny|base|small]
 cargo run -p pond-server -- chat  [--provider mock|llamafile|ollama] [--model M]
 cargo run -p pond-server -- status
 ```
+
+`bash scripts/giap.sh` is the menu-driven front door for all of the above plus
+build/install/service/GUI and a `doctor` that checks the known traps
+(`scripts/giap.sh doctor` is non-interactive and exits 1 on any FAIL).
+
+The server writes the port it actually bound to `<data_dir>/.runtime_api_port` —
+read that rather than assuming, since `--port` is optional and the fallback walks
+`4000..4009` (`ports::API_SERVER` + `ports::MAX_TRIES`).
 Data (both SQLite DBs, logs, downloaded models) lives in the OS data dir, resolved by `default_data_dir()`. When run detached (no TTY, e.g. a systemd service), `serve` needs stdin kept open or it shuts down on stdin EOF — and on Linux enable `loginctl enable-linger` so the process survives SSH logout.
 
 ### Frontend (`pond-desktop/`)
