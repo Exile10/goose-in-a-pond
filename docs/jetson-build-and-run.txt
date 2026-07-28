@@ -49,6 +49,7 @@ Everything below is also available from one menu-driven script that auto-detects
 the host, whether CUDA is usable, and the known bad states:
 
     bash scripts/giap.sh              # interactive menu
+    bash scripts/giap.sh install      # first-time install (-y to skip prompts)
     bash scripts/giap.sh doctor       # health report; exits 1 on any FAIL
     bash scripts/giap.sh status       # detection banner only
     bash scripts/giap.sh build        # web UI + server, right features for THIS host
@@ -247,27 +248,38 @@ OTHER GOTCHAS
 
 
 -------------------------------------------------------------------------------
-KNOWN OPEN ITEMS (as of 2026-07-28)
+KNOWN OPEN ITEMS (as of 2026-07-28, after the context fix)
 -------------------------------------------------------------------------------
 
-  - context_window_override is still 16384 in Settings. Harmless for local
-    inference now (the registry-pinned 4096 wins), but it is what turned the
-    CPU-only build into a 16K prefill, and it would still apply to Ollama.
-    Worth setting to 0.
+  RESOLVED since the first version of this document:
 
-  - apply_platform_settings logs "Metal/platform" and promises
-    n_gpu_layers = 99 on a CPU-only aarch64 Linux build. Misleading; it reads
-    like a working GPU build. Not yet fixed.
+  - Conversations no longer cut off after 3-4 turns. Nothing used to reserve
+    room for the model's own output, so a thinking block overran the 4096
+    window mid-generation, llama.cpp raised ContextLengthExceeded, and goose
+    compacted the conversation away through a path that ignores
+    GOOSE_AUTO_COMPACT_THRESHOLD. Fixed by CompactionProfile.output_reserve_tokens
+    plus context_size 4096 -> 16384. Verified: a 6-turn conversation with a 4 KB
+    tool result now completes with 0 compactions, context at ~50%.
+  - context_window_override is now 0 on the device.
+  - The stale /etc/systemd/system unit from an old install.sh run is removed.
+  - Power mode is 25W, not MAXN_SUPER: one identical turn produced 1,176
+    over-current events under MAXN_SUPER versus 44 at 25W, for a 5% decode
+    difference. Both modes clock memory at 3199 MHz and GIAP decode is
+    memory-bandwidth-bound, so MAXN_SUPER buys almost nothing on this workload.
+  - apply_platform_settings now says CPU-ONLY on aarch64 Linux instead of
+    "Metal/platform ... n_gpu_layers=99", which read like a working GPU build.
+  - embedded_ui_present compared a 20-byte window to a 21-byte marker and so
+    always returned true; the placeholder warning can now actually fire.
 
-  - tool_selection_mode is "all": 61 tools, ~25K chars of schema, about 2650 of
-    the 3252 prompt tokens. Switching to "relevant" is the biggest available
-    win for context headroom on-device.
+  STILL OPEN:
 
-  - context_size is pinned at 4096, but the measured KV cost is only ~18 KiB
-    per token (72 MiB total at 4096, from n_head_kv = 1). Raising it to 16384
-    would cost about 216 MiB against 5.5 GB free. Untested.
-
+  - tool_selection_mode is "all": 61 tools, ~2,650 of the prompt's tokens.
+    Switching to "relevant" measured 59 tools/6,539 tokens -> 17 tools/2,386 on
+    the Mac. Now an optimisation rather than a necessity, and it wants its own
+    burn-in: on a 2B model the escape hatch was only used when asked explicitly.
   - TTS has only the German voice installed (de_DE-thorsten-medium).
-    home_name in Settings is empty.
+  - home_name in Settings is empty.
+  - `giap.sh` writes a build stamp; `jetson.sh deploy` does not, so the doctor
+    reports build provenance as UNKNOWN after a deploy.
 
 ===============================================================================

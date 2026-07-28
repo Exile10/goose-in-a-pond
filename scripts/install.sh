@@ -5,7 +5,15 @@
 # and setup.sh (Linux production).
 #
 # Usage:
-#   bash scripts/install.sh [OPTIONS]
+#   bash scripts/giap.sh install      <-- PREFERRED: adds host-state guardrails
+#   bash scripts/install.sh [OPTIONS] <-- what giap.sh calls underneath
+#
+# Prefer giap.sh: it refuses to add a second systemd unit when one already
+# exists at either scope (this script writes a SYSTEM unit; a hand-configured
+# Jetson runs a USER unit of the same name, and two means two servers each
+# loading its own model), warns when Node is too old to build the web UI, and
+# stops a running service before a Jetson release link so the linker is not
+# OOM-killed.
 #
 # Modes (auto-detected if not specified):
 #   --production     Linux: systemd service + mDNS + auto-start
@@ -24,7 +32,7 @@
 #   --whisper-model MODEL  Whisper size: tiny|base|small (default: base)
 #
 # Production options (--production / --jetson):
-#   --port PORT      Override port (default: auto-select 80/8080/4000/5000)
+#   --port PORT      Override port (server default is 4000, falling back 4000..4009)
 #   --dedicated      Set hostname to 'pond', serve on port 80
 #   --shared         Keep hostname, use non-privileged port
 #   --no-service     Skip systemd service creation

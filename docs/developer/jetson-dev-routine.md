@@ -21,16 +21,25 @@ GIAP runs as a **user-level** systemd unit (no sudo needed to manage it, and
 ```bash
 ssh nano systemctl --user status goose-in-a-pond    # status
 ssh nano systemctl --user restart goose-in-a-pond   # restart
-ssh nano journalctl --user -u goose-in-a-pond -f    # follow logs
+ssh nano 'cd goose-in-a-pond && bash scripts/giap.sh doctor'   # first move when something is wrong
+ssh nano 'cd goose-in-a-pond && bash scripts/giap.sh logs'     # follow logs (knows the file path + UTC offset)
 ```
 
 - Unit file: `~/.config/systemd/user/goose-in-a-pond.service` on the Jetson
 - Binary: `~/goose-in-a-pond/target/release/pond-server` (CUDA build)
 - Dashboard: **http://nano.local:8080** (8080 because a user service cannot
   bind 80 without capabilities; the embedded web UI serves same-origin)
-- Inference: Ollama system service (`llama3.2:3b` — ~22 tok/s, fits the 8GB
-  GPU budget; see `docs/developer/inference_optimization.md` for the
-  fit-verdict rules and the NvMap drop_caches gotcha)
+- Logs: rolling files at `~/.local/share/goose-in-a-pond/logs/pond.log.YYYY-MM-DD`.
+  **Not journald** — `journalctl --user -u goose-in-a-pond` is empty by design,
+  which has repeatedly been misread as "the service is silent". Timestamps are
+  UTC; the device clock is EAT (+3), so fresh logs look three hours stale.
+- Inference: **in-process CUDA GGUF** (`gemma-4-E2B-it` Q4_K_M, n_ctx 16384,
+  ~24-26 tok/s decode). Confirm with `giap.sh status`'s engine field, or:
+  `grep "Applied Jetson Orin Nano CUDA" ~/.local/share/goose-in-a-pond/logs/pond.log.$(date +%F)`.
+  `Applied Metal/platform settings` on this box means the binary was built
+  WITHOUT the cuda feature and is running on the CPU. See
+  `docs/developer/inference_optimization.md` for the fit-verdict rules and the
+  NvMap drop_caches gotcha.
 
 ## Deploying
 
@@ -55,11 +64,16 @@ there first — or push to `jarida-io` and sync the mirror.
   Jetson, verified end-to-end with the full giap-* tool surface. First request
   after idle pays a one-time cold model-load (~70s); warm responses are ~8s for a
   short prompt. Keep the model resident with `OLLAMA_KEEP_ALIVE`.
-- **Set `context_window_override`** (Settings) to **16384** on the box. GIAP's
-  57-tool system prompt is ~12.5K tokens; Ollama's default `num_ctx` is 4096, so
-  without the override two-thirds of the tools are truncated out of the prompt.
-  The override flows into `GOOSE_CONTEXT_LIMIT` → Ollama `options.num_ctx` → the
-  KV cache, keeping all three consistent (commit `551b0e24`).
+- **Leave `context_window_override` at 0.** It used to be set to 16384 here for
+  the Ollama path, and that advice is now actively harmful: on the in-process
+  GGUF engine the registry-pinned `context_size` (16384) wins anyway, and a
+  larger override only makes GIAP budget history the engine cannot hold. See
+  `docs/jetson-build-and-run.txt` under "Known open items".
+- **Power mode: 25W (`sudo nvpmodel -m 1`), not MAXN_SUPER.** Measured on one
+  identical turn: MAXN_SUPER produced 1,176 over-current events versus 44 at
+  25W, for a 5% decode difference. Both modes run memory at the same 3199 MHz,
+  and GIAP decode is memory-bandwidth-bound, so MAXN_SUPER buys almost nothing
+  here.
 - **Direct llama.cpp (`llama-server`) is NOT wired in.** It was evaluated
   (research move R6) and deferred: Goose streams from the OpenAI endpoint and the
   box's June llama.cpp build's `--jinja` streaming tool-call parser errors on

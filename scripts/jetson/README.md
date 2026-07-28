@@ -1,5 +1,18 @@
 # Jetson (Orin Nano) build & deploy
 
+> **Start with `bash scripts/giap.sh`** — the menu-driven entry point for
+> install, build, service control and diagnostics on any host, the Jetson
+> included. It detects the board and whether CUDA is genuinely usable, stops the
+> service before a release link so the linker is not OOM-killed, and its doctor
+> catches the states below before you hit them:
+> `bash scripts/giap.sh doctor` (exits 1 on FAIL).
+>
+> From the dev machine, `bash scripts/giap.sh deploy` wraps `jetson.sh deploy`
+> and refuses to run when HEAD is missing from a deploy remote — the exact
+> silent-stale-build failure this page warns about below.
+>
+> This page documents the Jetson-specific verbs that `giap.sh` delegates to.
+
 Everything Jetson lives here, driven by the single entry point at the repo root:
 
 ```bash

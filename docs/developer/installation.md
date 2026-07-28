@@ -5,26 +5,70 @@
 ```bash
 git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
 cd goose-in-a-pond
-bash scripts/install.sh
+bash scripts/giap.sh          # menu: install, build, service, logs, doctor
 ```
 
-The install script handles everything: submodule init, dependencies, build, database setup, model downloads, and verification.
+`scripts/giap.sh` is the primary interface. It detects the host (Jetson /
+generic Linux / macOS), whether CUDA is usable, and the known bad states, then
+offers only the actions that apply. Non-interactive equivalents:
+
+```bash
+bash scripts/giap.sh install     # first-time install (-y to skip confirmations)
+bash scripts/giap.sh build       # web UI + pond-server with this host's features
+bash scripts/giap.sh doctor      # health report; exits 1 on any FAIL
+```
+
+Always run `doctor` after installing.
+
+### What `giap.sh install` does
+
+It delegates the work to `scripts/install.sh` — which remains the only place
+that knows the full sequence — and adds the guardrails install.sh cannot have,
+because they depend on host state it does not inspect:
+
+- **Refuses to add a second service unit.** `install.sh` writes a root-owned
+  unit to `/etc/systemd/system/`; a Jetson set up by hand runs a *user* unit of
+  the same name. Both installed means two servers, each loading its own ~3 GB
+  model into one memory pool. `giap.sh` passes `--no-service` when a unit exists
+  at either scope.
+- **Warns when Node is too old to build the web UI**, since the server would
+  then embed the `build.rs` placeholder and nothing at runtime can tell you.
+- **Stops a running service before a Jetson release build**, because the linker
+  is OOM-killed while a model is resident.
 
 ## Install Script Options
+
+`scripts/install.sh` is what `giap.sh install` calls underneath. Its real flags
+(from `scripts/lib/install-common.sh`):
 
 ```
 bash scripts/install.sh [OPTIONS]
 
-  --full            Build entire workspace including Goose (10+ min first time)
-  --fast            Build only server crates (default, ~2 min)
-  --desktop         Also install desktop app (npm install in pond-desktop)
+Modes (auto-detected if omitted):
+  --production      Linux: systemd service + mDNS + auto-start
+  --jetson          Jetson Orin Nano (CUDA auto-detect, SQLX_OFFLINE)
+  --minimal         Fastest: server + DB only, no model downloads
+
+Build:
+  --full            Build the entire workspace including Goose (10+ min)
+  --desktop         Also build the Tauri desktop app
+  --no-verify       Skip the post-install health check
+
+Models:
+  --ollama          Use Ollama as the LLM provider
+  --llamafile       Use llamafile as the LLM provider
   --no-models       Skip all model downloads
-  --no-verify       Skip post-install health check
-  --ollama          Pull LLM via Ollama (auto-detected if installed)
-  --llamafile       Download llamafile binary with embedded model
-  --whisper-model MODEL  Whisper size: tiny|base|small (default: base)
-  --data-dir DIR    Override data directory
+  --whisper-model MODEL   tiny|base|small (default: base)
+
+Production:
+  --port PORT       Override the port
+  --dedicated       Set hostname to 'pond', serve on port 80
+  --shared          Keep hostname, use a non-privileged port
+  --no-service      Skip systemd service creation
+  --data-dir DIR    Override the data directory
 ```
+
+There is no `--fast` flag; it was documented here but never parsed.
 
 ## Prerequisites
 
@@ -116,24 +160,38 @@ cd pond-desktop && npm run tauri dev
 
 ## Production Deployment (Linux)
 
-For headless deployment on Jetson or Linux servers:
+For headless deployment on a Linux server:
 
 ```bash
-# All-in-one: build, configure systemd, setup mDNS
-bash scripts/setup.sh --dedicated --port 80
+bash scripts/giap.sh install          # auto-detects production mode
+# or directly:
+bash scripts/install.sh --production --dedicated --port 80
 ```
 
-See `scripts/setup.sh --help` for options.
+`scripts/setup.sh` no longer exists — `install.sh` replaced both it and the old
+dev installer.
 
-## Cross-Compilation (Jetson Orin Nano)
+Service control afterwards is `bash scripts/giap.sh` menu 20-25 (install, start,
+stop, restart, status, logs, uninstall).
+
+## Jetson Orin Nano
+
+Cross-compilation is **not** viable for the local-inference path: nvcc must
+target the device architecture, so the CUDA build has to happen on the Jetson.
+Deploy from your dev machine instead — it builds the web UI locally (the
+device's Node is too old for Vite), syncs it, then builds on-device with the
+correct feature flags:
 
 ```bash
-# Requires: cargo install cross, Docker running
-SQLX_OFFLINE=true make server
-
-# Deploy to Jetson
-make deploy JETSON_HOST=jetson@192.168.1.100
+bash scripts/giap.sh deploy           # or: bash scripts/jetson.sh deploy
 ```
+
+For a CPU-only aarch64 binary without CUDA, `bash scripts/jetson.sh docker-build`
+builds in a linux/arm64 container.
+
+See [scripts/jetson/README.md](../../scripts/jetson/README.md) for the full
+workflow and [docs/jetson-build-and-run.txt](../jetson-build-and-run.txt) for
+the operational traps.
 
 ## Troubleshooting
 
