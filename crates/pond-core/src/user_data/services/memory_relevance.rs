@@ -76,10 +76,21 @@ const DEFAULT_IMPORTANCE: f32 = 0.5;
 /// (that is `memory_cleanup`'s decay).
 pub const RECENCY_HALF_LIFE_DAYS: f32 = 14.0;
 
-/// Recency term in `[0, 1]` for a fragment, measured from its last access if
-/// it has one and its creation time otherwise.
+/// Recency term in `[0, 1]` for a fragment, measured from when it was WRITTEN.
+///
+/// Deliberately not `last_accessed_at`. Injecting a memory refreshes that
+/// timestamp, so reading from it made being injected the very thing that kept a
+/// memory recent — an incumbency ratchet. On the device a memory already in the
+/// prompt carried a structural head start of 0.100, meaning a genuinely more
+/// relevant challenger needed a cosine edge of 0.20 just to displace it. That is
+/// why "I am a computer program" and "User is an individual" kept reappearing
+/// turn after turn while two real preferences never surfaced once.
+///
+/// `last_accessed_at` and `access_count` are still recorded and still read by
+/// `memory_cleanup` for decay and reinforcement — this changes what RANKS a
+/// memory for injection, not what keeps it alive.
 pub fn recency_score(fragment: &MemoryFragment, now: DateTime<Utc>) -> f32 {
-    let reference = fragment.last_accessed_at.unwrap_or(fragment.created_at);
+    let reference = fragment.created_at;
     let days = (now - reference).num_seconds() as f32 / 86_400.0;
     if days <= 0.0 {
         return 1.0;
@@ -515,12 +526,24 @@ mod tests {
         assert!((recency_score(&two_weeks, now) - 0.5).abs() < 0.02);
     }
 
+    /// Being injected must NOT make a memory look recent.
+    ///
+    /// Injection refreshes `last_accessed_at`, so ranking on it made the act of
+    /// being chosen the reason to be chosen again — an incumbency ratchet worth
+    /// 0.100 of head start, which on the device kept "I am a computer program"
+    /// in the prompt while two real preferences never surfaced. Recency is now
+    /// measured from when the memory was written, full stop.
     #[test]
-    fn last_access_beats_creation_time_for_recency() {
+    fn being_accessed_does_not_refresh_recency() {
         let now = Utc::now();
         let mut old_but_used = fragment("used", 0.5, 90);
         old_but_used.last_accessed_at = Some(now);
-        assert!((recency_score(&old_but_used, now) - 1.0).abs() < 0.01);
+        // 90 days at a 14-day half-life is ~0.012 — the access must not rescue it.
+        let score = recency_score(&old_but_used, now);
+        assert!(
+            score < 0.05,
+            "expected the write date to govern, got {score}"
+        );
     }
 
     #[test]

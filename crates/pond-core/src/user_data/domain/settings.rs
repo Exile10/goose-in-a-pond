@@ -516,7 +516,16 @@ pub struct Settings {
     pub memory_cleanup_enabled: bool,
 
     /// When true, a background task periodically merges duplicate/contradicting memories.
-    #[serde(default)]
+    ///
+    /// Default ON since 2026-07-28. Off, nothing ever removes what extraction
+    /// gets wrong: a device store audited that day was 87% noise — the
+    /// assistant's own self-description filed as the user's identity, five
+    /// third-party biography facts, and clock readings kept forever. The
+    /// consolidation prompt already targets exactly that ("general knowledge,
+    /// info already in the system prompt, anything the assistant said rather
+    /// than a user fact"), it had simply never been allowed to run. It is
+    /// inactivity-triggered and interruptible, so it costs a turn nothing.
+    #[serde(default = "Settings::default_memory_consolidation_enabled")]
     pub memory_consolidation_enabled: bool,
 
     /// Consolidation mode: "single" (1 LLM call) or "adversarial" (3-stage Proposer/Adversary/Judge).
@@ -787,7 +796,7 @@ impl Default for Settings {
             tool_output_compaction: Self::default_tool_output_compaction(),
             memory_extraction_enabled: true,
             memory_cleanup_enabled: true,
-            memory_consolidation_enabled: false, // requires enough memories to be useful
+            memory_consolidation_enabled: Self::default_memory_consolidation_enabled(),
             memory_consolidation_mode: Self::default_memory_consolidation_mode(),
             memory_graph_enabled: false, // experimental causal graph retrieval
             schedule_result_notify: Self::default_schedule_result_notify(),
@@ -1090,6 +1099,9 @@ impl Settings {
         true
     }
     fn default_memory_cleanup_enabled() -> bool {
+        true
+    }
+    fn default_memory_consolidation_enabled() -> bool {
         true
     }
     fn default_memory_consolidation_mode() -> String {

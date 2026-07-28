@@ -12,8 +12,8 @@
 
 use crate::models::ports::embedding::EmbeddingProvider;
 use crate::user_data::domain::memory::{
-    cosine_similarity, fact_defect, is_captured_request, normalise_fact_content, MemoryEventKind,
-    MemoryFragment, MemorySegment,
+    cosine_similarity, fact_defect, is_captured_request, names_user, normalise_fact_content,
+    MemoryEventKind, MemoryFragment, MemorySegment,
 };
 use crate::user_data::ports::memory_extractor::MemoryExtractor;
 use crate::user_data::ports::memory_repository::MemoryRepository;
@@ -142,18 +142,38 @@ impl MemoryExtractionService {
             // ongoing project. Filed as Context it still informs the next few
             // turns, then decays out (short tier) instead of sitting in the
             // Project segment forever crowding out real commitments.
-            let (segment, importance) =
-                if fact.segment == MemorySegment::Project && is_captured_request(&content) {
-                    tracing::debug!(
-                        "[memory-extraction] reclassified captured request as context: {content:?}"
-                    );
-                    (
-                        MemorySegment::Context,
-                        MemorySegment::Context.default_importance(),
-                    )
-                } else {
-                    (fact.segment.clone(), fact.importance)
-                };
+            // A fact that never names the user is not the user's identity,
+            // relationship or preference, whatever label the model put on it.
+            // Demoted to Knowledge rather than rejected: a demotion is
+            // reversible by consolidation and keeps a genuinely useful fact
+            // that happened to be worded without the word "user"; a rejection
+            // loses it forever. This is what let five William Ruto biography
+            // facts sit in `identity` alongside the user's home city.
+            let subject_misfiled = matches!(
+                fact.segment,
+                MemorySegment::Identity | MemorySegment::Relationship | MemorySegment::Preference
+            ) && !names_user(&content);
+
+            let (segment, importance) = if subject_misfiled {
+                tracing::debug!(
+                    "[memory-extraction] demoted {:?} fact that does not name the user: {content:?}",
+                    fact.segment
+                );
+                (
+                    MemorySegment::Knowledge,
+                    MemorySegment::Knowledge.default_importance(),
+                )
+            } else if fact.segment == MemorySegment::Project && is_captured_request(&content) {
+                tracing::debug!(
+                    "[memory-extraction] reclassified captured request as context: {content:?}"
+                );
+                (
+                    MemorySegment::Context,
+                    MemorySegment::Context.default_importance(),
+                )
+            } else {
+                (fact.segment.clone(), fact.importance)
+            };
 
             // Embedding is best-effort: a failure downgrades this fact to an
             // unembedded row (the startup backfill picks it up later), it never
